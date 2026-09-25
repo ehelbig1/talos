@@ -315,7 +315,7 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 | `OCI_REGISTRY_USERNAME` / `OCI_REGISTRY_PASSWORD` | none (anonymous) | both | OCI registry basic-auth (PAT works as password for GHCR) | 🔒 |
 | `REGISTRY_PUBLISH_TOKEN` | none in dev; REQUIRED in production (unset ⇒ the publish endpoint refuses every POST with 503) | talos-registry | Bearer token gating the template publish API | 🔒 |
 | `TALOS_SIGSTORE_REQUIRED` | prod refuses OCI sync unless an explicit policy is set | both | Sigstore verification policy: `required` / `audit` / `disabled` | 🔒 |
-| `TALOS_SIGSTORE_IDENTITY_REGEXP` | `""` | both | cosign `--certificate-identity-regexp` (pin to the publish workflow URL or operator identity) | 🔒 |
+| `TALOS_SIGSTORE_IDENTITY_REGEXP` | `""` | both | cosign `--certificate-identity-regexp` — pin to the publish workflow URL AND its ref (`…/template-publish\.yml@refs/heads/main$`): a pattern ending at `@` admits a signature from any branch a `workflow_dispatch` was pointed at. `install.sh` derives this form when enforcement is on and the variable is unset | 🔒 |
 | `TALOS_SIGSTORE_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` | both | cosign OIDC issuer pin | 🔒 |
 | `TALOS_COSIGN_MIN_VERSION` | `2.0.0` | worker | Minimum cosign binary version | 🔒 |
 | `TALOS_COSIGN_SHA256` | none (optional) | worker | Pin the cosign binary SHA-256 | 🔒 |
