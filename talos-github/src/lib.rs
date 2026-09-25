@@ -41,12 +41,13 @@ mod installation;
 mod installation_token;
 #[cfg(feature = "client")]
 mod token_cache;
+mod user_auth;
 mod webhook;
 
 pub use app_jwt::{AppSigningKey, MAX_APP_JWT_TTL_SECS};
 #[cfg(feature = "client")]
 pub use client::GithubAppClient;
-pub use config::GithubAppConfig;
+pub use config::{GithubAppConfig, GithubUserAuthConfig};
 pub use connect::{install_url, parse_setup_callback, SetupAction, SetupCallback};
 pub use error::GithubAppError;
 pub use installation::{parse_installation_info, InstallationInfo};
@@ -56,4 +57,11 @@ pub use installation_token::{
 };
 #[cfg(feature = "client")]
 pub use token_cache::{InstallationTokenCache, REFRESH_MARGIN_SECS};
+#[cfg(feature = "client")]
+pub use user_auth::GithubUserAuthClient;
+pub use user_auth::{
+    parse_user_installations_page, parse_user_token_response, InstallationAccess, UserAccessToken,
+    UserInstallationsPage, GITHUB_WEB_BASE, USER_INSTALLATIONS_MAX_PAGES,
+    USER_INSTALLATIONS_PER_PAGE,
+};
 pub use webhook::verify_app_webhook_signature;

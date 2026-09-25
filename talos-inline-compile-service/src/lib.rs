@@ -119,6 +119,13 @@ pub enum InlineCompileError {
     #[error("{0}")]
     PermissionDrift(String),
 
+    /// A module owned by this user already has this `node_id` as its name
+    /// and the caller asked for [`NameCollision::Refuse`]. Maps to `-32602`
+    /// — the caller fixes it by choosing another name or by referencing the
+    /// existing module by id. Nothing was compiled or written.
+    #[error("{0}")]
+    NameCollision(String),
+
     /// Compile produced no WASM bytes despite reporting success — a
     /// CompilationService bug or a transient runner failure. Maps to
     /// `-32000`. Message is the literal pre-extraction string.
@@ -136,7 +143,7 @@ impl InlineCompileError {
     /// Stable JSON-RPC error code for protocol wrappers.
     pub fn jsonrpc_code(&self) -> i32 {
         match self {
-            Self::InvalidArg(_) | Self::DependencyValidation(_) => -32602,
+            Self::InvalidArg(_) | Self::DependencyValidation(_) | Self::NameCollision(_) => -32602,
             Self::CapabilityCeilingViolation(_) => -32603,
             Self::LintFailed(_)
             | Self::CompilationFailed(_)
@@ -157,7 +164,8 @@ impl InlineCompileError {
             | Self::LintFailed(msg)
             | Self::CompilationFailed(msg)
             | Self::SharedModuleOverwrite(msg)
-            | Self::PermissionDrift(msg) => msg.clone(),
+            | Self::PermissionDrift(msg)
+            | Self::NameCollision(msg) => msg.clone(),
             // Display format adds the "Dependency validation failed: "
             // prefix around the raw allowlist-validator message, so the
             // user-facing text is `self.to_string()`, not the bare field
@@ -225,6 +233,74 @@ pub struct InlineCompileInput<'a> {
     /// args via `parse_fuel_budget_arg`. When `None`, the service
     /// falls back to `talos_compilation::scaffold::compute_max_fuel`.
     pub fuel_budget: Option<u64>,
+    /// What to do when a module owned by `user_id` already carries
+    /// `node_id` as its name. See [`NameCollision`].
+    pub on_name_collision: NameCollision,
+}
+
+/// How [`InlineCompileService`] treats an existing same-named module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameCollision {
+    /// Recompile the existing module in place, subject to the
+    /// shared-module and permission-drift guards and the recorded
+    /// world-change audit. `add_node_to_workflow`'s contract: re-running a
+    /// node with the same `node_id` updates ITS module.
+    Recompile,
+    /// Refuse with [`InlineCompileError::NameCollision`] and write nothing.
+    /// `create_workflow_from_spec`'s contract (2026-09-25): a spec creates
+    /// modules, it never rewrites one — before this it overwrote a
+    /// same-named module's WASM, world, hosts and secrets through an UPDATE
+    /// with no owner predicate and no audit record. Checked BEFORE the
+    /// compile (so a doomed request spends no compile budget) and again at
+    /// persist (a module created in between is still refused).
+    Refuse,
+}
+
+/// WASM produced by [`InlineCompileService::compile_checked`], bound to the
+/// input it was compiled from.
+///
+/// The fields are private, so the only way to obtain one is to pass every
+/// gate `compile_checked` runs; [`InlineCompileService::persist_compiled`]
+/// refuses one whose name, world or source differ from the input it is
+/// persisted with — so WASM compiled under one world can never be recorded
+/// under another.
+pub struct CompiledInline {
+    wasm_bytes: Vec<u8>,
+    node_id: String,
+    capability_world: String,
+    source_sha256: [u8; 32],
+}
+
+impl std::fmt::Debug for CompiledInline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledInline")
+            .field("node_id", &self.node_id)
+            .field("capability_world", &self.capability_world)
+            .field("wasm_len", &self.wasm_bytes.len())
+            .finish()
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl CompiledInline {
+    /// A `CompiledInline` for `input` from prebuilt bytes, skipping every
+    /// compile gate — for DB tests of [`InlineCompileService::persist_compiled`]
+    /// only. Behind the `test-support` feature, which no production crate
+    /// enables.
+    #[doc(hidden)]
+    pub fn prebuilt_for_tests(input: &InlineCompileInput<'_>, wasm_bytes: Vec<u8>) -> Self {
+        Self {
+            wasm_bytes,
+            node_id: input.node_id.to_string(),
+            capability_world: input.capability_world.to_string(),
+            source_sha256: source_sha256(input.rust_code),
+        }
+    }
+}
+
+fn source_sha256(rust_code: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(rust_code.as_bytes()).into()
 }
 
 /// Outcome of [`InlineCompileService::compile_and_persist`]. The
@@ -283,6 +359,19 @@ impl InlineCompileService {
         &self,
         input: InlineCompileInput<'_>,
     ) -> Result<InlineCompileOutcome, InlineCompileError> {
+        let compiled = self.compile_checked(&input).await?;
+        self.persist_compiled(&input, compiled).await
+    }
+
+    /// Every gate + lint + compile, and NO write. Split from
+    /// [`Self::persist_compiled`] (2026-09-25) so a caller compiling several
+    /// modules for one request — `create_workflow_from_spec` — can compile
+    /// ALL of them before persisting ANY, and a failure on the third leaves no
+    /// orphan from the first two to collide with on retry.
+    pub async fn compile_checked(
+        &self,
+        input: &InlineCompileInput<'_>,
+    ) -> Result<CompiledInline, InlineCompileError> {
         // 1. Validate capability_world length.
         if input.capability_world.len() > 100 {
             return Err(InlineCompileError::InvalidArg(
@@ -360,6 +449,14 @@ impl InlineCompileService {
                         world_full, actor_max, actor_id, world_full
                     )));
                 }
+            }
+        }
+
+        // 2b. A caller that must not overwrite refuses on the name BEFORE
+        //     spending the compile budget. Re-checked at persist.
+        if input.on_name_collision == NameCollision::Refuse {
+            if let Some(eid) = self.existing_module_id(input).await? {
+                return Err(name_collision_error(input.node_id, eid));
             }
         }
 
@@ -448,6 +545,36 @@ impl InlineCompileService {
             )));
         }
         let wasm_bytes = res.wasm_bytes.ok_or(InlineCompileError::NoWasmEmitted)?;
+        Ok(CompiledInline {
+            wasm_bytes,
+            node_id: input.node_id.to_string(),
+            capability_world: input.capability_world.to_string(),
+            source_sha256: source_sha256(input.rust_code),
+        })
+    }
+
+    /// Persist WASM from [`Self::compile_checked`] under `input`'s name,
+    /// world and grants — the shared-module / permission-drift guards (or the
+    /// [`NameCollision::Refuse`] refusal) and the recorded mirror write.
+    pub async fn persist_compiled(
+        &self,
+        input: &InlineCompileInput<'_>,
+        compiled: CompiledInline,
+    ) -> Result<InlineCompileOutcome, InlineCompileError> {
+        let CompiledInline {
+            wasm_bytes,
+            node_id,
+            capability_world,
+            source_sha256: compiled_sha,
+        } = compiled;
+        if node_id != input.node_id
+            || capability_world != input.capability_world
+            || compiled_sha != source_sha256(input.rust_code)
+        {
+            return Err(InlineCompileError::Internal(anyhow::anyhow!(
+                "compiled module does not match the input it is being persisted with"
+            )));
+        }
 
         // 6. Resolve allowed_hosts from caller-explicit or world default.
         let allowed_hosts = talos_workflow_creation_helpers::resolve_default_allowed_hosts(
@@ -458,18 +585,23 @@ impl InlineCompileService {
         // pre-extraction behaviour for the persistence write).
         let allowed_secrets: Vec<String> =
             input.explicit_allowed_secrets.clone().unwrap_or_default();
+        // Caller's allowed_methods. Until 2026-09-25 the mirror write below
+        // passed a literal `&[]` here, so an explicit list was compared by the
+        // drift guard and then DROPPED — and since an empty list denies every
+        // verb (`method_permitted`), a freshly inline-compiled http module
+        // could make no request at all whatever the caller declared.
+        let allowed_methods: Vec<String> =
+            input.explicit_allowed_methods.clone().unwrap_or_default();
 
         // 7. Find existing module by name + user (drives upsert).
-        let existing_id = self
-            .workflow_repo
-            .find_node_template_by_name_and_user(input.node_id, input.user_id)
-            .await
-            .map_err(|e| {
-                tracing::error!(err = ?e, "find_node_template_by_name_and_user failed");
-                InlineCompileError::Internal(e)
-            })?;
+        let existing_id = self.existing_module_id(input).await?;
 
         if let Some(eid) = existing_id {
+            // 7-. A caller that must not overwrite: refuse, even though the
+            //     pre-compile check passed (the name was taken meanwhile).
+            if input.on_name_collision == NameCollision::Refuse {
+                return Err(name_collision_error(input.node_id, eid));
+            }
             // 7a. Shared-module overwrite guard.
             //
             // MCP-885 (2026-05-14): pre-fix `.unwrap_or_default()` made
@@ -624,7 +756,7 @@ impl InlineCompileService {
                 input.rust_code,
                 max_fuel,
                 &allowed_hosts,
-                &[],
+                &allowed_methods,
                 &allowed_secrets,
                 input.integration_name.as_deref(),
                 input.dependencies,
@@ -653,6 +785,36 @@ impl InlineCompileService {
             max_fuel,
         })
     }
+}
+
+impl InlineCompileService {
+    /// The id of the module `input.user_id` already owns under
+    /// `input.node_id`, if any. A read failure is an ERROR, never "none":
+    /// "no module by that name" is what lets a write proceed.
+    async fn existing_module_id(
+        &self,
+        input: &InlineCompileInput<'_>,
+    ) -> Result<Option<Uuid>, InlineCompileError> {
+        self.workflow_repo
+            .find_node_template_by_name_and_user(input.node_id, input.user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(err = ?e, "find_node_template_by_name_and_user failed");
+                InlineCompileError::Internal(e)
+            })
+    }
+}
+
+/// The caller-facing refusal for [`NameCollision::Refuse`]. Names the
+/// existing module (the caller owns it — the lookup is user-scoped) so the
+/// caller can reference it by id instead.
+fn name_collision_error(node_id: &str, existing: Uuid) -> InlineCompileError {
+    InlineCompileError::NameCollision(format!(
+        "A module named '{node_id}' already exists (module_id {existing}). \
+         create_workflow_from_spec creates modules and never overwrites one: \
+         give this node a different id, or reference the existing module with \
+         module_id. To change the existing module's code, use hot_update_module."
+    ))
 }
 
 // -----------------------------------------------------------------------------

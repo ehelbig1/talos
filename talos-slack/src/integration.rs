@@ -154,20 +154,30 @@ impl SlackIntegrationService {
     /// `state`) — the victim's logged-in cookie ID then becomes the
     /// `user_id` the integration is linked to, attaching the attacker's
     /// Slack workspace to the victim's Talos account.
-    pub async fn get_authorization_url(&self, user_id: Uuid) -> Result<(String, String)> {
+    pub async fn get_authorization_url(
+        &self,
+        user_id: Uuid,
+        binding: &talos_oauth::BrowserBinding,
+    ) -> Result<(String, String)> {
         // Delegate to the shared driver — it builds the authorize URL from
         // `authorize_request()` and persists the PKCE + CSRF state token bound
         // to `user_id`. See the `OAuthIntegration` impl below.
-        talos_oauth::authorization_url(&self.db_pool, self, user_id).await
+        talos_oauth::authorization_url(&self.db_pool, self, user_id, binding).await
     }
 
     /// Handle OAuth callback and store the integration
-    pub async fn handle_callback(&self, code: String, state: String) -> Result<SlackIntegration> {
+    pub async fn handle_callback(
+        &self,
+        code: String,
+        state: String,
+        presented_binding: Option<&str>,
+    ) -> Result<SlackIntegration> {
         // Delegate to the shared driver — it consumes + validates the CSRF state
         // token (single-use, format, tenancy) and only then hands the validated
         // `ConsumedOAuthState` to `complete_callback()`. See the
         // `OAuthIntegration` impl below.
-        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
+        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state, presented_binding)
+            .await
     }
 }
 

@@ -765,6 +765,13 @@ CTRL_TESTS=(
     # schema/enum or status-guard pair diverges).
     "github_app_tenancy_tests"
     "oauth_flow_tests"
+    # GitHub App installation takeover + consent-completion CSRF (2026-09-25):
+    # drives the REAL connect service through connect → setup → authorized
+    # against a loopback github.com, asserting on ROWS that a spoofed setup
+    # `installation_id` moves nothing, that GitHub access alone cannot take an
+    # installation from an active owner, and that a URL minted in one browser
+    # cannot be completed in another. `common` (DATABASE_URL) harness.
+    "github_connect_flow_tests"
     "integration_state_crypto_tests"
     "memory_get_entry_tests"
     "module_execution_status_tests"
@@ -921,6 +928,12 @@ CTRL_TESTS=(
     "actor_budget_coverage_tests"
     # BR: the grant CHECK equals ACTOR_CEILING_WORLDS; one ceiling read.
     "capability_grant_world_check_tests"
+    # 2026-09-25: the sub-workflow binding reads actors.http_verb_ceiling, so a
+    # stricter child is not handed the parent's POST override.
+    "subworkflow_verb_ceiling_binding_tests"
+    # 2026-09-25: create_workflow_from_spec compiles through InlineCompileService,
+    # refuses a taken name, never grants "*" hosts, role-gates each world.
+    "create_workflow_from_spec_gate_tests"
 )
 # 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a
 # private per-test database (controller/tests/common::isolated_db_pool), so the

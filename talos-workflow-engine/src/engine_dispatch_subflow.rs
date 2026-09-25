@@ -1558,7 +1558,8 @@ impl ParallelWorkflowEngine {
     /// identity (memory scope + action attribution) plus the ceilings, where
     /// each ceiling is the most-restrictive of `(this engine's ceiling, the
     /// sub-workflow actor's ceiling)` on each axis (`max_llm_tier`,
-    /// `max_write_ceiling`, `egress_scope`).
+    /// `max_write_ceiling`, `http_verb_ceiling`, `egress_scope` — one
+    /// [`talos_workflow_engine_core::ActorCeilings`] value).
     ///
     /// **Identity: adopt the sub-actor.** `AdapterSet` copies the PARENT's
     /// `actor_id` verbatim into a freshly-built sub-engine, so without this a
@@ -1588,44 +1589,16 @@ impl ParallelWorkflowEngine {
     ) -> Option<talos_workflow_engine_core::SubworkflowBinding> {
         let resolver = self.sub_actor_context_resolver.as_ref()?;
         let sub = resolver.resolve_binding(sub_wf_id, user_id).await?;
-        // Egress narrows one-directionally (explicit Local wins), but — unlike
-        // the concrete tier/write axes — the override is an `Option` where
-        // `None` means "tier-derived default". Resolve BOTH sides to their
-        // EFFECTIVE concrete scope FIRST so a sub-actor air-gapped only by its
-        // tier default (egress column NULL, e.g. every pre-feature Tier-1
-        // actor) is NOT silently widened to a `Public` parent's scope across
-        // the sub-workflow boundary. Without this, `narrow(Some(Public), None)`
-        // would defer to the parent and drop the sub-actor's air-gap.
-        let parent_egress = talos_workflow_engine_core::EgressScope::effective(
-            self.egress_scope,
-            self.max_llm_tier,
-        );
-        let sub_egress_eff =
-            talos_workflow_engine_core::EgressScope::effective(sub.egress_scope, sub.max_llm_tier);
+        // Every axis narrows through ONE rule (`ActorCeilings::narrowed_for_child`)
+        // on EFFECTIVE values, so neither `Option` axis can let a `None` on
+        // one side defer to a permissive value on the other: a sub-actor
+        // air-gapped only by its tier default stays local under a `Public`
+        // parent, and a sub-actor whose verb override is NULL inherits ITS OWN
+        // `readonly` ceiling rather than the parent's `Some(Write)` override.
         Some(talos_workflow_engine_core::SubworkflowBinding {
             // Identity is adopted verbatim (see doc) — no narrowing.
             actor_id: sub.actor_id,
-            max_llm_tier: self.max_llm_tier.most_restrictive(sub.max_llm_tier),
-            max_write_ceiling: self
-                .max_write_ceiling
-                .most_restrictive(sub.max_write_ceiling),
-            // The verb-inference override narrows on its OWN axis, through its
-            // own rule: `None` means INHERIT, so it must not win over an
-            // explicit value in either direction — a parent that declares
-            // nothing cannot widen a child that declares `readonly`, and a
-            // child that declares nothing does not erase the parent's. Two
-            // explicit values take the more restrictive, exactly like the
-            // ceiling above. Composing this with `Option::or` (the obvious
-            // one-liner) would let a parent's `Some(Write)` silently win over
-            // a child's `Some(ReadOnly)`.
-            http_verb_ceiling: talos_workflow_engine_core::narrow_verb_inference_override(
-                self.http_verb_ceiling,
-                sub.http_verb_ceiling,
-            ),
-            egress_scope: talos_workflow_engine_core::EgressScope::narrow(
-                Some(parent_egress),
-                Some(sub_egress_eff),
-            ),
+            ceilings: self.ceilings().narrowed_for_child(sub.ceilings),
         })
     }
 
@@ -1645,12 +1618,15 @@ impl ParallelWorkflowEngine {
     ) {
         // `None` = identity couldn't be resolved (fail-closed DB error); keep
         // the parent's already-authorized identity rather than guess a scope.
-        if let Some(actor_id) = binding.actor_id {
+        // Exhaustive destructure: a field added to the binding is a compile
+        // error here until it is applied. The four ceilings travel as ONE
+        // `ActorCeilings` stamped by ONE setter — the verb override was
+        // dropped on this line (2026-09-25) while it was a hand-listed axis.
+        let talos_workflow_engine_core::SubworkflowBinding { actor_id, ceilings } = *binding;
+        if let Some(actor_id) = actor_id {
             sub_engine.set_actor_id(actor_id);
         }
-        sub_engine.set_max_llm_tier(binding.max_llm_tier);
-        sub_engine.set_max_write_ceiling(binding.max_write_ceiling);
-        sub_engine.set_egress_scope(binding.egress_scope);
+        sub_engine.set_ceilings(ceilings);
     }
 
     /// Apply [`Self::resolve_subworkflow_binding`] to a freshly-built
@@ -1855,7 +1831,8 @@ mod identity_binding_tests {
     use serde_json::Value as JsonValue;
     use std::sync::Arc;
     use talos_workflow_engine_core::{
-        EgressScope, LlmTier, SubworkflowActorContextResolver, SubworkflowBinding, WriteCeiling,
+        ActorCeilings, EgressScope, LlmTier, SubworkflowActorContextResolver, SubworkflowBinding,
+        WriteCeiling,
     };
     use uuid::Uuid;
 
@@ -1877,16 +1854,26 @@ mod identity_binding_tests {
         }
     }
 
+    fn ceilings(
+        tier: LlmTier,
+        write: WriteCeiling,
+        verb: Option<WriteCeiling>,
+        egress: Option<EgressScope>,
+    ) -> ActorCeilings {
+        ActorCeilings {
+            max_llm_tier: tier,
+            max_write_ceiling: write,
+            http_verb_ceiling: verb,
+            egress_scope: egress,
+        }
+    }
+
     fn engine_with_binding(
-        parent_tier: LlmTier,
-        parent_write: WriteCeiling,
-        parent_egress: Option<EgressScope>,
+        parent: ActorCeilings,
         sub: Option<SubworkflowBinding>,
     ) -> ParallelWorkflowEngine {
         let mut e = ParallelWorkflowEngine::new();
-        e.set_max_llm_tier(parent_tier);
-        e.set_max_write_ceiling(parent_write);
-        e.set_egress_scope(parent_egress);
+        e.set_ceilings(parent);
         e.set_sub_actor_context_resolver(Arc::new(MockResolver(sub)));
         e
     }
@@ -1897,15 +1884,15 @@ mod identity_binding_tests {
         // Parent is loose (Tier2 / Write / Public); sub-actor is strict
         // (Tier1 / ReadOnly / egress NULL → tier-derived Local).
         let e = engine_with_binding(
-            LlmTier::Tier2,
-            WriteCeiling::Write,
-            Some(EgressScope::Public),
+            ceilings(
+                LlmTier::Tier2,
+                WriteCeiling::Write,
+                None,
+                Some(EgressScope::Public),
+            ),
             Some(SubworkflowBinding {
                 actor_id: Some(sub_actor),
-                max_llm_tier: LlmTier::Tier1,
-                max_write_ceiling: WriteCeiling::ReadOnly,
-                http_verb_ceiling: None,
-                egress_scope: None,
+                ceilings: ceilings(LlmTier::Tier1, WriteCeiling::ReadOnly, None, None),
             }),
         );
 
@@ -1917,26 +1904,36 @@ mod identity_binding_tests {
         // Identity: the sub-workflow's own actor is adopted verbatim.
         assert_eq!(binding.actor_id, Some(sub_actor));
         // Ceilings: narrowed to the stricter sub-actor on every axis.
-        assert_eq!(binding.max_llm_tier, LlmTier::Tier1);
-        assert_eq!(binding.max_write_ceiling, WriteCeiling::ReadOnly);
+        assert_eq!(binding.ceilings.max_llm_tier, LlmTier::Tier1);
+        assert_eq!(binding.ceilings.max_write_ceiling, WriteCeiling::ReadOnly);
+        assert_eq!(
+            binding.ceilings.http_verb_ceiling,
+            Some(WriteCeiling::ReadOnly)
+        );
         // Tier1 sub-actor with NULL egress → effective Local; narrow(Public, Local) = Local.
-        assert_eq!(binding.egress_scope, Some(EgressScope::Local));
+        assert_eq!(binding.ceilings.egress_scope, Some(EgressScope::Local));
     }
 
     #[tokio::test]
     async fn resolve_binding_looser_sub_actor_never_widens_but_identity_still_adopted() {
         let sub_actor = Uuid::new_v4();
-        // Parent is strict (Tier1 / ReadOnly / Local); sub-actor is loose.
+        // Parent is strict (Tier1 / ReadOnly / Local); sub-actor is loose,
+        // including an explicit verb override granting POST.
         let e = engine_with_binding(
-            LlmTier::Tier1,
-            WriteCeiling::ReadOnly,
-            Some(EgressScope::Local),
+            ceilings(
+                LlmTier::Tier1,
+                WriteCeiling::ReadOnly,
+                None,
+                Some(EgressScope::Local),
+            ),
             Some(SubworkflowBinding {
                 actor_id: Some(sub_actor),
-                max_llm_tier: LlmTier::Tier2,
-                max_write_ceiling: WriteCeiling::Write,
-                http_verb_ceiling: None,
-                egress_scope: Some(EgressScope::Public),
+                ceilings: ceilings(
+                    LlmTier::Tier2,
+                    WriteCeiling::Write,
+                    Some(WriteCeiling::Write),
+                    Some(EgressScope::Public),
+                ),
             }),
         );
 
@@ -1949,9 +1946,73 @@ mod identity_binding_tests {
         // not a lattice; only ceilings narrow.
         assert_eq!(binding.actor_id, Some(sub_actor));
         // Every ceiling stays at the stricter parent value (no widening).
-        assert_eq!(binding.max_llm_tier, LlmTier::Tier1);
-        assert_eq!(binding.max_write_ceiling, WriteCeiling::ReadOnly);
-        assert_eq!(binding.egress_scope, Some(EgressScope::Local));
+        assert_eq!(binding.ceilings.max_llm_tier, LlmTier::Tier1);
+        assert_eq!(binding.ceilings.max_write_ceiling, WriteCeiling::ReadOnly);
+        assert_eq!(
+            binding.ceilings.http_verb_ceiling,
+            Some(WriteCeiling::ReadOnly)
+        );
+        assert_eq!(binding.ceilings.egress_scope, Some(EgressScope::Local));
+    }
+
+    /// 2026-09-25 regression: a parent whose verb override grants POST must
+    /// not hand that grant to a child bound to a `readonly` actor whose own
+    /// override is NULL. Pre-fix the child's `None` read as "no opinion" and
+    /// the parent's `Some(Write)` won — and the value was never stamped anyway.
+    #[tokio::test]
+    async fn a_parent_verb_override_does_not_reach_a_readonly_child() {
+        let parent = ceilings(
+            LlmTier::Tier2,
+            WriteCeiling::Write,
+            Some(WriteCeiling::Write),
+            None,
+        );
+        let e = engine_with_binding(
+            parent,
+            Some(SubworkflowBinding {
+                actor_id: Some(Uuid::new_v4()),
+                ceilings: ceilings(LlmTier::Tier2, WriteCeiling::ReadOnly, None, None),
+            }),
+        );
+        // A sub-engine built by `AdapterSet` starts with the PARENT's
+        // ceilings, override included.
+        let mut sub = ParallelWorkflowEngine::new();
+        sub.set_ceilings(parent);
+
+        e.bind_subengine_actor_and_ceilings(&mut sub, Uuid::new_v4(), Uuid::new_v4())
+            .await;
+
+        assert_eq!(sub.http_verb_ceiling, Some(WriteCeiling::ReadOnly));
+        assert_eq!(sub.ceilings().effective_http_verb(), WriteCeiling::ReadOnly);
+        assert_eq!(sub.max_write_ceiling, WriteCeiling::ReadOnly);
+    }
+
+    /// A child's EXPLICIT tightening override is honoured too: the resolver
+    /// must carry it, and the executor must stamp it.
+    #[tokio::test]
+    async fn a_child_verb_override_that_tightens_is_stamped() {
+        let parent = ceilings(LlmTier::Tier2, WriteCeiling::Write, None, None);
+        let e = engine_with_binding(
+            parent,
+            Some(SubworkflowBinding {
+                actor_id: Some(Uuid::new_v4()),
+                ceilings: ceilings(
+                    LlmTier::Tier2,
+                    WriteCeiling::Write,
+                    Some(WriteCeiling::ReadOnly),
+                    None,
+                ),
+            }),
+        );
+        let mut sub = ParallelWorkflowEngine::new();
+        sub.set_ceilings(parent);
+
+        e.bind_subengine_actor_and_ceilings(&mut sub, Uuid::new_v4(), Uuid::new_v4())
+            .await;
+
+        assert_eq!(sub.http_verb_ceiling, Some(WriteCeiling::ReadOnly));
+        // The data ceiling is untouched — the actor may keep notes.
+        assert_eq!(sub.max_write_ceiling, WriteCeiling::Write);
     }
 
     #[tokio::test]
@@ -1970,15 +2031,18 @@ mod identity_binding_tests {
         let sub_actor = Uuid::new_v4();
         let mut e = ParallelWorkflowEngine::new();
         e.set_actor_id(parent_actor);
+        e.set_http_verb_ceiling(Some(WriteCeiling::Write));
 
         ParallelWorkflowEngine::apply_subworkflow_binding(
             &mut e,
             &SubworkflowBinding {
                 actor_id: Some(sub_actor),
-                max_llm_tier: LlmTier::Tier1,
-                max_write_ceiling: WriteCeiling::ReadOnly,
-                http_verb_ceiling: None,
-                egress_scope: Some(EgressScope::Local),
+                ceilings: ceilings(
+                    LlmTier::Tier1,
+                    WriteCeiling::ReadOnly,
+                    Some(WriteCeiling::ReadOnly),
+                    Some(EgressScope::Local),
+                ),
             },
         );
 
@@ -1987,6 +2051,8 @@ mod identity_binding_tests {
         assert_eq!(e.actor_id, Some(sub_actor));
         assert_eq!(e.max_llm_tier, LlmTier::Tier1);
         assert_eq!(e.max_write_ceiling, WriteCeiling::ReadOnly);
+        // The axis the pre-2026-09-25 apply never stamped.
+        assert_eq!(e.http_verb_ceiling, Some(WriteCeiling::ReadOnly));
         assert_eq!(e.egress_scope, Some(EgressScope::Local));
     }
 
@@ -1995,6 +2061,9 @@ mod identity_binding_tests {
         let parent_actor = Uuid::new_v4();
         let mut e = ParallelWorkflowEngine::new();
         e.set_actor_id(parent_actor);
+        // The parent granted POST through the override; the fail-closed
+        // binding must take it away.
+        e.set_http_verb_ceiling(Some(WriteCeiling::Write));
 
         // actor_id: None models the fail-closed DB-error path — ceilings still
         // apply (fail-closed), but the parent's authorized identity is kept
@@ -2003,17 +2072,13 @@ mod identity_binding_tests {
             &mut e,
             &SubworkflowBinding {
                 actor_id: None,
-                max_llm_tier: LlmTier::Tier1,
-                max_write_ceiling: WriteCeiling::ReadOnly,
-                http_verb_ceiling: None,
-                egress_scope: Some(EgressScope::Local),
+                ceilings: ActorCeilings::FAIL_CLOSED,
             },
         );
 
         assert_eq!(e.actor_id, Some(parent_actor));
-        // Fail-closed ceilings were still stamped.
-        assert_eq!(e.max_llm_tier, LlmTier::Tier1);
-        assert_eq!(e.max_write_ceiling, WriteCeiling::ReadOnly);
-        assert_eq!(e.egress_scope, Some(EgressScope::Local));
+        // Fail-closed ceilings were still stamped — on every axis.
+        assert_eq!(e.ceilings(), ActorCeilings::FAIL_CLOSED);
+        assert_eq!(e.http_verb_ceiling, Some(WriteCeiling::ReadOnly));
     }
 }

@@ -9643,3 +9643,158 @@ was written for, because `http.rs` already names the resolver — the
 gate-that-doesn't-gate shape (#624, checks 64/65). `--count` stays **97**. The
 cross-surface pin counts resolver call sites PER FILE, which is what a file-scoped
 grep cannot do.
+
+## ES (2026-09-25) — the reference integration had the rule; both copies inverted it
+
+**How it was found.** Not by a sweep. The post-deploy read of #948 showed two
+controller WARN lines where the previous several deploys had produced zero:
+
+```
+WARN talos_google_cloud::handlers: gcp pubsub: no active watch for token; acking
+```
+
+Two occurrences 85 s apart in an 11-minute-old container and then silence — a
+Pub/Sub backlog draining after the restart, for a watch that no longer exists.
+Benign, self-limiting, correctly handled. But the sentence makes a DETERMINATE
+NEGATIVE claim ("no active watch"), and this file's own rule is that a read
+which FAILED is not a row which is ABSENT, so the handler was read to see
+whether it could tell the two apart.
+
+**It could.** The lookup is a clean three-way match — `Ok(Some)`, `Ok(None)`
+(WARN, "no active watch"), `Err` (ERROR, "watch lookup failed") — almost
+certainly because packages 79/79b swept exactly this class through these files.
+The defect is one level down, in the STATUS CODES the two non-`Found` arms
+return:
+
+```rust
+Ok(None) => { warn!(...);  return StatusCode::OK; }   // correct
+Err(e)   => { error!(...); return StatusCode::OK; }   // the log says error,
+                                                       // the wire says handled
+```
+
+So the arms were split and then answered identically. **Check 79 is green over
+this by its own stated limit**, which is worth quoting because it was written
+before the instance existed: *"it proves the arms are SPLIT, never that the
+`Err` arm is right — measured, not inferred: splitting the three arms correctly
+and then having `Err(e)` return the 404 with the original text SURVIVES."*
+79's entry also predicted the propagation failure: *"not a rule nobody knew, a
+rule that did not replicate when `docs/integration-pattern.md` was copied for
+the second and third integration, which is what the fourth will do too."*
+
+**The comparison that settled it.** Three transports, one question:
+
+| transport | absent row | unreadable row |
+|---|---|---|
+| Calendar (first integration, the doc's source) | 200 ack | **500 — Google retries** |
+| Gmail (second) | 200 ack | **200 — dropped** |
+| GCP (third) | 200 ack | **200 — dropped** |
+
+The reference implementation was right and both copies inverted it. And the
+malformed-envelope arms beside them carry an explicit justification for
+acking ("a sender bug, not something we fix by retrying") — so ack-versus-retry
+WAS reasoned about for the permanent case and simply never asked for the
+transient one.
+
+**A second finding fell out of the ordering.** The watch lookup sits ABOVE the
+execution-pause gate added by package BG, whose own comment reasons correctly
+that *"a 503 makes Pub/Sub redeliver — deferred, not dropped"* and whose
+`DeferReadFailed` variant defers on an unreadable pause flag. On a database
+outage the watch lookup is reached FIRST, so BG's careful
+deferred-not-dropped reasoning was unreachable in precisely the scenario it
+was written for.
+
+**Severity, measured.** The arm has never fired in the retained controller logs
+— LATENT. But the volume behind it is the platform's busiest inbound path:
+`pa-ask-email`, driven by the Gmail push, was **5 805 of 11 275 workflow
+executions over the 30 days to 2026-09-25 (51%)**. A dropped push there is an
+inbound question that is never answered and never retried.
+
+**Why the decision was extracted rather than patched twice.** A handler-level
+test cannot reach either call site: the lookup runs AFTER JWT verification, so
+driving it needs forged signing material. That is 79b's lesson restated —
+extraction is the only thing that closes a call-site defect — so the rule moved
+into `talos_integration_helpers::push_ack`, where it is pure and unit-tested,
+and the two call sites are covered by TEXTUAL pins. The pins strip `//`
+comments first, because both call sites' new explanatory comments quote
+`StatusCode::OK` while explaining why it is wrong: the self-report trap that
+has now caught checks 73, 87, 97, EG's check 4 and EQ.
+
+**The pin's own first draft was broken, and the shape of the failure is the
+lesson.** All three pins failed identically at one line, which reads like three
+bad anchors; it was one bug — `strip_line_comments` initialised its cut index
+to `line.len()` (BYTES) and then indexed a `Vec<char>`, so the first em-dash in
+either handler pushed the slice past the end. Both files are full of them. The
+custom "anchor not found" panic, written specifically so a pin that matches
+nothing cannot pass as a green tick, was never even reached. Third recorded
+byte/char miss.
+
+**Mutations: 7 applied worst-first, 7 caught**, baseline green before and
+after, every revert byte-verified and the harness reverting in a `finally`.
+M1/M2 restore the original defect at each call site (pins), M3 makes the
+shared decision ack an unreadable lookup (the DIFFER assertion), M5 counts the
+deferral and returns 200 anyway (a metric contradicting the wire), M6 removes
+the seeding, M7 defers as the wrong integration. **M4 is the one worth naming**:
+making an ABSENT watch defer is caught too, so the fix is bounded in BOTH
+directions — a deferral there would make Pub/Sub redeliver for the life of the
+subscription.
+
+**One process note.** The mutation harness was started with `nohup … &`, and
+the tool notification reported "completed, exit 0" for the *shell*, not the
+Python process. Reading the log at that moment showed 2 of 7 mutations and one
+`.bak` present — i.e. a mutation live in the tree — and a tree read at that
+instant would have been attributed to the branch. The recorded lesson ("a
+notification is not a finish") held; the run was waited out on a condition
+instead.
+
+**Deliberately not done.** Calendar is not rewritten to use `push_ack`: its 500
+already defers, and churning a correct handler is an unrelated behaviour
+change — it is pinned in its own vocabulary so it cannot drift the other way.
+No lint check was added and `--count` stays 97: the population is two call
+sites in two files, below #765's bar, and the shared decision plus three pins
+is the stronger guard. No alert on the new counter — the arm has never fired,
+so any threshold would be a guess.
+
+**Note on this package's own bullet.** It exceeds EP's ~1,200–2,000 B soft
+target at ~3,020 B. The discovery narrative above (the byte/char miss, the
+harness note, the WARN that started it) was moved here rather than kept there,
+and what remains in the bullet is ~12 decisions. EP's rule is explicit that
+losslessness is the hard rule and the byte budget the soft one, because a hard
+cap is what made DN's chunk 3 drop decisions to fit; the overrun is stated
+rather than paid for with a dropped decision.
+
+**Correction to this entry's own first draft: two existing tests were asserting
+the defect.** The extraction rationale above said no test could reach either
+call site. That was true of Gmail and FALSE of GCP, and the full test run said
+so — `talos-google-cloud` has a `pubsub_tests` module that drives
+`pubsub_push_handler` end to end with a forged-but-valid JWT (`keypair()` /
+`sign()`) against a state carrying a DEAD pool, and two of its tests failed on
+this change with `left: 503, right: 200`.
+
+They failed because they encoded the old behaviour, and the sharper half is that
+one of them explained itself:
+
+> *Valid JWT (correct aud) passes step 2; the garbage watch_token reaches
+> find_by_push_token which errors against the dead pool → step 3 acks 200 (no
+> 404 oracle).*
+
+The comment is right about the mechanism and wrong about the conclusion,
+because it folds two unrelated properties into one word. "No 404 oracle" is
+about not disclosing whether a token is valid — correct, and a 503 discloses
+nothing either, since it is returned whatever the token. "Acks 200" is about
+discarding the delivery, which is the defect. A test that asserts the wrong
+behaviour AND documents the reasoning that produced it is the most expensive
+kind, because the next reader inherits the justification along with the
+assertion.
+
+So the second test is now the behavioural guard for this package on the GCP
+transport (503, plus the deferral counter moving by exactly one), and the
+first — whose real subject is the accepted counter, not the status — keeps that
+assertion and has its premise corrected: it is named "for no watch" but drives
+a DEAD POOL, so it exercises the UNREADABLE path and not the absent one.
+
+**The coverage is therefore asymmetric, which is stated rather than smoothed
+over.** GCP's unreadable arm is driven behaviourally; Gmail has no handler test
+module at all, so its call site is held by the textual pin alone; and NEITHER
+transport covers the ABSENT arm, which needs a migrated database with no
+matching row. The corrected comment says so in the test itself, because the
+dead-pool test looks like coverage of both and is not.

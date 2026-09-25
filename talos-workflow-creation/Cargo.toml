@@ -11,8 +11,10 @@ anyhow.workspace = true
 regex = "1.12"
 serde.workspace = true
 serde_json.workspace = true
-talos-compilation = { path = "../talos-compilation" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
+# 2026-09-25: create_from_spec compiles inline nodes through the same service
+# add_node_to_workflow uses (gates + refusal on a taken name).
+talos-inline-compile-service = { path = "../talos-inline-compile-service" }
 talos-llm = { path = "../talos-llm" }
 talos-module-repository = { path = "../talos-module-repository" }
 # MCP-1050: canonical truncate_at_char_boundary for sanitized workflow name.

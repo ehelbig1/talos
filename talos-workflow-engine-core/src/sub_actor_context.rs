@@ -68,31 +68,22 @@ use uuid::Uuid;
 ///   sub-actor's identity is NOT an escalation: the resolver only returns
 ///   a binding for a workflow visible to `user_id` bound to an actor owned
 ///   by `user_id` (owner-validated, same gate as `resolve`).
-/// * **`max_llm_tier` / `max_write_ceiling` / `egress_scope`** — the
-///   sub-actor's RAW ceilings. The executor composes these with the
-///   parent's as `most_restrictive(parent, sub)` on each axis — a
-///   one-directional narrowing that can never widen the sub-workflow's
-///   authority.
+/// * **`ceilings`** — the sub-actor's RAW ceilings on all four signed axes
+///   (`max_llm_tier`, `max_write_ceiling`, `http_verb_ceiling`,
+///   `egress_scope`). The executor composes these with the parent's through
+///   [`crate::ActorCeilings::narrowed_for_child`] — a one-directional
+///   narrowing that can never widen the sub-workflow's authority. They are
+///   ONE value, not four fields, because the verb override (added 2026-09-24)
+///   was dropped on exactly this path while it was a hand-listed fourth
+///   field: the resolver never read it and the executor never stamped it.
 #[derive(Debug, Clone, Copy)]
 pub struct SubworkflowBinding {
     /// The sub-workflow's own bound actor, or `None` when the identity
     /// couldn't be resolved (fail-closed DB error) — see the type docs.
     pub actor_id: Option<Uuid>,
-    /// The sub-actor's LLM tier ceiling (data-egress). The executor composes
-    /// it with the parent's as `most_restrictive` — never widened.
-    pub max_llm_tier: crate::LlmTier,
-    /// The sub-actor's write ceiling (mutation authority). Composed with the
-    /// parent's as `most_restrictive` — never widened.
-    pub max_write_ceiling: crate::WriteCeiling,
-    /// Override for the VERB-INFERRED half of the write ceiling
-    /// (`http::fetch`, `http::fetch_all`, `graphql::execute`). `None`
-    /// inherits `max_write_ceiling`, which is byte-identical to the
-    /// pre-2026-09-24 behaviour. See `crate::CeilingAxis`.
-    pub http_verb_ceiling: Option<crate::WriteCeiling>,
-    /// The sub-actor's blanket public-egress override (`None` = tier-derived
-    /// default). Composed with the parent's via `EgressScope::narrow` —
-    /// explicit `Local` on either side wins.
-    pub egress_scope: Option<crate::EgressScope>,
+    /// The sub-actor's raw ceilings (or [`crate::ActorCeilings::FAIL_CLOSED`]
+    /// when the binding could not be read).
+    pub ceilings: crate::ActorCeilings,
 }
 
 /// Resolve the `__actor_context__` payload for a sub-workflow about

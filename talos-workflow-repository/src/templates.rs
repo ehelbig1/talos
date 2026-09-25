@@ -367,114 +367,11 @@ impl WorkflowRepository {
         .transpose()
     }
 
-    /// Update an existing module's WASM + metadata (inline compilation retry path).
-    ///
-    /// Phase 5.1: writes directly to the unified `modules` table by canonical id.
-    /// `capability_world` is stored in long form (`secrets-node`) on `modules`;
-    /// convert from the short form callers pass in.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn update_node_template_wasm(
-        &self,
-        id: Uuid,
-        wasm_bytes: &[u8],
-        code: &str,
-        world: &str,
-        secrets: &[String],
-        hosts: &[String],
-        integration_name: Option<&str>,
-    ) -> Result<()> {
-        use sha2::{Digest, Sha256};
-        let content_hash = format!("{:x}", Sha256::digest(wasm_bytes));
-        // Normalise to long form (`secrets-node`) — modules table CHECK expects it.
-        let cw_long = if world == "trusted" {
-            "automation-node".to_string()
-        } else if world.ends_with("-node") {
-            world.to_string()
-        } else {
-            format!("{}-node", world)
-        };
-        sqlx::query(
-            "UPDATE modules \
-             SET wasm_bytes = $1, source_code = $2, capability_world = $3, \
-                 allowed_secrets = $4, allowed_hosts = $5, \
-                 integration_name = $7, content_hash = $8, \
-                 size_bytes = $9, compiled_at = NOW() \
-             WHERE id = $6",
-        )
-        .bind(wasm_bytes)
-        .bind(code)
-        .bind(cw_long)
-        .bind(secrets)
-        .bind(hosts)
-        .bind(id)
-        .bind(integration_name)
-        .bind(&content_hash)
-        .bind(wasm_bytes.len() as i32)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Insert a new module (inline compilation when name is new).
-    ///
-    /// Phase 5.1: writes directly to the unified `modules` table with
-    /// `kind = 'extracted'` (matches the `add_node_to_workflow` rust_code
-    /// path).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn insert_node_template(
-        &self,
-        id: Uuid,
-        name: &str,
-        wasm_bytes: &[u8],
-        code: &str,
-        world: &str,
-        secrets: &[String],
-        hosts: &[String],
-        user_id: Uuid,
-        integration_name: Option<&str>,
-    ) -> Result<()> {
-        use sha2::{Digest, Sha256};
-        let content_hash = format!("{:x}", Sha256::digest(wasm_bytes));
-        // Normalise to long form (`secrets-node`) — modules table CHECK expects it.
-        let cw_long = if world == "trusted" {
-            "automation-node".to_string()
-        } else if world.ends_with("-node") {
-            world.to_string()
-        } else {
-            format!("{}-node", world)
-        };
-        let empty: Vec<String> = Vec::new();
-        sqlx::query(
-            "INSERT INTO modules ( \
-                id, user_id, name, kind, capability_world, \
-                allowed_hosts, allowed_methods, allowed_secrets, \
-                source_code, wasm_bytes, content_hash, size_bytes, \
-                integration_name, language, \
-                created_at, compiled_at, updated_at \
-             ) VALUES ( \
-                $1, $2, $3, 'extracted', $4, \
-                $5, $6, $7, \
-                $8, $9, $10, $11, \
-                $12, 'rust', \
-                NOW(), NOW(), NOW() \
-             )",
-        )
-        .bind(id)
-        .bind(user_id)
-        .bind(name)
-        .bind(cw_long)
-        .bind(hosts)
-        .bind(&empty)
-        .bind(secrets)
-        .bind(code)
-        .bind(wasm_bytes)
-        .bind(&content_hash)
-        .bind(wasm_bytes.len() as i32)
-        .bind(integration_name)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(())
-    }
+    // `update_node_template_wasm` / `insert_node_template` were DELETED
+    // (2026-09-25). Their only caller was `create_workflow_from_spec`, which now
+    // compiles and persists through `InlineCompileService`. The UPDATE carried
+    // no `user_id` predicate, overwrote a module's world, hosts and secrets, and
+    // recorded nothing — a writer that must not be re-acquired by a new caller.
 
     /// Returns the (id, name) of every non-archived workflow owned by `user_id`
     /// whose graph references `module_id`, EXCLUDING `current_workflow_id`.

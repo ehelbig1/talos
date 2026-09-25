@@ -1,6 +1,7 @@
 use super::api::GcpApiClient;
 use super::integration::{GoogleCloudIntegrationInfo, GoogleCloudIntegrationService};
 use talos_integration_helpers::api_json::ApiJson;
+use talos_integration_helpers::push_ack::{defer_unreadable_watch, PushWatchLookup};
 
 /// The read- and write-tier OAuth services, bundled as one axum state so the
 /// shared `/api/gcp/callback` can route by the state token's provider and the
@@ -158,6 +159,7 @@ pub async fn disconnect_integration_handler(
 pub async fn connect_gcp_handler(
     State(service): State<Arc<GoogleCloudIntegrationService>>,
     Extension(user_id): Extension<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     if !service.is_configured() {
         return (
@@ -171,16 +173,23 @@ pub async fn connect_gcp_handler(
             .into_response();
     }
 
-    match service.get_authorization_url(user_id).await {
-        Ok((url, csrf_token)) => Json(ApiResponse {
-            success: true,
-            data: Some(OAuthUrlResponse {
-                authorization_url: url,
-                csrf_token,
+    // Bind the state to THIS browser (connect-binding cookie): the callback
+    // must present it, so a URL minted here cannot be completed by someone
+    // else's browser — see talos_oauth::connect_binding.
+    let binding = talos_oauth::BrowserBinding::for_request(&headers);
+    match service.get_authorization_url(user_id, &binding).await {
+        Ok((url, csrf_token)) => (
+            [binding.set_cookie_pair()],
+            Json(ApiResponse {
+                success: true,
+                data: Some(OAuthUrlResponse {
+                    authorization_url: url,
+                    csrf_token,
+                }),
+                error: None,
             }),
-            error: None,
-        })
-        .into_response(),
+        )
+            .into_response(),
         Err(e) => {
             tracing::error!(user_id = %user_id, error = %e, "Failed to generate Google Cloud auth URL");
             (
@@ -208,6 +217,7 @@ pub async fn connect_gcp_handler(
 pub async fn gcp_callback_handler(
     Query(params): Query<OAuthCallbackParams>,
     State(services): State<Arc<GcpOAuthServices>>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     // Canonical FRONTEND_URL validation (rejects ? and # in addition to /).
     let frontend_url = talos_config::get_frontend_url();
@@ -260,7 +270,16 @@ pub async fn gcp_callback_handler(
         }
     };
 
-    match service.handle_callback(code, state).await {
+    match service
+        .handle_callback(
+            code,
+            state,
+            // The connect-binding cookie set at /connect — the consume refuses a
+            // state started in a different browser.
+            talos_oauth::presented_connect_binding(&headers).as_deref(),
+        )
+        .await
+    {
         Ok(integration) => {
             let label = integration
                 .account_email
@@ -785,14 +804,22 @@ pub async fn pubsub_push_handler(
     let (user_id, row) = match state.watch_service.find_by_push_token(&watch_token).await {
         Ok(Some(pair)) => pair,
         Ok(None) => {
-            // No active watch for this token (revoked / stale). Ack — do
-            // NOT 404 (that would leak whether a token is valid).
+            // No active watch for this token (revoked / stale). A determinate
+            // answer, so ACK — do NOT 404 (that would leak whether a token is
+            // valid) and do not defer (Pub/Sub would redeliver forever).
             tracing::warn!("gcp pubsub: no active watch for token; acking");
-            return StatusCode::OK;
+            return PushWatchLookup::Absent.status();
         }
         Err(e) => {
-            tracing::error!(error = %e, "gcp pubsub: watch lookup failed; acking");
-            return StatusCode::OK;
+            // The lookup did not ANSWER, so the watch's existence is unknown.
+            // Acking here would tell Pub/Sub the delivery was handled and drop
+            // it permanently; 503 makes Pub/Sub redeliver. Note the ordering:
+            // this read sits ABOVE the execution-pause gate, so on a database
+            // outage it is reached FIRST — the pause gate's own
+            // deferred-not-dropped reasoning is unreachable in exactly the
+            // scenario it was written for.
+            tracing::error!(error = %e, "gcp pubsub: watch lookup unreadable; deferring");
+            return defer_unreadable_watch(PushIntegration::Gcp);
         }
     };
 
@@ -1093,12 +1120,18 @@ mod pubsub_tests {
         ));
     }
 
-    /// A push whose JWT verifies but whose token names no watch is NOT an
+    /// A push whose JWT verifies but whose watch cannot be resolved is NOT an
     /// accepted push: GCP authentication completes only at the per-watch
     /// service-account check, which such a push never reaches. Counting it
     /// earlier would let a stream of stale-token deliveries keep
     /// `TalosGooglePushSilent` quiet. (The positive path needs a persisted
     /// watch row; it is pinned textually in talos-integration-helpers.)
+    ///
+    /// NOTE the state this drives: `state_with(.., None)` carries a DEAD pool,
+    /// so the lookup returns `Err` and this is the UNREADABLE path, not the
+    /// absent one — which is why the status is a 503 deferral. The ABSENT
+    /// (`Ok(None)`) case needs a migrated database with no matching row and is
+    /// NOT covered here; do not read this test as covering both.
     #[tokio::test]
     async fn a_verified_push_for_no_watch_is_not_counted_as_accepted() {
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
@@ -1131,16 +1164,42 @@ mod pubsub_tests {
             valid_envelope_body(),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(accepted() - before, 0.0, "no watch, no accepted push");
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unreadable lookup defers so Pub/Sub redelivers"
+        );
+        assert_eq!(
+            accepted() - before,
+            0.0,
+            "no resolvable watch, no accepted push"
+        );
     }
 
+    /// A valid JWT whose watch lookup CANNOT BE READ must be deferred, not
+    /// acked — the behavioural guard for package ES on the GCP transport.
+    ///
+    /// This test previously asserted 200 and its comment justified that with
+    /// "no 404 oracle", which conflated two different things: not leaking
+    /// whether a token is valid (correct, and a 503 leaks nothing either) with
+    /// acking the delivery (wrong — an ack tells Pub/Sub the message was
+    /// handled, so it is dropped permanently and nothing else retries it). It
+    /// was asserting the defect, and saying so.
     #[tokio::test]
-    async fn valid_jwt_but_unresolved_token_acks_200_no_dispatch() {
+    async fn valid_jwt_but_unreadable_lookup_defers_for_redelivery() {
         // Valid JWT (correct aud) passes step 2; the garbage watch_token
-        // reaches find_by_push_token which errors against the dead pool
-        // → step 3 acks 200 (no 404 oracle). dispatch is None → nothing
-        // is published.
+        // reaches find_by_push_token which ERRORS against the dead pool
+        // → step 3 defers with 503 so Pub/Sub redelivers. dispatch is None →
+        // nothing is published either way.
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let deferred = || {
+            talos_metrics::global()
+                .expect("registry installed")
+                .google_push_deferred_total
+                .with_label_values(&["gcp", "watch_lookup_unreadable"])
+                .get()
+        };
+        let before = deferred();
         let (enc, dec, kid) = keypair();
         let state = state_with(dec, &kid, AUD, None);
         let token = sign(
@@ -1162,6 +1221,20 @@ mod pubsub_tests {
             valid_envelope_body(),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "acking here would discard a delivery Pub/Sub would have redelivered"
+        );
+        assert!(
+            status.is_server_error(),
+            "a 2xx of any kind is read by Pub/Sub as handled"
+        );
+        assert_eq!(
+            deferred() - before,
+            1.0,
+            "the deferral must be counted, or a loop that ends in real loss \
+             past the subscription's retention is invisible"
+        );
     }
 }

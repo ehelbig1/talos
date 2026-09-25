@@ -13,6 +13,12 @@
 //!   from the state token set at authorize time.
 //! * **Replay** — the consume MUST be atomic single-use (`UPDATE … used=true …
 //!   WHERE used=false … RETURNING`), or a captured `code`+`state` replays.
+//! * **Consent-completion CSRF** (2026-09-25) — the state proves which Talos
+//!   user STARTED the flow, not which browser FINISHED it. An attacker who hands
+//!   a victim an authorize URL minted under the attacker's own account would
+//!   otherwise receive the victim's provider credential. The state row stores
+//!   the hash of a per-browser cookie ([`BrowserBinding`]) and the consume
+//!   REQUIRES the callback to present it — see `connect_binding.rs`.
 //!
 //! Centralizing them here means a NEW integration gets the CSRF/PKCE/replay/
 //! tenancy handling correct by construction — it supplies its provider config
@@ -27,6 +33,7 @@ use oauth2::{
 };
 use uuid::Uuid;
 
+use crate::connect_binding::{check_connect_binding, BindingCheck, BrowserBinding};
 use crate::validate_oauth_state_token_format;
 
 /// Provider inputs for [`begin_oauth_authorization`]. All borrowed — the caller
@@ -49,14 +56,34 @@ pub struct AuthorizeRequest<'a> {
 }
 
 /// Build the PKCE + CSRF authorize URL and persist a single-use state token
-/// bound to `user_id`. Returns `(auth_url, state)`.
+/// bound to `user_id` AND to the initiating browser (`binding`). Returns
+/// `(auth_url, state)`.
 ///
 /// The `state` binding to `user_id` is the tenancy anchor — [`consume_oauth_state`]
-/// recovers `user_id` from it on the callback, never from a session cookie.
+/// recovers `user_id` from it on the callback, never from a session cookie. The
+/// browser binding is what stops that anchor being handed to someone else: the
+/// caller MUST set `binding`'s cookie on the response that carries the URL
+/// ([`BrowserBinding::set_cookie_pair`]).
 pub async fn begin_oauth_authorization(
     pool: &sqlx::PgPool,
     req: &AuthorizeRequest<'_>,
     user_id: Uuid,
+    binding: &BrowserBinding,
+) -> Result<(String, String)> {
+    begin_oauth_authorization_with_subject(pool, req, user_id, binding, None).await
+}
+
+/// [`begin_oauth_authorization`] plus a flow-specific `subject` stored on the
+/// state row and handed back by the consume as
+/// [`ConsumedOAuthState::bound_subject`]. The GitHub App flow uses it to carry
+/// the installation id a pending claim names across its second hop: stored
+/// server-side, so the callback cannot substitute one.
+pub async fn begin_oauth_authorization_with_subject(
+    pool: &sqlx::PgPool,
+    req: &AuthorizeRequest<'_>,
+    user_id: Uuid,
+    binding: &BrowserBinding,
+    subject: Option<&str>,
 ) -> Result<(String, String)> {
     // oauth2 5.x replaced the 4-arg `BasicClient::new` with a type-state builder:
     // `new(ClientId)` then one setter per endpoint. Same inputs, same validation
@@ -82,20 +109,62 @@ pub async fn begin_oauth_authorization(
     let (auth_url, csrf_token) = auth.set_pkce_challenge(pkce_challenge).url();
 
     let state_secret = csrf_token.secret().to_string();
-
-    sqlx::query(
-        "INSERT INTO oauth_state_tokens (state_token, provider, pkce_verifier, user_id) \
-         VALUES ($1, $2, $3, $4)",
+    insert_state_row(
+        pool,
+        req.provider,
+        &state_secret,
+        Some(pkce_verifier.secret()),
+        user_id,
+        binding,
+        subject,
     )
-    .bind(&state_secret)
-    .bind(req.provider)
-    .bind(pkce_verifier.secret())
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .with_context(|| format!("Failed to store {} OAuth state token", req.provider))?;
+    .await?;
 
     Ok((auth_url.to_string(), state_secret))
+}
+
+/// Persist a single-use state token bound to `user_id` and `binding` for a flow
+/// that is NOT an OAuth authorize redirect (the GitHub App install URL carries
+/// a `state` but no PKCE). Returns the state. Consumed by the same
+/// [`consume_oauth_state`], so the format gate, single-use and browser binding
+/// are one implementation.
+pub async fn issue_bound_state(
+    pool: &sqlx::PgPool,
+    provider: &str,
+    user_id: Uuid,
+    binding: &BrowserBinding,
+) -> Result<String> {
+    // Same shape as the binding nonce: two v4 UUIDs, hex — passes the format
+    // gate and is URL-safe without encoding.
+    let state = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    insert_state_row(pool, provider, &state, None, user_id, binding, None).await?;
+    Ok(state)
+}
+
+async fn insert_state_row(
+    pool: &sqlx::PgPool,
+    provider: &str,
+    state: &str,
+    pkce_verifier: Option<&str>,
+    user_id: Uuid,
+    binding: &BrowserBinding,
+    subject: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO oauth_state_tokens \
+             (state_token, provider, pkce_verifier, user_id, session_binding_hash, bound_subject) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(state)
+    .bind(provider)
+    .bind(pkce_verifier)
+    .bind(user_id)
+    .bind(binding.hash())
+    .bind(subject)
+    .execute(pool)
+    .await
+    .with_context(|| format!("Failed to store {provider} OAuth state token"))?;
+    Ok(())
 }
 
 /// The state recovered from a validated, single-use-consumed callback.
@@ -107,6 +176,9 @@ pub struct ConsumedOAuthState {
     /// PKCE `code_verifier` to include in the provider's token exchange, if PKCE
     /// was used (it always is for flows started via [`begin_oauth_authorization`]).
     pub pkce_verifier: Option<String>,
+    /// The flow-specific subject stored at issue time
+    /// ([`begin_oauth_authorization_with_subject`]); `None` for every other flow.
+    pub bound_subject: Option<String>,
 }
 
 /// Peek the `provider` bound to a live (unused, unexpired) state token WITHOUT
@@ -143,13 +215,20 @@ pub async fn peek_state_provider(pool: &sqlx::PgPool, state: &str) -> Result<Opt
 /// Validate + atomically single-use-consume the callback `state` for `provider`,
 /// returning the bound `user_id` + PKCE verifier.
 ///
+/// `presented_binding` is the connect-binding cookie the CALLBACK request
+/// carried ([`crate::presented_connect_binding`]). The row's stored binding
+/// hash must match it: a state started in a different browser — or a row with
+/// no binding at all — is refused. The row is consumed FIRST, so a refused
+/// binding still burns the state and an attacker gets no retry against it.
+///
 /// Fails closed with a generic CSRF-safe error on an invalid, expired, replayed,
-/// or wrong-provider state — a new integration MUST call this rather than
-/// re-implement the consume, so the CSRF/replay/tenancy guarantees can't drift.
+/// wrong-provider or wrong-browser state — a new integration MUST call this
+/// rather than re-implement the consume, so the guarantees can't drift.
 pub async fn consume_oauth_state(
     pool: &sqlx::PgPool,
     provider: &str,
     state: &str,
+    presented_binding: Option<&str>,
 ) -> Result<ConsumedOAuthState> {
     // Format-gate before the DB touch (MCP-1171): `$1` binding already isolates
     // injection, but this closes the store/validate asymmetry + a multi-KB-state
@@ -159,10 +238,20 @@ pub async fn consume_oauth_state(
     // Atomic single-use consume: only an unused, unexpired token for THIS
     // provider flips to `used` and returns its bound pkce_verifier + user_id. A
     // replayed or foreign state matches zero rows.
-    let row = sqlx::query_as::<_, (Uuid, Option<String>, Option<Uuid>)>(
+    #[allow(clippy::type_complexity)]
+    let row = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Option<String>,
+            Option<Uuid>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
         "UPDATE oauth_state_tokens SET used = true \
          WHERE state_token = $1 AND provider = $2 AND used = false AND expires_at > NOW() \
-         RETURNING id, pkce_verifier, user_id",
+         RETURNING id, pkce_verifier, user_id, session_binding_hash, bound_subject",
     )
     .bind(state)
     .bind(provider)
@@ -170,9 +259,10 @@ pub async fn consume_oauth_state(
     .await
     .with_context(|| format!("Failed to validate {provider} OAuth state token"))?;
 
-    let (state_id, pkce_verifier, user_id_opt) = row.ok_or_else(|| {
-        anyhow!("Invalid or expired OAuth state token. This may indicate a CSRF attack.")
-    })?;
+    let (state_id, pkce_verifier, user_id_opt, stored_binding_hash, bound_subject) = row
+        .ok_or_else(|| {
+            anyhow!("Invalid or expired OAuth state token. This may indicate a CSRF attack.")
+        })?;
 
     // Best-effort PKCE scrub post-consume (MCP-1096): the verifier is already in
     // memory for the exchange; if this fails the 10-min TTL sweep gets it. Guards
@@ -190,6 +280,22 @@ pub async fn consume_oauth_state(
         );
     }
 
+    // Browser binding — AFTER the consume, so a refusal still burns the state.
+    let check = check_connect_binding(stored_binding_hash.as_deref(), presented_binding);
+    if check != BindingCheck::Matches {
+        // Never log either value — only which rule refused.
+        tracing::warn!(
+            target: "talos_audit",
+            event_kind = "oauth_connect_binding_refused",
+            provider,
+            reason = check.as_str(),
+            "OAuth connect callback refused: the state was not started by this browser"
+        );
+        return Err(anyhow!(
+            "Invalid or expired OAuth state token. This may indicate a CSRF attack."
+        ));
+    }
+
     let user_id = user_id_opt.ok_or_else(|| {
         anyhow!("State token missing user_id — cannot identify the initiating user")
     })?;
@@ -197,5 +303,6 @@ pub async fn consume_oauth_state(
     Ok(ConsumedOAuthState {
         user_id,
         pkce_verifier,
+        bound_subject,
     })
 }

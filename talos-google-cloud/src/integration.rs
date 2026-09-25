@@ -316,8 +316,12 @@ impl GoogleCloudIntegrationService {
     /// Generate the OAuth authorization URL for connecting a GCP account.
     /// Stores `user_id` in the state token so the callback can identify the
     /// user without session auth.
-    pub async fn get_authorization_url(&self, user_id: Uuid) -> Result<(String, String)> {
-        talos_oauth::authorization_url(&self.db_pool, self, user_id).await
+    pub async fn get_authorization_url(
+        &self,
+        user_id: Uuid,
+        binding: &talos_oauth::BrowserBinding,
+    ) -> Result<(String, String)> {
+        talos_oauth::authorization_url(&self.db_pool, self, user_id, binding).await
     }
 
     /// Handle the OAuth callback and store the integration. `user_id` is
@@ -326,8 +330,10 @@ impl GoogleCloudIntegrationService {
         &self,
         code: String,
         state: String,
+        presented_binding: Option<&str>,
     ) -> Result<GoogleCloudIntegration> {
-        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
+        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state, presented_binding)
+            .await
     }
 }
 

@@ -26,5 +26,11 @@ talos-capability-world = { path = "../talos-capability-world" }
 talos-compilation = { path = "../talos-compilation" }
 talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
 
+[features]
+# `CompiledInline::prebuilt_for_tests` — lets a DB test drive
+# `persist_compiled` (refusal at persist, the persisted grants) without a WASM
+# toolchain. Enabled only by `controller`'s dev-dependencies.
+test-support = []
+
 [lints]
 workspace = true

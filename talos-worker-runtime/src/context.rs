@@ -100,8 +100,13 @@ pub struct TalosContext {
     /// WASI state (file descriptors, env vars, etc.)
     wasi: WasiCtx,
     /// Resource table needed for the component model.
-    table: ResourceTable,
+    pub(crate) table: ResourceTable,
     http_ctx: wasmtime_wasi_http::WasiHttpCtx,
+    /// The `wasi:http` send path: the execution's hardened client (SSRF
+    /// resolver, local-only egress, no proxy, no redirects) — never upstream's
+    /// raw connect. Reachable only from the trusted world, whose
+    /// `outgoing-handler` is the gated one (`host::wasi_http`).
+    wasi_http_hooks: crate::host::wasi_http::HardenedWasiHttpHooks,
 
     /// Allowed outbound hosts for the `http::fetch` host function.
     /// An empty list means "deny all" (safe default; use `["*"]` to allow any host).
@@ -1489,11 +1494,16 @@ impl TalosContext {
         // Gmail while its LLM stays on-host. Fail-closed: an unset scope on a
         // Tier1 actor stays air-gapped exactly as before (byte-identical).
         let http_client = build_per_execution_http_client(&allowed_hosts, local_egress_only);
+        // The `wasi:http` send path shares THIS client, so a raw `wasi:http`
+        // request is filtered at connect exactly like `talos:core/http`.
+        let wasi_http_hooks =
+            crate::host::wasi_http::HardenedWasiHttpHooks::new(http_client.clone());
 
         Ok(Self {
             wasi,
             table,
             http_ctx,
+            wasi_http_hooks,
             allowed_hosts,
             allowed_methods,
             allowed_sql_operations: vec![],
@@ -1802,18 +1812,17 @@ impl wasmtime_wasi_http::p2::WasiHttpView for TalosContext {
         wasmtime_wasi_http::p2::WasiHttpCtxView {
             ctx: &mut self.http_ctx,
             table: &mut self.table,
-            // SECURITY (H2): default_hooks() is the UNFILTERED built-in
-            // send_request (raw hyper/tokio, no SSRF/allowlist/tier-1 gate). It
-            // is only ever reachable from a world that links
-            // wasi:http/outgoing-handler, and as of the 2026-05-28 review that
-            // is EXCLUSIVELY the trusted/automation linker (build_trusted_linker)
-            // — non-trusted worlds (minimal/network/governance/secrets/cache/…)
-            // register wasi:http/types ONLY via add_wasi_http_types_only, so the
-            // handler is unavailable there (a component importing it fails to
-            // link). Talos WASM nodes use talos:core/http for controlled HTTP
-            // (host allowlist, rate limits, SSRF protection); trusted modules are
-            // operator-authored and allowed unrestricted egress by design.
-            hooks: wasmtime_wasi_http::p2::default_hooks(),
+            // SECURITY: never `default_hooks()`. Upstream's default
+            // `send_request` connects with raw hyper/tokio on a name it
+            // resolves itself — no SSRF filter on the resolved address, no
+            // local-only egress. Until 2026-09-25 that was exactly what the
+            // trusted/automation world got, behind an UNGATED outgoing-handler.
+            // Now the handler is `host::wasi_http::GatedOutgoing` (the
+            // `talos:core/http` gate set, applied before this is reached) and
+            // the send is the execution's hardened client. Every other world
+            // links `wasi:http/types` only, so this send path is unreachable
+            // there (a component importing the handler fails to link).
+            hooks: &mut self.wasi_http_hooks,
         }
     }
 }
@@ -2157,54 +2166,138 @@ impl TalosContext {
             ledger.append("worker", action, payload)
         };
 
-        if let Some(n) = &self.nats_client {
-            let nats = n.clone();
-            // MCP-735 (2026-05-13): log NATS publish failures on the
-            // audit-ledger replication path. Local `ledger.append`
-            // above is the WORM source-of-truth (file-level
-            // append-only), so a publish failure doesn't lose the
-            // event — but SIEM/dashboard consumers watching the NATS
-            // stream would silently see zero capability-deny events
-            // during a NATS outage and conclude (incorrectly) that no
-            // probes are happening. Same operational-visibility class
-            // as MCP-733 (state-write SQL) and MCP-734 (state-write-
-            // through publish) — fire-and-forget for the guest, but
-            // operators need WARN-level visibility on systemic
-            // failures.
-            let label = label.to_string();
-            let event = event.clone();
-            tokio::spawn(async move {
-                let hash = event.calculate_hash();
-                let msg = serde_json::json!({
-                    "event": event,
-                    "hash": hash,
+        replicate_audit_event(self.nats_client.clone(), event.clone(), label.to_string());
+        Some(event)
+    }
+
+    /// [`Self::record_capability_denied_detailed`] for a SYNCHRONOUS host
+    /// function — the gated `wasi:http` handler (`host::wasi_http`), whose
+    /// upstream trait is sync.
+    ///
+    /// Same guest diagnostic, same ledger payload, same cap. The ledger is a
+    /// `tokio::sync::Mutex`; it is taken with `try_lock`, which succeeds unless
+    /// another task holds it at this instant — and during a guest's own host
+    /// call nothing else does (appends hold it only for the synchronous
+    /// `append`). Appending HERE, inside the host call, is what keeps the
+    /// event ahead of the execution's terminal anchor; a spawned append could
+    /// land after it and read as tampering. If the lock IS contended the
+    /// append is spawned instead and a WARN says ordering is not guaranteed
+    /// for that event.
+    pub(crate) fn record_capability_denied_now(
+        &mut self,
+        capability: &str,
+        policy: &str,
+        target: &str,
+        detail: Option<&'static str>,
+    ) {
+        let base = format!("{capability} denied by policy '{policy}' (target: {target})");
+        let line = match detail {
+            Some(d) => format!("{base} — {d}"),
+            None => base,
+        };
+        self.emit_host_diagnostic_now(policy, &line);
+        if self.audit_ledger.is_none() {
+            return;
+        }
+        let n = self
+            .denial_ledger_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (action, payload) = if n < Self::DENIAL_LEDGER_CAP {
+            (
+                "wasi:capability_denied",
+                serde_json::json!({
+                    "capability": capability,
+                    "policy": policy,
+                    "target": target,
+                    "actor_id": self.actor_id.map(|u| u.to_string()),
+                    "module_id": self.module_id.as_deref(),
+                })
+                .to_string(),
+            )
+        } else if n == Self::DENIAL_LEDGER_CAP {
+            (
+                "wasi:capability_denied_suppressed",
+                serde_json::json!({
+                    "suppressed_after": Self::DENIAL_LEDGER_CAP,
+                    "last_capability": capability,
+                    "last_policy": policy,
+                    "actor_id": self.actor_id.map(|u| u.to_string()),
+                    "module_id": self.module_id.as_deref(),
+                })
+                .to_string(),
+            )
+        } else {
+            return;
+        };
+        let Some(ledger_mutex) = self.audit_ledger.clone() else {
+            return;
+        };
+        let appended = ledger_mutex
+            .try_lock()
+            .map(|mut ledger| ledger.append("worker", action, &payload));
+        let event = match appended {
+            Ok(event) => event,
+            Err(_) => {
+                tracing::warn!(
+                    capability,
+                    policy,
+                    "audit ledger contended during a synchronous denial — appending from a \
+                     spawned task; this event's order relative to the terminal anchor is \
+                     not guaranteed"
+                );
+                let action = action.to_string();
+                let nats = self.nats_client.clone();
+                let label = capability.to_string();
+                tokio::spawn(async move {
+                    let event = ledger_mutex
+                        .lock()
+                        .await
+                        .append("worker", &action, &payload);
+                    replicate_audit_event(nats, event, label);
                 });
-                match serde_json::to_vec(&msg) {
-                    Ok(bytes) => {
-                        if let Err(e) = nats
-                            .publish(
-                                talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
-                                bytes.into(),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                target: "talos_rpc",
-                                event = %label,
-                                error = %e,
-                                "audit-ledger NATS replication failed — local ledger unaffected, SIEM stream will miss this event"
-                            );
-                        }
-                    }
-                    Err(e) => tracing::error!(
-                        event = %label,
-                        error = %e,
-                        "Failed to serialize audit event"
-                    ),
+                return;
+            }
+        };
+        replicate_audit_event(self.nats_client.clone(), event, capability.to_string());
+    }
+
+    /// [`Self::emit_host_diagnostic`] for a synchronous host function: the
+    /// in-process sink is written in place, the NATS publish is spawned
+    /// (it was fire-and-forget already). Shares `HOST_DIAG_CAP`.
+    pub(crate) fn emit_host_diagnostic_now(&mut self, reason: &str, message: &str) {
+        let count = self
+            .host_diag_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= Self::HOST_DIAG_CAP {
+            return;
+        }
+        if let Some(ref sink) = self.host_diag_sink {
+            if let Ok(mut lines) = sink.lock() {
+                if (lines.len() as u64) < Self::HOST_DIAG_CAP {
+                    lines.push(format_host_diagnostic_line(reason, message));
+                }
+            }
+        }
+        let Some(nats) = self.nats_client.clone() else {
+            return;
+        };
+        let Some(execution_id) = self.execution_id.as_deref().filter(|e| !e.is_empty()) else {
+            return;
+        };
+        let log_entry = build_host_diagnostic_entry(
+            execution_id,
+            self.request_id.as_deref().unwrap_or_default(),
+            reason,
+            message,
+        );
+        if let Ok(payload) = serde_json::to_vec(&log_entry) {
+            let topic = format!("wasm.log.{execution_id}");
+            tokio::spawn(async move {
+                if let Err(e) = nats.publish(topic, payload.into()).await {
+                    tracing::debug!(error = %e, "host diagnostic publish failed");
                 }
             });
         }
-        Some(event)
     }
 
     /// Record that a resolved CREDENTIAL is about to leave the host (package
@@ -2974,6 +3067,55 @@ mod per_host_rate_limit_tests {
 /// in-process [`HostDiagSink`] — so an operator reading a persisted log line
 /// and a developer reading `run_sandbox` output see the same text for the
 /// same event.
+/// Replicate one appended audit event to the WORM stream
+/// (`talos.audit.ledger`). Fire-and-forget; one home for the async and the
+/// synchronous recorders.
+///
+/// MCP-735 (2026-05-13): NATS publish failures are LOGGED. The local
+/// `ledger.append` is the source of truth, so a failed publish loses nothing
+/// — but SIEM/dashboard consumers watching the stream would silently see zero
+/// capability-deny events during a NATS outage and conclude no probes are
+/// happening, so operators need WARN-level visibility on systemic failures.
+fn replicate_audit_event(
+    nats: Option<Arc<async_nats::Client>>,
+    event: crate::audit::AuditEvent,
+    label: String,
+) {
+    let Some(nats) = nats else {
+        return;
+    };
+    tokio::spawn(async move {
+        let hash = event.calculate_hash();
+        let msg = serde_json::json!({
+            "event": event,
+            "hash": hash,
+        });
+        match serde_json::to_vec(&msg) {
+            Ok(bytes) => {
+                if let Err(e) = nats
+                    .publish(
+                        talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
+                        bytes.into(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "talos_rpc",
+                        event = %label,
+                        error = %e,
+                        "audit-ledger NATS replication failed — local ledger unaffected, SIEM stream will miss this event"
+                    );
+                }
+            }
+            Err(e) => tracing::error!(
+                event = %label,
+                error = %e,
+                "Failed to serialize audit event"
+            ),
+        }
+    });
+}
+
 pub(crate) fn format_host_diagnostic_line(reason: &str, message: &str) -> String {
     format!("[host:{reason}] {message}")
 }
