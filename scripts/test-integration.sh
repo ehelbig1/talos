@@ -428,6 +428,12 @@ CTRL_TESTS=(
     # execution is reported born `cancelled`, which the engine refuses to
     # dispatch (2026-09-25).
     "execution_cancel_engine_stop_tests"
+    # `enqueue_workflow` dispatches only rows its queued->running claim won (a
+    # row cancelled while it waited was run anyway) and runs them as the
+    # gate-resolved actor (an enqueue naming no actor skipped the ceiling and
+    # ran unbound) — 2026-09-25. `common` (DATABASE_URL) harness; uses NATS when
+    # TALOS_TEST_NATS_URL is set, so CTRL_TESTS and not TC_TESTS (64b).
+    "enqueue_drain_tests"
     # Privileged operations (key material, credential minting, capability
     # grants, audit settings, ownership transfer) require a VERIFIED second
     # factor: the gate matrix through the real schema, login/refresh flags, and

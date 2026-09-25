@@ -2196,6 +2196,7 @@ impl ExecutionRepository {
     }
 
     /// Transition queued → running for enqueue dispatch. Returns true if updated.
+    #[must_use = "the bool says whether THIS caller won the guarded status transition; acting on `Ok(false)` acts on a row another writer owns"]
     pub async fn mark_execution_running_from_queued(&self, exec_id: Uuid) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE workflow_executions SET status = 'running', started_at = NOW() \
@@ -2452,6 +2453,7 @@ impl ExecutionRepository {
     /// dispatch). `'pending'` kept in the predicate for pre-constraint
     /// legacy rows even though new writes can't produce it
     /// (workflow_executions_status_check).
+    #[must_use = "the bool says whether THIS caller won the guarded status transition; acting on `Ok(false)` acts on a row another writer owns"]
     pub async fn mark_execution_cancelled(&self, exec_id: Uuid, user_id: Uuid) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE workflow_executions \

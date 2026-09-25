@@ -40,7 +40,17 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
 - The ensemble `majority_vote` key is cut on a UTF-8 character
   boundary. A multi-byte character straddling byte 8192 of a
   candidate's serialized output panicked the engine task.
-
+- A `loop` node's body now passes the same pre-dispatch gates as a
+  single-node dispatch (2026-09-25). `run_loop_iterations` hand-built its
+  `DispatchJob` and skipped the capability-world ceiling, the
+  `requires_approval_for` approval gate, the per-module rate limit, and the
+  method-aware retry budget (it sent a literal `max_retries: 2`). The
+  ceiling, approval and retry decisions now come from one method,
+  `clear_module_dispatch`, shared with `run_single_node_dispatch`;
+  `check_rate_limit` runs once per body iteration. Two new
+  `termination_reason` values: `"dispatch_refused"` (ceiling or approval;
+  `iterations` counts only dispatched iterations) and `"rate_limited"`.
+  Both lift `__error` like the others. Pinned by `tests/loop_body_gates.rs`.
 - Loop bodies and pipeline steps no longer force a worker-side Redis
   fetch under the non-scoped `wasm:{module_id}` key. When the fetched
   `WasmModuleArtifact` already carries inline bytes, the loop

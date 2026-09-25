@@ -2797,6 +2797,139 @@ async fn handle_resume_executions(
     }
 }
 
+/// What the enqueue drain may do with ONE admitted row, decided by its
+/// `queued → running` claim.
+///
+/// The claim is an UPDATE guarded by `status = 'queued'`, so its `bool` is the
+/// answer to "does THIS drain own the run?" — and until 2026-09-25 the drain
+/// logged the `Err` and discarded the `bool`, dispatching whatever came back. A
+/// row the operator cancelled while it waited (`cancel_queued_executions`,
+/// `cancel_execution`) was run anyway, and the completion writer then declined
+/// to finalize it because it was not `running`: the work happened and the row
+/// still said `cancelled`.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueClaim {
+    /// This drain moved the row `queued → running` and owns the run: dispatch.
+    Claimed,
+    /// The row was no longer `queued` — cancelled while it waited, or claimed
+    /// by another writer. Do NOT dispatch.
+    NotQueued,
+    /// The claim could not be read. Fail CLOSED: do not dispatch a run nobody
+    /// can prove this drain owns.
+    Unreadable,
+}
+
+impl EnqueueClaim {
+    /// The pure decision over the claim's result.
+    pub fn from_claim(claim: &anyhow::Result<bool>) -> Self {
+        match claim {
+            Ok(true) => Self::Claimed,
+            Ok(false) => Self::NotQueued,
+            Err(_) => Self::Unreadable,
+        }
+    }
+}
+
+/// Run the `queued → running` claim for one row, classify it, and report it.
+///
+/// On `Unreadable` the row is finalized `failed` through the guarded finalizer
+/// (it leaves a `cancelled` / `completed` row alone), so a claim that failed
+/// AFTER committing does not strand a `running` row nobody is running. If that
+/// write fails too, the row keeps its status for the stale sweeps.
+pub async fn claim_enqueued_execution(
+    repo: &talos_execution_repository::ExecutionRepository,
+    exec_id: uuid::Uuid,
+) -> EnqueueClaim {
+    let result = repo.mark_execution_running_from_queued(exec_id).await;
+    let claim = EnqueueClaim::from_claim(&result);
+    match claim {
+        EnqueueClaim::Claimed => {}
+        EnqueueClaim::NotQueued => tracing::info!(
+            execution_id = %exec_id,
+            "enqueue_workflow: row is no longer queued (cancelled while it waited, or \
+             claimed elsewhere) — not dispatched"
+        ),
+        EnqueueClaim::Unreadable => {
+            tracing::error!(
+                target: "talos_audit",
+                execution_id = %exec_id,
+                error = ?result.err(),
+                "enqueue_workflow: queued→running claim failed — NOT dispatched (fail closed)"
+            );
+            if let Err(e) = repo
+                .fail_execution_unless_terminal(
+                    exec_id,
+                    "enqueue_workflow could not claim this queued execution (database error), \
+                     so it was not dispatched. Enqueue it again.",
+                    true,
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: "talos_audit",
+                    execution_id = %exec_id,
+                    error = %e,
+                    "enqueue_workflow: could not finalize an unclaimable row; it keeps its \
+                     status for the stale-execution sweeps"
+                );
+            }
+        }
+    }
+    claim
+}
+
+/// What one enqueue drain did, for its completion log line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EnqueueDrainSummary {
+    /// Rows this drain claimed and ran.
+    pub dispatched: usize,
+    /// Rows no longer `queued` when their turn came.
+    pub skipped_not_queued: usize,
+    /// Rows whose claim could not be read (not run).
+    pub refused_unreadable: usize,
+}
+
+/// The `enqueue_workflow` drain: claim each admitted row in order and run ONLY
+/// the rows this drain claimed, pacing claimed runs `delay` apart.
+///
+/// Extracted from the handler's spawned task with the run as a parameter, so a
+/// test can drive the REAL claim-and-decide sequence against a real database
+/// and observe which rows would have been dispatched — the call-site decision
+/// the pure [`EnqueueClaim::from_claim`] cannot see on its own.
+///
+/// The delay falls BEFORE the next claim, not before the next run, so a cancel
+/// that lands while the drain is pacing still takes effect; a skipped row adds
+/// no delay of its own, since nothing was dispatched.
+pub async fn drain_enqueued_batch<F, Fut>(
+    repo: &talos_execution_repository::ExecutionRepository,
+    items: Vec<(serde_json::Value, uuid::Uuid)>,
+    delay: std::time::Duration,
+    mut run_one: F,
+) -> EnqueueDrainSummary
+where
+    F: FnMut(serde_json::Value, uuid::Uuid) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut summary = EnqueueDrainSummary::default();
+    let mut pace_next = false;
+    for (input, exec_id) in items {
+        if std::mem::take(&mut pace_next) {
+            tokio::time::sleep(delay).await;
+        }
+        match claim_enqueued_execution(repo, exec_id).await {
+            EnqueueClaim::Claimed => {
+                summary.dispatched += 1;
+                run_one(input, exec_id).await;
+                pace_next = true;
+            }
+            EnqueueClaim::NotQueued => summary.skipped_not_queued += 1,
+            EnqueueClaim::Unreadable => summary.refused_unreadable += 1,
+        }
+    }
+    summary
+}
+
 async fn handle_enqueue_workflow(
     req_id: Option<serde_json::Value>,
     args: &Value,
@@ -2971,11 +3104,6 @@ async fn handle_enqueue_workflow(
         }
     };
 
-    let nats = match &state.nats_client {
-        Some(nc) => nc.clone(),
-        None => return mcp_error(req_id, -32000, "NATS client not available"),
-    };
-
     // Actor ownership + status + capability-ceiling enforcement via the
     // canonical full gate. MCP-728 (2026-05-13): upgrade from manual
     // archived/terminated/suspended + `check_execution_allowed_for_batch`
@@ -2994,18 +3122,33 @@ async fn handle_enqueue_workflow(
     // budget (MCP-566) — the full gate's budget check is implicitly
     // batch_size=1 which is insufficient for bulk enqueue. Both
     // checks are intentional: ceiling + batch-aware budget.
+    //
+    // 2026-09-25: the gate ran ONLY when the caller passed `actor_id`, and
+    // the drain below built its engine with NO actor at all. So a workflow
+    // bound to a `readonly` / `minimal-node` actor, enqueued without naming
+    // one, skipped the ceiling here, got no in-transaction budget check at
+    // admission (the batch helper only checks a `Some` actor), was stamped
+    // with the user's Default actor by the row trigger, and ran UNBOUND —
+    // `Write` ceiling, no capability-world ceiling. Now the actor is resolved
+    // ONCE, above everything that writes, the way `trigger_workflow` and
+    // `bulk_trigger_workflow` resolve it: the caller's `actor_id`, else the
+    // workflow's own bound actor, else (inside the gate) the user's default —
+    // and that ONE value is what the gate checks, what the rows are stamped
+    // with and what every engine in the drain is bound to.
     let enqueue_agent_id: Option<uuid::Uuid> = crate::utils::parse_optional_actor_id(args);
-    if let Some(agent_id) = enqueue_agent_id {
-        if let Err(e) = talos_workflow_authorization::authorize_workflow_trigger(
-            &state.workflow_repo,
-            &state.actor_repo,
-            &state.db_pool,
-            Some(agent_id),
-            user_id,
-            &graph_json,
-        )
-        .await
-        {
+    let trigger_actor = enqueue_agent_id.or(wf_record.actor_id);
+    let effective_actor = match talos_workflow_authorization::resolve_effective_actor(
+        &state.workflow_repo,
+        &state.actor_repo,
+        &state.db_pool,
+        trigger_actor,
+        user_id,
+        &graph_json,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
             use talos_workflow_authorization::TriggerAuthError;
             let msg = match e {
                 TriggerAuthError::ActorArchived => {
@@ -3029,7 +3172,7 @@ async fn handle_enqueue_workflow(
                     ..
                 } => {
                     tracing::warn!(
-                        actor_id = %agent_id,
+                        trigger_actor = ?trigger_actor,
                         workflow_id = %wf_id,
                         module_id = %module_id,
                         module_world = %module_world,
@@ -3044,7 +3187,7 @@ async fn handle_enqueue_workflow(
                 }
                 TriggerAuthError::Database(db_err) => {
                     tracing::error!(
-                        actor_id = %agent_id,
+                        trigger_actor = ?trigger_actor,
                         workflow_id = %wf_id,
                         error = %db_err,
                         "enqueue_workflow: authorization DB error"
@@ -3054,21 +3197,24 @@ async fn handle_enqueue_workflow(
             };
             return mcp_error(req_id, -32000, &msg);
         }
+    };
 
-        // MCP-566: batch-aware budget gate. Pre-fix the per-batch check
-        // used `check_execution_allowed` (batch_size=1 semantics), so an
-        // actor with `max_executions_per_hour = N` could be enqueued with
-        // a batch of size > N as long as the current hourly count was
-        // below N. Now passes `inputs.len()` so the gate refuses any
-        // batch that would push the count past the cap. Reject-whole
-        // semantics — the workflow-level concurrency cap already does
-        // partial admission via `create_executions_batch_under_concurrency_limit`;
-        // having TWO partial-admit caps stacked would make the response
-        // shape ambiguous.
-        //
-        // This check stacks WITH the full gate above: the full gate's
-        // implicit batch_size=1 budget check passes for an actor with
-        // 1 unit of remaining quota, but the batch may need N > 1.
+    // MCP-566: batch-aware budget gate. Pre-fix the per-batch check
+    // used `check_execution_allowed` (batch_size=1 semantics), so an
+    // actor with `max_executions_per_hour = N` could be enqueued with
+    // a batch of size > N as long as the current hourly count was
+    // below N. Now passes `inputs.len()` so the gate refuses any
+    // batch that would push the count past the cap. Reject-whole
+    // semantics — the workflow-level concurrency cap already does
+    // partial admission via `create_executions_batch_under_concurrency_limit`;
+    // having TWO partial-admit caps stacked would make the response
+    // shape ambiguous.
+    //
+    // This check stacks WITH the full gate above: the full gate's
+    // implicit batch_size=1 budget check passes for an actor with
+    // 1 unit of remaining quota, but the batch may need N > 1. It now
+    // runs for the RESOLVED actor, not only a caller-named one.
+    if let Some(agent_id) = effective_actor {
         let batch_size = inputs.len() as i64;
         if let Err(msg) =
             crate::actor::check_execution_allowed_for_batch(&state.db_pool, agent_id, batch_size)
@@ -3077,6 +3223,13 @@ async fn handle_enqueue_workflow(
             return mcp_error(req_id, -32000, &msg);
         }
     }
+
+    // Below the gate on purpose: a policy refusal does not depend on NATS
+    // being up, and nothing above this line writes a row.
+    let nats = match &state.nats_client {
+        Some(nc) => nc.clone(),
+        None => return mcp_error(req_id, -32000, "NATS client not available"),
+    };
 
     // Create execution records upfront with 'queued' status. The
     // cap-aware admission helper enforces `max_concurrent_executions`
@@ -3105,7 +3258,9 @@ async fn handle_enqueue_workflow(
             wf_id,
             user_id,
             version_id,
-            enqueue_agent_id,
+            // The resolved actor — the same value the drain binds each engine
+            // to, and the one the in-transaction budget check needs `Some` of.
+            effective_actor,
         )
         .await
     {
@@ -3265,8 +3420,9 @@ async fn handle_enqueue_workflow(
     let registry = state.registry.clone();
     let secrets_manager = state.secrets_manager.clone();
     let actor_repo = state.actor_repo.clone();
-    let delay_ms = (1000.0 / rate_per_second) as u64;
+    let delay = std::time::Duration::from_millis((1000.0 / rate_per_second) as u64);
     let queued_count = exec_ids.len();
+    let wf_actor_id = wf_record.actor_id;
 
     tokio::spawn(async move {
         // Pair input with its execution_id structurally — pre-batch this
@@ -3275,126 +3431,140 @@ async fn handle_enqueue_workflow(
         // the suffix when the per-row insert loop hit any failure. The
         // batch INSERT guarantees `exec_ids.len() == inputs.len()` at
         // this point, so `zip` enforces the invariant in the type system.
-        for (idx, (input_payload, &exec_id)) in inputs.iter().zip(exec_ids.iter()).enumerate() {
-            // Update status to running
-            if let Err(e) = repo.mark_execution_running_from_queued(exec_id).await {
-                tracing::error!(execution_id = %exec_id, "Failed to update execution status: {}", e);
-            }
+        let items: Vec<(serde_json::Value, uuid::Uuid)> =
+            inputs.into_iter().zip(exec_ids).collect();
+        let summary = drain_enqueued_batch(&repo, items, delay, |input_payload, exec_id| {
+            let repo = repo.clone();
+            let registry = registry.clone();
+            let secrets_manager = secrets_manager.clone();
+            let actor_repo = actor_repo.clone();
+            let nats = nats.clone();
+            let graph_json = graph_json.clone();
+            async move {
+                // Canonical builder; TimeoutPolicy::Honor (engine reads timeout
+                // from graph during load — pre-load extraction was redundant).
+                let mut engine = match talos_engine::builder::for_workflow(
+                    registry,
+                    secrets_manager,
+                    actor_repo,
+                    user_id,
+                    // The gate-resolved actor, already stamped on this row;
+                    // the workflow's own actor stays as the fallback, as in
+                    // `bulk_trigger_workflow`. This was `for_run` with NO
+                    // actor: a workflow bound to a `readonly` actor ran at
+                    // `Write` with no capability-world ceiling.
+                    talos_engine::builder::EngineOpts::for_run(wf_id, graph_json)
+                        .with_effective_actor(effective_actor, wf_actor_id),
+                )
+                .await
+                {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // MCP-450: DLP-redact engine build error before
+                        // persistence. Same secret-leak class as MCP-447.
+                        let redacted = talos_dlp_provider::redact_str(&e.to_string());
+                        if let Err(e) = repo.mark_execution_failed(exec_id, &redacted, None).await
+                        {
+                            tracing::warn!(
+                                target: "talos_audit", execution_id = %exec_id,
+                                error = %e,
+                                "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                            );
+                        }
+                        return;
+                    }
+                };
 
-            // Canonical builder; TimeoutPolicy::Honor (engine reads timeout
-            // from graph during load — pre-load extraction was redundant).
-            let mut engine = match talos_engine::builder::for_workflow(
-                registry.clone(),
-                secrets_manager.clone(),
-                actor_repo.clone(),
-                user_id,
-                talos_engine::builder::EngineOpts::for_run(wf_id, graph_json.clone()),
-            )
-            .await
-            {
-                Ok(e) => e,
-                Err(e) => {
-                    // MCP-450: DLP-redact engine build error before
-                    // persistence. Same secret-leak class as MCP-447.
-                    let redacted = talos_dlp_provider::redact_str(&e.to_string());
-                    if let Err(e) = repo.mark_execution_failed(exec_id, &redacted, None).await {
-                        tracing::warn!(
-                            target: "talos_audit", execution_id = %exec_id,
-                            error = %e,
-                            "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                let worker_key = crate::utils::load_worker_shared_key_logged(file!());
+                match talos_engine::nats_run::run_with_trigger_input_via_nats(
+                    &mut engine,
+                    nats,
+                    worker_key,
+                    input_payload,
+                    exec_id,
+                )
+                .await
+                {
+                    Ok(ctx) => {
+                        let output_data = talos_dlp_provider::redact_json(
+                            &serde_json::to_value(&ctx.results).unwrap_or(serde_json::json!({})),
                         );
-                    }
-                    if idx + 1 < inputs.len() {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    }
-                    continue;
-                }
-            };
-
-            let worker_key = crate::utils::load_worker_shared_key_logged(file!());
-            match talos_engine::nats_run::run_with_trigger_input_via_nats(
-                &mut engine,
-                nats.clone(),
-                worker_key,
-                input_payload.clone(),
-                exec_id,
-            )
-            .await
-            {
-                Ok(ctx) => {
-                    let output_data = talos_dlp_provider::redact_json(
-                        &serde_json::to_value(&ctx.results).unwrap_or(serde_json::json!({})),
-                    );
-                    // PR #423 sibling: a wait/confidence-gate pause returns
-                    // `Ok(ctx)` with `ctx.waiting = true` — the execution is
-                    // NOT completed. Persist status='waiting' so the row
-                    // stays resumable for the later approval/resume signal.
-                    if ctx.waiting {
-                        if let Err(ue) = repo.mark_execution_waiting(exec_id, &output_data).await {
+                        // PR #423 sibling: a wait/confidence-gate pause returns
+                        // `Ok(ctx)` with `ctx.waiting = true` — the execution is
+                        // NOT completed. Persist status='waiting' so the row
+                        // stays resumable for the later approval/resume signal.
+                        if ctx.waiting {
+                            if let Err(ue) =
+                                repo.mark_execution_waiting(exec_id, &output_data).await
+                            {
+                                tracing::warn!(
+                                    target: "talos_audit",
+                                    execution_id = %exec_id,
+                                    workflow_id = %wf_id,
+                                    error = %ue,
+                                    "enqueue_workflow: mark_execution_waiting UPDATE failed — execution row may stay in 'running' state and the pending resume will have nothing to advance"
+                                );
+                            }
+                        }
+                        // MCP-802 (2026-05-14): log mark_execution_completed
+                        // failures. Pre-fix `let _ = ...await` discarded the
+                        // Result, so a transient DB UPDATE failure (pool
+                        // exhaustion, encryption error, network blip) left
+                        // the execution row stuck in 'running' forever even
+                        // though the engine completed successfully. Child
+                        // module_executions rows orphan; downstream
+                        // dependents that wait on a not-yet-terminal status
+                        // block indefinitely. Same operator-visibility class
+                        // as MCP-741 (continuation-trigger cleanup) and
+                        // MCP-776 (scheduler failure-marking). WARN with
+                        // `target: "talos_audit"` so dashboards can
+                        // correlate "stuck running" reports to DB health.
+                        else if let Err(ue) =
+                            repo.mark_execution_completed(exec_id, &output_data).await
+                        {
                             tracing::warn!(
                                 target: "talos_audit",
                                 execution_id = %exec_id,
                                 workflow_id = %wf_id,
                                 error = %ue,
-                                "enqueue_workflow: mark_execution_waiting UPDATE failed — execution row may stay in 'running' state and the pending resume will have nothing to advance"
+                                "enqueue_workflow: mark_execution_completed UPDATE failed — execution row may stay in 'running' state"
                             );
                         }
                     }
-                    // MCP-802 (2026-05-14): log mark_execution_completed
-                    // failures. Pre-fix `let _ = ...await` discarded the
-                    // Result, so a transient DB UPDATE failure (pool
-                    // exhaustion, encryption error, network blip) left
-                    // the execution row stuck in 'running' forever even
-                    // though the engine completed successfully. Child
-                    // module_executions rows orphan; downstream
-                    // dependents that wait on a not-yet-terminal status
-                    // block indefinitely. Same operator-visibility class
-                    // as MCP-741 (continuation-trigger cleanup) and
-                    // MCP-776 (scheduler failure-marking). WARN with
-                    // `target: "talos_audit"` so dashboards can
-                    // correlate "stuck running" reports to DB health.
-                    else if let Err(ue) =
-                        repo.mark_execution_completed(exec_id, &output_data).await
-                    {
-                        tracing::warn!(
-                            target: "talos_audit",
-                            execution_id = %exec_id,
-                            workflow_id = %wf_id,
-                            error = %ue,
-                            "enqueue_workflow: mark_execution_completed UPDATE failed — execution row may stay in 'running' state"
-                        );
-                    }
-                }
-                Err(e) => {
-                    // MCP-450: DLP-redact engine run error before
-                    // persistence. Mirrors the success-path
-                    // redact_json above.
-                    let redacted = talos_dlp_provider::redact_str(&e.to_string());
-                    // MCP-802 sibling: log mark_execution_failed UPDATE
-                    // failures. Higher operator stakes than the Ok arm
-                    // — the engine ALREADY failed, and if the
-                    // failure-marking UPDATE also fails the row sits in
-                    // 'running' state masking the real failure. Same
-                    // WARN+target shape as above.
-                    if let Err(ue) = repo.mark_execution_failed(exec_id, &redacted, None).await {
-                        tracing::warn!(
-                            target: "talos_audit",
-                            execution_id = %exec_id,
-                            workflow_id = %wf_id,
-                            primary_error = %e,
-                            update_error = %ue,
-                            "enqueue_workflow: mark_execution_failed UPDATE failed — execution row may mask the real engine failure as 'running'"
-                        );
+                    Err(e) => {
+                        // MCP-450: DLP-redact engine run error before
+                        // persistence. Mirrors the success-path
+                        // redact_json above.
+                        let redacted = talos_dlp_provider::redact_str(&e.to_string());
+                        // MCP-802 sibling: log mark_execution_failed UPDATE
+                        // failures. Higher operator stakes than the Ok arm
+                        // — the engine ALREADY failed, and if the
+                        // failure-marking UPDATE also fails the row sits in
+                        // 'running' state masking the real failure. Same
+                        // WARN+target shape as above.
+                        if let Err(ue) = repo.mark_execution_failed(exec_id, &redacted, None).await
+                        {
+                            tracing::warn!(
+                                target: "talos_audit",
+                                execution_id = %exec_id,
+                                workflow_id = %wf_id,
+                                primary_error = %e,
+                                update_error = %ue,
+                                "enqueue_workflow: mark_execution_failed UPDATE failed — execution row may mask the real engine failure as 'running'"
+                            );
+                        }
                     }
                 }
             }
-
-            // Rate limit
-            if idx + 1 < inputs.len() {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-        }
-        tracing::info!(workflow_id = %wf_id, count = exec_ids.len(), "enqueue_workflow batch complete");
+        })
+        .await;
+        tracing::info!(
+            workflow_id = %wf_id,
+            dispatched = summary.dispatched,
+            skipped_not_queued = summary.skipped_not_queued,
+            refused_unreadable = summary.refused_unreadable,
+            "enqueue_workflow batch complete"
+        );
     });
 
     let response = serde_json::json!({

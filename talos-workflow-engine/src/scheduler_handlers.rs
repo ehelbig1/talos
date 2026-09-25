@@ -2370,6 +2370,18 @@ impl ParallelWorkflowEngine {
             None => body_module_id,
         };
 
+        // The body's pre-dispatch clearance — ceiling, approval, method-aware
+        // retry budget — from the SAME `clear_module_dispatch` the single-node
+        // path runs. Resolved once, on the first iteration that would
+        // dispatch, and reused: the module, the actor's ceiling and the
+        // `(execution, node)` approval record are all invariant across
+        // iterations (MCP-H6's hoisting argument), while a loop whose
+        // condition never admits an iteration creates no approval request.
+        // Until 2026-09-25 the body hand-built its `DispatchJob` and applied
+        // none of them, so a loop was a way around every one.
+        let mut body_clearance: Option<crate::engine_dispatch_single::ModuleDispatchClearance> =
+            None;
+
         while iteration < max_iters {
             // Evaluate condition against current output + loop metadata.
             // `iteration_count` is injected so conditions like
@@ -2398,6 +2410,54 @@ impl ParallelWorkflowEngine {
                 }
             }
 
+            // Pre-dispatch gates for THIS iteration, BEFORE it counts, so a
+            // refused iteration reports as not run (`iterations` = the
+            // iterations that dispatched) and writes no `module_executions`
+            // row — matching the single-node path, where a refusal happens
+            // before `record_started`. A failed prefetch skips the gates and is
+            // reported below as `module_fetch_error`, unchanged.
+            let clearance = match cached_wasm_module.as_ref() {
+                None => None,
+                Some(m) => {
+                    let cleared = match body_clearance.as_ref() {
+                        Some(c) => Ok(c.clone()),
+                        None => self
+                            .clear_module_dispatch(body_uuid, execution_id, m)
+                            .await
+                            .inspect(|c| body_clearance = Some(c.clone())),
+                    };
+                    match cleared {
+                        Err(msg) => {
+                            last_output = serde_json::json!({
+                                "__error": true,
+                                "error_message": msg.clone(),
+                            });
+                            termination_reason = "dispatch_refused";
+                            terminating_error = Some(msg);
+                            break;
+                        }
+                        // The fourth gate, once per DISPATCH (the single-node
+                        // path's reactor applies the same function once per
+                        // node): a body module limited to N/min cannot be run
+                        // N+1 times a minute by wrapping it in a loop.
+                        Ok(c) => {
+                            if let Some(envelope) = self.check_rate_limit(body_uuid).await {
+                                let msg = envelope
+                                    .get("error_message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Module rate limit exceeded")
+                                    .to_string();
+                                last_output = envelope;
+                                termination_reason = "rate_limited";
+                                terminating_error = Some(msg);
+                                break;
+                            }
+                            Some(c)
+                        }
+                    }
+                }
+            };
+
             iteration += 1;
 
             // Log iteration event via the engine's shared emit helper.
@@ -2405,10 +2465,12 @@ impl ParallelWorkflowEngine {
 
             // MCP-H6: reuse the prefetched module bytes. If the
             // prefetch failed, surface it now (same shape as pre-fix
-            // failure).
-            let wasm_module = match cached_wasm_module.as_ref() {
-                Some(m) => m.clone(),
-                None => {
+            // failure). `clearance` is `Some` exactly when the module is, so
+            // both are taken in one match and neither can be used without
+            // the other.
+            let (wasm_module, clearance) = match (cached_wasm_module.as_ref(), clearance) {
+                (Some(m), Some(c)) => (m.clone(), c),
+                _ => {
                     let msg = "Module fetch failed at loop-body prefetch".to_string();
                     last_output = serde_json::json!({
                         "__error": true,
@@ -2501,7 +2563,8 @@ impl ParallelWorkflowEngine {
             //
             // The row is also the per-iteration status/output record the
             // loop path never had; it is completed below on every exit path
-            // so it can't linger in 'running'.
+            // so it can't linger in 'running' — except the born-`cancelled`
+            // exit, whose row is already terminal at INSERT.
             let iter_exec_id = Uuid::new_v4();
             if let Some(ref store) = self.module_execution_store {
                 match store
@@ -2663,12 +2726,19 @@ impl ParallelWorkflowEngine {
                 http_verb_ceiling: self.http_verb_ceiling,
                 egress_scope: self.egress_scope,
                 // Loop-body idempotency is a follow-up; the single-node dispatch
-                // path carries the engine-stamped key today.
+                // path carries the engine-stamped key today. (It cannot simply
+                // reuse that key: every iteration would share one, and the
+                // provider would serve iterations 2..N the first one's reply.)
+                // So there is no idempotency upgrade to the budget below.
                 idempotency_key: None,
-                max_retries: 2,
-                backoff_ms: 500,
-                retry_condition: None,
-                retry_delay_expr: None,
+                // The body node's own retry policy, method-aware — was a
+                // hardcoded `max_retries: 2` for every body whatever its
+                // methods or world, so a POST body re-sent on a transport
+                // failure the single-node path would have refused to retry.
+                max_retries: clearance.max_retries,
+                backoff_ms: clearance.retry.backoff_ms,
+                retry_condition: clearance.retry.retry_condition.clone(),
+                retry_delay_expr: clearance.retry.retry_delay_expression.clone(),
                 // Retries inside a loop iteration are internal and
                 // should not inflate workflow-level retry metrics.
                 emit_retry_events: false,

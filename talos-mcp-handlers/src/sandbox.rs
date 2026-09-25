@@ -2168,8 +2168,10 @@ async fn handle_run_sandbox(
             secrets,                 // secrets from vault
             None,                    // token_sender
             Duration::from_secs(30), // timeout
-            talos_worker_runtime::runtime::RetryPolicy::default(), // retry_policy
-            None,                    // result_cache_ttl_secs
+            // Embedded rehearsal surface, no controller retry loop above it:
+            // the old in-process policy, named rather than defaulted.
+            talos_worker_runtime::runtime::RetryPolicy::in_process_transient(),
+            None, // result_cache_ttl_secs
             talos_worker_runtime::runtime::SecurityPolicy::default(),
             None,  // capability_world_hint
             None,  // max_fuel_override
@@ -3779,7 +3781,9 @@ async fn handle_test_module(
             secrets,
             None,
             std::time::Duration::from_secs(timeout_secs),
-            talos_worker_runtime::runtime::RetryPolicy::default(),
+            // Embedded rehearsal surface, no controller retry loop above it:
+            // the old in-process policy, named rather than defaulted.
+            talos_worker_runtime::runtime::RetryPolicy::in_process_transient(),
             None,
             security_policy,
             None, // capability_world_hint
