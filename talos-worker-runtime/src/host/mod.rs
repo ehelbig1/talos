@@ -48,6 +48,11 @@ mod reason_class_denial_tests;
 #[cfg(test)]
 mod sibling_egress_reason_tests;
 
+/// A tier-2 + `egress_scope = local` actor is refused a public IP literal on
+/// every guest HTTP surface (2026-09-25).
+#[cfg(test)]
+mod local_egress_literal_tests;
+
 #[cfg(test)]
 mod sse_connect_failure_tests;
 
@@ -101,6 +106,10 @@ pub(crate) use data::*;
 pub(crate) use database::*;
 #[allow(unused_imports)]
 pub(crate) use egress::*;
+
+/// The gated `wasi:http/outgoing-handler` (trusted world only) and its
+/// hardened send path (2026-09-25).
+pub(crate) mod wasi_http;
 #[allow(unused_imports)]
 pub(crate) use email::*;
 #[allow(unused_imports)]

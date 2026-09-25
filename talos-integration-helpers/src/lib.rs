@@ -36,6 +36,7 @@ pub mod admin;
 pub mod api_json;
 pub mod audit;
 pub mod google_jwt;
+pub mod push_ack;
 pub mod renewal;
 pub mod state_store;
 pub mod watch_binding;

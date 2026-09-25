@@ -2994,13 +2994,20 @@ pub(crate) fn build_router(
         .layer(Extension(api_limiter.clone()))
         .layer(Extension(whitelist.clone()));
 
-    // GitHub App Setup-URL callback — NO auth middleware. A cross-site redirect
-    // from github.com carries no SameSite=Strict session cookie; the user is
-    // recovered from the single-use state token instead (B2b-2).
+    // GitHub App Setup-URL + user-authorization callbacks — NO auth middleware.
+    // Cross-site redirects from github.com carry no SameSite=Strict session
+    // cookie; the user is recovered from single-use state tokens bound to the
+    // initiating browser. `/setup` only starts GitHub user authorization;
+    // `/authorized` claims the installation after GitHub confirms the
+    // authorizing user can access it (the setup `installation_id` is spoofable).
     let github_setup_callback_route = Router::new()
         .route(
             "/api/github/setup",
             get(talos_github_connect::github_setup_callback_handler),
+        )
+        .route(
+            "/api/github/authorized",
+            get(talos_github_connect::github_authorized_callback_handler),
         )
         .with_state(github_connect_service.clone())
         .layer(from_fn(rate_limit::rate_limit_middleware))

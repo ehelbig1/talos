@@ -318,19 +318,23 @@ impl wit_http::Host for TalosContext {
         // host-fn ceiling: those gate key resolution; this gates the
         // network destination. Both are needed — a guest can bring its
         // own key (`config["api_key"]`) and bypass `llm::*` entirely.
-        if matches!(
-            self.max_llm_tier,
-            talos_workflow_job_protocol::LlmTier::Tier1
-        ) {
+        // Egress-posture gate: tier-1 LLM hosts + public IP literals, and
+        // public IP literals for ANY local-egress-only actor (a resolver never
+        // sees a literal) — one predicate, `egress_posture_deny_reason`.
+        {
             let host_lower = host.to_ascii_lowercase();
-            if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+            if let Some(policy) = egress_posture_deny_reason(
+                &host_lower,
+                self.max_llm_tier,
+                self.local_egress_only,
+            ) {
                 self.record_capability_denied("http-fetch", policy, host)
                     .await;
                 tracing::warn!(
                     host,
                     actor_id = ?self.actor_id,
                     policy,
-                    "tier-1 actor egress refused (external LLM host or public IP literal)"
+                    "actor egress posture refused egress (tier-1: external LLM host or public IP literal; local-only egress: public IP literal)"
                 );
                 return Err(deny_forbidden(self, tier1_egress_class(policy)));
             }
@@ -1250,7 +1254,15 @@ impl wit_http::Host for TalosContext {
         // `networkerror` a redispatch would treat as transient.
         let mut cancelled_during_validation = false;
 
-        for req in &reqs {
+        // CONSUMED, not borrowed. EQ (2026-09-24) recorded as a stated limit
+        // that this loop iterated `&reqs`, so every request's PRE-SUBSTITUTION
+        // body stayed alive and reachable for the rest of the function: a
+        // future `validated.push(Ok((.., req.body.clone(), ..)))` — sending the
+        // bytes that still carry the `vault://` marker — COMPILED, and only the
+        // source pin caught it. Taking ownership makes that a borrow-checker
+        // error instead of a lint finding, and lets the body be MOVED into the
+        // validated tuple rather than cloned.
+        for req in reqs {
             // Per-ENTRY cancellation. The entry check at the top of this fn
             // covered only the first entry: a cancel arriving while entry 1's
             // DNS lookup or vault resolve was in flight let entries 2..N keep
@@ -1358,19 +1370,23 @@ impl wit_http::Host for TalosContext {
 
             // 5. Tier-1 LLM egress ceiling. Per-request so a mixed batch
             //    rejects only the tier-2 LLM entries.
-            if matches!(
-                self.max_llm_tier,
-                talos_workflow_job_protocol::LlmTier::Tier1
-            ) {
+            // Egress-posture gate: tier-1 LLM hosts + public IP literals, and
+            // public IP literals for ANY local-egress-only actor (a resolver never
+            // sees a literal) — one predicate, `egress_posture_deny_reason`.
+            {
                 let host_lower = host.to_ascii_lowercase();
-                if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                if let Some(policy) = egress_posture_deny_reason(
+                    &host_lower,
+                    self.max_llm_tier,
+                    self.local_egress_only,
+                ) {
                     self.record_capability_denied("http-fetch-all", policy, &host)
                         .await;
                     tracing::warn!(
                         host = %host,
                         actor_id = ?self.actor_id,
                         policy,
-                        "tier-1 actor fetch_all egress refused (external LLM host or public IP literal)"
+                        "actor egress posture refused fetch_all egress (tier-1: external LLM host or public IP literal; local-only egress: public IP literal)"
                     );
                     validated.push(Err(deny_forbidden(self, tier1_egress_class(policy))));
                     continue;
@@ -1588,24 +1604,30 @@ impl wit_http::Host for TalosContext {
             // MCP-783's rule that a validation-failed entry keeps its own error
             // and spends no rate-limit budget.
             let resolved_body = if req.body.is_empty() {
-                req.body.clone()
+                req.body
             } else {
                 let declared_content_type = req
                     .headers
                     .iter()
                     .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
                     .map(|(_, v)| v.clone());
-                match self
+                // Bound to a local FIRST: a temporary in a `match` scrutinee
+                // lives to the end of the match, so resolving inline would keep
+                // `&req.body` borrowed through the arms and make the move below
+                // a borrow error.
+                let outcome = self
                     .resolve_vault_json_body(
                         crate::context::SecretUseSurface::HttpJsonBody,
                         &host,
                         &req.body,
                         declared_content_type.as_deref(),
                     )
-                    .await
-                {
+                    .await;
+                match outcome {
                     Ok(Some(substituted)) => substituted,
-                    Ok(None) => req.body.clone(),
+                    // No marker in this body: hand the ORIGINAL over by move.
+                    // It is not reachable afterwards, which is the point.
+                    Ok(None) => req.body,
                     Err(_) => {
                         validated.push(Err(deny_forbidden(self, reason_class::SECRET_LOOKUP)));
                         continue;
@@ -1614,7 +1636,7 @@ impl wit_http::Host for TalosContext {
             };
 
             validated.push(Ok((
-                req.url.clone(),
+                req.url,
                 reqwest_method,
                 hdrs,
                 resolved_body,

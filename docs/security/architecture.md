@@ -382,6 +382,19 @@ names were retired and every gate reads them as unrecognised.
   does not permit (`talos-workflow-engine/src/capability_ceiling.rs::refuse_module_over_ceiling`,
   both single and pipeline paths), which also covers sub-workflow children.
 - Runtime: wasmtime links only the WIT imports of the module's declared world.
+- Egress: every outbound HTTP surface a world links applies ONE gate set —
+  host allowlist (empty denies), SSRF on IP literals and, at connect, on the
+  RESOLVED address, the actor's egress posture (tier-1: external LLM hosts
+  and public IP literals; any local-egress-only actor, including tier 2 with
+  `egress_scope = local`: public IP literals), the write ceiling on its verb
+  axis, the method allowlist, per-execution and per-host rate limits, and a
+  ledger entry per refusal. `automation-node` is the only world that links
+  the raw `wasi:http/outgoing-handler` (a JS module's `fetch` compiles to it);
+  that handler is gated by the same set
+  (`talos-worker-runtime/src/host/wasi_http.rs::gated_handle`) and sends
+  through the execution's hardened client. Until 2026-09-25 it was
+  upstream's unfiltered handler, on the premise that automation modules are
+  operator-authored — any user holding an `automation-node` grant compiles one.
 - Grants: a user's own ceiling lives in `user_capability_grants`, whose CHECK
   constraint admits exactly the 12 worlds; an actor's world cannot exceed it. A
   user with no row holds `http-node`. A user cannot revoke their own grant when

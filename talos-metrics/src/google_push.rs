@@ -67,6 +67,34 @@ pub enum PushRefusalReason {
     JwkFetchFailed,
 }
 
+/// Why a Google **push** delivery was DEFERRED rather than answered.
+///
+/// A deferral is not a refusal. Every [`PushRefusalReason`] means *we rejected
+/// this sender*; a deferral means the push authenticated (or would have) and
+/// the platform could not determine what to do with it, so it asks the
+/// transport to deliver it again. Keeping the two counters apart matters
+/// because they call for opposite operator responses: a refusal is the
+/// fail-closed control working, a deferral is Talos failing to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushDeferReason {
+    /// The watch/channel lookup for this push returned `Err` — a pool timeout,
+    /// a Postgres restart, projection drift. The row's existence is UNKNOWN,
+    /// so the push is deferred; acking it would discard work nothing else
+    /// retries. Distinct from an ABSENT row, which is a determinate answer and
+    /// is acked (see `talos_integration_helpers::push_ack`).
+    WatchLookupUnreadable,
+}
+
+impl PushDeferReason {
+    pub const ALL: &'static [Self] = &[Self::WatchLookupUnreadable];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WatchLookupUnreadable => "watch_lookup_unreadable",
+        }
+    }
+}
+
 impl PushRefusalReason {
     pub const ALL: &'static [Self] = &[
         Self::MissingBearer,

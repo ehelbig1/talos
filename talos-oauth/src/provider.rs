@@ -16,18 +16,24 @@
 //!     }
 //! }
 //! // public API delegates to the drivers:
-//! pub async fn get_authorization_url(&self, uid: Uuid) -> Result<(String, String)> {
-//!     talos_oauth::authorization_url(&self.db_pool, self, uid).await
+//! pub async fn get_authorization_url(&self, uid: Uuid, binding: &BrowserBinding)
+//!     -> Result<(String, String)> {
+//!     talos_oauth::authorization_url(&self.db_pool, self, uid, binding).await
 //! }
-//! pub async fn handle_callback(&self, code: String, state: String) -> Result<MyIntegration> {
-//!     talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
+//! pub async fn handle_callback(&self, code: String, state: String, presented: Option<&str>)
+//!     -> Result<MyIntegration> {
+//!     talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state, presented).await
 //! }
+//! // The connect HANDLER builds `BrowserBinding::for_request(&headers)` and sets
+//! // `binding.set_cookie_pair()` on its response; the callback HANDLER passes
+//! // `presented_connect_binding(&headers)`. See docs/adding-an-integration.md §2.
 //! ```
 
 use anyhow::Result;
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::connect_binding::BrowserBinding;
 use crate::flow::{
     begin_oauth_authorization, consume_oauth_state, AuthorizeRequest, ConsumedOAuthState,
 };
@@ -68,26 +74,31 @@ pub trait OAuthIntegration: Sync {
 }
 
 /// Drive the authorize step: build the PKCE + CSRF authorize URL and persist the
-/// state token bound to `user_id`. Returns `(auth_url, state)`.
+/// state token bound to `user_id` and to the initiating browser. Returns
+/// `(auth_url, state)`; the caller sets `binding`'s cookie on its response.
 pub async fn authorization_url<P: OAuthIntegration + ?Sized>(
     pool: &sqlx::PgPool,
     provider: &P,
     user_id: Uuid,
+    binding: &BrowserBinding,
 ) -> Result<(String, String)> {
-    begin_oauth_authorization(pool, &provider.authorize_request()?, user_id).await
+    begin_oauth_authorization(pool, &provider.authorize_request()?, user_id, binding).await
 }
 
 /// Drive the callback: **consume + validate** the state token (CSRF / single-use
-/// / format / tenancy — via [`consume_oauth_state`], unskippable) and only then
-/// hand the validated `ConsumedOAuthState` to the provider's exchange. This
-/// ordering is the whole point of the trait: a new integration cannot exchange a
-/// `code` without first passing the security-critical consume.
+/// / format / tenancy / browser binding — via [`consume_oauth_state`],
+/// unskippable) and only then hand the validated `ConsumedOAuthState` to the
+/// provider's exchange. This ordering is the whole point of the trait: a new
+/// integration cannot exchange a `code` without first passing the
+/// security-critical consume. `presented_binding` is the callback request's
+/// connect-binding cookie ([`crate::presented_connect_binding`]).
 pub async fn handle_oauth_callback<P: OAuthIntegration + ?Sized>(
     pool: &sqlx::PgPool,
     provider: &P,
     code: &str,
     state: &str,
+    presented_binding: Option<&str>,
 ) -> Result<P::Connected> {
-    let consumed = consume_oauth_state(pool, provider.provider(), state).await?;
+    let consumed = consume_oauth_state(pool, provider.provider(), state, presented_binding).await?;
     provider.complete_callback(pool, code, consumed).await
 }

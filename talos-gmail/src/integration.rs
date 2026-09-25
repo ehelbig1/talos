@@ -173,22 +173,32 @@ impl GmailIntegrationService {
     /// Stores `user_id` in the state token so the callback can identify the
     /// user without requiring session auth (cross-site redirects from OAuth
     /// providers may not carry session cookies).
-    pub async fn get_authorization_url(&self, user_id: Uuid) -> Result<(String, String)> {
+    pub async fn get_authorization_url(
+        &self,
+        user_id: Uuid,
+        binding: &talos_oauth::BrowserBinding,
+    ) -> Result<(String, String)> {
         // Delegate to the shared driver — it builds the authorize URL from
         // `authorize_request()` and persists the PKCE + CSRF state token bound
         // to `user_id`. See the `OAuthIntegration` impl below.
-        talos_oauth::authorization_url(&self.db_pool, self, user_id).await
+        talos_oauth::authorization_url(&self.db_pool, self, user_id, binding).await
     }
 
     /// Handle OAuth callback and store the integration.
     /// `user_id` is recovered from the state token (stored during `get_authorization_url`),
     /// so this handler does NOT require session authentication.
-    pub async fn handle_callback(&self, code: String, state: String) -> Result<GmailIntegration> {
+    pub async fn handle_callback(
+        &self,
+        code: String,
+        state: String,
+        presented_binding: Option<&str>,
+    ) -> Result<GmailIntegration> {
         // Delegate to the shared driver — it consumes + validates the CSRF state
         // token (single-use, format, tenancy) and only then hands the validated
         // `ConsumedOAuthState` to `complete_callback()`. See the
         // `OAuthIntegration` impl below.
-        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
+        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state, presented_binding)
+            .await
     }
 }
 

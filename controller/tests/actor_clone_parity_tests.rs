@@ -126,6 +126,14 @@ async fn a_clone_carries_grants_ceilings_budget_and_approval_policies() {
         (tier.as_str(), egress.as_deref(), ceiling.as_str()),
         ("tier1", Some("public"), "readonly")
     );
+    // A NULL verb override (inherit) clones as NULL — the copy invents nothing.
+    let verb: Option<String> =
+        sqlx::query_scalar("SELECT http_verb_ceiling FROM actors WHERE id = $1")
+            .bind(out.new_actor_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(verb, None);
 
     let (per_hour, fuel): (Option<i32>, Option<i64>) = sqlx::query_as(
         "SELECT max_executions_per_hour, max_fuel_per_execution FROM actor_budget_policies WHERE actor_id = $1",
@@ -142,6 +150,51 @@ async fn a_clone_carries_grants_ceilings_budget_and_approval_policies() {
             .await
             .unwrap();
     assert_eq!(policies, 1, "the approval gate travelled with the clone");
+}
+
+/// 2026-09-25 regression: the verb-inference override travels with the clone.
+///
+/// The source may keep notes (`max_write_ceiling = write`) but must not POST
+/// (`http_verb_ceiling = readonly`). Pre-fix the clone dropped the override,
+/// so the copy inherited `write` on the verb axis and COULD POST — a clone
+/// wider than its source.
+#[tokio::test]
+async fn a_clone_carries_the_http_verb_ceiling() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool, Some("automation-node")).await;
+    let source = seed_source(&pool, user, "http-node", "active").await;
+    // `seed_source` makes a `readonly` actor; raising it to `write` needs the
+    // sanctioned grant GUC or the escalation guard (20260709180000) refuses.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('talos.allow_ceiling_grant', 'on', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE actors SET max_write_ceiling = 'write', http_verb_ceiling = 'readonly' WHERE id = $1",
+    )
+    .bind(source)
+    .execute(&mut *tx)
+    .await
+    .expect("seed a write actor whose verb axis is readonly");
+    tx.commit().await.unwrap();
+    let repo = ActorRepository::new(pool.clone());
+
+    let out = clone_actor(&pool, &repo, req(user, source, None))
+        .await
+        .expect("clone succeeds");
+
+    let (write, verb): (String, Option<String>) =
+        sqlx::query_as("SELECT max_write_ceiling, http_verb_ceiling FROM actors WHERE id = $1")
+            .bind(out.new_actor_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (write.as_str(), verb.as_deref()),
+        ("write", Some("readonly")),
+        "the clone must refuse POST exactly as its source does"
+    );
 }
 
 /// Revoking a grant does not lower existing actors — so a clone must be refused

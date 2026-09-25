@@ -3,8 +3,10 @@
 //!
 //! Stores GitHub App installation **metadata** only — never tokens. Installation
 //! access tokens are short-lived and minted on demand (see `talos-github` B1 +
-//! the renewal arm B3). The connect/install callback (B2b) upserts here; module
-//! dispatch (B4) resolves an installation by the repo's owning account.
+//! the renewal arm B3). The connect flow (B2b) claims here through
+//! [`GithubAppInstallationRepository::claim_recorded`] — the ONE writer of a
+//! row's owner; module dispatch (B4) resolves an installation by the repo's
+//! owning account.
 //!
 //! All queries are runtime-checked `sqlx::query_as` (no `query!` macros), so this
 //! crate needs no `.sqlx` offline cache.
@@ -33,6 +35,65 @@ pub struct GithubAppInstallation {
 const COLS: &str = "id, user_id, installation_id, account_login, account_type, \
                     permissions, repository_selection, is_active, created_at, updated_at";
 
+/// The facts of a claim, all GitHub-verified by the caller.
+#[derive(Debug, Clone, Copy)]
+pub struct NewInstallationClaim<'a> {
+    pub user_id: Uuid,
+    pub installation_id: i64,
+    pub account_login: &'a str,
+    pub account_type: Option<&'a str>,
+    pub permissions: Option<&'a serde_json::Value>,
+    pub repository_selection: Option<&'a str>,
+}
+
+/// What a claim did. `#[must_use]`: ignoring `OwnedByAnotherUser` would report
+/// a connect that did not happen.
+#[must_use]
+#[derive(Debug, Clone)]
+pub enum InstallationClaim {
+    /// The row is now this user's and active; the claim is recorded.
+    Claimed {
+        row: GithubAppInstallation,
+        transition: ClaimTransition,
+    },
+    /// An ACTIVE row owned by another user — refused, nothing written.
+    OwnedByAnotherUser,
+}
+
+/// How the claimed row came to be this user's (recorded as `transition`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimTransition {
+    /// No row for this installation existed.
+    Created,
+    /// The row was already this user's (re-install / permission change).
+    Refreshed,
+    /// The row was this user's but inactive (a reconnect after disconnect).
+    Reactivated,
+    /// The row was another user's and INACTIVE — the only cross-user move.
+    ReassignedFromInactive,
+}
+
+impl ClaimTransition {
+    fn from_prior(prior: Option<(Uuid, bool)>, claimant: Uuid) -> Self {
+        match prior {
+            None => Self::Created,
+            Some((owner, true)) if owner == claimant => Self::Refreshed,
+            Some((owner, false)) if owner == claimant => Self::Reactivated,
+            // (other, true) cannot reach here: the guarded upsert returned no row.
+            Some(_) => Self::ReassignedFromInactive,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Refreshed => "refreshed",
+            Self::Reactivated => "reactivated",
+            Self::ReassignedFromInactive => "reassigned_from_inactive",
+        }
+    }
+}
+
 pub struct GithubAppInstallationRepository {
     pool: PgPool,
 }
@@ -42,21 +103,43 @@ impl GithubAppInstallationRepository {
         Self { pool }
     }
 
-    /// Insert (or update, on the unique `installation_id`) an installation.
+    /// Claim an installation for `claim.user_id`, recording the claim in
+    /// `admin_event_log` in the SAME transaction.
     ///
-    /// The connect callback (B2b) calls this. On re-install / permission change
-    /// GitHub reuses the same `installation_id`, so we upsert: refresh the
-    /// metadata, re-activate, and re-bind ownership to the connecting user.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn upsert(
+    /// **An active installation owned by another user is never reassigned.**
+    /// Until 2026-09-25 this was an upsert whose conflict arm set
+    /// `user_id = EXCLUDED.user_id` unconditionally, so any user who reached the
+    /// connect callback with someone else's `installation_id` (GitHub documents
+    /// that the Setup-URL value can be spoofed) moved the row — and with it
+    /// `github_app:<owner>` token minting — to themselves. The conflict arm now
+    /// updates only when the row is already this user's or is inactive, and a
+    /// guarded-out conflict returns no row: [`InstallationClaim::OwnedByAnotherUser`].
+    /// The SQL predicate is the authority (it also settles two concurrent first
+    /// claims); the `FOR UPDATE` read before it exists only to record what the
+    /// claim replaced.
+    ///
+    /// A claim that cannot be recorded does not happen (the transaction rolls
+    /// back). Callers MUST first prove the user can access the installation —
+    /// this method guards ownership, not access.
+    pub async fn claim_recorded(
         &self,
-        user_id: Uuid,
-        installation_id: i64,
-        account_login: &str,
-        account_type: Option<&str>,
-        permissions: Option<&serde_json::Value>,
-        repository_selection: Option<&str>,
-    ) -> Result<GithubAppInstallation> {
+        claim: &NewInstallationClaim<'_>,
+    ) -> Result<InstallationClaim> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin installation claim")?;
+
+        let prior: Option<(Uuid, Uuid, bool)> = sqlx::query_as(
+            "SELECT id, user_id, is_active FROM github_app_installations \
+             WHERE installation_id = $1 FOR UPDATE",
+        )
+        .bind(claim.installation_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("read prior github_app_installation")?;
+
         let row = sqlx::query_as::<_, GithubAppInstallation>(&format!(
             "INSERT INTO github_app_installations \
                  (user_id, installation_id, account_login, account_type, \
@@ -70,18 +153,56 @@ impl GithubAppInstallationRepository {
                  repository_selection = EXCLUDED.repository_selection, \
                  is_active = true, \
                  updated_at = now() \
+             WHERE github_app_installations.user_id = EXCLUDED.user_id \
+                OR NOT github_app_installations.is_active \
              RETURNING {COLS}"
         ))
-        .bind(user_id)
-        .bind(installation_id)
-        .bind(account_login)
-        .bind(account_type)
-        .bind(permissions)
-        .bind(repository_selection)
-        .fetch_one(&self.pool)
+        .bind(claim.user_id)
+        .bind(claim.installation_id)
+        .bind(claim.account_login)
+        .bind(claim.account_type)
+        .bind(claim.permissions)
+        .bind(claim.repository_selection)
+        .fetch_optional(&mut *tx)
         .await
-        .context("upsert github_app_installation")?;
-        Ok(row)
+        .context("claim github_app_installation")?;
+
+        let Some(row) = row else {
+            // Guarded out: an active row owned by someone else. Nothing was
+            // written, so there is nothing to record here — the caller logs the
+            // refusal. Dropping `tx` rolls back the row lock.
+            return Ok(InstallationClaim::OwnedByAnotherUser);
+        };
+
+        let transition = ClaimTransition::from_prior(prior.map(|(_, u, a)| (u, a)), claim.user_id);
+        let details = serde_json::json!({
+            "installation_id": claim.installation_id,
+            "account_login": claim.account_login,
+            "account_type": claim.account_type,
+            "repository_selection": claim.repository_selection,
+            "transition": transition.as_str(),
+            "previous_user_id": prior.and_then(|(_, u, _)| (u != claim.user_id).then_some(u)),
+            "ownership_verified_by": "github_user_installations",
+        });
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(claim.user_id),
+            "github_installation_claimed",
+            "github_app_installation",
+            Some(row.id),
+            &format!(
+                "GitHub App installation {} ({}) connected ({})",
+                claim.installation_id,
+                claim.account_login,
+                transition.as_str()
+            ),
+            Some(&details),
+        )
+        .await
+        .context("record github installation claim")?;
+
+        tx.commit().await.context("commit installation claim")?;
+        Ok(InstallationClaim::Claimed { row, transition })
     }
 
     /// Look up an installation by GitHub's installation id (any active state).

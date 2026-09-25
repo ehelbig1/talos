@@ -110,6 +110,7 @@
 /// `talos-workflow-engine-core` while disabling it on the engine.
 pub const HAS_LLM_PRIMITIVES: bool = cfg!(feature = "llm-primitives");
 
+mod actor_ceilings;
 mod approval_gate;
 mod assistant_report_reader;
 pub mod attempt_window;
@@ -148,6 +149,7 @@ mod transport;
 mod wasm_cache;
 mod write_ceiling;
 
+pub use actor_ceilings::ActorCeilings;
 pub use approval_gate::{ApprovalGate, ApprovalStatus};
 pub use assistant_report_reader::AssistantReportReader;
 pub use attempt_window::{
@@ -208,7 +210,7 @@ pub use system_node::{JoinMode, SystemNodeKind};
 pub use transport::JobTransport;
 pub use wasm_cache::{scoped_wasm_cache_key, scoped_wasm_redis_uri};
 pub use write_ceiling::{
-    effective_write_ceiling, http_verb_ceiling_from_db, narrow_verb_inference_override,
-    write_ceiling_denies, write_ceiling_denies_axis, CeilingAxis, WriteCeiling,
-    AGENT_MEMORY_SET_OP, WRITE_CEILING_POLICY,
+    effective_write_ceiling, http_verb_ceiling_from_db, write_ceiling_denies,
+    write_ceiling_denies_axis, CeilingAxis, WriteCeiling, AGENT_MEMORY_SET_OP,
+    WRITE_CEILING_POLICY,
 };
