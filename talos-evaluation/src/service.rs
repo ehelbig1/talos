@@ -390,7 +390,12 @@ impl EvaluationService {
         };
 
         let (score, passed, reasoning, not_applicable) = match &output {
-            Some(v) => self.judge(backend, task, v).await?,
+            // The judge is the OPERATOR's eval spend: attribute it to the user
+            // (it was platform-attributed). Deliberately not to the actor — an
+            // eval must not consume the actor's own token budget.
+            Some(v) => {
+                talos_llm::usage::scoped_user(input.user_id, self.judge(backend, task, v)).await?
+            }
             // Terminal but no output (failed / cancelled / timed_out) is a real
             // quality signal — score 0. NOT an abstention: the arm produced
             // nothing, which is a result, not an absence of subject matter.
