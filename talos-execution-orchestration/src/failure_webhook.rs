@@ -67,7 +67,10 @@ static FAILURE_WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     .expect("talos-execution-orchestration: failed to build failure-webhook HTTP client (TLS init)")
 });
 
-pub(crate) async fn dispatch_failure_webhook(
+/// Fire the workflow's stored failure webhook for `execution_id`: fire-time
+/// SSRF re-validation, the shared SSRF-safe client, never an error to the
+/// caller. `pub` so other crates reuse this one dispatcher instead of a copy.
+pub async fn dispatch_failure_webhook(
     workflow_repo: &WorkflowRepository,
     workflow_id: Uuid,
     execution_id: Uuid,

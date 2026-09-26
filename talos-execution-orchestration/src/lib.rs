@@ -31,7 +31,7 @@ mod count_memory_write_nodes;
 pub mod crash_recovery;
 mod deep_merge;
 mod errors;
-mod failure_webhook;
+pub mod failure_webhook;
 mod finalize;
 mod input;
 mod outcome;
