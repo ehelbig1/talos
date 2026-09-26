@@ -231,6 +231,11 @@ impl ExecutionOrchestrationService {
         let mut trigger_input = result_collector::extract_trigger_input(output_data.as_ref());
         if let Some(overrides) = input_overrides {
             deep_merge(&mut trigger_input, &overrides);
+            // Overrides are caller-authored: engine-authored keys never
+            // belong in the payload this run stores.
+            talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys(
+                &mut trigger_input,
+            );
         }
 
         // 7. Mint a new execution_id and create the row with parent

@@ -124,11 +124,18 @@ pub const TRIGGER_INPUT_KEY: &str = "__trigger_input__";
 /// Used by replay / retry / replay-with-input handlers to recover the
 /// original trigger payload so the new execution re-runs against the
 /// same input. Centralized so the magic-key string lives in one place.
+///
+/// Engine-authored keys are STRIPPED: a row written before the trigger paths
+/// lifted `__actor_context__` off the stored payload carries decrypted actor
+/// memory here, and the engine strips those keys at the seed anyway, so
+/// carrying them forward would only re-persist the memory on the new run.
 pub fn extract_trigger_input(output_data: Option<&Value>) -> Value {
-    output_data
+    let mut input = output_data
         .and_then(|o| o.get(TRIGGER_INPUT_KEY))
         .cloned()
-        .unwrap_or_else(|| serde_json::json!({}))
+        .unwrap_or_else(|| serde_json::json!({}));
+    talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys(&mut input);
+    input
 }
 
 /// NATS subject the alert is published on. Pinned at module scope so
@@ -397,6 +404,19 @@ mod tests {
         });
         let extracted = extract_trigger_input(Some(&stored));
         assert_eq!(extracted, serde_json::json!({"k": "v", "n": 7}));
+    }
+
+    #[test]
+    fn extract_trigger_input_drops_engine_authored_keys() {
+        let stored = serde_json::json!({
+            "__trigger_input__": {
+                "k": "v",
+                "__actor_context__": {"memories": ["decrypted"]},
+                "__accumulated__": {"n": 1}
+            }
+        });
+        let extracted = extract_trigger_input(Some(&stored));
+        assert_eq!(extracted, serde_json::json!({"k": "v"}));
     }
 
     #[test]
