@@ -1688,7 +1688,7 @@ tests:
   - interval: 1m
     name: a clean boot is silent — startup backlog completes, nothing fires
     input_series:
-      # The whole backlog completed. The other four series EXIST at 0 (they
+      # The whole backlog completed. The other five series EXIST at 0 (they
       # are pre-seeded at registration) — which is the point twice over: an
       # absent counter would match nothing so the alert could not fire on
       # the cold case either, AND the ratio arm divides by the sum over all
@@ -1702,6 +1702,8 @@ tests:
       - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="denied",job="talos-controller"}'
         values: "0x60"
       - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="fenced",job="talos-controller"}'
+        values: "0x60"
+      - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="cancelled",job="talos-controller"}'
         values: "0x60"
     alert_rule_test:
       - eval_time: 45m
@@ -1741,12 +1743,15 @@ tests:
   # Policy refusals are excluded by the outcome selector: an archived actor
   # or a capability-ceiling violation is a chronic configuration state,
   # unchanged by how many schedules came due at once.
+  # An operator cancel is an operator's act, not a herd symptom.
   - interval: 1m
-    name: denied and fenced startup runs never reach this alert
+    name: denied, fenced and cancelled startup runs never reach this alert
     input_series:
       - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="denied",job="talos-controller"}'
         values: "0+1x60"
       - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="fenced",job="talos-controller"}'
+        values: "0+1x60"
+      - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="cancelled",job="talos-controller"}'
         values: "0+1x60"
     alert_rule_test:
       - eval_time: 45m

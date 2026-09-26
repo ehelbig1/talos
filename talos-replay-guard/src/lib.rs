@@ -31,9 +31,7 @@
 //!   nonce) so a memory-RPC nonce can't collide with a job-result nonce.
 
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
 
 /// Result of an atomic check-and-record against the shared store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,73 +62,6 @@ pub trait ReplayGuard: Send + Sync {
     /// Short label for logs/metrics.
     fn name(&self) -> &'static str {
         "replay-guard"
-    }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Hard cap for the process-local guard's map, matching the sync caches.
-const PROCESS_LOCAL_HARD_CAP: usize = 200_000;
-
-/// In-process [`ReplayGuard`] backed by a `Mutex<HashMap>` with TTL eviction.
-///
-/// This is the trait's reference implementation and a drop-in for tests and
-/// single-replica deploys. It does NOT provide cross-replica protection — for
-/// that, register a [`RedisReplayGuard`]. Semantics mirror the existing
-/// `JobNonceCache` (sweep-on-insert past `2×ttl`, hard-cap aggressive sweep).
-#[derive(Default)]
-pub struct ProcessLocalReplayGuard {
-    /// key -> unix-secs expiry.
-    seen: Mutex<HashMap<String, u64>>,
-}
-
-impl ProcessLocalReplayGuard {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Current entry count (for health/metrics). Returns 0 if the lock is
-    /// poisoned (the hot path is poison-tolerant, so the map stays usable).
-    pub fn len(&self) -> usize {
-        self.seen.lock().map(|g| g.len()).unwrap_or(0)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-#[async_trait]
-impl ReplayGuard for ProcessLocalReplayGuard {
-    async fn check_and_record(&self, key: &str, ttl_secs: u64) -> ReplayOutcome {
-        let now = now_secs();
-        let expiry = now.saturating_add(ttl_secs);
-        let mut g = match self.seen.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // Sweep expired entries (cheap only above a small size).
-        if g.len() > 1024 {
-            g.retain(|_, exp| *exp > now);
-        }
-        match g.get(key) {
-            Some(exp) if *exp > now => return ReplayOutcome::Replay,
-            _ => {}
-        }
-        if g.len() >= PROCESS_LOCAL_HARD_CAP {
-            g.retain(|_, exp| *exp > now);
-        }
-        g.insert(key.to_string(), expiry);
-        ReplayOutcome::Fresh
-    }
-
-    fn name(&self) -> &'static str {
-        "process-local"
     }
 }
 
@@ -257,22 +188,23 @@ pub fn admit(outcome: ReplayOutcome, fail_closed: bool) -> bool {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn process_local_fresh_then_replay() {
-        let g = ProcessLocalReplayGuard::new();
-        assert_eq!(g.check_and_record("k1", 60).await, ReplayOutcome::Fresh);
-        assert_eq!(g.check_and_record("k1", 60).await, ReplayOutcome::Replay);
-        // A different key is independent.
-        assert_eq!(g.check_and_record("k2", 60).await, ReplayOutcome::Fresh);
-        assert_eq!(g.len(), 2);
+    /// Test double: a guard that never sees a replay. (The in-process
+    /// reference implementation had no production caller and was deleted;
+    /// the process-local caches live in the signed-message crates.)
+    struct AlwaysFresh;
+
+    #[async_trait]
+    impl ReplayGuard for AlwaysFresh {
+        async fn check_and_record(&self, _key: &str, _ttl_secs: u64) -> ReplayOutcome {
+            ReplayOutcome::Fresh
+        }
     }
 
-    #[tokio::test]
-    async fn process_local_expired_key_is_fresh_again() {
-        let g = ProcessLocalReplayGuard::new();
-        // ttl 0 → expiry == now, so `*exp > now` is false on the next lookup.
-        assert_eq!(g.check_and_record("k", 0).await, ReplayOutcome::Fresh);
-        assert_eq!(g.check_and_record("k", 0).await, ReplayOutcome::Fresh);
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
     }
 
     #[test]
@@ -290,7 +222,7 @@ mod tests {
     fn registration_is_single_shot() {
         // NB: OnceLock is process-global; keep this the only test that registers
         // so it doesn't race sibling tests.
-        let g: Arc<dyn ReplayGuard> = Arc::new(ProcessLocalReplayGuard::new());
+        let g: Arc<dyn ReplayGuard> = Arc::new(AlwaysFresh);
         assert!(register_shared_replay_guard(g.clone()).is_ok());
         assert!(register_shared_replay_guard(g).is_err());
         assert!(shared_replay_guard().is_some());

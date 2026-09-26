@@ -2216,6 +2216,7 @@ the override). Core type `talos_workflow_engine_core::EgressScope` (fail-closed
 2. **Tier-2 `expose_secret`** — explicit opt-in per module (`allow_tier2_exposure: true`), rate-limited (10/execution, 100/user/day), audit-logged at WARN level. Currently hardcoded to `false` across all engine dispatch paths.
 
 **Every engine dispatch path MUST call `build_encrypted_secrets()`** (or the equivalent inline block) to populate the job's `encrypted_secrets` field. Sending `Default::default()` means the module silently loses access to all secrets — vault:// headers fail with `Notfound`, LLM calls fail with missing keys. This was a real bug in loop-node dispatches fixed 2026-04-16. When adding a new dispatch path (new system-node kind, new parallel executor, etc.), grep for `encrypted_secrets:` in `parallel.rs` and verify the new site matches the existing pattern.
+**Correction, 2026-09-26:** `ParallelWorkflowEngine::build_encrypted_secrets()` had no callers and was DELETED; the one home every dispatch path uses is `secrets_pipeline::build_encrypted_secrets_for` (`build_dispatch_secrets_for` when sealing). Read every mention of `build_encrypted_secrets()` in this file as that function. The line above is kept byte-identical for `scripts/check-engineering-log.py`.
 
 **Secret flow through the system:**
 - Controller: `SecretsManager::get_module_secrets(node_id)` + `get_secrets_by_paths(vault_paths)` + `prefetch_llm_vault_keys(user_id)` → plaintext `HashMap<String, String>` → `EncryptedSecrets::encrypt(map, key)` → AES-256-GCM ciphertext in `JobRequest.encrypted_secrets` → NATS publish.
@@ -2392,6 +2393,7 @@ introduced per-org v4 per table).
 ## Architectural Mandate (CRITICAL)
 
 **Workspace topology after the May-2026 spike.** The controller bin is now ~7.3k LoC (down from ~95k); 105 `talos-*` workspace crates own the implementation. The bin is bootstrap (main.rs ~6.4k, lib.rs + ~59 re-export shims under 10 LoC each). Every former top-level module in `controller/src/*` is now a small re-export shim pointing at its canonical home crate; do not write new logic in those shims. When a path like `crate::foo::bar` appears in remaining controller code, treat it as syntactic sugar for `talos_foo::bar` — the dep tree, lints, and ownership belong to the underlying crate.
+**Current measurement, 2026-09-26** (the paragraph above is the May figure, kept byte-identical): 148 workspace members; `controller/src/main.rs` + `controller/src/bootstrap/` are ~15.3k lines (`bootstrap/background.rs` alone ~6.6k), so "the bin is ~7.3k LoC" no longer holds. Derive these from `cargo metadata` / `wc -l` rather than trusting a figure here.
 
 The MCP handler tree lives in `talos-mcp-handlers` (~65k LoC, 27 source files: 21 handler-domain modules + lib/types/utils/schemas/tests support). The GraphQL surface lives in `talos-api`. Both keep `pub mod` re-export shims at `controller/src/mcp/mod.rs` and `controller/src/api/mod.rs` so existing import paths keep resolving. **When the priority-extraction list below references `mcp/foo.rs`, the actual file is now `talos-mcp-handlers/src/foo.rs` — the work is the same, the path moved.**
 

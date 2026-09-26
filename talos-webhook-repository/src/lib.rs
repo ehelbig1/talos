@@ -6,6 +6,29 @@ use anyhow::{Context, Result};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+/// Webhook triggers one user may hold — ONE home for both create paths
+/// (GraphQL `createWebhookTrigger` and MCP `create_webhook`).
+pub const MAX_WEBHOOKS_PER_USER: i64 = 500;
+
+/// Take the per-user webhook-create advisory lock on `tx` and count the
+/// user's triggers under it. Salt 42939990001 — distinct from MCP-685's
+/// api-keys salt so the two subsystems don't block each other.
+async fn lock_and_count_user_webhooks(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: Uuid,
+) -> Result<i64> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 42939990001))")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .context("Failed to acquire per-user advisory lock")?;
+    sqlx::query_scalar("SELECT COUNT(*) FROM webhook_triggers WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&mut **tx)
+        .await
+        .context("Failed to count webhooks under cap lock")
+}
+
 pub struct WebhookRepository {
     db_pool: PgPool,
 }
@@ -214,21 +237,7 @@ impl WebhookRepository {
             .await
             .context("Failed to begin webhook create transaction")?;
 
-        // Per-user advisory lock. 42939990001 — distinct salt from
-        // MCP-685's api-keys salt so the two subsystems don't block
-        // each other.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 42939990001))")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .context("Failed to acquire per-user advisory lock")?;
-
-        let current: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM webhook_triggers WHERE user_id = $1")
-                .bind(user_id)
-                .fetch_one(&mut *tx)
-                .await
-                .context("Failed to count webhooks under cap lock")?;
+        let current = lock_and_count_user_webhooks(&mut tx, user_id).await?;
 
         if current >= cap {
             // Transaction rolls back on drop, releasing the advisory lock.
@@ -270,9 +279,19 @@ impl WebhookRepository {
     }
 
     /// Persist a webhook trigger for the GraphQL `createWebhookTrigger`
-    /// mutation (no per-user cap gate — that flow belongs to
-    /// `try_create_under_cap`, the MCP path). Returns the inserted row id.
-    pub async fn insert_trigger(&self, t: NewWebhookTrigger<'_>) -> Result<Uuid> {
+    /// mutation under the SAME per-user cap and advisory lock as
+    /// [`Self::try_create_under_cap`] (the MCP path). `Ok(None)` when the user
+    /// already holds [`MAX_WEBHOOKS_PER_USER`] triggers. Until 2026-09-26 the
+    /// GraphQL path had no cap at all.
+    pub async fn insert_trigger(&self, t: NewWebhookTrigger<'_>) -> Result<Option<Uuid>> {
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("Failed to begin webhook create transaction")?;
+        if lock_and_count_user_webhooks(&mut tx, t.user_id).await? >= MAX_WEBHOOKS_PER_USER {
+            return Ok(None);
+        }
         let id = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO webhook_triggers (
@@ -296,9 +315,12 @@ impl WebhookRepository {
         .bind(t.allowed_ips)
         .bind(t.user_id)
         .bind(t.event_filter)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(id)
+        tx.commit()
+            .await
+            .context("Failed to commit webhook create transaction")?;
+        Ok(Some(id))
     }
 
     /// Fetch a webhook-DLQ entry for replay, ownership-gated via the

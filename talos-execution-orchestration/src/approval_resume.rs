@@ -103,15 +103,15 @@ impl ExecutionOrchestrationService {
         //    mirroring the GraphQL `resumeWorkflow` mutation): while the
         //    execution was paused the operator may have suspended /
         //    terminated the bound actor or downgraded its capability
-        //    ceiling. Gate against the DRAFT graph — the same definition
-        //    the resume kernel will run (`claim_*` returns
-        //    `workflows.graph_json`). Runs BEFORE the claim so a denied
+        //    ceiling. Gate against the graph the resume kernel will run —
+        //    the execution's pinned version, or the draft only when none was
+        //    recorded (`RESUME_GRAPH_SQL`, shared with `claim_*`). Runs BEFORE the claim so a denied
         //    resume leaves the row in 'waiting' (recoverable by fixing
         //    the actor and re-submitting), never stuck in 'resuming'.
         if exec.actor_id.is_some() {
             let graph_json = self
                 .execution_repo
-                .get_workflow_graph_for_user_or_orgs(exec.workflow_id, user_id, writable_org_ids)
+                .get_resume_graph_for_user_or_orgs(execution_id, user_id, writable_org_ids)
                 .await
                 .map_err(OrchestrationError::Internal)?
                 .ok_or(OrchestrationError::WorkflowNotFound(exec.workflow_id))?;

@@ -891,6 +891,49 @@ pub fn strip_engine_authored_keys_from_map(obj: &mut serde_json::Map<String, ser
     }
 }
 
+/// Prepare a trigger payload for STORAGE after actor-context injection:
+/// remove and return [`ACTOR_CONTEXT`] (the caller hands it to the engine,
+/// which carries it as a property), and strip the other engine-authored keys.
+///
+/// The payload is persisted (`workflow_executions.input_data`, the output's
+/// `__trigger_input__`), and the engine strips all five at the trigger seed
+/// anyway, so a copy left in the payload does nothing except put DECRYPTED
+/// actor memory into a stored trace.
+pub fn lift_actor_context_for_storage(
+    payload: &mut serde_json::Value,
+) -> Option<serde_json::Value> {
+    let obj = payload.as_object_mut()?;
+    let lifted = obj.remove(ACTOR_CONTEXT);
+    strip_engine_authored_keys_from_map(obj);
+    lifted
+}
+
+/// Serializes a value with every [`ENGINE_AUTHORED_INPUT_KEYS`] key removed
+/// at EVERY depth, without cloning it. For persisted previews of a node's
+/// input (`node_input` events): the merged input carries decrypted actor
+/// memory and the accumulated context, neither of which belongs in a
+/// plaintext event row.
+pub struct WithoutEngineAuthoredKeys<'a>(pub &'a serde_json::Value);
+
+impl serde::Serialize for WithoutEngineAuthoredKeys<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self.0 {
+            serde_json::Value::Object(m) => {
+                let mut map = s.serialize_map(None)?;
+                for (k, v) in m {
+                    if !ENGINE_AUTHORED_INPUT_KEYS.contains(&k.as_str()) {
+                        map.serialize_entry(k, &WithoutEngineAuthoredKeys(v))?;
+                    }
+                }
+                map.end()
+            }
+            serde_json::Value::Array(a) => s.collect_seq(a.iter().map(WithoutEngineAuthoredKeys)),
+            other => other.serialize(s),
+        }
+    }
+}
+
 /// The child-seed variant: strips every engine-authored input key EXCEPT
 /// [`TRIGGER_INPUT`], which the parent dispatcher legitimately wraps into a
 /// sub-workflow's trigger envelope (see [`ENGINE_AUTHORED_INPUT_KEYS`]).
@@ -1550,6 +1593,35 @@ mod tests {
                 "{output_key} is output-side protocol and must not be stripped"
             );
         }
+    }
+
+    #[test]
+    fn a_stored_preview_carries_no_engine_authored_key_at_any_depth() {
+        let input = json!({
+            "__actor_context__": { "memories": ["decrypted"] },
+            "__accumulated__": { "a": 1 },
+            "question": "q",
+            "input": { "__actor_context__": "nested", "keep": [ { "__staleness__": 1, "x": 2 } ] }
+        });
+        let s = serde_json::to_string(&WithoutEngineAuthoredKeys(&input)).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            back,
+            json!({ "question": "q", "input": { "keep": [ { "x": 2 } ] } })
+        );
+    }
+
+    #[test]
+    fn storage_lift_returns_the_context_and_strips_the_rest() {
+        let mut payload = json!({
+            "__actor_context__": { "memories": [] },
+            "__trigger_input__": 1,
+            "message_id": "m"
+        });
+        let lifted = lift_actor_context_for_storage(&mut payload);
+        assert_eq!(lifted, Some(json!({ "memories": [] })));
+        assert_eq!(payload, json!({ "message_id": "m" }));
+        assert_eq!(lift_actor_context_for_storage(&mut json!("bare")), None);
     }
 
     #[test]

@@ -148,7 +148,9 @@ case "$CURRENT" in
         fi
         NEW_B64="$(printf '%s' "$CONTROLLER_TOKEN" | base64 | tr -d '\n')"
         PAYLOAD="$(printf '{"data":{"VAULT_TOKEN":"%s"}}' "$NEW_B64")"
-        if ! kubectl -n "$NAMESPACE" patch secret "$BOOTSTRAP_SECRET" --type=merge -p "$PAYLOAD" >/dev/null; then
+        # The patch travels on stdin, never argv: a token on the command line
+        # is readable from /proc/<pid>/cmdline by anything in the pod.
+        if ! printf '%s' "$PAYLOAD" | kubectl -n "$NAMESPACE" patch secret "$BOOTSTRAP_SECRET" --type=merge --patch-file=/dev/stdin >/dev/null; then
             # A minted token that never reaches the Secret is a live credential
             # nobody holds: revoke it before failing, so a retry mints cleanly.
             printf '%s\n' "$CONTROLLER_TOKEN" | vexec sh -c 'VAULT_TOKEN=$(cat); export VAULT_TOKEN; vault token revoke -self >/dev/null' \

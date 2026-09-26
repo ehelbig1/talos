@@ -744,3 +744,148 @@ async fn subworkflow_stored_timeout_without_the_marker_is_not_enforced() {
         result.err()
     );
 }
+
+// ── SubWorkflow batch: a drained sibling honours its own skip_condition ──
+
+/// Two sub-workflow nodes ready at once are batched: the loop head pops the
+/// first and drains the second. The skip check at the loop head only ever saw
+/// the FIRST, so the second ran its child even with `skip_condition: "true"`.
+#[tokio::test]
+async fn a_batched_sub_workflow_sibling_honours_its_skip_condition() {
+    let sub_wf_id = Uuid::new_v4();
+    let module_id = Uuid::new_v4();
+    let kind = || SystemNodeKind::SubWorkflow {
+        workflow_id: sub_wf_id,
+        timeout_secs: 30,
+    };
+    let parent = WorkflowGraphBuilder::new()
+        .add_system_node("first", kind())
+        .add_system_node("second", kind())
+        .with_skip_condition("second", "true")
+        .build()
+        .expect("parent graph builds");
+
+    let engine = engine_for(&parent, Some(child_graph(module_id)), module_id, None);
+    let dispatcher = Arc::new(
+        talos_workflow_engine_test_utils::dispatch::ScriptedDispatcher::new()
+            .with_response(module_id, json!({ "ok": true })),
+    );
+    let ctx = engine
+        .run_with_transport(dispatcher.clone(), None, Uuid::new_v4())
+        .await
+        .expect("the run completes");
+
+    assert_eq!(
+        dispatcher.jobs().len(),
+        1,
+        "only the un-skipped sub-workflow may run its child"
+    );
+    assert_eq!(
+        ctx.results
+            .values()
+            .filter(|v| v.get("__skipped") == Some(&json!(true)))
+            .count(),
+        1,
+        "the skipped sibling commits a `__skipped` envelope: {:?}",
+        ctx.results
+    );
+}
+
+// ── Oversized output: a failure, not a success ──────────────────────
+
+/// An output over `max_node_output_bytes` used to be REPLACED by an error
+/// envelope and then committed as a SUCCESS — the run reported `completed`.
+#[tokio::test]
+async fn an_oversized_module_output_fails_the_run() {
+    let module_id = Uuid::new_v4();
+    let graph = WorkflowGraphBuilder::new()
+        .add_module("big", module_id, None)
+        .build()
+        .expect("graph builds");
+    let mut engine = engine_for(&graph, None, module_id, None);
+    engine.set_max_node_output_bytes(64);
+    let result = engine
+        .run_with_transport(
+            Arc::new(FixedOutputDispatcher(json!({ "blob": "x".repeat(200) }))),
+            None,
+            Uuid::new_v4(),
+        )
+        .await;
+    let err = match result {
+        Ok(ctx) => panic!("an oversized output must fail the run: {:?}", ctx.results),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("too large"), "{err}");
+}
+
+// ── In-flight modules keep being polled while a system node is awaited ──
+
+/// Sleeps per module id before answering, so a test controls which branch
+/// finishes first.
+struct DelayedDispatcher(HashMap<Uuid, Duration>);
+
+#[async_trait]
+impl NodeDispatcher for DelayedDispatcher {
+    async fn dispatch(&self, job: DispatchJob) -> Result<DispatchResult, BoxError> {
+        tokio::time::sleep(self.0.get(&job.module_id).copied().unwrap_or_default()).await;
+        Ok(DispatchResult {
+            output: json!({ "ok": true }),
+        })
+    }
+}
+
+/// A sub-workflow node is awaited inline by the reactor. Before the fix the
+/// in-flight module pool was not polled meanwhile, so a sibling module that
+/// finished in 20 ms was only observed once the 600 ms child returned — and
+/// its recorded wall time was the child's.
+#[tokio::test]
+async fn a_module_finishing_during_an_inline_sub_workflow_keeps_its_own_wall_time() {
+    let sub_wf_id = Uuid::new_v4();
+    let fast = Uuid::new_v4();
+    let slow = Uuid::new_v4();
+    let parent = WorkflowGraphBuilder::new()
+        .add_module("fast", fast, None)
+        .add_system_node(
+            "call_child",
+            SystemNodeKind::SubWorkflow {
+                workflow_id: sub_wf_id,
+                timeout_secs: 30,
+            },
+        )
+        .build()
+        .expect("parent graph builds");
+
+    let mut engine = engine_for(&parent, Some(child_graph(slow)), fast, None);
+    engine.set_module_fetcher(Arc::new(
+        InMemoryModuleFetcher::new()
+            .with_module(fast, stub_artifact(fast))
+            .with_module(slow, stub_artifact(slow)),
+    ));
+    let hook = Arc::new(talos_workflow_engine_test_utils::capture::CaptureNodeLifecycleHook::new());
+    engine.set_node_hook(hook.clone());
+    let dispatcher = Arc::new(DelayedDispatcher(HashMap::from([
+        (fast, Duration::from_millis(20)),
+        (slow, Duration::from_millis(600)),
+    ])));
+    engine
+        .run_with_transport(dispatcher, None, Uuid::new_v4())
+        .await
+        .expect("the run completes");
+
+    let fast_wall_ms = hook
+        .calls()
+        .into_iter()
+        .find_map(|c| match c {
+            talos_workflow_engine_test_utils::capture::LifecycleCall::Completed {
+                node_label,
+                wall_time_ms,
+                ..
+            } if node_label.as_deref() == Some("fast") => Some(wall_time_ms),
+            _ => None,
+        })
+        .expect("the fast module completes");
+    assert!(
+        fast_wall_ms < 400,
+        "the fast module's wall time must not include the sub-workflow's: {fast_wall_ms} ms"
+    );
+}

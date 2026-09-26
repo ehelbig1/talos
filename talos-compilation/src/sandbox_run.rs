@@ -416,6 +416,7 @@ fn kill_process_group(pgid: i32) {
     }
     // SAFETY: `killpg` takes two plain integers and touches no memory owned
     // by this process; the guard above excludes the two special group ids.
+    #[allow(unsafe_code)] // see SAFETY above
     let rc = unsafe { libc::killpg(pgid, libc::SIGKILL) };
     if rc != 0 {
         let err = io::Error::last_os_error();
@@ -585,6 +586,7 @@ mod tests {
     #[cfg(unix)]
     fn pid_is_gone(pid: i32) -> bool {
         // SAFETY: signal 0 performs only the existence/permission check.
+        #[allow(unsafe_code)] // signal 0 only probes for existence
         let rc = unsafe { libc::kill(pid, 0) };
         rc != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }

@@ -76,6 +76,7 @@
 //! each owns its own terminal-write logic.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -129,12 +130,14 @@ pub async fn run_with_seed_fenced(
     let token = CancellationToken::new();
     engine.set_cancellation_token(Some(token.clone()));
 
+    let operator_cancelled = Arc::new(AtomicBool::new(false));
     // Reaped on EVERY exit (return or panic) via the drop guard — see AbortOnDrop.
     let _heartbeat = AbortOnDrop(tokio::spawn(epoch_fence_heartbeat(
         pool,
         execution_id,
         my_epoch,
         token.clone(),
+        operator_cancelled.clone(),
     )));
 
     let result = run_with_seed_via_nats(
@@ -148,7 +151,7 @@ pub async fn run_with_seed_fenced(
 
     // `_heartbeat`'s drop aborts the task here (and on a panic unwind). No manual
     // `token.cancel()` needed — abort stops the poll loop.
-    result
+    attribute_stop(result, &operator_cancelled)
 }
 
 /// Run a FRESH workflow execution (trigger-input entry path) under an epoch
@@ -184,12 +187,14 @@ pub async fn run_with_trigger_input_fenced(
     let token = CancellationToken::new();
     engine.set_cancellation_token(Some(token.clone()));
 
+    let operator_cancelled = Arc::new(AtomicBool::new(false));
     // Reaped on EVERY exit (return or panic) via the drop guard — see AbortOnDrop.
     let _heartbeat = AbortOnDrop(tokio::spawn(epoch_fence_heartbeat(
         pool,
         execution_id,
         my_epoch,
         token.clone(),
+        operator_cancelled.clone(),
     )));
 
     let result = run_with_trigger_input_via_nats(
@@ -202,7 +207,29 @@ pub async fn run_with_trigger_input_fenced(
     .await;
 
     // `_heartbeat`'s drop aborts the task here (and on a panic unwind).
-    result
+    attribute_stop(result, &operator_cancelled)
+}
+
+/// A fence stop caused by an OPERATOR cancel (the heartbeat saw the row turn
+/// `cancelled`) is reported as [`WorkflowEngineError::CancelledByOperator`],
+/// not as a fence.
+fn attribute_stop(
+    result: Result<WorkflowContext, WorkflowEngineError>,
+    operator_cancelled: &AtomicBool,
+) -> Result<WorkflowContext, WorkflowEngineError> {
+    match result {
+        Err(WorkflowEngineError::Cancelled) if operator_cancelled.load(Ordering::Acquire) => {
+            Err(WorkflowEngineError::CancelledByOperator)
+        }
+        other => other,
+    }
+}
+
+/// True when the run stopped because an operator cancelled its execution —
+/// in this controller (`run_tracked`) or seen by the fence heartbeat. The row
+/// is already `cancelled`: do not mark it failed, and do not count a fence.
+pub fn was_cancelled_by_operator(err: &WorkflowEngineError) -> bool {
+    matches!(err, WorkflowEngineError::CancelledByOperator)
 }
 
 /// True when `err` is the cancellation a fence abort produces. Lets callers
@@ -253,6 +280,7 @@ async fn epoch_fence_heartbeat(
     execution_id: Uuid,
     my_epoch: i64,
     token: CancellationToken,
+    operator_cancelled: Arc<AtomicBool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(FENCE_HEARTBEAT_SECS));
     // Skip the immediate first tick — there's nothing to check until at least
@@ -288,6 +316,9 @@ async fn epoch_fence_heartbeat(
                         break;
                     }
                     FenceDecision::Terminal { status } => {
+                        if status == "cancelled" {
+                            operator_cancelled.store(true, Ordering::Release);
+                        }
                         tracing::info!(
                             %execution_id, %status,
                             "execution FENCE: the execution is no longer running (an operator \
@@ -360,6 +391,19 @@ mod tests {
             FenceDecision::Superseded { observed_epoch: 4 }
         );
         assert_eq!(fence_decision(3, None), FenceDecision::Vanished);
+    }
+
+    #[test]
+    fn an_operator_cancel_is_not_reported_as_a_fence() {
+        let flag = AtomicBool::new(true);
+        let err = attribute_stop(Err(WorkflowEngineError::Cancelled), &flag).unwrap_err();
+        assert!(was_cancelled_by_operator(&err));
+        assert!(!was_fenced(&err));
+        // Control: a supersede leaves the flag unset and stays a fence.
+        let flag = AtomicBool::new(false);
+        let err = attribute_stop(Err(WorkflowEngineError::Cancelled), &flag).unwrap_err();
+        assert!(was_fenced(&err));
+        assert!(!was_cancelled_by_operator(&err));
     }
 
     #[test]

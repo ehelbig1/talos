@@ -69,6 +69,54 @@ pub const MAX_LIST_LIMIT: i64 = 200;
 /// calling; the batched fn truncates as defense in depth so a future caller
 /// can't fan a single `= ANY($1)` scan across an unbounded actor set.
 pub const MAX_ACTOR_IDS_PER_BATCH: usize = 100;
+
+/// Longest `prefix` / `suffix` a [`MemoryKeyMatch`] accepts, in bytes. Keys
+/// are validated far below this on write; the bound only stops a caller from
+/// binding an arbitrarily large LIKE pattern.
+pub const MAX_KEY_MATCH_BYTES: usize = 256;
+
+/// Escape SQL LIKE metacharacters (`\`, `%`, `_`) so `s` matches literally
+/// under `ESCAPE '\'`. One home for this crate's LIKE-literal escaping.
+#[must_use]
+pub fn escape_like_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Optional literal key restriction for
+/// [`list_memories_with_ciphertext_batched_scoped`]: keep only keys that start
+/// with `prefix` AND end with `suffix` (each `None` = unrestricted). Two
+/// independent predicates rather than one `prefix%suffix` pattern, so a key
+/// where the two overlap (`a/latest` for prefix `a/`, suffix `/latest`) still
+/// matches.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryKeyMatch<'a> {
+    pub prefix: Option<&'a str>,
+    pub suffix: Option<&'a str>,
+}
+
+impl MemoryKeyMatch<'_> {
+    /// The escaped `LIKE` patterns (`prefix%`, `%suffix`), or an error when
+    /// either side exceeds [`MAX_KEY_MATCH_BYTES`].
+    pub fn like_patterns(&self) -> Result<(Option<String>, Option<String>)> {
+        for (name, v) in [("prefix", self.prefix), ("suffix", self.suffix)] {
+            if v.is_some_and(|v| v.len() > MAX_KEY_MATCH_BYTES) {
+                anyhow::bail!("key {name} exceeds {MAX_KEY_MATCH_BYTES} bytes");
+            }
+        }
+        Ok((
+            self.prefix.map(|p| format!("{}%", escape_like_literal(p))),
+            self.suffix.map(|s| format!("%{}", escape_like_literal(s))),
+        ))
+    }
+}
+
 pub const MEMORY_TYPES: &[&str] = &["working", "episodic", "semantic", "scratchpad"];
 
 /// CSV rendering of [`MEMORY_TYPES`] for error messages.
@@ -264,6 +312,11 @@ static GRAPH_EXTRACTION_SHED_TOTAL: std::sync::atomic::AtomicU64 =
 pub fn graph_extraction_shed_total() -> u64 {
     GRAPH_EXTRACTION_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Wall-clock bound on one extraction (LLM call with retries + Neo4j
+/// upserts), so a hung backend releases its permit instead of starving the
+/// other writes.
+const GRAPH_EXTRACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Graph extraction callback. Controllers wire this at startup via
 /// [`register_graph_hook`]; the worker never registers one (so graph
@@ -674,13 +727,25 @@ fn admit_graph_extraction(
             // extraction is the only answer that does not run it unbounded.
             return;
         };
-        if let Err(e) = hook.extract(actor_id, key.clone(), value).await {
-            tracing::debug!(
+        let outcome = tokio::time::timeout(
+            GRAPH_EXTRACTION_TIMEOUT,
+            hook.extract(actor_id, key.clone(), value),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!(
                 actor_id = %actor_id,
                 key = %key,
                 error = %e,
                 "Graph entity extraction failed (non-fatal)"
-            );
+            ),
+            Err(_) => tracing::warn!(
+                actor_id = %actor_id,
+                key = %key,
+                timeout_secs = GRAPH_EXTRACTION_TIMEOUT.as_secs(),
+                "Graph entity extraction timed out — permit released"
+            ),
         }
     });
     true
@@ -737,6 +802,8 @@ pub struct MemoryHit {
     pub memory_type: String,
     pub expires_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// Cosine similarity on the vector path; [`KEYWORD_FALLBACK_SCORE`]
+    /// (no similarity claimed) on the keyword fallback.
     pub score: f64,
     /// Per-row `metadata` JSONB — the filter key (`metadata.kind`) is
     /// applied at the DB layer by `recall_semantic_filtered`, but
@@ -849,6 +916,13 @@ pub struct ForgetOutcome {
 /// advisory lock), i.e. an extra round trip or a migration on every memory
 /// write; a lock taken inside this one statement would not help, because the
 /// statement's snapshot predates the lock.
+// Overwrite semantics (2026-09-26): the row describes THIS write.
+// * embedding — a failed regeneration stores NULL, never the previous
+//   content's vector (the backfill repairs NULL; nothing repairs a stale
+//   vector, and the ciphertext's random nonce means "unchanged" cannot be
+//   proven here without a decrypt).
+// * metadata — omitted means NULL, not "inherit the old `kind`" (an
+//   inherited kind silently kept a rewritten key excluded from recall).
 const PERSIST_MEMORY_ROW_SQL: &str = "INSERT INTO actor_memory \
      (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id, importance) \
      SELECT $1::uuid, $2::text, $3::bytea, $4::uuid, $5::smallint, $6::text, $7::timestamptz, \
@@ -861,9 +935,9 @@ const PERSIST_MEMORY_ROW_SQL: &str = "INSERT INTO actor_memory \
          value_format  = EXCLUDED.value_format, \
          memory_type   = EXCLUDED.memory_type, \
          expires_at    = EXCLUDED.expires_at, \
-         embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
-         embedding_model = COALESCE(EXCLUDED.embedding_model, actor_memory.embedding_model), \
-         metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
+         embedding     = EXCLUDED.embedding, \
+         embedding_model = EXCLUDED.embedding_model, \
+         metadata      = EXCLUDED.metadata, \
          org_id        = EXCLUDED.org_id, \
          importance    = EXCLUDED.importance, \
          updated_at    = now()";
@@ -1700,7 +1774,7 @@ pub async fn recall_recent_by_types(
          WHERE actor_id = $1 \
            AND memory_type = ANY($2) \
            AND (expires_at IS NULL OR expires_at > now()) \
-         ORDER BY updated_at DESC LIMIT $3",
+         ORDER BY updated_at DESC, id LIMIT $3",
     )
     .bind(actor_id)
     .bind(&owned)
@@ -1750,7 +1824,7 @@ pub async fn recall_recent_excluding_types(
          WHERE actor_id = $1 \
            AND NOT (memory_type = ANY($2)) \
            AND (expires_at IS NULL OR expires_at > now()) \
-         ORDER BY updated_at DESC LIMIT $3",
+         ORDER BY updated_at DESC, id LIMIT $3",
     )
     .bind(actor_id)
     .bind(&owned)
@@ -1806,7 +1880,7 @@ pub async fn recall_recent_excluding_types_and_kinds(
                 OR metadata IS NULL \
                 OR metadata->>'kind' IS NULL \
                 OR metadata->>'kind' != ALL($4::text[])) \
-         ORDER BY updated_at DESC LIMIT $3",
+         ORDER BY updated_at DESC, id LIMIT $3",
     )
     .bind(actor_id)
     .bind(&owned_types)
@@ -1871,7 +1945,7 @@ pub async fn recall_recent_excluding_types_and_kinds_ts(
                 OR metadata IS NULL \
                 OR metadata->>'kind' IS NULL \
                 OR metadata->>'kind' != ALL($4::text[])) \
-         ORDER BY updated_at DESC LIMIT $3",
+         ORDER BY updated_at DESC, id LIMIT $3",
     )
     .bind(actor_id)
     .bind(&owned_types)
@@ -1934,11 +2008,7 @@ pub async fn list_memories(
     // actor, so not a cross-tenant leak — but a behavioral
     // surprise + DoS surface). `ESCAPE '\\'` added to the SQL so
     // the bound backslash-escaped bytes are interpreted as literal.
-    let escaped_prefix = prefix.map(|p| {
-        p.replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-    });
+    let escaped_prefix = prefix.map(escape_like_literal);
     let rows = sqlx::query(
         "SELECT key, memory_type, expires_at, updated_at, metadata, \
                 octet_length(value_enc) AS value_bytes \
@@ -1947,7 +2017,7 @@ pub async fn list_memories(
            AND (expires_at IS NULL OR expires_at > now()) \
            AND ($2::text IS NULL OR key LIKE $2 || '%' ESCAPE '\\') \
            AND ($3::text IS NULL OR memory_type = $3) \
-         ORDER BY updated_at DESC \
+         ORDER BY updated_at DESC, id \
          LIMIT $4",
     )
     .bind(actor_id)
@@ -2048,9 +2118,18 @@ pub async fn decrypt_memory_list_row(row: &MemoryListRowEnc) -> Result<serde_jso
 /// `actor_id = ANY($1)` scan.
 ///
 /// **Per-actor fairness.** A windowed
-/// `ROW_NUMBER() OVER (PARTITION BY actor_id ORDER BY created_at DESC, key ASC)`
-/// caps EACH actor at `limit_per_actor` rows (newest-first) so one
-/// memory-heavy actor can't starve the batch — the single-actor path's
+/// `ROW_NUMBER() OVER (PARTITION BY actor_id ORDER BY updated_at DESC, key ASC)`
+/// caps EACH actor at `limit_per_actor` rows (most recently WRITTEN first) so
+/// one memory-heavy actor can't starve the batch. The window is by
+/// `updated_at`, not `created_at`: an upsert bumps `updated_at` and never
+/// `created_at`, so a creation-time window dropped exactly the keys that are
+/// rewritten on every run (a `<name>/latest` briefing) once an actor held
+/// more rows than the cap.
+///
+/// **Key restriction.** `key_match` narrows the scan in SQL to keys with a
+/// literal prefix and/or suffix (LIKE metacharacters escaped, see
+/// [`MemoryKeyMatch`]), so a caller that wants one key family is not windowed
+/// out by every other row the actor holds — the single-actor path's
 /// per-actor `LIMIT` becomes a per-partition window here. The outer
 /// `ORDER BY actor_id, memory_type, key ASC` reproduces the single-actor
 /// path's within-actor ordering (`memory_type, key ASC`) so the grouped
@@ -2071,11 +2150,13 @@ pub async fn list_memories_with_ciphertext_batched_scoped(
     conn: &mut sqlx::PgConnection,
     actor_ids: &[Uuid],
     memory_type_filter: Option<&str>,
+    key_match: MemoryKeyMatch<'_>,
     limit_per_actor: i64,
 ) -> Result<Vec<MemoryListRowEnc>> {
     if actor_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let (prefix_pattern, suffix_pattern) = key_match.like_patterns()?;
     // Defense in depth: the resolver rejects >MAX_ACTOR_IDS_PER_BATCH ids
     // before calling, so this truncation is unreachable in practice — it
     // bounds the `= ANY($1)` scan for any future direct caller.
@@ -2097,12 +2178,14 @@ pub async fn list_memories_with_ciphertext_batched_scoped(
                     memory_type, expires_at, updated_at, \
                     ROW_NUMBER() OVER ( \
                         PARTITION BY actor_id \
-                        ORDER BY created_at DESC, key ASC \
+                        ORDER BY updated_at DESC, key ASC \
                     ) AS rn \
              FROM actor_memory \
              WHERE actor_id = ANY($1) \
                AND ($2::text IS NULL OR memory_type = $2) \
                AND (expires_at IS NULL OR expires_at > NOW()) \
+               AND ($4::text IS NULL OR key LIKE $4 ESCAPE '\\') \
+               AND ($5::text IS NULL OR key LIKE $5 ESCAPE '\\') \
          ) ranked \
          WHERE rn <= $3 \
          ORDER BY actor_id, memory_type, key ASC",
@@ -2110,6 +2193,8 @@ pub async fn list_memories_with_ciphertext_batched_scoped(
     .bind(capped_ids)
     .bind(memory_type_filter)
     .bind(limit)
+    .bind(prefix_pattern)
+    .bind(suffix_pattern)
     .fetch_all(conn)
     .await
     .context("list_memories_with_ciphertext_batched_scoped")
@@ -2188,10 +2273,7 @@ pub async fn list_keys_with_limit(
     let limit = limit.clamp(1, LIST_KEYS_HARD_CAP);
     let pattern = prefix
         .map(|p| {
-            let escaped = p
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
+            let escaped = escape_like_literal(p);
             format!("{}%", escaped)
         })
         .unwrap_or_else(|| "%".to_string());
@@ -2365,6 +2447,17 @@ pub async fn recall_semantic_filtered(
         }
     }
 
+    // When the query DID embed, a zero-row vector result means every
+    // embedded row was judged and scored below the floor — the keyword
+    // fallback must not resurrect those. It may only reach rows the vector
+    // search could not judge (no embedding yet, or a different model).
+    // (No active model means nothing was judged: the vector predicate
+    // `embedding_model = NULL` matches no row, so every row is fair game.)
+    let unjudged_only = if embedding_attempted {
+        embedding::active_embedding_model()
+    } else {
+        None
+    };
     let hits = recall_keyword_inner(
         pool,
         actor_id,
@@ -2372,6 +2465,7 @@ pub async fn recall_semantic_filtered(
         limit,
         memory_type_filter,
         exclude_kinds,
+        unjudged_only.as_deref(),
     )
     .await?;
     Ok(SearchOutcome {
@@ -2408,7 +2502,7 @@ pub async fn recall_keyword(
     query: &str,
     limit: i64,
 ) -> Result<Vec<MemoryHit>> {
-    recall_keyword_inner(pool, actor_id, query, limit.clamp(1, 50), None, &[]).await
+    recall_keyword_inner(pool, actor_id, query, limit.clamp(1, 50), None, &[], None).await
 }
 
 async fn recall_keyword_inner(
@@ -2418,6 +2512,9 @@ async fn recall_keyword_inner(
     limit: i64,
     memory_type_filter: Option<&str>,
     exclude_kinds: &[String],
+    // `Some(model)` restricts the match to rows the vector path could not
+    // judge (`embedding IS NULL` or embedded under a different model).
+    unjudged_only: Option<&str>,
 ) -> Result<Vec<MemoryHit>> {
     // Tokenize the query into meaningful terms, then OR-match each as a
     // separate ILIKE. A natural-language question like "which pull
@@ -2446,13 +2543,7 @@ async fn recall_keyword_inner(
     // Empty token set (e.g. "what is it?") → fall back to whole-phrase
     // ILIKE so callers don't see a completely empty result set.
     if tokens.is_empty() {
-        let escaped = query
-            .chars()
-            .take(200)
-            .collect::<String>()
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
+        let escaped = escape_like_literal(&query.chars().take(200).collect::<String>());
         let pattern = format!("%{}%", escaped);
         // Phase B: encrypted bytes can't be substring-matched at the DB
         // layer, so keyword fallback now matches `key` only. The vector-
@@ -2470,7 +2561,9 @@ async fn recall_keyword_inner(
                     OR metadata IS NULL \
                     OR metadata->>'kind' IS NULL \
                     OR metadata->>'kind' != ALL($5::text[])) \
-             ORDER BY updated_at DESC \
+               AND ($6::text IS NULL OR embedding IS NULL \
+                    OR embedding_model IS DISTINCT FROM $6) \
+             ORDER BY updated_at DESC, id \
              LIMIT $3",
         )
         .bind(actor_id)
@@ -2478,6 +2571,7 @@ async fn recall_keyword_inner(
         .bind(limit)
         .bind(memory_type_filter)
         .bind(exclude_kinds)
+        .bind(unjudged_only)
         .fetch_all(pool)
         .await?;
         return rows_to_memory_hits(rows).await;
@@ -2488,10 +2582,7 @@ async fn recall_keyword_inner(
     let patterns: Vec<String> = tokens
         .iter()
         .map(|t| {
-            let escaped = t
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
+            let escaped = escape_like_literal(t);
             format!("%{}%", escaped)
         })
         .collect();
@@ -2516,7 +2607,9 @@ async fn recall_keyword_inner(
                 OR metadata IS NULL \
                 OR metadata->>'kind' IS NULL \
                 OR metadata->>'kind' != ALL($5::text[])) \
-         ORDER BY updated_at DESC \
+           AND ($6::text IS NULL OR embedding IS NULL \
+                OR embedding_model IS DISTINCT FROM $6) \
+         ORDER BY updated_at DESC, id \
          LIMIT $3",
     )
     .bind(actor_id)
@@ -2524,6 +2617,7 @@ async fn recall_keyword_inner(
     .bind(limit)
     .bind(memory_type_filter)
     .bind(exclude_kinds)
+    .bind(unjudged_only)
     .fetch_all(pool)
     .await
     .context("recall_keyword")?;
@@ -2580,18 +2674,20 @@ fn is_stopword(t: &str) -> bool {
     )
 }
 
+/// Similarity score carried by every keyword-fallback hit. A key-name match
+/// is not a similarity measurement, so it claims NONE: the hits keep their
+/// recency order in the list, and a min-score floor or a relevance-weighted
+/// ranker cannot mistake them for strong semantic matches. (Until
+/// 2026-09-26 they carried a positional `1.0 - i*0.02`, which passed every
+/// floor and out-ranked real cosine hits.)
+pub const KEYWORD_FALLBACK_SCORE: f64 = 0.0;
+
 /// Shared rows → MemoryHit conversion used by both the token and whole-
-/// phrase keyword-fallback branches. Score decays 0.02 per rank so the
-/// newest hit (i = 0) lands at 1.0 and the 50th hit (i = 49) at 0.02 —
-/// callers who sort by score are effectively sorting by recency. Beyond
-/// the 50th hit the `.max(0.0)` clamp pins everything to 0.0.
-/// Convert raw rows into MemoryHits, decrypting `value_enc`/`value_key_id`
-/// when present (Phase A). Async because decryption may need to fetch the
-/// DEK via SecretsManager. The score is positional (newest = 1.0) — same
-/// scheme as the legacy sync helper this replaces.
+/// phrase keyword-fallback branches, decrypting `value_enc`/`value_key_id`
+/// (Phase A). Scores are [`KEYWORD_FALLBACK_SCORE`].
 async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<MemoryHit>> {
     let mut hits = Vec::with_capacity(rows.len());
-    for (i, r) in rows.into_iter().enumerate() {
+    for r in rows {
         // MCP-S2: SELECT actor_id + value_format alongside the existing
         // columns so the AAD-dispatch resolver picks the right path.
         // Callers' SQL must include `actor_id` and `value_format` in
@@ -2622,7 +2718,7 @@ async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Mem
             memory_type: r.try_get("memory_type")?,
             expires_at: r.try_get("expires_at")?,
             updated_at: r.try_get("updated_at")?,
-            score: (1.0 - (i as f64 * 0.02)).max(0.0),
+            score: KEYWORD_FALLBACK_SCORE,
             metadata: r.try_get::<Option<serde_json::Value>, _>("metadata")?,
             // Phase 3a durable signals. check 52: Option read + `?` fails loud on
             // projection drift; widen `real`/`int4` to the ranker's f64/i64.
@@ -3552,7 +3648,7 @@ pub async fn scan_reflection_input(
                       OR metadata IS NULL \
                       OR metadata->>'kind' IS NULL \
                       OR metadata->>'kind' != ALL($2::text[])) \
-               ORDER BY updated_at DESC \
+               ORDER BY updated_at DESC, id \
                LIMIT $3";
     let rows = sqlx::query(sql)
         .bind(actor_id)
@@ -3627,6 +3723,9 @@ pub async fn measure_value_bytes_in_tx<'c>(
     Ok(size.unwrap_or(0))
 }
 
+/// Rows per `clone_memories` UNNEST insert.
+const CLONE_INSERT_CHUNK: usize = 500;
+
 /// Bulk-copy the live `semantic` and `episodic` memories of one actor to
 /// another, in a single SQL round-trip. Returns the number of rows
 /// written.
@@ -3664,9 +3763,9 @@ pub async fn measure_value_bytes_in_tx<'c>(
 ///
 /// On `ON CONFLICT (actor_id, key)` (i.e. the destination already has a
 /// memory at the same key), the destination row is overwritten with the
-/// source ciphertext + key_id + memory_type + expires_at + metadata, and
-/// `updated_at` is bumped to NOW(). This matches the prior inline-SQL
-/// behaviour at the two extracted call sites.
+/// source ciphertext + key_id + memory_type + expires_at + metadata, its
+/// embedding is cleared (it described the OLD content; the backfill
+/// regenerates it), and `updated_at` is bumped to NOW().
 ///
 /// **Deliberately NOT subject to [`MAX_MEMORIES_PER_ACTOR`]** (2026-09-25).
 /// The cap lives in the persist statement guest-reachable writes go through;
@@ -3820,6 +3919,8 @@ pub async fn clone_memories(
                    memory_type = EXCLUDED.memory_type, \
                    expires_at = EXCLUDED.expires_at, \
                    metadata = EXCLUDED.metadata, \
+                   embedding = NULL, \
+                   embedding_model = NULL, \
                    updated_at = NOW() \
              RETURNING 1 \
          ) SELECT COUNT(*) FROM inserted",
@@ -3830,11 +3931,23 @@ pub async fn clone_memories(
     .await
     .context("clone_memories: bulk copy v0 (legacy no-AAD) rows")?;
 
+    // One UNNEST statement per chunk rather than one INSERT per row.
     let mut v1_count: i64 = 0;
-    for row in v1_buffered {
-        sqlx::query(
+    for chunk in v1_buffered.chunks(CLONE_INSERT_CHUNK) {
+        let keys: Vec<&str> = chunk.iter().map(|r| r.key.as_str()).collect();
+        let ciphertexts: Vec<&[u8]> = chunk.iter().map(|r| r.new_ciphertext.as_slice()).collect();
+        let key_ids: Vec<Uuid> = chunk.iter().map(|r| r.new_key_id).collect();
+        let formats: Vec<i16> = chunk.iter().map(|r| r.new_format).collect();
+        let types: Vec<&str> = chunk.iter().map(|r| r.memory_type.as_str()).collect();
+        let expires: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+            chunk.iter().map(|r| r.new_expires_at).collect();
+        let metadata: Vec<Option<serde_json::Value>> =
+            chunk.iter().map(|r| r.metadata.clone()).collect();
+        let inserted = sqlx::query(
             "INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata, org_id, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) \
+             SELECT $1, u.key, u.value_enc, u.value_key_id, u.value_format, u.memory_type, u.expires_at, u.metadata, $9, NOW() \
+             FROM UNNEST($2::text[], $3::bytea[], $4::uuid[], $5::int2[], $6::text[], $7::timestamptz[], $8::jsonb[]) \
+                  AS u(key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata) \
              ON CONFLICT (actor_id, key) DO UPDATE \
                SET value_enc = EXCLUDED.value_enc, \
                    value_key_id = EXCLUDED.value_key_id, \
@@ -3843,21 +3956,23 @@ pub async fn clone_memories(
                    expires_at = EXCLUDED.expires_at, \
                    metadata = EXCLUDED.metadata, \
                    org_id = EXCLUDED.org_id, \
+                   embedding = NULL, \
+                   embedding_model = NULL, \
                    updated_at = NOW()",
         )
         .bind(target_actor_id)
-        .bind(&row.key)
-        .bind(row.new_ciphertext.as_slice())
-        .bind(row.new_key_id)
-        .bind(row.new_format)
-        .bind(&row.memory_type)
-        .bind(row.new_expires_at)
-        .bind(row.metadata)
+        .bind(&keys)
+        .bind(&ciphertexts)
+        .bind(&key_ids)
+        .bind(&formats)
+        .bind(&types)
+        .bind(&expires)
+        .bind(&metadata)
         .bind(target_org)
         .execute(&mut *tx)
         .await
-        .with_context(|| format!("clone_memories: insert v1 target row key={}", row.key))?;
-        v1_count += 1;
+        .context("clone_memories: insert re-encrypted target rows")?;
+        v1_count += inserted.rows_affected() as i64;
     }
 
     tx.commit()
@@ -3911,10 +4026,7 @@ pub async fn forget_prefix(
     if prefix.is_empty() {
         anyhow::bail!("forget_prefix requires a non-empty prefix");
     }
-    let escaped = prefix
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
+    let escaped = escape_like_literal(prefix);
     // `RETURNING` the liveness of each removed row makes the reported split a
     // property of the DELETE itself rather than of a second query that could
     // describe a different set — the same discipline as
@@ -3971,6 +4083,9 @@ pub async fn refresh_ttl(
 // Operations
 // ============================================================================
 
+/// Rows per page of [`re_encrypt_memories_to_org`] (keyset on `id`).
+const MEMORY_SWEEP_PAGE: i64 = 200;
+
 /// Outcome of [`re_encrypt_memories_to_org`].
 #[derive(Debug, Clone, Default)]
 pub struct MemoryReEncryptStats {
@@ -3996,51 +4111,62 @@ pub async fn re_encrypt_memories_to_org(pool: &Pool<Postgres>) -> Result<MemoryR
     let Some(hook) = MEMORY_CRYPTO_HOOK.get().cloned() else {
         return Ok(MemoryReEncryptStats::default());
     };
-    let rows = sqlx::query(
-        "SELECT am.actor_id, am.key, am.value_enc, am.value_key_id, am.value_format, a.org_id \
+    let mut re_encrypted = 0u64;
+    let mut failed = 0u64;
+    // Keyset-paged on `id`: a bounded page in memory at a time, and a row
+    // that fails (still pending) is stepped over rather than re-read forever.
+    let mut after = Uuid::nil();
+    loop {
+        let page = sqlx::query(
+        "SELECT am.id, am.actor_id, am.key, am.value_enc, am.value_key_id, am.value_format, a.org_id \
          FROM actor_memory am JOIN actors a ON a.id = am.actor_id \
          WHERE a.org_id IS NOT NULL \
-           AND talos_org_dek_pending(am.value_key_id, a.org_id)",
+           AND talos_org_dek_pending(am.value_key_id, a.org_id) \
+           AND am.id > $1 \
+         ORDER BY am.id \
+         LIMIT $2",
     )
+    .bind(after)
+    .bind(MEMORY_SWEEP_PAGE)
     .fetch_all(pool)
     .await
     .context("re_encrypt_memories_to_org: select stale rows")?;
+        let Some(last) = page.last() else { break };
+        after = last.try_get("id")?;
+        let full_page = page.len() as i64 == MEMORY_SWEEP_PAGE;
+        for r in page {
+            let actor_id: Uuid = r.try_get("actor_id")?;
+            let key: String = r.try_get("key")?;
+            let value_enc: Vec<u8> = r.try_get("value_enc")?;
+            let value_key_id: Uuid = r.try_get("value_key_id")?;
+            let src_format: i16 = r.try_get("value_format")?;
+            let org_id: Uuid = r.try_get("org_id")?;
 
-    let mut re_encrypted = 0u64;
-    let mut failed = 0u64;
-    for r in rows {
-        let actor_id: Uuid = r.try_get("actor_id")?;
-        let key: String = r.try_get("key")?;
-        let value_enc: Vec<u8> = r.try_get("value_enc")?;
-        let value_key_id: Uuid = r.try_get("value_key_id")?;
-        let src_format: i16 = r.try_get("value_format")?;
-        let org_id: Uuid = r.try_get("org_id")?;
+            let aad = build_memory_aad(actor_id, &key);
+            let plaintext = match hook
+                .decrypt(value_key_id, value_enc, aad.clone(), src_format)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(%actor_id, %key, "memory per-org sweep: decrypt failed: {e}");
+                    failed += 1;
+                    continue;
+                }
+            };
+            let (new_key_id, new_ct, new_format) = match hook
+                .encrypt(plaintext.to_string(), Some(org_id), aad)
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(%actor_id, %key, "memory per-org sweep: re-encrypt failed: {e}");
+                    failed += 1;
+                    continue;
+                }
+            };
 
-        let aad = build_memory_aad(actor_id, &key);
-        let plaintext = match hook
-            .decrypt(value_key_id, value_enc, aad.clone(), src_format)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(%actor_id, %key, "memory per-org sweep: decrypt failed: {e}");
-                failed += 1;
-                continue;
-            }
-        };
-        let (new_key_id, new_ct, new_format) = match hook
-            .encrypt(plaintext.to_string(), Some(org_id), aad)
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(%actor_id, %key, "memory per-org sweep: re-encrypt failed: {e}");
-                failed += 1;
-                continue;
-            }
-        };
-
-        match sqlx::query(
+            match sqlx::query(
             "UPDATE actor_memory \
              SET value_enc = $1, value_key_id = $2, value_format = $3, org_id = $4, updated_at = now() \
              WHERE actor_id = $5 AND key = $6 AND value_key_id = $7 AND value_format = $8",
@@ -4067,6 +4193,10 @@ pub async fn re_encrypt_memories_to_org(pool: &Pool<Postgres>) -> Result<MemoryR
                 tracing::error!(%actor_id, %key, "memory per-org sweep: update failed: {e}");
                 failed += 1;
             }
+        }
+        }
+        if !full_page {
+            break;
         }
     }
 
@@ -6447,5 +6577,63 @@ mod forget_prefix_scope_pins {
              preview; purged tombstones then inflate deleted_count past the \
              previewed set for a reason the operator cannot attribute"
         );
+    }
+}
+
+#[cfg(test)]
+mod key_match_tests {
+    use super::{escape_like_literal, MemoryKeyMatch, MAX_KEY_MATCH_BYTES};
+
+    #[test]
+    fn like_metacharacters_are_escaped_literally() {
+        assert_eq!(
+            escape_like_literal("daily_brief/latest"),
+            "daily\\_brief/latest"
+        );
+        assert_eq!(escape_like_literal("100%"), "100\\%");
+        // Backslash is escaped once, and never re-escapes an escape it added.
+        assert_eq!(escape_like_literal("a\\b"), "a\\\\b");
+        assert_eq!(escape_like_literal("\\%"), "\\\\\\%");
+        assert_eq!(escape_like_literal("plain/key"), "plain/key");
+    }
+
+    #[test]
+    fn patterns_anchor_each_side_independently() {
+        let m = MemoryKeyMatch {
+            prefix: Some("crm_"),
+            suffix: Some("/latest"),
+        };
+        assert_eq!(
+            m.like_patterns().unwrap(),
+            (Some("crm\\_%".to_string()), Some("%/latest".to_string()))
+        );
+        assert_eq!(
+            MemoryKeyMatch::default().like_patterns().unwrap(),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn an_oversized_side_is_refused_not_truncated() {
+        let long = "x".repeat(MAX_KEY_MATCH_BYTES + 1);
+        let ok = "x".repeat(MAX_KEY_MATCH_BYTES);
+        assert!(MemoryKeyMatch {
+            prefix: None,
+            suffix: Some(&long)
+        }
+        .like_patterns()
+        .is_err());
+        assert!(MemoryKeyMatch {
+            prefix: Some(&long),
+            suffix: None
+        }
+        .like_patterns()
+        .is_err());
+        assert!(MemoryKeyMatch {
+            prefix: Some(&ok),
+            suffix: Some(&ok)
+        }
+        .like_patterns()
+        .is_ok());
     }
 }

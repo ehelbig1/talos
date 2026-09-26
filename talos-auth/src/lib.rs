@@ -22,6 +22,28 @@ const MAX_PASSWORD_ATTEMPTS: i32 = 5;
 /// How long a locked account stays locked.
 const PASSWORD_LOCKOUT_MINUTES: i64 = 15;
 
+/// Claim one password-attempt slot (see `AuthService::claim_password_attempt`).
+/// No row back = the account is locked. An expired lock restarts the count at
+/// 1; the claim that reaches the limit sets the lock. Evaluated under the row
+/// lock, so concurrent claims serialise and none sees a stale count.
+const CLAIM_PASSWORD_ATTEMPT_SQL: &str = r#"
+    UPDATE users
+    SET
+        failed_login_attempts = CASE
+            WHEN locked_until IS NOT NULL AND locked_until <= NOW() THEN 1
+            ELSE failed_login_attempts + 1
+        END,
+        locked_until = CASE
+            WHEN locked_until IS NOT NULL AND locked_until <= NOW() THEN NULL
+            WHEN failed_login_attempts + 1 >= $1 THEN NOW() + ($2::int * INTERVAL '1 minute')
+            ELSE locked_until
+        END
+    WHERE id = $3
+      AND is_active = true
+      AND (locked_until IS NULL OR locked_until <= NOW())
+    RETURNING failed_login_attempts
+"#;
+
 /// Batches one cleanup call will issue before reporting `truncated`. Matches
 /// `talos-advanced-repository`'s `MAX_BATCHES_PER_SWEEP`.
 const MAX_SWEEP_BATCHES: u32 = 20;
@@ -909,6 +931,15 @@ impl PreviousKeyPair {
     }
 }
 
+/// A refresh token minted but not yet stored. `Debug` is not derived: the
+/// token is a bearer credential.
+struct MintedRefreshToken {
+    token: zeroize::Zeroizing<String>,
+    lookup_hash: String,
+    token_hash: String,
+    expires_at: DateTime<Utc>,
+}
+
 /// Authentication service
 pub struct AuthService {
     pub db_pool: Pool<Postgres>,
@@ -1087,37 +1118,38 @@ impl AuthService {
         }
     }
 
-    /// Count one wrong password against `user_id` and lock the account when the
-    /// count reaches [`MAX_PASSWORD_ATTEMPTS`]; returns the new count. The ONE
-    /// place the lockout counter moves — login and password change share it.
+    /// Claim one password-attempt slot for `user_id` BEFORE the bcrypt verify;
+    /// `Some(n)` is the slot number (1-based), `None` means the account is
+    /// locked and no verify may run. The ONE place the lockout counter moves —
+    /// login and password change share it.
     ///
-    /// A single `UPDATE … RETURNING` so two concurrent wrong guesses cannot
-    /// both read the same count and each add one.
-    async fn record_wrong_password(&self, user_id: Uuid) -> Result<i32> {
-        let locked_until = Utc::now() + Duration::minutes(PASSWORD_LOCKOUT_MINUTES);
-        let row = sqlx::query(
-            r#"
-            UPDATE users
-            SET
-                failed_login_attempts = failed_login_attempts + 1,
-                locked_until = CASE
-                    WHEN failed_login_attempts + 1 >= $1 THEN $2
-                    ELSE locked_until
-                END
-            WHERE id = $3
-            RETURNING failed_login_attempts
-            "#,
-        )
-        .bind(MAX_PASSWORD_ATTEMPTS)
-        .bind(locked_until)
-        .bind(user_id)
-        .fetch_one(&self.db_pool)
-        .await?;
-
+    /// The counter counts attempts, not failures: a success resets it
+    /// ([`Self::clear_password_attempts`]). Claiming before the verify is what
+    /// bounds a burst of concurrent guesses to [`MAX_PASSWORD_ATTEMPTS`] per
+    /// lock window; counting after the verify let every guess already in
+    /// flight run its bcrypt against an unlocked row.
+    async fn claim_password_attempt(&self, user_id: Uuid) -> Result<Option<i32>> {
+        let row = sqlx::query(CLAIM_PASSWORD_ATTEMPT_SQL)
+            .bind(MAX_PASSWORD_ATTEMPTS)
+            .bind(PASSWORD_LOCKOUT_MINUTES as i32)
+            .bind(user_id)
+            .fetch_optional(&self.db_pool)
+            .await?;
         use sqlx::Row as _;
-        Ok(row
-            .try_get::<Option<i32>, _>("failed_login_attempts")?
-            .unwrap_or(1))
+        row.map(|r| r.try_get::<i32, _>("failed_login_attempts"))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Reset the lockout counter after the password was PROVEN.
+    async fn clear_password_attempts(&self, user_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(())
     }
 
     /// Does `password` open an account whose stored hash is `stored_hash`?
@@ -1347,60 +1379,50 @@ impl AuthService {
             }
         };
 
-        // Check if account is locked.
+        // Claim an attempt slot BEFORE the verify, so concurrent guesses cannot
+        // each run a bcrypt against an unlocked row (see
+        // `claim_password_attempt`).
         //
-        // SECURITY: return the same generic "Invalid email or password" error
-        // as the user-not-found and wrong-password paths. A distinguishable
-        // "account is locked" message confirms email registration to an
-        // attacker who has burned the lockout threshold on a candidate email
-        // — the locked branch only fires when `locked_until` is set, which
-        // only happens for real accounts. Server-side log retains the actual
-        // lockout state for forensics.
-        if let Some(locked_until) = user.locked_until {
-            if locked_until > Utc::now() {
-                let remaining = (locked_until - Utc::now()).num_seconds();
-                // Security review 2026-07-19 (L3): run the same-cost dummy
-                // bcrypt as the user-not-found path (MCP-1084) BEFORE returning.
-                // Without it the locked branch returns ~one-bcrypt faster than
-                // the wrong-password path, so an attacker who has burned the
-                // lockout threshold can distinguish "locked" (real account) from
-                // "wrong password" by timing — a registration oracle the unified
-                // error message otherwise closes.
-                let password_owned = password.to_string();
-                let dummy_hash = self.dummy_password_hash.clone();
-                let _ =
-                    tokio::task::spawn_blocking(move || verify(&password_owned, &dummy_hash)).await;
-                self.log_auth_event_best_effort(
-                    Some(user.id),
-                    "login_failed",
-                    Some(email),
-                    ip_address,
-                    user_agent,
-                    false,
-                    Some(&format!("Account locked for {} more seconds", remaining)),
-                )
-                .await;
-                *reason = Some(AUTH_REASON_LOCKED);
-                return Err(anyhow!("Invalid email or password"));
-            } else {
-                // Lock period expired, reset failed attempts
-                sqlx::query!(
-                    "UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = $1",
-                    user.id
-                )
-                .execute(&self.db_pool)
-                .await?;
-                user.failed_login_attempts = 0;
-                user.locked_until = None;
-            }
-        }
+        // SECURITY: a refused claim returns the same generic "Invalid email or
+        // password" error as the user-not-found and wrong-password paths. A
+        // distinguishable "account is locked" message confirms email
+        // registration to an attacker who has burned the lockout threshold on
+        // a candidate email. Server-side log retains the lockout state.
+        let Some(attempt) = self.claim_password_attempt(user.id).await? else {
+            // Security review 2026-07-19 (L3): run the same-cost dummy bcrypt
+            // as the user-not-found path (MCP-1084) BEFORE returning, so
+            // "locked" is not distinguishable from "wrong password" by timing.
+            let password_owned = password.to_string();
+            let dummy_hash = self.dummy_password_hash.clone();
+            let _ = tokio::task::spawn_blocking(move || verify(&password_owned, &dummy_hash)).await;
+            let detail = match user.locked_until {
+                Some(until) if until > Utc::now() => format!(
+                    "Account locked for {} more seconds",
+                    (until - Utc::now()).num_seconds()
+                ),
+                _ => "Account locked".to_string(),
+            };
+            self.log_auth_event_best_effort(
+                Some(user.id),
+                "login_failed",
+                Some(email),
+                ip_address,
+                user_agent,
+                false,
+                Some(&detail),
+            )
+            .await;
+            *reason = Some(AUTH_REASON_LOCKED);
+            return Err(anyhow!("Invalid email or password"));
+        };
 
         // Verify password (use spawn_blocking to avoid blocking the async executor)
         let is_valid = self.password_matches(password, &user.password_hash).await?;
 
         if !is_valid {
             const MAX_ATTEMPTS: i32 = MAX_PASSWORD_ATTEMPTS;
-            let new_attempts = self.record_wrong_password(user.id).await?;
+            // The slot claimed above already counted this guess.
+            let new_attempts = attempt;
 
             if new_attempts >= MAX_ATTEMPTS {
                 // Log account lockout server-side; return the same generic
@@ -1445,13 +1467,16 @@ impl AuthService {
             }
         }
 
-        // Update last login and reset failed attempts
+        // The password is proven: record the login and reset the counter
+        // (including a lock the claim above may have set on the last slot).
         sqlx::query!(
             "UPDATE users SET last_login_at = NOW(), failed_login_attempts = 0, locked_until = NULL WHERE id = $1",
             user.id
         )
         .execute(&self.db_pool)
         .await?;
+        user.failed_login_attempts = 0;
+        user.locked_until = None;
 
         // A password login proves no second factor: with TOTP enrolled the
         // session is pending until the code is verified; without it the
@@ -1516,6 +1541,13 @@ impl AuthService {
     /// Generate refresh token and store in database (long-lived: 7 days)
     #[must_use]
     pub async fn generate_refresh_token(&self, user_id: Uuid, auth: SessionAuth) -> Result<String> {
+        let minted = self.mint_refresh_token().await?;
+        Self::store_refresh_token(&self.db_pool, user_id, auth, &minted).await?;
+        Ok(minted.token.to_string())
+    }
+
+    /// A fresh refresh token and its stored forms (no database write).
+    async fn mint_refresh_token(&self) -> Result<MintedRefreshToken> {
         // Generate token and lookup hash before any async operations
         let (refresh_token, lookup_hash, expires_at) = {
             // Generate cryptographically secure random token (32 bytes = 256 bits).
@@ -1525,7 +1557,7 @@ impl AuthService {
             let mut rng = rand::rngs::OsRng;
             let mut token_bytes = [0u8; 32];
             rng.fill_bytes(&mut token_bytes);
-            let refresh_token = hex::encode(token_bytes);
+            let refresh_token = zeroize::Zeroizing::new(hex::encode(token_bytes));
 
             // Generate lookup hash for fast queries (not for security, just for efficient lookups)
             let lookup_hash = generate_token_lookup_hash(&refresh_token);
@@ -1539,26 +1571,146 @@ impl AuthService {
         // Hash the token before storing (use spawn_blocking to avoid blocking the async executor)
         let cost = self.bcrypt_cost;
         let token_for_hash = refresh_token.clone();
-        let token_hash = tokio::task::spawn_blocking(move || hash(&token_for_hash, cost))
+        let token_hash = tokio::task::spawn_blocking(move || hash(token_for_hash.as_str(), cost))
             .await
             .context("Token hashing task panicked")??;
 
-        // Store in database with lookup hash for efficient queries
+        Ok(MintedRefreshToken {
+            token: refresh_token,
+            lookup_hash,
+            token_hash,
+            expires_at,
+        })
+    }
+
+    /// Store a minted refresh token as a new `user_sessions` row.
+    async fn store_refresh_token<'e>(
+        executor: impl sqlx::PgExecutor<'e>,
+        user_id: Uuid,
+        auth: SessionAuth,
+        minted: &MintedRefreshToken,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO user_sessions (user_id, refresh_token_hash, refresh_token_lookup_hash, expires_at, is_2fa_verified, second_factor_verified)
              VALUES ($1, $2, $3, $4, $5, $6)"
         )
         .bind(user_id)
-        .bind(&token_hash)
-        .bind(&lookup_hash)
-        .bind(expires_at)
+        .bind(&minted.token_hash)
+        .bind(&minted.lookup_hash)
+        .bind(minted.expires_at)
         .bind(auth.is_2fa_verified())
         .bind(auth.second_factor_verified())
-        .execute(&self.db_pool)
+        .execute(executor)
         .await
         .context("Failed to store refresh token")?;
+        Ok(())
+    }
 
-        Ok(refresh_token)
+    /// Run the reuse detector for a refresh token that matched no live
+    /// session, record the verdict and act on it. Every caller then refuses
+    /// the refresh with the same generic error.
+    async fn detect_token_reuse(&self, lookup_hash: &str) {
+        // TOKEN-REUSE DETECTION. If this lookup_hash matches a
+        // recently-rotated session (rotated_session_audit table),
+        // the token was VALID until rotation — someone else used
+        // it, then the client tried to refresh with the now-stale
+        // token.
+        //
+        // 5-second grace window: tabs that race a refresh on the
+        // same token can both pass bcrypt, the loser hits this
+        // path with rows_affected=0 OR the lookup_hash gone. We
+        // don't want to revoke a user's entire account because
+        // their second tab got pre-empted by 50ms. After 5s the
+        // race-condition explanation is no longer plausible —
+        // any "reuse" is either a stolen-token replay or a
+        // serious client-side bug, and revoke-all-and-re-login
+        // is the safe response.
+        let read = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
+            "SELECT user_id, rotated_at FROM rotated_session_audit \
+             WHERE lookup_hash = $1 AND expires_at > NOW()",
+        )
+        .bind(lookup_hash)
+        .fetch_optional(&self.db_pool)
+        .await;
+        // Keep the failure's text before the read is moved into the
+        // classifier; the classifier is deliberately blind to it.
+        let read_error = read.as_ref().err().map(ToString::to_string);
+
+        // One `match`, four arms, and EVERY arm records — so a
+        // detection and a non-detection are no longer identical to
+        // every dashboard and rule. `record_token_reuse` is reached
+        // from here and nowhere else.
+        match classify_token_reuse(read, Utc::now()) {
+            TokenReuseFinding::DetectorUnreadable => {
+                talos_metrics::record_token_reuse(TokenReuseOutcome::DetectorUnreadable);
+                tracing::error!(
+                    target: "talos_security_alert",
+                    event_kind = "token_reuse_detector_unreadable",
+                    error = read_error.as_deref().unwrap_or("unknown"),
+                    "Refresh-token REUSE DETECTION could not run — the \
+                     rotated_session_audit read failed. This is NOT a statement \
+                     that the token was not reused: a replayed stolen token is \
+                     indistinguishable from a stale bookmark from here, and NO \
+                     session was revoked. The refresh itself is refused either \
+                     way, so the request fails closed; the RESPONSE is what did \
+                     not happen."
+                );
+            }
+            TokenReuseFinding::NotReused => {
+                talos_metrics::record_token_reuse(TokenReuseOutcome::NotReused);
+            }
+            TokenReuseFinding::WithinGrace { user_id, age_secs } => {
+                talos_metrics::record_token_reuse(TokenReuseOutcome::WithinGrace);
+                tracing::debug!(
+                    user_id = %user_id,
+                    age_secs,
+                    grace_secs = TOKEN_REUSE_GRACE_SECS,
+                    "Token reuse within the grace window — likely tab race, not revoking"
+                );
+            }
+            TokenReuseFinding::Reused {
+                user_id: reused_user_id,
+                age_secs,
+            } => {
+                tracing::error!(
+                    target: "talos_security_alert",
+                    event_kind = "refresh_token_reuse_detected",
+                    user_id = %reused_user_id,
+                    age_secs,
+                    "Refresh-token reuse detected — revoking ALL sessions for the affected user. \
+                     Either a stolen token was replayed after the legitimate rotation, or a \
+                     client serialised a stale token to disk. Either way, force re-auth is \
+                     the safe response."
+                );
+                self.log_auth_event_best_effort(
+                    Some(reused_user_id),
+                    "refresh_token_reuse_detected",
+                    None,
+                    None,
+                    None,
+                    false,
+                    Some("rotated session refresh attempted"),
+                )
+                .await;
+                let revoked = match self.revoke_all_sessions(reused_user_id).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "talos_security_alert",
+                            event_kind = "refresh_token_reuse_revoke_failed",
+                            user_id = %reused_user_id,
+                            error = %e,
+                            "Refresh-token reuse was DETECTED and the response did NOT \
+                             happen — revoking the affected user's sessions failed, so \
+                             the replayed token's own freshly-minted session is still \
+                             alive. Revoke this user's sessions by hand."
+                        );
+                        false
+                    }
+                };
+                talos_metrics::record_token_reuse(reuse_response_outcome(revoked));
+            }
+        }
     }
 
     /// Validate refresh token and generate new access token
@@ -1603,107 +1755,7 @@ impl AuthService {
         let session = match session {
             Some(s) => s,
             None => {
-                // TOKEN-REUSE DETECTION. If this lookup_hash matches a
-                // recently-rotated session (rotated_session_audit table),
-                // the token was VALID until rotation — someone else used
-                // it, then the client tried to refresh with the now-stale
-                // token.
-                //
-                // 5-second grace window: tabs that race a refresh on the
-                // same token can both pass bcrypt, the loser hits this
-                // path with rows_affected=0 OR the lookup_hash gone. We
-                // don't want to revoke a user's entire account because
-                // their second tab got pre-empted by 50ms. After 5s the
-                // race-condition explanation is no longer plausible —
-                // any "reuse" is either a stolen-token replay or a
-                // serious client-side bug, and revoke-all-and-re-login
-                // is the safe response.
-                let read = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
-                    "SELECT user_id, rotated_at FROM rotated_session_audit \
-                     WHERE lookup_hash = $1 AND expires_at > NOW()",
-                )
-                .bind(&lookup_hash)
-                .fetch_optional(&self.db_pool)
-                .await;
-                // Keep the failure's text before the read is moved into the
-                // classifier; the classifier is deliberately blind to it.
-                let read_error = read.as_ref().err().map(ToString::to_string);
-
-                // One `match`, four arms, and EVERY arm records — so a
-                // detection and a non-detection are no longer identical to
-                // every dashboard and rule. `record_token_reuse` is reached
-                // from here and nowhere else.
-                match classify_token_reuse(read, Utc::now()) {
-                    TokenReuseFinding::DetectorUnreadable => {
-                        talos_metrics::record_token_reuse(TokenReuseOutcome::DetectorUnreadable);
-                        tracing::error!(
-                            target: "talos_security_alert",
-                            event_kind = "token_reuse_detector_unreadable",
-                            error = read_error.as_deref().unwrap_or("unknown"),
-                            "Refresh-token REUSE DETECTION could not run — the \
-                             rotated_session_audit read failed. This is NOT a statement \
-                             that the token was not reused: a replayed stolen token is \
-                             indistinguishable from a stale bookmark from here, and NO \
-                             session was revoked. The refresh itself is refused either \
-                             way, so the request fails closed; the RESPONSE is what did \
-                             not happen."
-                        );
-                    }
-                    TokenReuseFinding::NotReused => {
-                        talos_metrics::record_token_reuse(TokenReuseOutcome::NotReused);
-                    }
-                    TokenReuseFinding::WithinGrace { user_id, age_secs } => {
-                        talos_metrics::record_token_reuse(TokenReuseOutcome::WithinGrace);
-                        tracing::debug!(
-                            user_id = %user_id,
-                            age_secs,
-                            grace_secs = TOKEN_REUSE_GRACE_SECS,
-                            "Token reuse within the grace window — likely tab race, not revoking"
-                        );
-                    }
-                    TokenReuseFinding::Reused {
-                        user_id: reused_user_id,
-                        age_secs,
-                    } => {
-                        tracing::error!(
-                            target: "talos_security_alert",
-                            event_kind = "refresh_token_reuse_detected",
-                            user_id = %reused_user_id,
-                            age_secs,
-                            "Refresh-token reuse detected — revoking ALL sessions for the affected user. \
-                             Either a stolen token was replayed after the legitimate rotation, or a \
-                             client serialised a stale token to disk. Either way, force re-auth is \
-                             the safe response."
-                        );
-                        self.log_auth_event_best_effort(
-                            Some(reused_user_id),
-                            "refresh_token_reuse_detected",
-                            None,
-                            None,
-                            None,
-                            false,
-                            Some("rotated session refresh attempted"),
-                        )
-                        .await;
-                        let revoked = match self.revoke_all_sessions(reused_user_id).await {
-                            Ok(_) => true,
-                            Err(e) => {
-                                tracing::error!(
-                                    target: "talos_security_alert",
-                                    event_kind = "refresh_token_reuse_revoke_failed",
-                                    user_id = %reused_user_id,
-                                    error = %e,
-                                    "Refresh-token reuse was DETECTED and the response did NOT \
-                                     happen — revoking the affected user's sessions failed, so \
-                                     the replayed token's own freshly-minted session is still \
-                                     alive. Revoke this user's sessions by hand."
-                                );
-                                false
-                            }
-                        };
-                        talos_metrics::record_token_reuse(reuse_response_outcome(revoked));
-                    }
-                }
+                self.detect_token_reuse(&lookup_hash).await;
                 // Same generic error in either case — don't tip the attacker off
                 // with a different response on detection.
                 return Err(anyhow!("Invalid or expired refresh token"));
@@ -1807,55 +1859,69 @@ impl AuthService {
         // Get user
         let user = self.get_user(user_id).await?;
 
-        // Atomically update last_used_at AND verify the session was not revoked between
-        // the initial SELECT and this UPDATE. If rows_affected == 0 the session row was
-        // deleted (revoked) in the window while bcrypt was running — reject the request.
-        let updated = sqlx::query_scalar::<_, Uuid>(
-            "UPDATE user_sessions SET last_used_at = NOW() WHERE id = $1 RETURNING id",
+        // Hash the replacement before the transaction so no bcrypt runs while
+        // the old session's row is locked.
+        let minted = self.mint_refresh_token().await?;
+
+        // Rotate in ONE transaction: CONSUME the old session (the row lock
+        // serialises two uses of one token), store the new one, and arm the
+        // reuse detector. A concurrent use that loses the consume finds zero
+        // rows and is judged by the reuse detector — it never mints a second
+        // session. A failed consume or insert fails the refresh; nothing is
+        // left half-rotated.
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("Failed to begin refresh rotation")?;
+        let consumed = sqlx::query_scalar::<_, Uuid>(
+            "DELETE FROM user_sessions WHERE id = $1 AND expires_at > NOW() RETURNING id",
         )
         .bind(session_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await
-        .context("Failed to update session last_used_at")?;
-
-        if updated.is_none() {
-            return Err(anyhow!("Refresh token has been revoked"));
+        .context("Failed to consume refresh session")?;
+        if consumed.is_none() {
+            // Revoked, or rotated by a concurrent use of the same token while
+            // this one ran its bcrypt.
+            drop(tx);
+            self.detect_token_reuse(&lookup_hash).await;
+            return Err(anyhow!("Invalid or expired refresh token"));
         }
-
-        // Generate new access token
-        let access_token = self.generate_access_token(&user, auth)?;
-
-        // Rotate the refresh token: issue a new one, then delete the old session.
-        //
-        // Order matters: insert-then-delete ensures we never have zero valid sessions for
-        // the user. If the insert fails we abort and the original session remains intact.
-        // If the delete fails after a successful insert, the user will have two valid
-        // sessions briefly — acceptable since the old token expires within 7 days and
-        // the lookup-hash fast path prevents O(N·bcrypt) scanning of stale rows.
-        let new_refresh_token = self.generate_refresh_token(user.id, auth).await?;
+        Self::store_refresh_token(&mut *tx, user.id, auth, &minted).await?;
 
         // Record this lookup_hash in the rotated_session_audit table so a
         // future refresh attempt with the (now-stale) original token can be
         // recognised as token-reuse rather than a generic "expired" miss.
         // The audit row is meaningful for the duration of the original
         // token's expiry window — set expires_at to now + 7d to match
-        // generate_refresh_token's TTL.
+        // generate_refresh_token's TTL. Under a SAVEPOINT so a failed arm
+        // stays non-fatal (see below) without aborting the rotation.
         let audit_expires = Utc::now() + Duration::days(7);
-        match sqlx::query(
-            "INSERT INTO rotated_session_audit (lookup_hash, user_id, expires_at) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (lookup_hash) DO NOTHING",
-        )
-        .bind(&lookup_hash)
-        .bind(user.id)
-        .bind(audit_expires)
-        .execute(&self.db_pool)
-        .await
-        {
+        let armed = async {
+            let mut sp = sqlx::Acquire::begin(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO rotated_session_audit (lookup_hash, user_id, expires_at) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (lookup_hash) DO NOTHING",
+            )
+            .bind(&lookup_hash)
+            .bind(user.id)
+            .bind(audit_expires)
+            .execute(&mut *sp)
+            .await?;
+            sp.commit().await
+        }
+        .await;
+        tx.commit()
+            .await
+            .context("Failed to commit refresh rotation")?;
+
+        match armed {
             // The detector is ARMED for this token: a later replay of it is
             // now recognisable. Counted on the success path too, because the
             // failure series below is unreadable without a denominator.
-            Ok(_) => {
+            Ok(()) => {
                 talos_metrics::record_rotation_audit_arm(RotationAuditArmOutcome::Armed);
             }
             // Non-fatal — reuse detection is defence-in-depth, not a hard
@@ -1878,19 +1944,9 @@ impl AuthService {
             }
         }
 
-        // Best-effort deletion of the old session. Failure is logged but does not prevent
-        // the caller from proceeding with the new token pair.
-        if let Err(e) = sqlx::query("DELETE FROM user_sessions WHERE id = $1")
-            .bind(session_id)
-            .execute(&self.db_pool)
-            .await
-        {
-            tracing::warn!(
-                session_id = %session_id,
-                "Failed to delete rotated refresh token session (non-fatal): {}",
-                e
-            );
-        }
+        // Generate new access token
+        let access_token = self.generate_access_token(&user, auth)?;
+        let new_refresh_token = minted.token.to_string();
 
         // Log refresh event
         self.log_auth_event_best_effort(
@@ -2309,12 +2365,15 @@ impl AuthService {
         validate_password(new_password)
             .map_err(|e| PasswordChangeError::PolicyRejected(e.to_string()))?;
 
+        // Claim the attempt slot before the verify — same rule as login.
+        let Some(attempt) = self.claim_password_attempt(user_id).await? else {
+            return Err(PasswordChangeError::Locked);
+        };
         if !self
             .password_matches(current_password, &user.password_hash)
             .await?
         {
-            let attempts = self.record_wrong_password(user_id).await?;
-            return Err(if attempts >= MAX_PASSWORD_ATTEMPTS {
+            return Err(if attempt >= MAX_PASSWORD_ATTEMPTS {
                 PasswordChangeError::Locked
             } else {
                 PasswordChangeError::WrongCurrentPassword
@@ -2325,6 +2384,9 @@ impl AuthService {
             .password_matches(new_password, &user.password_hash)
             .await?
         {
+            // The current password was proven: the claimed slot is released
+            // as on a successful login.
+            self.clear_password_attempts(user_id).await?;
             return Err(PasswordChangeError::Unchanged);
         }
 

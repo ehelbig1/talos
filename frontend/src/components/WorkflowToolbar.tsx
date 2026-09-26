@@ -35,6 +35,7 @@ import {
 } from "@/generated/graphql";
 import { ControlFlowMenu } from "@/components/builder/ControlFlowMenu";
 import { toast } from "sonner";
+import { userFacingErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
 
 // Sub-components
@@ -129,7 +130,8 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
       queryClient.invalidateQueries({ queryKey: ["Workflows"] });
       window.dispatchEvent(new CustomEvent("workflowDeleted"));
     },
-    onError: () => toast.error("Failed to delete workflow"),
+    onError: (err) =>
+      toast.error(userFacingErrorMessage(err, "Failed to delete workflow")),
   });
 
   useEffect(() => {

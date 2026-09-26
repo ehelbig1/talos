@@ -448,7 +448,7 @@ async fn handle_list_secret_usage(
                     "rotation_note": "Vault-first resolution per call (post r306) — a value changed via the dashboard or the GraphQL `updateSecret` mutation propagates without restart. Tier-1 actors skip this path entirely.",
                 }),
                 serde_json::json!({
-                    "consumer": "Engine job dispatch (ParallelWorkflowEngine::build_encrypted_secrets)",
+                    "consumer": "Engine job dispatch (secrets_pipeline::build_encrypted_secrets_for)",
                     "purpose": "Pre-fetched into every job's encrypted_secrets so guest LLM Inference modules can resolve the key via the host llm:: WIT interface (Tier-2 actors only).",
                     "rotation_safe": true,
                     "rotation_note": "Resolved per-dispatch from the same vault cache; rotation lands on the next dispatch.",
@@ -867,6 +867,14 @@ async fn handle_normalize_secret_paths(
 /// embeds their own user_id. Returns a structured outcome so workflow
 /// authors debugging 401s have an observable signal for whether the
 /// refresh layer actually ran.
+/// The ONE caller-facing sentence for a failed manual OAuth refresh. Fixed
+/// text: the underlying error (DB / provider detail) goes to the log only.
+const OAUTH_REFRESH_FAILED_MESSAGE: &str =
+    "OAuth refresh failed. Common causes: (1) missing env vars \
+     (GOOGLE_CLIENT_ID/SECRET, ATLASSIAN_CLIENT_ID/SECRET); (2) the refresh_token is revoked \
+     (user needs to re-authorize); (3) the integration_credentials row is missing or marked \
+     is_active=false. Details are in the controller log (target talos_oauth_refresh).";
+
 async fn handle_refresh_oauth_token(
     req_id: Option<Value>,
     args: &Value,
@@ -945,14 +953,25 @@ async fn handle_refresh_oauth_token(
                 error = %e,
                 "manual refresh_oauth_token failed"
             );
-            mcp_error(
-                req_id,
-                -32000,
-                &format!(
-                    "OAuth refresh failed: {}. Common causes: (1) missing env vars (GOOGLE_CLIENT_ID/SECRET, ATLASSIAN_CLIENT_ID/SECRET); (2) the refresh_token is revoked (user needs to re-authorize); (3) the integration_credentials row is missing or marked is_active=false.",
-                    e
-                ),
-            )
+            // The error chain can carry database / provider text; it is logged
+            // above and never echoed to the caller.
+            mcp_error(req_id, -32000, OAUTH_REFRESH_FAILED_MESSAGE)
         }
+    }
+}
+
+#[cfg(test)]
+mod oauth_refresh_message_tests {
+    /// SOURCE PIN (textual): the refresh failure reply is the fixed sentence,
+    /// never the error chain (which can carry DB / provider text).
+    #[test]
+    fn refresh_failure_does_not_echo_the_error() {
+        let src = include_str!("secrets.rs");
+        let at = src.find("async fn handle_refresh_oauth_token").unwrap();
+        let body = &src[at..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("mcp_error(req_id, -32000, OAUTH_REFRESH_FAILED_MESSAGE)"));
+        assert!(!body.contains(&format!("OAuth refresh failed: {}", "{}")));
+        assert!(!super::OAUTH_REFRESH_FAILED_MESSAGE.contains('{'));
     }
 }

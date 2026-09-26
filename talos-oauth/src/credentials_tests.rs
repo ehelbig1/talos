@@ -141,4 +141,28 @@ mod tests {
         let err = anyhow::anyhow!("the requested calendar already exists upstream");
         assert!(!is_pg_unique_violation(&err));
     }
+
+    #[test]
+    fn only_invalid_grant_marks_a_credential_for_reauth() {
+        use crate::credentials::refresh_error_is_revoked_grant as revoked;
+        assert!(revoked(
+            r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#
+        ));
+        assert!(!revoked(r#"{"error":"invalid_client"}"#));
+        assert!(!revoked(r#"{"error":"temporarily_unavailable"}"#));
+        assert!(!revoked("<html>502 Bad Gateway</html>"));
+        assert!(!revoked(""));
+    }
+
+    /// Source pins: a revoked grant is skipped by the proactive task and by
+    /// every later refresh, and a re-link clears the stamp.
+    #[test]
+    fn revoked_grants_are_skipped_until_relinked() {
+        let task = include_str!("refresh_task.rs");
+        assert!(task.contains("AND needs_reauth_at IS NULL"));
+        assert!(task.contains("LIMIT $2"));
+        let creds = include_str!("credentials.rs");
+        assert!(creds.contains("needs_reauth_at = NULL,"));
+        assert!(creds.contains("SET needs_reauth_at = NOW()"));
+    }
 }

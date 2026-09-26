@@ -327,9 +327,17 @@ impl JobNonceCache {
         }
     }
 
-    /// Returns `true` if the nonce is fresh (and atomically records it),
-    /// `false` if it's a replay within the freshness window.
+    /// Test shorthand: `true` only when [`Self::admit`] admitted the nonce.
+    #[cfg(test)]
     fn check_and_record(&self, nonce: &str, ts: u64, max_age_secs: u64) -> bool {
+        self.admit(nonce, ts, max_age_secs) == NonceAdmission::Fresh
+    }
+
+    /// Record `nonce` if it is fresh. Refuses a replay, and refuses (fails
+    /// closed) when the cache is still at [`NONCE_CACHE_HARD_CAP`] after the
+    /// emergency sweep — admitting it anyway would let a flood grow the map
+    /// without bound, and evicting a live entry would open a replay hole.
+    fn admit(&self, nonce: &str, ts: u64, max_age_secs: u64) -> NonceAdmission {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -366,7 +374,7 @@ impl JobNonceCache {
                 .store(0, std::sync::atomic::Ordering::Relaxed);
         }
         if g.contains_key(nonce) {
-            return false;
+            return NonceAdmission::Replay;
         }
         // Hard cap: if rate × 2× retention exceeds 200k entries, we're under
         // abnormal load (or a flood). Drop everything older than the strict
@@ -376,13 +384,31 @@ impl JobNonceCache {
         if g.len() >= NONCE_CACHE_HARD_CAP {
             let aggressive_cutoff = now.saturating_sub(retention);
             g.retain(|_, t| *t > aggressive_cutoff);
+            if g.len() >= NONCE_CACHE_HARD_CAP {
+                return NonceAdmission::CacheFull;
+            }
         }
         g.insert(nonce.to_string(), ts);
         self.inserts_since_sweep
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        true
+        NonceAdmission::Fresh
     }
 }
+
+/// Outcome of recording a nonce in the shared replay cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonceAdmission {
+    Fresh,
+    Replay,
+    /// Every live entry is still inside its retention window and the map is
+    /// at the hard cap — refused rather than grown or evicted.
+    CacheFull,
+}
+
+/// Upper bound on a signed message's nonce (`"<unix_secs>:<hex>"`). Producers
+/// emit ≤ 53 bytes (20-digit u64, `:`, 32 hex); the nonce is stored in the
+/// replay cache, so an unbounded one is a memory lever for any signer.
+const MAX_SIGNED_NONCE_LEN: usize = 96;
 
 static JOB_NONCE_CACHE: std::sync::LazyLock<JobNonceCache> =
     std::sync::LazyLock::new(JobNonceCache::new);
@@ -391,8 +417,8 @@ static JOB_NONCE_CACHE: std::sync::LazyLock<JobNonceCache> =
 /// within the freshness window. Returns `true` on first observation
 /// (and atomically records it), `false` on replay. Used by every
 /// `verify()` impl in this crate after HMAC verification succeeds.
-fn check_and_record_job_nonce(nonce: &str, ts: u64, max_age_secs: u64) -> bool {
-    JOB_NONCE_CACHE.check_and_record(nonce, ts, max_age_secs)
+fn check_and_record_job_nonce(nonce: &str, ts: u64, max_age_secs: u64) -> NonceAdmission {
+    JOB_NONCE_CACHE.admit(nonce, ts, max_age_secs)
 }
 
 /// Current entry count of the process-local job-nonce replay cache.
@@ -1449,6 +1475,12 @@ trait SignedMessage {
     /// orders are otherwise equivalent, differing only in WHICH error
     /// string is returned for a nonce malformed in both ways at once.)
     fn check_freshness_window(&self, max_age_secs: u64) -> Result<u64, VerifyError> {
+        if self.nonce().len() > MAX_SIGNED_NONCE_LEN {
+            return Err(VerifyError::new(
+                VerifyFailureKind::MalformedNonce,
+                format!("oversized {}", Self::NONCE_LABEL),
+            ));
+        }
         let parts: Vec<&str> = self.nonce().splitn(2, ':').collect();
         if parts.len() != 2 {
             return Err(VerifyError::new(
@@ -1612,17 +1644,27 @@ trait SignedMessage {
         // this check, anyone with NATS-publish access can capture a
         // signed message and re-fire it any number of times until
         // ts + max_age_secs expires.
-        if !check_and_record_job_nonce(self.nonce(), ts, max_age_secs) {
-            return Err(VerifyError::new(
+        match check_and_record_job_nonce(self.nonce(), ts, max_age_secs) {
+            NonceAdmission::Fresh => Ok(()),
+            NonceAdmission::Replay => Err(VerifyError::new(
                 VerifyFailureKind::Replay,
                 format!(
                     "{} already seen (replay attempt within {}-second window)",
                     Self::NONCE_LABEL,
                     max_age_secs
                 ),
-            ));
+            )),
+            // Classed with Replay (the replay guard refused it); the message
+            // says why, so it is not mistaken for a duplicate.
+            NonceAdmission::CacheFull => Err(VerifyError::new(
+                VerifyFailureKind::Replay,
+                format!(
+                    "{} refused: replay cache full ({} live entries) — failing closed",
+                    Self::NONCE_LABEL,
+                    NONCE_CACHE_HARD_CAP
+                ),
+            )),
         }
-        Ok(())
     }
 
     /// Shared primary-verifier core: [`Self::verify_no_replay_core`] plus
@@ -1735,6 +1777,32 @@ fn clear_job_nonce_cache_for_test() {
 /// test must not poison the mutex and convert one failure into N.
 #[cfg(test)]
 pub(crate) static NONCE_CACHE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// At the hard cap with every entry still live, the cache refuses rather than
+/// growing past the cap (pre-fix it swept nothing and inserted anyway).
+#[cfg(test)]
+#[test]
+fn a_full_nonce_cache_fails_closed() {
+    let cache = JobNonceCache::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    {
+        let mut g = cache.seen.lock().unwrap();
+        for i in 0..NONCE_CACHE_HARD_CAP {
+            g.insert(format!("live-{i}"), now);
+        }
+    }
+    assert_eq!(cache.admit("new", now, 300), NonceAdmission::CacheFull);
+    assert_eq!(cache.admit("live-7", now, 300), NonceAdmission::Replay);
+    assert_eq!(cache.seen.lock().unwrap().len(), NONCE_CACHE_HARD_CAP);
+    // Once the entries age out, the emergency sweep frees room again.
+    for t in cache.seen.lock().unwrap().values_mut() {
+        *t = now - 10_000;
+    }
+    assert_eq!(cache.admit("new", now, 300), NonceAdmission::Fresh);
+}
 
 /// The shared nonce cache is cross-type: a narrow verifier must never sweep
 /// away a wider verifier's live nonces.
@@ -3584,7 +3652,7 @@ mod full_tier_reservation_tests {
 /// legitimate value (a job with no secrets), but it must be constructed
 /// via the explicitly-named [`EncryptedSecrets::empty`] so it can never
 /// arise by *accident* — e.g. `encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty()` in
-/// a dispatch path that should have called `build_encrypted_secrets()`,
+/// a dispatch path that should have called `secrets_pipeline::build_encrypted_secrets_for`,
 /// which silently strips a module's secret access (the real loop-node
 /// bug, 2026-04-16). This makes lint check 17 a compiler guarantee: the
 /// empty case now costs a deliberate `::empty()` at the call site.
@@ -3601,7 +3669,7 @@ impl EncryptedSecrets {
     /// secrets. Deliberately named (not `Default`) so choosing "no
     /// secrets" is always an explicit decision at the call site. If a
     /// module is *expected* to have secrets, do NOT use this — go through
-    /// the engine's `build_encrypted_secrets()` prefetch instead.
+    /// the engine's `secrets_pipeline::build_encrypted_secrets_for` prefetch instead.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -3717,17 +3785,19 @@ impl EncryptedSecrets {
             ));
         }
 
-        let plaintext =
-            serde_json::to_vec(secrets).map_err(|e| format!("serialize secrets: {e}"))?;
+        // Plaintext buffer and subkey are wiped on drop (every return path).
+        let plaintext = zeroize::Zeroizing::new(
+            serde_json::to_vec(secrets).map_err(|e| format!("serialize secrets: {e}"))?,
+        );
 
         // The AES-GCM key is an HKDF subkey of the root, never the raw
         // root (which is also the HMAC signing key). v2: a non-empty `aad`
         // folds the per-job context into the subkey so the random-nonce
         // budget is per-job. Encrypt and decrypt derive it identically, so
         // the round-trip stays symmetric.
-        let aead_key = envelope_seal_key(key, aad);
-        let cipher =
-            Aes256Gcm::new_from_slice(&aead_key).map_err(|e| format!("create cipher: {e}"))?;
+        let aead_key = zeroize::Zeroizing::new(envelope_seal_key(key, aad));
+        let cipher = Aes256Gcm::new_from_slice(aead_key.as_slice())
+            .map_err(|e| format!("create cipher: {e}"))?;
 
         // OsRng (CSPRNG via getrandom) for nonce parity with the rest of
         // the Talos signing surface — see talos-memory/src/rpc_auth.rs's
@@ -3743,7 +3813,7 @@ impl EncryptedSecrets {
             .encrypt(
                 nonce,
                 Payload {
-                    msg: plaintext.as_ref(),
+                    msg: plaintext.as_slice(),
                     aad,
                 },
             )
@@ -3796,18 +3866,20 @@ impl EncryptedSecrets {
         // envelope.) For an empty `aad` there is only the v1 key. AES-GCM's
         // tag makes the extra attempt safe — a wrong key cannot forge a
         // passing tag. `aad` is bound into the tag on every attempt.
-        let candidates: Vec<[u8; 32]> = if aad.is_empty() {
-            vec![derive_envelope_aead_key_v1(key)]
+        let candidates: Vec<zeroize::Zeroizing<[u8; 32]>> = if aad.is_empty() {
+            vec![zeroize::Zeroizing::new(derive_envelope_aead_key_v1(key))]
         } else {
             vec![
-                derive_envelope_aead_key_v2(key, aad),
-                derive_envelope_aead_key_v1(key),
+                zeroize::Zeroizing::new(derive_envelope_aead_key_v2(key, aad)),
+                zeroize::Zeroizing::new(derive_envelope_aead_key_v1(key)),
             ]
         };
 
         for aead_key in candidates {
-            let cipher =
-                Aes256Gcm::new_from_slice(&aead_key).map_err(|e| format!("create cipher: {e}"))?;
+            let cipher = Aes256Gcm::new_from_slice(aead_key.as_slice())
+                .map_err(|e| format!("create cipher: {e}"))?;
+            // The decrypted JSON buffer is wiped once parsed. (The returned
+            // map holds plain Strings — its owner is responsible for it.)
             if let Ok(plaintext) = cipher.decrypt(
                 nonce,
                 Payload {
@@ -3815,7 +3887,8 @@ impl EncryptedSecrets {
                     aad,
                 },
             ) {
-                return serde_json::from_slice(&plaintext)
+                let plaintext = zeroize::Zeroizing::new(plaintext);
+                return serde_json::from_slice(plaintext.as_slice())
                     .map_err(|e| format!("deserialize secrets: {e}"));
             }
         }
@@ -10287,6 +10360,19 @@ mod tests {
             err.contains("too old"),
             "verify_no_replay must reject stale nonce before HMAC; got: {err}"
         );
+    }
+
+    #[test]
+    fn job_request_verify_rejects_an_oversized_nonce() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.sign(&key).unwrap();
+        let ts = req.job_nonce.split(':').next().unwrap().to_string();
+        // Well-formed and fresh, but long enough to be a memory lever once
+        // recorded. Refused before the MAC, so it never reaches the cache.
+        req.job_nonce = format!("{ts}:{}", "ab".repeat(64));
+        let err = req.verify_no_replay(&key, 300).unwrap_err();
+        assert!(err.contains("oversized"), "got: {err}");
     }
 
     #[test]

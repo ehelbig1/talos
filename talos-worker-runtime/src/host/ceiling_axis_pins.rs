@@ -24,7 +24,7 @@ fn declared_axes() -> Vec<(String, String)> {
     let inferred = format!("CeilingAxis::{}", "VerbInferred");
     let categorical = format!("CeilingAxis::{}", "Categorical");
 
-    let files: [&str; 10] = [
+    let files: [&str; 11] = [
         include_str!("http.rs"),
         // The raw `wasi:http` gate (trusted world, 2026-09-25): a second
         // `http-fetch` site on the verb axis, so the op SET is unchanged.
@@ -37,6 +37,8 @@ fn declared_axes() -> Vec<(String, String)> {
         include_str!("database.rs"),
         include_str!("object_storage.rs"),
         include_str!("integration_state.rs"),
+        // Agent orchestration reuses the messaging op labels (2026-09-25).
+        include_str!("orchestration.rs"),
     ];
 
     let mut out = Vec::new();

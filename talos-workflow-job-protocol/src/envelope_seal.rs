@@ -210,7 +210,7 @@ impl WorkerEphemeral {
     /// controller's `epk_c`, re-derives the AES key, and AEAD-opens the
     /// ciphertext under the same `(exec_id, worker_id, epk_w)` AAD. The
     /// ephemeral secret is consumed (single-use → forward secrecy). Returns the
-    /// plaintext secrets JSON. Fails closed on a non-contributory shared secret,
+    /// plaintext secrets JSON, wiped on drop. Fails closed on a non-contributory shared secret,
     /// a wrong `epk_c`, or any AAD mismatch (wrong execution/worker/key).
     pub fn open(
         self,
@@ -219,7 +219,7 @@ impl WorkerEphemeral {
         worker_id: &str,
         ciphertext: &[u8],
         nonce: &[u8; 12],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
         let peer = PublicKey::from(*epk_c);
         let ss = self.secret.diffie_hellman(&peer);
         let mut key = derive_seal_key(&ss, exec_id)?;
@@ -234,6 +234,7 @@ impl WorkerEphemeral {
                     aad: &aad,
                 },
             )
+            .map(zeroize::Zeroizing::new)
             .map_err(|_| "AES-GCM open failed (wrong key or tampered ciphertext)".to_string());
         key.zeroize();
         plaintext
@@ -512,7 +513,7 @@ mod tests {
                 &sealed.nonce,
             )
             .unwrap();
-        assert_eq!(opened, secret);
+        assert_eq!(opened.as_slice(), secret);
     }
 
     #[test]

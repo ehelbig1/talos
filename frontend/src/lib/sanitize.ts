@@ -97,3 +97,37 @@ export function sanitizeErrorMessage(message: string): string {
 
   return sanitized;
 }
+
+/**
+ * A server error the API explicitly marked user-facing (`extensions.safe`,
+ * set by `.extend_safe()`). The production whitelist above would reduce
+ * "Invalid 2FA code" or a delete refusal naming its referencing workflows to
+ * a generic string; the server already chose these for display.
+ */
+export class DisplaySafeError extends Error {
+  readonly displaySafe = true;
+  constructor(message: string) {
+    super(capDisplayText(message));
+    this.name = "DisplaySafeError";
+  }
+}
+
+const MAX_DISPLAY_LEN = 500;
+
+/** Control characters out, length capped — the only processing a
+ *  server-marked message gets. */
+function capDisplayText(message: string): string {
+  // eslint-disable-next-line no-control-regex
+  const clean = message.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  return clean.length > MAX_DISPLAY_LEN
+    ? clean.slice(0, MAX_DISPLAY_LEN) + "…"
+    : clean;
+}
+
+/** The message to show for a caught error: verbatim when the server marked
+ *  it safe, otherwise through `sanitizeErrorMessage`, else `fallback`. */
+export function userFacingErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof DisplaySafeError) return err.message || fallback;
+  const raw = err instanceof Error ? err.message : "";
+  return sanitizeErrorMessage(raw) || fallback;
+}

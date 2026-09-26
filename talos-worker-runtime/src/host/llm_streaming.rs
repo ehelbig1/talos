@@ -137,7 +137,7 @@ impl TalosContext {
             // caps).
             use futures_util::StreamExt;
             let mut byte_stream = response.bytes_stream();
-            let mut buffer = String::new();
+            let mut lines = super::line_reader::LineReader::new(MAX_LLM_STREAM_BUFFER_BYTES);
 
             // MCP-1215: idle-between-chunks timeout. Both major
             // providers emit something within seconds (Anthropic
@@ -168,17 +168,12 @@ impl TalosContext {
                         return;
                     }
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                // MCP-1113: cap the no-newline accumulator. A
-                // misbehaving provider streaming a long line without `\n`
-                // would otherwise grow `buffer` monotonically until
-                // worker OOM. Same shape as the sibling SSE consumer
-                // at line ~10186 (TALOS_SSE_MAX_EVENT_BYTES).
-                if buffer.len() > MAX_LLM_STREAM_BUFFER_BYTES {
+                // MCP-1113: cap the no-newline accumulator (shared byte-level
+                // reader — see `host::line_reader`).
+                if let Err(e) = lines.push(&chunk) {
                     tracing::warn!(
                         max_bytes = MAX_LLM_STREAM_BUFFER_BYTES,
-                        actual_bytes = buffer.len(),
+                        actual_bytes = e.tail_bytes,
                         "LLM SSE buffer exceeded max bytes with no newline; aborting stream"
                     );
                     let _ = tx
@@ -194,12 +189,11 @@ impl TalosContext {
                 // provider's wire framing into canonical events; the
                 // channel JSON protocol below is unchanged from the
                 // pre-trait code so `next_event` needs no changes.
-                while let Some(line_end) = buffer.find('\n') {
-                    let line = buffer[..line_end].trim().to_string();
-                    buffer = buffer[line_end + 1..].to_string();
+                while let Some(line) = lines.next_line() {
+                    let line = line.trim();
 
                     let mut events = Vec::new();
-                    decoder.feed_line(&line, &mut events);
+                    decoder.feed_line(line, &mut events);
                     for ev in events {
                         match ev {
                             llm_providers::StreamEventOut::TextDelta(t) => {

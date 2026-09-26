@@ -484,7 +484,9 @@ pub(crate) const MAX_INBOUND_HEADER_VALUE_BYTES: usize = 16 * 1024;
 ///    point it at internal IPs. This flag trusts that explicitly-listed
 ///    hostnames have stable, operator-controlled DNS.
 ///
-/// Read once at startup. Restart the worker after changing the env var.
+/// Read per call (an env lookup), and read by BOTH the host-fn pre-checks
+/// and the connect-time `SsrfFilteringResolver` through this one function,
+/// so the two layers cannot disagree. Warns once per process.
 // MCP-1060 (2026-05-15): routed through the canonical
 // `bool_env_or_default` helper rather than an inline `matches!` copy.
 // This site originally accepted `1 | true | yes | on` — the canonical
@@ -492,38 +494,75 @@ pub(crate) const MAX_INBOUND_HEADER_VALUE_BYTES: usize = 16 * 1024;
 // negation, which is a strict-superset behaviour change (operators
 // who set `=off` previously got `false` via the no-match arm; same
 // result now via the recognised-falsy arm).
-pub(crate) static ALLOW_PRIVATE_HOST_TARGETS: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| {
-        let raw_enabled =
-            talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false);
-        // wasm-security-review (2026-05-22): refuse to honour the flag
-        // in production. The flag is a dev-only convenience (reaching
-        // `host.docker.internal` etc.) and shouldn't widen the SSRF
-        // blast radius on a production deployment. Matches the
-        // `ssrf_resolver` production gate so the two layers agree on
-        // when the bypass is actually live.
-        let is_prod = talos_config::is_production();
-        let enabled = raw_enabled && !is_prod;
-        if raw_enabled && is_prod {
-            tracing::warn!(
-                "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true is ignored in production. \
-                 The env toggle is dev-only — unset it on this deployment, or \
-                 unset RUST_ENV=production if this is a single-pod dev cluster."
-            );
-        } else if enabled {
-            // L-2: structured WARN at first lookup so operators see in
-            // dev logs that the SSRF defense is relaxed. The flag is a
-            // "trust me, I know what I'm doing" escape hatch — it
-            // should be visible at runtime, not silent.
-            tracing::warn!(
-                "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true — \
-                 SSRF defense relaxed for hostnames in allowed_hosts. \
-                 IP literals to private ranges remain blocked. \
-                 Dev-only — production deployments ignore this flag."
-            );
-        }
-        enabled
-    });
+pub(crate) fn allow_private_host_targets() -> bool {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let raw_enabled = talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false);
+    // wasm-security-review (2026-05-22): refuse to honour the flag
+    // in production. The flag is a dev-only convenience (reaching
+    // `host.docker.internal` etc.) and shouldn't widen the SSRF
+    // blast radius on a production deployment.
+    let is_prod = talos_config::is_production();
+    let enabled = raw_enabled && !is_prod;
+    if raw_enabled {
+        WARNED.call_once(|| {
+            if is_prod {
+                tracing::warn!(
+                    "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true is ignored in production. \
+                     The env toggle is dev-only — unset it on this deployment, or \
+                     unset RUST_ENV=production if this is a single-pod dev cluster."
+                );
+            } else {
+                // L-2: visible at runtime, not silent.
+                tracing::warn!(
+                    "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true — \
+                     SSRF defense relaxed for hostnames in allowed_hosts. \
+                     IP literals to private ranges remain blocked. \
+                     Dev-only — production deployments ignore this flag."
+                );
+            }
+        });
+    }
+    enabled
+}
+
+/// Whether `host` is named EXPLICITLY (not via `*`) in `allowed_hosts` — the
+/// per-execution half of the private-host bypass. Case-insensitive and
+/// trailing-dot-insensitive, matching `host_allowlist_match_kind` and the
+/// connect-time resolver (which lowercases), so the host-fn pre-check and the
+/// resolver cannot disagree about one request.
+pub(crate) fn host_explicitly_allowed(allowed_hosts: &[String], host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    allowed_hosts
+        .iter()
+        .filter(|p| p.as_str() != "*")
+        .any(|p| p.trim_end_matches('.').eq_ignore_ascii_case(host))
+}
+
+/// The ONE reader of the private-host bypass for the host-function
+/// pre-checks: the env toggle (already refused in production by
+/// [`allow_private_host_targets`]) AND an explicit allowlist entry.
+pub(crate) fn private_host_bypass_applies(allowed_hosts: &[String], host: &str) -> bool {
+    allow_private_host_targets() && host_explicitly_allowed(allowed_hosts, host)
+}
+
+#[cfg(test)]
+mod private_host_bypass_tests {
+    use super::host_explicitly_allowed;
+
+    #[test]
+    fn explicit_match_is_case_and_trailing_dot_insensitive() {
+        let allowed = vec!["Host.Docker.Internal".to_string()];
+        assert!(host_explicitly_allowed(&allowed, "host.docker.internal"));
+        assert!(host_explicitly_allowed(&allowed, "HOST.DOCKER.INTERNAL."));
+        assert!(!host_explicitly_allowed(&allowed, "other.internal"));
+    }
+
+    #[test]
+    fn wildcard_never_counts_as_explicit() {
+        assert!(!host_explicitly_allowed(&["*".to_string()], "anything"));
+        assert!(!host_explicitly_allowed(&[], "anything"));
+    }
+}
 
 #[cfg(test)]
 mod reserved_topic_prefix_tests {

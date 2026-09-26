@@ -157,13 +157,41 @@ export function refreshSession(): Promise<RefreshOutcome> {
   if (activeRefresh) return activeRefresh;
   activeRefresh = doRefresh()
     .then((outcome) => {
-      if (outcome.refreshed) refreshEpoch += 1;
+      if (outcome.refreshed) {
+        refreshEpoch += 1;
+        recordRefreshTime(Date.now());
+      }
       return outcome;
     })
     .finally(() => {
       activeRefresh = null;
     });
   return activeRefresh;
+}
+
+/**
+ * When ANY tab of this browser last refreshed successfully. The cookies are
+ * shared by every tab, so the 14-minute timer uses this to skip a refresh
+ * another tab already made. A timestamp only; storage failure reads as
+ * "unknown" and costs at most one extra refresh.
+ */
+export const LAST_REFRESH_STORAGE_KEY = "talos_session_refreshed_at";
+
+function recordRefreshTime(at: number): void {
+  try {
+    localStorage.setItem(LAST_REFRESH_STORAGE_KEY, String(at));
+  } catch {
+    // Private mode / blocked storage: the timer falls back to its own clock.
+  }
+}
+
+export function lastRefreshTime(): number | null {
+  try {
+    const raw = Number(localStorage.getItem(LAST_REFRESH_STORAGE_KEY));
+    return Number.isFinite(raw) && raw > 0 ? raw : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

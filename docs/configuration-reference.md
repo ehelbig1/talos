@@ -103,13 +103,14 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `BCRYPT_COST` | `12` | controller | Bcrypt cost factor for password hashing | 🔒 (tuning) |
 | `API_KEY_BCRYPT_COST` | built-in default | talos-api-keys | Bcrypt cost for API-key hashing | 🔒 (tuning) |
 | `TOTP_ISSUER` | `Talos` | controller | TOTP issuer label shown in authenticator apps | |
-| `BOOTSTRAP_FIRST_USER_EMAIL` | none (optional) | controller | Pin the first bootstrap admin user email (`talos-auth`) | |
+| `BOOTSTRAP_FIRST_USER_EMAIL` | none (optional) | controller | Pin the first-user `automation-node` promotion to this email (`talos-auth`). Honoured only for an account that proves it owns the address — an OAuth sign-in with that provider-verified email (a password signup verifies nothing and never qualifies; grant by hand with `grantCapabilityCeiling` instead). An unparsable value REFUSES the promotion (no first-user-wins fallback). Unset = first user wins | |
 
 ### Encryption keys / Vault (KEK/DEK)
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
 | `TALOS_MASTER_KEY` (+`_FILE`) | required when `KEK_PROVIDER=env`, AND under `KEK_PROVIDER=vault` unless `KEK_DISABLE_LEGACY=true` (the legacy dual-wrap provider still loads it and refuses boot without it) | controller | Master KEK for envelope encryption | 🔒 |
+| `TALOS_MASTER_KEY_PREVIOUS` (+`_FILE`) | unset (no previous key) | controller | The OLD master key during a staged env→env rotation: with `TALOS_MASTER_KEY=<new>` every controller unwraps DEKs new-then-previous, and `rotateMasterKey(<new>)` rewraps the rows still under this key. `rotateMasterKey` REFUSES unless the fleet runs in this posture. Remove it (and roll) once the rewrap reports done | 🔒 |
 | `KEK_PROVIDER` | `env` | controller | KEK provider kind (`env` / `vault`) | 🔒 |
 | `TALOS_ALLOW_ENV_KEK` | unset (refuse) | controller | Explicit opt-in required to boot production with an env-var KEK (lint check 45; fails closed) | 🔒 |
 | `KEK_DISABLE_LEGACY` | `false` | controller | Disable the legacy env-KEK dual-wrap path under `KEK_PROVIDER=vault` (`true`/`1`/`yes`/`on`; before 2026-09-12 only `true`/`1`) | 🔒 |
@@ -128,7 +129,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 |---|---|---|---|---|
 | `ADMIN_SECRET_KEY` | `""` (disabled) | controller | Constant-time `X-Admin-Secret` compare for admin endpoints | 🔒 |
 | `ENABLE_ADMIN_OPS` | `false` | controller | "Big red button" gate enabling admin ops | 🔒 |
-| `PROMETHEUS_SCRAPE_TOKEN` | none in dev; REQUIRED in production (unset ⇒ every scrape is refused 403) | controller | Bearer token gating `/metrics/prometheus`; constant-time compared | 🔒 |
+| `PROMETHEUS_SCRAPE_TOKEN` | none in dev; REQUIRED in every non-development `RUST_ENV` — production AND staging (unset ⇒ every scrape is refused 403) | controller | Bearer token gating `/metrics/prometheus`; constant-time compared | 🔒 |
 | `METRICS_AUTH_TOKENS` | REQUIRED — the worker refuses to start its metrics server (and panics at boot) when unset or empty, in every environment | worker | Comma-separated tokens gating the worker metrics endpoint | 🔒 |
 | `ALLOWED_ORIGIN` | dev: localhost list; prod: **required** (panics unset) | controller | CORS allowed origins (credentialed requests) | 🔒 |
 | `ALLOW_DEV_UNSAFE_CSRF_BYPASS` | `false` | controller | Dev-only `/graphql` CSRF disable; panics in production if truthy | 🔒 |
@@ -166,8 +167,8 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `WORKER_SHARED_KEY` (+`_FILE`, `_PREVIOUS`) | none in dev (controller WARNs and boots); in production every NATS dispatch is REFUSED until it is set | both | HMAC shared key for worker auth (rotation-capable); also the IKM for checkpoint/envelope AEAD derivations | 🔒 |
 | `TALOS_AOT_HMAC_KEY` / `_PREVIOUS` | none in dev (an ephemeral random key is minted per process); REQUIRED in production — ≥32 raw bytes or the worker panics at boot | worker | HMAC key signing AOT-compiled WASM cache entries | 🔒 |
 | `TALOS_AUDIT_SIGNING_KEY` / `_PREVIOUS` | none | both | Key signing hash-chained audit-ledger entries (`talos-audit-event`) | 🔒 |
-| `TALOS_WORKFLOW_SIGNING_KEY` | none | controller | Key for workflow-definition signatures | 🔒 |
-| `TALOS_WORKFLOW_SIGNING_STRICT` | `false` | controller | Reject unsigned workflows | 🔒 |
+| ~~`TALOS_WORKFLOW_SIGNING_KEY`~~ | n/a | — | **Not a variable (removed 2026-09-26).** Its reader, `talos-workflow-signing`, had zero callers: no workflow version was ever signed and `workflow_versions.graph_hash`/`graph_signature` were never written. Crate and columns deleted | |
+| ~~`TALOS_WORKFLOW_SIGNING_STRICT`~~ | n/a | — | **Not a variable (removed 2026-09-26).** Documented as "Reject unsigned workflows"; nothing ever consulted it, so no unsigned workflow was ever rejected. Deleted with the crate | |
 | `TALOS_WORKER_REGISTRATION_TOKEN` | none (optional) | both | Shared token for worker self-registration — the SAME value on controller (gate) and worker (bearer); unset on either side disables the handshake | 🔒 |
 | `TALOS_CONTROLLER_URL` | none (dev compose: `http://controller:8000`) | worker | Controller base URL the worker self-registers against — not a secret. Registration also requires the token above **and** `TALOS_WORKER_SIGNING_KEY`; with all three, the worker reports its build into `get_platform_info.fleet` | |
 | `TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN` | unset | controller | Require a bound registration token | 🔒 |
@@ -302,7 +303,7 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | none | worker | S3 credentials | 🔒 |
 | `S3_REGION` | built-in default | worker | S3 region | |
 | `DLP_PROVIDER` | `builtin` | talos-dlp-provider | DLP provider selection | |
-| `DLP_WEBHOOK_URL` | `""` | talos-dlp-provider | External DLP webhook URL | |
+| `DLP_WEBHOOK_URL` | `""` | talos-dlp-provider | External DLP webhook URL (receives unredacted data). Must be `https://` in production — a plaintext URL is refused there and the builtin redactor is used | |
 | `DLP_WEBHOOK_TOKEN` | none (optional) | talos-dlp-provider | DLP webhook auth token | 🔒 |
 | `TALOS_POLICY_NOTIFICATION_WEBHOOK` | none (optional) | talos-actor-policies | Webhook for actor-policy violation alerts | |
 
@@ -315,12 +316,12 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 | `OCI_REGISTRY_USERNAME` / `OCI_REGISTRY_PASSWORD` | none (anonymous) | both | OCI registry basic-auth (PAT works as password for GHCR) | 🔒 |
 | `REGISTRY_PUBLISH_TOKEN` | none in dev; REQUIRED in production (unset ⇒ the publish endpoint refuses every POST with 503) | talos-registry | Bearer token gating the template publish API | 🔒 |
 | `TALOS_SIGSTORE_REQUIRED` | prod refuses OCI sync unless an explicit policy is set | both | Sigstore verification policy: `required` / `audit` / `disabled` | 🔒 |
-| `TALOS_SIGSTORE_IDENTITY_REGEXP` | `""` | both | cosign `--certificate-identity-regexp` (pin to the publish workflow URL or operator identity) | 🔒 |
+| `TALOS_SIGSTORE_IDENTITY_REGEXP` | `""` | both | cosign `--certificate-identity-regexp` — pin to the publish workflow URL AND its ref (`…/template-publish\.yml@refs/heads/main$`): a pattern ending at `@` admits a signature from any branch a `workflow_dispatch` was pointed at. `install.sh` derives this form when enforcement is on and the variable is unset | 🔒 |
 | `TALOS_SIGSTORE_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` | both | cosign OIDC issuer pin | 🔒 |
 | `TALOS_COSIGN_MIN_VERSION` | `2.0.0` | worker | Minimum cosign binary version | 🔒 |
 | `TALOS_COSIGN_SHA256` | none (optional) | worker | Pin the cosign binary SHA-256 | 🔒 |
 | `TALOS_ALLOW_UNATTESTED_WASM` | off | worker | DEV-ONLY: permit unattested WASM modules (`1`/`true`/`yes`). IGNORED in production — `block_unattested = is_production() || !allow` | 🔒 |
-| `TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS` | off | worker | DEV-ONLY: accept OCI manifests whose signature could not be verified. REFUSED whenever the process is in production OR `TALOS_SIGSTORE_REQUIRED` is `required` | 🔒 |
+| ~~`TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS`~~ | n/a | — | **Not a variable (removed 2026-09-25).** The worker now resolves an OCI tag to a manifest ONCE, binds it by the digest it computes from the manifest body, and fetches the layer the manifest names by digest, so a "manifest without a layer descriptor" is simply refused (`oci_manifest_missing_layer_descriptor`) — there is no unverified-bytes path left to opt into | |
 
 Script-level publish knobs (`scripts/publish-images.sh`, not Rust reads):
 `TALOS_PUBLISH_SIGN`, `TALOS_PUBLISH_SKIP_CI_CHECK`, `GITHUB_TOKEN`/`GHCR_TOKEN` 🔒.
@@ -409,7 +410,7 @@ into both deployments.
 | `ARCHIVE_AFTER_DAYS` | `30` | controller | Days an execution stays in `workflow_executions` before being MOVED to the archive. This is the window that bounds the LIVE table, and the one `execution_events` / `workflow_execution_logs` / `execution_approval_tokens` CASCADE at. Overridden per-cluster by `system_settings.archive_after_days` (`set_archive_policy`). **What an operator sees past this window:** the execution row itself stays fully readable by id — `get_execution_status` / `get_execution_output` / `get_execution_cost` and friends answer from `workflow_executions_archive` and stamp the response `archived: true` with `archived_at`. What is GONE is the per-node detail: `get_execution_logs`, `get_execution_trace`, `get_execution_timeline`, `get_execution_waterfall` and `analyze_execution_failure` all read `execution_events`, which the move CASCADEs away, so they say so rather than rendering an empty node list. Operations that ACT on a live row (`cancel_execution`, `retry_execution`, `replay_execution`, `acknowledge_execution_failure`, `watch_execution`) refuse with "archived" as the stated reason — never "not found or access denied", which was the pre-2026-09-04 behaviour and is false in both clauses. Set this longer if per-node traces matter to you more than live-table size. | |
 | `AUDIT_LOG_RETENTION_DAYS` | `90` | controller | Retention for the webhook request log and webhook DLQ (daily at 02:00 UTC). **It does NOT apply to `auth_audit_log` or `secret_audit_log`** — both carry the `prevent_audit_modification` BEFORE DELETE trigger (migration `20260408000001`) and are append-only by security policy; until 2026-09-10 the cleanup tried anyway and logged a `42501` ERROR every night while deleting nothing. It now reads the policy from the catalog and logs `append-only by policy` at INFO. Dropping that trigger is an operator decision; if it is dropped, the batched delete runs under this window. | |
 | `TALOS_AUDIT_TABLE_RETENTION_DAYS` | `180` | controller | **Added 2026-09-10.** Age-based reaper for the audit-shaped tables that are NOT immutable and grew forever: `actor_action_log` (`"timestamp"`), `module_update_history` (`created_at`) and **resolved** `ops_alerts` (`resolved_at`; `new`/`acked` alerts are never touched, however old). Runs inside the 6-hourly `ExecutionRetention` pass in 5 000-row batches, 20 batches per table per tick. **Floor 30 days**: any value below 30 is raised to 30 with a WARN, so a typo (`18` for `180`) cannot wipe an audit trail; non-positive or unparseable values fall to the default. `admin_event_log` is deliberately NOT covered — it is append-only by trigger and permanent. The per-user `cleanup_ops_alerts` MCP tool is unchanged and can be stricter. | |
-| `GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN` | `10` | controller | **Added 2026-09-10.** Per-USER token bucket on the GraphQL mutations whose cost is an LLM call or a synchronous compile/execute: `createWorkflowFromDescription`, `testModule` (up to 120 s of WASM inline), `testWorkflow`. Refusal is a `RATE_LIMITED` error carrying `retryAfterSecs`. In-memory per controller replica, so the fleet ceiling is `replicas × N`; the per-IP limiter still applies underneath. `0`/empty → default (never deny-all). | |
+| `GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN` | `10` | controller | **Added 2026-09-10.** Per-USER token bucket on the GraphQL mutations whose cost is an LLM call or a synchronous compile/execute: `createWorkflowFromDescription`, `generateCode`, `createModuleFromTemplate` (a cargo compile), `testModule` (up to 120 s of WASM inline), `testWorkflow`. Each alias of one of these in a single request spends its own token. Refusal is a `RATE_LIMITED` error carrying `retryAfterSecs`. In-memory per controller replica, so the fleet ceiling is `replicas × N`; the per-IP limiter still applies underneath. `0`/empty → default (never deny-all). | |
 | `GRAPHQL_RHAI_PER_USER_PER_MIN` | `60` | controller | **Added 2026-09-10.** Same bucket shape for the synchronous Rhai evaluators (`analyzeRhai`, `testRhaiExpression`, 100 KB scripts). | |
 | `STUCK_EXECUTION_TIMEOUT_MINS` | `30` | controller | Mark executions stuck after N minutes | |
 | `EXECUTION_RESUME_STALE_MINS` | `5` | controller | Stale threshold to resume executions | |
@@ -436,6 +437,7 @@ into both deployments.
 | `TALOS_MAX_YAML_BYTES` | 1 MiB | controller | Max YAML workflow size | |
 | `ENABLE_EDGE_ROUTING` | `false` | controller | Per-user vs shared NATS dispatch topic. ONE parser since 2026-09-12: the engine dispatcher compared `== "true"` while the Gmail push used `edge_routing_enabled()`, so `ENABLE_EDGE_ROUTING=1` routed module-bound pushes per-user and engine jobs to the shared topic | |
 | `ENFORCE_RATE_LIMITS_IN_DEV` | `false` | controller | Apply rate limits in dev | |
+| `RATE_LIMIT_IPV6_PREFIX_LEN` | `64` | controller | IPv6 prefix length the per-IP limiters (API/webhook limiter, `tower_governor`, the auth limiter) bucket on; 32–128, anything else uses the default. IPv4 and IPv4-mapped IPv6 key on the IPv4 address. Audit logs keep the full address | |
 | `TALOS_WEBHOOK_USER_RPM` | `300` | talos-webhooks | Per-user webhook rate limit | |
 | `MCP_AGENT_RATE_LIMIT_PER_MIN` | `1000` | controller | MCP agent rate limit | |
 | `MCP_USER_RATE_LIMIT_PER_MIN` | `5000` | controller | MCP user rate limit | |
@@ -562,7 +564,7 @@ Where to SEE the effective window rather than infer it:
 | `GOOGLE_CLOUD_CLIENT_ID`/`_SECRET` ← `GOOGLE_CLIENT_ID`/`_SECRET` | GCP-specific vars override; generic `GOOGLE_*` is the fallback. Intentional layering, not deprecation. |
 | `BASE_URL` default drift | **RESOLVED 2026-07-24**: `talos-api-docs` previously read `BASE_URL` with a drifted `http://localhost:3000` default; it now calls the canonical `talos_config::get_base_url()` accessor (default `http://localhost:8000`, validated). One default everywhere. |
 | `TALOS_BASE_URL` vs `BASE_URL` | Distinct today: `TALOS_BASE_URL` is a platform-status display override (`talos-mcp-handlers`), `BASE_URL` builds real callback/webhook URLs. Confusable naming; prefer `BASE_URL` (via `get_base_url`) for anything functional. |
-| `<VAR>_FILE` / `<VAR>_PREVIOUS` families | Not duplicates — the Docker-secrets and key-rotation patterns: `JWT_SECRET(_FILE)`, `JWT_PRIVATE_KEY(_FILE)`, `JWT_PUBLIC_KEY(_FILE/_PREVIOUS)`, `JWT_ALGORITHM(_PREVIOUS)`, `WORKER_SHARED_KEY(_FILE/_PREVIOUS)`, `TALOS_AOT_HMAC_KEY(_PREVIOUS)`, `TALOS_AUDIT_SIGNING_KEY(_PREVIOUS)`, `TALOS_CONTROLLER_PUBLIC_KEY(_PREVIOUS)`, `TALOS_MASTER_KEY(_FILE)`, `VAULT_*(_FILE)`, `NATS_PASSWORD(_FILE)`. |
+| `<VAR>_FILE` / `<VAR>_PREVIOUS` families | Not duplicates — the Docker-secrets and key-rotation patterns: `JWT_SECRET(_FILE)`, `JWT_PRIVATE_KEY(_FILE)`, `JWT_PUBLIC_KEY(_FILE/_PREVIOUS)`, `JWT_ALGORITHM(_PREVIOUS)`, `WORKER_SHARED_KEY(_FILE/_PREVIOUS)`, `TALOS_AOT_HMAC_KEY(_PREVIOUS)`, `TALOS_AUDIT_SIGNING_KEY(_PREVIOUS)`, `TALOS_CONTROLLER_PUBLIC_KEY(_PREVIOUS)`, `TALOS_MASTER_KEY(_FILE/_PREVIOUS)`, `VAULT_*(_FILE)`, `NATS_PASSWORD(_FILE)`. |
 | `TALOS_MAX_CONCURRENT_EXECUTIONS` vs `TALOS_MAX_CONCURRENT_NODES` | Distinct knobs (execution-level vs node-level concurrency) — easily confused, not duplicates. |
 | `OLLAMA_URL` | Read in ≥3 crates (worker host LLM, talos-config memory loops, controller graph-RAG) with the same default — widely read, not drifted. |
 

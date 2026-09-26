@@ -3,6 +3,7 @@
 
 use super::*;
 
+use super::egress_admission::{admit_url, DenialKind, UrlAdmitted, UrlRefusal};
 use crate::reason_class;
 pub(crate) use talos_idempotency::dedup_request_hash;
 use talos_idempotency::{DedupCheck, DedupResponse, InMemoryIdempotencyStore};
@@ -114,6 +115,28 @@ pub(crate) const WRITE_CEILING_VERB_DETAIL: &str =
      governing the twelve categorical ops — agent-memory, database, email, messaging, \
      webhook, object-storage, integration-state. Raising max_write_ceiling instead also \
      works and grants all fifteen, which is more than a POST-shaped read needs";
+
+/// The verb's wire token — the one spelling the method allowlist, dry-run
+/// mock and dedup hash all read.
+fn method_token(method: &wit_http::Method) -> &'static str {
+    match method {
+        wit_http::Method::Get => "GET",
+        wit_http::Method::Post => "POST",
+        wit_http::Method::Put => "PUT",
+        wit_http::Method::Delete => "DELETE",
+        wit_http::Method::Patch => "PATCH",
+    }
+}
+
+fn to_reqwest_method(method: &wit_http::Method) -> reqwest::Method {
+    match method {
+        wit_http::Method::Get => reqwest::Method::GET,
+        wit_http::Method::Post => reqwest::Method::POST,
+        wit_http::Method::Put => reqwest::Method::PUT,
+        wit_http::Method::Delete => reqwest::Method::DELETE,
+        wit_http::Method::Patch => reqwest::Method::PATCH,
+    }
+}
 
 pub(crate) fn http_method_mutates(method: &wit_http::Method) -> bool {
     match method {
@@ -234,12 +257,30 @@ fn deny_invalid_url(ctx: &TalosContext, class: &'static str) -> wit_http::Error 
     wit_http::Error::Invalidurl
 }
 
-/// Re-export of the shared policy→class mapper. It moved to
-/// [`crate::reason_class::tier1_egress_class`] when `graphql`, `webhook` and
-/// `http_stream` grew the same denial — all four surfaces call the same
-/// `tier1_egress_deny_reason`, so a per-file copy of the mapping is exactly
-/// the drift this workspace keeps paying for.
-use crate::reason_class::tier1_egress_class;
+impl TalosContext {
+    /// Record a URL-admission refusal for `op` and return the guest's error.
+    ///
+    /// The one place an [`admit_url`] refusal becomes a `wit_http::Error`, for
+    /// both `fetch` and each `fetch_all` entry: a policy refusal is recorded
+    /// as an audit denial first, then the class is latched against the paired
+    /// discriminant. The byte cap and a parse failure record no denial.
+    async fn refuse_url(&mut self, op: &'static str, refusal: UrlRefusal) -> wit_http::Error {
+        if let UrlRefusal::Policy(p) = &refusal {
+            self.record_capability_denied(op, p.policy, &p.target).await;
+        }
+        tracing::warn!(
+            op,
+            module_id = ?self.module_id,
+            actor_id = ?self.actor_id,
+            refusal = ?refusal,
+            "outbound HTTP request refused at URL admission"
+        );
+        match refusal.kind() {
+            DenialKind::Forbidden => deny_forbidden(self, refusal.class()),
+            DenialKind::InvalidUrl => deny_invalid_url(self, refusal.class()),
+        }
+    }
+}
 
 // ============================================================================
 // HTTP
@@ -283,64 +324,26 @@ impl wit_http::Host for TalosContext {
             tracing::warn!("WASM module attempted HTTP request but lacks Http capability");
             return Err(deny_forbidden(self, reason_class::CAPABILITY_WORLD));
         }
-        // MCP-1148: cap URL bytes BEFORE invoking `url::Url::parse`.
-        // The parser is O(N); a hostile guest could ship a 10 MB URL
-        // and force the host to walk every byte on every call.
-        if req.url.len() > MAX_OUTBOUND_URL_BYTES {
-            tracing::warn!(
-                module_id = ?self.module_id,
-                url_len = req.url.len(),
-                limit = MAX_OUTBOUND_URL_BYTES,
-                "wit_http::fetch rejected: URL length exceeds cap"
-            );
-            return Err(deny_invalid_url(self, reason_class::URL_TOO_LONG));
-        }
-        // Validate and parse the URL first.
-        let url: url::Url = match req.url.parse() {
-            Ok(u) => u,
-            // A genuine author typo — the ONE `invalidurl` cause that is not a
-            // host decision. Telling it apart from the byte cap above and the
-            // plaintext-scheme SECURITY refusal below is the point of the class:
-            // all three reach the operator as `name: "invalidurl"`.
-            Err(_) => return Err(deny_invalid_url(self, reason_class::URL_PARSE)),
+        // URL admission — byte cap, parse, scheme, allowlist, IP literal,
+        // `allowed_hosts`, egress posture — has ONE home shared with
+        // `fetch_all` and the raw `wasi:http` gate: `admit_url`.
+        let admitted = match admit_url(&req.url, &self.url_policy()) {
+            Ok(a) => a,
+            Err(r) => return Err(self.refuse_url("http-fetch", r).await),
         };
-
-        // HTTPS-only by default. Plaintext outbound traffic can leak
-        // `vault://` headers; the SSRF gate protects destination but
-        // not data-in-flight. Operators with a legitimate plaintext
-        // target opt in via `WASM_ALLOW_INSECURE_HTTP=1`.
-        match classify_url_scheme(url.scheme(), insecure_http_opt_in()) {
-            UrlSchemeVerdict::Https => {}
-            UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
-                tracing::warn!(
-                    scheme = %scheme,
-                    host = %url.host_str().unwrap_or(""),
-                    "WASM module sent insecure-scheme HTTP request — \
-                     allowed by WASM_ALLOW_INSECURE_HTTP=1 (operator opt-in). \
-                     Confirm this is intended; plaintext traffic can leak vault:// \
-                     headers in flight."
-                );
-            }
-            UrlSchemeVerdict::InsecureRefused { scheme } => {
-                self.record_capability_denied(
-                    "http-fetch",
-                    "insecure-scheme",
-                    &format!("{scheme} {}", url.host_str().unwrap_or("")),
-                )
-                .await;
-                tracing::warn!(
-                    scheme = %scheme,
-                    host = %url.host_str().unwrap_or(""),
-                    "WASM module attempted non-https HTTP request — denied. \
-                     Set WASM_ALLOW_INSECURE_HTTP=1 to permit plaintext outbound."
-                );
-                return Err(deny_invalid_url(self, reason_class::INSECURE_SCHEME));
-            }
+        let url = admitted.url;
+        let host: &str = &admitted.host;
+        let host_match = admitted.host_match;
+        if let Some(scheme) = &admitted.insecure_opt_in {
+            tracing::warn!(
+                scheme = %scheme,
+                host,
+                "WASM module sent insecure-scheme HTTP request — \
+                 allowed by WASM_ALLOW_INSECURE_HTTP=1 (operator opt-in). \
+                 Confirm this is intended; plaintext traffic can leak vault:// \
+                 headers in flight."
+            );
         }
-
-        // Enforce the host allowlist.  An empty list means DENY ALL — the module
-        // must be configured with an explicit allowlist, or use "*" to allow any host.
-        let host = url.host_str().unwrap_or("");
         // Structured trace for diagnosing vault:// and host-allowlist
         // rejections. Visible at RUST_LOG=worker=debug level.
         tracing::debug!(
@@ -350,78 +353,6 @@ impl wit_http::Host for TalosContext {
             capability_world = ?self.capability_world,
             "http fetch dispatch"
         );
-        if self.allowed_hosts.is_empty() {
-            self.record_capability_denied("http-fetch", "no-allowlist-configured", host)
-                .await;
-            tracing::warn!(
-                host,
-                "WASM module attempted HTTP request but no host allowlist is configured — \
-                 denying. Set WASM_ALLOWED_HOSTS=\"*\" to allow all hosts."
-            );
-            return Err(deny_forbidden(self, reason_class::NO_ALLOWLIST));
-        }
-
-        // DNS rebinding / SSRF protection: if the host parses as an IP address literal,
-        // reject private, loopback, link-local, multicast, broadcast, and CGNAT ranges
-        // immediately. This prevents a WASM module from using an IP literal to reach
-        // internal services even when the allowlist contains a wildcard ("*").
-        // SSRF: reject IP-literal hosts in denied ranges via the shared
-        // chokepoint (covers IPv4 + IPv6 + CGNAT + IPv4-mapped). Blocks even
-        // when the allowlist contains a wildcard ("*").
-        if let Some((ip, policy)) = denied_ip_literal(&url) {
-            self.record_capability_denied("http-fetch", policy, &ip.to_string())
-                .await;
-            tracing::warn!(
-                ip = %ip,
-                policy,
-                "WASM module attempted to reach a private IP literal — blocking"
-            );
-            return Err(deny_forbidden(self, reason_class::PRIVATE_IP));
-        }
-
-        let host_match = match host_allowlist_match_kind(&self.allowed_hosts, host) {
-            Some(kind) => kind,
-            None => {
-                self.record_capability_denied("http-fetch", "allowed-hosts", host)
-                    .await;
-                tracing::warn!(
-                    host,
-                    allowed_count = self.allowed_hosts.len(),
-                    "WASM module attempted to reach a forbidden host"
-                );
-                return Err(deny_forbidden(self, reason_class::ALLOWED_HOSTS));
-            }
-        };
-
-        // Tier-1 LLM egress ceiling — deny external LLM provider hosts
-        // regardless of `allowed_hosts`. Closes the HTTP bypass: a
-        // Tier-1 guest can NOT reach `api.anthropic.com` even with
-        // `api.anthropic.com` explicitly in `allowed_hosts` + its own
-        // API key in `allowed_secrets`. This sits above the `llm::*`
-        // host-fn ceiling: those gate key resolution; this gates the
-        // network destination. Both are needed — a guest can bring its
-        // own key (`config["api_key"]`) and bypass `llm::*` entirely.
-        // Egress-posture gate: tier-1 LLM hosts + public IP literals, and
-        // public IP literals for ANY local-egress-only actor (a resolver never
-        // sees a literal) — one predicate, `egress_posture_deny_reason`.
-        {
-            let host_lower = host.to_ascii_lowercase();
-            if let Some(policy) = egress_posture_deny_reason(
-                &host_lower,
-                self.max_llm_tier,
-                self.local_egress_only,
-            ) {
-                self.record_capability_denied("http-fetch", policy, host)
-                    .await;
-                tracing::warn!(
-                    host,
-                    actor_id = ?self.actor_id,
-                    policy,
-                    "actor egress posture refused egress (tier-1: external LLM host or public IP literal; local-only egress: public IP literal)"
-                );
-                return Err(deny_forbidden(self, tier1_egress_class(policy)));
-            }
-        }
 
         // Write-ceiling gate: a read-only actor may issue read requests (GET)
         // but not mutating ones (POST / PUT / PATCH / DELETE). Pure decision,
@@ -468,12 +399,8 @@ impl wit_http::Host for TalosContext {
         // that effort. Burning the global slot keeps the abuse pattern
         // expensive for the attacker. The host string is normalized to
         // host:port (lowercased) inside `check_per_host_rate_limit`.
-        let host_for_limit = match url.port_or_known_default() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        };
         if !self.check_per_host_rate_limit(
-            &host_for_limit,
+            &admitted.host_for_limit,
             MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION,
         ) {
             tracing::warn!(
@@ -514,13 +441,7 @@ impl wit_http::Host for TalosContext {
         // and circuit-breaker are intentionally skipped here — neither
         // is meaningful for traffic that will never leave the worker.
         if self.dry_run {
-            let dry_method = match req.method {
-                wit_http::Method::Get => "GET",
-                wit_http::Method::Post => "POST",
-                wit_http::Method::Put => "PUT",
-                wit_http::Method::Delete => "DELETE",
-                wit_http::Method::Patch => "PATCH",
-            };
+            let dry_method = method_token(&req.method);
             if dry_method != "GET" {
                 tracing::info!(
                     method = dry_method,
@@ -548,13 +469,7 @@ impl wit_http::Host for TalosContext {
         // DNS and strands no breaker permit, and a key-reuse refusal is
         // decided before any I/O. Dry-run stays ahead of it so a dry-run POST
         // is still mocked rather than served from the store.
-        let method_str_early = match req.method {
-            wit_http::Method::Get => "GET",
-            wit_http::Method::Post => "POST",
-            wit_http::Method::Put => "PUT",
-            wit_http::Method::Delete => "DELETE",
-            wit_http::Method::Patch => "PATCH",
-        };
+        let method_str = method_token(&req.method);
         // The key goes out as a header only on MUTATING verbs (a GET is safe to
         // retry) and only when the guest has not set the header itself.
         let idem_header_to_emit: Option<String> = if http_method_mutates(&req.method) {
@@ -572,7 +487,7 @@ impl wit_http::Host for TalosContext {
         let dedup_key: Option<String> = idem_header_to_emit
             .as_deref()
             .and_then(|idem| scoped_dedup_key(self.user_id, self.actor_id, host, idem));
-        let request_hash = dedup_request_hash(method_str_early, &req.url, &req.body);
+        let request_hash = dedup_request_hash(method_str, &req.url, &req.body);
         if let Some(ref k) = dedup_key {
             match get_global_idempotency_store().check(k, &request_hash) {
                 DedupCheck::Completed(cached) => {
@@ -630,11 +545,7 @@ impl wit_http::Host for TalosContext {
         // a sibling service (e.g. nova on host.docker.internal:3030) while
         // keeping the wildcard-allowlist case fully protected. IP literals
         // are still rejected unconditionally above.
-        let bypass_dns_ssrf = *ALLOW_PRIVATE_HOST_TARGETS
-            && self
-                .allowed_hosts
-                .iter()
-                .any(|p| p != "*" && p == host);
+        let bypass_dns_ssrf = private_host_bypass_applies(&self.allowed_hosts, host);
         if url
             .host()
             .is_some_and(|h| matches!(h, url::Host::Domain(_)))
@@ -704,13 +615,6 @@ impl wit_http::Host for TalosContext {
 
         // Enforce method allowlist (empty = DENY every verb — see
         // `talos_workflow_job_protocol::method_permitted`).
-        let method_str = match req.method {
-            wit_http::Method::Get => "GET",
-            wit_http::Method::Post => "POST",
-            wit_http::Method::Put => "PUT",
-            wit_http::Method::Delete => "DELETE",
-            wit_http::Method::Patch => "PATCH",
-        };
         if !talos_workflow_job_protocol::method_permitted(&self.allowed_methods, method_str) {
             self.record_capability_denied_detailed(
                 "http-fetch",
@@ -840,13 +744,7 @@ impl wit_http::Host for TalosContext {
 
         let client = self.http_client.clone();
 
-        let reqwest_method = match method {
-            wit_http::Method::Get => reqwest::Method::GET,
-            wit_http::Method::Post => reqwest::Method::POST,
-            wit_http::Method::Put => reqwest::Method::PUT,
-            wit_http::Method::Delete => reqwest::Method::DELETE,
-            wit_http::Method::Patch => reqwest::Method::PATCH,
-        };
+        let reqwest_method = to_reqwest_method(&method);
 
         // Dry-run interception now happens earlier (before DNS) — this
         // path is only reached for non-dry-run runs, which proceed to
@@ -1336,7 +1234,6 @@ impl wit_http::Host for TalosContext {
         // separate buffer-then-drain dance. Checks are ordered cheap-first
         // so we never do a DNS lookup or vault resolution for a request
         // we'll reject on a sync check anyway.
-        let bypass_dns_env = *ALLOW_PRIVATE_HOST_TARGETS;
 
         #[allow(clippy::type_complexity)]
         let mut validated: Vec<
@@ -1386,106 +1283,30 @@ impl wit_http::Host for TalosContext {
                 continue;
             }
 
-            // MCP-1148: per-entry URL byte cap. fetch_all amplifies the
-            // single-fetch URL-parse-cost concern by `batch_size` —
-            // 64-entry batches with 10 MB URLs each would otherwise
-            // pay 640 MB of parse work per batch fire.
-            if req.url.len() > MAX_OUTBOUND_URL_BYTES {
+            // 1–5. URL admission, the SAME function `fetch` calls (byte cap,
+            //      parse, scheme, allowlist, IP literal, `allowed_hosts`,
+            //      egress posture). Per entry, so a mixed batch rejects only
+            //      the entries that fail.
+            let admitted = match admit_url(&req.url, &self.url_policy()) {
+                Ok(a) => a,
+                Err(r) => {
+                    validated.push(Err(self.refuse_url("http-fetch-all", r).await));
+                    continue;
+                }
+            };
+            let UrlAdmitted {
+                url,
+                host,
+                host_match,
+                host_for_limit,
+                insecure_opt_in,
+            } = admitted;
+            if let Some(scheme) = insecure_opt_in {
                 tracing::warn!(
-                    module_id = ?self.module_id,
-                    url_len = req.url.len(),
-                    limit = MAX_OUTBOUND_URL_BYTES,
-                    "fetch_all: per-request URL exceeds cap"
+                    scheme = %scheme,
+                    host = %host,
+                    "fetch_all: insecure-scheme request allowed by WASM_ALLOW_INSECURE_HTTP=1"
                 );
-                validated.push(Err(deny_invalid_url(self, reason_class::URL_TOO_LONG)));
-                continue;
-            }
-
-            // 1. URL parse.
-            let url: url::Url = match req.url.parse() {
-                Ok(u) => u,
-                Err(_) => {
-                    validated.push(Err(deny_invalid_url(self, reason_class::URL_PARSE)));
-                    continue;
-                }
-            };
-            let host = url.host_str().unwrap_or("").to_string();
-
-            // 1b. HTTPS-only by default (see `classify_url_scheme` doc).
-            // Operator opt-in via `WASM_ALLOW_INSECURE_HTTP=1`.
-            match classify_url_scheme(url.scheme(), insecure_http_opt_in()) {
-                UrlSchemeVerdict::Https => {}
-                UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
-                    tracing::warn!(
-                        scheme = %scheme,
-                        host = %host,
-                        "fetch_all: insecure-scheme request allowed by WASM_ALLOW_INSECURE_HTTP=1"
-                    );
-                }
-                UrlSchemeVerdict::InsecureRefused { scheme } => {
-                    self.record_capability_denied(
-                        "http-fetch-all",
-                        "insecure-scheme",
-                        &format!("{scheme} {host}"),
-                    )
-                    .await;
-                    validated.push(Err(deny_invalid_url(self, reason_class::INSECURE_SCHEME)));
-                    continue;
-                }
-            }
-
-            // 2. Allowlist must be configured.
-            if self.allowed_hosts.is_empty() {
-                self.record_capability_denied("http-fetch-all", "no-allowlist-configured", &host)
-                    .await;
-                validated.push(Err(deny_forbidden(self, reason_class::NO_ALLOWLIST)));
-                continue;
-            }
-
-            // 3. SSRF: classify IP literals (no network I/O).
-            //    Single source of truth in classify_private_ip — covers
-            //    CGNAT and IPv4-mapped IPv6 too.
-            if let Some((ip, policy)) = denied_ip_literal(&url) {
-                self.record_capability_denied("http-fetch-all", policy, &ip.to_string())
-                    .await;
-                validated.push(Err(deny_forbidden(self, reason_class::PRIVATE_IP)));
-                continue;
-            }
-
-            // 4. allowed_hosts pattern match.
-            let host_match = match host_allowlist_match_kind(&self.allowed_hosts, &host) {
-                Some(kind) => kind,
-                None => {
-                    self.record_capability_denied("http-fetch-all", "allowed-hosts", &host)
-                        .await;
-                    validated.push(Err(deny_forbidden(self, reason_class::ALLOWED_HOSTS)));
-                    continue;
-                }
-            };
-
-            // 5. Tier-1 LLM egress ceiling. Per-request so a mixed batch
-            //    rejects only the tier-2 LLM entries.
-            // Egress-posture gate: tier-1 LLM hosts + public IP literals, and
-            // public IP literals for ANY local-egress-only actor (a resolver never
-            // sees a literal) — one predicate, `egress_posture_deny_reason`.
-            {
-                let host_lower = host.to_ascii_lowercase();
-                if let Some(policy) = egress_posture_deny_reason(
-                    &host_lower,
-                    self.max_llm_tier,
-                    self.local_egress_only,
-                ) {
-                    self.record_capability_denied("http-fetch-all", policy, &host)
-                        .await;
-                    tracing::warn!(
-                        host = %host,
-                        actor_id = ?self.actor_id,
-                        policy,
-                        "actor egress posture refused fetch_all egress (tier-1: external LLM host or public IP literal; local-only egress: public IP literal)"
-                    );
-                    validated.push(Err(deny_forbidden(self, tier1_egress_class(policy))));
-                    continue;
-                }
             }
 
             // 5b. Write-ceiling gate: read-only actors may GET but not
@@ -1520,13 +1341,7 @@ impl wit_http::Host for TalosContext {
             }
 
             // 6. HTTP method allowlist.
-            let method_str = match req.method {
-                wit_http::Method::Get => "GET",
-                wit_http::Method::Post => "POST",
-                wit_http::Method::Put => "PUT",
-                wit_http::Method::Delete => "DELETE",
-                wit_http::Method::Patch => "PATCH",
-            };
+            let method_str = method_token(&req.method);
             if !talos_workflow_job_protocol::method_permitted(&self.allowed_methods, method_str) {
                 self.record_capability_denied_detailed(
                     "http-fetch-all",
@@ -1547,10 +1362,6 @@ impl wit_http::Host for TalosContext {
             // sibling per-request validation checks above. This
             // prevents `fetch_all` from being a per-host-limit
             // bypass.
-            let host_for_limit = match url.port_or_known_default() {
-                Some(port) => format!("{host}:{port}"),
-                None => host.to_string(),
-            };
             if !self
                 .check_per_host_rate_limit(&host_for_limit, MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION)
             {
@@ -1577,8 +1388,7 @@ impl wit_http::Host for TalosContext {
             //    common entries, so the wall-clock cost is dominated by
             //    the actual HTTP request, not the lookup.
             let is_hostname = matches!(url.host(), Some(url::Host::Domain(_)));
-            let bypass_dns =
-                bypass_dns_env && self.allowed_hosts.iter().any(|p| p != "*" && p == &host);
+            let bypass_dns = private_host_bypass_applies(&self.allowed_hosts, &host);
             if is_hostname && !bypass_dns {
                 match tokio::net::lookup_host(format!("{}:80", host)).await {
                     Ok(addrs) => {
@@ -1649,13 +1459,7 @@ impl wit_http::Host for TalosContext {
                 validated.push(Err(deny_forbidden(self, reason_class::REQUEST_HEADER_CAP)));
                 continue;
             }
-            let reqwest_method = match req.method {
-                wit_http::Method::Get => reqwest::Method::GET,
-                wit_http::Method::Post => reqwest::Method::POST,
-                wit_http::Method::Put => reqwest::Method::PUT,
-                wit_http::Method::Delete => reqwest::Method::DELETE,
-                wit_http::Method::Patch => reqwest::Method::PATCH,
-            };
+            let reqwest_method = to_reqwest_method(&req.method);
             let mut hdrs: Vec<(String, String)> = Vec::with_capacity(req.headers.len());
             let mut header_failed = false;
             for (k, v) in &req.headers {
@@ -2121,6 +1925,10 @@ impl wit_http::Host for TalosContext {
                         return Err(wit_http::Error::Networkerror);
                     }
                     if !reserved.grow(chunk.len()) {
+                        tracing::warn!(
+                            "wit_http::fetch_all entry refused: the call's response-byte \
+                             budget is exhausted"
+                        );
                         return Err(wit_http::Error::Networkerror);
                     }
                     resp_body_bytes.extend_from_slice(&chunk);

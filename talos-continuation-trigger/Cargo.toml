@@ -26,6 +26,7 @@ talos-metrics = { path = "../talos-metrics" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 tokio = { version = "1", features = ["rt", "macros"] }
 tracing.workspace = true
 uuid.workspace = true

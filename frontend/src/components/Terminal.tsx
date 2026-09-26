@@ -1,6 +1,9 @@
 import React, { useMemo, useState, useEffect, useRef } from "react";
 import { useUIStore } from "@/store/uiStore";
-import { useEphemeralExecutionStore } from "@/store/executionStore";
+import {
+  useEphemeralExecutionStore,
+  type LogEntry,
+} from "@/store/executionStore";
 import { cn } from "@/lib/utils";
 import {
   Terminal as TerminalIcon,
@@ -26,6 +29,140 @@ import {
 } from "@/components/ui";
 
 type LogLevel = "all" | "errors" | "warnings" | "info";
+
+/** Rows rendered per window (the newest); "show earlier" adds another. */
+export const TERMINAL_WINDOW = 300;
+
+/** One log line. Memoized: appending to the log must not re-render the
+ *  rows already on screen. */
+const TerminalRow = React.memo(function TerminalRow({
+  entry,
+}: {
+  entry: LogEntry;
+}) {
+  const isError = entry.level === "[ERROR]";
+  const isWarn = entry.level === "[WARN]";
+
+  return (
+    <div
+      className={cn(
+        "group flex gap-6 px-4 py-2 transition-premium rounded-xl border-l-4",
+        isError
+          ? "bg-destructive/5 border-destructive shadow-[0_0_20px_hsla(var(--destructive),0.1)] text-white"
+          : isWarn
+            ? "bg-warning/5 border-warning shadow-[0_0_20px_hsla(var(--warning),0.1)] text-white"
+            : "border-transparent hover:bg-white/[0.02] text-muted-foreground/80 hover:text-white",
+      )}
+    >
+      <span className="text-[10px] font-black font-mono text-muted-foreground/30 group-hover:text-primary transition-premium shrink-0 select-none uppercase tracking-tighter w-12 text-right">
+        {entry.timestamp}
+      </span>
+
+      <div className="flex-1 min-w-0">
+        {entry.nodeId && (
+          <span className="text-primary font-black mr-3 text-[10px] tracking-[0.1em] font-outfit uppercase">
+            [{entry.nodeId.slice(0, 8)}]
+          </span>
+        )}
+
+        {entry.structured ? (
+          <div className="inline-block align-top w-full">
+            {entry.structured.type === "llm_stream" && (
+              <div className="flex gap-4 items-start bg-primary/5 p-4 rounded-2xl border border-primary/10 shadow-2xl glass-dark optimize-blur">
+                <div className="flex flex-col items-center gap-1 shrink-0 mt-1">
+                  <Badge
+                    variant="outline"
+                    className="bg-primary/20 text-primary border-primary/30 text-[9px] h-4 px-2 font-black shadow-[0_0_15px_hsla(var(--primary),0.2)] rounded-full uppercase tracking-widest"
+                  >
+                    LLM
+                  </Badge>
+                </div>
+                <span className="text-white/90 leading-relaxed italic font-medium selection:bg-primary/30">
+                  {entry.structured.content}
+                </span>
+              </div>
+            )}
+            {entry.structured.type === "tool_call" && (
+              <div className="flex flex-col gap-3 bg-warning/5 p-4 rounded-2xl border border-warning/10 shadow-2xl glass-dark optimize-blur">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <Badge
+                      variant="outline"
+                      className="bg-warning/20 text-warning border-warning/30 text-[9px] h-4 px-2 font-black shadow-[0_0_15px_hsla(var(--warning),0.2)] rounded-full uppercase tracking-widest"
+                    >
+                      TOOL
+                    </Badge>
+                    <span className="text-white font-black uppercase tracking-widest font-outfit text-xs">
+                      {entry.structured.toolName}
+                    </span>
+                  </div>
+                  <div className="w-2 h-2 rounded-full bg-warning animate-status-pulse" />
+                </div>
+                <div className="relative">
+                  <div className="absolute top-0 right-0 p-2">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 text-muted-foreground/30 hover:text-warning"
+                      onClick={() =>
+                        entry.structured?.arguments &&
+                        navigator.clipboard.writeText(
+                          entry.structured.arguments,
+                        )
+                      }
+                    >
+                      <Copy className="h-3 w-3" />
+                    </Button>
+                  </div>
+                  <pre className="text-warning/70 p-4 bg-black/40 rounded-xl border border-white/5 overflow-x-auto selection:bg-warning/30 font-mono text-[10px] leading-relaxed custom-scrollbar">
+                    {entry.structured.arguments}
+                  </pre>
+                </div>
+              </div>
+            )}
+            {entry.structured.type === "token_usage" && (
+              <div className="flex items-center gap-4 bg-success/5 px-4 py-2 rounded-full border border-success/10 shadow-lg w-fit mt-1">
+                <Cpu className="h-3.5 w-3.5 text-success shadow-[0_0_10px_hsla(var(--success),0.5)]" />
+                <div className="flex items-center gap-3">
+                  <span className="text-success/80 font-black text-[10px] uppercase tracking-[0.2em]">
+                    UPLINK: {entry.structured.inputTokens ?? 0}
+                  </span>
+                  <div className="w-1 h-1 rounded-full bg-success/30" />
+                  <span className="text-success/80 font-black text-[10px] uppercase tracking-[0.2em]">
+                    DOWNLINK: {entry.structured.outputTokens ?? 0}
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <span
+            className={cn(
+              "break-words selection:bg-primary/30 leading-relaxed font-medium",
+              isError
+                ? "text-white font-black"
+                : isWarn
+                  ? "text-white"
+                  : "text-muted-foreground group-hover:text-white transition-premium",
+            )}
+          >
+            {entry.text.toUpperCase()}
+          </span>
+        )}
+      </div>
+
+      <div className="w-12 flex justify-end shrink-0 opacity-0 group-hover:opacity-100 transition-premium">
+        {isError ? (
+          <AlertCircle className="h-4 w-4 text-destructive shadow-[0_0_10px_hsla(var(--destructive),0.5)]" />
+        ) : isWarn ? (
+          <Info className="h-4 w-4 text-warning shadow-[0_0_10px_hsla(var(--warning),0.5)]" />
+        ) : (
+          <CheckCircle2 className="h-4 w-4 text-success/40" />
+        )}
+      </div>
+    </div>
+  );
+});
 
 const Terminal = () => {
   const [filter, setFilter] = useState<LogLevel>("all");
@@ -72,6 +209,18 @@ const Terminal = () => {
   const warningCount = useMemo(
     () => processedLogs.filter((e) => e.level === "[WARN]").length,
     [processedLogs],
+  );
+
+  // Windowed rendering: the newest TERMINAL_WINDOW rows, more on request —
+  // the log holds up to 5000 entries and rendering them all at once stalls.
+  const [windowSize, setWindowSize] = useState(TERMINAL_WINDOW);
+  const hiddenCount = Math.max(0, filteredLogEntries.length - windowSize);
+  const visibleEntries = useMemo(
+    () =>
+      hiddenCount > 0
+        ? filteredLogEntries.slice(hiddenCount)
+        : filteredLogEntries,
+    [filteredLogEntries, hiddenCount],
   );
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -251,131 +400,21 @@ const Terminal = () => {
             </div>
           </div>
         ) : (
-          filteredLogEntries.map((entry, i) => {
-            const isError = entry.level === "[ERROR]";
-            const isWarn = entry.level === "[WARN]";
-
-            return (
-              <div
-                key={`${i}-${entry.timestamp}`}
-                className={cn(
-                  "group flex gap-6 px-4 py-2 transition-premium rounded-xl border-l-4",
-                  isError
-                    ? "bg-destructive/5 border-destructive shadow-[0_0_20px_hsla(var(--destructive),0.1)] text-white"
-                    : isWarn
-                      ? "bg-warning/5 border-warning shadow-[0_0_20px_hsla(var(--warning),0.1)] text-white"
-                      : "border-transparent hover:bg-white/[0.02] text-muted-foreground/80 hover:text-white",
-                )}
+          <>
+            {hiddenCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setWindowSize((n) => n + TERMINAL_WINDOW)}
+                className="relative z-10 w-full py-2 text-[10px] font-black uppercase tracking-widest text-muted-foreground/60 hover:text-primary"
               >
-                <span className="text-[10px] font-black font-mono text-muted-foreground/30 group-hover:text-primary transition-premium shrink-0 select-none uppercase tracking-tighter w-12 text-right">
-                  {entry.timestamp}
-                </span>
-
-                <div className="flex-1 min-w-0">
-                  {entry.nodeId && (
-                    <span className="text-primary font-black mr-3 text-[10px] tracking-[0.1em] font-outfit uppercase">
-                      [{entry.nodeId.slice(0, 8)}]
-                    </span>
-                  )}
-
-                  {entry.structured ? (
-                    <div className="inline-block align-top w-full">
-                      {entry.structured.type === "llm_stream" && (
-                        <div className="flex gap-4 items-start bg-primary/5 p-4 rounded-2xl border border-primary/10 shadow-2xl glass-dark optimize-blur">
-                          <div className="flex flex-col items-center gap-1 shrink-0 mt-1">
-                            <Badge
-                              variant="outline"
-                              className="bg-primary/20 text-primary border-primary/30 text-[9px] h-4 px-2 font-black shadow-[0_0_15px_hsla(var(--primary),0.2)] rounded-full uppercase tracking-widest"
-                            >
-                              LLM
-                            </Badge>
-                          </div>
-                          <span className="text-white/90 leading-relaxed italic font-medium selection:bg-primary/30">
-                            {entry.structured.content}
-                          </span>
-                        </div>
-                      )}
-                      {entry.structured.type === "tool_call" && (
-                        <div className="flex flex-col gap-3 bg-warning/5 p-4 rounded-2xl border border-warning/10 shadow-2xl glass-dark optimize-blur">
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-3">
-                              <Badge
-                                variant="outline"
-                                className="bg-warning/20 text-warning border-warning/30 text-[9px] h-4 px-2 font-black shadow-[0_0_15px_hsla(var(--warning),0.2)] rounded-full uppercase tracking-widest"
-                              >
-                                TOOL
-                              </Badge>
-                              <span className="text-white font-black uppercase tracking-widest font-outfit text-xs">
-                                {entry.structured.toolName}
-                              </span>
-                            </div>
-                            <div className="w-2 h-2 rounded-full bg-warning animate-status-pulse" />
-                          </div>
-                          <div className="relative">
-                            <div className="absolute top-0 right-0 p-2">
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-6 w-6 text-muted-foreground/30 hover:text-warning"
-                                onClick={() =>
-                                  entry.structured?.arguments &&
-                                  navigator.clipboard.writeText(
-                                    entry.structured.arguments,
-                                  )
-                                }
-                              >
-                                <Copy className="h-3 w-3" />
-                              </Button>
-                            </div>
-                            <pre className="text-warning/70 p-4 bg-black/40 rounded-xl border border-white/5 overflow-x-auto selection:bg-warning/30 font-mono text-[10px] leading-relaxed custom-scrollbar">
-                              {entry.structured.arguments}
-                            </pre>
-                          </div>
-                        </div>
-                      )}
-                      {entry.structured.type === "token_usage" && (
-                        <div className="flex items-center gap-4 bg-success/5 px-4 py-2 rounded-full border border-success/10 shadow-lg w-fit mt-1">
-                          <Cpu className="h-3.5 w-3.5 text-success shadow-[0_0_10px_hsla(var(--success),0.5)]" />
-                          <div className="flex items-center gap-3">
-                            <span className="text-success/80 font-black text-[10px] uppercase tracking-[0.2em]">
-                              UPLINK: {entry.structured.inputTokens ?? 0}
-                            </span>
-                            <div className="w-1 h-1 rounded-full bg-success/30" />
-                            <span className="text-success/80 font-black text-[10px] uppercase tracking-[0.2em]">
-                              DOWNLINK: {entry.structured.outputTokens ?? 0}
-                            </span>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  ) : (
-                    <span
-                      className={cn(
-                        "break-words selection:bg-primary/30 leading-relaxed font-medium",
-                        isError
-                          ? "text-white font-black"
-                          : isWarn
-                            ? "text-white"
-                            : "text-muted-foreground group-hover:text-white transition-premium",
-                      )}
-                    >
-                      {entry.text.toUpperCase()}
-                    </span>
-                  )}
-                </div>
-
-                <div className="w-12 flex justify-end shrink-0 opacity-0 group-hover:opacity-100 transition-premium">
-                  {isError ? (
-                    <AlertCircle className="h-4 w-4 text-destructive shadow-[0_0_10px_hsla(var(--destructive),0.5)]" />
-                  ) : isWarn ? (
-                    <Info className="h-4 w-4 text-warning shadow-[0_0_10px_hsla(var(--warning),0.5)]" />
-                  ) : (
-                    <CheckCircle2 className="h-4 w-4 text-success/40" />
-                  )}
-                </div>
-              </div>
-            );
-          })
+                Show {Math.min(hiddenCount, TERMINAL_WINDOW)} earlier (
+                {hiddenCount} hidden)
+              </button>
+            )}
+            {visibleEntries.map((entry) => (
+              <TerminalRow key={entry.seq} entry={entry} />
+            ))}
+          </>
         )}
       </div>
     </div>

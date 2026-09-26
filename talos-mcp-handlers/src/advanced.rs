@@ -2,6 +2,7 @@ use super::types::JsonRpcResponse;
 use super::utils::{check_outbound_url_no_ssrf, mcp_denied, mcp_error, mcp_not_found, mcp_text};
 use super::{auth, McpState};
 use std::sync::Arc;
+use talos_advanced_repository::MarketplacePublish;
 use uuid::Uuid;
 
 /// MCP-1136 (2026-05-16): cache the approval-gate notification webhook
@@ -492,7 +493,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "search_marketplace",
-            "description": "Search the module marketplace. Filter by name, capability world, or tag. Results ordered by download count.",
+            "description": "Search the module marketplace. Filter by name, capability world, or tag. Names are unique per publisher: each result carries publisher_id, first_party and verified. Verified listings first, then by download count.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -504,11 +505,16 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "install_from_marketplace",
-            "description": "Install a module from the marketplace into your workspace. Creates a new compiled module from the published source.",
+            "description": "Install a module from the marketplace into your workspace. Installs the code FROZEN when that version was published (not the publisher's current module). Hosts, methods and approval requirements come from the listing and are shown in the reply; allowed_secrets is your own grant (default none). Refused if your agent role lacks the module's capability world.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "listing_id": { "type": "string", "description": "UUID of the marketplace listing to install" }
+                    "listing_id": { "type": "string", "description": "UUID of the marketplace listing to install" },
+                    "allowed_secrets": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "YOUR vault paths the installed copy may read (default: none). The publisher's secret grant is never inherited — secrets resolve as you."
+                    }
                 },
                 "required": ["listing_id"]
             }
@@ -841,7 +847,7 @@ pub async fn dispatch(
         }
         "search_marketplace" => Some(handle_search_marketplace(req_id, args, state).await),
         "install_from_marketplace" => {
-            Some(handle_install_from_marketplace(req_id, args, state, user_id).await)
+            Some(handle_install_from_marketplace(req_id, args, state, &agent).await)
         }
         "get_marketplace_stats" => Some(handle_get_marketplace_stats(req_id, state).await),
         "create_approval_gate" => {
@@ -2359,101 +2365,97 @@ async fn handle_publish_to_marketplace(
         _ => "1.0.0".to_string(),
     };
 
-    // Fetch module info and verify ownership
-    match state
+    // Read the module (ownership-checked). What is read here is FROZEN on the
+    // listing — install never reads the publisher's live row again.
+    let snapshot = match state
         .advanced_repo
-        .get_wasm_module_for_marketplace(module_id, user_id)
+        .get_module_for_marketplace(module_id, user_id)
         .await
     {
-        Ok(Some(module)) => {
-            let mod_name = module.name;
-            let capability_world = module.capability_world;
-            let source_code = module.source_code;
-
-            if mod_name.len() > 200 {
-                return mcp_error(req_id, -32602, "Module name must not exceed 200 characters");
-            }
-
-            if source_code.is_none() {
-                return mcp_denied(
-                    req_id,
-                    -32000,
-                    "Module has no source code and cannot be published to the marketplace",
-                );
-            }
-
-            match state.advanced_repo.publish_to_marketplace(module_id, user_id, &mod_name, &description, &capability_world, &version, &tags).await {
-                Ok(listing_id) => mcp_text(req_id, &format!(
-                    "Module '{}' published to marketplace.\nListing ID: {}\nVersion: {}\nWorld: {}\nTags: {:?}",
-                    mod_name, listing_id, version, capability_world, tags
-                )),
-                Err(e) => {
-                    tracing::error!("publish_to_marketplace failed: {}", e);
-                    mcp_error(req_id, -32000, "Failed to publish module to marketplace")
-                }
-            }
-        }
-        Ok(None) => {
-            // Not in wasm_modules — check node_templates (compile_custom_sandbox output)
-            match state
-                .advanced_repo
-                .get_sandbox_for_marketplace(module_id, user_id)
-                .await
-            {
-                Ok(Some(sandbox)) => {
-                    let mod_name = sandbox.name;
-                    let wasm_bytes = sandbox.wasm_bytes;
-
-                    if wasm_bytes.is_none() {
-                        return mcp_denied(
-                            req_id,
-                            -32000,
-                            "Sandbox module has no compiled WASM and cannot be published",
-                        );
-                    }
-
-                    if mod_name.len() > 200 {
-                        return mcp_error(
-                            req_id,
-                            -32602,
-                            "Module name must not exceed 200 characters",
-                        );
-                    }
-
-                    // Derive capability_world by inspecting the WASM bytes.
-                    let capability_world = wasm_bytes
-                        .as_deref()
-                        .map(|b| {
-                            talos_worker_runtime::inspect_component(b)
-                                .capability_world
-                                .to_string()
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    // module_marketplace.module_id has no FK constraint, so a node_templates.id is valid.
-                    match state.advanced_repo.publish_to_marketplace(module_id, user_id, &mod_name, &description, &capability_world, &version, &tags).await {
-                        Ok(listing_id) => mcp_text(req_id, &format!(
-                            "Sandbox module '{}' published to marketplace.\nListing ID: {}\nVersion: {}\nWorld: {}\nTags: {:?}",
-                            mod_name, listing_id, version, capability_world, tags
-                        )),
-                        Err(e) => {
-                            tracing::error!("publish_to_marketplace (sandbox) insert failed: {}", e);
-                            mcp_error(req_id, -32000, "Failed to publish sandbox module to marketplace")
-                        }
-                    }
-                }
-                Ok(None) => mcp_denied(req_id, -32000, "Module not found or access denied"),
-                Err(e) => {
-                    tracing::error!("publish_to_marketplace sandbox lookup failed: {}", e);
-                    mcp_error(req_id, -32000, "Failed to look up module")
-                }
-            }
-        }
+        Ok(Some(s)) => s,
+        Ok(None) => return mcp_denied(req_id, -32000, "Module not found or access denied"),
         Err(e) => {
-            tracing::error!("publish_to_marketplace lookup failed: {}", e);
-            mcp_error(req_id, -32000, "Failed to look up module")
+            tracing::error!("publish_to_marketplace lookup failed: {:#}", e);
+            return mcp_error(req_id, -32000, "Failed to look up module");
+        }
+    };
+    if snapshot.name.len() > 200 {
+        return mcp_error(req_id, -32602, "Module name must not exceed 200 characters");
+    }
+    if snapshot.source_code.is_none() {
+        return mcp_denied(
+            req_id,
+            -32000,
+            "Module has no source code and cannot be published to the marketplace",
+        );
+    }
+    // The listed world is the one the BYTES import, not the row's label.
+    let capability_world = marketplace_world(&snapshot.wasm_bytes, &snapshot.capability_world);
+
+    match state
+        .advanced_repo
+        .publish_to_marketplace(
+            module_id,
+            user_id,
+            &snapshot,
+            &capability_world,
+            &description,
+            &version,
+            &tags,
+        )
+        .await
+    {
+        Ok(MarketplacePublish::Published { listing_id }) => mcp_text(
+            req_id,
+            &format!(
+                "Module '{}' published to marketplace.\nListing ID: {}\nVersion: {}\nWorld: {}\nTags: {:?}\n\
+                 The code is frozen on the listing: later changes to your module do not reach \
+                 installers until you publish a new version.",
+                snapshot.name, listing_id, version, capability_world, tags
+            ),
+        ),
+        Ok(MarketplacePublish::MetadataUpdated { listing_id }) => mcp_text(
+            req_id,
+            &format!(
+                "Version {} of '{}' is already published (listing {}): description and tags \
+                 updated. Its code is unchanged — a version's code is immutable; publish a new \
+                 version to ship new code.",
+                version, snapshot.name, listing_id
+            ),
+        ),
+        Ok(MarketplacePublish::NameReserved) => mcp_denied(
+            req_id,
+            -32000,
+            &format!(
+                "The name '{}' is held by a verified marketplace listing of another publisher. \
+                 Rename the module before publishing.",
+                snapshot.name
+            ),
+        ),
+        Ok(MarketplacePublish::NotOwned) => mcp_denied(
+            req_id,
+            -32000,
+            "This name/version is already published by another publisher",
+        ),
+        Err(e) => {
+            tracing::error!("publish_to_marketplace failed: {:#}", e);
+            mcp_error(req_id, -32000, "Failed to publish module to marketplace")
         }
     }
+}
+
+/// The world a marketplace listing declares: INSPECTED from the bytes when
+/// there are bytes (a row's label is a claim; the import section is what
+/// the module can call), else the row's stored world — a source-only module
+/// is compiled at that world on first use. Long form (`http-node`).
+fn marketplace_world(wasm_bytes: &Option<Vec<u8>>, stored: &str) -> String {
+    let short = match wasm_bytes {
+        Some(b) => talos_worker_runtime::inspect_component(b)
+            .capability_world
+            .to_string(),
+        None => talos_capability_world::world_short(stored).to_string(),
+    };
+    talos_module_repository::capability_world_long(&short)
 }
 
 async fn handle_search_marketplace(
@@ -2511,6 +2513,12 @@ async fn handle_search_marketplace(
                     serde_json::json!({
                         "id": r.id.to_string(),
                         "module_id": r.module_id.to_string(),
+                        // Names are unique per PUBLISHER, so a result is only
+                        // identifiable with its publisher and trust signal.
+                        "publisher_id": r.publisher_id.to_string(),
+                        "first_party": r.publisher_id
+                            == talos_advanced_repository::SYSTEM_PUBLISHER_ID,
+                        "verified": r.verified,
                         "name": r.name,
                         "description": r.description,
                         "capability_world": r.capability_world,
@@ -2541,109 +2549,142 @@ async fn handle_install_from_marketplace(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
-    user_id: Uuid,
+    agent: &auth::AgentIdentity,
 ) -> JsonRpcResponse {
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
     let listing_id = match crate::utils::require_uuid(args, "listing_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
     };
+    // The installer's OWN secret grant. The publisher's `allowed_secrets` is
+    // never inherited: secrets resolve as the installer, so inheriting it let
+    // a publisher choose which of the INSTALLER's vault paths the code reads.
+    let installer_secrets = match parse_installer_secrets(args) {
+        Ok(v) => v,
+        Err(msg) => return mcp_error(req_id, -32602, &msg),
+    };
 
-    // Fetch the listing
-    let listing = state
+    let listing = match state
         .advanced_repo
         .get_marketplace_listing(listing_id)
-        .await;
-
-    match listing {
-        Ok(Some(listing_row)) => {
-            let source_module_id = listing_row.module_id;
-            let listing_name = listing_row.name;
-            let capability_world = listing_row.capability_world;
-
-            let install_name = format!("{} (marketplace)", listing_name);
-
-            // Fetch the source module's full installable artifact. The repo
-            // normalises empty-vec wasm_bytes to None so we don't have to
-            // double-check for zero-length here.
-            let source_row = state
-                .advanced_repo
-                .get_wasm_module_source(source_module_id)
-                .await;
-
-            match source_row {
-                Ok(Some(src)) => {
-                    use talos_advanced_repository::InstallDispatch;
-                    match InstallDispatch::from_source(&src) {
-                        InstallDispatch::Wasm => match state
-                            .advanced_repo
-                            .install_wasm_from_marketplace(
-                                user_id,
-                                listing_id,
-                                &install_name,
-                                &capability_world,
-                                src,
-                            )
-                            .await
-                        {
-                            Ok(new_module_id) => mcp_text(
-                                req_id,
-                                &format!(
-                                    "Module '{}' installed from marketplace.\nNew module ID: {}\nCapability world: {}",
-                                    listing_name, new_module_id, capability_world
-                                ),
-                            ),
-                            Err(e) => {
-                                tracing::error!("install_from_marketplace insert failed: {}", e);
-                                mcp_error(req_id, -32000, "Failed to install module")
-                            }
-                        },
-                        InstallDispatch::Template => match state
-                            .advanced_repo
-                            .install_template_from_marketplace(
-                                user_id,
-                                listing_id,
-                                &install_name,
-                                &capability_world,
-                                src,
-                            )
-                            .await
-                        {
-                            Ok(new_template_id) => mcp_text(
-                                req_id,
-                                &format!(
-                                    "Sandbox module '{}' installed from marketplace (source-only — will compile on first use).\nTemplate ID: {}\nCapability world: {}\n\nUse this Template ID when adding the module to a workflow.",
-                                    listing_name, new_template_id, capability_world
-                                ),
-                            ),
-                            Err(e) => {
-                                tracing::error!(
-                                    "install_from_marketplace (sandbox) insert failed: {}",
-                                    e
-                                );
-                                mcp_error(req_id, -32000, "Failed to install module")
-                            }
-                        },
-                        InstallDispatch::Reject => mcp_denied(
-                            req_id,
-                            -32000,
-                            "Marketplace listing has no installable artifact: the source module has \
-                             neither compiled WASM bytes nor source code. The publisher must republish.",
-                        ),
-                    }
-                }
-                Ok(None) => mcp_error(req_id, -32000, "Source module no longer exists"),
-                Err(e) => {
-                    tracing::error!("install_from_marketplace source lookup failed: {}", e);
-                    mcp_error(req_id, -32000, "Failed to fetch source module")
-                }
-            }
-        }
-        Ok(None) => mcp_error(req_id, -32000, "Marketplace listing not found"),
+        .await
+    {
+        Ok(Some(l)) => l,
+        Ok(None) => return mcp_error(req_id, -32000, "Marketplace listing not found"),
         Err(e) => {
-            tracing::error!("install_from_marketplace listing lookup failed: {}", e);
-            mcp_error(req_id, -32000, "Failed to look up marketplace listing")
+            tracing::error!("install_from_marketplace listing lookup failed: {:#}", e);
+            return mcp_error(req_id, -32000, "Failed to look up marketplace listing");
+        }
+    };
+    let Some(src) = listing.artifact else {
+        return mcp_denied(
+            req_id,
+            -32000,
+            "Marketplace listing has no installable snapshot (it predates frozen listings, or \
+             its first-party source is gone). The publisher must republish.",
+        );
+    };
+    let dispatch = talos_advanced_repository::InstallDispatch::from_source(&src);
+    if dispatch == talos_advanced_repository::InstallDispatch::Reject {
+        return mcp_denied(
+            req_id,
+            -32000,
+            "Marketplace listing has no installable artifact: it has neither compiled WASM \
+             bytes nor source code. The publisher must republish.",
+        );
+    }
+    // Gate the role on the world the code will RUN at — inspected from the
+    // bytes, not the listing's label (the catalog twin gates the same way).
+    let world = marketplace_world(&src.wasm_bytes, &listing.capability_world);
+    if talos_capability_world::world_short(&world) == "unknown" {
+        return mcp_denied(
+            req_id,
+            -32000,
+            "Marketplace listing's bytes are not a recognised Talos component — refusing to install",
+        );
+    }
+    if let Err(resp) = crate::sandbox::require_agent_role_permits_world(
+        &req_id,
+        agent,
+        &world,
+        "install a marketplace module for",
+    ) {
+        return resp;
+    }
+    let grants = src.grants_for_installer(installer_secrets);
+    let install_name = format!("{} (marketplace)", listing.name);
+
+    let installed = match dispatch {
+        talos_advanced_repository::InstallDispatch::Wasm => state
+            .advanced_repo
+            .install_wasm_from_marketplace(user_id, listing_id, &install_name, &world, src, &grants)
+            .await
+            .map(|id| (id, "Module", "New module ID")),
+        _ => state
+            .advanced_repo
+            .install_template_from_marketplace(
+                user_id,
+                listing_id,
+                &install_name,
+                &world,
+                src,
+                &grants,
+            )
+            .await
+            .map(|id| {
+                (
+                    id,
+                    "Sandbox module (source-only — compiles on first use)",
+                    "Template ID",
+                )
+            }),
+    };
+    match installed {
+        Ok((new_id, kind, id_label)) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "installed": format!("{kind} '{}' installed from marketplace", listing.name),
+                "id_label": id_label,
+                "module_id": new_id.to_string(),
+                "capability_world": world,
+                "publisher_id": listing.publisher_id.to_string(),
+                "first_party": listing.publisher_id == talos_advanced_repository::SYSTEM_PUBLISHER_ID,
+                "verified": listing.verified,
+                // What this copy may do, shown so the installer reviews it.
+                "allowed_hosts": grants.allowed_hosts,
+                "allowed_methods": grants.allowed_methods,
+                "allowed_secrets": grants.allowed_secrets,
+                "requires_approval_for": grants.requires_approval_for,
+                "secrets_note": "allowed_secrets is YOUR grant (the install argument), never the \
+                    publisher's. Widen it with update_module_secrets if the module needs vault paths.",
+            }))
+            .unwrap_or_default(),
+        ),
+        Err(e) => {
+            tracing::error!("install_from_marketplace insert failed: {:#}", e);
+            mcp_error(req_id, -32000, "Failed to install module")
         }
     }
+}
+
+/// The install's `allowed_secrets` argument: absent/null = none; otherwise
+/// every entry must be a non-empty string, and the list passes the registry's
+/// shared validator.
+fn parse_installer_secrets(args: &serde_json::Value) -> Result<Vec<String>, String> {
+    let out = match args.get("allowed_secrets") {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .enumerate()
+            .map(|(i, v)| match v.as_str().map(str::trim) {
+                Some(s) if !s.is_empty() => Ok(s.to_string()),
+                _ => Err(format!("allowed_secrets[{i}] must be a non-empty string")),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("allowed_secrets must be an array of strings".to_string()),
+    };
+    talos_registry::validate_allowed_secrets(&out)?;
+    Ok(out)
 }
 
 async fn handle_get_marketplace_stats(

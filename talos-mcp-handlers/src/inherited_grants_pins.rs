@@ -167,3 +167,45 @@ fn run_sandbox_passes_the_resolved_method_grant() {
         "the sandbox execution call no longer names allowed_methods: {window}"
     );
 }
+
+/// The marketplace install is a fifth module writer (raw SQL, not a
+/// `WasmModule` literal). Both of its INSERTs must carry the method grant and
+/// the INSTALLER's secret grant through the one `InheritedGrants` value —
+/// before 2026-09-25 they bound the publisher's `allowed_secrets` and no
+/// `allowed_methods` at all (empty = deny every verb since EJ).
+///
+/// TEXTUAL, like the pin above: it proves the binds are the grant value's
+/// fields, not that the value is right (`grants_for_installer`'s unit test
+/// covers that).
+#[test]
+fn marketplace_install_binds_every_grant_from_the_one_value() {
+    let src = include_str!("../../talos-advanced-repository/src/lib.rs");
+    let mut installs = 0usize;
+    for fn_name in [
+        "install_wasm_from_marketplace(",
+        "install_template_from_marketplace(",
+    ] {
+        let at = src
+            .find(&format!("pub async fn {fn_name}"))
+            .unwrap_or_else(|| panic!("{fn_name} moved or renamed"));
+        let body = &src[at..];
+        let body = &body[..body.find("\n    }\n").expect("fn end")];
+        installs += 1;
+        for field in [
+            "allowed_methods",
+            "allowed_secrets",
+            "allowed_hosts",
+            "requires_approval_for",
+        ] {
+            assert!(
+                body.contains(&format!(".bind(&grants.{field})")),
+                "{fn_name} does not bind grants.{field}"
+            );
+        }
+        assert!(
+            !body.contains(&format!("src.allowed_{}", "secrets")),
+            "{fn_name} binds the publisher's secret grant"
+        );
+    }
+    assert_eq!(installs, 2);
+}

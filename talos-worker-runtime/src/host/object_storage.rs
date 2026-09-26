@@ -600,7 +600,13 @@ impl wit_object_storage::Host for TalosContext {
         let mut entries = Vec::new();
         for key_match in body.split("<Key>").skip(1) {
             if let Some(key_end) = key_match.find("</Key>") {
-                let key = key_match[..key_end].to_string();
+                // S3 XML-escapes keys (`a&amp;b.txt`); hand the guest the
+                // real key. A malformed escape (never from a real S3) drops
+                // the entry rather than returning a key that does not exist.
+                let Some(key) = decode_xml_text(&key_match[..key_end]) else {
+                    tracing::warn!(bucket = %bucket, "S3 LIST returned an undecodable key; skipping");
+                    continue;
+                };
                 let size = key_match
                     .split("<Size>")
                     .nth(1)
@@ -622,6 +628,37 @@ impl wit_object_storage::Host for TalosContext {
         }
 
         Ok(entries)
+    }
+}
+
+/// Decode the XML entities in one text node (`&amp; &lt; &gt; &quot; &apos;`
+/// and numeric `&#NN;` / `&#xHH;` references); `None` on a malformed escape.
+pub(crate) fn decode_xml_text(raw: &str) -> Option<String> {
+    quick_xml::escape::unescape(raw)
+        .ok()
+        .map(|c| c.into_owned())
+}
+
+#[cfg(test)]
+mod decode_xml_text_tests {
+    use super::decode_xml_text;
+
+    #[test]
+    fn s3_escaped_keys_decode_to_the_real_key() {
+        assert_eq!(decode_xml_text("a&amp;b.txt").as_deref(), Some("a&b.txt"));
+        assert_eq!(
+            decode_xml_text("&lt;x&gt; &quot;q&quot; &apos;s&apos;").as_deref(),
+            Some("<x> \"q\" 's'")
+        );
+        assert_eq!(
+            decode_xml_text("caf&#233;&#x2F;").as_deref(),
+            Some("caf\u{e9}/")
+        );
+        assert_eq!(
+            decode_xml_text("plain/key.txt").as_deref(),
+            Some("plain/key.txt")
+        );
+        assert_eq!(decode_xml_text("bad&bogus;"), None);
     }
 }
 

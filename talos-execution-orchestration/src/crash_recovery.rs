@@ -204,17 +204,17 @@ pub(crate) async fn resume_one(
     let exec_id = row.id;
     let origin_label = origin.label();
 
-    // The workflow was deleted between the original run and this restart — we
-    // have no graph to resume against. Fail terminally.
+    // The workflow — or the version this run was started on — was deleted
+    // before this resume: there is no graph to resume against. Fail terminally.
     let Some(graph_json) = row.graph_json else {
         fail(
             &deps,
             exec_id,
             origin,
-            &format!("{origin_label}: workflow was deleted before resume"),
+            &format!("{origin_label}: workflow or its pinned version was deleted before resume"),
         )
         .await;
-        tracing::warn!(execution_id = %exec_id, "{origin_label}: workflow deleted — marked failed");
+        tracing::warn!(execution_id = %exec_id, "{origin_label}: workflow or pinned version deleted — marked failed");
         return;
     };
 
@@ -350,6 +350,17 @@ pub(crate) async fn resume_one(
                 "{origin_label}: execution resumed"
             );
         }
+        // An operator cancelled the resumed run: the row is already
+        // `cancelled`. Its own outcome — not a resume failure, not a fence.
+        Err(ref e) if talos_engine::fence::was_cancelled_by_operator(e) => {
+            if origin.records_metrics() {
+                record_outcome("cancelled", 1);
+            }
+            tracing::info!(
+                execution_id = %exec_id,
+                "{origin_label}: resumed run stopped — the execution was cancelled by an operator"
+            );
+        }
         // Fenced: another controller superseded this resume (epoch advanced).
         // Do NOT mark the row failed — it now belongs to the new owner, or a
         // reclaim already failed it. Failing here would clobber the new owner's
@@ -443,6 +454,28 @@ mod strip_waiting_placeholder_tests {
 
         let out = strip_waiting_placeholder_seeds(seed);
         assert_eq!(out.len(), 3);
+    }
+
+    /// Every label literal passed to `record_outcome` must be a seeded label:
+    /// an unseeded series is absent, and absence reads as "no match". Also
+    /// pins that an operator cancel has its own label rather than `fenced`.
+    #[test]
+    fn every_recorded_outcome_is_a_seeded_label() {
+        let src = include_str!("crash_recovery.rs");
+        let needle = concat!("record_outcome", "(\"");
+        let labels: Vec<&str> = src
+            .split(needle)
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert!(labels.len() >= 5, "scan found too few sites: {labels:?}");
+        for label in &labels {
+            assert!(
+                talos_metrics::CRASH_RECOVERY_OUTCOMES.contains(label),
+                "record_outcome(\"{label}\") is not in CRASH_RECOVERY_OUTCOMES"
+            );
+        }
+        assert!(labels.contains(&"cancelled"), "{labels:?}");
     }
 
     #[test]

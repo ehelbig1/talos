@@ -1,12 +1,6 @@
-// MCP-946 (2026-05-15): kept `#![allow(dead_code)]`. The `allow`
-// method on `RateLimiter` is currently unused — production flow
-// uses `IpRateLimiter` via a different plumbing path. Vestigial,
-// tracked for cleanup follow-up.
-#![allow(dead_code)]
-
 use dashmap::DashMap;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -55,15 +49,6 @@ impl RateLimiter {
             buckets: Arc::new(DashMap::new()),
             user_buckets: Arc::new(DashMap::new()),
         }
-    }
-
-    /// Returns true if the request is allowed under the rate limit.
-    /// `max_requests_per_minute == 0` always denies.
-    pub fn allow(&self, id: Uuid, max_requests_per_minute: usize) -> bool {
-        if max_requests_per_minute == 0 {
-            return false;
-        }
-        Self::consume_token(&self.buckets, id, max_requests_per_minute)
     }
 
     /// Check both per-trigger and per-user aggregate rate limits.
@@ -137,30 +122,25 @@ impl RateLimiter {
 }
 
 // ============================================================================
-// Circuit Breaker: per-(IP, trigger) auth failure tracking
+// Circuit Breaker: auth-failure tracking keyed per (source, trigger)
 // ============================================================================
 //
-// A source IP that fails authentication CB_OPEN_THRESHOLD times within
-// CB_FAILURE_WINDOW against ONE trigger gets blocked from THAT trigger for
-// CB_BLOCK_DURATION. This prevents brute-force probers from paying repeated
-// HMAC CPU costs and DB round trips.
+// A source that fails authentication against ONE trigger CB_OPEN_THRESHOLD
+// times within CB_FAILURE_WINDOW is blocked for CB_BLOCK_DURATION — for THAT
+// trigger only. GitHub / Slack deliver every tenant's webhooks from shared IP
+// ranges, so a breaker keyed on the IP alone let one tenant's stale signing
+// secret block every other tenant behind that IP. The only IP-wide signal is
+// the pre-lookup one: a source naming CB_IP_WIDE_DISTINCT_UNKNOWN distinct
+// trigger ids that do not exist is enumerating, and is blocked for every
+// trigger. It counts DISTINCT ids, so a sender still posting to one deleted
+// trigger can never trip it.
 //
-// Keyed on (IP, trigger id) since 2026-09-25, NOT on the IP alone. The IP-only
-// key was chosen "so one attacker probing many triggers trips the breaker
-// once", and it made the breaker a cross-tenant lever: GitHub, Slack and most
-// SaaS senders deliver EVERY tenant's webhooks from one shared egress range, so
-// one tenant whose signing secret was rotated (or mistyped) produced ten
-// `InvalidSignature` failures from `140.82.115.x` and blocked that IP — i.e.
-// GitHub — for every tenant on the platform for a minute, re-blocking on every
-// later failure (MCP-526). F3 had already removed the trigger-STATE failures
-// from the count for exactly this reason; the auth failures it kept are just as
-// much about one trigger's secret. The cost, stated: an attacker probing M
-// triggers now gets 10 attempts per trigger rather than 10 in total. That is a
-// small widening in practice — every trigger id is a 122-bit UUID the prober
-// must already hold, `TriggerNotFound` is not counted at all, and the per-IP
-// request limiter in front of the router still bounds the rate.
+// Sources are keyed on the IPv4 address, or the IPv6 /64 (one subscriber's
+// allocation — per-address keying is free to rotate around).
 
 const CB_OPEN_THRESHOLD: u32 = 10;
+const CB_IP_WIDE_DISTINCT_UNKNOWN: usize = 20;
+#[cfg_attr(test, allow(dead_code))] // tests swap in `TEST_BLOCK_DURATION_MS`
 const CB_BLOCK_DURATION: Duration = Duration::from_secs(60);
 const CB_FAILURE_WINDOW: Duration = Duration::from_secs(300);
 
@@ -181,9 +161,9 @@ fn current_block_duration() -> Duration {
 fn current_block_duration() -> Duration {
     CB_BLOCK_DURATION
 }
-/// Types of failures a webhook request can end in. Only the AUTHENTICATION
-/// failures count toward the IP-keyed circuit breaker — see
-/// [`CircuitBreakerFailureType::counts_toward_breaker`].
+/// Types of failures a webhook request can end in. Only the failures that
+/// say something about the SENDER count — see
+/// [`CircuitBreakerFailureType::breaker_scope`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitBreakerFailureType {
     RateLimitExceeded,
@@ -195,25 +175,34 @@ pub enum CircuitBreakerFailureType {
     InternalError,
 }
 
+/// Which breaker record a counted failure lands in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BreakerScope {
+    /// A credential failure against one trigger: blocks that trigger only.
+    Trigger(Uuid),
+    /// Unknown trigger ids (pre-lookup): blocks the source for every trigger.
+    SourceWide,
+}
+
 impl CircuitBreakerFailureType {
-    /// Does this failure say something about the SENDER's credentials?
+    /// Where (if anywhere) this failure is counted for `trigger_id`.
     ///
-    /// F3: the breaker is keyed by source IP, and GitHub / Slack / most SaaS
-    /// senders deliver EVERY tenant's webhooks from one shared IP range. A
-    /// failure that is about the TRIGGER's state (disabled, deleted, its
-    /// per-trigger rate limit, an internal error on our side) therefore
-    /// says nothing about the sender and, counted, would let one tenant's
-    /// paused trigger — or one tenant's burst past ITS limit — open the
-    /// breaker against every other tenant behind that IP. Only a wrong
-    /// signature, a wrong verification token, or a disallowed source IP is
-    /// evidence about the sender itself.
-    pub fn counts_toward_breaker(self) -> bool {
-        matches!(
-            self,
+    /// F3: a failure about the TRIGGER's state (disabled, its per-trigger rate
+    /// limit, an internal error on our side) says nothing about the sender and
+    /// is never counted. A wrong signature / verification token / source IP is
+    /// evidence about the sender — but only for the trigger it failed against.
+    /// An unknown trigger id is the pre-lookup probe signal, counted source-wide
+    /// by DISTINCT id.
+    pub fn breaker_scope(self, trigger_id: Uuid) -> Option<BreakerScope> {
+        match self {
             CircuitBreakerFailureType::InvalidSignature
-                | CircuitBreakerFailureType::InvalidVerificationToken
-                | CircuitBreakerFailureType::IpNotAllowed
-        )
+            | CircuitBreakerFailureType::InvalidVerificationToken
+            | CircuitBreakerFailureType::IpNotAllowed => Some(BreakerScope::Trigger(trigger_id)),
+            CircuitBreakerFailureType::TriggerNotFound => Some(BreakerScope::SourceWide),
+            CircuitBreakerFailureType::RateLimitExceeded
+            | CircuitBreakerFailureType::TriggerDisabled
+            | CircuitBreakerFailureType::InternalError => None,
+        }
     }
 }
 
@@ -233,15 +222,37 @@ impl fmt::Display for CircuitBreakerFailureType {
     }
 }
 
+/// The source key: an IPv4 address (IPv4-mapped IPv6 unwrapped), or an IPv6
+/// address truncated to its /64.
+#[must_use]
+pub fn breaker_source(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(Ipv6Addr::from(
+                u128::from(v6) & 0xffff_ffff_ffff_ffff_0000_0000_0000_0000,
+            )),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BreakerKey {
+    source: IpAddr,
+    scope: BreakerScope,
+}
+
 struct CbRecord {
     consecutive_failures: u32,
+    /// Distinct unknown trigger ids (source-wide scope only), capped.
+    unknown_ids: Vec<Uuid>,
     blocked_until: Option<Instant>,
     last_failure: Instant,
 }
 
 pub struct CircuitBreaker {
-    /// Keyed by (source IP, trigger id) — see the section note above.
-    records: Arc<DashMap<(IpAddr, Uuid), CbRecord>>,
+    records: Arc<DashMap<BreakerKey, CbRecord>>,
 }
 
 impl Default for CircuitBreaker {
@@ -257,96 +268,105 @@ impl CircuitBreaker {
         }
     }
 
-    /// Returns `true` if `ip` is currently blocked from `trigger_id`.
-    pub fn is_blocked(&self, ip: IpAddr, trigger_id: Uuid) -> bool {
+    fn scope_blocked(&self, source: IpAddr, scope: BreakerScope, now: Instant) -> bool {
         self.records
-            .get(&(ip, trigger_id))
+            .get(&BreakerKey { source, scope })
             .and_then(|r| r.blocked_until)
-            .map(|until| until > Instant::now())
-            .unwrap_or(false)
+            .is_some_and(|until| until > now)
     }
 
-    /// Record an authentication failure for an IP with specific failure type.
-    /// If failures reach the threshold, block the IP.
-    /// Returns true if this failure caused the circuit breaker to open.
+    /// Is a request from `ip` to `trigger_id` blocked — by that trigger's own
+    /// record or by the source-wide one? Runs before any DB work (the trigger
+    /// id comes from the path).
+    pub fn is_blocked(&self, ip: IpAddr, trigger_id: Uuid) -> bool {
+        let source = breaker_source(ip);
+        let now = Instant::now();
+        self.scope_blocked(source, BreakerScope::SourceWide, now)
+            || self.scope_blocked(source, BreakerScope::Trigger(trigger_id), now)
+    }
+
+    /// Record a failure of `failure_type` from `ip` against `trigger_id`.
+    /// Returns true if this failure opened (or re-opened) a block.
     ///
-    /// Non-authentication failure types are IGNORED here (logged at debug,
-    /// return `false`) — the ONE chokepoint for F3, so a new call site cannot
-    /// reintroduce a trigger-state failure into the sender-keyed breaker.
+    /// The ONE chokepoint for F3: failure types with no
+    /// [`CircuitBreakerFailureType::breaker_scope`] are ignored here.
     pub fn record_failure_with_type(
         &self,
         ip: IpAddr,
         trigger_id: Uuid,
         failure_type: CircuitBreakerFailureType,
     ) -> bool {
-        if !failure_type.counts_toward_breaker() {
+        let Some(scope) = failure_type.breaker_scope(trigger_id) else {
             tracing::debug!(
                 ip = %ip,
                 trigger_id = %trigger_id,
                 failure_type = %failure_type,
-                "Circuit breaker: non-auth failure type not counted (shared sender IPs)"
+                "Circuit breaker: trigger-state failure not counted (shared sender IPs)"
             );
             return false;
-        }
+        };
+        let source = breaker_source(ip);
         let now = Instant::now();
         let mut entry = self
             .records
-            .entry((ip, trigger_id))
+            .entry(BreakerKey { source, scope })
             .or_insert_with(|| CbRecord {
                 consecutive_failures: 0,
+                unknown_ids: Vec::new(),
                 blocked_until: None,
                 last_failure: now,
             });
         let record = entry.value_mut();
 
-        // Reset counter if the IP has been quiet for the failure window.
+        // Reset counter if the source has been quiet for the failure window.
         if now.duration_since(record.last_failure) >= CB_FAILURE_WINDOW {
             record.consecutive_failures = 0;
+            record.unknown_ids.clear();
             record.blocked_until = None;
         }
 
-        // MCP-526: clear `blocked_until` once the block has actually
-        // expired. Pre-fix the field was set on first threshold-cross
-        // and never re-cleared except by the 5-minute quiet-window
-        // reset above. Combined with the re-block check
-        // (`blocked_until.is_none()`), this meant: once an IP had been
-        // blocked once, the breaker became INERT against further
-        // failures from that IP. Every failure also updates
-        // `last_failure = now`, so the quiet window never elapses for
-        // an actively-probing attacker — they get unlimited free
-        // failed-auth attempts post-block, the exact threat the
-        // breaker exists to throttle. Clearing the marker here means
-        // the very next failure after block expiry re-trips the
-        // threshold check (the failure counter is already ≥10), so
-        // a confirmed attacker is re-blocked every 60s on the next
-        // attempt. The 5-min quiet-window reset above still grants
-        // a clean slate to genuinely-quiet IPs.
+        // MCP-526: clear an EXPIRED block so the next failure re-trips the
+        // threshold check. Every failure updates `last_failure`, so the quiet
+        // window above never elapses for an actively-probing source — without
+        // this the breaker went inert after its first block.
         if let Some(until) = record.blocked_until {
             if until <= now {
                 record.blocked_until = None;
             }
         }
 
-        record.consecutive_failures += 1;
         record.last_failure = now;
+        let tripped = match scope {
+            BreakerScope::Trigger(_) => {
+                record.consecutive_failures += 1;
+                record.consecutive_failures >= CB_OPEN_THRESHOLD
+            }
+            BreakerScope::SourceWide => {
+                if record.unknown_ids.len() < CB_IP_WIDE_DISTINCT_UNKNOWN
+                    && !record.unknown_ids.contains(&trigger_id)
+                {
+                    record.unknown_ids.push(trigger_id);
+                }
+                record.unknown_ids.len() >= CB_IP_WIDE_DISTINCT_UNKNOWN
+            }
+        };
 
         let mut opened = false;
-        if record.consecutive_failures >= CB_OPEN_THRESHOLD && record.blocked_until.is_none() {
+        if tripped && record.blocked_until.is_none() {
             let block_duration = current_block_duration();
             record.blocked_until = Some(now + block_duration);
             opened = true;
             tracing::warn!(
-                ip = %ip,
-                trigger_id = %trigger_id,
-                failures = record.consecutive_failures,
+                source = %source,
+                scope = ?scope,
                 failure_type = %failure_type,
-                "Circuit breaker opened: IP blocked from this trigger for {}s",
+                "Circuit breaker opened for {}s",
                 block_duration.as_secs()
             );
         } else {
             tracing::debug!(
-                ip = %ip,
-                trigger_id = %trigger_id,
+                source = %source,
+                scope = ?scope,
                 failures = record.consecutive_failures,
                 failure_type = %failure_type,
                 "Circuit breaker recorded failure"
@@ -355,32 +375,20 @@ impl CircuitBreaker {
         opened
     }
 
-    /// Record an authentication failure for `ip` against `trigger_id`.
-    /// Backwards-compatible wrapper that uses InvalidSignature as the failure type.
-    pub fn record_failure(&self, ip: IpAddr, trigger_id: Uuid) {
-        self.record_failure_with_type(ip, trigger_id, CircuitBreakerFailureType::InvalidSignature);
-    }
-
     /// Record a successful authentication for an IP.
     ///
-    /// MCP-439: a success does NOT wipe the IP's accumulated failure
-    /// history. In a multi-tenant deployment, any attacker who controls
-    /// even one valid trigger could otherwise interleave 9 failed probes
-    /// against victim triggers with 1 successful call to their own
-    /// trigger to reset the counter indefinitely — the
-    /// `CB_OPEN_THRESHOLD` (10 failures within 5 min) would never be
-    /// reached. Failures now decay only via the 5-minute quiet window
-    /// in `record_failure_with_type`, which fires when an IP has no
-    /// failures (legitimate or otherwise) for `CB_FAILURE_WINDOW`. A
-    /// blocked IP's `blocked_until` is preserved so a race where a
-    /// blocked IP somehow gets a success doesn't unblock them early.
+    /// MCP-439: a success does NOT wipe accumulated failure history — an
+    /// attacker holding one valid trigger could otherwise interleave successes
+    /// with failed probes to keep the counter below the threshold forever.
+    /// Failures decay only via the `CB_FAILURE_WINDOW` quiet window.
     pub fn record_success(&self, _ip: IpAddr, _trigger_id: Uuid) {
-        // Intentionally no-op. Failures expire via CB_FAILURE_WINDOW,
-        // not via interleaved successes.
+        // Intentionally no-op.
     }
 
-    /// Operator reset: forget every record for `ip` — against one trigger when
-    /// `trigger_id` is given, against all of them otherwise. Returns how many
+    /// Operator reset: forget every record for `ip`'s source (the /64 for an
+    /// IPv6 address, see [`breaker_source`]) — its record against one trigger
+    /// when `trigger_id` is given, or every record including the source-wide
+    /// enumeration block otherwise. Returns how many
     /// records were removed and how many of those were an ACTIVE block, so the
     /// caller can say what it actually did.
     ///
@@ -390,9 +398,11 @@ impl CircuitBreaker {
     /// anything; the block simply expired on its own a minute later.
     pub fn reset_ip(&self, ip: IpAddr, trigger_id: Option<Uuid>) -> ResetOutcome {
         let now = Instant::now();
+        let source = breaker_source(ip);
         let mut outcome = ResetOutcome::default();
-        self.records.retain(|(rec_ip, rec_trigger), record| {
-            let matches = *rec_ip == ip && trigger_id.is_none_or(|t| t == *rec_trigger);
+        self.records.retain(|key, record| {
+            let matches = key.source == source
+                && trigger_id.is_none_or(|t| key.scope == BreakerScope::Trigger(t));
             if matches {
                 outcome.records_removed += 1;
                 if record.blocked_until.is_some_and(|until| until > now) {
@@ -412,18 +422,23 @@ impl CircuitBreaker {
             .retain(|_, r| now.duration_since(r.last_failure) < max_age);
     }
 
-    /// Return a snapshot of all currently-blocked (IP, trigger) pairs for
-    /// observability. Each entry is (ip, trigger_id, blocked_until).
-    pub fn blocked_ips(&self) -> Vec<(IpAddr, Uuid, Instant)> {
+    /// Currently-blocked records for observability: (source, trigger id,
+    /// blocked_until). The trigger id is `None` for a source-wide
+    /// (enumeration) block, which covers every trigger.
+    pub fn blocked_ips(&self) -> Vec<(IpAddr, Option<Uuid>, Instant)> {
         let now = Instant::now();
         self.records
             .iter()
             .filter_map(|entry| {
-                let (ip, trigger_id) = *entry.key();
+                let key = *entry.key();
+                let trigger = match key.scope {
+                    BreakerScope::Trigger(t) => Some(t),
+                    BreakerScope::SourceWide => None,
+                };
                 entry
                     .blocked_until
                     .filter(|&until| until > now)
-                    .map(|until| (ip, trigger_id, until))
+                    .map(|until| (key.source, trigger, until))
             })
             .collect()
     }
@@ -443,6 +458,8 @@ mod tests {
     use super::*;
     use std::thread;
 
+    const T: Uuid = Uuid::from_u128(0x7);
+
     #[test]
     fn test_rate_limiter_allows_within_limit() {
         let limiter = RateLimiter::new();
@@ -450,7 +467,7 @@ mod tests {
 
         // A fresh bucket starts full, so all 10 requests should succeed.
         for _ in 0..10 {
-            assert!(limiter.allow(id, 10));
+            assert!(limiter.allow_for_trigger(id, 10, Uuid::nil(), 0).0);
         }
     }
 
@@ -461,11 +478,11 @@ mod tests {
 
         // Consume all 5 tokens.
         for _ in 0..5 {
-            assert!(limiter.allow(id, 5));
+            assert!(limiter.allow_for_trigger(id, 5, Uuid::nil(), 0).0);
         }
 
         // Next request should be denied.
-        assert!(!limiter.allow(id, 5));
+        assert!(!limiter.allow_for_trigger(id, 5, Uuid::nil(), 0).0);
     }
 
     #[test]
@@ -478,22 +495,22 @@ mod tests {
 
         // Consume all tokens.
         for _ in 0..limit {
-            limiter.allow(id, limit);
+            limiter.allow_for_trigger(id, limit, Uuid::nil(), 0);
         }
 
         // Should be denied immediately.
-        assert!(!limiter.allow(id, limit));
+        assert!(!limiter.allow_for_trigger(id, limit, Uuid::nil(), 0).0);
 
         // After 110ms, at least 1 token should have refilled (600/min = 10/sec).
         thread::sleep(Duration::from_millis(110));
-        assert!(limiter.allow(id, limit));
+        assert!(limiter.allow_for_trigger(id, limit, Uuid::nil(), 0).0);
     }
 
     #[test]
     fn test_rate_limiter_zero_limit_always_denies() {
         let limiter = RateLimiter::new();
         let id = Uuid::new_v4();
-        assert!(!limiter.allow(id, 0));
+        assert!(!limiter.allow_for_trigger(id, 0, Uuid::nil(), 0).0);
     }
 
     #[test]
@@ -504,12 +521,12 @@ mod tests {
 
         // Exhaust id1.
         for _ in 0..3 {
-            limiter.allow(id1, 3);
+            limiter.allow_for_trigger(id1, 3, Uuid::nil(), 0);
         }
-        assert!(!limiter.allow(id1, 3));
+        assert!(!limiter.allow_for_trigger(id1, 3, Uuid::nil(), 0).0);
 
         // id2 should still be fresh.
-        assert!(limiter.allow(id2, 3));
+        assert!(limiter.allow_for_trigger(id2, 3, Uuid::nil(), 0).0);
     }
 
     #[test]
@@ -571,86 +588,105 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_counts_only_auth_failures() {
-        // F3: trigger-state failures (not found / disabled / rate-limited /
-        // internal) are NOT evidence about the sender and must not move the
-        // IP-keyed breaker. Pre-fix this test asserted the opposite
-        // ("all should count toward threshold").
+        // F3: trigger-state failures (disabled / rate-limited / internal) are
+        // NOT evidence about the sender and must not move the breaker.
         let cb = CircuitBreaker::new();
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        let trigger = Uuid::new_v4();
 
         for _ in 0..5 {
             assert!(!cb.record_failure_with_type(
                 ip,
-                trigger,
-                CircuitBreakerFailureType::TriggerNotFound
-            ));
-            assert!(!cb.record_failure_with_type(
-                ip,
-                trigger,
+                T,
                 CircuitBreakerFailureType::TriggerDisabled
             ));
             assert!(!cb.record_failure_with_type(
                 ip,
-                trigger,
+                T,
                 CircuitBreakerFailureType::RateLimitExceeded
             ));
-            assert!(!cb.record_failure_with_type(
-                ip,
-                trigger,
-                CircuitBreakerFailureType::InternalError
-            ));
-            cb.record_failure_with_type(ip, trigger, CircuitBreakerFailureType::InvalidSignature);
+            assert!(!cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InternalError));
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         }
-        // 20 non-auth + 5 auth failures: below the 10-auth-failure threshold.
-        assert!(!cb.is_blocked(ip, trigger));
+        assert!(!cb.is_blocked(ip, T));
 
-        // Five more AUTH failures of the other two counted kinds open it.
         for _ in 0..3 {
-            cb.record_failure_with_type(
-                ip,
-                trigger,
-                CircuitBreakerFailureType::InvalidVerificationToken,
-            );
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidVerificationToken);
         }
         for _ in 0..2 {
-            cb.record_failure_with_type(ip, trigger, CircuitBreakerFailureType::IpNotAllowed);
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::IpNotAllowed);
         }
-        assert!(cb.is_blocked(ip, trigger));
+        assert!(cb.is_blocked(ip, T));
     }
 
-    /// The cross-tenant defect this keying closes. GitHub delivers every
-    /// tenant's webhooks from one shared IP range; ten bad signatures against
-    /// ONE tenant's trigger (a rotated or mistyped secret) used to block that
-    /// IP — GitHub — for every tenant. Now only the failing trigger is blocked.
     #[test]
-    fn a_shared_sender_ip_failing_one_trigger_does_not_block_another() {
+    fn breaker_scopes_partition_the_failure_types() {
+        use CircuitBreakerFailureType::*;
+        for t in [InvalidSignature, InvalidVerificationToken, IpNotAllowed] {
+            assert_eq!(t.breaker_scope(T), Some(BreakerScope::Trigger(T)), "{t}");
+        }
+        assert_eq!(
+            TriggerNotFound.breaker_scope(T),
+            Some(BreakerScope::SourceWide)
+        );
+        for t in [RateLimitExceeded, TriggerDisabled, InternalError] {
+            assert_eq!(t.breaker_scope(T), None, "{t} is a trigger-state failure");
+        }
+    }
+
+    /// One tenant's stale secret, delivered from a shared sender IP, blocks
+    /// that tenant's trigger only — every other trigger behind the IP flows.
+    #[test]
+    fn a_failing_trigger_does_not_block_other_triggers_behind_the_same_ip() {
         let cb = CircuitBreaker::new();
-        let github: IpAddr = "140.82.115.10".parse().unwrap();
-        let tenant_a = Uuid::new_v4();
-        let tenant_b = Uuid::new_v4();
+        let ip: IpAddr = "140.82.112.1".parse().unwrap();
+        let other = Uuid::from_u128(0x8);
         for _ in 0..CB_OPEN_THRESHOLD {
-            cb.record_failure_with_type(
-                github,
-                tenant_a,
-                CircuitBreakerFailureType::InvalidSignature,
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
+        }
+        assert!(cb.is_blocked(ip, T));
+        assert!(!cb.is_blocked(ip, other));
+    }
+
+    /// A sender still posting to ONE deleted trigger never trips the
+    /// source-wide block; a source naming many distinct unknown ids does.
+    #[test]
+    fn source_wide_block_counts_distinct_unknown_trigger_ids() {
+        let cb = CircuitBreaker::new();
+        let ip: IpAddr = "140.82.112.2".parse().unwrap();
+        let deleted = Uuid::from_u128(0x9);
+        for _ in 0..100 {
+            cb.record_failure_with_type(ip, deleted, CircuitBreakerFailureType::TriggerNotFound);
+        }
+        assert!(!cb.is_blocked(ip, T));
+
+        let mut opened = false;
+        for i in 0..CB_IP_WIDE_DISTINCT_UNKNOWN as u128 {
+            opened |= cb.record_failure_with_type(
+                ip,
+                Uuid::from_u128(0x1000 + i),
+                CircuitBreakerFailureType::TriggerNotFound,
             );
         }
+        assert!(opened);
         assert!(
-            cb.is_blocked(github, tenant_a),
-            "the trigger whose signatures fail is blocked for that sender"
+            cb.is_blocked(ip, T),
+            "source-wide block covers every trigger"
         );
-        assert!(
-            !cb.is_blocked(github, tenant_b),
-            "another tenant's trigger behind the same shared sender IP must stay open"
-        );
-        // And the count is per trigger: failures spread across triggers do
-        // not add up to a block on any of them.
-        let spread: Vec<Uuid> = (0..CB_OPEN_THRESHOLD).map(|_| Uuid::new_v4()).collect();
-        for t in &spread {
-            cb.record_failure_with_type(github, *t, CircuitBreakerFailureType::InvalidSignature);
+    }
+
+    #[test]
+    fn ipv6_sources_are_keyed_on_their_64() {
+        let cb = CircuitBreaker::new();
+        for i in 0..CB_OPEN_THRESHOLD {
+            let ip: IpAddr = format!("2001:db8:1:2::{:x}", i + 1).parse().unwrap();
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         }
-        assert!(spread.iter().all(|t| !cb.is_blocked(github, *t)));
+        assert!(cb.is_blocked("2001:db8:1:2:ffff::1".parse().unwrap(), T));
+        assert!(!cb.is_blocked("2001:db8:1:3::1".parse().unwrap(), T));
+        assert_eq!(
+            breaker_source("::ffff:10.1.2.3".parse().unwrap()),
+            "10.1.2.3".parse::<IpAddr>().unwrap()
+        );
     }
 
     /// The operator reset really resets, and says what it removed. Its MCP
@@ -674,6 +710,10 @@ mod tests {
             );
         }
         assert!(cb.is_blocked(ip, blocked));
+        assert!(cb
+            .blocked_ips()
+            .iter()
+            .any(|(s, t, _)| *s == ip && *t == Some(blocked)));
 
         // Narrowed to one trigger: only that record goes.
         let one = cb.reset_ip(ip, Some(blocked));
@@ -702,43 +742,43 @@ mod tests {
         assert_eq!(cb.reset_ip(ip, None), ResetOutcome::default());
     }
 
+    /// A whole-source reset also clears the source-wide enumeration block,
+    /// and an IPv6 reset covers the /64 the breaker keyed on.
     #[test]
-    fn breaker_partition_is_exactly_the_three_auth_failures() {
-        use CircuitBreakerFailureType::*;
-        for t in [InvalidSignature, InvalidVerificationToken, IpNotAllowed] {
-            assert!(t.counts_toward_breaker(), "{t} is an auth failure");
+    fn reset_ip_clears_the_source_wide_block_for_the_whole_64() {
+        let cb = CircuitBreaker::new();
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2::ffff".parse().unwrap();
+        for _ in 0..CB_IP_WIDE_DISTINCT_UNKNOWN {
+            cb.record_failure_with_type(
+                a,
+                Uuid::new_v4(),
+                CircuitBreakerFailureType::TriggerNotFound,
+            );
         }
-        for t in [
-            RateLimitExceeded,
-            TriggerDisabled,
-            TriggerNotFound,
-            InternalError,
-        ] {
-            assert!(!t.counts_toward_breaker(), "{t} is a trigger-state failure");
-        }
+        assert!(cb.is_blocked(b, T));
+        assert!(cb.blocked_ips().iter().any(|(_, t, _)| t.is_none()));
+        assert_eq!(cb.reset_ip(b, None).active_blocks_removed, 1);
+        assert!(!cb.is_blocked(a, T));
     }
 
     #[test]
     fn test_circuit_breaker_returns_opened_status() {
         let cb = CircuitBreaker::new();
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        let trigger = Uuid::new_v4();
 
         // Record 9 failures - should return false (not opened yet)
         for _ in 0..9 {
-            let opened = cb.record_failure_with_type(
-                ip,
-                trigger,
-                CircuitBreakerFailureType::InvalidSignature,
-            );
+            let opened =
+                cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
             assert!(!opened);
         }
 
         // 10th failure should open the circuit
         let opened =
-            cb.record_failure_with_type(ip, trigger, CircuitBreakerFailureType::InvalidSignature);
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         assert!(opened);
-        assert!(cb.is_blocked(ip, trigger));
+        assert!(cb.is_blocked(ip, T));
     }
 
     #[test]
@@ -749,30 +789,26 @@ mod tests {
         // counter below the threshold forever.
         let cb = CircuitBreaker::new();
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        let trigger = Uuid::new_v4();
 
         // 9 failures — one short of the threshold (10).
         for _ in 0..9 {
-            cb.record_failure_with_type(ip, trigger, CircuitBreakerFailureType::InvalidSignature);
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         }
-        assert!(
-            !cb.is_blocked(ip, trigger),
-            "9 failures should not yet block"
-        );
+        assert!(!cb.is_blocked(ip, T), "9 failures should not yet block");
 
         // A success must NOT wipe the failure history.
-        cb.record_success(ip, trigger);
-        assert!(!cb.is_blocked(ip, trigger), "success alone does not block");
+        cb.record_success(ip, T);
+        assert!(!cb.is_blocked(ip, T), "success alone does not block");
 
         // ONE more failure must trip the breaker — proving the 9 prior
         // failures were preserved across the intervening success.
         let opened =
-            cb.record_failure_with_type(ip, trigger, CircuitBreakerFailureType::InvalidSignature);
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         assert!(
             opened,
             "10th failure must open the breaker even after a success"
         );
-        assert!(cb.is_blocked(ip, trigger), "IP must now be blocked");
+        assert!(cb.is_blocked(ip, T), "IP must now be blocked");
     }
 
     #[test]
@@ -793,34 +829,33 @@ mod tests {
 
         let cb = CircuitBreaker::new();
         let ip: IpAddr = "10.0.0.42".parse().unwrap();
-        let trigger = Uuid::new_v4();
 
         // 10 failures → first block opens.
         for _ in 0..10 {
-            cb.record_failure_with_type(ip, trigger, CircuitBreakerFailureType::InvalidSignature);
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         }
         assert!(
-            cb.is_blocked(ip, trigger),
+            cb.is_blocked(ip, T),
             "first block must open after 10 failures"
         );
 
         // Wait for the (shortened) block to expire.
         thread::sleep(Duration::from_millis(80));
         assert!(
-            !cb.is_blocked(ip, trigger),
+            !cb.is_blocked(ip, T),
             "block must expire after CB_BLOCK_DURATION"
         );
 
         // The very next failure must re-trip the breaker — pre-fix
         // this stayed silent and the IP kept failing freely.
         let opened =
-            cb.record_failure_with_type(ip, trigger, CircuitBreakerFailureType::InvalidSignature);
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         assert!(
             opened,
             "the first failure after block expiry must re-open the breaker"
         );
         assert!(
-            cb.is_blocked(ip, trigger),
+            cb.is_blocked(ip, T),
             "IP must be blocked again on the post-expiry failure"
         );
 
@@ -836,22 +871,21 @@ mod tests {
         // interleaved, accumulated failures must cross the threshold.
         let cb = CircuitBreaker::new();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let trigger = Uuid::new_v4();
 
         // 5 cycles of (1 success, 1 failure). 5 failures total.
         for _ in 0..5 {
-            cb.record_success(ip, trigger);
-            cb.record_failure_with_type(ip, trigger, CircuitBreakerFailureType::InvalidSignature);
+            cb.record_success(ip, T);
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         }
-        assert!(!cb.is_blocked(ip, trigger), "5 failures < threshold");
+        assert!(!cb.is_blocked(ip, T), "5 failures < threshold");
 
         // 5 more cycles. Now 10 failures total.
         for _ in 0..5 {
-            cb.record_success(ip, trigger);
-            cb.record_failure_with_type(ip, trigger, CircuitBreakerFailureType::InvalidSignature);
+            cb.record_success(ip, T);
+            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         }
         assert!(
-            cb.is_blocked(ip, trigger),
+            cb.is_blocked(ip, T),
             "interleaved successes must NOT save the attacker — \
              10 accumulated failures must still trip the breaker"
         );

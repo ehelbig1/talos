@@ -903,9 +903,19 @@ async fn evicted_module_reads_as_evicted_not_missing_and_recompile_clears_it() {
     assert!(has_bytes);
     assert_eq!(evicted_at, None, "a recompile must clear wasm_evicted_at");
 
+    // `content_hash` (never set by this writer), `size_bytes` and `max_fuel`
+    // are nullable: a row carrying NULL in them must still dispatch.
+    sqlx::query("UPDATE modules SET size_bytes = NULL, max_fuel = NULL WHERE id = $1")
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
     let m = registry
         .get_module_for_execution(id, user_id)
         .await
         .unwrap();
     assert_eq!(m.wasm_bytes, vec![1u8, 2, 3]);
+    assert_eq!(m.content_hash, "");
+    assert_eq!(m.size_bytes, 0);
+    assert_eq!(m.max_fuel, 2_000_000);
 }

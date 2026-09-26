@@ -48,24 +48,18 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
       const evTimestamp = new Date(ev.timestamp ?? fallbackNow).getTime();
       const relativeMs = evTimestamp - firstTimestamp;
 
+      // A node paused on an approval gate (WAITING) keeps its first start.
       if (
-        ev.status === "NodeStarted" ||
-        ev.status === "Running" ||
         ev.status === "RUNNING" ||
-        ev.status === "AwaitingApproval"
+        (ev.status === "WAITING" && !nodeStarts.has(nodeId))
       ) {
         nodeStarts.set(nodeId, relativeMs);
       }
 
-      if (
-        ev.status === "NodeCompleted" ||
-        ev.status === "COMPLETED" ||
-        ev.status === "NodeFailed" ||
-        ev.status === "FAILED"
-      ) {
+      if (ev.status === "COMPLETED" || ev.status === "FAILED") {
         const startMs = nodeStarts.get(nodeId) ?? relativeMs;
         const durationMs = ev.durationMs ?? Math.max(1, relativeMs - startMs);
-        const isFailed = ev.status === "NodeFailed" || ev.status === "FAILED";
+        const isFailed = ev.status === "FAILED";
 
         result.push({
           nodeId,

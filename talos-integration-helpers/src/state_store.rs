@@ -14,7 +14,8 @@ use chrono::Utc;
 use dashmap::DashMap;
 use std::hash::Hash;
 use std::sync::Arc;
-use talos_integration_state::execute_op;
+use talos_integration_state::{execute_op, update_existing, UpdateError};
+pub use talos_integration_state::{RowUpdate, UpdateOutcome};
 use talos_memory::integration_state_rpc::{
     IndexedSlots, IntegrationOp, IntegrationOpResult, IntegrationStateError, ListFilter,
     StoredEntry,
@@ -102,6 +103,34 @@ impl ChannelStore {
         .await
         .map_err(|e| anyhow!("integration_state set failed: {:?}", e))?;
         Ok(())
+    }
+
+    /// Atomic read-modify-write of the EXISTING row keyed by `id`:
+    /// `mutate` sees the current row under a row lock and the write is an
+    /// UPDATE, never an insert. Hot paths (cursor advance, push bookkeeping)
+    /// use this instead of read → [`Self::set`], which could resurrect a row
+    /// a concurrent stop deleted or revert a concurrent rewrite's fields.
+    pub async fn update_existing<F>(
+        &self,
+        user_id: Uuid,
+        id: Uuid,
+        mutate: F,
+    ) -> Result<UpdateOutcome>
+    where
+        F: FnOnce(&StoredEntry) -> Result<RowUpdate>,
+    {
+        update_existing(
+            &self.pool,
+            self.integration_name,
+            user_id,
+            &self.key(id),
+            mutate,
+        )
+        .await
+        .map_err(|e| match e {
+            UpdateError::State(e) => anyhow!("integration_state update failed: {:?}", e),
+            UpdateError::Mutation(e) => e,
+        })
     }
 
     /// Delete a row keyed by `id`.

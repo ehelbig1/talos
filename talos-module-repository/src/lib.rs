@@ -57,7 +57,7 @@ pub struct CapabilityChangeAudit<'a> {
 /// `modules.capability_world` is stored in long form (`secrets-node`), which
 /// the worker's `CapabilityWorld` parser reads; compile paths carry the short
 /// form (`secrets`). `trusted` is the legacy name of `automation-node`.
-fn capability_world_long(short: &str) -> String {
+pub fn capability_world_long(short: &str) -> String {
     if short == "trusted" {
         "automation-node".to_string()
     } else if short.ends_with("-node") {
@@ -2236,6 +2236,11 @@ impl ModuleRepository {
         name: &str,
         user_id: Uuid,
     ) -> Result<Option<Uuid>> {
+        // Step 1 is an EQUALITY on the normalised forms, so it takes the raw
+        // name — no pattern, nothing to escape.
+        if let Some(id) = self.find_module_id_strip_normalised(name, user_id).await? {
+            return Ok(Some(id));
+        }
         // `-`/`_`/space fold to `%` on purpose: that is the fuzz this lookup
         // is for. A literal `%` or `\` in the input is NOT — it is a wildcard
         // the caller injected, and `module_name: "%"` used to resolve to an
@@ -2244,19 +2249,14 @@ impl ModuleRepository {
         // catalog contains either character, so this is byte-identical for
         // every real name.
         let escaped = name.replace('\\', "\\\\").replace('%', "\\%");
-        if let Some(id) = self
-            .find_module_id_strip_normalised(&escaped, user_id)
-            .await?
-        {
-            return Ok(Some(id));
-        }
         let folded = escaped.to_lowercase().replace(['-', '_', ' '], "%");
         self.find_module_id_by_ilike(&format!("%{}%", folded), user_id)
             .await
     }
 
     /// Step 1 of [`Self::resolve_module_id_by_name_for_user`]: strip `-` and
-    /// `_` from both sides, then compare. Private — the only correct way to
+    /// `_` from both sides, then compare with `=` (it was `ILIKE`, so a `%` or
+    /// `\\` in the caller's name was a wildcard/escape here). Private — the only correct way to
     /// reach it is through the scoped resolver.
     async fn find_module_id_strip_normalised(
         &self,
@@ -2266,7 +2266,7 @@ impl ModuleRepository {
         let id: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM modules \
              WHERE LOWER(REPLACE(REPLACE(name, '-', ''), '_', '')) \
-                   ILIKE LOWER(REPLACE(REPLACE($1, '-', ''), '_', '')) \
+                   = LOWER(REPLACE(REPLACE($1, '-', ''), '_', '')) \
                AND (user_id IS NULL OR user_id = $2) \
              ORDER BY (user_id IS NULL), compiled_at DESC NULLS LAST, id \
              LIMIT 1",
@@ -3008,6 +3008,13 @@ impl ModuleRepository {
                     modules.imported_interfaces), \
                 dependencies = COALESCE(EXCLUDED.dependencies, modules.dependencies), \
                 config = COALESCE(EXCLUDED.config, modules.config), \
+                /* A per-user catalog install whose bytes change here is no \
+                   longer the catalog's: detach it so the catalog refresh \
+                   (refresh_catalog_wasm_by_slug) never overwrites the user's \
+                   code with catalog bytes. */ \
+                catalog_slug = CASE WHEN modules.user_id IS NOT NULL \
+                                     AND modules.content_hash IS DISTINCT FROM EXCLUDED.content_hash \
+                                    THEN NULL ELSE modules.catalog_slug END, \
                 compiled_at = NOW() \
              /* updated_at deliberately NOT set — see talos-registry/src/lib.rs. */ \
              /* INTENTIONALLY OMITTED from SET list — preserve existing values: \
@@ -3272,15 +3279,15 @@ impl ModuleRepository {
         // One round-trip per logical question — the DB optimizer will
         // batch them in the same connection. Could be a single CTE for
         // marginal speed, but readability + ease of modification wins.
+        // Every count PROPAGATES: a failed read is an error, never a `0` the
+        // operator tool would render as a measured value.
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM modules")
             .fetch_one(&self.db_pool)
-            .await
-            .unwrap_or(0);
+            .await?;
         let by_kind_rows: Vec<(String, i64)> =
             sqlx::query_as("SELECT kind, COUNT(*) FROM modules GROUP BY kind")
                 .fetch_all(&self.db_pool)
-                .await
-                .unwrap_or_default();
+                .await?;
         let mut by_kind = std::collections::HashMap::new();
         for (k, c) in by_kind_rows {
             by_kind.insert(k, c);
@@ -3303,14 +3310,12 @@ impl ModuleRepository {
         let phase14_dependencies_set: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM modules WHERE dependencies IS NOT NULL")
                 .fetch_one(&self.db_pool)
-                .await
-                .unwrap_or(0);
+                .await?;
         let phase14_imports_set: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM modules WHERE array_length(imported_interfaces, 1) > 0",
         )
         .fetch_one(&self.db_pool)
-        .await
-        .unwrap_or(0);
+        .await?;
 
         Ok(ModuleUnificationSnapshot {
             total,
@@ -3467,42 +3472,28 @@ impl ModuleRepository {
         Ok(())
     }
 
-    /// Find non-archived workflows that reference a module by EITHER its
-    /// wasm_modules.id OR its template_id (the dual-UUID problem). Returns
+    /// Find the caller's non-archived workflows that reference a module by
+    /// EITHER its id OR its template_id (the dual-UUID problem). Returns
     /// (workflow_id, name, owning_user_id) so the post-hot-update validator
     /// can run with the workflow's actual owner. Capped at 50 rows.
+    ///
+    /// Scoped to `owner` (2026-09-25): a module is dispatchable only by its
+    /// owner's workflows (`get_module`'s `user_id = $2 OR user_id IS NULL`), so
+    /// another tenant's graph that merely NAMES the id cannot run it — and must
+    /// not appear in a hot-update reply or veto the update. The match is
+    /// STRUCTURAL (a node's `type` or `data.moduleId`, the loader's own rule),
+    /// not a substring of the whole graph text.
     pub async fn find_dependent_workflows_dual_id(
         &self,
         module_id: Uuid,
         template_id: Option<Uuid>,
+        owner: Uuid,
     ) -> Result<Vec<(Uuid, String, Uuid)>> {
-        let pattern_self = format!("%{}%", module_id);
-        let pattern_template = template_id.map(|tid| format!("%{}%", tid));
-        let rows: Vec<(Uuid, String, Uuid)> = match &pattern_template {
-            Some(pt) if pt != &pattern_self => {
-                sqlx::query_as(
-                    "SELECT id, name, user_id FROM workflows \
-                 WHERE (graph_json LIKE $1 OR graph_json LIKE $2) \
-                   AND (status IS NULL OR status != 'archived') \
-                 ORDER BY updated_at DESC, id DESC LIMIT 50",
-                )
-                .bind(&pattern_self)
-                .bind(pt)
-                .fetch_all(&self.db_pool)
-                .await?
-            }
-            _ => {
-                sqlx::query_as(
-                    "SELECT id, name, user_id FROM workflows \
-                 WHERE graph_json LIKE $1 \
-                   AND (status IS NULL OR status != 'archived') \
-                 ORDER BY updated_at DESC, id DESC LIMIT 50",
-                )
-                .bind(&pattern_self)
-                .fetch_all(&self.db_pool)
-                .await?
-            }
-        };
+        let rows: Vec<(Uuid, String, Uuid)> = sqlx::query_as(&dependent_workflows_sql("user_id"))
+            .bind(dependent_module_ids(module_id, template_id))
+            .bind(owner)
+            .fetch_all(&self.db_pool)
+            .await?;
         Ok(rows)
     }
 
@@ -3513,41 +3504,20 @@ impl ModuleRepository {
     ///
     /// Returns (workflow_id, workflow_name, Option<actor_id>). Workflows
     /// without an actor_id pass through as `None` — they don't impose a
-    /// ceiling. Same 50-row cap and same dual-UUID matcher as the sibling
-    /// method; kept as a separate query so callers that don't care about
-    /// actor_id pay nothing.
+    /// ceiling. Same owner scope, 50-row cap and structural matcher as the
+    /// sibling method.
     pub async fn find_dependent_workflows_with_actors_dual_id(
         &self,
         module_id: Uuid,
         template_id: Option<Uuid>,
+        owner: Uuid,
     ) -> Result<Vec<(Uuid, String, Option<Uuid>)>> {
-        let pattern_self = format!("%{}%", module_id);
-        let pattern_template = template_id.map(|tid| format!("%{}%", tid));
-        let rows: Vec<(Uuid, String, Option<Uuid>)> = match &pattern_template {
-            Some(pt) if pt != &pattern_self => {
-                sqlx::query_as(
-                    "SELECT id, name, actor_id FROM workflows \
-                 WHERE (graph_json LIKE $1 OR graph_json LIKE $2) \
-                   AND (status IS NULL OR status != 'archived') \
-                 ORDER BY updated_at DESC, id DESC LIMIT 50",
-                )
-                .bind(&pattern_self)
-                .bind(pt)
+        let rows: Vec<(Uuid, String, Option<Uuid>)> =
+            sqlx::query_as(&dependent_workflows_sql("actor_id"))
+                .bind(dependent_module_ids(module_id, template_id))
+                .bind(owner)
                 .fetch_all(&self.db_pool)
-                .await?
-            }
-            _ => {
-                sqlx::query_as(
-                    "SELECT id, name, actor_id FROM workflows \
-                 WHERE graph_json LIKE $1 \
-                   AND (status IS NULL OR status != 'archived') \
-                 ORDER BY updated_at DESC, id DESC LIMIT 50",
-                )
-                .bind(&pattern_self)
-                .fetch_all(&self.db_pool)
-                .await?
-            }
-        };
+                .await?;
         Ok(rows)
     }
 
@@ -3962,6 +3932,35 @@ async fn record_module_deletes(
     .await
 }
 
+/// The id set a dependent-workflow lookup matches: the module id and, when it
+/// differs, its template id — lowercased, as the graph stores them.
+fn dependent_module_ids(module_id: Uuid, template_id: Option<Uuid>) -> Vec<String> {
+    let mut ids = vec![module_id.to_string()];
+    if let Some(t) = template_id.filter(|t| *t != module_id) {
+        ids.push(t.to_string());
+    }
+    ids
+}
+
+/// The dependent-workflow statement, projecting `third` (`user_id` or
+/// `actor_id`). `$1` = the id set, `$2` = the module's owner. A node references
+/// a module through `type` or `data.moduleId` (`node_module_id`'s rule).
+fn dependent_workflows_sql(third: &str) -> String {
+    debug_assert!(matches!(third, "user_id" | "actor_id"));
+    format!(
+        "SELECT w.id, w.name, w.{third} FROM workflows w \
+         WHERE w.user_id = $2 \
+           AND (w.status IS NULL OR w.status != 'archived') \
+           AND EXISTS ( \
+               SELECT 1 FROM jsonb_array_elements( \
+                   CASE WHEN jsonb_typeof(w.graph_json::jsonb -> 'nodes') = 'array' \
+                        THEN w.graph_json::jsonb -> 'nodes' ELSE '[]'::jsonb END) n \
+               WHERE lower(n ->> 'type') = ANY($1::text[]) \
+                  OR lower(n -> 'data' ->> 'moduleId') = ANY($1::text[])) \
+         ORDER BY w.updated_at DESC, w.id DESC LIMIT 50"
+    )
+}
+
 #[cfg(test)]
 mod visible_module_tests {
     use super::{resolve_visible_modules, VisibleModule};
@@ -4183,5 +4182,60 @@ mod preview_action_scope_pins {
             "the exported cap must match the query's actual bound — a disclosure \
              derived from the wrong number is worse than none"
         );
+    }
+}
+
+#[cfg(test)]
+mod dependent_workflow_scope_tests {
+    use super::*;
+
+    /// The hot-update dependent lookup is owner-scoped and structural. Before
+    /// 2026-09-25 it was `graph_json LIKE '%<uuid>%'` over EVERY tenant, so
+    /// another tenant's workflow names leaked into the reply and its actor
+    /// could veto the update.
+    #[test]
+    fn dependent_lookup_is_owner_scoped_and_structural() {
+        for third in ["user_id", "actor_id"] {
+            let sql = dependent_workflows_sql(third);
+            assert!(sql.contains("WHERE w.user_id = $2"), "{sql}");
+            assert!(sql.contains("n ->> 'type'") && sql.contains("'moduleId'"));
+            assert!(!sql.contains("LIKE"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn id_set_dedupes_the_template_twin() {
+        let m = Uuid::from_u128(1);
+        assert_eq!(dependent_module_ids(m, Some(m)).len(), 1);
+        assert_eq!(dependent_module_ids(m, Some(Uuid::from_u128(2))).len(), 2);
+        assert_eq!(dependent_module_ids(m, None), vec![m.to_string()]);
+    }
+
+    /// SOURCE PIN (textual): the strip-normalised name match is an equality,
+    /// not an ILIKE a caller's `%` / `\` could steer; and the unification
+    /// snapshot does not default a failed count.
+    #[test]
+    fn name_match_is_equality_and_snapshot_propagates() {
+        let src = include_str!("lib.rs");
+        let at = src
+            .find("async fn find_module_id_strip_normalised")
+            .unwrap();
+        let body = &src[at..at + 900];
+        assert!(body.contains("= LOWER(REPLACE(REPLACE($1"));
+        assert!(!body.contains(&format!("{} LOWER(REPLACE(REPLACE($1", "ILIKE")));
+        let at = src
+            .find("pub async fn module_unification_snapshot")
+            .unwrap();
+        let body = &src[at..at + 2600];
+        assert!(!body.contains(".unwrap_or(0)") && !body.contains(".unwrap_or_default()"));
+    }
+
+    /// SOURCE PIN (textual): a hot update that changes a per-user row's bytes
+    /// detaches it from the catalog, so the catalog refresh cannot overwrite it.
+    #[test]
+    fn mirror_write_detaches_changed_user_rows_from_the_catalog() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains("catalog_slug = CASE WHEN modules.user_id IS NOT NULL"));
+        assert!(src.contains("modules.content_hash IS DISTINCT FROM EXCLUDED.content_hash"));
     }
 }

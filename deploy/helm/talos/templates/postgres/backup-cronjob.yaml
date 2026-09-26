@@ -36,6 +36,8 @@ spec:
           labels:
             {{- include "talos.componentLabels" (list . "postgres-backup") | nindent 12 }}
         spec:
+          # No Kubernetes API access needed: no service-account token in the pod.
+          automountServiceAccountToken: false
           restartPolicy: OnFailure
           {{- include "talos.imagePullSecrets" . | nindent 10 }}
           securityContext:

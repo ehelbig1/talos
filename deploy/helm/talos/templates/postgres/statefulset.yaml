@@ -71,6 +71,8 @@ spec:
         # independently.
         checksum/postgres-credentials-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.componentName" (list . "postgres-credentials"))) }}
     spec:
+      # No Kubernetes API access needed: no service-account token in the pod.
+      automountServiceAccountToken: false
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:
         runAsNonRoot: true

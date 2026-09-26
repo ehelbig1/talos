@@ -41,7 +41,9 @@ use serde_json::Value as JsonValue;
 use talos_integration_helpers::audit::{
     insert_channel_audit, truncate_and_redact_error, ChannelAuditEvent,
 };
-use talos_integration_helpers::state_store::{ttl_with_grace, ChannelStore};
+use talos_integration_helpers::state_store::{
+    ttl_with_grace, ChannelStore, RowUpdate, UpdateOutcome,
+};
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{
     IndexedSlots, IntegrationOp, IntegrationOpResult, ListFilter, StoredEntry,
@@ -102,6 +104,48 @@ impl WatchChannelRow {
                 .unwrap_or_else(Utc::now),
         }
     }
+}
+
+/// The stored form of a channel row. Every slot is populated so the indexed
+/// lookups for webhook/renewal work consistently. The row stays visible well
+/// past Google's advertised expiration (14-day grace, 1-hour floor — in
+/// `talos_integration_helpers::state_store`) so a run of renewal failures
+/// does not make it vanish between scheduler ticks; happy-path rows are
+/// deleted explicitly by renew / stop / deactivate.
+fn row_write(row: &WatchChannelRow) -> Result<(serde_json::Value, Option<u64>, IndexedSlots)> {
+    Ok((
+        serde_json::to_value(row).context("encode gcal watch row")?,
+        ttl_with_grace(row.expiration_ms),
+        IndexedSlots {
+            idx_str_1: Some(row.channel_id.clone()),
+            idx_str_2: Some(row.calendar_id.clone()),
+            idx_ts_1_ms: Some(row.expiration_ms),
+            idx_int_1: None,
+        },
+    ))
+}
+
+fn replace_with(row: &WatchChannelRow) -> Result<RowUpdate> {
+    let (value, ttl_seconds, slots) = row_write(row)?;
+    Ok(RowUpdate::Replace {
+        value,
+        ttl_seconds,
+        slots,
+    })
+}
+
+/// The row with `msg_num` recorded, or `None` for a duplicate / out-of-order
+/// message number.
+fn advanced_message_number(
+    mut row: WatchChannelRow,
+    msg_num: i64,
+    now_ms: i64,
+) -> Option<WatchChannelRow> {
+    (msg_num > row.last_message_number).then(|| {
+        row.last_message_number = msg_num;
+        row.updated_at_ms = now_ms;
+        row
+    })
 }
 
 /// Decode a `StoredEntry` from integration_state into a `WatchChannelRow`.
@@ -195,19 +239,34 @@ impl GoogleCalendarService {
         // Fast path: if this (integration_id, calendar_id) already has a
         // live channel, update its module_id without touching Google's
         // API. Looked up via `idx_str_2 = calendar_id` + value filter.
-        if let Some(mut existing) = self
+        if let Some(existing) = self
             .find_channel_by_integration_and_calendar(user_id, integration_id, calendar_id)
             .await?
         {
-            existing.module_id = module_id;
-            existing.updated_at_ms = Utc::now().timestamp_millis();
-            self.upsert_channel_row(user_id, &existing).await?;
-            tracing::info!(
-                channel_uuid = %existing.id,
-                calendar = %calendar_id,
-                "♻️  Reusing existing gcal watch channel (module_id updated)"
-            );
-            return Ok(existing.to_watch_channel(user_id));
+            // Field-scoped, row-locked: only the binding changes, so a
+            // concurrent message-number / sync-token write is never reverted.
+            let now_ms = Utc::now().timestamp_millis();
+            let mut rebound = None;
+            self.store()
+                .update_existing(user_id, existing.id, |entry| {
+                    let mut row = decode_row(entry)?;
+                    row.module_id = module_id;
+                    row.updated_at_ms = now_ms;
+                    let update = replace_with(&row)?;
+                    rebound = Some(row);
+                    Ok(update)
+                })
+                .await?;
+            // `None`: the row vanished since the lookup (a concurrent stop);
+            // fall through and create a fresh channel.
+            if let Some(row) = rebound {
+                tracing::info!(
+                    channel_uuid = %row.id,
+                    calendar = %calendar_id,
+                    "♻️  Reusing existing gcal watch channel (module_id updated)"
+                );
+                return Ok(row.to_watch_channel(user_id));
+            }
         }
 
         // Slow path: call Google to create a fresh channel and persist.
@@ -795,40 +854,35 @@ impl GoogleCalendarService {
     /// `Err` means the channel was unreachable (decode error, DB
     /// outage) — the caller treats these as INTERNAL_SERVER_ERROR.
     ///
-    /// **Race note:** integration_state has no per-row conditional
-    /// UPDATE, so this is a read-modify-write. Two concurrent webhooks
-    /// with msg N and N+1 can both read the same `last_message_number`
-    /// and both return `Ok(true)`, overwriting each other. The
-    /// resulting row has whichever write landed last; dedup for the
-    /// LOSING write is defeated. Event-level Redis deduplication
-    /// downstream (`deduplicate_events`) covers this: even if
-    /// `advance_message_number` misses a duplicate, the event-payload
-    /// dedup prevents duplicate job dispatch. If Redis is unavailable,
-    /// this degrades gracefully (worst case: duplicate execution of
-    /// one event).
+    /// The read-modify-write runs under a row lock
+    /// (`ChannelStore::update_existing`), so two concurrent webhooks with
+    /// msg N and N+1 serialize: exactly the newer one advances, and a
+    /// concurrent stop/renew is never undone (the row is never re-created).
     pub(crate) async fn advance_message_number(
         &self,
         user_id: Uuid,
         channel_uuid: Uuid,
         msg_num: i64,
     ) -> Result<bool> {
-        let entry = match self.store().get_entry(user_id, channel_uuid).await? {
-            Some(entry) => entry,
-            None => {
-                return Err(anyhow!(
-                    "channel {} not found during msg-num advance",
-                    channel_uuid
-                ))
-            }
-        };
-        let mut row = decode_row(&entry)?;
-        if msg_num <= row.last_message_number {
-            return Ok(false);
+        let now_ms = Utc::now().timestamp_millis();
+        let outcome = self
+            .store()
+            .update_existing(user_id, channel_uuid, |entry| {
+                let row = decode_row(entry)?;
+                match advanced_message_number(row, msg_num, now_ms) {
+                    Some(row) => replace_with(&row),
+                    None => Ok(RowUpdate::Unchanged),
+                }
+            })
+            .await?;
+        match outcome {
+            UpdateOutcome::Updated => Ok(true),
+            UpdateOutcome::Unchanged => Ok(false),
+            UpdateOutcome::Absent => Err(anyhow!(
+                "channel {} not found during msg-num advance",
+                channel_uuid
+            )),
         }
-        row.last_message_number = msg_num;
-        row.updated_at_ms = Utc::now().timestamp_millis();
-        self.upsert_channel_row(user_id, &row).await?;
-        Ok(true)
     }
 
     // -----------------------------------------------------------------
@@ -838,31 +892,9 @@ impl GoogleCalendarService {
     /// Upsert a channel row. Every slot is populated so the indexed
     /// lookups for webhook/renewal work consistently.
     async fn upsert_channel_row(&self, user_id: Uuid, row: &WatchChannelRow) -> Result<()> {
-        let value = serde_json::to_value(row).context("encode gcal watch row")?;
-        // Keep the row visible well past Google's advertised
-        // expiration so a run of renewal failures doesn't cause the
-        // row to vanish between scheduler ticks — the 14-day grace
-        // rule (and the 1-hour floor for already-past expirations)
-        // lives in `talos_integration_helpers::state_store`.
-        //
-        // Happy-path rows are deleted explicitly by `renew_watch_
-        // channel` / `stop_watch_channel` / `deactivate_integration`,
-        // so this TTL only fires for truly abandoned rows.
-        let ttl_seconds = ttl_with_grace(row.expiration_ms);
-
+        let (value, ttl_seconds, slots) = row_write(row)?;
         self.store()
-            .set(
-                user_id,
-                row.id,
-                value,
-                ttl_seconds,
-                IndexedSlots {
-                    idx_str_1: Some(row.channel_id.clone()),
-                    idx_str_2: Some(row.calendar_id.clone()),
-                    idx_ts_1_ms: Some(row.expiration_ms),
-                    idx_int_1: None,
-                },
-            )
+            .set(user_id, row.id, value, ttl_seconds, slots)
             .await
     }
 
@@ -876,14 +908,20 @@ impl GoogleCalendarService {
         channel_uuid: Uuid,
         sync_token: &str,
     ) -> Result<()> {
-        let entry = match self.store().get_entry(user_id, channel_uuid).await? {
-            Some(entry) => entry,
-            None => anyhow::bail!("channel {} not found", channel_uuid),
-        };
-        let mut row = decode_row(&entry)?;
-        row.sync_token = Some(sync_token.to_string());
-        row.updated_at_ms = Utc::now().timestamp_millis();
-        self.upsert_channel_row(user_id, &row).await
+        let now_ms = Utc::now().timestamp_millis();
+        let outcome = self
+            .store()
+            .update_existing(user_id, channel_uuid, |entry| {
+                let mut row = decode_row(entry)?;
+                row.sync_token = Some(sync_token.to_string());
+                row.updated_at_ms = now_ms;
+                replace_with(&row)
+            })
+            .await?;
+        if outcome == UpdateOutcome::Absent {
+            anyhow::bail!("channel {} not found", channel_uuid);
+        }
+        Ok(())
     }
 
     async fn find_channel_by_integration_and_calendar(
@@ -911,5 +949,52 @@ impl GoogleCalendarService {
     /// without a key; production construction always sets it.
     fn worker_shared_key(&self) -> Option<&[u8]> {
         self.shared_key.get().map(|k| k.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod hot_path_tests {
+    use super::*;
+
+    fn row(last: i64) -> WatchChannelRow {
+        WatchChannelRow {
+            id: Uuid::nil(),
+            integration_id: Uuid::nil(),
+            calendar_id: "primary".into(),
+            channel_id: "ch".into(),
+            resource_id: "res".into(),
+            webhook_url: "https://example.com/hook".into(),
+            expiration_ms: 0,
+            sync_token: Some("current".into()),
+            module_id: Some(Uuid::from_u128(3)),
+            last_message_number: last,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn message_numbers_only_move_forward() {
+        let r = advanced_message_number(row(5), 6, 42).expect("newer message");
+        assert_eq!((r.last_message_number, r.updated_at_ms), (6, 42));
+        assert_eq!(r.sync_token.as_deref(), Some("current"));
+        assert!(advanced_message_number(row(5), 5, 42).is_none());
+        assert!(advanced_message_number(row(5), 4, 42).is_none());
+    }
+
+    /// Source pin: both hot-path writers go through the row-locked update,
+    /// never read → upsert (which resurrected stopped channels).
+    #[test]
+    fn hot_path_writers_use_the_row_locked_update() {
+        let src = include_str!("watch.rs");
+        for f in [
+            "async fn advance_message_number",
+            "async fn update_channel_sync_token",
+        ] {
+            let body = &src[src.find(f).unwrap()..];
+            let body = &body[..body.find("\n    }\n").unwrap()];
+            assert!(body.contains("update_existing("), "{f}");
+            assert!(!body.contains("upsert_channel_row"), "{f}");
+        }
     }
 }

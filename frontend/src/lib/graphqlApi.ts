@@ -322,11 +322,13 @@ export interface ActorMemoryGroup {
  * Batched sibling of `listActorMemories`: one request returns the
  * memories of MANY owned actors, grouped per actor (max 100 ids per
  * call — the server refuses larger batches). Ids that are unknown or
- * not owned by the caller are silently skipped (no group).
+ * not owned by the caller are silently skipped (no group). `keySuffix`
+ * restricts the read, server-side, to keys ending with that literal text.
  */
 export const listActorsMemories = async (
   actorIds: string[],
   memoryType?: string,
+  keySuffix?: string,
 ): Promise<ActorMemoryGroup[]> => {
   if (actorIds.length === 0) return [];
   const response = await graphqlRequest<{
@@ -334,6 +336,7 @@ export const listActorsMemories = async (
   }>(GetActorsMemoriesDocument, {
     actorIds,
     memoryType: memoryType ?? null,
+    keySuffix: keySuffix ?? null,
   });
   return response.actorsMemories ?? [];
 };

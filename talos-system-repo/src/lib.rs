@@ -8,7 +8,6 @@
 
 use anyhow::Result;
 use sqlx::PgPool;
-use std::sync::OnceLock;
 use uuid::Uuid;
 
 /// The columns of a new `mcp_agents` row (see
@@ -65,13 +64,23 @@ pub struct RevokedAgent {
 /// hash of a literal known string, since that path discards the
 /// verify result; here we need a hash whose source is non-recoverable
 /// because the hash is actually PERSISTED).
-static SYNTHETIC_PASSWORD_HASH: OnceLock<String> = OnceLock::new();
+///
+/// The first computation (~100 ms of bcrypt) runs on the blocking pool, not
+/// the async runtime thread; concurrent first callers wait on one init.
+static SYNTHETIC_PASSWORD_HASH: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
-fn synthetic_password_hash() -> &'static str {
-    SYNTHETIC_PASSWORD_HASH.get_or_init(|| {
-        talos_unusable_password::unusable_password_hash(bcrypt::DEFAULT_COST)
-            .expect("bcrypt::hash at DEFAULT_COST cannot fail")
-    })
+async fn synthetic_password_hash() -> Result<&'static str> {
+    SYNTHETIC_PASSWORD_HASH
+        .get_or_try_init(|| async {
+            tokio::task::spawn_blocking(|| {
+                talos_unusable_password::unusable_password_hash(bcrypt::DEFAULT_COST)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("synthetic password hash task failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("synthetic password hash failed: {e}"))
+        })
+        .await
+        .map(String::as_str)
 }
 
 pub struct SystemRepository {
@@ -262,7 +271,7 @@ impl SystemRepository {
         )
         // An empty hash made `bcrypt::verify` return Err instantly — a
         // timing tell, and an internal error instead of a refusal.
-        .bind(synthetic_password_hash())
+        .bind(synthetic_password_hash().await?)
         .fetch_optional(&self.db_pool)
         .await?;
         Ok(id)
@@ -356,7 +365,7 @@ impl SystemRepository {
         )
         .bind(user_id)
         .bind(synthetic_email)
-        .bind(synthetic_password_hash())
+        .bind(synthetic_password_hash().await?)
         .execute(&self.db_pool)
         .await?;
         Ok(())
@@ -395,9 +404,9 @@ mod synthetic_hash_tests {
     /// 31-char hash. Pre-fix the literal `"$2b$12$00...00"` was 49
     /// chars and bcrypt::verify rejected it as malformed in ~0 ms,
     /// distinguishable from a real verify (~100 ms at cost=12).
-    #[test]
-    fn synthetic_hash_is_structurally_valid_bcrypt() {
-        let h = synthetic_password_hash();
+    #[tokio::test]
+    async fn synthetic_hash_is_structurally_valid_bcrypt() {
+        let h = synthetic_password_hash().await.unwrap();
         assert_eq!(
             h.len(),
             60,
@@ -413,11 +422,11 @@ mod synthetic_hash_tests {
 
     /// MCP-709: the cached hash is deterministic within a process —
     /// subsequent calls return the same Arc-cached value (not a new
-    /// bcrypt computation). Sanity check that OnceLock semantics hold.
-    #[test]
-    fn synthetic_hash_is_process_stable() {
-        let a = synthetic_password_hash();
-        let b = synthetic_password_hash();
+    /// bcrypt computation). Sanity check that OnceCell semantics hold.
+    #[tokio::test]
+    async fn synthetic_hash_is_process_stable() {
+        let a = synthetic_password_hash().await.unwrap();
+        let b = synthetic_password_hash().await.unwrap();
         assert_eq!(a, b);
     }
 
@@ -428,9 +437,9 @@ mod synthetic_hash_tests {
     /// path — and Err returns nearly-instantly, recreating the timing
     /// leak. Ok(false) takes the full bcrypt cost and routes through
     /// the failed_login_attempts increment / generic-error path.
-    #[test]
-    fn bcrypt_verify_returns_false_not_err() {
-        let h = synthetic_password_hash();
+    #[tokio::test]
+    async fn bcrypt_verify_returns_false_not_err() {
+        let h = synthetic_password_hash().await.unwrap();
         let result = bcrypt::verify("any password an attacker would try", h);
         assert!(
             matches!(result, Ok(false)),

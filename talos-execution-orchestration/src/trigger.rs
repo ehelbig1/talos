@@ -528,7 +528,13 @@ impl ExecutionOrchestrationService {
         // 14. Engine build. Lift any caller-provided __actor_context__
         // out so the engine propagates it to ALL nodes (the builder
         // attaches it as a property; not just on the root payload).
-        let lifted_actor_context = input_payload.get("__actor_context__").cloned();
+        // The payload is persisted (`__trigger_input__` in the output, the
+        // failure output), so the decrypted context is REMOVED from it, not
+        // copied; the engine strips engine-authored keys at the seed anyway.
+        let lifted_actor_context =
+            talos_workflow_engine_core::reserved_keys::lift_actor_context_for_storage(
+                &mut input_payload,
+            );
         let nats = self
             .nats_client
             .as_ref()
@@ -743,6 +749,14 @@ impl ExecutionOrchestrationService {
                 // to the resumer, or a reclaim already failed it; clobbering it
                 // would corrupt the new owner's state. Just log and bow out,
                 // mirroring the resume path's `was_fenced` handling.
+                // An operator cancelled the run: the row is already
+                // `cancelled` — no failure write, no alert, no webhook.
+                Err(ref e) if talos_engine::fence::was_cancelled_by_operator(e) => {
+                    tracing::info!(
+                        execution_id = %execution_id,
+                        "trigger: run stopped — the execution was cancelled by an operator"
+                    );
+                }
                 Err(ref e) if talos_engine::fence::was_fenced(e) => {
                     tracing::warn!(
                         execution_id = %execution_id,

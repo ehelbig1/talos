@@ -116,6 +116,9 @@ pub struct CancelOutcome {
     pub engine: EngineStop,
     /// What happened to the fleet broadcast.
     pub broadcast: CancelBroadcast,
+    /// In-flight `module_executions` rows moved to `cancelled`; `None` when
+    /// not attempted or the write failed (unknown, not zero).
+    pub module_rows_cancelled: Option<u64>,
 }
 
 impl ExecutionOrchestrationService {
@@ -160,6 +163,7 @@ impl ExecutionOrchestrationService {
                 marked: false,
                 engine: EngineStop::NotAttempted,
                 broadcast: CancelBroadcast::NotAttempted,
+                module_rows_cancelled: None,
             });
         }
 
@@ -173,10 +177,36 @@ impl ExecutionOrchestrationService {
             EngineStop::NotRunningHere
         };
 
+        // The `cancel_siblings_on_workflow_fail` trigger fires only on
+        // `failed`, so without this every module row still `running` under a
+        // cancelled execution waited for the stuck sweep to call it `timeout`.
+        // A failure here does not undo the cancel; the sweep stays the backstop.
+        let module_rows_cancelled =
+            match talos_workflow_repository::cancel_running_module_executions(
+                &self.db_pool,
+                exec_id,
+                talos_workflow_repository::SiblingCancelReason::WorkflowCancelled,
+            )
+            .await
+            {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "talos_audit",
+                        execution_id = %exec_id,
+                        error = %e,
+                        "cancel: finalizing in-flight module executions failed — rows stay \
+                         'running' until the stuck sweep"
+                    );
+                    None
+                }
+            };
+
         Ok(CancelOutcome {
             marked: true,
             engine,
             broadcast: self.broadcast_cancel(exec_id).await,
+            module_rows_cancelled,
         })
     }
 
@@ -240,6 +270,26 @@ impl ExecutionOrchestrationService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TEXTUAL pin (the path needs a database): a successful mark finalizes
+    /// the execution's in-flight module rows, and only after the mark.
+    #[test]
+    fn a_cancel_finalizes_in_flight_module_rows_after_the_mark() {
+        let src = include_str!("cancel.rs");
+        let body = src
+            .split("pub async fn cancel_execution(")
+            .nth(1)
+            .and_then(|b| b.split("async fn broadcast_cancel(").next())
+            .expect("cancel_execution body");
+        let mark = body.find(".mark_execution_cancelled(").expect("mark");
+        let finalize = body
+            .find(concat!("SiblingCancelReason::", "WorkflowCancelled"))
+            .expect("the cancel must finalize module rows");
+        assert!(
+            mark < finalize,
+            "finalize only after the mark matched a row"
+        );
+    }
 
     #[test]
     fn engine_stop_tags_are_stable_and_distinct() {

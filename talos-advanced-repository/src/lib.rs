@@ -32,17 +32,71 @@ pub struct ArchivedExecutionRow {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug)]
-pub struct WasmModuleRow {
+/// The publisher's module as read for publishing — what the listing FREEZES.
+/// Install reads this snapshot, never the publisher's live row, so a later
+/// hot_update cannot reach installers. `allowed_secrets` is deliberately
+/// absent: secrets resolve as the INSTALLER, who grants their own.
+#[derive(Clone)]
+pub struct MarketplaceSnapshot {
     pub name: String,
+    /// The module row's stored world (used when there are no bytes to inspect).
     pub capability_world: String,
     pub source_code: Option<String>,
+    /// Normalised: `Some(empty)` is `None` (see [`normalize_wasm_bytes`]).
+    pub wasm_bytes: Option<Vec<u8>>,
+    pub config_schema: serde_json::Value,
+    pub allowed_hosts: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub requires_approval_for: Vec<String>,
+    pub content_hash: Option<String>,
 }
 
-#[derive(Debug)]
-pub struct SandboxModuleRow {
-    pub name: String,
-    pub wasm_bytes: Option<Vec<u8>>,
+impl std::fmt::Debug for MarketplaceSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarketplaceSnapshot")
+            .field("name", &self.name)
+            .field("capability_world", &self.capability_world)
+            .field("has_source", &self.source_code.is_some())
+            .field("wasm_len", &self.wasm_bytes.as_ref().map(Vec::len))
+            .field("content_hash", &self.content_hash)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The publisher of first-party (catalog) listings.
+pub const SYSTEM_PUBLISHER_ID: Uuid = Uuid::nil();
+
+/// Outcome of [`AdvancedRepository::publish_to_marketplace`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum MarketplacePublish {
+    /// A new `(publisher, name, version)` listing, snapshot frozen.
+    Published { listing_id: Uuid },
+    /// The caller already published this version: description/tags updated,
+    /// the frozen code is NOT replaced (a version's code is immutable — ship
+    /// a new version).
+    MetadataUpdated { listing_id: Uuid },
+    /// A VERIFIED listing by another publisher holds this name.
+    NameReserved,
+    /// The conflicting row is not the caller's (defensive: unreachable while
+    /// the key includes the publisher).
+    NotOwned,
+}
+
+impl MarketplacePublish {
+    /// Pure decision over the two reads the publish transaction makes.
+    /// `upserted` is `(listing_id, inserted)` from the upsert, `None` when
+    /// its ownership predicate filtered the conflict arm.
+    pub fn decide(name_reserved: bool, upserted: Option<(Uuid, bool)>) -> Self {
+        if name_reserved {
+            return Self::NameReserved;
+        }
+        match upserted {
+            Some((listing_id, true)) => Self::Published { listing_id },
+            Some((listing_id, false)) => Self::MetadataUpdated { listing_id },
+            None => Self::NotOwned,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -51,15 +105,42 @@ pub struct MarketplaceListingRow {
     pub name: String,
     pub capability_world: String,
     pub version: String,
+    pub publisher_id: Uuid,
+    pub verified: bool,
+    /// What an install writes: the frozen snapshot, or — for a first-party
+    /// listing only — the live catalog row. `None` = nothing installable
+    /// (a legacy user listing with no snapshot, or a catalog row gone).
+    pub artifact: Option<TemplateSourceRow>,
 }
 
+/// An installable artifact. Carries only NON-secret grants; the installer's
+/// `allowed_secrets` is supplied separately (see
+/// [`TemplateSourceRow::grants_for_installer`]).
 #[derive(Debug)]
 pub struct TemplateSourceRow {
     pub code_template: String,
     pub wasm_bytes: Option<Vec<u8>>,
     pub config_schema: serde_json::Value,
-    pub allowed_secrets: Vec<String>,
     pub allowed_hosts: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub requires_approval_for: Vec<String>,
+}
+
+impl TemplateSourceRow {
+    /// The grants an installed copy receives: hosts, methods and approval
+    /// requirements travel with the code (one value — package EK's rule);
+    /// `allowed_secrets` is the INSTALLER's, never the publisher's.
+    pub fn grants_for_installer(
+        &self,
+        installer_secrets: Vec<String>,
+    ) -> talos_registry::InheritedGrants {
+        talos_registry::InheritedGrants {
+            allowed_hosts: self.allowed_hosts.clone(),
+            allowed_methods: self.allowed_methods.clone(),
+            allowed_secrets: installer_secrets,
+            requires_approval_for: self.requires_approval_for.clone(),
+        }
+    }
 }
 
 /// What `install_from_marketplace` should do with a fetched
@@ -1876,19 +1957,16 @@ impl AdvancedRepository {
 
     // ── Marketplace ───────────────────────────────────────────────────────────
 
-    /// Fetch WASM module info for marketplace publishing (ownership-checked).
-    pub async fn get_wasm_module_for_marketplace(
+    /// Read the caller's module for publishing (ownership-checked): the
+    /// snapshot the listing will freeze.
+    pub async fn get_module_for_marketplace(
         &self,
         module_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<WasmModuleRow>> {
-        // Phase 4 prep: query the unified `modules` table with the 3-shape
-        // id match. `source_code` is now first-class on the modules row;
-        // the previous wasm_modules-only query missed catalog-installed
-        // modules whose source lives elsewhere (returns NULL gracefully
-        // for those, same as before).
+    ) -> Result<Option<MarketplaceSnapshot>> {
         let row = sqlx::query(
-            "SELECT name, capability_world, source_code \
+            "SELECT name, capability_world, source_code, wasm_bytes, config_schema, \
+                    allowed_hosts, allowed_methods, requires_approval_for, content_hash \
                FROM modules \
               WHERE id = $1 \
                 AND user_id = $2",
@@ -1897,89 +1975,162 @@ impl AdvancedRepository {
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await
-        .context("get_wasm_module_for_marketplace")?;
+        .context("get_module_for_marketplace")?;
 
-        row.map(|r| -> Result<WasmModuleRow> {
-            Ok(WasmModuleRow {
+        row.map(|r| -> Result<MarketplaceSnapshot> {
+            Ok(MarketplaceSnapshot {
                 name: r.try_get("name")?,
                 capability_world: r.try_get("capability_world")?,
                 source_code: r.try_get::<Option<String>, _>("source_code")?,
+                wasm_bytes: normalize_wasm_bytes(r.try_get::<Option<Vec<u8>>, _>("wasm_bytes")?),
+                config_schema: r
+                    .try_get::<Option<serde_json::Value>, _>("config_schema")?
+                    .unwrap_or(serde_json::json!({})),
+                allowed_hosts: r.try_get("allowed_hosts")?,
+                allowed_methods: r.try_get("allowed_methods")?,
+                requires_approval_for: r.try_get("requires_approval_for")?,
+                content_hash: r.try_get::<Option<String>, _>("content_hash")?,
             })
         })
         .transpose()
     }
 
-    /// Fetch sandbox template info for marketplace publishing (ownership-checked).
-    pub async fn get_sandbox_for_marketplace(
-        &self,
-        module_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<Option<SandboxModuleRow>> {
-        // Phase 4 prep: query the unified `modules` table. The legacy
-        // `node_templates.precompiled_wasm` mapped to `modules.wasm_bytes`
-        // (Phase 1.1 backfill); the new query reads it directly.
-        let row = sqlx::query(
-            "SELECT name, wasm_bytes \
-               FROM modules \
-              WHERE id = $1 \
-                AND user_id = $2",
-        )
-        .bind(module_id)
-        .bind(user_id)
-        .fetch_optional(&self.db_pool)
-        .await
-        .context("get_sandbox_for_marketplace")?;
-
-        row.map(|r| -> Result<SandboxModuleRow> {
-            Ok(SandboxModuleRow {
-                name: r.try_get("name")?,
-                wasm_bytes: r.try_get::<Option<Vec<u8>>, _>("wasm_bytes")?,
-            })
-        })
-        .transpose()
-    }
-
-    /// Insert or update a marketplace listing. Returns the listing UUID.
+    /// Publish (or re-describe) the caller's listing, freezing `snapshot`, and
+    /// record it — ONE transaction.
+    ///
+    /// Until 2026-09-25 the upsert keyed `ON CONFLICT (name, version)` with no
+    /// publisher and no ownership predicate, so any user could overwrite any
+    /// other publisher's listing, a verified first-party one included. The
+    /// key is now `(publisher_id, name, version)` (migration
+    /// `20260926130000`), the conflict arm is guarded by the publisher, and a
+    /// name held by a VERIFIED listing of another publisher is reserved.
+    /// Republishing an existing version updates its description/tags only.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_to_marketplace(
         &self,
         module_id: Uuid,
         user_id: Uuid,
-        name: &str,
-        description: &str,
+        snapshot: &MarketplaceSnapshot,
         world: &str,
+        description: &str,
         version: &str,
         tags: &[String],
-    ) -> Result<Uuid> {
-        let row = sqlx::query(
-            "INSERT INTO module_marketplace \
-             (module_id, publisher_id, name, description, capability_world, version, tags) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (name, version) DO UPDATE SET \
-             description = EXCLUDED.description, tags = EXCLUDED.tags, updated_at = NOW() \
-             RETURNING id",
+    ) -> Result<MarketplacePublish> {
+        let mut tx = self.db_pool.begin().await?;
+        let name_reserved: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM module_marketplace \
+                            WHERE name = $1 AND verified AND publisher_id <> $2)",
         )
-        .bind(module_id)
+        .bind(&snapshot.name)
         .bind(user_id)
-        .bind(name)
-        .bind(description)
-        .bind(world)
-        .bind(version)
-        .bind(tags)
-        .fetch_one(&self.db_pool)
+        .fetch_one(&mut *tx)
         .await
-        .context("publish_to_marketplace")?;
-
-        Ok(row.try_get("id")?)
+        .context("publish_to_marketplace reserved-name check")?;
+        let upserted: Option<(Uuid, bool)> = if name_reserved {
+            None
+        } else {
+            sqlx::query_as(
+                "INSERT INTO module_marketplace \
+                 (module_id, publisher_id, name, description, capability_world, version, tags, \
+                  snapshot_source_code, snapshot_wasm_bytes, snapshot_config_schema, \
+                  snapshot_allowed_hosts, snapshot_allowed_methods, \
+                  snapshot_requires_approval_for, snapshot_content_hash, snapshot_taken_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW()) \
+                 ON CONFLICT (publisher_id, name, version) DO UPDATE SET \
+                 description = EXCLUDED.description, tags = EXCLUDED.tags, updated_at = NOW() \
+                 WHERE module_marketplace.publisher_id = EXCLUDED.publisher_id \
+                 RETURNING id, (xmax = 0) AS inserted",
+            )
+            .bind(module_id)
+            .bind(user_id)
+            .bind(&snapshot.name)
+            .bind(description)
+            .bind(world)
+            .bind(version)
+            .bind(tags)
+            .bind(&snapshot.source_code)
+            .bind(&snapshot.wasm_bytes)
+            .bind(&snapshot.config_schema)
+            .bind(&snapshot.allowed_hosts)
+            .bind(&snapshot.allowed_methods)
+            .bind(&snapshot.requires_approval_for)
+            .bind(&snapshot.content_hash)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("publish_to_marketplace upsert")?
+        };
+        let outcome = MarketplacePublish::decide(name_reserved, upserted);
+        let (event_type, listing_id) = match outcome {
+            MarketplacePublish::Published { listing_id } => {
+                ("marketplace_module_published", listing_id)
+            }
+            MarketplacePublish::MetadataUpdated { listing_id } => {
+                ("marketplace_listing_updated", listing_id)
+            }
+            MarketplacePublish::NameReserved | MarketplacePublish::NotOwned => {
+                tx.rollback().await?;
+                return Ok(outcome);
+            }
+        };
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(user_id),
+            event_type,
+            "module",
+            Some(module_id),
+            &format!(
+                "Marketplace listing '{}' v{} ({})",
+                snapshot.name, version, event_type
+            ),
+            Some(&serde_json::json!({
+                "listing_id": listing_id,
+                "name": snapshot.name,
+                "version": version,
+                "capability_world": world,
+                "content_hash": snapshot.content_hash,
+                "allowed_hosts": snapshot.allowed_hosts,
+                "allowed_methods": snapshot.allowed_methods,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(outcome)
     }
 
-    /// Fetch a marketplace listing by ID (must be public).
+    /// Fetch a public listing and what an install would write.
+    ///
+    /// The artifact is the listing's frozen snapshot. A first-party listing
+    /// (publisher = [`SYSTEM_PUBLISHER_ID`]) without one resolves the LIVE
+    /// catalog row — platform-maintained code — but only while that row is
+    /// still catalog-scoped. A user listing without a snapshot yields no
+    /// artifact: installing the publisher's current row is the defect.
     pub async fn get_marketplace_listing(
         &self,
         listing_id: Uuid,
     ) -> Result<Option<MarketplaceListingRow>> {
         let row = sqlx::query(
-            "SELECT m.module_id, m.name, m.capability_world, m.version \
-             FROM module_marketplace m WHERE m.id = $1 AND m.is_public = true",
+            "SELECT mm.module_id, mm.name, mm.capability_world, mm.version, \
+                    mm.publisher_id, mm.verified, \
+                    (mm.snapshot_taken_at IS NOT NULL OR c.id IS NOT NULL) AS installable, \
+                    CASE WHEN mm.snapshot_taken_at IS NOT NULL THEN mm.snapshot_source_code \
+                         ELSE c.source_code END AS source_code, \
+                    CASE WHEN mm.snapshot_taken_at IS NOT NULL THEN mm.snapshot_wasm_bytes \
+                         ELSE c.wasm_bytes END AS wasm_bytes, \
+                    CASE WHEN mm.snapshot_taken_at IS NOT NULL THEN mm.snapshot_config_schema \
+                         ELSE c.config_schema END AS config_schema, \
+                    CASE WHEN mm.snapshot_taken_at IS NOT NULL THEN mm.snapshot_allowed_hosts \
+                         ELSE c.allowed_hosts END AS allowed_hosts, \
+                    CASE WHEN mm.snapshot_taken_at IS NOT NULL THEN mm.snapshot_allowed_methods \
+                         ELSE c.allowed_methods END AS allowed_methods, \
+                    CASE WHEN mm.snapshot_taken_at IS NOT NULL \
+                         THEN mm.snapshot_requires_approval_for \
+                         ELSE c.requires_approval_for END AS requires_approval_for \
+               FROM module_marketplace mm \
+               LEFT JOIN modules c \
+                 ON c.id = mm.module_id \
+                AND mm.publisher_id = '00000000-0000-0000-0000-000000000000'::uuid \
+                AND c.user_id IS NULL AND c.kind = 'catalog' \
+              WHERE mm.id = $1 AND mm.is_public = true",
         )
         .bind(listing_id)
         .fetch_optional(&self.db_pool)
@@ -1987,94 +2138,39 @@ impl AdvancedRepository {
         .context("get_marketplace_listing")?;
 
         row.map(|r| -> Result<MarketplaceListingRow> {
+            let installable: bool = r.try_get("installable")?;
+            let artifact = if installable {
+                Some(TemplateSourceRow {
+                    code_template: r
+                        .try_get::<Option<String>, _>("source_code")?
+                        .unwrap_or_default(),
+                    wasm_bytes: normalize_wasm_bytes(
+                        r.try_get::<Option<Vec<u8>>, _>("wasm_bytes")?,
+                    ),
+                    config_schema: r
+                        .try_get::<Option<serde_json::Value>, _>("config_schema")?
+                        .unwrap_or(serde_json::json!({})),
+                    allowed_hosts: r
+                        .try_get::<Option<Vec<String>>, _>("allowed_hosts")?
+                        .unwrap_or_default(),
+                    allowed_methods: r
+                        .try_get::<Option<Vec<String>>, _>("allowed_methods")?
+                        .unwrap_or_default(),
+                    requires_approval_for: r
+                        .try_get::<Option<Vec<String>>, _>("requires_approval_for")?
+                        .unwrap_or_default(),
+                })
+            } else {
+                None
+            };
             Ok(MarketplaceListingRow {
                 module_id: r.try_get("module_id")?,
                 name: r.try_get("name")?,
                 capability_world: r.try_get("capability_world")?,
                 version: r.try_get("version")?,
-            })
-        })
-        .transpose()
-    }
-
-    /// Fetch the full installable artifact for a marketplace source module —
-    /// source, bytes, schema, and the security-relevant allowlists.
-    ///
-    /// Returns the same `TemplateSourceRow` shape as `get_template_source` so
-    /// the install handler can branch on artifact availability without two
-    /// parallel struct shapes drifting. `wasm_bytes` is normalised to `None`
-    /// when the column is NULL OR empty (`vec![]`) — collapsing the two
-    /// "no compiled bytes" cases means callers can't accidentally write a
-    /// zero-byte module by forgetting to check `is_empty()`. This was the
-    /// 2026-04-27 regression: the published listing's `wasm_bytes` was
-    /// `Some(vec![])`, the install accepted it, the worker then failed
-    /// with "failed to fetch wasm module from redis (not found)".
-    pub async fn get_wasm_module_source(
-        &self,
-        module_id: Uuid,
-    ) -> Result<Option<TemplateSourceRow>> {
-        let row = sqlx::query(
-            "SELECT source_code, wasm_bytes, config_schema, allowed_secrets, allowed_hosts \
-               FROM modules \
-              WHERE id = $1 \
-              LIMIT 1",
-        )
-        .bind(module_id)
-        .fetch_optional(&self.db_pool)
-        .await
-        .context("get_wasm_module_source")?;
-
-        row.map(|r| -> Result<TemplateSourceRow> {
-            Ok(TemplateSourceRow {
-                code_template: r
-                    .try_get::<Option<String>, _>("source_code")?
-                    .unwrap_or_default(),
-                wasm_bytes: normalize_wasm_bytes(r.try_get::<Option<Vec<u8>>, _>("wasm_bytes")?),
-                config_schema: r
-                    .try_get::<Option<serde_json::Value>, _>("config_schema")?
-                    .unwrap_or(serde_json::json!({})),
-                allowed_secrets: r
-                    .try_get::<Option<Vec<String>>, _>("allowed_secrets")?
-                    .unwrap_or_default(),
-                allowed_hosts: r
-                    .try_get::<Option<Vec<String>>, _>("allowed_hosts")?
-                    .unwrap_or_default(),
-            })
-        })
-        .transpose()
-    }
-
-    /// Fetch a node template for marketplace installation.
-    pub async fn get_template_source(&self, module_id: Uuid) -> Result<Option<TemplateSourceRow>> {
-        // Phase 5: unified `modules` table. `source_code` replaces
-        // `code_template`, `wasm_bytes` replaces `precompiled_wasm`.
-        let row = sqlx::query(
-            "SELECT source_code, wasm_bytes, config_schema, allowed_secrets, allowed_hosts \
-             FROM modules \
-             WHERE id = $1",
-        )
-        .bind(module_id)
-        .fetch_optional(&self.db_pool)
-        .await
-        .context("get_template_source")?;
-
-        row.map(|r| -> Result<TemplateSourceRow> {
-            Ok(TemplateSourceRow {
-                // `modules.source_code` is nullable (catalog-only rows have NULL);
-                // fall back to empty string to preserve the legacy non-null field shape.
-                code_template: r
-                    .try_get::<Option<String>, _>("source_code")?
-                    .unwrap_or_default(),
-                wasm_bytes: r.try_get::<Option<Vec<u8>>, _>("wasm_bytes")?,
-                config_schema: r
-                    .try_get::<Option<serde_json::Value>, _>("config_schema")?
-                    .unwrap_or(serde_json::json!({})),
-                allowed_secrets: r
-                    .try_get::<Option<Vec<String>>, _>("allowed_secrets")?
-                    .unwrap_or_default(),
-                allowed_hosts: r
-                    .try_get::<Option<Vec<String>>, _>("allowed_hosts")?
-                    .unwrap_or_default(),
+                publisher_id: r.try_get("publisher_id")?,
+                verified: r.try_get("verified")?,
+                artifact,
             })
         })
         .transpose()
@@ -2088,6 +2184,10 @@ impl AdvancedRepository {
     /// the same invariant as a defence-in-depth check, since silently
     /// writing a NULL/empty `wasm_bytes` row produces the same prod
     /// regression class (worker errors with "module not found in redis").
+    ///
+    /// `world` is the world INSPECTED from the bytes (long form); `grants`
+    /// carries all four grants as one value — hosts/methods/approval from the
+    /// listing, secrets from the installer (never the publisher's).
     pub async fn install_wasm_from_marketplace(
         &self,
         user_id: Uuid,
@@ -2095,6 +2195,7 @@ impl AdvancedRepository {
         install_name: &str,
         world: &str,
         src: TemplateSourceRow,
+        grants: &talos_registry::InheritedGrants,
     ) -> Result<Uuid> {
         // Defence in depth: the handler should have rejected this case, but
         // refuse here too rather than write a zero-byte module that the
@@ -2114,26 +2215,23 @@ impl AdvancedRepository {
             .await
             .context("install_wasm_from_marketplace begin")?;
 
-        // Phase 5: write directly to the unified `modules` table. Marketplace
-        // installs are user-owned sandbox modules (compiled on install).
-        // allowed_secrets and allowed_hosts are propagated from the source
-        // module's listing — without them, every vault:// header in the
-        // module's config fails at runtime and `talos::core::http::fetch`
-        // refuses to call the listed providers.
         sqlx::query(
             "INSERT INTO modules \
-             (id, name, kind, capability_world, source_code, wasm_bytes, user_id, \
-              allowed_secrets, allowed_hosts, compiled_at) \
-             VALUES ($1, $2, 'sandbox', $3, $4, $5, $6, $7, $8, NOW())",
+             (id, name, kind, capability_world, source_code, wasm_bytes, config_schema, user_id, \
+              allowed_secrets, allowed_hosts, allowed_methods, requires_approval_for, compiled_at) \
+             VALUES ($1, $2, 'sandbox', $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())",
         )
         .bind(new_module_id)
         .bind(install_name)
         .bind(world)
         .bind(&src.code_template)
         .bind(&wasm_bytes)
+        .bind(&src.config_schema)
         .bind(user_id)
-        .bind(&src.allowed_secrets)
-        .bind(&src.allowed_hosts)
+        .bind(&grants.allowed_secrets)
+        .bind(&grants.allowed_hosts)
+        .bind(&grants.allowed_methods)
+        .bind(&grants.requires_approval_for)
         .execute(&mut *tx)
         .await
         .context("install_wasm_from_marketplace insert")?;
@@ -2154,11 +2252,9 @@ impl AdvancedRepository {
     /// Install a sandbox template from the marketplace (atomic INSERT + download count increment).
     /// Returns the new template ID.
     ///
-    /// `world` is the listing's `capability_world` — propagated explicitly so
-    /// the new row records the same WIT world the publisher targeted. Without
-    /// this the column defaulted to `minimal-node`, silently downgrading
-    /// every source-only marketplace install (sibling regression to the WASM
-    /// install path's lost allowlists, fixed in the same release).
+    /// `world` is the listing's frozen world (long form) — there are no bytes
+    /// to inspect, and the first compile is bound to it. Grants as for
+    /// [`Self::install_wasm_from_marketplace`].
     pub async fn install_template_from_marketplace(
         &self,
         user_id: Uuid,
@@ -2166,6 +2262,7 @@ impl AdvancedRepository {
         install_name: &str,
         world: &str,
         src: TemplateSourceRow,
+        grants: &talos_registry::InheritedGrants,
     ) -> Result<Uuid> {
         let new_template_id = Uuid::new_v4();
         let mut tx = self
@@ -2174,13 +2271,13 @@ impl AdvancedRepository {
             .await
             .context("install_template_from_marketplace begin")?;
 
-        // Phase 5: write directly to the unified `modules` table. Sandbox
-        // template install: `kind='sandbox'` + source_code + optional wasm_bytes.
         sqlx::query(
             "INSERT INTO modules \
              (id, name, kind, capability_world, category, description, config_schema, \
-              source_code, wasm_bytes, user_id, allowed_secrets, allowed_hosts) \
-             VALUES ($1, $2, 'sandbox', $3, 'sandbox', 'Installed from marketplace', $4, $5, $6, $7, $8, $9)",
+              source_code, wasm_bytes, user_id, allowed_secrets, allowed_hosts, \
+              allowed_methods, requires_approval_for) \
+             VALUES ($1, $2, 'sandbox', $3, 'sandbox', 'Installed from marketplace', $4, $5, \
+                     $6, $7, $8, $9, $10, $11)",
         )
         .bind(new_template_id)
         .bind(install_name)
@@ -2189,8 +2286,10 @@ impl AdvancedRepository {
         .bind(&src.code_template)
         .bind(&src.wasm_bytes)
         .bind(user_id)
-        .bind(&src.allowed_secrets)
-        .bind(&src.allowed_hosts)
+        .bind(&grants.allowed_secrets)
+        .bind(&grants.allowed_hosts)
+        .bind(&grants.allowed_methods)
+        .bind(&grants.requires_approval_for)
         .execute(&mut *tx)
         .await
         .context("install_template_from_marketplace insert")?;
@@ -3660,7 +3759,11 @@ impl AdvancedRepository {
     }
 
     /// Transition a queued execution to 'running'.
-    pub async fn set_execution_running(&self, exec_id: Uuid) -> Result<()> {
+    /// Claim a queued row: `true` when THIS call moved it `queued → running`,
+    /// `false` when it was no longer queued (cancelled while it waited, or
+    /// claimed elsewhere) — the caller must then NOT run it.
+    #[must_use = "a row that was not claimed must not be run"]
+    pub async fn set_execution_running(&self, exec_id: Uuid) -> Result<bool> {
         sqlx::query(
             "UPDATE workflow_executions SET status = 'running', started_at = NOW() \
              WHERE id = $1 AND status = 'queued'",
@@ -3668,7 +3771,7 @@ impl AdvancedRepository {
         .bind(exec_id)
         .execute(&self.db_pool)
         .await
-        .map(|_| ())
+        .map(|r| r.rows_affected() == 1)
         .context("set_execution_running")
     }
 
@@ -3843,7 +3946,10 @@ impl AdvancedRepository {
                AND NOT EXISTS (
                    SELECT 1 FROM module_marketplace mm
                    WHERE mm.module_id = m.id
-               )",
+               )
+             /* Keyed per publisher since 20260926130000: a user listing of the
+                same name can no longer block (or fail) the first-party one. */
+             ON CONFLICT (publisher_id, name, version) DO NOTHING",
         )
         .execute(&mut *tx)
         .await
@@ -4125,7 +4231,7 @@ impl AdvancedRepository {
         limit: i64,
     ) -> Result<Vec<MarketplaceSearchRow>> {
         let mut sql = String::from(
-            "SELECT id, module_id, publisher_id, name, description, capability_world, version, downloads, tags, created_at \
+            "SELECT id, module_id, publisher_id, verified, name, description, capability_world, version, downloads, tags, created_at \
              FROM module_marketplace WHERE is_public = true",
         );
         let mut bind_idx = 0u32;
@@ -4149,7 +4255,12 @@ impl AdvancedRepository {
             binds.push(tag.to_string());
         }
         bind_idx += 1;
-        sql.push_str(&format!(" ORDER BY downloads DESC LIMIT ${}", bind_idx));
+        // Verified (first-party) listings first, so a same-named user listing
+        // cannot outrank the one it imitates; `id` makes the order total.
+        sql.push_str(&format!(
+            " ORDER BY verified DESC, downloads DESC, id LIMIT ${}",
+            bind_idx
+        ));
 
         let mut q = sqlx::query(&sql);
         for b in &binds {
@@ -4163,6 +4274,8 @@ impl AdvancedRepository {
                 Ok(MarketplaceSearchRow {
                     id: r.try_get("id")?,
                     module_id: r.try_get("module_id")?,
+                    publisher_id: r.try_get("publisher_id")?,
+                    verified: r.try_get("verified")?,
                     name: r.try_get("name")?,
                     description: r
                         .try_get::<Option<String>, _>("description")?
@@ -4419,6 +4532,8 @@ pub struct MarketplaceSearchFilter<'a> {
 pub struct MarketplaceSearchRow {
     pub id: Uuid,
     pub module_id: Uuid,
+    pub publisher_id: Uuid,
+    pub verified: bool,
     pub name: String,
     pub description: String,
     pub capability_world: String,
@@ -4593,9 +4708,63 @@ mod tests {
             code_template: String::new(),
             wasm_bytes: None,
             config_schema: serde_json::json!({}),
-            allowed_secrets: vec![],
             allowed_hosts: vec![],
+            allowed_methods: vec![],
+            requires_approval_for: vec![],
         }
+    }
+
+    /// The publish decision: a reserved (verified, other-publisher) name is
+    /// refused before anything is written; an upsert filtered by the
+    /// ownership predicate is `NotOwned`, never a silent success.
+    #[test]
+    fn publish_decision_covers_every_arm() {
+        let id = Uuid::from_u128(7);
+        assert_eq!(
+            MarketplacePublish::decide(true, Some((id, true))),
+            MarketplacePublish::NameReserved
+        );
+        assert_eq!(
+            MarketplacePublish::decide(false, Some((id, true))),
+            MarketplacePublish::Published { listing_id: id }
+        );
+        assert_eq!(
+            MarketplacePublish::decide(false, Some((id, false))),
+            MarketplacePublish::MetadataUpdated { listing_id: id }
+        );
+        assert_eq!(
+            MarketplacePublish::decide(false, None),
+            MarketplacePublish::NotOwned
+        );
+    }
+
+    /// An installed copy's secrets are the INSTALLER's; hosts, methods and
+    /// approval requirements travel with the code.
+    #[test]
+    fn installer_supplies_secrets_listing_supplies_the_rest() {
+        let mut src = empty_row();
+        src.allowed_hosts = vec!["api.example.com".into()];
+        src.allowed_methods = vec!["GET".into()];
+        src.requires_approval_for = vec!["email_send".into()];
+        let g = src.grants_for_installer(vec![]);
+        assert!(g.allowed_secrets.is_empty());
+        assert_eq!(g.allowed_hosts, vec!["api.example.com".to_string()]);
+        assert_eq!(g.allowed_methods, vec!["GET".to_string()]);
+        assert_eq!(g.requires_approval_for, vec!["email_send".to_string()]);
+        let g = src.grants_for_installer(vec!["mine/*".into()]);
+        assert_eq!(g.allowed_secrets, vec!["mine/*".to_string()]);
+    }
+
+    /// SOURCE PIN (textual): the publish upsert conflicts on the publisher-
+    /// scoped key and guards its update arm by publisher; install reads the
+    /// snapshot, never the publisher's live module row.
+    #[test]
+    fn marketplace_statements_are_publisher_scoped_and_snapshot_based() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains("ON CONFLICT (publisher_id, name, version) DO UPDATE SET"));
+        assert!(src.contains("WHERE module_marketplace.publisher_id = EXCLUDED.publisher_id"));
+        assert!(!src.contains(&format!("ON CONFLICT (name, {}) DO UPDATE", "version")));
+        assert!(!src.contains(&format!("pub async fn get_wasm_module_{}(", "source")));
     }
 
     #[test]

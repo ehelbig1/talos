@@ -749,7 +749,11 @@ async fn batched_listing_groups_caps_and_decrypts_across_actors() {
     let ordered = vec![actor_a, actor_b, actor_empty, actor_unknown];
     let mut conn = pool.acquire().await.expect("acquire conn");
     let flat = mem::list_memories_with_ciphertext_batched_scoped(
-        &mut conn, &ordered, None, 2, // per-actor cap
+        &mut conn,
+        &ordered,
+        None,
+        mem::MemoryKeyMatch::default(),
+        2, // per-actor cap
     )
     .await
     .expect("batched listing");
@@ -812,11 +816,77 @@ async fn batched_listing_groups_caps_and_decrypts_across_actors() {
         }
     }
 
-    // Empty actor_ids short-circuits to an empty result.
+    // (f) the cap windows by LAST WRITE: re-writing the oldest row (an upsert
+    // bumps updated_at, never created_at) makes it survive and drops k2.
+    mem::persist_memory(
+        &pool,
+        actor_a,
+        &a_k1,
+        &serde_json::json!({ "v": "A-one-rewritten" }),
+        "episodic",
+        None,
+    )
+    .await
+    .expect("rewrite actor_a k1");
     let mut conn = pool.acquire().await.expect("acquire conn 2");
-    let empty = mem::list_memories_with_ciphertext_batched_scoped(&mut conn, &[], None, 10)
-        .await
-        .expect("empty batch");
+    let rewritten = mem::list_memories_with_ciphertext_batched_scoped(
+        &mut conn,
+        &[actor_a],
+        None,
+        mem::MemoryKeyMatch::default(),
+        2,
+    )
+    .await
+    .expect("batched listing after rewrite");
+    let keys: std::collections::HashSet<&str> = rewritten.iter().map(|r| r.key.as_str()).collect();
+    assert!(
+        keys.contains(a_k1.as_str()) && keys.contains(a_k3.as_str()),
+        "the rewritten k1 and k3 are the two most recently written, got {keys:?}"
+    );
+
+    // (g) the key restriction runs in SQL and matches LITERALLY: `_` in the
+    // suffix is not a wildcard, so `a_k1` does not match the key `a-k1`.
+    let by_suffix = mem::list_memories_with_ciphertext_batched_scoped(
+        &mut conn,
+        &[actor_a, actor_b],
+        None,
+        mem::MemoryKeyMatch {
+            prefix: Some(&prefix),
+            suffix: Some("-k1"),
+        },
+        1000,
+    )
+    .await
+    .expect("suffix-filtered listing");
+    let mut matched: Vec<&str> = by_suffix.iter().map(|r| r.key.as_str()).collect();
+    matched.sort_unstable();
+    let mut want = vec![a_k1.as_str(), b_k1.as_str()];
+    want.sort_unstable();
+    assert_eq!(matched, want);
+    let literal = mem::list_memories_with_ciphertext_batched_scoped(
+        &mut conn,
+        &[actor_a],
+        None,
+        mem::MemoryKeyMatch {
+            prefix: None,
+            suffix: Some("a_k1"),
+        },
+        1000,
+    )
+    .await
+    .expect("literal-underscore listing");
+    assert!(literal.is_empty(), "`_` must not act as a LIKE wildcard");
+
+    // Empty actor_ids short-circuits to an empty result.
+    let empty = mem::list_memories_with_ciphertext_batched_scoped(
+        &mut conn,
+        &[],
+        None,
+        mem::MemoryKeyMatch::default(),
+        10,
+    )
+    .await
+    .expect("empty batch");
     assert!(empty.is_empty(), "empty actor_ids → no rows");
     drop(conn);
 
@@ -1309,6 +1379,68 @@ async fn consolidation_writes_nothing_when_every_source_changed() {
     .expect("operator consolidate");
     assert_eq!(retired, 1);
 
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+}
+
+/// An overwrite describes THIS write: omitted metadata is NULL (not the old
+/// `kind`), and the previous content's embedding never survives a content
+/// update (NULL when regeneration is unavailable, otherwise a fresh vector).
+#[tokio::test]
+async fn overwrite_replaces_metadata_and_never_keeps_a_stale_embedding() {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
+        return;
+    };
+    let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
+    let key = format!("{prefix}overwrite");
+    mem::persist_memory_with_metadata(
+        &pool,
+        actor_id,
+        &key,
+        &serde_json::json!({ "text": "first" }),
+        Some(&serde_json::json!({ "kind": "daily_brief" })),
+        "semantic",
+        None,
+    )
+    .await
+    .expect("persist first");
+    // Plant a sentinel vector standing in for the OLD content's embedding.
+    sqlx::query(
+        "UPDATE actor_memory SET embedding = array_fill(0.125::real, ARRAY[1024])::vector, \
+         embedding_model = 'stale-sentinel' WHERE actor_id = $1 AND key = $2",
+    )
+    .bind(actor_id)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("plant sentinel");
+
+    mem::persist_memory(
+        &pool,
+        actor_id,
+        &key,
+        &serde_json::json!({ "text": "second, different content" }),
+        "semantic",
+        None,
+    )
+    .await
+    .expect("overwrite");
+    let (metadata, model): (Option<serde_json::Value>, Option<String>) = sqlx::query_as(
+        "SELECT metadata, embedding_model FROM actor_memory WHERE actor_id = $1 AND key = $2",
+    )
+    .bind(actor_id)
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("read back");
+    assert_eq!(
+        metadata, None,
+        "omitted metadata must not inherit the old kind"
+    );
+    assert_ne!(
+        model.as_deref(),
+        Some("stale-sentinel"),
+        "the old content's embedding must not survive the overwrite"
+    );
     cleanup_prefix(&pool, actor_id, &prefix).await;
 }
 

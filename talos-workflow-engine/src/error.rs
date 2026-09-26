@@ -189,6 +189,13 @@ pub enum WorkflowEngineError {
     #[error("workflow execution was cancelled by caller")]
     Cancelled,
 
+    /// The run was stopped because an OPERATOR cancelled its execution (the
+    /// row is already `cancelled`). Distinct from [`Cancelled`](Self::Cancelled),
+    /// which a crash-recovery epoch fence also produces: a caller must neither
+    /// mark the row failed nor count the stop as a fence.
+    #[error("workflow execution was cancelled by an operator")]
+    CancelledByOperator,
+
     /// Hard structural problem reading a `graph_json` payload —
     /// invalid JSON, top-level not an object, or `nodes` / `edges`
     /// fields with the wrong type. Soft issues (skipped nodes,

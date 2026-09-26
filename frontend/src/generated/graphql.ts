@@ -684,6 +684,7 @@ export type GetActorMemoriesQuery = {
 export type GetActorsMemoriesQueryVariables = Exact<{
   actorIds: Array<string> | string;
   memoryType?: string | null | undefined;
+  keySuffix?: string | null | undefined;
 }>;
 
 export type GetActorsMemoriesQuery = {
@@ -3122,8 +3123,12 @@ export const useGetActorMemoriesQuery = <
 };
 
 export const GetActorsMemoriesDocument = new TypedDocumentString(`
-    query GetActorsMemories($actorIds: [UUID!]!, $memoryType: String) {
-  actorsMemories(actorIds: $actorIds, memoryType: $memoryType) {
+    query GetActorsMemories($actorIds: [UUID!]!, $memoryType: String, $keySuffix: String) {
+  actorsMemories(
+    actorIds: $actorIds
+    memoryType: $memoryType
+    keySuffix: $keySuffix
+  ) {
     actorId
     memories {
       key

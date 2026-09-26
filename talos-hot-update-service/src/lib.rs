@@ -235,7 +235,7 @@ impl HotUpdateService {
             // along with its actor_id.
             let bindings = match self
                 .module_repo
-                .find_dependent_workflows_with_actors_dual_id(module_id, ctx.template_id)
+                .find_dependent_workflows_with_actors_dual_id(module_id, ctx.template_id, user_id)
                 .await
             {
                 Ok(v) => v,
@@ -454,7 +454,9 @@ impl HotUpdateService {
         }
 
         // 11. Validate dependent workflows (informational; never blocks).
-        let affected_workflows = self.validate_dependents(module_id, ctx.template_id).await;
+        let affected_workflows = self
+            .validate_dependents(module_id, ctx.template_id, user_id)
+            .await;
 
         // 12. Collect lint warnings (compiler-emitted).
         // MCP-909: prepend any capability-downgrade warnings from
@@ -696,6 +698,7 @@ impl HotUpdateService {
         &self,
         module_id: Uuid,
         template_id: Option<Uuid>,
+        owner: Uuid,
     ) -> Vec<DependentWorkflowResult> {
         // MCP-884 (2026-05-14): log the DB error before returning empty.
         // Pre-fix `.unwrap_or_default()` swallowed the sqlx error so the
@@ -714,7 +717,7 @@ impl HotUpdateService {
         // the API response level.
         let dependents = match self
             .module_repo
-            .find_dependent_workflows_dual_id(module_id, template_id)
+            .find_dependent_workflows_dual_id(module_id, template_id, owner)
             .await
         {
             Ok(rows) => rows,

@@ -446,7 +446,14 @@ impl ParallelWorkflowEngine {
         // INJECT_CONTEXT actor-memory payload, real prod symptom 2026-04-29).
         {
             let input_preview = {
-                let s = serde_json::to_string(&wrapped_input).unwrap_or_default();
+                // Engine-authored keys (decrypted `__actor_context__`,
+                // `__accumulated__`, …) never reach this plaintext event row.
+                let s = serde_json::to_string(
+                    &talos_workflow_engine_core::reserved_keys::WithoutEngineAuthoredKeys(
+                        &wrapped_input,
+                    ),
+                )
+                .unwrap_or_default();
                 if s.len() > 4096 {
                     format!(
                         "{}...(truncated)",
@@ -1776,6 +1783,42 @@ mod reserved_key_set_or_remove_tests {
             None => {}
             Some(v) => assert_eq!(v, &json!({ "memories": ["real"] })),
         }
+    }
+
+    #[tokio::test]
+    async fn the_node_input_event_never_persists_engine_authored_keys() {
+        let (node_id, module_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut engine = engine_for(node_id, module_id);
+        // A reasoning world so the engine DOES inject the (decrypted) context.
+        let mut artifact = stub_artifact(module_id);
+        artifact.capability_world = "agent-node".into();
+        engine.set_module_fetcher(Arc::new(
+            InMemoryModuleFetcher::new().with_module(module_id, artifact),
+        ));
+        engine.set_actor_context(json!({ "memories": ["SECRET-MEMORY"] }));
+        let sink = Arc::new(talos_workflow_engine_test_utils::capture::CaptureEventSink::new());
+        engine.set_event_sink(sink.clone());
+        let payload =
+            dispatch_with(&engine, node_id, module_id, Some(json!({ "real": true }))).await;
+        // Events are emitted from a spawned task.
+        for _ in 0..50 {
+            if !sink.events_of_type("node_input").is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let events = sink.events_of_type("node_input");
+        assert_eq!(events.len(), 1);
+        let preview = events[0].log_message.as_deref().unwrap_or_default();
+        if payload.get("__actor_context__").is_some() {
+            // Control: the dispatched payload DID carry it.
+            assert!(payload.to_string().contains("SECRET-MEMORY"));
+        }
+        for key in talos_workflow_engine_core::reserved_keys::ENGINE_AUTHORED_INPUT_KEYS {
+            assert!(!preview.contains(key), "`{key}` persisted: {preview}");
+        }
+        assert!(!preview.contains("SECRET-MEMORY"), "{preview}");
+        assert!(preview.contains("\"data\":1"), "{preview}");
     }
 
     #[tokio::test]

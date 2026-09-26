@@ -421,6 +421,40 @@ pub fn validate_oauth_state_token_format(state_token: &str) -> Result<()> {
     Ok(())
 }
 
+/// The only scopes a login may add: the Google Calendar grants the login
+/// callback turns into a calendar integration.
+pub const LOGIN_EXTRA_SCOPES_ALLOWED: &[&str] = &[
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.events.readonly",
+];
+
+/// Refuse caller-supplied login scopes outside [`LOGIN_EXTRA_SCOPES_ALLOWED`]
+/// (Google only; no other provider takes extra scopes).
+pub fn check_login_extra_scopes(provider: &OAuthProvider, scopes: Option<&[String]>) -> Result<()> {
+    let Some(scopes) = scopes else {
+        return Ok(());
+    };
+    if !matches!(provider, OAuthProvider::Google) {
+        return Err(anyhow!("extra scopes are not supported for this provider"));
+    }
+    if scopes.is_empty() || scopes.len() > LOGIN_EXTRA_SCOPES_ALLOWED.len() {
+        return Err(anyhow!("invalid extra scopes"));
+    }
+    if let Some(bad) = scopes
+        .iter()
+        .find(|s| !LOGIN_EXTRA_SCOPES_ALLOWED.contains(&s.as_str()))
+    {
+        // The value is caller-controlled: report its length, never echo it.
+        return Err(anyhow!(
+            "scope not permitted at login ({} bytes)",
+            bad.len()
+        ));
+    }
+    Ok(())
+}
+
 /// S1 (login-CSRF / session-fixation): browser-session binding for the
 /// **pre-auth SSO LOGIN** flow.
 ///
@@ -662,9 +696,48 @@ impl OAuthService {
         }
         let redis_nonce_key = format!("oauth_nonce:{}", state_token);
 
-        // Step 1: Atomic Redis check-and-set using Lua script
-        // This prevents race conditions where two requests check Redis simultaneously
-        // before either updates it.
+        // Step 1: DB-level atomic consumption — the authoritative single-use
+        // claim. It runs FIRST so a transient DB failure cannot leave the
+        // Redis marker set and burn a nonce whose row was never consumed.
+        //
+        // MCP-1096 (2026-05-16): NULL out `pkce_verifier` on consume.
+        // The verifier is short-lived (10-min row TTL) but credential-
+        // class — combined with an intercepted authorization code it
+        // completes the OAuth exchange. Pre-fix consumed rows kept
+        // the verifier in DB until `cleanup_expired_state_tokens`
+        // swept them at the 10-minute mark. A read-only DB compromise
+        // during that window exposed live (used=false, not expired)
+        // AND just-consumed (used=true, not expired) verifiers; the
+        // just-consumed ones have no exploit value on their own (the
+        // `code` is single-use at the provider), but defense-in-depth
+        // says scrub credential-class fields the moment they stop
+        // being needed. Same persistence-boundary discipline as
+        // MCP-1002 (oauth_state_tokens added to query_paginated
+        // blocklist). Caller already retrieved the verifier via
+        // `get_pkce_verifier` before this UPDATE fires; setting it to
+        // NULL here is safe.
+        let result = sqlx::query_as::<_, (Uuid, Option<String>)>(
+            "UPDATE oauth_state_tokens
+             SET used = true, pkce_verifier = NULL
+             WHERE state_token = $1 AND provider = $2 AND used = false AND expires_at > NOW()
+             RETURNING id, session_binding_hash",
+        )
+        .bind(state_token)
+        .bind(provider)
+        .fetch_optional(&self.db_pool)
+        .await
+        .context("Failed to validate OAuth state token")?;
+
+        let (_id, stored_binding_hash) = match result {
+            Some(row) => row,
+            None => {
+                return Err(anyhow!(
+                    "Invalid or expired OAuth state token. This may indicate a CSRF attack."
+                ));
+            }
+        };
+
+        // Step 2: Redis marker (defence in depth behind the DB claim above).
         if let Some(redis) = &self.redis_client {
             match redis.get_multiplexed_tokio_connection().await {
                 Ok(mut con) => {
@@ -718,45 +791,6 @@ impl OAuthService {
                 }
             }
         }
-
-        // Step 2: DB-level atomic consumption
-        //
-        // MCP-1096 (2026-05-16): NULL out `pkce_verifier` on consume.
-        // The verifier is short-lived (10-min row TTL) but credential-
-        // class — combined with an intercepted authorization code it
-        // completes the OAuth exchange. Pre-fix consumed rows kept
-        // the verifier in DB until `cleanup_expired_state_tokens`
-        // swept them at the 10-minute mark. A read-only DB compromise
-        // during that window exposed live (used=false, not expired)
-        // AND just-consumed (used=true, not expired) verifiers; the
-        // just-consumed ones have no exploit value on their own (the
-        // `code` is single-use at the provider), but defense-in-depth
-        // says scrub credential-class fields the moment they stop
-        // being needed. Same persistence-boundary discipline as
-        // MCP-1002 (oauth_state_tokens added to query_paginated
-        // blocklist). Caller already retrieved the verifier via
-        // `get_pkce_verifier` before this UPDATE fires; setting it to
-        // NULL here is safe.
-        let result = sqlx::query_as::<_, (Uuid, Option<String>)>(
-            "UPDATE oauth_state_tokens
-             SET used = true, pkce_verifier = NULL
-             WHERE state_token = $1 AND provider = $2 AND used = false AND expires_at > NOW()
-             RETURNING id, session_binding_hash",
-        )
-        .bind(state_token)
-        .bind(provider)
-        .fetch_optional(&self.db_pool)
-        .await
-        .context("Failed to validate OAuth state token")?;
-
-        let (_id, stored_binding_hash) = match result {
-            Some(row) => row,
-            None => {
-                return Err(anyhow!(
-                    "Invalid or expired OAuth state token. This may indicate a CSRF attack."
-                ));
-            }
-        };
 
         // S1 (login-CSRF / session-fixation): if the row was written with
         // a browser-session binding, the callback MUST present the
@@ -833,6 +867,11 @@ impl OAuthService {
                 provider.as_str()
             ));
         }
+
+        // `extra_scopes` arrives from an UNAUTHENTICATED query parameter and
+        // turns the login into an offline-consent grant: only the scopes the
+        // login callback knows how to use are accepted.
+        check_login_extra_scopes(&provider, extra_scopes.as_deref())?;
 
         let (auth_url, csrf_token, pkce_verifier) = match provider {
             OAuthProvider::Google => self.get_google_auth_url(extra_scopes).await,
@@ -1301,7 +1340,11 @@ impl OAuthService {
                 .as_str()
                 .ok_or_else(|| anyhow!("Missing email in Snyk response"))?
                 .to_string(),
-            email_verified: true, // Snyk doesn't provide this, assume verified
+            // Snyk's API does not say whether the address was verified, so it
+            // is treated as UNVERIFIED: a Snyk identity can sign in to an
+            // account it is already linked to, but never create or match one
+            // by email.
+            email_verified: false,
             name: attrs["name"].as_str().map(|s| s.to_string()),
             picture: None, // Snyk doesn't provide avatar URLs
             // Include tokens for Snyk API integrations
@@ -1334,18 +1377,6 @@ impl OAuthService {
         user_info: OAuthUserInfo,
         existing_user_id: Option<Uuid>,
     ) -> Result<(Uuid, bool)> {
-        // Require a verified email address before allowing account creation or linking.
-        // Accepting unverified emails could allow an attacker to claim another user's
-        // account by registering with that email at a permissive OAuth provider.
-        if !user_info.email_verified {
-            anyhow::bail!(
-                "OAuth login rejected: email address '{}' is not verified by the provider. \
-                 Please verify your email with {} before signing in.",
-                user_info.email,
-                provider.as_str()
-            );
-        }
-
         // Check if OAuth account already exists
         if let Some(existing) = self
             .get_oauth_account(&provider, &user_info.provider_user_id)
@@ -1367,6 +1398,21 @@ impl OAuthService {
             self.link_oauth_account(user_id, provider, user_info)
                 .await?;
             return Ok((user_id, false));
+        }
+
+        // Require a verified email address before creating or matching an
+        // account BY EMAIL. Accepting unverified emails could let an attacker
+        // claim another user's address at a permissive provider. (An already-
+        // linked account above is identified by the provider's user id, and
+        // an explicit link is the authenticated user's own act — neither
+        // trusts the email.)
+        if !user_info.email_verified {
+            anyhow::bail!(
+                "OAuth login rejected: email address '{}' is not verified by the provider. \
+                 Please verify your email with {} before signing in.",
+                user_info.email,
+                provider.as_str()
+            );
         }
 
         // Check if user exists by email. Dynamic query (not the `query!`
@@ -1467,8 +1513,13 @@ impl OAuthService {
                 .and_then(|v| v.parse::<u32>().ok())
                 .filter(|c| (4..=31).contains(c))
                 .unwrap_or(bcrypt::DEFAULT_COST);
-            let sentinel_hash = talos_unusable_password::unusable_password_hash(sentinel_cost)
-                .map_err(|e| anyhow::anyhow!("Failed to create unusable password hash: {}", e))?;
+            // bcrypt at signup cost is ~100-400 ms of CPU: off the async runtime.
+            let sentinel_hash = tokio::task::spawn_blocking(move || {
+                talos_unusable_password::unusable_password_hash(sentinel_cost)
+            })
+            .await
+            .context("unusable password hash task failed")?
+            .map_err(|e| anyhow::anyhow!("Failed to create unusable password hash: {}", e))?;
             // MCP-1004 (2026-05-15): sanitize provider-supplied display
             // name before persistence. Pre-fix `user_info.name` was bound
             // verbatim — providers occasionally return names with embedded
@@ -2750,5 +2801,47 @@ mod oauth2_v5_exchange_wire_contract {
             "the error surfaced from a failed exchange must not echo the \
              client_secret: {err:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod login_input_tests {
+    use super::*;
+
+    #[test]
+    fn login_extra_scopes_are_allowlisted() {
+        let cal = vec!["https://www.googleapis.com/auth/calendar".to_string()];
+        assert!(check_login_extra_scopes(&OAuthProvider::Google, None).is_ok());
+        assert!(check_login_extra_scopes(&OAuthProvider::Google, Some(&cal)).is_ok());
+        for bad in [
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/cloud-platform",
+            "",
+        ] {
+            let v = vec![bad.to_string()];
+            assert!(
+                check_login_extra_scopes(&OAuthProvider::Google, Some(&v)).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(check_login_extra_scopes(&OAuthProvider::Google, Some(&[])).is_err());
+        assert!(check_login_extra_scopes(&OAuthProvider::Okta, Some(&cal)).is_err());
+        // The error never echoes the caller's value.
+        let v = vec!["evil-scope".to_string()];
+        let e = check_login_extra_scopes(&OAuthProvider::Google, Some(&v)).unwrap_err();
+        assert!(!e.to_string().contains("evil-scope"));
+    }
+
+    /// Source pins: Snyk identities are unverified, and the email gate sits
+    /// below the already-linked-account return (so linked users keep working).
+    #[test]
+    fn snyk_email_is_unverified_and_gated_only_for_email_matching() {
+        let src = include_str!("lib.rs");
+        // Assembled so this line cannot match itself.
+        assert!(!src.contains(&format!("email_verified: {}, // Snyk", "true")));
+        let f = &src[src.find("pub async fn link_or_create_user").unwrap()..];
+        let linked = f.find("return Ok((existing.user_id, false))").unwrap();
+        let gate = f.find("if !user_info.email_verified").unwrap();
+        assert!(gate > linked);
     }
 }

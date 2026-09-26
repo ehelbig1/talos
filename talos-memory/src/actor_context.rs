@@ -326,6 +326,34 @@ pub fn fused_score(c: &Candidate, w: &Weights, now: DateTime<Utc>, access_weight
         + w.importance * importance(c, access_weight)
 }
 
+/// Split a semantic-recall outcome into the hits that are SIMILARITY
+/// evidence and those that are not. Only `vector_cosine` hits carry a real
+/// score; keyword-fallback hits are key-name matches, so they enter the
+/// merge as recency rows (relevance = the recency baseline) instead of as
+/// semantic hits a floor or ranker would weigh as similarity.
+pub fn split_semantic_outcome(
+    outcome: crate::SearchOutcome,
+) -> (Vec<crate::MemoryHit>, Vec<RecencyRow>) {
+    if outcome.method == "vector_cosine" {
+        return (outcome.hits, Vec::new());
+    }
+    let rows = outcome
+        .hits
+        .into_iter()
+        .map(|h| {
+            (
+                h.key,
+                h.value,
+                h.memory_type,
+                Some(h.updated_at),
+                h.importance,
+                h.access_count,
+            )
+        })
+        .collect();
+    (Vec::new(), rows)
+}
+
 /// Merge the smart-context retrieval layers into a single deduplicated
 /// [`Candidate`] list, ready for [`rank_candidates`] then
 /// [`pack_within_budget`].
@@ -774,6 +802,48 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn keyword_fallback_hits_enter_at_recency_footing_not_as_similarity() {
+        let kw = |key: &str| crate::MemoryHit {
+            score: crate::KEYWORD_FALLBACK_SCORE,
+            ..hit(key, 0.0, "episodic")
+        };
+        let outcome = crate::SearchOutcome {
+            hits: vec![kw("review-a"), kw("review-b")],
+            method: "keyword_fallback",
+            embedding_attempted: false,
+        };
+        let (semantic, as_recency) = split_semantic_outcome(outcome);
+        assert!(semantic.is_empty());
+        assert_eq!(as_recency.len(), 2);
+        let out = select_candidates(
+            None,
+            vec![hit("real", 0.8, "semantic")],
+            as_recency,
+            0.25,
+            G_BASE,
+            R_BASE,
+        );
+        let rel: Vec<_> = out.iter().map(|c| (c.key.as_str(), c.relevance)).collect();
+        assert_eq!(
+            rel,
+            vec![("real", 0.8), ("review-a", R_BASE), ("review-b", R_BASE)],
+            "a key-name match must not out-rank a real cosine hit"
+        );
+
+        let vector = crate::SearchOutcome {
+            hits: vec![hit("v", 0.9, "semantic")],
+            method: "vector_cosine",
+            embedding_attempted: true,
+        };
+        let (semantic, as_recency) = split_semantic_outcome(vector);
+        assert_eq!(semantic.len(), 1);
+        assert!(as_recency.is_empty());
+        // The source score claims no similarity: a keyword hit fed straight
+        // to the floor as a semantic hit is dropped, never ranked top.
+        assert!(select_candidates(None, vec![kw("k")], vec![], 0.25, G_BASE, R_BASE).is_empty());
     }
 
     #[test]

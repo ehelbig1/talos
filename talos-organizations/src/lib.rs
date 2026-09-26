@@ -548,6 +548,15 @@ impl OrganizationService {
             .as_deref()
             .and_then(OrgRole::from_str)
             .ok_or_else(|| anyhow!("Caller is not a member of this organization"))?;
+        // The caller must manage members (Admin+), read under the same row
+        // lock as the change: a gate at the API layer alone reads the role in
+        // another transaction, so a concurrent demotion of the caller could
+        // slip between the check and this write.
+        if !caller_role.can_manage_members() {
+            return Err(anyhow!(
+                "Insufficient permissions: changing a member's role requires admin"
+            ));
+        }
 
         // Prevent downgrading the last owner — check within the transaction with FOR UPDATE.
         if new_role != OrgRole::Owner {

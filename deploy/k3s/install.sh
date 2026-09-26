@@ -65,10 +65,14 @@
 #                                      it demands an explicit choice, and "disabled" is one).
 #                              "audit"    → verify, log on failure, continue (migration).
 #                              "required" → verify, refuse on failure (production).
-#   TALOS_SIGSTORE_IDENTITY_REGEXP  Required when TALOS_SIGSTORE_REQUIRED is set. Regex matched
-#                                   against the SAN URI of the Fulcio cert. For GitHub Actions
-#                                   keyless, pin to the workflow URL pattern. Example:
-#                                   ^https://github\\.com/${TALOS_GHCR_OWNER}/talos/\\.github/workflows/template-publish\\.yml@
+#   TALOS_SIGSTORE_IDENTITY_REGEXP  Regex matched against the SAN URI of the Fulcio cert
+#                                   (`<workflow URL>@<git ref>`). Unset while enforcement
+#                                   is on → derived from TALOS_GHCR_OWNER/TALOS_GHCR_REPO as
+#                                   template-publish.yml@refs/heads/main. Set by hand, write
+#                                   it YAML-escaped (doubled backslashes) and pin the ref:
+#                                   ^https://github\\.com/${TALOS_GHCR_OWNER}/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$
+#                                   A pattern ending at `@` admits a signature from ANY
+#                                   branch a workflow_dispatch was pointed at.
 #   ANTHROPIC_API_KEY / OPENAI_API_KEY
 #   EMBEDDING_API_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL / EMBEDDING_DIMENSIONS / EMBEDDING_MAX_RPM
 #       Pick a provider (in order of recommendation):
@@ -96,7 +100,7 @@ set -euo pipefail
 # ── Config ────────────────────────────────────────────────────────
 TALOS_NAMESPACE="${TALOS_NAMESPACE:-talos}"
 TALOS_RELEASE="${TALOS_RELEASE:-talos}"
-K3S_VERSION="${K3S_VERSION:-v1.31.4+k3s1}"
+K3S_VERSION="${K3S_VERSION:-v1.31.4+k3s1}"   # override → also set K3S_INSTALL_SCRIPT_SHA256
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
 SIGSTORE_VERSION="${SIGSTORE_VERSION:-0.12.0}"
 HELM_VERSION="${HELM_VERSION:-v3.16.3}"
@@ -144,6 +148,20 @@ TALOS_API_HOST="${TALOS_API_HOST:-api.$TALOS_HOST}"
 TALOS_FRONTEND_HOST="${TALOS_FRONTEND_HOST:-$TALOS_HOST}"
 TALOS_GHCR_REPO="${TALOS_GHCR_REPO:-talos}"
 
+# Template-signing identity: pinned to template-publish.yml ON refs/heads/main.
+# YAML-escaped (doubled backslashes) because it lands in a double-quoted
+# values string below.
+case "${TALOS_SIGSTORE_REQUIRED:-disabled}" in
+    ""|disabled|false) ;;
+    *)
+        if [[ -z "${TALOS_SIGSTORE_IDENTITY_REGEXP:-}" ]]; then
+            TALOS_SIGSTORE_IDENTITY_REGEXP="^https://github\\\\.com/${TALOS_GHCR_OWNER:-OWNER}/${TALOS_GHCR_REPO}/\\\\.github/workflows/template-publish\\\\.yml@refs/heads/main\$"
+        elif [[ "$TALOS_SIGSTORE_IDENTITY_REGEXP" != *'@refs/heads/main$' ]]; then
+            warn "TALOS_SIGSTORE_IDENTITY_REGEXP does not end in '@refs/heads/main\$' — a signature minted from any other branch would be admitted."
+        fi
+        ;;
+esac
+
 [[ $EUID -eq 0 ]] || die "run as root (or via sudo)."
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -167,10 +185,29 @@ else
     #   operators wanting non-root post-install access should
     #   `sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config && sudo chown $USER ~/.kube/config`.
     # --secrets-encryption: encrypt Secrets at rest in etcd.
-    curl -sfL https://get.k3s.io | \
-        INSTALL_K3S_VERSION="$K3S_VERSION" \
+    #
+    # The installer script is fetched from the k3s repo AT THE PINNED TAG and
+    # checked against a sha256 before it runs as root — the old
+    # `curl https://get.k3s.io | sh` executed whatever that URL served at that
+    # moment. (The script itself verifies the k3s binary against the release's
+    # sha256sum file.) The default hash is for the default K3S_VERSION; set
+    # K3S_INSTALL_SCRIPT_SHA256 alongside any other version.
+    K3S_DEFAULT_VERSION="v1.31.4+k3s1"
+    K3S_DEFAULT_INSTALL_SCRIPT_SHA256="f60c3d8940dfc896f7d83aaf57726c91cf21afc4bca40036472df108d9700b4b"
+    if [[ -z "${K3S_INSTALL_SCRIPT_SHA256:-}" ]]; then
+        [[ "$K3S_VERSION" == "$K3S_DEFAULT_VERSION" ]] \
+            || die "K3S_VERSION=$K3S_VERSION needs K3S_INSTALL_SCRIPT_SHA256 (sha256 of install.sh at that tag)."
+        K3S_INSTALL_SCRIPT_SHA256="$K3S_DEFAULT_INSTALL_SCRIPT_SHA256"
+    fi
+    K3S_TMP="$(mktemp -d)"
+    curl -fsSL -o "$K3S_TMP/install.sh" \
+        "https://raw.githubusercontent.com/k3s-io/k3s/${K3S_VERSION//+/%2B}/install.sh"
+    echo "${K3S_INSTALL_SCRIPT_SHA256}  $K3S_TMP/install.sh" | sha256sum --check --strict --quiet \
+        || die "k3s install.sh checksum mismatch for $K3S_VERSION — refusing to run it"
+    INSTALL_K3S_VERSION="$K3S_VERSION" \
         INSTALL_K3S_EXEC="--write-kubeconfig-mode 600 --secrets-encryption" \
-        sh -
+        sh "$K3S_TMP/install.sh"
+    rm -rf "$K3S_TMP"
     ok "k3s installed"
 fi
 
@@ -187,10 +224,18 @@ if command -v helm >/dev/null 2>&1; then
     ok "helm already installed ($(helm version --short))"
 else
     log "Installing helm $HELM_VERSION"
-    curl -sfL "https://get.helm.sh/helm-$HELM_VERSION-linux-amd64.tar.gz" \
-        | tar -xz -C /tmp
-    install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
-    rm -rf /tmp/linux-amd64
+    # Verified against the release's published .sha256sum and unpacked in a
+    # private mktemp dir — the old `curl | tar -C /tmp` ran whatever bytes
+    # arrived, from a predictable path any local user could pre-plant.
+    HELM_TMP="$(mktemp -d)"
+    HELM_TGZ="helm-$HELM_VERSION-linux-amd64.tar.gz"
+    curl -fsSL -o "$HELM_TMP/$HELM_TGZ" "https://get.helm.sh/$HELM_TGZ"
+    curl -fsSL -o "$HELM_TMP/$HELM_TGZ.sha256sum" "https://get.helm.sh/$HELM_TGZ.sha256sum"
+    (cd "$HELM_TMP" && sha256sum --check --strict "$HELM_TGZ.sha256sum") \
+        || die "helm $HELM_VERSION checksum mismatch — refusing to install"
+    tar -xz -C "$HELM_TMP" -f "$HELM_TMP/$HELM_TGZ"
+    install -m 0755 "$HELM_TMP/linux-amd64/helm" /usr/local/bin/helm
+    rm -rf "$HELM_TMP"
     ok "helm installed"
 fi
 
@@ -285,6 +330,31 @@ if [[ "$WT_FRESH" = no && "$WT_PHASE" != "$WT_LAST" && "${TALOS_WORKER_TRUST:-au
     log "  (previous run applied '${WT_LAST:-none}'; each run advances one phase — re-run install.sh until D)"
 fi
 
+# Secret VALUES never go on a command line: `--from-literal=K=$secret` and
+# `patch -p '{"stringData":…}'` put them in kubectl's argv, readable by every
+# local user via `ps` / /proc/<pid>/cmdline. Values are staged as 0600 files
+# in a private mktemp dir (removed on EXIT) and passed as `--from-file` /
+# `--patch-file`, so argv carries paths only. `printf '%s'` keeps the bytes
+# exact (no trailing newline), same as --from-literal.
+SECRET_STAGE_DIR="$(umask 077; mktemp -d)"
+trap 'rm -rf "$SECRET_STAGE_DIR"' EXIT
+
+# create_secret_from_pairs NAME KEY=VALUE... — `kubectl create secret generic`
+# with every value delivered through a staged file. (A bash function call is
+# not an exec: the KEY=VALUE words never reach any process's argv.)
+create_secret_from_pairs() {
+    local name="$1"; shift
+    local dir kv key file_args=()
+    dir="$(umask 077; mktemp -d "$SECRET_STAGE_DIR/secret.XXXXXX")"
+    for kv in "$@"; do
+        key="${kv%%=*}"
+        (umask 077; printf '%s' "${kv#*=}" > "$dir/$key")
+        file_args+=(--from-file="$key=$dir/$key")
+    done
+    k3s kubectl -n "$TALOS_NAMESPACE" create secret generic "$name" "${file_args[@]}"
+    rm -rf "$dir"
+}
+
 # secret_get KEY → the decoded value of a bootstrap-Secret key ("" if absent).
 secret_get() {
     k3s kubectl -n "$TALOS_NAMESPACE" get secret "$SECRET_NAME" \
@@ -315,10 +385,10 @@ if [[ "${TALOS_USE_INTERNAL_POSTGRES:-no}" == "yes" ]]; then
     else
         log "Generating in-cluster Postgres credentials"
         PG_PASSWORD=$(openssl rand -base64 32 | tr -d '+=/' | head -c 32)
-        k3s kubectl -n "$TALOS_NAMESPACE" create secret generic "$PG_CREDS_SECRET_NAME" \
-            --from-literal=POSTGRES_USER="$PG_USER" \
-            --from-literal=POSTGRES_PASSWORD="$PG_PASSWORD" \
-            --from-literal=POSTGRES_DB="$PG_DB"
+        create_secret_from_pairs "$PG_CREDS_SECRET_NAME" \
+            POSTGRES_USER="$PG_USER" \
+            POSTGRES_PASSWORD="$PG_PASSWORD" \
+            POSTGRES_DB="$PG_DB"
         # `helm.sh/resource-policy=keep` so the PVC's password survives a
         # `helm uninstall`. The chart's secret template carries the same
         # annotation when `passwordSecret.create=true`; we apply it
@@ -361,8 +431,13 @@ if [[ $HAS_BOOTSTRAP -eq 1 && $HAS_NEO4J -eq 1 ]]; then
                 -o "jsonpath={.data.${key}}" 2>/dev/null | grep -q .; then
             return 0
         fi
+        # Values here are generated hex/base64-stripped/fixed tokens — no JSON
+        # escaping needed — but the patch still travels as a 0600 file.
+        (umask 077; printf '{"stringData":{"%s":"%s"}}' "$key" "$value" \
+            > "$SECRET_STAGE_DIR/backfill.json")
         k3s kubectl -n "$TALOS_NAMESPACE" patch secret "$SECRET_NAME" --type merge \
-            -p "$(printf '{"stringData":{"%s":"%s"}}' "$key" "$value")" >/dev/null
+            --patch-file "$SECRET_STAGE_DIR/backfill.json" >/dev/null
+        rm -f "$SECRET_STAGE_DIR/backfill.json"
         ok "  back-filled missing bootstrap key $key (chart now requires it)"
     }
     backfill_secret_key NATS_CLUSTER_USER "talos-route"
@@ -470,77 +545,76 @@ else
     # production scrape while the dashboard looked configured.
     PROMETHEUS_SCRAPE_TOKEN=$(rand_hex32)
 
-    # Build the kubectl create-secret args. Optional/empty values are
+    # KEY=VALUE pairs for create_secret_from_pairs. Optional/empty values are
     # included as empty strings so the chart's `optional: true` secretKeyRef
     # resolves cleanly (vs missing keys, which print warnings on every pod start).
     args=(
-        --from-literal=DATABASE_URL="$TALOS_POSTGRES_URL"
-        --from-literal=REDIS_URL="$TALOS_REDIS_URL"
-        --from-literal=NATS_USER="$NATS_USER"
-        --from-literal=NATS_PASSWORD="$NATS_PASSWORD"
-        --from-literal=NATS_CLUSTER_USER="$NATS_CLUSTER_USER"
-        --from-literal=NATS_CLUSTER_PASSWORD="$NATS_CLUSTER_PASSWORD"
-        --from-literal=NATS_WORKER_USER="$NATS_WORKER_USER"
-        --from-literal=NATS_WORKER_PASSWORD="$NATS_WORKER_PASSWORD"
-        --from-literal=TALOS_CONTROLLER_SIGNING_KEY="$WT_CTL_SEED"
-        --from-literal=TALOS_CONTROLLER_PUBLIC_KEY="$WT_CTL_PUB"
-        --from-literal=TALOS_WORKER_SIGNING_KEY_STAGED="$WT_WRK_SEED"
-        --from-literal=TALOS_WORKER_PUBLIC_KEY="$WT_WRK_PUB"
-        --from-literal=NEO4J_USER="neo4j"
-        --from-literal=NEO4J_PASSWORD="$NEO4J_PASSWORD"
-        --from-literal=TALOS_MASTER_KEY="$TALOS_MASTER_KEY"
+        DATABASE_URL="$TALOS_POSTGRES_URL"
+        REDIS_URL="$TALOS_REDIS_URL"
+        NATS_USER="$NATS_USER"
+        NATS_PASSWORD="$NATS_PASSWORD"
+        NATS_CLUSTER_USER="$NATS_CLUSTER_USER"
+        NATS_CLUSTER_PASSWORD="$NATS_CLUSTER_PASSWORD"
+        NATS_WORKER_USER="$NATS_WORKER_USER"
+        NATS_WORKER_PASSWORD="$NATS_WORKER_PASSWORD"
+        TALOS_CONTROLLER_SIGNING_KEY="$WT_CTL_SEED"
+        TALOS_CONTROLLER_PUBLIC_KEY="$WT_CTL_PUB"
+        TALOS_WORKER_SIGNING_KEY_STAGED="$WT_WRK_SEED"
+        TALOS_WORKER_PUBLIC_KEY="$WT_WRK_PUB"
+        NEO4J_USER="neo4j"
+        NEO4J_PASSWORD="$NEO4J_PASSWORD"
+        TALOS_MASTER_KEY="$TALOS_MASTER_KEY"
         # Pre-init placeholder. The vault-init Job replaces this with a
         # least-privilege `talos-controller` token (transit/encrypt + decrypt
         # against the talos-kek key, nothing else) once Vault is unsealed.
         # The controller refuses to start while this placeholder is set —
         # vault-init triggers a rollout after the swap so the controller
         # picks up the real token automatically. See vault/init-job.yaml.
-        --from-literal=VAULT_TOKEN="__pending_vault_init__"
-        --from-literal=JWT_SECRET="$JWT_SECRET"
-        --from-literal=WORKER_SHARED_KEY="$WORKER_SHARED_KEY"
-        --from-literal=TALOS_AUDIT_SIGNING_KEY="$AUDIT_SIGNING_KEY"
-        --from-literal=TALOS_AOT_HMAC_KEY="$AOT_HMAC_KEY"
-        --from-literal=MINIO_ROOT_USER="$MINIO_ROOT_USER"
-        --from-literal=MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD"
-        --from-literal=MINIO_CONTROLLER_USER="$MINIO_CONTROLLER_USER"
-        --from-literal=MINIO_CONTROLLER_PASSWORD="$MINIO_CONTROLLER_PASSWORD"
-        --from-literal=MINIO_VERIFIER_USER="$MINIO_VERIFIER_USER"
-        --from-literal=MINIO_VERIFIER_PASSWORD="$MINIO_VERIFIER_PASSWORD"
-        --from-literal=METRICS_AUTH_TOKENS="$METRICS_AUTH_TOKENS"
-        --from-literal=PROMETHEUS_SCRAPE_TOKEN="$PROMETHEUS_SCRAPE_TOKEN"
-        --from-literal=ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
-        --from-literal=OPENAI_API_KEY="${OPENAI_API_KEY:-}"
-        --from-literal=EMBEDDING_API_URL="${EMBEDDING_API_URL:-}"
-        --from-literal=EMBEDDING_API_KEY="${EMBEDDING_API_KEY:-}"
-        --from-literal=EMBEDDING_MODEL="${EMBEDDING_MODEL:-}"
-        --from-literal=EMBEDDING_DIMENSIONS="${EMBEDDING_DIMENSIONS:-}"
-        --from-literal=EMBEDDING_MAX_RPM="${EMBEDDING_MAX_RPM:-}"
-        --from-literal=GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-}"
-        --from-literal=GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET:-}"
-        --from-literal=GMAIL_CLIENT_ID="${GMAIL_CLIENT_ID:-}"
-        --from-literal=GMAIL_CLIENT_SECRET="${GMAIL_CLIENT_SECRET:-}"
-        --from-literal=SLACK_CLIENT_ID="${SLACK_CLIENT_ID:-}"
-        --from-literal=SLACK_CLIENT_SECRET="${SLACK_CLIENT_SECRET:-}"
-        --from-literal=ATLASSIAN_CLIENT_ID="${ATLASSIAN_CLIENT_ID:-}"
-        --from-literal=ATLASSIAN_CLIENT_SECRET="${ATLASSIAN_CLIENT_SECRET:-}"
-        --from-literal=OKTA_DOMAIN="${OKTA_DOMAIN:-}"
-        --from-literal=OKTA_CLIENT_ID="${OKTA_CLIENT_ID:-}"
-        --from-literal=OKTA_CLIENT_SECRET="${OKTA_CLIENT_SECRET:-}"
-        --from-literal=SNYK_CLIENT_ID="${SNYK_CLIENT_ID:-}"
-        --from-literal=SNYK_CLIENT_SECRET="${SNYK_CLIENT_SECRET:-}"
-        --from-literal=ADMIN_SECRET_KEY="${ADMIN_SECRET_KEY:-}"
-        --from-literal=TOTP_ISSUER="${TOTP_ISSUER:-Talos}"
+        VAULT_TOKEN="__pending_vault_init__"
+        JWT_SECRET="$JWT_SECRET"
+        WORKER_SHARED_KEY="$WORKER_SHARED_KEY"
+        TALOS_AUDIT_SIGNING_KEY="$AUDIT_SIGNING_KEY"
+        TALOS_AOT_HMAC_KEY="$AOT_HMAC_KEY"
+        MINIO_ROOT_USER="$MINIO_ROOT_USER"
+        MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD"
+        MINIO_CONTROLLER_USER="$MINIO_CONTROLLER_USER"
+        MINIO_CONTROLLER_PASSWORD="$MINIO_CONTROLLER_PASSWORD"
+        MINIO_VERIFIER_USER="$MINIO_VERIFIER_USER"
+        MINIO_VERIFIER_PASSWORD="$MINIO_VERIFIER_PASSWORD"
+        METRICS_AUTH_TOKENS="$METRICS_AUTH_TOKENS"
+        PROMETHEUS_SCRAPE_TOKEN="$PROMETHEUS_SCRAPE_TOKEN"
+        ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+        OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+        EMBEDDING_API_URL="${EMBEDDING_API_URL:-}"
+        EMBEDDING_API_KEY="${EMBEDDING_API_KEY:-}"
+        EMBEDDING_MODEL="${EMBEDDING_MODEL:-}"
+        EMBEDDING_DIMENSIONS="${EMBEDDING_DIMENSIONS:-}"
+        EMBEDDING_MAX_RPM="${EMBEDDING_MAX_RPM:-}"
+        GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-}"
+        GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET:-}"
+        GMAIL_CLIENT_ID="${GMAIL_CLIENT_ID:-}"
+        GMAIL_CLIENT_SECRET="${GMAIL_CLIENT_SECRET:-}"
+        SLACK_CLIENT_ID="${SLACK_CLIENT_ID:-}"
+        SLACK_CLIENT_SECRET="${SLACK_CLIENT_SECRET:-}"
+        ATLASSIAN_CLIENT_ID="${ATLASSIAN_CLIENT_ID:-}"
+        ATLASSIAN_CLIENT_SECRET="${ATLASSIAN_CLIENT_SECRET:-}"
+        OKTA_DOMAIN="${OKTA_DOMAIN:-}"
+        OKTA_CLIENT_ID="${OKTA_CLIENT_ID:-}"
+        OKTA_CLIENT_SECRET="${OKTA_CLIENT_SECRET:-}"
+        SNYK_CLIENT_ID="${SNYK_CLIENT_ID:-}"
+        SNYK_CLIENT_SECRET="${SNYK_CLIENT_SECRET:-}"
+        ADMIN_SECRET_KEY="${ADMIN_SECRET_KEY:-}"
+        TOTP_ISSUER="${TOTP_ISSUER:-Talos}"
     )
 
     if wt_worker_key_live "$WT_PHASE"; then
-        args+=(--from-literal=TALOS_WORKER_SIGNING_KEY="$WT_WRK_SEED")
+        args+=(TALOS_WORKER_SIGNING_KEY="$WT_WRK_SEED")
     fi
-    k3s kubectl -n "$TALOS_NAMESPACE" create secret generic "$SECRET_NAME" "${args[@]}"
+    create_secret_from_pairs "$SECRET_NAME" "${args[@]}"
     ok "bootstrap secret created (${#args[@]} keys)"
 
     # Neo4j auth Secret — combined "user/password" form, separate from bootstrap.
-    k3s kubectl -n "$TALOS_NAMESPACE" create secret generic "$NEO4J_SECRET_NAME" \
-        --from-literal=NEO4J_AUTH="neo4j/$NEO4J_PASSWORD"
+    create_secret_from_pairs "$NEO4J_SECRET_NAME" NEO4J_AUTH="neo4j/$NEO4J_PASSWORD"
     ok "neo4j auth secret created"
 
     warn "Back BOTH secrets up NOW — losing TALOS_MASTER_KEY orphans every DEK."

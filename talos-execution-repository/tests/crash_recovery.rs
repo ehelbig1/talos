@@ -325,3 +325,117 @@ async fn claim_and_reclaim_bump_epoch() {
 
     cleanup(&pool, user_id, wf_id).await;
 }
+
+/// A resume runs the graph the execution was STARTED on — its pinned
+/// `workflow_version_id` — not the current draft; the draft is the fallback
+/// only for an execution that recorded no version. The approval gate reads
+/// the same graph the claim returns.
+#[tokio::test]
+async fn a_resume_runs_the_pinned_version_not_the_draft() {
+    let Some(url) = db_url() else { return };
+    let _g = SERIAL.lock().await;
+    let pool = connect(&url).await;
+    // The seeded draft is `{"nodes":[]}`.
+    let (_seed_exec, wf_id, user_id) = seed_running_exec(&pool, 0).await;
+    let version_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflow_versions (id,workflow_id,version_number,graph_json,published_by,is_active) \
+         VALUES ($1,$2,1,'{\"nodes\":[{\"id\":\"published\"}]}'::jsonb,$3,true)",
+    )
+    .bind(version_id)
+    .bind(wf_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (pinned, unpinned) = (Uuid::new_v4(), Uuid::new_v4());
+    for (id, v) in [(pinned, Some(version_id)), (unpinned, None)] {
+        sqlx::query(
+            "INSERT INTO workflow_executions (id,workflow_id,user_id,status,workflow_version_id) \
+             VALUES ($1,$2,$3,'waiting',$4)",
+        )
+        .bind(id)
+        .bind(wf_id)
+        .bind(user_id)
+        .bind(v)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let repo = ExecutionRepository::new(pool.clone());
+
+    let gate = repo
+        .get_resume_graph_for_user_or_orgs(pinned, user_id, &[])
+        .await
+        .unwrap()
+        .expect("gate graph");
+    assert!(gate.contains("published"), "gate read the draft: {gate}");
+    let claimed = repo
+        .claim_waiting_execution_for_resume(pinned, user_id, &[])
+        .await
+        .unwrap()
+        .expect("claimed");
+    let graph = claimed.graph_json.expect("graph");
+    assert!(graph.contains("published"), "resume ran the draft: {graph}");
+
+    // Control: no pinned version ⇒ the draft.
+    let claimed = repo
+        .claim_waiting_execution_for_resume(unpinned, user_id, &[])
+        .await
+        .unwrap()
+        .expect("claimed");
+    assert!(!claimed.graph_json.expect("draft").contains("published"));
+
+    let _ = sqlx::query("DELETE FROM workflow_executions WHERE workflow_id = $1")
+        .bind(wf_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM workflow_versions WHERE workflow_id = $1")
+        .bind(wf_id)
+        .execute(&pool)
+        .await;
+    cleanup(&pool, user_id, wf_id).await;
+}
+
+/// `list_latest_executions_for_workflows_scoped` (per-workflow LIMIT 1
+/// probes): newest per workflow, one row per workflow even when the id list
+/// repeats, and another user's executions stay invisible.
+#[tokio::test]
+async fn latest_execution_per_workflow_is_the_newest_visible_one() {
+    let Some(url) = db_url() else { return };
+    let _g = SERIAL.lock().await;
+    let pool = connect(&url).await;
+    let (old_exec, wf_id, user_id) = seed_running_exec(&pool, 60).await;
+    let newer = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflow_executions (id,workflow_id,user_id,status,started_at) \
+         VALUES ($1,$2,$3,'completed', NOW() - make_interval(mins => 5))",
+    )
+    .bind(newer)
+    .bind(wf_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let repo = ExecutionRepository::new(pool.clone());
+    let mut conn = pool.acquire().await.unwrap();
+
+    let rows = repo
+        .list_latest_executions_for_workflows_scoped(&mut conn, &[wf_id, wf_id], user_id, &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one row per workflow");
+    assert_eq!(rows[0].id, newer);
+    assert_ne!(rows[0].id, old_exec);
+
+    let stranger = repo
+        .list_latest_executions_for_workflows_scoped(&mut conn, &[wf_id], Uuid::new_v4(), &[])
+        .await
+        .unwrap();
+    assert!(
+        stranger.is_empty(),
+        "another user's executions are invisible"
+    );
+    drop(conn);
+    cleanup(&pool, user_id, wf_id).await;
+}

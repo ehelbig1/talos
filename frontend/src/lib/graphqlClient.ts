@@ -1,4 +1,4 @@
-import { sanitizeErrorMessage } from "@/lib/sanitize";
+import { DisplaySafeError, sanitizeErrorMessage } from "@/lib/sanitize";
 import { getCsrfToken } from "@/lib/csrf";
 import {
   currentRefreshEpoch,
@@ -8,6 +8,7 @@ import {
 } from "@/lib/session";
 import { subscribeOverSharedSocket } from "@/lib/wsHub";
 import { config } from "@/config";
+import type { ExecutionStatus } from "@/generated/schema";
 /**
  * Minimal GraphQL client used by the Talos frontend — TRANSPORT ONLY.
  *
@@ -181,8 +182,11 @@ export async function graphqlRequest<T>(
       throw new Error(rawMsg);
     }
 
-    // Sanitize and cap error message length to prevent overly verbose backend errors from
-    // flooding the UI or leaking sensitive internal details.
+    // Every error explicitly marked user-facing by the server is shown as
+    // written (see `DisplaySafeError`); anything else is sanitized and capped.
+    if (errors.every((e) => e.extensions?.safe === true)) {
+      throw new DisplaySafeError(rawMsg);
+    }
     throw new Error(sanitizeErrorMessage(rawMsg));
   }
 
@@ -205,13 +209,22 @@ export function graphqlFetcher<TData, TVariables>(
  * Subscribe to a GraphQL subscription using a raw WebSocket.
  * The function returns an unsubscribe callback.
  */
+/**
+ * The wire values of the server's `ExecutionStatus` enum, derived from the
+ * generated type so a literal the server never sends (`"AwaitingApproval"`)
+ * is a compile error. Node-level `WAITING` means the node is paused on an
+ * approval gate; execution-level `WAITING` (no `nodeId`) means the run is
+ * suspended.
+ */
+export type ExecutionStatusValue = `${ExecutionStatus}`;
+
 export interface ExecutionUpdate {
   traceId?: string;
   spanId?: string;
 
   executionId: string;
   nodeId?: string;
-  status: string;
+  status: ExecutionStatusValue;
   logMessage?: string;
   // Enhanced tracking fields
   retryAttempt?: number;

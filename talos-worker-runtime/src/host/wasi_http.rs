@@ -65,10 +65,7 @@ use wasmtime_wasi_http::p2::types::{
 };
 use wasmtime_wasi_http::p2::{HttpResult, WasiHttpHooks, WasiHttpView};
 
-use super::egress::{
-    classify_url_scheme, denied_ip_literal, egress_posture_deny_reason, host_allowlist_match_kind,
-    insecure_http_opt_in, UrlSchemeVerdict,
-};
+use super::egress::insecure_http_opt_in;
 use super::limits::{MAX_HTTP_CALLS_PER_EXECUTION, MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION};
 use crate::context::TalosContext;
 
@@ -205,29 +202,21 @@ pub(crate) fn wasi_http_admission(
                 ..refuse("invalid-authority", "")
             }
         })?;
-    let host = url.host_str().unwrap_or("").to_string();
-
-    if let UrlSchemeVerdict::InsecureRefused { scheme } =
-        classify_url_scheme(url.scheme(), policy.insecure_http_opt_in)
-    {
-        return Err(refuse("insecure-scheme", format!("{scheme} {host}")));
-    }
-    if policy.allowed_hosts.is_empty() {
-        return Err(refuse("no-allowlist-configured", host));
-    }
-    if let Some((ip, p)) = denied_ip_literal(&url) {
-        return Err(refuse(p, ip.to_string()));
-    }
-    let Some(matched) = host_allowlist_match_kind(policy.allowed_hosts, &host) else {
-        return Err(refuse("allowed-hosts", host));
+    // Scheme, allowlist, IP literal, `allowed_hosts`, egress posture: the
+    // same function `talos:core/http::fetch` / `fetch_all` call.
+    let url_policy = super::egress_admission::UrlPolicy {
+        allowed_hosts: policy.allowed_hosts,
+        max_llm_tier: policy.max_llm_tier,
+        local_egress_only: policy.local_egress_only,
+        insecure_http_opt_in: policy.insecure_http_opt_in,
     };
-    if let Some(p) = egress_posture_deny_reason(
-        &host.to_ascii_lowercase(),
-        policy.max_llm_tier,
-        policy.local_egress_only,
-    ) {
-        return Err(refuse(p, host));
-    }
+    let super::egress_admission::UrlAdmitted {
+        host,
+        host_match: matched,
+        host_for_limit,
+        ..
+    } = super::egress_admission::admit_parsed_url(url, &url_policy)
+        .map_err(|r| refuse(r.policy, r.target))?;
     let mutates = method_mutates(&target.method);
     // The write ceiling on its VERB-INFERRED axis, under the `http-fetch` op
     // label (see `WASI_HTTP_OP`). The pair is written on one line so
@@ -265,10 +254,6 @@ pub(crate) fn wasi_http_admission(
             ..refuse("method-allowlist", format!("{} {host}", target.method))
         });
     }
-    let host_for_limit = match url.port_or_known_default() {
-        Some(p) => format!("{host}:{p}"),
-        None => host.clone(),
-    };
     Ok(WasiHttpAdmitted {
         host,
         host_for_limit,

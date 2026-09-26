@@ -20,6 +20,16 @@
  * repeated), the reconnect backoff (5 attempts before a first ack, 30
  * after — MCP-865's numbers), and the 24 h maximum connection lifetime.
  *
+ * The attempt counter resets on `connection_ack` ONLY, never on `open`: the
+ * server closes a disallowed-Origin socket after the upgrade with no
+ * `connection_error`, so an `open` proves nothing and resetting there made
+ * the pre-ack cap unreachable (a reconnect every second, forever). Auth
+ * recovery shares that counter, runs at most once per
+ * `AUTH_RECOVERY_MIN_INTERVAL_MS`, and stops after the second refusal that
+ * follows a successful recovery — a refreshed cookie the socket still does
+ * not carry (different WS host, a proxy stripping `Cookie`) must not turn
+ * into a refresh-token rotation loop.
+ *
  * Imports only `config` and `session`, never a request wrapper, so it cannot
  * form a cycle with the callers it serves.
  */
@@ -47,6 +57,10 @@ const MAX_CONNECTION_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const MAX_ATTEMPTS_BEFORE_FIRST_ACK = 5;
 const MAX_ATTEMPTS_AFTER_ACK = 30;
 const MAX_BACKOFF_MS = 30_000;
+const AUTH_RECOVERY_MIN_INTERVAL_MS = 30_000;
+/** Refusals after a SUCCESSFUL recovery (with no ack in between) before the
+ *  hub gives up: the fresh cookie is evidently not reaching the socket. */
+const MAX_REFUSALS_AFTER_RECOVERY = 2;
 
 function wsBaseUrl(): string {
   // MCP-900: explicit VITE_WS_URL > derived from VITE_API_URL > page origin.
@@ -74,6 +88,10 @@ export class SubscriptionHub {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connectedAt = 0;
   private epochAtConnect = 0;
+  private lastRecoveryAt = Number.NEGATIVE_INFINITY;
+  /** A recovery succeeded and no socket has been acked since. */
+  private recoveredSinceAck = false;
+  private refusalsAfterRecovery = 0;
 
   subscribe<T>(
     query: string,
@@ -153,7 +171,6 @@ export class SubscriptionHub {
 
     ws.onopen = () => {
       if (ws !== this.ws) return;
-      this.reconnectAttempts = 0;
       ws.send(JSON.stringify({ type: "connection_init", payload: {} }));
     };
     ws.onmessage = (msg) => this.onMessage(ws, msg);
@@ -198,6 +215,9 @@ export class SubscriptionHub {
       case "connection_ack": {
         if (this.acked) return;
         this.acked = true;
+        this.reconnectAttempts = 0;
+        this.recoveredSinceAck = false;
+        this.refusalsAfterRecovery = 0;
         for (const id of this.subs.keys()) this.sendStart(id);
         return;
       }
@@ -241,19 +261,40 @@ export class SubscriptionHub {
   }
 
   /** The ONE auth-recovery site (MCP-864's parity with the REST 401 path):
-   *  close, recover the session through the epoch, reconnect on success. */
+   *  close, recover the session through the epoch, reconnect on success —
+   *  bounded by the shared attempt counter and a minimum interval. */
   private recoverAuth(ws: WebSocket): void {
     this.closedByHub = true;
     this.detach();
     ws.close(4403, "Forbidden");
-    recoverSession(this.epochAtConnect).then((recovered) => {
-      if (recovered && this.subs.size > 0 && !this.ws) {
-        this.reconnectAttempts = 0;
-        this.connect();
+    if (this.recoveredSinceAck) {
+      this.refusalsAfterRecovery++;
+      if (this.refusalsAfterRecovery >= MAX_REFUSALS_AFTER_RECOVERY) {
+        console.warn(
+          "[subscriptions] still refused after a successful session refresh; not retrying",
+        );
+        return;
       }
+    }
+    if (this.reconnectAttempts >= MAX_ATTEMPTS_BEFORE_FIRST_ACK) return;
+    this.reconnectAttempts++;
+    const run = () => {
+      this.reconnectTimer = null;
+      if (this.subs.size === 0 || this.ws) return;
+      this.lastRecoveryAt = Date.now();
+      recoverSession(this.epochAtConnect).then((recovered) => {
+        if (!recovered) return;
+        this.recoveredSinceAck = true;
+        if (this.subs.size > 0 && !this.ws) this.connect();
+      });
       // Not recovered: the subscriptions stay registered and dormant; the
       // next `subscribe()` (or a page that signs in again) opens a socket.
-    });
+    };
+    const wait =
+      this.lastRecoveryAt + AUTH_RECOVERY_MIN_INTERVAL_MS - Date.now();
+    this.clearReconnect();
+    if (wait > 0) this.reconnectTimer = setTimeout(run, wait);
+    else run();
   }
 
   private onClose(ws: WebSocket, event: CloseEvent): void {

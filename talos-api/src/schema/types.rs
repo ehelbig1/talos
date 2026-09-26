@@ -13,8 +13,14 @@ use crate::schema::SafeErrorExtensions;
 pub struct Workflow {
     pub id: Uuid,
     pub name: String,
-    /// Serialized representation of the graph (flexible JSON).
-    pub graph_json: String,
+    /// The stored graph. `None` only on a list read whose selection did not
+    /// ask for `graphJson` (see `workflows`), so it is never rendered empty.
+    #[graphql(skip)]
+    pub graph_json: Option<String>,
+    /// Node/edge counts the list query derived in SQL; `None` means derive
+    /// them from `graph_json` on demand (single-workflow reads, mutations).
+    #[graphql(skip)]
+    pub graph_counts: Option<(Option<i32>, Option<i32>)>,
     /// The version `graphJson` is at. Advances whenever the graph changes,
     /// through ANY writer (this API, MCP tools, rollback). Pass it back as
     /// `updateWorkflow(expectedGraphVersion:)` so a save made from a stale
@@ -800,17 +806,13 @@ impl async_graphql::dataloader::Loader<ActorNameKey> for ActorNameLoader {
 /// the EXACT `we.user_id = $2 OR w.org_id = ANY($3)` predicate the
 /// top-level `latestWorkflowExecutions` query uses.
 ///
-/// `org_scope` mirrors `user_accessible_org_ids`' `ApiKeyOrgScope`
-/// short-circuit: `Some(org)` = org-scoped API key (restrict to that one
-/// org even if the user belongs to others); `None` = session/user key
-/// (the loader resolves the full membership list itself, ONCE per batch —
+/// The loader resolves the user's membership list itself, ONCE per batch —
 /// resolving it in the field resolver would re-introduce a per-parent
 /// `organization_members` query, since the `UserOrgIds` request cache is
-/// never populated).
+/// never populated.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct LatestExecutionKey {
     pub user_id: Uuid,
-    pub org_scope: Option<Uuid>,
     pub workflow_id: Uuid,
 }
 
@@ -839,30 +841,23 @@ impl async_graphql::dataloader::Loader<LatestExecutionKey> for LatestExecutionLo
     {
         let exec_repo = talos_execution_repository::ExecutionRepository::new(self.0.clone());
 
-        // Group by (user, org_scope) so each batched query carries its
-        // own tenancy scope — one group per request in practice.
-        let mut groups: std::collections::HashMap<(Uuid, Option<Uuid>), Vec<Uuid>> =
+        // Group by user so each batched query carries its own tenancy scope
+        // — one group per request in practice.
+        let mut groups: std::collections::HashMap<Uuid, Vec<Uuid>> =
             std::collections::HashMap::new();
         for key in keys {
-            groups
-                .entry((key.user_id, key.org_scope))
-                .or_default()
-                .push(key.workflow_id);
+            groups.entry(key.user_id).or_default().push(key.workflow_id);
         }
 
         let mut out = std::collections::HashMap::new();
-        for ((user_id, org_scope), workflow_ids) in groups {
+        for (user_id, workflow_ids) in groups {
             // Resolve accessible orgs once per batch, mirroring
-            // `user_accessible_org_ids`: org-scoped API key → that single
-            // org; otherwise the user's full membership list, failing
-            // CLOSED to an empty list on DB error (reader sees only
-            // personally-owned executions; MCP-617 fail-mode).
-            let org_ids: Vec<Uuid> = match org_scope {
-                Some(org) => vec![org],
-                None => match talos_organizations::OrganizationService::list_user_org_ids(
-                    &self.0, user_id,
-                )
-                .await
+            // `user_accessible_org_ids`, failing CLOSED to an empty list on
+            // DB error (reader sees only personally-owned executions;
+            // MCP-617 fail-mode).
+            let org_ids: Vec<Uuid> =
+                match talos_organizations::OrganizationService::list_user_org_ids(&self.0, user_id)
+                    .await
                 {
                     Ok(ids) => ids,
                     Err(e) => {
@@ -873,8 +868,7 @@ impl async_graphql::dataloader::Loader<LatestExecutionKey> for LatestExecutionLo
                         );
                         Vec::new()
                     }
-                },
-            };
+                };
 
             let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
             let mut tx = talos_db::begin_tenant_read_scoped(&self.0, &scope)
@@ -897,7 +891,6 @@ impl async_graphql::dataloader::Loader<LatestExecutionKey> for LatestExecutionLo
                 out.insert(
                     LatestExecutionKey {
                         user_id,
-                        org_scope,
                         workflow_id: r.workflow_id,
                     },
                     // Same lean projection the top-level
@@ -946,6 +939,26 @@ fn loader_err(
 
 #[ComplexObject]
 impl Workflow {
+    /// Serialized representation of the graph (flexible JSON).
+    async fn graph_json(&self) -> Result<&str> {
+        self.graph_json.as_deref().ok_or_else(|| {
+            async_graphql::Error::new("graphJson was not loaded for this read").extend_safe()
+        })
+    }
+
+    /// Number of nodes in the graph (its top-level `nodes` array). Null when
+    /// the stored graph has no such array or is not valid JSON. Cheaper than
+    /// selecting `graphJson` when only the size is needed.
+    async fn node_count(&self) -> Option<i32> {
+        self.counts().0
+    }
+
+    /// Number of edges in the graph (its top-level `edges` array). Null when
+    /// the stored graph has no such array or is not valid JSON.
+    async fn edge_count(&self) -> Option<i32> {
+        self.counts().1
+    }
+
     /// Display name of the owning actor (null when unbound, or when the
     /// actor belongs to another user). Batched via [`ActorNameLoader`].
     async fn actor_name(&self, ctx: &Context<'_>) -> Result<Option<String>> {
@@ -965,19 +978,25 @@ impl Workflow {
     /// with the same user/org predicate as `latestWorkflowExecutions`.
     async fn latest_execution(&self, ctx: &Context<'_>) -> Result<Option<WorkflowExecution>> {
         let user_id = loader_user_id(ctx)?;
-        let org_scope = ctx
-            .data::<crate::schema::ApiKeyOrgScope>()
-            .ok()
-            .map(|s| s.0);
         let loader = ctx.data::<async_graphql::dataloader::DataLoader<LatestExecutionLoader>>()?;
         loader
             .load_one(LatestExecutionKey {
                 user_id,
-                org_scope,
                 workflow_id: self.id,
             })
             .await
             .map_err(loader_err("latest execution"))
+    }
+}
+
+impl Workflow {
+    pub(crate) fn counts(&self) -> (Option<i32>, Option<i32>) {
+        self.graph_counts.unwrap_or_else(|| {
+            self.graph_json.as_deref().map_or(
+                (None, None),
+                talos_workflow_repository::graph_counts_from_json,
+            )
+        })
     }
 }
 

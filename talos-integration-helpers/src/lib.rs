@@ -110,7 +110,7 @@ async fn resolve_dispatch_secrets_map(
     // load. Same operator-visibility class as MCP-733..778
     // fire-and-forget sweep — DEBUG (not WARN) because a missing LLM
     // key is the common case for modules that don't need one; sibling
-    // `ParallelWorkflowEngine::build_encrypted_secrets` follows the
+    // `secrets_pipeline::build_encrypted_secrets_for` follows the
     // same DEBUG convention.
     match sm.get_llm_vault_keys(Some(user_id)).await {
         Ok(llm_keys) => {

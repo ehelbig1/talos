@@ -320,8 +320,12 @@ pub struct TalosContext {
     /// Dropping `_ephemeral_dir` removes the directory from the file system.
     _ephemeral_dir: TempDir,
 
-    /// Maximum memory allowed for this execution (bytes).
+    /// Maximum memory allowed for this execution (bytes) — the TOTAL across
+    /// every linear memory in the store, not per memory.
     pub max_memory_bytes: usize,
+    /// Linear-memory bytes committed so far across ALL memories in this
+    /// store (see `memory_growth_admitted`).
+    pub(crate) committed_memory_bytes: usize,
 
     /// Remaining crypto compute budget in microseconds.
     /// Shared across all `hash()` and `hmac()` calls in this execution.
@@ -365,6 +369,10 @@ pub struct TalosContext {
     pub(crate) http_calls_per_host: dashmap::DashMap<String, u64>,
     pub(crate) db_query_count: AtomicU64,
     pub(crate) messaging_publish_count: AtomicU64,
+    /// Per-execution `cache` host-fn call count (`MAX_CACHE_CALLS_PER_EXECUTION`).
+    pub(crate) cache_call_count: AtomicU64,
+    /// Per-execution `cache` write bytes (`MAX_CACHE_WRITE_BYTES_PER_EXECUTION`).
+    pub(crate) cache_write_bytes: AtomicU64,
     /// RFC 0011 P2c: per-execution count of `model::predict*` INPUTS
     /// (a batch of N counts N — each input costs the controller one
     /// local embed + one ANN query). Capped at
@@ -1550,6 +1558,7 @@ impl TalosContext {
             fs_dir,
             _ephemeral_dir: ephemeral_dir,
             max_memory_bytes,
+            committed_memory_bytes: 0,
             crypto_budget_us: AtomicU64::new(5_000_000), // 5 seconds default
             request_id: None,
             cancellation_token: None,
@@ -1559,6 +1568,8 @@ impl TalosContext {
             http_calls_per_host: dashmap::DashMap::new(),
             db_query_count: AtomicU64::new(0),
             messaging_publish_count: AtomicU64::new(0),
+            cache_call_count: AtomicU64::new(0),
+            cache_write_bytes: AtomicU64::new(0),
             model_predict_input_count: AtomicU64::new(0),
             model_fewshot_call_count: AtomicU64::new(0),
             email_send_count: AtomicU64::new(0),
@@ -1769,10 +1780,19 @@ impl ResourceLimiter for TalosContext {
             limit_mb = self.max_memory_bytes / 1024 / 1024,
             "WASM memory growth requested"
         );
-        if desired > self.max_memory_bytes {
+        // The pooling allocator admits up to `max_memories_per_component`
+        // memories per component; a per-memory comparison let a store hold
+        // that many times the limit. Charge every growth against ONE total.
+        let Some(committed) = memory_growth_admitted(
+            self.committed_memory_bytes,
+            current,
+            desired,
+            self.max_memory_bytes,
+        ) else {
             tracing::warn!(
                 current_mb = current / 1024 / 1024,
                 desired_mb = desired / 1024 / 1024,
+                committed_mb = self.committed_memory_bytes / 1024 / 1024,
                 limit_mb = self.max_memory_bytes / 1024 / 1024,
                 "WASM memory limit exceeded — denying allocation"
             );
@@ -1782,7 +1802,8 @@ impl ResourceLimiter for TalosContext {
                 desired / 1024 / 1024
             ));
             return Ok(false);
-        }
+        };
+        self.committed_memory_bytes = committed;
         Ok(true)
     }
 
@@ -1813,6 +1834,51 @@ impl ResourceLimiter for TalosContext {
             return Ok(false);
         }
         Ok(true)
+    }
+}
+
+/// Store-wide linear-memory accounting: a growth from `current` to `desired`
+/// bytes adds `desired - current` to the store's committed total. Returns the
+/// new total, or `None` when it would exceed `max`. Committed bytes never
+/// shrink (wasm memories cannot), so an over-count is the fail-safe direction.
+pub(crate) fn memory_growth_admitted(
+    committed: usize,
+    current: usize,
+    desired: usize,
+    max: usize,
+) -> Option<usize> {
+    let next = committed.checked_add(desired.saturating_sub(current))?;
+    (next <= max).then_some(next)
+}
+
+#[cfg(test)]
+mod memory_growth_tests {
+    use super::memory_growth_admitted;
+
+    #[test]
+    fn many_memories_share_one_limit() {
+        let max = 128 << 20;
+        // Twenty memories each growing to 100 MiB: the per-memory check
+        // admitted all twenty (2 GB); the store total admits exactly one.
+        let mut committed = 0;
+        let mut admitted = 0;
+        for _ in 0..20 {
+            if let Some(next) = memory_growth_admitted(committed, 0, 100 << 20, max) {
+                committed = next;
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 1);
+        assert_eq!(committed, 100 << 20);
+    }
+
+    #[test]
+    fn growth_charges_only_the_delta() {
+        let max = 10;
+        assert_eq!(memory_growth_admitted(4, 4, 8, max), Some(8));
+        assert_eq!(memory_growth_admitted(8, 8, 10, max), Some(10));
+        assert_eq!(memory_growth_admitted(10, 10, 11, max), None);
+        assert_eq!(memory_growth_admitted(usize::MAX, 0, 1, usize::MAX), None);
     }
 }
 

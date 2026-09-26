@@ -1,6 +1,6 @@
 import { config } from "@/config";
 import React, { useState } from "react";
-import { sanitizeErrorMessage } from "@/lib/sanitize";
+import { userFacingErrorMessage } from "@/lib/sanitize";
 import {
   login as authLogin,
   signup as authSignup,
@@ -44,11 +44,7 @@ export function AuthForm() {
         }
       }
     } catch (err) {
-      setError(
-        sanitizeErrorMessage(
-          err instanceof Error ? err.message : "Login failed",
-        ),
-      );
+      setError(userFacingErrorMessage(err, "Login failed"));
     } finally {
       setIsLoading(false);
     }
@@ -63,11 +59,7 @@ export function AuthForm() {
       const user = await verifyTwoFactor(twoFactorCode);
       setAuthUser(user);
     } catch (err: unknown) {
-      setError(
-        sanitizeErrorMessage(
-          err instanceof Error ? err.message : "Invalid verification code",
-        ),
-      );
+      setError(userFacingErrorMessage(err, "Invalid verification code"));
     } finally {
       setIsLoading(false);
     }

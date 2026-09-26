@@ -30,6 +30,18 @@ pub struct LlmUsageRecord {
     /// Requesting user when a [`scoped_user`] scope is active; `None` for
     /// platform-attributed calls (background maintenance, unwrapped sites).
     pub user_id: Option<Uuid>,
+    /// Actor whose work this call was, when an [`scoped_actor`] scope is
+    /// active — the column `max_llm_tokens_per_day` sums. Background loops
+    /// acting for an actor (consolidation, reflection) set it so their spend
+    /// counts against that actor's budget.
+    pub actor_id: Option<Uuid>,
+}
+
+/// Attribution carried by the task-local scope.
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageScope {
+    user_id: Option<Uuid>,
+    actor_id: Option<Uuid>,
 }
 
 type UsageSink = dyn Fn(LlmUsageRecord) + Send + Sync;
@@ -40,7 +52,7 @@ type UsageSink = dyn Fn(LlmUsageRecord) + Send + Sync;
 static USAGE_SINK: OnceLock<Arc<UsageSink>> = OnceLock::new();
 
 tokio::task_local! {
-    static USAGE_USER: Option<Uuid>;
+    static USAGE_SCOPE: UsageScope;
 }
 
 /// Install the global usage sink. Idempotent-safe: the first caller wins
@@ -54,25 +66,40 @@ pub fn set_usage_sink(sink: Arc<UsageSink>) {
 /// Run `fut` with LLM usage attributed to `user_id`. Nested scopes shadow
 /// (innermost wins).
 pub async fn scoped_user<F: Future>(user_id: Uuid, fut: F) -> F::Output {
-    USAGE_USER.scope(Some(user_id), fut).await
+    let scope = UsageScope {
+        user_id: Some(user_id),
+        actor_id: None,
+    };
+    USAGE_SCOPE.scope(scope, fut).await
+}
+
+/// Run `fut` with LLM usage attributed to `actor_id` (and `user_id` when the
+/// caller knows it). Nested scopes shadow (innermost wins).
+pub async fn scoped_actor<F: Future>(actor_id: Uuid, user_id: Option<Uuid>, fut: F) -> F::Output {
+    let scope = UsageScope {
+        user_id,
+        actor_id: Some(actor_id),
+    };
+    USAGE_SCOPE.scope(scope, fut).await
 }
 
 /// Record one completion's usage into the global sink (no-op when no sink is
 /// installed). Called by the response-parse sites in this crate; safe to call
 /// from any task — the user scope is read via `try_with` so tasks outside a
-/// [`scoped_user`] scope simply record unattributed.
+/// [`scoped_user`] / [`scoped_actor`] scope simply record unattributed.
 pub(crate) fn record(provider: &str, model: &str, prompt_tokens: u64, completion_tokens: u64) {
     if prompt_tokens == 0 && completion_tokens == 0 {
         return;
     }
     if let Some(sink) = USAGE_SINK.get() {
-        let user_id = USAGE_USER.try_with(|u| *u).ok().flatten();
+        let scope = USAGE_SCOPE.try_with(|s| *s).unwrap_or_default();
         sink(LlmUsageRecord {
             provider: provider.to_string(),
             model: model.to_string(),
             prompt_tokens,
             completion_tokens,
-            user_id,
+            user_id: scope.user_id,
+            actor_id: scope.actor_id,
         });
     }
 }
@@ -117,6 +144,12 @@ mod tests {
             record("ollama", "m2", 7, 3);
         })
         .await;
+        // 2b. Actor scope → actor_id (and the optional user) recorded.
+        let aid = Uuid::new_v4();
+        scoped_actor(aid, None, async {
+            record("ollama", "m2b", 4, 2);
+        })
+        .await;
         // 3. Zero-usage records are dropped.
         record("anthropic", "m3", 0, 0);
         // 4. Anthropic extractor pulls usage.input_tokens/output_tokens.
@@ -134,14 +167,16 @@ mod tests {
         record_ollama("m", &serde_json::json!({}));
 
         let got = captured.lock().unwrap();
-        assert_eq!(got.len(), 4, "expected exactly 4 recorded entries");
-        assert_eq!(got[0].user_id, None);
+        assert_eq!(got.len(), 5, "expected exactly 5 recorded entries");
+        assert_eq!((got[0].user_id, got[0].actor_id), (None, None));
         assert_eq!((got[0].prompt_tokens, got[0].completion_tokens), (10, 5));
-        assert_eq!(got[1].user_id, Some(uid));
+        assert_eq!((got[1].user_id, got[1].actor_id), (Some(uid), None));
         assert_eq!(got[1].provider, "ollama");
-        assert_eq!(got[2].provider, "anthropic");
-        assert_eq!((got[2].prompt_tokens, got[2].completion_tokens), (100, 42));
-        assert_eq!(got[3].provider, "ollama");
-        assert_eq!((got[3].prompt_tokens, got[3].completion_tokens), (55, 11));
+        assert_eq!((got[2].user_id, got[2].actor_id), (None, Some(aid)));
+        assert_eq!(got[3].provider, "anthropic");
+        assert_eq!((got[3].prompt_tokens, got[3].completion_tokens), (100, 42));
+        assert_eq!(got[3].actor_id, None, "scope ended with its future");
+        assert_eq!(got[4].provider, "ollama");
+        assert_eq!((got[4].prompt_tokens, got[4].completion_tokens), (55, 11));
     }
 }

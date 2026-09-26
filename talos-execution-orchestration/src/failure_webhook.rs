@@ -20,54 +20,29 @@ use talos_workflow_repository::WorkflowRepository;
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// MCP-1112 (2026-05-16): cache the hardened failure-webhook HTTP
-/// client at module scope so `dispatch_failure_webhook` doesn't
-/// rebuild it per call. Sibling sweep of MCP-1110 (talos-search-
-/// service) and MCP-1111 (talos-memory) — third copy of the
-/// per-call `Client::builder().build()` anti-pattern.
+/// ONE hardened failure-webhook client per process (MCP-1112: the per-call
+/// build discarded keep-alive exactly when failures spike). Built via the
+/// shared SSRF-safe builder: redirect(none) (MCP-469) + the connect-time
+/// `ControllerSsrfResolver`, which closes the DNS-rebinding TOCTOU the
+/// fire-time `check_outbound_url_no_ssrf` cannot — the URL is user-supplied.
 ///
-/// Hot path: fires on EVERY workflow execution failure. In a
-/// degraded state (provider outage, mis-deployed module, network
-/// partition) failure rates spike — the prior code rebuilt the
-/// full TLS context + per-call connection pool on every fire,
-/// guaranteeing zero keep-alive reuse to the operator-facing
-/// alert target (PagerDuty / Slack webhook / Opsgenie / internal
-/// incident-mgmt API). Each fresh handshake adds ~50-200ms of
-/// connect latency PLUS amplifies provider-side rate-limit
-/// accounting (fresh connections count harder than warm pool
-/// reuse on most provider tiers — exactly when the operator is
-/// most acutely waiting for the alert).
-///
-/// MCP-469 redirect=none preserved exactly — the SSRF gate at
-/// `check_outbound_url_no_ssrf` covers the literal URL but a 302
-/// from a validated host to an internal IP would pivot beneath
-/// the gate without `.redirect(Policy::none())`. MCP-1034 explicit
-/// connect_timeout(2s) preserved so a black-holed endpoint fails
-/// fast on TCP-handshake instead of burning the full 5s budget.
-///
-/// `.expect()` on TLS-init failure matches the sibling MCP-1110/
-/// 1111 pattern — TLS init failing is a deployment issue (broken
-/// system roots / OS misconfiguration), not a request-time
-/// recoverable error. Pre-fix `Err(e) => log+return` silently
-/// dropped EVERY failure webhook for the pod's lifetime with no
-/// signal to operators that alerting itself was broken; loud
-/// first-call panic is the better failure mode.
-static FAILURE_WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    // Built via the shared SSRF-safe builder: redirect(none) + the connect-time
-    // ControllerSsrfResolver closing the DNS-rebinding TOCTOU the call-time
-    // `check_outbound_url_no_ssrf` (at fire time) can't. The failure-notification
-    // URL is user-supplied (set_failure_notification), so without the resolver an
-    // attacker controlling its DNS could rebind it to 169.254.169.254 / an
-    // internal service after validation. (The connect-timeout is the builder's
-    // shared 5 s rather than the previous 2 s — a negligible fast-fail change.)
+/// `None` when TLS init failed: every fire then logs an ERROR naming it. This
+/// dispatcher runs inside detached tasks (the trigger path and MCP
+/// `call_workflow`), where a first-use panic would lose the task's result
+/// rather than surface the broken alerting any louder.
+static FAILURE_WEBHOOK_CLIENT: LazyLock<Option<reqwest::Client>> = LazyLock::new(|| {
     talos_http_utils::outbound::build_outbound_webhook_client_with_timeout(
         "talos-failure-webhook/1.0",
         WEBHOOK_TIMEOUT,
     )
-    .expect("talos-execution-orchestration: failed to build failure-webhook HTTP client (TLS init)")
+    .map_err(|e| tracing::error!(error = %e, "failure-webhook HTTP client build failed"))
+    .ok()
 });
 
-pub(crate) async fn dispatch_failure_webhook(
+/// Fire the workflow's stored failure webhook for `execution_id`: fire-time
+/// SSRF re-validation, the shared SSRF-safe client, never an error to the
+/// caller. `pub` so other crates reuse this one dispatcher instead of a copy.
+pub async fn dispatch_failure_webhook(
     workflow_repo: &WorkflowRepository,
     workflow_id: Uuid,
     execution_id: Uuid,
@@ -78,7 +53,19 @@ pub(crate) async fn dispatch_failure_webhook(
         .await
     {
         Ok(Some(u)) => u,
-        _ => return,
+        Ok(None) => return,
+        // A failed read is not "no webhook configured": say the operator
+        // notification was skipped.
+        Err(e) => {
+            tracing::warn!(
+                target: "talos_rpc",
+                workflow_id = %workflow_id,
+                execution_id = %execution_id,
+                error = %e,
+                "failure_webhook URL unreadable — operator notification skipped"
+            );
+            return;
+        }
     };
     if check_outbound_url_no_ssrf(&url).is_err() {
         tracing::warn!(
@@ -94,12 +81,14 @@ pub(crate) async fn dispatch_failure_webhook(
         "error": error,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    // MCP-1112: shared once-built client (see FAILURE_WEBHOOK_CLIENT
-    // module-scope LazyLock above). One TLS context + one
-    // connection pool process-wide. MCP-469 redirect=none policy
-    // and MCP-1034 explicit connect_timeout preserved in the
-    // builder up there.
-    let client: &reqwest::Client = &FAILURE_WEBHOOK_CLIENT;
+    let Some(client) = FAILURE_WEBHOOK_CLIENT.as_ref() else {
+        tracing::error!(
+            workflow_id = %workflow_id,
+            execution_id = %execution_id,
+            "failure_webhook HTTP client unavailable (TLS init failed) — operator notification undelivered"
+        );
+        return;
+    };
     // MCP-742 (2026-05-13): log POST failures. The failure-webhook is
     // typically wired to operator alerting (PagerDuty, Slack,
     // incident-mgmt). Pre-fix `let _ = client.post(...).await`

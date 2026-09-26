@@ -490,6 +490,28 @@ pub struct BackendCandidate {
     pub macro_recall: f64,
 }
 
+/// L2 strengths the linear backend is fitted at; the best macro-recall wins.
+const LINEAR_L2_GRID: [f32; 3] = [1e-4, 1e-2, 1e-1];
+
+/// One linear grid point: fit, then score every holdout embedding. Pure CPU;
+/// run on the blocking pool.
+fn fit_and_score(
+    train: &[(Vec<f32>, String, f32)],
+    holdout_embeddings: &[Option<Vec<f32>>],
+    opts: crate::linear::FitOpts,
+) -> anyhow::Result<(Vec<Option<(String, f32)>>, Vec<u8>)> {
+    let model = crate::linear::fit_weighted(train, opts)?;
+    let scored = holdout_embeddings
+        .iter()
+        .map(|e| {
+            e.as_ref()
+                .and_then(|e| model.predict(e))
+                .map(|p| (p.label, p.confidence))
+        })
+        .collect();
+    Ok((scored, model.to_artifact()?))
+}
+
 /// Evaluate EVERY available backend on ONE shared stratified holdout and
 /// return the candidates ordered best-first (macro-RECALL; ties break
 /// toward `knn-pgvector`, which serves without an artifact). This is the RFC's
@@ -571,7 +593,11 @@ pub async fn run_backend_selection_eval(
     // (auto-tuning; a few sub-second fits). Everything else comes from the
     // caller's base opts.
     let train: Vec<(Vec<f32>, String, f32)> = service
-        .load_train_embeddings_with_source(&mut *conn, dataset_id)
+        .load_train_embeddings_with_source(
+            &mut *conn,
+            dataset_id,
+            crate::linear::MAX_TRAIN_EXAMPLES,
+        )
         .await?
         .into_iter()
         .map(|(emb, label, is_corr)| {
@@ -584,32 +610,40 @@ pub async fn run_backend_selection_eval(
         })
         .collect();
     if train.len() >= 10 {
-        const L2_GRID: [f32; 3] = [1e-4, 1e-2, 1e-1];
+        // The fits are CPU-bound (epochs × rows × classes × dims): run each
+        // grid point on the blocking pool, in parallel, never on an async
+        // worker thread. The eval's transaction — and the dataset advisory
+        // lock it holds — stays open across them DELIBERATELY: the lock pins
+        // the split this report scores and the caller records the version
+        // under the same transaction; releasing it mid-eval would let a
+        // concurrent eval re-split underneath the report.
+        let train = std::sync::Arc::new(train);
+        let holdout_embeddings: std::sync::Arc<Vec<Option<Vec<f32>>>> =
+            std::sync::Arc::new(holdout.iter().map(|ex| ex.embedding.clone()).collect());
+        let fits = LINEAR_L2_GRID.map(|l2| {
+            let (train, holdout_embeddings) = (train.clone(), holdout_embeddings.clone());
+            let opts = crate::linear::FitOpts { l2, ..linear_opts };
+            tokio::task::spawn_blocking(move || fit_and_score(&train, &holdout_embeddings, opts))
+        });
         // (report, artifact, l2, macro_recall) of the best fit so far —
         // grid points are ranked by the same macro-recall selection score.
         let mut best: Option<(EvalReport, Vec<u8>, f32, f64)> = None;
-        for &l2 in &L2_GRID {
-            let opts = crate::linear::FitOpts { l2, ..linear_opts };
-            let model = match crate::linear::fit_weighted(&train, opts) {
-                Ok(m) => m,
-                Err(e) => {
+        for (fit, &l2) in fits.into_iter().zip(LINEAR_L2_GRID.iter()) {
+            let (scored, artifact) = match fit.await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
                     tracing::warn!(target: "talos_ml", %l2, error = %e, "linear fit failed at this l2");
                     continue;
                 }
+                Err(e) => {
+                    tracing::warn!(target: "talos_ml", %l2, error = %e, "linear fit task failed at this l2");
+                    continue;
+                }
             };
-            let scored: Vec<Option<(String, f32)>> = holdout
-                .iter()
-                .map(|ex| {
-                    ex.embedding
-                        .as_ref()
-                        .and_then(|e| model.predict(e))
-                        .map(|p| (p.label, p.confidence))
-                })
-                .collect();
             let report = report_from_scored(&truths, &sources, &scored)?;
             let mr = macro_recall(&report);
             if best.as_ref().map(|(_, _, _, b)| mr > *b).unwrap_or(true) {
-                best = Some((report, model.to_artifact()?, l2, mr));
+                best = Some((report, artifact, l2, mr));
             }
         }
         match best {

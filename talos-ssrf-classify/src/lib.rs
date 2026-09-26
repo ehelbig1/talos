@@ -17,14 +17,18 @@
 //! Coverage:
 //! - IPv4: loopback (127/8), RFC1918, link-local incl. metadata (169.254/16),
 //!   multicast, broadcast, the whole `0.0.0.0/8` (Linux routes it to loopback),
-//!   and RFC 6598 CGNAT (100.64/10).
+//!   RFC 6598 CGNAT (100.64/10), IETF protocol assignments (192.0.0/24),
+//!   benchmarking (198.18/15) and reserved class E (240/4).
 //! - IPv6: loopback (`::1`), multicast, unspecified (`::`), link-local
 //!   (`fe80::/10`), unique-local (`fc00::/7`), deprecated site-local
 //!   (`fec0::/10`), and every **IPv4-in-IPv6 transition form** —
-//!   IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`),
-//!   NAT64 well-known (`64:ff9b::/96`), and 6to4 (`2002::/16`) — canonicalized
+//!   IPv4-mapped (`::ffff:a.b.c.d`), IPv4-translated (`::ffff:0:a.b.c.d`),
+//!   IPv4-compatible (`::a.b.c.d`), NAT64 well-known (`64:ff9b::/96`), and 6to4
+//!   (`2002::/16`) — canonicalized
 //!   to their embedded IPv4 and re-checked, so the v4 rules can't be bypassed
-//!   by spelling a private/loopback/metadata target in any IPv6 form.
+//!   by spelling a private/loopback/metadata target in any IPv6 form. The
+//!   local-use NAT64 prefix (`64:ff9b:1::/48`, RFC 8215) is refused outright:
+//!   it is operator-defined, so its embedded IPv4 position is not knowable.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -52,6 +56,16 @@ pub fn classify_private_ipv4(addr: Ipv4Addr) -> Option<&'static str> {
     if (u32::from(addr) >> 22) == (0x6440_0000u32 >> 22) {
         return Some("private-ip-cgnat");
     }
+    // IETF protocol assignments (192.0.0.0/24), benchmarking (198.18.0.0/15)
+    // and reserved class E (240.0.0.0/4): none is a public destination, and
+    // an internal network may route any of them.
+    let o = addr.octets();
+    if (o[0] == 192 && o[1] == 0 && o[2] == 0) || (o[0] == 198 && (o[1] & 0xfe) == 18) {
+        return Some("private-ip-special-purpose");
+    }
+    if o[0] >= 240 {
+        return Some("private-ip-reserved");
+    }
     None
 }
 
@@ -69,6 +83,11 @@ fn embedded_ipv4(segs: [u16; 8]) -> Option<(Ipv4Addr, &'static str)> {
     // IPv4-mapped `::ffff:a.b.c.d` — segs[4]==0, segs[5]==0xffff.
     if high_zero && segs[4] == 0 && segs[5] == 0xffff {
         return Some((v4_from_segs(segs[6], segs[7]), "ipv4-mapped-ipv6"));
+    }
+    // IPv4-translated `::ffff:0:a.b.c.d` (RFC 2765 SIIT) — segs[4]==0xffff,
+    // segs[5]==0.
+    if high_zero && segs[4] == 0xffff && segs[5] == 0 {
+        return Some((v4_from_segs(segs[6], segs[7]), "ipv4-translated-ipv6"));
     }
     // IPv4-compatible `::a.b.c.d` (deprecated) — the entire high 96 bits zero.
     // Callers handle `::`/`::1` before this, so the embedded v4 here is a real
@@ -129,11 +148,17 @@ fn classify_private_ipv6(addr: Ipv6Addr) -> Option<&'static str> {
                 (_, "nat64") => "private-ip-nat64",
                 ("private-ip-cgnat", "6to4") => "private-ip-cgnat-6to4",
                 (_, "6to4") => "private-ip-6to4",
+                (_, "ipv4-translated-ipv6") => "private-ip-ipv4-translated-ipv6",
                 _ => "private-ip-embedded-ipv4",
             });
         }
         // Embedded v4 is public → governed by the hostname allowlist like any
         // public destination; not an SSRF target on its own.
+    }
+    // Local-use NAT64 `64:ff9b:1::/48` (RFC 8215): translated by an
+    // operator-run gateway to an address we cannot extract, so refuse it all.
+    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
+        return Some("private-ip-nat64-local");
     }
     // IPv6 link-local (fe80::/10), unique-local (fc00::/7), and deprecated
     // site-local (fec0::/10).
@@ -262,6 +287,53 @@ mod tests {
         assert_eq!(
             classify_private_ip(ip("2002:a00:1::")),
             Some("private-ip-6to4")
+        );
+    }
+
+    #[test]
+    fn rejects_special_purpose_and_reserved_v4() {
+        for s in [
+            "192.0.0.1",   // IETF protocol assignments
+            "192.0.0.170", // NAT64 discovery
+            "198.18.0.1",  // benchmarking
+            "198.19.255.254",
+            "240.0.0.1", // class E
+            "254.1.2.3",
+            "255.255.255.255",
+        ] {
+            assert!(
+                classify_private_ip(ip(s)).is_some(),
+                "{s} should be blocked"
+            );
+        }
+        // Adjacent public space stays allowed.
+        assert!(classify_private_ip(ip("192.0.1.1")).is_none());
+        assert!(classify_private_ip(ip("198.17.255.255")).is_none());
+        assert!(classify_private_ip(ip("198.20.0.1")).is_none());
+    }
+
+    #[test]
+    fn rejects_ipv4_translated_embedding_private_v4() {
+        assert_eq!(
+            classify_private_ip(ip("::ffff:0:7f00:1")),
+            Some("private-ip-ipv4-translated-ipv6")
+        );
+        assert_eq!(
+            classify_private_ip(ip("::ffff:0:a9fe:a9fe")),
+            Some("private-ip-ipv4-translated-ipv6")
+        );
+        assert!(classify_private_ip(ip("::ffff:0:808:808")).is_none());
+    }
+
+    #[test]
+    fn rejects_local_use_nat64_prefix() {
+        assert_eq!(
+            classify_private_ip(ip("64:ff9b:1::808:808")),
+            Some("private-ip-nat64-local")
+        );
+        assert_eq!(
+            classify_private_ip(ip("64:ff9b:1:ffff::1")),
+            Some("private-ip-nat64-local")
         );
     }
 }

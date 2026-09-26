@@ -73,7 +73,6 @@ pub mod worker_manager;
 pub(crate) mod workflow_authorization;
 pub(crate) mod workflow_creation_helpers;
 pub(crate) mod workflow_repository;
-pub mod workflow_signing;
 pub mod workflow_validation;
 pub mod workflow_versions;
 pub mod ws_auth;

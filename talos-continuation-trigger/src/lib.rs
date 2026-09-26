@@ -299,6 +299,7 @@ pub async fn trigger_continuation_workflow(
     // is validated + active. Curated scope keeps transient `working` memory out
     // of the trace; `insert_queued_execution` below additionally DLP-redacts the
     // stored payload. No relevance hint on a push event → recency-based recall.
+    let mut lifted_actor_context = None;
     if matches!(source_kind, TriggerSourceKind::GmailPush) {
         if let Some(bound_actor) = workflow_actor_id {
             let opted_out = serde_json::from_str::<serde_json::Value>(&graph_json)
@@ -319,6 +320,14 @@ pub async fn trigger_continuation_workflow(
                 .await;
             }
         }
+    }
+    // The decrypted context reaches the ENGINE as a property below, never
+    // the stored payload: `input_data` is plaintext, and the engine strips
+    // every engine-authored key at the trigger seed anyway.
+    if let Some(ctx) = talos_workflow_engine_core::reserved_keys::lift_actor_context_for_storage(
+        &mut trigger_payload,
+    ) {
+        lifted_actor_context = Some(ctx);
     }
 
     // 1. Create execution record (queued; transitions to running in the spawn
@@ -473,12 +482,12 @@ pub async fn trigger_continuation_workflow(
     // capability) as the pre-suspension half.
     let mut engine_opts = EngineOpts::for_run(workflow_id, graph_json.clone())
         .with_effective_actor(effective_actor_id, workflow_actor_id);
-    // Tier 2: LIFT any injected `__actor_context__` (GmailPush path above) onto
-    // the engine so per-node `needs_memory` gating applies and it reaches deeper
-    // LLM nodes, not just the root — matching the scheduler / direct-trigger
-    // lift. The payload keeps its own copy for the stored trace.
-    if let Some(ctx) = trigger_payload.get("__actor_context__") {
-        engine_opts = engine_opts.with_actor_context(Some(ctx.clone()));
+    // Tier 2: the injected `__actor_context__` (GmailPush path above), lifted
+    // off the stored payload, goes onto the engine so per-node `needs_memory`
+    // gating applies and it reaches deeper LLM nodes, not just the root —
+    // matching the scheduler / direct-trigger lift.
+    if lifted_actor_context.is_some() {
+        engine_opts = engine_opts.with_actor_context(lifted_actor_context);
     }
     let mut engine = match for_workflow(registry, secrets_manager, actor_repo, user_id, engine_opts)
         .await
@@ -532,8 +541,36 @@ pub async fn trigger_continuation_workflow(
 
     // Spawn the engine run — same pattern as trigger_workflow / enqueue_workflow
     tokio::spawn(async move {
-        if let Err(e) = repo.set_execution_running(execution_id).await {
-            tracing::error!(execution_id = %execution_id, "Failed to mark running: {}", e);
+        match QueuedClaim::from_claim(&repo.set_execution_running(execution_id).await) {
+            QueuedClaim::Claimed => {}
+            // Cancelled while queued (or claimed elsewhere): the row is not
+            // ours to run and needs no finalizing.
+            QueuedClaim::NotQueued => {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    "continuation row no longer queued — not running it"
+                );
+                return;
+            }
+            // Fail CLOSED: a run nobody can prove this task owns is not run.
+            QueuedClaim::Unreadable => {
+                tracing::error!(
+                    execution_id = %execution_id,
+                    "continuation queued→running claim unreadable — not running it"
+                );
+                if let Err(mark_err) = repo
+                    .fail_execution(execution_id, "Could not claim the queued execution")
+                    .await
+                {
+                    tracing::warn!(
+                        target: "talos_audit",
+                        execution_id = %execution_id,
+                        error = %mark_err,
+                        "fail_execution UPDATE failed after an unreadable claim — execution row may remain 'queued'"
+                    );
+                }
+                return;
+            }
         }
 
         match run_with_trigger_input_via_nats(
@@ -604,6 +641,14 @@ pub async fn trigger_continuation_workflow(
                     );
                 }
             }
+            // The row is already `cancelled` and its in-flight module rows
+            // were finalized by the cancel itself: nothing to fail.
+            Err(e) if talos_engine::fence::was_cancelled_by_operator(&e) => {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    "continuation run stopped — the execution was cancelled by an operator"
+                );
+            }
             Err(e) => {
                 // MCP-452: DLP-redact the engine error before
                 // persistence and logging. Same secret-leak class
@@ -638,6 +683,46 @@ pub async fn trigger_continuation_workflow(
     });
 
     Some(execution_id.to_string())
+}
+
+/// The decision over a `queued → running` claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuedClaim {
+    /// This task moved the row and owns the run.
+    Claimed,
+    /// The row was no longer `queued` — do not run.
+    NotQueued,
+    /// The claim could not be read — fail closed.
+    Unreadable,
+}
+
+impl QueuedClaim {
+    fn from_claim(claim: &anyhow::Result<bool>) -> Self {
+        match claim {
+            Ok(true) => Self::Claimed,
+            Ok(false) => Self::NotQueued,
+            Err(_) => Self::Unreadable,
+        }
+    }
+}
+
+#[cfg(test)]
+mod queued_claim_tests {
+    use super::QueuedClaim;
+
+    #[test]
+    fn only_a_row_this_task_moved_is_run() {
+        assert_eq!(QueuedClaim::from_claim(&Ok(true)), QueuedClaim::Claimed);
+        assert_eq!(
+            QueuedClaim::from_claim(&Ok(false)),
+            QueuedClaim::NotQueued,
+            "a row cancelled while queued must not run"
+        );
+        assert_eq!(
+            QueuedClaim::from_claim(&Err(anyhow::anyhow!("pool timeout"))),
+            QueuedClaim::Unreadable
+        );
+    }
 }
 
 #[cfg(test)]

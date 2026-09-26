@@ -25,8 +25,9 @@
 //!   `dependencies` changed, **or** the row has no WASM yet (the last fixes
 //!   the metadata-only first-seed row).
 //! - [`refresh_catalog_wasm_by_slug`] writes the freshly compiled bytes to
-//!   EVERY row sharing the slug, so any existing stale twin also gets new
-//!   code (the safe alternative to rewriting workflow graph_json).
+//!   every PRISTINE row sharing the slug (compare-and-set on the shared
+//!   build's hash), so a stale twin gets new code while a hot-updated install
+//!   keeps the user's bytes.
 //! - [`reconcile_duplicate_catalog_modules`] logs a WARN naming each dupe
 //!   set and the workflows referencing a stale twin — diagnostic only, it
 //!   never rewrites user data.
@@ -376,12 +377,23 @@ pub async fn upsert_catalog_template_by_slug(
     })
 }
 
-/// Write freshly compiled WASM to EVERY catalog-derived row sharing this
-/// `catalog_slug` — the shared `user_id IS NULL` row AND every per-user
-/// install of the same template. This is the safe fix for stale twins:
-/// rather than rewriting workflow graph_json to repoint at a survivor
-/// (which touches user data), we keep both twins' code current so a node
-/// pinned to either UUID runs the new binary.
+/// Write freshly compiled WASM to every catalog-derived row sharing this
+/// `catalog_slug` that is still PRISTINE — the shared `user_id IS NULL` row(s)
+/// and any per-user install whose bytes are still the shared build's. This is
+/// the safe fix for stale twins: rather than rewriting workflow graph_json to
+/// repoint at a survivor, we keep the twins' code current.
+///
+/// **Compare-and-set (2026-09-25).** `hot_update_module` keeps a per-user
+/// install's `kind`/`catalog_slug`, so the old `WHERE catalog_slug = $1 AND
+/// kind = 'catalog'` also overwrote a user's hot-updated bytes with catalog
+/// bytes — the row then RAN catalog code while showing the user's source. A
+/// per-user row is now refreshed only when its `content_hash` equals a shared
+/// row's hash as it stood BEFORE this refresh (read in the same statement).
+/// Stated cost: a pristine install compiled separately whose bytes differ from
+/// the shared build is no longer auto-refreshed; it keeps the code it was
+/// installed with until reinstalled. Hot update now also clears the row's
+/// `catalog_slug` (talos-module-repository), so a detached row is never a
+/// candidate again.
 ///
 /// Returns the number of rows updated.
 pub async fn refresh_catalog_wasm_by_slug(
@@ -390,21 +402,30 @@ pub async fn refresh_catalog_wasm_by_slug(
     wasm_bytes: &[u8],
     content_hash: &str,
 ) -> Result<u64> {
-    let res = sqlx::query(
-        // Compile outputs only; see store_precompiled_template.
-        "UPDATE modules SET \
-             wasm_bytes = $2, content_hash = $3, size_bytes = $4, \
-             compiled_at = NOW() \
-         WHERE catalog_slug = $1 AND kind = 'catalog'",
-    )
-    .bind(catalog_slug)
-    .bind(wasm_bytes)
-    .bind(content_hash)
-    .bind(wasm_bytes.len() as i32)
-    .execute(pool)
-    .await?;
+    let res = sqlx::query(REFRESH_CATALOG_WASM_BY_SLUG_SQL)
+        .bind(catalog_slug)
+        .bind(wasm_bytes)
+        .bind(content_hash)
+        .bind(wasm_bytes.len() as i32)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected())
 }
+
+/// The statement behind [`refresh_catalog_wasm_by_slug`], hoisted so its
+/// compare-and-set predicate is pinned without a database. The subquery reads
+/// the shared rows' PRE-update hashes (one statement, one snapshot).
+pub const REFRESH_CATALOG_WASM_BY_SLUG_SQL: &str =
+    // Compile outputs only; see store_precompiled_template.
+    "UPDATE modules m SET \
+         wasm_bytes = $2, content_hash = $3, size_bytes = $4, \
+         compiled_at = NOW() \
+     WHERE m.catalog_slug = $1 AND m.kind = 'catalog' \
+       AND (m.user_id IS NULL \
+            OR EXISTS (SELECT 1 FROM modules c \
+                        WHERE c.catalog_slug = $1 AND c.kind = 'catalog' \
+                          AND c.user_id IS NULL \
+                          AND c.content_hash IS NOT DISTINCT FROM m.content_hash))";
 
 /// Read-only reconciler: identify duplicate catalog-module twins and log a
 /// WARN naming each dupe set plus the workflows referencing a stale twin.
@@ -567,6 +588,22 @@ mod allowed_methods_manifest_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The compare-and-set predicate: a per-user row is refreshed only when it
+    /// still carries the shared build's hash. Dropping the EXISTS arm restores
+    /// the defect (a hot-updated install ran catalog bytes under user source).
+    #[test]
+    fn refresh_only_touches_pristine_rows() {
+        let sql = REFRESH_CATALOG_WASM_BY_SLUG_SQL;
+        assert!(sql.contains("m.user_id IS NULL"));
+        assert!(sql.contains("c.content_hash IS NOT DISTINCT FROM m.content_hash"));
+        assert!(sql.contains("c.user_id IS NULL"));
+        // The shared-row hash must be read in the SAME statement (pre-update
+        // snapshot), not bound from a caller that already overwrote it.
+        assert!(!sql.contains("$5"));
+        let where_at = sql.find("WHERE m.catalog_slug").unwrap();
+        assert!(sql[where_at..].contains(" AND (m.user_id IS NULL"));
+    }
 
     fn row(
         id: u128,

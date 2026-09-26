@@ -1,12 +1,13 @@
 import React, { Suspense, lazy } from "react";
 import {
-  BrowserRouter,
+  createBrowserRouter,
   Routes,
   Route,
   NavLink,
   Navigate,
   useLocation,
 } from "react-router";
+import { RouterProvider } from "react-router/dom";
 import { TooltipProvider } from "@radix-ui/react-tooltip";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
@@ -399,12 +400,22 @@ function AppContent() {
   return <AuthenticatedApp />;
 }
 
+// A data router (one splat route; the app's own <Routes> stay descendant
+// routes) so pages can use `useBlocker` — the editor's unsaved-changes guard.
+function createAppRouter() {
+  return createBrowserRouter([
+    {
+      path: "*",
+      element: (
+        <AuthProvider>
+          <AppContent />
+        </AuthProvider>
+      ),
+    },
+  ]);
+}
+
 export default function App() {
-  return (
-    <BrowserRouter>
-      <AuthProvider>
-        <AppContent />
-      </AuthProvider>
-    </BrowserRouter>
-  );
+  const [router] = React.useState(createAppRouter);
+  return <RouterProvider router={router} />;
 }

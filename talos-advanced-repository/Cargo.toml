@@ -8,6 +8,9 @@ publish.workspace = true
 
 [dependencies]
 talos-admin-event-log = { path = "../talos-admin-event-log" }
+# `InheritedGrants`: the ONE value a module install carries its grants in
+# (package EK) — the marketplace install is a fifth writer of that shape.
+talos-registry = { path = "../talos-registry" }
 talos-execution-finalizer = { path = "../talos-execution-finalizer" }
 talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
 # The ONE home for sibling cancellation (`cancel_running_module_executions`);

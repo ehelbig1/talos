@@ -882,7 +882,10 @@ pub(crate) async fn run_sse_reader<S>(
 /// are read, and accumulated `data:` over `max_event_bytes` aborts at the line
 /// that crosses it, after delivering the events completed before it.
 pub(crate) struct SseParser {
-    buffer: String,
+    /// Raw BYTES, decoded one complete line at a time: decoding each network
+    /// chunk on its own turned a multi-byte UTF-8 character split across two
+    /// chunks into two U+FFFD replacement characters.
+    buffer: Vec<u8>,
     event_type: Option<String>,
     data_lines: Vec<String>,
     data_bytes: usize,
@@ -893,7 +896,7 @@ pub(crate) struct SseParser {
 impl SseParser {
     pub(crate) fn new(max_event_bytes: usize) -> Self {
         Self {
-            buffer: String::new(),
+            buffer: Vec::new(),
             event_type: None,
             data_lines: Vec::new(),
             data_bytes: 0,
@@ -916,16 +919,21 @@ impl SseParser {
         // accumulated data. A misbehaving server that never emits a blank
         // line would otherwise grow `data_lines` monotonically until the
         // worker OOMs, and one huge line with no `\n` would grow `buffer`.
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
         if self.buffer.len() > self.max_event_bytes {
             return (events, Some(SseStreamEnd::EventBytesCap));
         }
         let mut consumed = 0usize;
         let mut abort = None;
-        while let Some(rel) = self.buffer[consumed..].find('\n') {
+        while let Some(rel) = self.buffer[consumed..].iter().position(|&b| b == b'\n') {
             let nl_pos = consumed + rel;
-            let line = self.buffer[consumed..nl_pos].trim_end_matches('\r');
+            let mut raw = &self.buffer[consumed..nl_pos];
+            while let [rest @ .., b'\r'] = raw {
+                raw = rest;
+            }
+            let decoded = String::from_utf8_lossy(raw);
+            let line: &str = &decoded;
             consumed = nl_pos + 1;
             if line.is_empty() {
                 // Blank line = event boundary
@@ -1093,6 +1101,21 @@ mod sse_reader_bound_tests {
             .expect("a 4 MiB chunk of short lines must parse in one pass, not quadratically");
         assert_eq!((events, aborted), (0, false));
         assert!(elapsed < Duration::from_secs(10), "({elapsed:?})");
+    }
+
+    /// A multi-byte character split across two network chunks decodes
+    /// intact: the parser buffers bytes and decodes a line only once complete.
+    #[test]
+    fn a_multibyte_character_split_across_chunks_decodes_intact() {
+        let bytes = "data: caf\u{e9} \u{2014} ok\n\n".as_bytes();
+        let split = bytes.iter().position(|&b| b == 0xE2).unwrap() + 1;
+        let mut p = SseParser::new(1024);
+        let (first, _) = p.feed(&bytes[..split]);
+        assert!(first.is_empty());
+        let (events, abort) = p.feed(&bytes[split..]);
+        assert!(abort.is_none());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "caf\u{e9} \u{2014} ok");
     }
 
     /// The bounded-MEMORY assertion: a server streaming 1 MiB events to a

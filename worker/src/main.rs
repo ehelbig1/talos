@@ -23,7 +23,7 @@ use worker::error_sanitize::sanitize_error_message;
 use worker::job_span::JobSpan;
 use worker::module_fetcher::{
     self, enforce_production_sigstore_policy_explicit, parse_cosign_version, parse_semver_triple,
-    resolve_and_hash_cosign_binary, validate_sigstore_identity_regexp, FetchedModule,
+    resolve_and_hash_cosign_binary, validate_sigstore_identity_regexp_for_policy, FetchedModule,
     SigstorePolicy,
 };
 use worker::runtime::{PipelineStepSpec, RetryPolicy, SecurityPolicy};
@@ -33,6 +33,7 @@ use worker::{circuit_breaker, metrics, metrics_server, sql_validator};
 
 use worker::runtime::TalosRuntime;
 
+mod rejected_jobs;
 #[cfg(test)]
 mod retry_policy_pin;
 
@@ -1863,7 +1864,7 @@ async fn execute_pipeline_job(
     // returns the per-step secrets vector (aligned index-for-index with
     // `req.steps`). Fail-closed on any claim / verify / open / shape error — a
     // pipeline whose secrets can't be obtained must not run secretless.
-    let claimed_secrets: Option<Vec<std::collections::HashMap<String, String>>> = if req.sealing
+    let mut claimed_secrets: Option<secret_claim::ZeroizingSecretMaps> = if req.sealing
         == talos_workflow_job_protocol::SEALING_CLAIM_ECIES
     {
         let Some(signing_key) = worker_result_signing_key() else {
@@ -1886,9 +1887,10 @@ async fn execute_pipeline_job(
         .await
         {
             Ok(raw) => {
-                match serde_json::from_slice::<Vec<std::collections::HashMap<String, String>>>(&raw)
-                {
-                    Ok(v) => Some(v),
+                match serde_json::from_slice::<Vec<std::collections::HashMap<String, String>>>(
+                    raw.as_slice(),
+                ) {
+                    Ok(v) => Some(secret_claim::ZeroizingSecretMaps::new(v)),
                     Err(e) => {
                         ::tracing::error!(target: "talos_security", job_id = %req.job_id, error = %e, "malformed pipeline claim payload");
                         _span.end_error("malformed pipeline claim payload");
@@ -1912,8 +1914,9 @@ async fn execute_pipeline_job(
     // this pipeline (matches the encryption-side binding).
     let mut step_specs: Vec<PipelineStepSpec> = Vec::with_capacity(req.steps.len());
     for (i, step) in req.steps.iter().enumerate() {
-        let secrets = if let Some(ref per_step) = claimed_secrets {
-            per_step.get(i).cloned().unwrap_or_default()
+        let secrets = if let Some(ref mut per_step) = claimed_secrets {
+            // Moved out, not cloned: no second plaintext copy per step.
+            per_step.take(i)
         } else if step.encrypted_secrets.is_empty() {
             std::collections::HashMap::new()
         } else {
@@ -2322,11 +2325,24 @@ async fn main() -> anyhow::Result<()> {
         let sigstore_policy_at_startup = SigstorePolicy::from_env();
         if sigstore_policy_at_startup != SigstorePolicy::Disabled {
             let regexp = std::env::var("TALOS_SIGSTORE_IDENTITY_REGEXP").unwrap_or_default();
-            match validate_sigstore_identity_regexp(&regexp) {
-                Ok(()) => {
+            // The policy-aware validator also refuses, under Required, a
+            // workflow pin that does not pin the git ref (`…\.yml@` alone
+            // admits a signature from any branch); Audit gets the warning.
+            match validate_sigstore_identity_regexp_for_policy(&regexp, sigstore_policy_at_startup)
+            {
+                Ok(None) => {
                     ::tracing::info!(
                         policy = ?sigstore_policy_at_startup,
                         "Sigstore identity regexp validated at startup"
+                    );
+                }
+                Ok(Some(warning)) => {
+                    ::tracing::warn!(
+                        policy = ?sigstore_policy_at_startup,
+                        rejection = ?warning,
+                        reason = %warning.human_reason(),
+                        "TALOS_SIGSTORE_IDENTITY_REGEXP accepted with a warning — \
+                         would fail closed under Required"
                     );
                 }
                 Err(rejection) => match sigstore_policy_at_startup {
@@ -2533,6 +2549,7 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = talos_task_supervision::register_metrics(prometheus::default_registry(), &[]) {
         eprintln!("Warning: failed to register panic metrics: {e}");
     }
+    rejected_jobs::seed();
 
     // MCP-580: spawn the circuit-breaker periodic cleanup task so the
     // per-host `records` DashMap doesn't grow monotonically with
@@ -2928,17 +2945,24 @@ async fn main() -> anyhow::Result<()> {
                             // SECURITY: cap payload size before deserialization to prevent
                             // memory exhaustion from oversized NATS messages.
                             const MAX_JOB_PAYLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MB
+                            // Dropped WITHOUT a reply — see `rejected_jobs` for why
+                            // no fail-fast result can be sent safely.
                             if msg.payload.len() > MAX_JOB_PAYLOAD_BYTES {
-                                ::tracing::error!(
-                                    payload_bytes = msg.payload.len(),
-                                    "SECURITY: rejecting oversized job payload"
+                                rejected_jobs::record(
+                                    rejected_jobs::JobKind::Single,
+                                    rejected_jobs::RejectReason::Oversized,
+                                    msg.payload.len(),
                                 );
                                 continue;
                             }
                             let req: JobRequest = match serde_json::from_slice(&msg.payload) {
                                 Ok(r) => r,
-                                Err(e) => {
-                                    ::tracing::error!(error = %e, "Failed to decode job request");
+                                Err(_) => {
+                                    rejected_jobs::record(
+                                        rejected_jobs::JobKind::Single,
+                                        rejected_jobs::RejectReason::Undecodable,
+                                        msg.payload.len(),
+                                    );
                                     continue;
                                 }
                             };
@@ -3199,16 +3223,21 @@ async fn main() -> anyhow::Result<()> {
                             // SECURITY: cap payload size before deserialization.
                             const MAX_PIPELINE_PAYLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MB
                             if msg.payload.len() > MAX_PIPELINE_PAYLOAD_BYTES {
-                                ::tracing::error!(
-                                    payload_bytes = msg.payload.len(),
-                                    "SECURITY: rejecting oversized pipeline job payload"
+                                rejected_jobs::record(
+                                    rejected_jobs::JobKind::Pipeline,
+                                    rejected_jobs::RejectReason::Oversized,
+                                    msg.payload.len(),
                                 );
                                 continue;
                             }
                             let req: PipelineJobRequest = match serde_json::from_slice(&msg.payload) {
                                 Ok(r) => r,
-                                Err(e) => {
-                                    ::tracing::error!(error = %e, "Failed to decode pipeline job request");
+                                Err(_) => {
+                                    rejected_jobs::record(
+                                        rejected_jobs::JobKind::Pipeline,
+                                        rejected_jobs::RejectReason::Undecodable,
+                                        msg.payload.len(),
+                                    );
                                     continue;
                                 }
                             };

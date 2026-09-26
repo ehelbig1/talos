@@ -62,80 +62,67 @@ pub async fn promote_first_user_if_needed(
         return Ok(false);
     }
 
-    // L-14: optional operator pin. When `BOOTSTRAP_FIRST_USER_EMAIL` is
-    // set, only that email is allowed to win the bootstrap promotion —
-    // closing the "fresh public deployment + attacker-registers-first"
-    // race. Operators of single-tenant deploys typically own the email,
-    // so this pin is the safest default for any deployment exposed to
-    // the public internet before the operator's own signup completes.
+    // L-14: optional operator pin (`BOOTSTRAP_FIRST_USER_EMAIL`). Unset =
+    // legacy "first user wins" (non-public deploys, e.g. compose stacks where
+    // nobody can beat the operator to signup).
     //
-    // Unset = legacy "first user wins" behavior (intentionally preserved
-    // for non-public deploys; e.g., compose stacks where no one can
-    // beat the operator to /auth/register).
-    // MCP-1154 (2026-05-16): validate the operator pin against the
-    // canonical `validate_email_format` (MCP-1153 helper). Pre-fix
-    // a misconfigured `BOOTSTRAP_FIRST_USER_EMAIL` (typo, missing
-    // `@`, accidental quoting like "\"op@example.com\"") silently
-    // produced a value that no signup could match — the `WHERE
-    // LOWER(email) = $1` SQL never matched, so the bootstrap stayed
-    // dormant indefinitely. The operator's intent ("pin to this
-    // email") silently fell back to legacy "first user wins"
-    // behaviour, exposing the public-deploy race the pin was added
-    // (L-14) to close.
-    //
-    // Fix shape: validate at module entry. On failure emit a
-    // structured ERROR and treat the env var as unset — the legacy
-    // path is the safer fallback (a NEVER-MATCHING pin opens the
-    // exact race operators set this var to close). Operator gets a
-    // loud log line so misconfig is observable at first
-    // `promote_first_user_if_needed` call.
-    let pinned_email = std::env::var("BOOTSTRAP_FIRST_USER_EMAIL")
-        .ok()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .and_then(|email| match crate::validate_email_format(&email) {
-            Ok(()) => Some(email),
-            Err(reason) => {
-                tracing::error!(
-                    target: "talos_auth",
-                    event_kind = "bootstrap_pinned_email_invalid_format",
-                    reason,
-                    "BOOTSTRAP_FIRST_USER_EMAIL set but does not parse as a valid email; \
-                     ignoring the operator pin and falling back to the legacy first-user-wins \
-                     path. Fix the env var (or unset it) to re-enable the L-14 pinned-email \
-                     race-close behaviour."
-                );
-                None
-            }
-        });
+    // 2026-09-26: an INVALID pin refuses the promotion outright. It used to
+    // fall back to first-user-wins — i.e. a typo in the one variable set to
+    // close the public-deploy race reopened exactly that race. And a VALID pin
+    // is honoured only for an account that PROVES it owns the address: password
+    // signup verifies no email, so whoever registered the pinned address first
+    // (the attacker the pin exists to stop) used to win it. Ownership is proven
+    // by an OAuth sign-in whose provider reported that address verified
+    // (`talos-oauth` refuses unverified emails); an operator who signs up with
+    // a password grants the ceiling by hand instead (`grantCapabilityCeiling`
+    // as platform admin).
+    let pin = resolve_bootstrap_pin(std::env::var("BOOTSTRAP_FIRST_USER_EMAIL").ok().as_deref());
 
     // Resolve candidate: pinned email > caller-provided user > earliest-created.
-    let user_id: Option<Uuid> = if let Some(ref email) = pinned_email {
-        let pinned: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1")
-                .bind(email)
-                .fetch_optional(pool)
-                .await?;
-        if pinned.is_none() {
-            tracing::info!(
+    let user_id: Option<Uuid> = match pin {
+        BootstrapPin::Invalid(reason) => {
+            tracing::error!(
                 target: "talos_auth",
-                event_kind = "bootstrap_pinned_email_not_yet_registered",
-                pinned_email = %email,
-                "Bootstrap: pinned operator email not yet registered — \
-                 leaving automation-node ceiling unbound until they sign up"
+                event_kind = "bootstrap_pinned_email_invalid_format",
+                reason,
+                "BOOTSTRAP_FIRST_USER_EMAIL is set but is not a valid email; the \
+                 first-user promotion is REFUSED until it is fixed or unset (it no \
+                 longer falls back to first-user-wins)."
             );
             return Ok(false);
         }
-        pinned
-    } else {
-        match candidate_user_id {
+        BootstrapPin::Email(ref email) => {
+            let proven: Option<Uuid> = sqlx::query_scalar(
+                "SELECT u.id FROM users u \
+                 JOIN oauth_accounts oa ON oa.user_id = u.id \
+                 WHERE LOWER(u.email) = $1 AND LOWER(oa.email) = $1 AND u.is_active = true \
+                 ORDER BY u.created_at ASC LIMIT 1",
+            )
+            .bind(email)
+            .fetch_optional(pool)
+            .await?;
+            if proven.is_none() {
+                tracing::warn!(
+                    target: "talos_auth",
+                    event_kind = "bootstrap_pinned_email_unproven",
+                    "Bootstrap: no account has proven ownership of the pinned \
+                     BOOTSTRAP_FIRST_USER_EMAIL (an OAuth sign-in with that verified \
+                     address). A password signup does not qualify — grant the \
+                     automation-node ceiling by hand (grantCapabilityCeiling as platform \
+                     admin) or sign in once via OAuth and restart the controller."
+                );
+                return Ok(false);
+            }
+            proven
+        }
+        BootstrapPin::Unset => match candidate_user_id {
             Some(u) => Some(u),
             None => {
                 sqlx::query_scalar("SELECT id FROM users ORDER BY created_at ASC LIMIT 1")
                     .fetch_optional(pool)
                     .await?
             }
-        }
+        },
     };
     let Some(user_id) = user_id else {
         // No users in the DB yet — nothing to promote. Retry on next signup.
@@ -211,4 +198,57 @@ pub async fn promote_first_user_if_needed(
          stdio endpoint which auto-assigns '*'."
     );
     Ok(true)
+}
+
+/// The operator's `BOOTSTRAP_FIRST_USER_EMAIL`, classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapPin {
+    /// Unset or empty: legacy first-user-wins.
+    Unset,
+    /// A valid address, trimmed and lowercased.
+    Email(String),
+    /// Set but unparsable: the promotion is refused (never first-user-wins).
+    Invalid(&'static str),
+}
+
+/// Classify the raw pin value. Pure so the refusal is unit-tested.
+#[must_use]
+pub fn resolve_bootstrap_pin(raw: Option<&str>) -> BootstrapPin {
+    let Some(email) = raw
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+    else {
+        return BootstrapPin::Unset;
+    };
+    match crate::validate_email_format(&email) {
+        Ok(()) => BootstrapPin::Email(email),
+        Err(reason) => BootstrapPin::Invalid(reason),
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn an_invalid_pin_refuses_rather_than_falling_back() {
+        assert!(matches!(
+            resolve_bootstrap_pin(Some("\"op@example.com\"")),
+            BootstrapPin::Invalid(_)
+        ));
+        assert!(matches!(
+            resolve_bootstrap_pin(Some("no-at-sign")),
+            BootstrapPin::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn unset_and_valid_pins_classify() {
+        assert_eq!(resolve_bootstrap_pin(None), BootstrapPin::Unset);
+        assert_eq!(resolve_bootstrap_pin(Some("  ")), BootstrapPin::Unset);
+        assert_eq!(
+            resolve_bootstrap_pin(Some(" Op@Example.com ")),
+            BootstrapPin::Email("op@example.com".into())
+        );
+    }
 }

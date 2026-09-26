@@ -51,7 +51,9 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use talos_integration_helpers::audit::{insert_channel_audit, ChannelAuditEvent};
-use talos_integration_helpers::state_store::{ChannelStore, CreateLockMap};
+use talos_integration_helpers::state_store::{
+    ChannelStore, CreateLockMap, RowUpdate, UpdateOutcome,
+};
 use talos_integration_helpers::watch_binding::{check_module_binding, ModuleBindingRefusal};
 use talos_memory::integration_state_rpc::{IndexedSlots, ListFilter, StoredEntry};
 use uuid::Uuid;
@@ -408,6 +410,7 @@ impl GcpWatchService {
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
             "SELECT user_id, key FROM integration_state \
              WHERE integration_name = 'google_cloud' AND idx_str_1 = $1 \
+             ORDER BY user_id, key \
              LIMIT 2",
         )
         .bind(&token_hash)
@@ -457,24 +460,39 @@ impl GcpWatchService {
     /// (or unset), so a burst of pushes doesn't hammer integration_state
     /// for a liveness field.
     pub async fn record_push_received(&self, user_id: Uuid, channel_uuid: Uuid) -> Result<()> {
-        let mut row = self.require_by_id(user_id, channel_uuid).await?;
+        // Row-locked read-modify-write of the EXISTING row: never re-creates a
+        // watch a concurrent stop deleted, never reverts a concurrent rewrite.
         let now_ms = Utc::now().timestamp_millis();
-        let should_write = match row.last_push_received_ms {
-            Some(prev) => now_ms.saturating_sub(prev) >= PUSH_RECEIVED_THROTTLE_MS,
-            None => true,
-        };
-        if should_write {
-            row.last_push_received_ms = Some(now_ms);
-            row.updated_at_ms = now_ms;
-            self.upsert_row(user_id, &row).await?;
+        let outcome = self
+            .store()
+            .update_existing(user_id, channel_uuid, |entry| {
+                let row = decode_row(entry)?;
+                match push_stamped_row(row, now_ms) {
+                    Some(row) => {
+                        let (value, ttl_seconds, slots) = row_write(&row)?;
+                        Ok(RowUpdate::Replace {
+                            value,
+                            ttl_seconds,
+                            slots,
+                        })
+                    }
+                    None => Ok(RowUpdate::Unchanged),
+                }
+            })
+            .await?;
+        if outcome == UpdateOutcome::Absent {
+            return Err(anyhow!(
+                "google_cloud watch {} not found for user {}",
+                channel_uuid,
+                user_id
+            ));
         }
         Ok(())
     }
 
     /// Load one watch row by internal uuid (ownership via the
     /// user-scoped store). **Three-way** — `Ok(None)` is "no such
-    /// watch", `Err` is "we could not look". Callers that cannot act
-    /// on the distinction take [`Self::require_by_id`].
+    /// watch", `Err` is "we could not look".
     pub(crate) async fn find_by_id(
         &self,
         user_id: Uuid,
@@ -484,24 +502,6 @@ impl GcpWatchService {
             Some(entry) => decode_row(&entry).map(Some),
             None => Ok(None),
         }
-    }
-
-    /// [`Self::find_by_id`] for callers to which an absent row is just
-    /// another failure. The message is the pre-split one, verbatim.
-    pub(crate) async fn require_by_id(
-        &self,
-        user_id: Uuid,
-        channel_uuid: Uuid,
-    ) -> Result<GcpWatchRow> {
-        self.find_by_id(user_id, channel_uuid)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "google_cloud watch {} not found for user {}",
-                    channel_uuid,
-                    user_id
-                )
-            })
     }
 
     /// List every google_cloud watch row this user owns.
@@ -514,24 +514,41 @@ impl GcpWatchService {
     // ------------------------------------------------------------------
 
     async fn upsert_row(&self, user_id: Uuid, row: &GcpWatchRow) -> Result<()> {
-        let value = serde_json::to_value(row).context("encode google_cloud watch row")?;
+        let (value, ttl_seconds, slots) = row_write(row)?;
         self.store()
-            .set(
-                user_id,
-                row.id,
-                value,
-                // No TTL: the user owns the upstream subscription, so
-                // there is nothing on our side to expire or renew.
-                None,
-                IndexedSlots {
-                    idx_str_1: Some(talos_text_util::sha256_hex(&row.push_token)),
-                    idx_str_2: Some(row.expected_sa_email.clone()),
-                    idx_ts_1_ms: row.last_push_received_ms,
-                    idx_int_1: None,
-                },
-            )
+            .set(user_id, row.id, value, ttl_seconds, slots)
             .await
     }
+}
+
+/// The stored form of a watch row. No TTL: the user owns the upstream
+/// subscription, so there is nothing on our side to expire or renew.
+fn row_write(row: &GcpWatchRow) -> Result<(serde_json::Value, Option<u64>, IndexedSlots)> {
+    Ok((
+        serde_json::to_value(row).context("encode google_cloud watch row")?,
+        None,
+        IndexedSlots {
+            idx_str_1: Some(talos_text_util::sha256_hex(&row.push_token)),
+            idx_str_2: Some(row.expected_sa_email.clone()),
+            idx_ts_1_ms: row.last_push_received_ms,
+            idx_int_1: None,
+        },
+    ))
+}
+
+/// The row with the push stamped, or `None` when the previous stamp is
+/// younger than [`PUSH_RECEIVED_THROTTLE_MS`] (a burst of pushes must not
+/// hammer integration_state for a liveness field).
+fn push_stamped_row(mut row: GcpWatchRow, now_ms: i64) -> Option<GcpWatchRow> {
+    let due = match row.last_push_received_ms {
+        Some(prev) => now_ms.saturating_sub(prev) >= PUSH_RECEIVED_THROTTLE_MS,
+        None => true,
+    };
+    due.then(|| {
+        row.last_push_received_ms = Some(now_ms);
+        row.updated_at_ms = now_ms;
+        row
+    })
 }
 
 /// List every google_cloud watch row a user owns, from a bare pool.
@@ -661,5 +678,39 @@ mod tests {
         assert!(!is_valid_sa_email(
             "evil@my-proj.iam.gserviceaccount.com.attacker.com"
         ));
+    }
+
+    #[test]
+    fn push_stamp_is_throttled_and_keeps_the_current_row() {
+        let row = GcpWatchRow {
+            id: Uuid::nil(),
+            integration_id: Uuid::nil(),
+            display_name: "d".into(),
+            expected_sa_email: "sa@p.iam.gserviceaccount.com".into(),
+            push_token: "t".into(),
+            module_id: Some(Uuid::from_u128(9)),
+            last_push_received_ms: Some(1_000),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        assert!(push_stamped_row(row.clone(), 1_000 + PUSH_RECEIVED_THROTTLE_MS - 1).is_none());
+        let now = 1_000 + PUSH_RECEIVED_THROTTLE_MS;
+        let stamped = push_stamped_row(row.clone(), now).expect("due");
+        assert_eq!(stamped.last_push_received_ms, Some(now));
+        assert_eq!(stamped.module_id, row.module_id);
+        let fresh = GcpWatchRow {
+            last_push_received_ms: None,
+            ..row
+        };
+        assert!(push_stamped_row(fresh, 5).is_some());
+    }
+
+    #[test]
+    fn push_stamp_goes_through_the_row_locked_update() {
+        let src = include_str!("watch.rs");
+        let body = &src[src.find("pub async fn record_push_received").unwrap()..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        assert!(body.contains("update_existing("));
+        assert!(!body.contains("upsert_row") && !body.contains("require_by_id"));
     }
 }

@@ -12,7 +12,7 @@
 //! This module provides the resolver ([`GithubTokenResolver`]) and the
 //! path-scheme parser ([`parse_github_app_secret_path`]). **B4-wiring** — calling
 //! the resolver from the controller's per-module secret prefetch
-//! (`build_encrypted_secrets`) and injecting the token under the module's
+//! (`secrets_pipeline::build_encrypted_secrets_for`) and injecting the token under the module's
 //! token-secret key — is the remaining step (it touches the security-critical
 //! secret-prefetch path and is best validated against a live workflow run).
 

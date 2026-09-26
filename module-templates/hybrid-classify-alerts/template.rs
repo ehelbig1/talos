@@ -143,6 +143,40 @@ fn provider_from(s: &str) -> talos::core::llm::Provider {
     }
 }
 
+/// Rewrite every `</agent_memory` / `</untrusted_data` prefix so text placed
+/// inside a spotlighting wrapper cannot close it. A deliberate COPY of
+/// `talos_memory::spotlight::neutralize_closing_tags` (a catalog template
+/// cannot import workspace crates); `talos-memory`'s tests pin every copy
+/// byte-identical to the llm-inference one.
+// BEGIN neutralize_closing_tags (pinned by talos-memory::spotlight tests)
+fn neutralize_closing_tags(input: &str) -> String {
+    const TAGS: [&str; 2] = ["agent_memory", "untrusted_data"];
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len() + 8);
+    let mut last = 0;
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'/' {
+            let after = &bytes[i + 2..];
+            if let Some(tag) = TAGS.iter().find(|t| {
+                let t = t.as_bytes();
+                after.len() >= t.len() && after[..t.len()].eq_ignore_ascii_case(t)
+            }) {
+                out.push_str(&input[last..i]);
+                out.push_str("<\\/");
+                out.push_str(tag);
+                i += 2 + tag.len();
+                last = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&input[last..]);
+    out
+}
+// END neutralize_closing_tags
+
 /// LLM classify one alert's feature text into exactly one severity label.
 /// Mirrors `smart-classifier::llm_classify`: single-label JSON contract,
 /// `<untrusted_data>` spotlighting of the (external, attacker-influenced)
@@ -179,11 +213,15 @@ fn llm_classify(
         );
         for (ex_text, ex_label) in few_shot {
             sys.push_str(&format!(
-                "\n<example label=\"{ex_label}\"><untrusted_data>{ex_text}</untrusted_data></example>"
+                "\n<example label=\"{ex_label}\"><untrusted_data>{}</untrusted_data></example>",
+                neutralize_closing_tags(ex_text)
             ));
         }
     }
-    let user_content = format!("<untrusted_data>\n{text}\n</untrusted_data>");
+    let user_content = format!(
+        "<untrusted_data>\n{}\n</untrusted_data>",
+        neutralize_closing_tags(text)
+    );
     let req = talos::core::llm::CompletionRequest {
         provider: Some(provider),
         model: Some(llm_model.to_string()),

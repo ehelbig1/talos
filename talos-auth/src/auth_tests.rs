@@ -904,3 +904,62 @@ fn the_reuse_verdicts_are_a_closed_distinct_set() {
         .collect();
     assert_eq!(arm, vec!["armed", "failed"]);
 }
+
+// ── Race pins (2026-09-26). TEXTUAL: the decisions live in SQL and in the
+// statement ORDER of two async bodies, which need a database to drive. The
+// concurrency itself is exercised by the controller DB suite.
+
+fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+    let start = src.find(signature).expect("function present");
+    let rest = &src[start..];
+    let end = rest.find("\n    }\n").expect("function end");
+    &rest[..end]
+}
+
+const LIB_SRC: &str = include_str!("lib.rs");
+
+#[test]
+fn the_claim_refuses_a_locked_row_and_locks_on_the_limit_slot() {
+    let sql = CLAIM_PASSWORD_ATTEMPT_SQL;
+    assert!(sql.contains("AND (locked_until IS NULL OR locked_until <= NOW())"));
+    assert!(sql.contains("WHEN failed_login_attempts + 1 >= $1 THEN"));
+    assert!(sql.contains("RETURNING failed_login_attempts"));
+}
+
+#[test]
+fn login_and_password_change_claim_a_slot_before_the_verify() {
+    for sig in [
+        "async fn login_classified(",
+        "async fn change_password_inner(",
+    ] {
+        let body = fn_body(LIB_SRC, sig);
+        let claim = body.find("claim_password_attempt(").expect("claims a slot");
+        let verify = body.find("password_matches(").expect("verifies");
+        assert!(
+            claim < verify,
+            "{sig}: the slot must be claimed before bcrypt"
+        );
+    }
+    assert!(
+        !LIB_SRC.contains(&["record_wrong", "_password("].concat()),
+        "counting AFTER the verify let concurrent guesses bypass the lockout"
+    );
+}
+
+#[test]
+fn a_refresh_consumes_the_old_session_before_it_stores_the_new_one() {
+    let body = fn_body(LIB_SRC, "pub async fn refresh_access_token(");
+    let consume = body
+        .find("DELETE FROM user_sessions WHERE id = $1 AND expires_at > NOW() RETURNING id")
+        .expect("atomic consume");
+    let store = body
+        .find("store_refresh_token(&mut *tx")
+        .expect("new session stored in the rotation transaction");
+    let commit = body.find("tx.commit()").expect("commit");
+    let mint = body.find("generate_access_token(").expect("access token");
+    assert!(consume < store && store < commit && commit < mint);
+    assert!(
+        body.contains("if consumed.is_none()") && body.contains("self.detect_token_reuse("),
+        "a lost consume must go to the reuse detector, not mint a session"
+    );
+}

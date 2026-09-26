@@ -32,7 +32,7 @@ IMAGE="$1"
 # Bind verification to OUR repo + OUR release workflow + a tag push.
 # Anything else is rejected — even a workflow run on the same repo from
 # a malicious branch would fail this check.
-EXPECTED_IDENTITY_REGEXP='^https://github.com/ehelbig1/talos/\.github/workflows/release\.yml@refs/tags/v.*'
+EXPECTED_IDENTITY_REGEXP='^https://github\.com/ehelbig1/talos/\.github/workflows/release\.yml@refs/tags/v[^/]+$'
 EXPECTED_OIDC_ISSUER='https://token.actions.githubusercontent.com'
 
 # SLSA generator runs from its own reusable workflow, signed by its own

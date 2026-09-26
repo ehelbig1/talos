@@ -1596,7 +1596,7 @@ pub async fn process_webhook_events(
         // PLUS the host-reserved LLM provider keys. Without this, modules
         // using talos::core::llm::* fail with NotConfigured and vault://
         // header substitution returns NotFound. Mirrors the canonical
-        // pattern in talos-webhooks and the engine's build_encrypted_secrets.
+        // pattern in talos-webhooks and the engine's secrets_pipeline::build_encrypted_secrets_for.
         //
         // RFC 0010 P3 (M4): under claim-based sealing register the plaintext
         // for a worker claim (`sealing = SEALING_CLAIM_ECIES`); otherwise the

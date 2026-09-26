@@ -2770,7 +2770,7 @@ impl ExecutionRepository {
         // alive-but-slow, the epoch it holds (the pre-claim value) no longer
         // matches the row, so its fence heartbeat sees the mismatch and aborts.
         // The bumped value is returned so the resumer can heartbeat against it.
-        let row = sqlx::query_as::<_, StuckExecutionForResume>(
+        let row = sqlx::query_as::<_, StuckExecutionForResume>(&format!(
             "WITH claimed AS ( \
                  SELECT id FROM workflow_executions \
                  WHERE status = 'running' \
@@ -2786,9 +2786,8 @@ impl ExecutionRepository {
              RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, e.epoch, \
                        (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
                            AS workflow_default_actor_id, \
-                       (SELECT w.graph_json FROM workflows w WHERE w.id = e.workflow_id) \
-                           AS graph_json",
-        )
+                       {RESUME_GRAPH_SQL} AS graph_json",
+        ))
         .bind(stale_after_minutes)
         .fetch_optional(&self.db_pool)
         .await?;
@@ -2829,7 +2828,7 @@ impl ExecutionRepository {
         // scoping (the MCP submit_workflow_approval path). The resumed run
         // itself executes as the EXECUTION's owner (RETURNING e.user_id) —
         // the org editor authorizes the resume, they don't impersonate it.
-        let row = sqlx::query_as::<_, StuckExecutionForResume>(
+        let row = sqlx::query_as::<_, StuckExecutionForResume>(&format!(
             "UPDATE workflow_executions e \
              SET status = 'resuming', updated_at = NOW(), epoch = e.epoch + 1 \
              WHERE e.id = $1 \
@@ -2840,9 +2839,8 @@ impl ExecutionRepository {
              RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, e.epoch, \
                        (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
                            AS workflow_default_actor_id, \
-                       (SELECT w.graph_json FROM workflows w WHERE w.id = e.workflow_id) \
-                           AS graph_json",
-        )
+                       {RESUME_GRAPH_SQL} AS graph_json",
+        ))
         .bind(execution_id)
         .bind(user_id)
         .bind(writable_org_ids)
@@ -2851,26 +2849,28 @@ impl ExecutionRepository {
         Ok(row)
     }
 
-    /// Org-aware sibling of `get_workflow_graph_for_user` for the resume
-    /// authorization gate: org-owned workflows are readable by members whose
-    /// org ids are in `writable_org_ids`. Kept separate so the user-scoped
-    /// callers (retry / replay / failure-analysis) keep their strict predicate.
-    pub async fn get_workflow_graph_for_user_or_orgs(
+    /// The graph a resume of `execution_id` will RUN (see
+    /// [`RESUME_GRAPH_SQL`]), for the resume authorization gate — the gate
+    /// must judge the definition the claim returns, not the current draft.
+    /// Org-aware: a member whose org ids are in `writable_org_ids` may read an
+    /// org-owned execution's graph.
+    pub async fn get_resume_graph_for_user_or_orgs(
         &self,
-        wf_id: Uuid,
+        execution_id: Uuid,
         user_id: Uuid,
         writable_org_ids: &[Uuid],
     ) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT graph_json FROM workflows \
-             WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))",
-        )
-        .bind(wf_id)
+        let row: Option<(Option<String>,)> = sqlx::query_as(&format!(
+            "SELECT {RESUME_GRAPH_SQL} FROM workflow_executions e \
+             LEFT JOIN workflows w0 ON w0.id = e.workflow_id \
+             WHERE e.id = $1 AND (e.user_id = $2 OR w0.org_id = ANY($3))"
+        ))
+        .bind(execution_id)
         .bind(user_id)
         .bind(writable_org_ids)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|(gj,)| gj))
+        Ok(row.and_then(|(gj,)| gj))
     }
 
     /// Terminal exit for a claimed (`resuming`) execution whose resume could
@@ -4093,8 +4093,10 @@ impl ExecutionRepository {
         Ok(BudgetAdmission::Admitted)
     }
 
-    /// Latest execution per workflow (DISTINCT ON) for a batch of
-    /// workflow ids, gated on ownership OR org access. Takes the caller's
+    /// Latest execution per workflow for a batch of workflow ids, gated on
+    /// ownership OR org access. One `LIMIT 1` probe per workflow on
+    /// `(workflow_id, started_at DESC)` — a `DISTINCT ON` over `= ANY($1)`
+    /// visited every live execution of every listed workflow. Takes the caller's
     /// connection: the GraphQL `latestWorkflowExecutions` query runs this
     /// on a `begin_tenant_read_scoped` tx so the workflow_executions RLS
     /// policy backstops the app-layer `we.user_id = $2 OR w.org_id =
@@ -4109,12 +4111,19 @@ impl ExecutionRepository {
     ) -> Result<Vec<LatestExecutionRow>> {
         let rows = sqlx::query_as::<_, LatestExecutionRow>(
             r#"
-            SELECT DISTINCT ON (we.workflow_id)
-                we.id, we.workflow_id, we.status, we.started_at, we.completed_at, we.error_message, we.created_at
-            FROM workflow_executions we
-            LEFT JOIN workflows w ON w.id = we.workflow_id
-            WHERE we.workflow_id = ANY($1) AND (we.user_id = $2 OR w.org_id = ANY($3))
-            ORDER BY we.workflow_id, we.started_at DESC
+            SELECT l.id, l.workflow_id, l.status, l.started_at, l.completed_at,
+                   l.error_message, l.created_at
+            FROM (SELECT DISTINCT u.id FROM unnest($1::uuid[]) AS u(id)) wf
+            LEFT JOIN workflows w ON w.id = wf.id
+            CROSS JOIN LATERAL (
+                SELECT we.id, we.workflow_id, we.status, we.started_at, we.completed_at,
+                       we.error_message, we.created_at
+                FROM workflow_executions we
+                WHERE we.workflow_id = wf.id AND (we.user_id = $2 OR w.org_id = ANY($3))
+                ORDER BY we.started_at DESC, we.id DESC
+                LIMIT 1
+            ) l
+            ORDER BY l.workflow_id
             "#,
         )
         .bind(workflow_ids)
@@ -4363,6 +4372,15 @@ pub struct PendingApprovalRow {
     pub workflow_name: Option<String>,
 }
 
+/// The graph a RESUME of execution `e` runs: the version it was STARTED on
+/// (`workflow_version_id`), or the draft only for an execution that recorded
+/// none. NULL when the pinned version row is gone — the caller hard-skips,
+/// never silently running a draft the paused run never saw.
+const RESUME_GRAPH_SQL: &str = "CASE WHEN e.workflow_version_id IS NULL \
+     THEN (SELECT w.graph_json FROM workflows w WHERE w.id = e.workflow_id) \
+     ELSE (SELECT v.graph_json::text FROM workflow_versions v \
+           WHERE v.id = e.workflow_version_id AND v.workflow_id = e.workflow_id) END";
+
 /// Row returned by `list_stuck_executions_for_resume`.
 ///
 /// Carries everything the resume-after-restart path needs to
@@ -4384,8 +4402,9 @@ pub struct StuckExecutionForResume {
     /// NULL (LEFT-JOINed; NULL if the workflow row was deleted between
     /// trigger and resume).
     pub workflow_default_actor_id: Option<Uuid>,
-    /// The workflow definition. NULL only if the workflow row was deleted
-    /// between trigger and resume — caller treats NULL as a hard skip.
+    /// The definition the run was started on ([`RESUME_GRAPH_SQL`]). NULL if
+    /// the workflow, or its pinned version, was deleted between trigger and
+    /// resume — caller treats NULL as a hard skip.
     pub graph_json: Option<String>,
 }
 

@@ -65,8 +65,8 @@ runs, returns error," with no obvious cause.
 
 Rule: when adding a new dispatch path (new system-node kind, new
 parallel executor, anything that constructs a `DispatchJob`), you MUST
-call `self.build_encrypted_secrets(node_id, &worker_shared_key)` or
-`build_encrypted_secrets_for(...)` at a non-Self-borrowing site.
+build its secrets through `secrets_pipeline::build_dispatch_secrets_for`
+(or `build_encrypted_secrets_for` when sealing does not apply).
 
 **Never** write `encrypted_secrets: Default::default()` in a production
 dispatch path. That's a silent security regression waiting to happen.
@@ -152,24 +152,17 @@ Always call through the shims in the engine body. Direct access to
 and scatters the fallback logic. The shims centralize it.
 
 When adding a new policy trait, add a matching `self.method_name` shim
-in the same spot in the impl block.
+in the same spot in the impl bloc## One secrets pipeline
 
-## The `build_encrypted_secrets` duality
+`secrets_pipeline::build_encrypted_secrets_for(...)` (extract vault paths →
+resolve → encrypt) is the one path; `build_dispatch_secrets_for(...)` wraps
+it and also resolves the plaintext for claim-based sealing. Both are free
+functions so `async move` closures can call them. The former `&self` shim
+`ParallelWorkflowEngine::build_encrypted_secrets` had no caller and was
+deleted — don't reintroduce a second path (see commit ca023c3, the
+loop-node secrets fix).
 
-Two variants exist:
-
-- `self.build_encrypted_secrets(node_id, &worker_shared_key)` — the
-  `&self` form. Reads `self.node_configs[node_id]` for vault refs.
-- `build_encrypted_secrets_for(resolver, node_id, user_id, vault_paths, extra_paths, key)` —
-  free function for `async move` closures that can't hold `&self`.
-
-**Use `&self` shim when possible.** The free fn exists only for
-closures. If you're inlining the free fn into a spot where `&self` is
-available, the `&self` shim is the right call.
-
-Both share the same pipeline (extract vault paths → resolve → encrypt).
-Previous work consolidated them into one code path (see commit
-ca023c3 — the loop-node secrets fix). Don't re-duplicate.
+e.
 
 ## Pipeline-chain pitfalls
 
@@ -327,7 +320,7 @@ This crate is for the scheduling loop, the system-node handlers, and
   handler if it dispatches a child graph, tests in `engine.rs` for
   the new arm.
 - **Adding a dispatch site**: verify `encrypted_secrets` is populated
-  via `build_encrypted_secrets*`; verify `emit_retry_events` is set
+  via `build_dispatch_secrets_for`; verify `emit_retry_events` is set
   appropriately for the observability layer; verify nil-UUID topic
   mapping if it's a new transport adapter (though adapters belong in
   downstream crates, not here).

@@ -2313,7 +2313,7 @@ impl ParallelWorkflowEngine {
         // loop body. Pre-fix every iteration re-ran:
         //   1. `fetch_module(body_uuid)` — 1 SELECT against `modules`
         //      (no in-process cache).
-        //   2. `build_encrypted_secrets(body_module_id, exec, key)` —
+        //   2. `build_dispatch_secrets(body_module_id, exec, key)` —
         //      1 SELECT against `secrets` + per-row AES decrypt +
         //      LLM-keys resolve + AES encrypt of the result.
         // For a 100-iteration loop that's ~300 extra DB round-trips

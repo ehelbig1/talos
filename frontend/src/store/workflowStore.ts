@@ -111,6 +111,9 @@ export interface WorkflowState {
   // (`execution_timeout_secs`, …), carried verbatim through load → save.
   graphExtras: Record<string, unknown>;
   isDirty: boolean;
+  // Advances on every edit. A save captures it when it reads the graph and
+  // clears `isDirty` only if nothing changed while the request was in flight.
+  editGeneration: number;
   onNodesChange: OnNodesChange;
   onEdgesChange: OnEdgesChange;
   connectNodes: (connection: Connection, edgeType?: string) => void;
@@ -142,7 +145,14 @@ export interface WorkflowState {
     graphExtras: Record<string, unknown>;
   }) => void;
   setGraphVersion: (graphVersion: number | null) => void;
-  markClean: () => void;
+  /** Clear `isDirty`. With a generation, only if no edit happened since it
+   *  was read; returns whether the store is now clean. */
+  markClean: (generation?: number) => boolean;
+}
+
+/** The patch every editing action applies alongside its change. */
+function dirtied(s: Pick<WorkflowState, "editGeneration">) {
+  return { isDirty: true, editGeneration: s.editGeneration + 1 };
 }
 
 export const useWorkflowStore = create<WorkflowState>((set, get) => ({
@@ -156,12 +166,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   graphVersion: null,
   graphExtras: {},
   isDirty: false,
+  editGeneration: 0,
   onNodesChange: (changes) => {
     const nextNodes = applyNodeChanges(changes, get().nodes) as WorkflowNode[];
     const hasSignificantChange = changes.some((c) => c.type !== "select");
     set({
       nodes: nextNodes,
-      isDirty: get().isDirty || hasSignificantChange,
+      ...(hasSignificantChange ? dirtied(get()) : {}),
     });
   },
   onEdgesChange: (changes) => {
@@ -169,7 +180,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     const hasSignificantChange = changes.some((c) => c.type !== "select");
     set({
       edges: nextEdges,
-      isDirty: get().isDirty || hasSignificantChange,
+      ...(hasSignificantChange ? dirtied(get()) : {}),
     });
   },
   connectNodes: (connection, edgeType?) => {
@@ -201,14 +212,14 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       type: "conditionEdge",
       data: { edgeType: (edgeType as EdgeData["edgeType"]) || "default" },
     };
-    set({ edges: [...get().edges, newEdge], isDirty: true });
+    set({ edges: [...get().edges, newEdge], ...dirtied(get()) });
   },
   updateEdgeData: (edgeId, data) => {
     set({
       edges: get().edges.map((e) =>
         e.id === edgeId ? { ...e, data: { ...(e.data || {}), ...data } } : e,
       ),
-      isDirty: true,
+      ...dirtied(get()),
     });
   },
   addNode: (
@@ -236,21 +247,21 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         importedInterfaces,
       },
     };
-    set({ nodes: [...get().nodes, newNode], isDirty: true });
+    set({ nodes: [...get().nodes, newNode], ...dirtied(get()) });
   },
   updateNodeData: (id: string, data: Partial<WorkflowNodeData>) => {
     set({
       nodes: get().nodes.map((n) =>
         n.id === id ? { ...n, data: { ...n.data, ...data } } : n,
       ),
-      isDirty: true,
+      ...dirtied(get()),
     });
   },
   deleteNode: (id) => {
     set({
       nodes: get().nodes.filter((n) => n.id !== id),
       edges: get().edges.filter((e) => e.source !== id && e.target !== id),
-      isDirty: true,
+      ...dirtied(get()),
     });
   },
   duplicateNode: (nodeId) => {
@@ -265,7 +276,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       },
       selected: false,
     };
-    set({ nodes: [...get().nodes, clone], isDirty: true });
+    set({ nodes: [...get().nodes, clone], ...dirtied(get()) });
   },
   clearWorkflow: () => {
     set({
@@ -294,13 +305,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     );
   },
   setMaxConcurrentExecutions: (count) => {
-    set({ maxConcurrentExecutions: count, isDirty: true });
+    set({ maxConcurrentExecutions: count, ...dirtied(get()) });
   },
   setPriority: (priority) => {
-    set({ priority, isDirty: true });
+    set({ priority, ...dirtied(get()) });
   },
   setIntent: (intent) => {
-    set({ intent, isDirty: true });
+    set({ intent, ...dirtied(get()) });
   },
   setGraphDocument: ({ graphVersion, graphExtras }) => {
     set({ graphVersion, graphExtras });
@@ -308,8 +319,12 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   setGraphVersion: (graphVersion) => {
     set({ graphVersion });
   },
-  markClean: () => {
+  markClean: (generation) => {
+    if (generation !== undefined && generation !== get().editGeneration) {
+      return false;
+    }
     set({ isDirty: false });
+    return true;
   },
 }));
 

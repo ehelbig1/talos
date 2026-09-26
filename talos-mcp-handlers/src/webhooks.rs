@@ -821,11 +821,14 @@ async fn handle_get_webhook_security_stats(
             .into_iter()
             .map(|(ip, trigger_id, blocked_until)| {
                 let remaining_secs = blocked_until.saturating_duration_since(now).as_secs();
-                // The breaker is keyed by (IP, trigger) since 2026-09-25: a
-                // block covers ONE trigger, so the entry names it.
+                // The breaker is keyed by (source, trigger) since 2026-09-25: a
+                // credential-failure block covers ONE trigger, so the entry
+                // names it. `trigger_id: null` is the source-wide block opened
+                // by probing many unknown trigger ids; it covers every trigger.
+                // An IPv6 source is its /64.
                 serde_json::json!({
                     "ip": ip.to_string(),
-                    "trigger_id": trigger_id.to_string(),
+                    "trigger_id": trigger_id.map(|t| t.to_string()),
                     "remaining_seconds": remaining_secs,
                 })
             })

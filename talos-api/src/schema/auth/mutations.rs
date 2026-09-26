@@ -452,6 +452,8 @@ impl AuthMutations {
     }
 
     async fn setup_two_factor(&self, ctx: &Context<'_>) -> Result<TwoFactorSetup> {
+        // The body carries a TOTP secret / backup codes.
+        crate::schema::mark_response_no_store(ctx);
         // MCP-649 (2026-05-13): require_2fa for symmetry with
         // `disable_two_factor` (line 381) — every 2FA-management
         // endpoint should require an `is_2fa_verified=true` token.
@@ -515,6 +517,8 @@ impl AuthMutations {
         ctx: &Context<'_>,
         input: Enable2FAInput,
     ) -> Result<TwoFactorEnrollment> {
+        // The body carries a TOTP secret / backup codes.
+        crate::schema::mark_response_no_store(ctx);
         // MCP-649: matches setup_two_factor — require_2fa for
         // symmetry with disable_two_factor. See setup_two_factor for
         // the full rationale (defense-in-depth on top of the atomic

@@ -461,6 +461,9 @@ services:
         # variable is unset (e.g. building from a tarball).
         GIT_SHA_OVERRIDE: ${GIT_SHA_OVERRIDE:-unknown}
         GIT_DIRTY_OVERRIDE: ${GIT_DIRTY_OVERRIDE:-false}
+        # Cargo profile: `docker` (fast, opt-level=1) for dev; publish-images.sh
+        # sets TALOS_CARGO_PROFILE=dist for shipped images.
+        CARGO_PROFILE: ${TALOS_CARGO_PROFILE:-docker}
     container_name: talos-controller
     environment:
       DATABASE_URL: postgres://talos:${POSTGRES_PASSWORD}@postgres:5432/talos
@@ -629,6 +632,10 @@ services:
       AWS_S3_FORCE_PATH_STYLE: "true"
       MINIO_BUCKET: audit-logs
       TALOS_MASTER_KEY: ${TALOS_MASTER_KEY:?TALOS_MASTER_KEY required in .env}
+      # Set ONLY during a staged master-key rotation (the OLD key, while
+      # TALOS_MASTER_KEY holds the new one); empty = unset. See
+      # docs/SECRETS_MANAGEMENT.md.
+      TALOS_MASTER_KEY_PREVIOUS: ${TALOS_MASTER_KEY_PREVIOUS:-}
       # KEK provider selection: `env` (default) loads TALOS_MASTER_KEY for
       # local AES-256-GCM. `vault` calls Vault transit; legacy env stays
       # wired for Phase-4 read-fallback + dual-write rollback safety.
@@ -668,7 +675,6 @@ services:
       PLAID_CLIENT_ID: ${PLAID_CLIENT_ID:-}
       PLAID_SECRET: ${PLAID_SECRET:-}
       PLAID_ENV: ${PLAID_ENV:-}
-      TALOS_WORKFLOW_SIGNING_KEY: ${TALOS_WORKFLOW_SIGNING_KEY:-}
       MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA: ${MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA:-}
       # allow-untransported-env: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
       # allow-untransported-env: OTEL_EXPORTER_OTLP_ENDPOINT — deliberately NOT
@@ -865,7 +871,7 @@ services:
       TALOS_REPLAY_FAIL_CLOSED: ${TALOS_REPLAY_FAIL_CLOSED:-false}
       TALOS_SIGNATURE_DIAG: ${TALOS_SIGNATURE_DIAG:-}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       # DEV template live-editing: bind-mount the repo's module-templates
       # over the image-baked copy so install_module_from_catalog picks up
@@ -934,6 +940,7 @@ services:
         # controller's build-skew WARN fires on a healthy same-tree fleet.
         GIT_SHA_OVERRIDE: ${GIT_SHA_OVERRIDE:-unknown}
         GIT_DIRTY_OVERRIDE: ${GIT_DIRTY_OVERRIDE:-false}
+        CARGO_PROFILE: ${TALOS_CARGO_PROFILE:-docker}
     environment:
       # Injection audit 2026-07-20: the per-actor write-ceiling gate
       # (readonly vs write) was inert without this — ceilings in the DB
@@ -1602,7 +1609,7 @@ services:
       # resolves to the frontend container itself, not the controller.
       API_PROXY_TARGET: http://controller:8000
     ports:
-      - "3002:3000"
+      - "127.0.0.1:3002:3000"
     volumes:
       # Mount host source so Vite HMR picks up file changes without rebuilding
       - ./frontend/src:/app/src

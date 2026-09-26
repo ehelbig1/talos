@@ -205,6 +205,38 @@ pub fn fuel_exhausted_message(
     )
 }
 
+/// Whether a wasmtime call error is fuel exhaustion — by TYPE
+/// (`wasmtime::Trap::OutOfFuel` anywhere in the error chain), never by text.
+pub(crate) fn is_out_of_fuel_trap(e: &wasmtime::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel))
+        || e.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel)
+}
+
+#[cfg(test)]
+mod out_of_fuel_trap_tests {
+    use super::is_out_of_fuel_trap;
+
+    #[test]
+    fn matches_the_trap_type_even_under_context() {
+        let e = wasmtime::Error::from(wasmtime::Trap::OutOfFuel);
+        assert!(is_out_of_fuel_trap(&e));
+        assert!(is_out_of_fuel_trap(
+            &e.context("error while executing at wasm backtrace")
+        ));
+    }
+
+    #[test]
+    fn text_mentioning_fuel_is_not_fuel_exhaustion() {
+        let e = wasmtime::Error::from(wasmtime::Trap::UnreachableCodeReached)
+            .context("wasm backtrace: 0: compute_fuel (all fuel consumed? OutOfFuel)");
+        assert!(!is_out_of_fuel_trap(&e));
+        assert!(!is_out_of_fuel_trap(&wasmtime::Error::msg(
+            "fuel price api failed"
+        )));
+    }
+}
+
 #[cfg(test)]
 mod fuel_exhausted_message_tests {
     use super::fuel_exhausted_message;
@@ -4071,7 +4103,7 @@ impl TalosRuntime {
                                 let error_str = e.to_string();
                                 let error_type = if error_str.contains("timeout") {
                                     "timeout"
-                                } else if error_str.contains("fuel") {
+                                } else if error_str.starts_with("WASM fuel exhausted") {
                                     "out_of_fuel"
                                 } else if error_str.contains("trap") {
                                     "trap"
@@ -4605,15 +4637,10 @@ impl TalosRuntime {
                 if let Some(oom_msg) = oom_msg {
                     return Err(anyhow::anyhow!("{}", oom_msg));
                 }
-                // Check both Display and Debug formats — wasmtime may put
-                // "all fuel consumed" in the error chain, not the top-level message
-                let err_str = format!("{}", e);
-                let err_debug = format!("{:?}", e);
-                if err_str.contains("fuel")
-                    || err_str.contains("all fuel consumed")
-                    || err_debug.contains("fuel")
-                    || err_debug.contains("OutOfFuel")
-                {
+                // Typed check: the Debug text carries guest function names and
+                // host error text, so a substring match misclassified any trap
+                // in a guest fn named e.g. `compute_fuel` as fuel exhaustion.
+                if is_out_of_fuel_trap(&e) {
                     return Err(anyhow::anyhow!(
                         "{}",
                         fuel_exhausted_message(fuel_consumed, effective_fuel_limit, None)
@@ -4655,6 +4682,8 @@ impl TalosRuntime {
                     } else {
                         std::borrow::Cow::Owned(talos_dlp_provider::redact_str(stderr_trimmed_raw))
                     };
+                let err_str = format!("{}", e);
+                let err_debug = format!("{:?}", e);
                 if !stderr_trimmed_raw.is_empty()
                     && (err_str.contains("trap") || err_debug.contains("trap"))
                 {
@@ -5000,15 +5029,10 @@ impl TalosRuntime {
                 if let Some(oom_msg) = oom_msg {
                     return Err(anyhow::anyhow!("{}", oom_msg));
                 }
-                // Check both Display and Debug formats — wasmtime may put
-                // "all fuel consumed" in the error chain, not the top-level message
-                let err_str = format!("{}", e);
-                let err_debug = format!("{:?}", e);
-                if err_str.contains("fuel")
-                    || err_str.contains("all fuel consumed")
-                    || err_debug.contains("fuel")
-                    || err_debug.contains("OutOfFuel")
-                {
+                // Typed check: the Debug text carries guest function names and
+                // host error text, so a substring match misclassified any trap
+                // in a guest fn named e.g. `compute_fuel` as fuel exhaustion.
+                if is_out_of_fuel_trap(&e) {
                     return Err(anyhow::anyhow!(
                         "{}",
                         fuel_exhausted_message(fuel_consumed, self.fuel_limit, None)
@@ -5510,8 +5534,7 @@ impl TalosRuntime {
                     if let Some(oom_msg) = oom_msg {
                         anyhow::bail!("{}", oom_msg);
                     }
-                    let err_str = format!("{}", e);
-                    if err_str.contains("fuel") || err_str.contains("all fuel consumed") {
+                    if is_out_of_fuel_trap(&e) {
                         // `step_max_fuel` — NOT `self.fuel_limit`. This site
                         // reported the runtime-wide default as "Current fuel
                         // limit" while `store.set_fuel(step.max_fuel)` above is
@@ -6033,6 +6056,7 @@ fn load_precompiled_on(
     // (version, expected_cap, serialized), so this point is reached only
     // when the serialized bytes were produced locally for this exact
     // cap-world.
+    #[allow(unsafe_code)] // HMAC-verified blob; see SAFETY above.
     let component = unsafe { Component::deserialize(engine, serialized)? };
 
     tracing::info!(
@@ -6209,15 +6233,10 @@ impl TalosRuntime {
                 if let Some(oom_msg) = oom_msg {
                     return Err(anyhow::anyhow!("{}", oom_msg));
                 }
-                // Check both Display and Debug formats — wasmtime may put
-                // "all fuel consumed" in the error chain, not the top-level message
-                let err_str = format!("{}", e);
-                let err_debug = format!("{:?}", e);
-                if err_str.contains("fuel")
-                    || err_str.contains("all fuel consumed")
-                    || err_debug.contains("fuel")
-                    || err_debug.contains("OutOfFuel")
-                {
+                // Typed check: the Debug text carries guest function names and
+                // host error text, so a substring match misclassified any trap
+                // in a guest fn named e.g. `compute_fuel` as fuel exhaustion.
+                if is_out_of_fuel_trap(&e) {
                     return Err(anyhow::anyhow!(
                         "{}",
                         fuel_exhausted_message(fuel_consumed, self.fuel_limit, None)

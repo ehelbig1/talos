@@ -184,7 +184,8 @@ impl KekProvider for EnvKekProvider {
         &self,
         dek: &[u8; 32],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>> {
-        let dek = *dek;
+        // Owned copy for the future, wiped when the future drops.
+        let dek = Zeroizing::new(*dek);
         Box::pin(async move {
             let cipher = Aes256Gcm::new_from_slice(&self.master_key)
                 .context("Failed to construct master cipher")?;
@@ -218,10 +219,19 @@ impl KekProvider for EnvKekProvider {
                 .context("Failed to construct master cipher")?;
             let nonce = Nonce::from_slice(&wrapped[..12]);
             let ciphertext = &wrapped[12..];
-            let plaintext = cipher
-                .decrypt(nonce, ciphertext)
-                .map_err(|e| anyhow!("Failed to unwrap DEK: {}", e))?;
-            Ok(Zeroizing::new(plaintext))
+            let plaintext = Zeroizing::new(
+                cipher
+                    .decrypt(nonce, ciphertext)
+                    .map_err(|e| anyhow!("Failed to unwrap DEK: {}", e))?,
+            );
+            // Same contract the Vault provider enforces: a DEK is 32 bytes.
+            if plaintext.len() != 32 {
+                return Err(anyhow!(
+                    "Unwrapped DEK has length {}, expected 32",
+                    plaintext.len()
+                ));
+            }
+            Ok(plaintext)
         })
     }
 
@@ -258,6 +268,21 @@ pub fn env_kek_provider_from_environment() -> Result<Arc<dyn KekProvider>> {
     Ok(Arc::new(EnvKekProvider::from_hex(&hex)?))
 }
 
+/// The PREVIOUS master key during a staged rotation
+/// (`TALOS_MASTER_KEY_PREVIOUS`, or `_FILE`), as the legacy provider for
+/// `SecretsManager::with_kek_providers`. `None` when unset or empty. With it
+/// loaded every replica unwraps new-then-previous, so a fleet rolled onto
+/// `TALOS_MASTER_KEY=<new>` keeps every DEK readable while
+/// `rotate_master_key` rewraps them.
+pub fn env_kek_legacy_provider_from_environment() -> Result<Option<Arc<dyn KekProvider>>> {
+    let Some(hex) = talos_config::read_env_or_file("TALOS_MASTER_KEY_PREVIOUS") else {
+        return Ok(None);
+    };
+    let provider =
+        EnvKekProvider::from_hex(&hex).context("TALOS_MASTER_KEY_PREVIOUS is not a valid key")?;
+    Ok(Some(Arc::new(provider)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +308,23 @@ mod tests {
         let a = kek.wrap_dek(&dek).await.unwrap();
         let b = kek.wrap_dek(&dek).await.unwrap();
         assert_ne!(a[..12], b[..12], "GCM nonce was reused across wraps");
+    }
+
+    #[tokio::test]
+    async fn env_kek_rejects_a_wrapped_value_that_is_not_a_dek() {
+        // A well-formed AES-GCM blob under the right key whose plaintext is
+        // not 32 bytes must not be handed out as a DEK.
+        let key = [21u8; 32];
+        let kek = EnvKekProvider::from_raw_bytes(key.to_vec());
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce = [1u8; 12];
+        let mut wrapped = nonce.to_vec();
+        wrapped.extend(
+            cipher
+                .encrypt(Nonce::from_slice(&nonce), &[7u8; 16][..])
+                .unwrap(),
+        );
+        assert!(kek.unwrap_dek(&wrapped).await.is_err());
     }
 
     #[tokio::test]

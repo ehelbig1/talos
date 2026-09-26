@@ -6,6 +6,7 @@ export const STATUS_BORDER: Record<NodeStatusType, string> = {
   running: "border-l-blue-500",
   success: "border-l-green-500",
   failed: "border-l-red-500",
+  skipped: "border-l-muted-foreground/50",
   awaiting_approval: "border-l-amber-400",
 };
 
@@ -14,6 +15,7 @@ const STATUS_DOT: Record<NodeStatusType, string> = {
   running: "bg-blue-500 animate-status-pulse",
   success: "bg-green-500",
   failed: "bg-red-500",
+  skipped: "bg-muted-foreground/50",
   awaiting_approval: "bg-amber-400 animate-pulse",
 };
 

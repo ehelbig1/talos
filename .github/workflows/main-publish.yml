@@ -32,16 +32,18 @@ name: Main Publish
 # Bypass mirrors the script's --skip-ci-check: the `skip_ci_check`
 # input — explicit and recorded in the run log, by design.
 #
-# Verification (example — the identity is the WORKFLOW URI):
+# Verification (example — the identity is the WORKFLOW URI + REF):
 #   cosign verify \
-#     --certificate-identity-regexp "^https://github\\.com/OWNER/talos/\\.github/workflows/main-publish\\.yml@" \
+#     --certificate-identity-regexp "^https://github\\.com/OWNER/talos/\\.github/workflows/main-publish\\.yml@refs/heads/main$" \
 #     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
 #     ghcr.io/OWNER/talos-controller@sha256:<digest>
 #
-# The trailing `@` in the identity regexp is load-bearing: without it, a
-# fork workflow named `main-publish.yml-evil.yml` would also match (same
-# class as the template-publish.yml pin documented in CLAUDE.md). Append
-# `refs/heads/main$` after the `@` to additionally pin the ref.
+# The ref suffix is load-bearing. The Fulcio SAN is `<workflow>@<ref>`, and a
+# workflow_dispatch run can target ANY branch, so a regexp ending at `@`
+# admits an image built from an unreviewed branch and signed by this same
+# workflow. `@refs/heads/main$` admits main only, and the trailing `$` stops
+# `refs/heads/main-evil`. The `publish-ref-gate` job below refuses any other
+# ref before a single image is pushed or signed.
 
 # Auto-trigger on push to main stays DISABLED (deliberate May-2026
 # decision) — every publish is an explicit workflow_dispatch run. To
@@ -85,6 +87,25 @@ env:
   SHORT_SHA: ${{ github.sha }}
 
 jobs:
+  # ── Ref gate: only refs/heads/main may publish ─────────────────────────
+  # Deliberately NOT bypassable by skip_ci_check: the signing identity a
+  # cluster pins is `main-publish.yml@refs/heads/main`, and `:main-latest`
+  # is a MUTABLE tag clusters may follow — a dispatch from any other branch
+  # must fail loudly here rather than push and sign an unreviewed build.
+  publish-ref-gate:
+    name: Publish gate (refs/heads/main only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require refs/heads/main
+        run: |
+          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "::error::main-publish.yml may only run on refs/heads/main (got ${{ github.ref }})."
+            echo "Re-dispatch with:  gh workflow run main-publish.yml --ref main"
+            exit 1
+          fi
+
   # ── Publish gate: require a green quality.yml run for this SHA ─────────
   # CI analogue of publish-images.sh's gate: nothing else stands between
   # this workflow and a production image, so refuse to build unless the
@@ -99,6 +120,7 @@ jobs:
   # the run log.
   ci-gate:
     name: Publish gate (quality.yml green)
+    needs: [publish-ref-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -133,10 +155,14 @@ jobs:
   build:
     name: Build & Push (${{ matrix.service }})
     needs: [ci-gate]
+    # Defence in depth behind publish-ref-gate.
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    # 60 minutes — the cold cargo workspace build takes ~45 min on a
-    # 16-CPU runner; warm builds with BuildKit cache hit ~15 min.
-    timeout-minutes: 60
+    # The cold `docker`-profile workspace build took ~45 min on a 16-CPU
+    # runner; the `dist` profile (opt-level=3 + thin LTO) is slower and its
+    # CI time is not yet measured, so the ceiling is doubled rather than
+    # guessed tight. Revisit after the first dist publish.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -247,9 +273,13 @@ jobs:
           # Build args expose the git SHA to the controller binary's
           # build.rs so session_start.server_version reflects this commit.
           # Mirrors release.yml's GIT_SHA_OVERRIDE pattern.
+          # CARGO_PROFILE=dist: the optimised shipping profile (Cargo.toml);
+          # the Dockerfiles default to the fast dev `docker` profile. The
+          # frontend Dockerfile declares no such ARG and ignores it.
           build-args: |
             GIT_SHA_OVERRIDE=${{ github.sha }}
             GIT_DIRTY_OVERRIDE=false
+            CARGO_PROFILE=dist
 
       # Persist the digest as a tiny artifact so the sign + summarise
       # jobs can read it back. One artifact per service; downstream jobs
@@ -299,6 +329,7 @@ jobs:
   sign:
     name: Sign (${{ matrix.service }})
     needs: [build]
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

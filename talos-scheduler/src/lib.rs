@@ -1431,6 +1431,15 @@ impl SchedulerService {
         let mut to_spawn: Vec<(Uuid, Uuid, Uuid)> = Vec::with_capacity(due_schedules.len());
 
         for schedule in &due_schedules {
+            // Each row's writes run in a SAVEPOINT. A failed statement aborts
+            // the whole Postgres transaction; COMMIT then answers ROLLBACK
+            // without an error, and every spawn already staged in `to_spawn`
+            // would fire with its `next_trigger_at` advance undone — a double
+            // fire on the next poll. Rolling back to the savepoint confines a
+            // failure to its own row.
+            let mut row_tx = sqlx::Acquire::begin(&mut *tx)
+                .await
+                .map_err(|e| format!("Failed to open per-schedule savepoint: {}", e))?;
             // Calculate next trigger time before releasing the lock.
             let next_trigger = match calculate_next_trigger(
                 &schedule.cron_expression,
@@ -1461,7 +1470,7 @@ impl SchedulerService {
                         "UPDATE workflow_schedules SET is_enabled = false, updated_at = NOW() WHERE id = $1",
                     )
                     .bind(schedule.id)
-                    .execute(&mut *tx)
+                    .execute(&mut *row_tx)
                     .await
                     {
                         tracing::warn!(
@@ -1471,6 +1480,13 @@ impl SchedulerService {
                             disable_error = %de,
                             "Scheduler: failed to disable schedule with unparseable cron — schedule will reappear in next poll and re-fire this WARN until the underlying DB issue resolves"
                         );
+                        row_tx.rollback().await.map_err(|e| {
+                            format!("Failed to roll back per-schedule savepoint: {}", e)
+                        })?;
+                    } else {
+                        row_tx.commit().await.map_err(|e| {
+                            format!("Failed to release per-schedule savepoint: {}", e)
+                        })?;
                     }
                     continue;
                 }
@@ -1488,7 +1504,7 @@ impl SchedulerService {
             )
             .bind(schedule.id)
             .bind(next_trigger)
-            .execute(&mut *tx)
+            .execute(&mut *row_tx)
             .await
             {
                 tracing::error!(
@@ -1496,8 +1512,16 @@ impl SchedulerService {
                     "Failed to update schedule timestamps: {}",
                     e
                 );
+                row_tx
+                    .rollback()
+                    .await
+                    .map_err(|e| format!("Failed to roll back per-schedule savepoint: {}", e))?;
                 continue;
             }
+            row_tx
+                .commit()
+                .await
+                .map_err(|e| format!("Failed to release per-schedule savepoint: {}", e))?;
 
             // MCP-539: stage the spawn, fire it only after commit succeeds.
             to_spawn.push((schedule.workflow_id, schedule.user_id, schedule.id));
@@ -2701,6 +2725,16 @@ async fn run_scheduled_execution(
                 "Scheduled workflow execution completed"
             );
         }
+        // An operator cancelled the run (here, or seen by the fence): the row
+        // is already `cancelled`, so nothing to mark and nothing to alert.
+        Err(e) if talos_engine::fence::was_cancelled_by_operator(&e) => {
+            record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_CANCELLED);
+            tracing::info!(
+                execution_id = %execution_id,
+                schedule_id = %schedule_id,
+                "Scheduler: run stopped — the execution was cancelled by an operator"
+            );
+        }
         Err(e) if talos_engine::fence::was_fenced(&e) => {
             // FU-1 fence: a fence abort means crash-recovery reclaimed this
             // scheduled run (the row's epoch advanced) — it now belongs to the
@@ -2901,6 +2935,7 @@ mod startup_herd_tests {
             talos_metrics::SCHEDULER_OUTCOME_SKIPPED,
             talos_metrics::SCHEDULER_OUTCOME_DENIED,
             talos_metrics::SCHEDULER_OUTCOME_FENCED,
+            talos_metrics::SCHEDULER_OUTCOME_CANCELLED,
         ] {
             assert!(
                 talos_metrics::SCHEDULER_DISPATCH_OUTCOMES.contains(&outcome),
@@ -2908,12 +2943,12 @@ mod startup_herd_tests {
             );
         }
         // The list above must not drift from the emitting sites either: every
-        // outcome constant this crate can emit is one of the five, and the
+        // outcome constant this crate can emit is one of the six, and the
         // partition claim in the metric's docs depends on the closed set
         // staying closed.
         assert_eq!(
             talos_metrics::SCHEDULER_DISPATCH_OUTCOMES.len(),
-            5,
+            6,
             "a new outcome must be added to this test, to the pre-seed loop, and \
              to the herd alert's outcome selector — an unseeded series is absent, \
              and every `increase(...)` idiom reads absent as 'no match'"
@@ -3579,6 +3614,9 @@ mod startup_herd_tests {
         // re-armed so the fire is deferred rather than dropped.
         ("SCHEDULER_OUTCOME_DENIED", 4),
         ("SCHEDULER_OUTCOME_FENCED", 1),
+        // Since 2026-09-26: an operator cancel is its own arm and its own
+        // outcome, no longer counted as `fenced`.
+        ("SCHEDULER_OUTCOME_CANCELLED", 1),
     ];
 
     #[test]

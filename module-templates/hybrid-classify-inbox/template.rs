@@ -138,6 +138,40 @@ fn provider_from(s: &str) -> talos::core::llm::Provider {
     }
 }
 
+/// Rewrite every `</agent_memory` / `</untrusted_data` prefix so text placed
+/// inside a spotlighting wrapper cannot close it. A deliberate COPY of
+/// `talos_memory::spotlight::neutralize_closing_tags` (a catalog template
+/// cannot import workspace crates); `talos-memory`'s tests pin every copy
+/// byte-identical to the llm-inference one.
+// BEGIN neutralize_closing_tags (pinned by talos-memory::spotlight tests)
+fn neutralize_closing_tags(input: &str) -> String {
+    const TAGS: [&str; 2] = ["agent_memory", "untrusted_data"];
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len() + 8);
+    let mut last = 0;
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'/' {
+            let after = &bytes[i + 2..];
+            if let Some(tag) = TAGS.iter().find(|t| {
+                let t = t.as_bytes();
+                after.len() >= t.len() && after[..t.len()].eq_ignore_ascii_case(t)
+            }) {
+                out.push_str(&input[last..i]);
+                out.push_str("<\\/");
+                out.push_str(tag);
+                i += 2 + tag.len();
+                last = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&input[last..]);
+    out
+}
+// END neutralize_closing_tags
+
 /// Run the LLM leg over the abstained subset. Returns the parsed
 /// classify output, or a human-readable error the caller decides how to
 /// treat (fail-loud vs partial-emit).
@@ -157,9 +191,11 @@ fn run_llm_leg(
     // as the LLM_Inference node's SPOTLIGHTING default). serde_json
     // serialization escapes any braces/quotes in the email so it cannot
     // break out of the JSON string context.
+    // serde_json does not escape `/`, so a body carrying `</untrusted_data>`
+    // would close the wrapper early — neutralise it first.
     let user_content = format!(
         "<untrusted_data>\n{}\n</untrusted_data>",
-        serde_json::to_string(&user_payload).map_err(|e| e.to_string())?
+        neutralize_closing_tags(&serde_json::to_string(&user_payload).map_err(|e| e.to_string())?)
     );
     let req = talos::core::llm::CompletionRequest {
         provider: Some(provider),

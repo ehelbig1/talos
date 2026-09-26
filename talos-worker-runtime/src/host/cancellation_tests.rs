@@ -205,19 +205,12 @@ fn cancelled_is_declared_non_transient() {
 //
 // ## Why no test here calls `fetch_all` on an UNCANCELLED Http-world context
 //
-// `fetch_all`'s validation block reads `*ALLOW_PRIVATE_HOST_TARGETS`, a
-// process-global `LazyLock<bool>` over `WORKER_ALLOW_PRIVATE_HOST_TARGETS`
-// (`host/limits.rs`). First read wins for the life of the process. An
-// unrelated test — `host_impl_tests::fetch_with_bearer_sends_single_bearer_prefix`
-// — `set_var`s that variable and then needs the LazyLock to observe it, and
-// its own comment explains the isolation it relies on: "nextest runs each test
-// in its own process". True under `cargo nextest` (what CI runs) and NOT true
-// under plain `cargo test`, where any earlier test that forces the LazyLock
-// freezes it at `false` and the bearer test fails with `forbiddenhost`.
-//
-// So the cancelled direction — where the guard returns BEFORE that read — is
-// the only one taken through `fetch_all` here. The falsification directions
-// below are taken without initialising the static.
+// Historically `fetch_all` read a process-global `LazyLock` over
+// `WORKER_ALLOW_PRIVATE_HOST_TARGETS` that froze on first read and could break
+// the bearer test under plain `cargo test`. The toggle is now read per call
+// (`host::allow_private_host_targets`), but the cancelled direction — where the
+// guard returns BEFORE any egress — remains the only one taken here, so these
+// tests stay network-free.
 // ---------------------------------------------------------------------------
 
 use crate::cancel_registry::CancelRegistry;
@@ -345,8 +338,7 @@ async fn a_cancel_for_another_execution_does_not_stop_this_one() {
     );
 
     // Theirs never latched anything — the guard was never reached for it.
-    // (Its `fetch_all` is deliberately not called; see the module note above
-    // on the `ALLOW_PRIVATE_HOST_TARGETS` LazyLock.)
+    // (Its `fetch_all` is deliberately not called; see the module note above.)
     assert!(their_ctx.network_reason_handle().lock().unwrap().is_none());
 }
 

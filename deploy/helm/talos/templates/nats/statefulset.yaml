@@ -30,6 +30,8 @@ spec:
         # automatically when the bootstrap content changes.
         checksum/bootstrap-secret-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.bootstrapSecretName" .)) }}
     spec:
+      # No Kubernetes API access needed: no service-account token in the pod.
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 60
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:

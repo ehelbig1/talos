@@ -113,7 +113,7 @@ pub const SCHEDULER_PHASE_STEADY: &str = "steady";
 /// The complete, closed set of `outcome` label values on
 /// `talos_scheduler_dispatches_total`. See [`SCHEDULER_DISPATCH_PHASES`].
 ///
-/// **These five values PARTITION the scheduler's dispatch attempts**, and that
+/// **These six values PARTITION the scheduler's dispatch attempts**, and that
 /// is a load-bearing property rather than a tidiness one: the alert runbook
 /// tells operators to reconcile this counter against the boot backlog size
 /// logged by `event_kind="scheduler_startup_backlog"`, and a counter with
@@ -123,12 +123,13 @@ pub const SCHEDULER_PHASE_STEADY: &str = "steady";
 /// `return` to that path, add its `record_dispatch` in the same edit — the
 /// crate's `every_terminal_path_records_an_outcome` test documents the
 /// enumeration, but only a human keeps it true.
-pub const SCHEDULER_DISPATCH_OUTCOMES: [&str; 5] = [
+pub const SCHEDULER_DISPATCH_OUTCOMES: [&str; 6] = [
     SCHEDULER_OUTCOME_COMPLETED,
     SCHEDULER_OUTCOME_FAILED,
     SCHEDULER_OUTCOME_SKIPPED,
     SCHEDULER_OUTCOME_DENIED,
     SCHEDULER_OUTCOME_FENCED,
+    SCHEDULER_OUTCOME_CANCELLED,
 ];
 
 /// The execution reached a terminal success.
@@ -154,6 +155,18 @@ pub const SCHEDULER_OUTCOME_DENIED: &str = "denied";
 /// dispatch — the row now belongs to the resumer — but it is a terminal path,
 /// and an uncounted terminal path is what stops the counter being a partition.
 pub const SCHEDULER_OUTCOME_FENCED: &str = "fenced";
+/// An operator cancelled the run mid-flight (the engine answered
+/// `CancelledByOperator`). Not `fenced`: no reclaim happened, the row is
+/// already `cancelled`, and folding the two together hid operator action
+/// inside a split-brain signal.
+pub const SCHEDULER_OUTCOME_CANCELLED: &str = "cancelled";
+
+/// The complete, closed set of `outcome` label values on
+/// `talos_crash_recovery_total`, all pre-seeded at 0. `fenced` is a resume
+/// superseded by another controller's reclaim; `cancelled` is a resumed run an
+/// operator cancelled — distinct, so the split-brain signal stays clean.
+pub const CRASH_RECOVERY_OUTCOMES: [&str; 5] =
+    ["resumed", "failed", "reclaimed", "fenced", "cancelled"];
 
 /// Process-global metrics registry.
 ///
@@ -1723,8 +1736,8 @@ pub struct TalosMetrics {
     /// success, and it is how a dropped daily cron becomes observable rather
     /// than a WARN nobody reads.
     ///
-    /// The five outcomes are a PARTITION of dispatch attempts, not a sample:
-    /// see [`SCHEDULER_DISPATCH_OUTCOMES`]. Fifteen closed series, all pre-seeded.
+    /// The six outcomes are a PARTITION of dispatch attempts, not a sample:
+    /// see [`SCHEDULER_DISPATCH_OUTCOMES`]. Eighteen closed series, all pre-seeded.
     /// Deliberately carries NO workflow name, schedule id or user id — those
     /// are unbounded cardinality.
     pub scheduler_dispatches_total: CounterVec,
@@ -2590,7 +2603,7 @@ impl TalosMetrics {
                 "talos_crash_recovery_total",
                 "Total crash-recovery resume outcomes since process start",
             ),
-            &["outcome"], // resumed, failed, reclaimed
+            &["outcome"], // CRASH_RECOVERY_OUTCOMES
         )?;
         registry.register(Box::new(crash_recovery_total.clone()))?;
         // Pre-seed the outcome series to 0. Unlike the high-frequency execution
@@ -2598,7 +2611,7 @@ impl TalosMetrics {
         // so without seeding these series would be absent in steady state and
         // `rate()` / absence alerts + dashboard panels would have nothing to
         // reference. A counter seeded at 0 is correct and always present.
-        for outcome in ["resumed", "failed", "reclaimed"] {
+        for outcome in CRASH_RECOVERY_OUTCOMES {
             crash_recovery_total
                 .with_label_values(&[outcome])
                 .inc_by(0.0);
@@ -3225,13 +3238,14 @@ impl TalosMetrics {
                  = a later poll holding a schedule overdue by more than the \
                  catch-up threshold, e.g. after a host suspend/resume — both \
                  are BACKLOGS and drain under the startup ceiling), \
-                 outcome=completed|failed|skipped|denied|fenced. skipped = \
+                 outcome=completed|failed|skipped|denied|fenced|cancelled. skipped = \
                  refused for CAPACITY (concurrency cap or actor budget), \
                  which for a daily cron means the run is lost until tomorrow; \
                  denied = refused by POLICY (actor not runnable, capability \
-                 ceiling); fenced = superseded by a crash-recovery reclaim. \
-                 The five outcomes PARTITION every dispatch attempt, so the \
-                 total reconciles against the boot backlog size. Fifteen closed \
+                 ceiling); fenced = superseded by a crash-recovery reclaim; \
+                 cancelled = stopped by an operator cancel. \
+                 The six outcomes PARTITION every dispatch attempt, so the \
+                 total reconciles against the boot backlog size. Eighteen closed \
                  series; never labelled by workflow, schedule or user — \
                  unbounded cardinality.",
             ),
@@ -5413,7 +5427,7 @@ mod tests {
             // startup-phase series sit at 0 forever, and the alert on them is
             // built on `increase(...)` — so an absent series is a
             // detector that cannot fire on the very condition it exists to
-            // catch. All fifteen are asserted, not just the alerted ones: an
+            // catch. All eighteen are asserted, not just the alerted ones: an
             // operator comparing a backlog phase against steady needs both
             // halves to exist before either number means anything, and the
             // herd alert's ratio arm divides by the sum over ALL outcomes — an
@@ -5426,16 +5440,19 @@ mod tests {
             r#"talos_scheduler_dispatches_total{outcome="skipped",phase="startup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="denied",phase="startup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="fenced",phase="startup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="cancelled",phase="startup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="completed",phase="catchup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="failed",phase="catchup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="skipped",phase="catchup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="denied",phase="catchup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="fenced",phase="catchup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="cancelled",phase="catchup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="completed",phase="steady"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="failed",phase="steady"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="skipped",phase="steady"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="denied",phase="steady"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="fenced",phase="steady"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="cancelled",phase="steady"} 0"#,
             "talos_scheduler_readiness_holds_total 0",
             "talos_scheduler_readiness_degraded 0",
         ] {
@@ -5464,7 +5481,7 @@ mod tests {
     }
 
     // Crash-recovery outcome counter (durable execution, RFC 0003) must be
-    // registered, pre-seeded at 0 for all three outcomes (so dashboards/alerts
+    // registered, pre-seeded at 0 for every outcome (so dashboards/alerts
     // have a series in steady state), and increment correctly. A regression
     // here means the crash-recovery observability surface silently disappears.
     #[test]
@@ -5473,7 +5490,7 @@ mod tests {
 
         // Pre-seeded at 0 from new() — present before any recovery runs.
         let rendered = m.render_prometheus().expect("render");
-        for outcome in ["resumed", "failed", "reclaimed"] {
+        for outcome in CRASH_RECOVERY_OUTCOMES {
             assert!(
                 rendered.contains(&format!(
                     "talos_crash_recovery_total{{outcome=\"{outcome}\"}} 0"

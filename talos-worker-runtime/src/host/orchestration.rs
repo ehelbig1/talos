@@ -235,11 +235,21 @@ impl wit_agent_orchestration::Host for TalosContext {
             tracing::warn!(module_id = ?self.module_id, "WASM module attempted agent invoke but lacks Agent or Trusted capability");
             return Err(wit_agent_orchestration::Error::PermissionDenied);
         }
-
-        let nats = self
-            .nats_client
-            .as_ref()
-            .ok_or(wit_agent_orchestration::Error::InvocationFailed)?;
+        // Write-ceiling gate, parity with `messaging::request` (2026-09-25):
+        // invoking another agent is a NATS request to a responder that may
+        // mutate. Same op label and CATEGORICAL axis as messaging, so the
+        // ceiling's op partition is unchanged; the target names the agent.
+        let invoke_target = format!("agent:{}", msg.target);
+        if self
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "messaging-request",
+                &invoke_target,
+            )
+            .await
+        {
+            return Err(wit_agent_orchestration::Error::PermissionDenied);
+        }
 
         // Cap timeout to 120 seconds (WIT spec maximum)
         let timeout = std::time::Duration::from_millis(timeout_ms.min(120_000) as u64);
@@ -286,6 +296,33 @@ impl wit_agent_orchestration::Host for TalosContext {
             );
             return Err(wit_agent_orchestration::Error::InvocationFailed);
         }
+
+        // Rate limit AFTER pure validation (MCP-784's rule), sharing the
+        // guest's NATS publish budget with `messaging`.
+        if !self.check_rate_limit(
+            &self.messaging_publish_count,
+            MAX_MESSAGING_PUBLISHES_PER_EXECUTION,
+        ) {
+            tracing::warn!(module_id = ?self.module_id, "Agent invoke rate limit exceeded");
+            if let Some(ref m) = self.metrics {
+                m.record_rate_limit_exceeded("messaging");
+            }
+            return Err(wit_agent_orchestration::Error::InvocationFailed);
+        }
+        if self.dry_run {
+            tracing::info!(target_agent = %msg.target, "Dry-run: intercepted agent invoke");
+            return Ok(wit_agent_orchestration::AgentResponse {
+                source: msg.target,
+                payload: r#"{"__dry_run__":true}"#.to_string(),
+                success: true,
+                correlation_id: msg.correlation_id,
+            });
+        }
+
+        let nats = self
+            .nats_client
+            .clone()
+            .ok_or(wit_agent_orchestration::Error::InvocationFailed)?;
 
         // Build NATS topic for agent invocation
         let topic = talos_workflow_job_protocol::subjects::agent_invoke_for(&msg.target);
@@ -390,11 +427,18 @@ impl wit_agent_orchestration::Host for TalosContext {
             tracing::warn!(module_id = ?self.module_id, "WASM module attempted agent send but lacks Agent or Trusted capability");
             return Err(wit_agent_orchestration::Error::PermissionDenied);
         }
-
-        let nats = self
-            .nats_client
-            .as_ref()
-            .ok_or(wit_agent_orchestration::Error::InvocationFailed)?;
+        // Write-ceiling gate, parity with `messaging::publish` — see invoke.
+        let send_target = format!("agent:{}", msg.target);
+        if self
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "messaging-publish",
+                &send_target,
+            )
+            .await
+        {
+            return Err(wit_agent_orchestration::Error::PermissionDenied);
+        }
 
         // SECURITY: Sanitize agent target name (same rules as invoke).
         if msg.target.is_empty()
@@ -433,6 +477,25 @@ impl wit_agent_orchestration::Host for TalosContext {
             return Err(wit_agent_orchestration::Error::InvocationFailed);
         }
 
+        if !self.check_rate_limit(
+            &self.messaging_publish_count,
+            MAX_MESSAGING_PUBLISHES_PER_EXECUTION,
+        ) {
+            tracing::warn!(module_id = ?self.module_id, "Agent send rate limit exceeded");
+            if let Some(ref m) = self.metrics {
+                m.record_rate_limit_exceeded("messaging");
+            }
+            return Err(wit_agent_orchestration::Error::InvocationFailed);
+        }
+        if self.dry_run {
+            tracing::info!(target_agent = %msg.target, "Dry-run: intercepted agent send");
+            return Ok(());
+        }
+
+        let nats = self
+            .nats_client
+            .clone()
+            .ok_or(wit_agent_orchestration::Error::InvocationFailed)?;
         let topic = talos_workflow_job_protocol::subjects::agent_message_for(&msg.target);
 
         // H-4: signed NATS envelope, see invoke() above for rationale.
@@ -637,5 +700,65 @@ mod signed_agent_envelope_tests {
 
         let res = verify_signed_agent_envelope(subject, &tampered_bytes);
         assert!(res.is_err(), "tampered payload must fail HMAC verify");
+    }
+}
+
+#[cfg(test)]
+mod agent_gate_parity_tests {
+    use super::*;
+
+    fn agent_ctx() -> TalosContext {
+        TalosContext::new(
+            crate::wit_inspector::CapabilityWorld::Agent,
+            vec![],
+            vec![],
+            128,
+            std::collections::HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            talos_workflow_job_protocol::LlmTier::Tier2,
+            None,
+        )
+        .expect("context builds")
+    }
+
+    fn msg() -> wit_agent_orchestration::AgentMessage {
+        wit_agent_orchestration::AgentMessage {
+            target: "planner".to_string(),
+            payload: "{}".to_string(),
+            correlation_id: None,
+        }
+    }
+
+    /// Dry-run intercepts both before any NATS is needed; a spent publish
+    /// budget refuses both BEFORE the dry-run mock (the pre-fix code had
+    /// neither gate and would have tried NATS).
+    #[tokio::test]
+    async fn invoke_and_send_honour_dry_run_and_the_publish_budget() {
+        use wit_agent_orchestration::Host;
+        let mut ctx = agent_ctx();
+        ctx.dry_run = true;
+        let r = ctx
+            .invoke(msg(), 1000)
+            .await
+            .expect("dry-run invoke is mocked");
+        assert!(r.payload.contains("__dry_run__"));
+        assert!(ctx.send(msg()).await.is_ok());
+
+        ctx.messaging_publish_count.store(
+            MAX_MESSAGING_PUBLISHES_PER_EXECUTION,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(matches!(
+            ctx.invoke(msg(), 1000).await,
+            Err(wit_agent_orchestration::Error::InvocationFailed)
+        ));
+        assert!(matches!(
+            ctx.send(msg()).await,
+            Err(wit_agent_orchestration::Error::InvocationFailed)
+        ));
     }
 }

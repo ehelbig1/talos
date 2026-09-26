@@ -71,7 +71,6 @@ talos-audit-ledger = { path = "../talos-audit-ledger" }
 talos-db = { path = "../talos-db" }
 talos-text-util = { path = "../talos-text-util" }
 talos-trace-nats = { path = "../talos-trace-nats" }
-talos-workflow-signing = { path = "../talos-workflow-signing" }
 talos-capability-downgrade = { path = "../talos-capability-downgrade" }
 talos-workflow-creation = { path = "../talos-workflow-creation" }
 talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }

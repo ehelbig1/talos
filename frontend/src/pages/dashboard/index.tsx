@@ -2,6 +2,7 @@ import React, { useState, useMemo, lazy, Suspense } from "react";
 import { useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { userFacingErrorMessage } from "@/lib/sanitize";
 
 const WorkflowExecutionHistoryDialog = lazy(
   () => import("@/components/settings/WorkflowExecutionHistoryDialog"),
@@ -12,16 +13,13 @@ const WorkflowVersionsPanel = lazy(
 import { gql, subscribeWorkflowExecutions } from "@/lib/graphqlClient";
 import { useEffect } from "react";
 import type {
-  WorkflowsQuery,
   ListActorsQuery,
   LatestWorkflowExecutionsQuery,
   MySchedulesQuery,
 } from "@/generated/graphql";
 import {
   useListActorsQuery,
-  useWorkflowsQuery,
   useTriggerWorkflowMutation,
-  useLatestWorkflowExecutionsQuery,
   useDeleteWorkflowMutation,
   useGetApprovalsQuery,
   useMySchedulesQuery,
@@ -36,6 +34,10 @@ import { Search, Activity, Plus, ChevronDown } from "lucide-react";
 import WorkflowStatsPanel from "./WorkflowStatsPanel";
 import ActorsPanel from "./ActorsPanel";
 import WorkflowCard from "./WorkflowCard";
+import {
+  useDashboardWorkflows,
+  useLatestExecutions,
+} from "@/lib/dashboardData";
 import EmptyState from "./EmptyState";
 import type { Workflow, WorkflowSchedule } from "./WorkflowCard";
 
@@ -69,8 +71,9 @@ export default function Dashboard() {
       toast.success("Workflow deleted");
       setWorkflowToDelete(null);
     },
-    onError: () => {
-      toast.error("Failed to delete workflow");
+    onError: (err) => {
+      // A refusal (running executions, referenced as a sub-workflow) says why.
+      toast.error(userFacingErrorMessage(err, "Failed to delete workflow"));
       setWorkflowToDelete(null);
     },
   });
@@ -99,10 +102,12 @@ export default function Dashboard() {
     return map;
   }, [schedulesData]);
 
-  const { data: workflows = [], isLoading } = useWorkflowsQuery(undefined, {
-    staleTime: 60_000,
-    select: (data: WorkflowsQuery) => data.workflows,
-  });
+  const { data: workflowsData, isLoading } = useDashboardWorkflows();
+  const workflows = useMemo(
+    () => workflowsData?.workflows ?? [],
+    [workflowsData],
+  );
+  const workflowsTruncated = workflowsData?.truncated ?? false;
 
   const { data: actorsData } = useListActorsQuery(undefined, {
     staleTime: 30_000,
@@ -182,16 +187,8 @@ export default function Dashboard() {
   // ---------------------------------------------------------------------
   // Periodic refetch of latest workflow execution status.
   // ---------------------------------------------------------------------
-  const { data: latestExecutionsData } = useLatestWorkflowExecutionsQuery(
-    { workflowIds: workflows.map((w) => w.id) },
-    {
-      enabled: workflows.length > 0,
-      // Frequency significantly reduced; WebSocket handles immediate start-up telemetry.
-      // Heartbeat refetch remains as a fallback for terminal state transitions.
-      refetchInterval: 30_000,
-      refetchOnWindowFocus: true,
-    },
-  );
+  const workflowIds = useMemo(() => workflows.map((w) => w.id), [workflows]);
+  const { data: latestExecutionsData } = useLatestExecutions(workflowIds);
 
   React.useEffect(() => {
     if (latestExecutionsData?.latestWorkflowExecutions) {
@@ -408,6 +405,14 @@ export default function Dashboard() {
 
         {/* Workflow Grid */}
         <section className="relative">
+          {workflowsTruncated && (
+            <p
+              role="status"
+              className="mb-6 text-[10px] font-black uppercase tracking-widest text-warning"
+            >
+              Showing the first {workflows.length} workflows; more exist.
+            </p>
+          )}
           {workflows.length === 0 ? (
             <EmptyState onNew={handleNew} />
           ) : filteredWorkflows.length === 0 ? (

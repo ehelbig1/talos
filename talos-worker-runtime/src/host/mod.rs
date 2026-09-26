@@ -56,6 +56,10 @@ mod local_egress_literal_tests;
 #[cfg(test)]
 mod sse_connect_failure_tests;
 
+/// `fetch` / `fetch_all` admission, pinned per refusal across the extraction
+/// into `egress_admission`.
+#[cfg(test)]
+mod http_admission_characterization_tests;
 /// `vault://` body substitution must reach every guest-composed egress
 /// surface, not only `http::fetch` (2026-09-24).
 #[cfg(test)]
@@ -66,6 +70,7 @@ mod crypto;
 mod data;
 mod database;
 mod egress;
+mod egress_admission;
 mod email;
 mod files;
 mod governance;
@@ -74,6 +79,8 @@ mod http;
 mod http_stream;
 mod integration_state;
 mod limits;
+/// Byte-level SSE line reader shared by the two streaming readers.
+mod line_reader;
 mod llm;
 pub(crate) mod llm_gate;
 pub(crate) mod llm_providers;

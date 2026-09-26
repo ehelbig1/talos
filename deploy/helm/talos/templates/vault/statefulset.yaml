@@ -42,6 +42,8 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/vault/configmap.yaml") . | sha256sum }}
     spec:
+      # No Kubernetes API access needed: no service-account token in the pod.
+      automountServiceAccountToken: false
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "talos.podSecurityContext" . | nindent 8 }}

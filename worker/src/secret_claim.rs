@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::time::Duration;
+use zeroize::{Zeroize, Zeroizing};
 
 use talos_workflow_job_protocol::{
     ClaimResponse, DispatchSigningKey, DispatchVerifyingKey, SecretClaim, WorkerEphemeral,
@@ -100,7 +101,7 @@ pub fn process_reply_raw(
     worker_id: &str,
     controller_keys: &[DispatchVerifyingKey],
     reply_bytes: &[u8],
-) -> Result<Vec<u8>, ClaimClientError> {
+) -> Result<Zeroizing<Vec<u8>>, ClaimClientError> {
     if controller_keys.is_empty() {
         return Err(ClaimClientError::NoControllerKey);
     }
@@ -128,6 +129,31 @@ pub fn process_reply_raw(
     .map_err(ClaimClientError::OpenFailed)
 }
 
+/// Per-step secret maps that wipe every value still held when dropped —
+/// the pipeline path moves each step's map out with [`Self::take`], and
+/// anything left over (or everything, on an early return) is zeroized.
+pub struct ZeroizingSecretMaps(Vec<HashMap<String, String>>);
+
+impl ZeroizingSecretMaps {
+    pub fn new(maps: Vec<HashMap<String, String>>) -> Self {
+        Self(maps)
+    }
+    /// Move step `i`'s map out (empty when absent), leaving nothing behind.
+    pub fn take(&mut self, i: usize) -> HashMap<String, String> {
+        self.0.get_mut(i).map(std::mem::take).unwrap_or_default()
+    }
+}
+
+impl Drop for ZeroizingSecretMaps {
+    fn drop(&mut self) {
+        for map in &mut self.0 {
+            for v in map.values_mut() {
+                v.zeroize();
+            }
+        }
+    }
+}
+
 /// Verify + open the controller's reply into a flat secrets map (single-node
 /// convenience over [`process_reply_raw`]).
 pub fn process_reply(
@@ -138,7 +164,7 @@ pub fn process_reply(
     reply_bytes: &[u8],
 ) -> Result<HashMap<String, String>, ClaimClientError> {
     let plaintext = process_reply_raw(we, exec_id, worker_id, controller_keys, reply_bytes)?;
-    serde_json::from_slice(&plaintext).map_err(|e| ClaimClientError::Serde(e.to_string()))
+    serde_json::from_slice(plaintext.as_slice()).map_err(|e| ClaimClientError::Serde(e.to_string()))
 }
 
 /// Full claim round-trip over NATS returning the RAW opened plaintext bytes.
@@ -152,7 +178,7 @@ pub async fn claim_secrets_raw(
     worker_id: &str,
     worker_signing_key: &DispatchSigningKey,
     controller_keys: &[DispatchVerifyingKey],
-) -> Result<Vec<u8>, ClaimClientError> {
+) -> Result<Zeroizing<Vec<u8>>, ClaimClientError> {
     let claim_inbox = claim_inbox.ok_or(ClaimClientError::MissingClaimInbox)?;
     if controller_keys.is_empty() {
         return Err(ClaimClientError::NoControllerKey);
@@ -190,13 +216,25 @@ pub async fn claim_secrets(
         controller_keys,
     )
     .await?;
-    serde_json::from_slice(&plaintext).map_err(|e| ClaimClientError::Serde(e.to_string()))
+    serde_json::from_slice(plaintext.as_slice()).map_err(|e| ClaimClientError::Serde(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use talos_workflow_job_protocol::{seal_secrets, SealedSecrets};
+
+    #[test]
+    fn leftover_step_maps_are_wiped_and_taken_maps_leave_nothing() {
+        let map = |v: &str| -> HashMap<String, String> {
+            [("k".to_string(), v.to_string())].into_iter().collect()
+        };
+        let mut maps = ZeroizingSecretMaps::new(vec![map("s0"), map("s1")]);
+        assert_eq!(maps.take(0).get("k").unwrap(), "s0");
+        assert!(maps.take(0).is_empty(), "a taken map is moved, not copied");
+        assert!(maps.take(9).is_empty());
+        assert_eq!(maps.take(1).get("k").unwrap(), "s1");
+    }
 
     #[test]
     fn build_and_process_roundtrip_against_simulated_controller() {

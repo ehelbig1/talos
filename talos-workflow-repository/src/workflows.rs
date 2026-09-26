@@ -1120,6 +1120,16 @@ impl WorkflowRepository {
     /// Paginated workflow listing across ownership OR org access, newest
     /// first with a unique `id DESC` tiebreaker. Same scoped-executor
     /// contract as `get_workflow_for_accessor_scoped`.
+    ///
+    /// `projection` says what the caller will render: `graph_json` is
+    /// returned only when asked for (a list that only needs counts does not
+    /// ship every graph), and the node/edge counts are derived in SQL, over
+    /// the requested PAGE only (the inner query paginates first), and only
+    /// when asked for. `graph_json` is TEXT, so text that is not valid JSON —
+    /// or a graph without a `nodes`/`edges` array — yields a NULL count
+    /// rather than failing the whole list (`pg_input_is_valid` guards the
+    /// cast). [`graph_counts_from_json`] is the Rust twin for rows read
+    /// elsewhere.
     pub async fn list_workflows_for_accessor_scoped(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -1127,16 +1137,35 @@ impl WorkflowRepository {
         accessible_org_ids: &[Uuid],
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<WorkflowAccessRow>> {
-        let rows = sqlx::query_as::<_, WorkflowAccessRow>(
-            "SELECT id, name, graph_json, graph_version, max_concurrent_executions, intent, actor_id \
-             FROM workflows WHERE (user_id = $1 OR org_id = ANY($4)) \
-             ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
+        projection: WorkflowListProjection,
+    ) -> Result<Vec<WorkflowListRow>> {
+        let rows = sqlx::query_as::<_, WorkflowListRow>(
+            "SELECT p.id, p.name, \
+                    CASE WHEN $5 THEN p.graph_json END AS graph_json, \
+                    p.graph_version, p.max_concurrent_executions, p.intent, p.actor_id, \
+                    CASE WHEN jsonb_typeof(g.doc -> 'nodes') = 'array' \
+                         THEN jsonb_array_length(g.doc -> 'nodes') END AS node_count, \
+                    CASE WHEN jsonb_typeof(g.doc -> 'edges') = 'array' \
+                         THEN jsonb_array_length(g.doc -> 'edges') END AS edge_count \
+             FROM ( \
+                 SELECT id, name, graph_json, graph_version, max_concurrent_executions, \
+                        intent, actor_id, created_at \
+                 FROM workflows WHERE (user_id = $1 OR org_id = ANY($4)) \
+                 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3 \
+             ) p \
+             LEFT JOIN LATERAL ( \
+                 SELECT CASE WHEN $6 AND pg_input_is_valid(p.graph_json, 'jsonb') \
+                             THEN p.graph_json::jsonb END AS doc \
+                 OFFSET 0 \
+             ) g ON true \
+             ORDER BY p.created_at DESC, p.id DESC",
         )
         .bind(user_id)
         .bind(limit)
         .bind(offset)
         .bind(accessible_org_ids)
+        .bind(projection.graph_json)
+        .bind(projection.graph_counts)
         .fetch_all(conn)
         .await?;
         Ok(rows)
@@ -2600,7 +2629,7 @@ pub struct GraphAndActorRow {
 }
 
 /// Workflow row (accessor-gated projection) returned by
-/// `get_workflow_for_accessor_scoped` / `list_workflows_for_accessor_scoped`.
+/// `get_workflow_for_accessor_scoped`.
 #[derive(Debug, sqlx::FromRow)]
 pub struct WorkflowAccessRow {
     pub id: Uuid,
@@ -2612,6 +2641,48 @@ pub struct WorkflowAccessRow {
     pub max_concurrent_executions: Option<i32>,
     pub intent: Option<serde_json::Value>,
     pub actor_id: Option<Uuid>,
+}
+
+/// What a `list_workflows_for_accessor_scoped` caller will render.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorkflowListProjection {
+    /// Return `graph_json` (otherwise the column comes back NULL).
+    pub graph_json: bool,
+    /// Derive `node_count` / `edge_count` in SQL (otherwise both are NULL).
+    pub graph_counts: bool,
+}
+
+/// Row returned by `list_workflows_for_accessor_scoped`. `graph_json` is
+/// `None` when the projection did not ask for it; a count is `None` when it
+/// was not asked for or the stored graph has no such array.
+#[derive(Debug, sqlx::FromRow)]
+pub struct WorkflowListRow {
+    pub id: Uuid,
+    pub name: String,
+    pub graph_json: Option<String>,
+    pub graph_version: i64,
+    pub max_concurrent_executions: Option<i32>,
+    pub intent: Option<serde_json::Value>,
+    pub actor_id: Option<Uuid>,
+    pub node_count: Option<i32>,
+    pub edge_count: Option<i32>,
+}
+
+/// Node and edge counts of a stored graph: the lengths of its top-level
+/// `nodes` / `edges` arrays, each `None` when the text is not JSON or the key
+/// is missing or not an array. The Rust twin of the SQL derivation in
+/// `list_workflows_for_accessor_scoped`, for a graph already in memory.
+#[must_use]
+pub fn graph_counts_from_json(graph_json: &str) -> (Option<i32>, Option<i32>) {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(graph_json) else {
+        return (None, None);
+    };
+    let len = |key: &str| {
+        doc.get(key)
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| i32::try_from(a.len()).ok())
+    };
+    (len("nodes"), len("edges"))
 }
 
 /// The number of nodes a stored graph declares: the length of its top-level
@@ -3119,5 +3190,32 @@ mod node_count_from_graph_json_tests {
             )),
             3
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_counts_from_json_tests {
+    use super::graph_counts_from_json;
+
+    #[test]
+    fn counts_each_array_and_nulls_what_is_not_one() {
+        assert_eq!(
+            graph_counts_from_json(r#"{"nodes":[{},{}],"edges":[{}]}"#),
+            (Some(2), Some(1))
+        );
+        assert_eq!(
+            graph_counts_from_json(r#"{"nodes":[],"edges":[]}"#),
+            (Some(0), Some(0))
+        );
+        // A missing or non-array key is unknown, not zero.
+        assert_eq!(graph_counts_from_json(r#"{"nodes":[1]}"#), (Some(1), None));
+        assert_eq!(
+            graph_counts_from_json(r#"{"nodes":"x","edges":{}}"#),
+            (None, None)
+        );
+        // Malformed text or a non-object document never fails the caller.
+        assert_eq!(graph_counts_from_json("not json"), (None, None));
+        assert_eq!(graph_counts_from_json("[1,2]"), (None, None));
+        assert_eq!(graph_counts_from_json(""), (None, None));
     }
 }

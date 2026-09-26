@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
+  MAX_STREAMING_CHARS,
+  boundStreamingText,
+  flushExecutionUpdates,
   useEphemeralExecutionStore,
   usePersistedExecutionStore,
 } from "./executionStore";
@@ -11,6 +14,8 @@ describe("executionStore", () => {
         nodeStatuses: {},
         nodeResults: {},
         events: [],
+        processedLogs: [],
+        nodeStreamingContent: {},
         currentExecutionId: null,
         currentWorkflowId: null,
         isRunning: false,
@@ -42,13 +47,60 @@ describe("executionStore", () => {
         elapsedMs: 100,
       } as any;
       store.addEvent(event);
+      flushExecutionUpdates();
       expect(useEphemeralExecutionStore.getState().events).toHaveLength(1);
     });
 
     it("stores the event payload it was given", () => {
       const event = { executionId: "1", status: "ok", elapsedMs: 100 } as any;
       useEphemeralExecutionStore.getState().addEvent(event);
+      flushExecutionUpdates();
       expect(useEphemeralExecutionStore.getState().events[0]).toEqual(event);
+    });
+
+    it("buffers a burst of events into ONE store update, bounded at 5000", () => {
+      let notifications = 0;
+      const unsub = useEphemeralExecutionStore.subscribe(() => notifications++);
+      const store = useEphemeralExecutionStore.getState();
+      for (let i = 0; i < 6000; i++) {
+        store.addEvent({
+          executionId: "e",
+          status: "RUNNING",
+          elapsedMs: i,
+        } as never);
+      }
+      expect(notifications).toBe(0);
+      flushExecutionUpdates();
+      unsub();
+      expect(notifications).toBe(1);
+      const state = useEphemeralExecutionStore.getState();
+      expect(state.events).toHaveLength(5000);
+      expect(state.processedLogs).toHaveLength(5000);
+      // The newest are kept, with increasing row keys.
+      expect(state.events[4999].elapsedMs).toBe(5999);
+      expect(state.processedLogs[4999].seq).toBeGreaterThan(
+        state.processedLogs[0].seq,
+      );
+    });
+
+    it("streams tokens in batches and bounds each node's text", () => {
+      const store = useEphemeralExecutionStore.getState();
+      store.appendNodeStreamingContent("n1", "a".repeat(MAX_STREAMING_CHARS));
+      store.appendNodeStreamingContent("n1", "tail");
+      flushExecutionUpdates();
+      const text =
+        useEphemeralExecutionStore.getState().nodeStreamingContent.n1;
+      expect(text.length).toBe(MAX_STREAMING_CHARS);
+      expect(text.endsWith("tail")).toBe(true);
+      expect(boundStreamingText("short")).toBe("short");
+    });
+
+    it("a new run discards events buffered for the previous one", () => {
+      const store = useEphemeralExecutionStore.getState();
+      store.addEvent({ executionId: "old", status: "RUNNING" } as never);
+      store.setRunning("new", "wf");
+      flushExecutionUpdates();
+      expect(useEphemeralExecutionStore.getState().events).toEqual([]);
     });
 
     it("starts running and clears previous state", () => {

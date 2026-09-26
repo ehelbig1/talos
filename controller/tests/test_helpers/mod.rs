@@ -113,6 +113,7 @@ async fn shared_conn_string() -> String {
                 // reads `CONTAINER_ID`, which is written once above and never
                 // mutated, and is registered exactly once (guarded by the
                 // `OnceLock::set` succeeding).
+                #[allow(unsafe_code)] // see SAFETY above.
                 unsafe {
                     libc::atexit(reap_shared_container);
                 }

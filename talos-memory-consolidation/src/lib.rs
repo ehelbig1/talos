@@ -131,9 +131,13 @@ async fn summarize_external_budgeted(
         return Ok(None);
     }
     let client = talos_llm::LlmClient::with_vault(secrets_manager.clone(), None);
-    let raw = client
-        .generate_with_schema(system, user, schema, tool_name)
-        .await?;
+    // Attributed to the actor: the budget gate above sums its own spend.
+    let raw = talos_llm::usage::scoped_actor(
+        actor_id,
+        None,
+        client.generate_with_schema(system, user, schema, tool_name),
+    )
+    .await?;
     Ok(Some(raw))
 }
 
@@ -514,15 +518,20 @@ async fn run_consolidation_tick(
                     tracing::warn!(target: "talos_memory_consolidation", %actor_id, "local summarize planned but ollama unavailable; skipping");
                     continue;
                 };
-                match ollama
-                    .complete_with_schema(
+                // Attributed to the actor, so the spend counts against its
+                // `max_llm_tokens_per_day` (the budget this loop checks).
+                match talos_llm::usage::scoped_actor(
+                    actor_id,
+                    None,
+                    ollama.complete_with_schema(
                         &model,
                         &system,
                         &user,
                         SUMMARY_MAX_TOKENS,
                         &consolidation_schema(),
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
                     Ok(s) => s,
                     Err(e) => {
@@ -1085,15 +1094,20 @@ async fn run_reflection_tick(
                     tracing::warn!(target: "talos_memory_reflection", %actor_id, "local reflection planned but ollama unavailable; skipping");
                     continue;
                 };
-                match ollama
-                    .complete_with_schema(
+                // Attributed to the actor, so the spend counts against its
+                // `max_llm_tokens_per_day` (the budget this loop checks).
+                match talos_llm::usage::scoped_actor(
+                    actor_id,
+                    None,
+                    ollama.complete_with_schema(
                         &model,
                         &system,
                         &user,
                         REFLECTION_MAX_TOKENS,
                         &reflection_schema(),
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
                     Ok(s) => s,
                     Err(e) => {

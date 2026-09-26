@@ -56,7 +56,9 @@ use std::sync::Arc;
 use talos_integration_helpers::audit::{
     insert_channel_audit, truncate_and_redact_error, ChannelAuditEvent,
 };
-use talos_integration_helpers::state_store::{ttl_with_grace, ChannelStore, CreateLockMap};
+use talos_integration_helpers::state_store::{
+    ttl_with_grace, ChannelStore, CreateLockMap, RowUpdate, UpdateOutcome,
+};
 use talos_integration_helpers::watch_binding::{check_module_binding, ModuleBindingRefusal};
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{
@@ -97,6 +99,32 @@ pub struct GmailWatchRow {
     pub workflow_id: Option<Uuid>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// The stored form of a watch row. Same 14-day TTL grace as gcal so a streak
+/// of renewal failures doesn't sweep the row out of the scheduler's view —
+/// the grace rule lives in `talos_integration_helpers::state_store`.
+fn row_write(row: &GmailWatchRow) -> Result<(serde_json::Value, Option<u64>, IndexedSlots)> {
+    Ok((
+        serde_json::to_value(row).context("encode gmail row")?,
+        ttl_with_grace(row.expiration_ms),
+        IndexedSlots {
+            idx_str_1: Some(row.email_address.clone()),
+            idx_str_2: Some(row.topic_name.clone()),
+            idx_ts_1_ms: Some(row.expiration_ms),
+            idx_int_1: None,
+        },
+    ))
+}
+
+/// The cursor-advanced row, or `None` when `new_history_id` would not move it
+/// forward (monotonic: a late push never regresses the stored cursor).
+fn advanced_row(mut row: GmailWatchRow, new_history_id: u64, now_ms: i64) -> Option<GmailWatchRow> {
+    (new_history_id > row.history_id).then(|| {
+        row.history_id = new_history_id;
+        row.updated_at_ms = now_ms;
+        row
+    })
 }
 
 fn decode_row(entry: &StoredEntry) -> Result<GmailWatchRow> {
@@ -260,7 +288,7 @@ impl GmailWatchService {
         // replaces the filter; we don't want to do that implicitly,
         // so fast-path skips the Google call entirely and only flips
         // our bookkeeping.
-        if let Some(mut existing) = self
+        if let Some(existing) = self
             .find_single_for_integration(user_id, integration_id)
             .await?
         {
@@ -272,11 +300,30 @@ impl GmailWatchService {
                     );
                 }
             }
-            existing.module_id = module_id;
-            existing.workflow_id = workflow_id;
-            existing.updated_at_ms = Utc::now().timestamp_millis();
-            self.upsert_row(user_id, &existing).await?;
-            return Ok(existing);
+            // Field-scoped, row-locked: only the binding changes, so a
+            // concurrent cursor advance is never reverted.
+            let now_ms = Utc::now().timestamp_millis();
+            let mut rebound = None;
+            self.store()
+                .update_existing(user_id, existing.id, |entry| {
+                    let mut row = decode_row(entry)?;
+                    row.module_id = module_id;
+                    row.workflow_id = workflow_id;
+                    row.updated_at_ms = now_ms;
+                    let (value, ttl_seconds, slots) = row_write(&row)?;
+                    rebound = Some(row);
+                    Ok(RowUpdate::Replace {
+                        value,
+                        ttl_seconds,
+                        slots,
+                    })
+                })
+                .await?;
+            // `None`: the row vanished since the lookup (a concurrent stop);
+            // fall through and create a fresh watch.
+            if let Some(row) = rebound {
+                return Ok(row);
+            }
         }
 
         Ok(self
@@ -475,14 +522,18 @@ impl GmailWatchService {
                 idx_str_1_eq: Some(email.to_string()),
                 ..Default::default()
             };
-            // Errors are deliberately ignored (pre-extraction `if let
-            // Ok(...)` behavior): a failing user is skipped, the next
-            // owner is tried.
-            if let Ok(entries) = self.store().list_entries(user_id, filter, 1).await {
-                if let Some(entry) = entries.into_iter().next() {
-                    let row = decode_row(&entry)?;
-                    return Ok(Some((user_id, row)));
-                }
+            // An owner whose read FAILED is not skipped: owners are tried in
+            // user_id order, so a failure means the deterministic target is
+            // unknown. `Err` makes the push handler defer (503) instead of
+            // acking a delivery that may well have a watch.
+            let entries = self
+                .store()
+                .list_entries(user_id, filter, 1)
+                .await
+                .context("gmail watch lookup by mailbox")?;
+            if let Some(entry) = entries.into_iter().next() {
+                let row = decode_row(&entry)?;
+                return Ok(Some((user_id, row)));
             }
         }
         Ok(None)
@@ -497,14 +548,27 @@ impl GmailWatchService {
         channel_uuid: Uuid,
         new_history_id: u64,
     ) -> Result<()> {
-        let mut row = self.require_by_id(user_id, channel_uuid).await?;
-        // Monotonic: never regress. If a later push arrived first
-        // (unlikely but technically possible under retry pressure),
-        // we keep the higher cursor.
-        if new_history_id > row.history_id {
-            row.history_id = new_history_id;
-            row.updated_at_ms = Utc::now().timestamp_millis();
-            self.upsert_row(user_id, &row).await?;
+        // Row-locked read-modify-write of the EXISTING row: a concurrent stop
+        // (delete) or rewrite (binding change, renewal) is never undone.
+        let now_ms = Utc::now().timestamp_millis();
+        let outcome = self
+            .store()
+            .update_existing(user_id, channel_uuid, |entry| {
+                let row = decode_row(entry)?;
+                match advanced_row(row, new_history_id, now_ms) {
+                    Some(row) => {
+                        row_write(&row).map(|(value, ttl_seconds, slots)| RowUpdate::Replace {
+                            value,
+                            ttl_seconds,
+                            slots,
+                        })
+                    }
+                    None => Ok(RowUpdate::Unchanged),
+                }
+            })
+            .await?;
+        if outcome == UpdateOutcome::Absent {
+            tracing::debug!(%channel_uuid, "gmail watch gone before cursor advance; not recreated");
         }
         Ok(())
     }
@@ -628,25 +692,9 @@ impl GmailWatchService {
     }
 
     async fn upsert_row(&self, user_id: Uuid, row: &GmailWatchRow) -> Result<()> {
-        let value = serde_json::to_value(row).context("encode gmail row")?;
-        // Same 14-day grace as gcal so a streak of renewal failures
-        // doesn't sweep the row out of the scheduler's view — the
-        // grace rule lives in `talos_integration_helpers::state_store`.
-        let ttl_seconds = ttl_with_grace(row.expiration_ms);
-
+        let (value, ttl_seconds, slots) = row_write(row)?;
         self.store()
-            .set(
-                user_id,
-                row.id,
-                value,
-                ttl_seconds,
-                IndexedSlots {
-                    idx_str_1: Some(row.email_address.clone()),
-                    idx_str_2: Some(row.topic_name.clone()),
-                    idx_ts_1_ms: Some(row.expiration_ms),
-                    idx_int_1: None,
-                },
-            )
+            .set(user_id, row.id, value, ttl_seconds, slots)
             .await
     }
 
@@ -787,5 +835,47 @@ impl GmailWatchService {
         integration_id: Uuid,
     ) -> tokio::sync::OwnedMutexGuard<()> {
         self.create_locks.acquire((user_id, integration_id)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(history_id: u64) -> GmailWatchRow {
+        GmailWatchRow {
+            id: Uuid::nil(),
+            integration_id: Uuid::nil(),
+            email_address: "a@example.com".into(),
+            topic_name: "projects/p/topics/t".into(),
+            history_id,
+            label_ids: vec![],
+            expiration_ms: 0,
+            module_id: None,
+            workflow_id: Some(Uuid::from_u128(7)),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn the_cursor_only_moves_forward() {
+        let advanced = advanced_row(row(10), 12, 99).expect("forward move");
+        assert_eq!((advanced.history_id, advanced.updated_at_ms), (12, 99));
+        // Everything else is the CURRENT row's, not a stale copy's.
+        assert_eq!(advanced.workflow_id, Some(Uuid::from_u128(7)));
+        assert!(advanced_row(row(10), 10, 99).is_none());
+        assert!(advanced_row(row(10), 9, 99).is_none());
+    }
+
+    /// The hot path must not read → upsert (resurrects a stopped watch,
+    /// reverts a concurrent rewrite). Source pin.
+    #[test]
+    fn cursor_advance_goes_through_the_row_locked_update() {
+        let src = include_str!("watch.rs");
+        let body = &src[src.find("pub async fn advance_history_id").unwrap()..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        assert!(body.contains("update_existing("));
+        assert!(!body.contains("upsert_row") && !body.contains("require_by_id"));
     }
 }

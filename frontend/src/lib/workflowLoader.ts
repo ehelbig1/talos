@@ -75,10 +75,22 @@ interface GraphJson {
   [key: string]: unknown;
 }
 
+/** Advances per call: only the most recent load may populate the editor. */
+let latestLoad = 0;
+
 /**
- * Load a workflow from the backend by ID and populate the editor
+ * Load a workflow from the backend by ID and populate the editor.
+ *
+ * A response that arrives after a newer load started, or after the caller
+ * says it no longer wants it (`isCurrent`, e.g. the route moved on), is
+ * dropped instead of overwriting the editor. Resolves `true` when applied.
  */
-export async function loadWorkflowById(workflowId: string): Promise<void> {
+export async function loadWorkflowById(
+  workflowId: string,
+  options: { isCurrent?: () => boolean } = {},
+): Promise<boolean> {
+  const load = ++latestLoad;
+  const stale = () => load !== latestLoad || options.isCurrent?.() === false;
   try {
     // Fetch workflow from backend
     const data = await graphqlRequest<GetWorkflowLoaderQuery>(
@@ -87,9 +99,10 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
     );
 
     const workflow = data.workflow;
+    if (stale()) return false;
     if (!workflow) {
       toast.error("Workflow not found");
-      return;
+      return false;
     }
 
     // Guard against excessively large graphJson payloads (>2 MiB) before parsing.
@@ -298,6 +311,7 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
       };
     });
 
+    if (stale()) return false;
     // Update the workflow store
     const store = useWorkflowStore.getState();
     if (import.meta.env.DEV)
@@ -318,7 +332,9 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
       (workflow.intent as Record<string, unknown> | null | undefined) ?? {},
     );
     store.loadWorkflow({ nodes, edges });
+    return true;
   } catch (error) {
+    if (stale()) return false;
     if (import.meta.env.DEV) console.error("Failed to load workflow:", error);
     // Notify the user so they know what failed
     toast.error(

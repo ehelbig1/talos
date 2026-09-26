@@ -9,7 +9,7 @@
 #   (or use scripts/build-compiler-image.sh)
 
 # ---------- stage 1: install toolchain + cargo extensions ----------
-FROM rust:1.91-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65 AS builder-base
+FROM rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS builder-base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -26,7 +26,7 @@ RUN rustup target add wasm32-wasip2
 
 # Install cargo-component (WASM component model toolchain) and cargo-audit (CVE scanner)
 RUN cargo install cargo-component@0.21.1 --locked && \
-    cargo install cargo-audit --locked
+    cargo install cargo-audit --version 0.22.2 --locked
 
 # Pre-fetch the RustSec advisory database. The runtime container runs
 # `cargo audit --no-fetch --db /opt/talos-advisory-db` (network is denied
@@ -59,7 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
     chmod -R a+rX /opt/talos-advisory-db
 
 # ---------- stage 2: slim runtime image ----------
-FROM rust:1.91-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65
+FROM rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082
 
 ENV DEBIAN_FRONTEND=noninteractive
 

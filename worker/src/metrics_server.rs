@@ -309,6 +309,48 @@ fn validate_bearer_token(auth_header: Option<&str>) -> bool {
     false
 }
 
+/// The `Authorization` header value, split on the FIRST ':' only — a token
+/// containing ':' was truncated by `split(':').nth(1)`.
+fn authorization_header<'a>(lines: &[&'a str]) -> Option<&'a str> {
+    lines
+        .iter()
+        .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+        .and_then(|line| line.split_once(':'))
+        .map(|(_, v)| v.trim())
+}
+
+/// Cap on the request line + headers the metrics server will read.
+const MAX_REQUEST_HEAD_BYTES: usize = 4096;
+
+/// Read until the end of the HTTP header block (`\r\n\r\n`), EOF, or
+/// `cap` bytes — whichever comes first. More than `cap` bytes without a
+/// header terminator is refused. Generic so it is testable over a duplex.
+async fn read_request_head<R>(r: &mut R, cap: usize) -> Result<Vec<u8>, &'static str>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = r.read(&mut chunk).await.map_err(|_| "Read error")?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > cap {
+            return Err("Invalid request size");
+        }
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    if buf.is_empty() {
+        return Err("Invalid request size");
+    }
+    Ok(buf)
+}
+
 /// Handle a single HTTP connection with security hardening
 async fn handle_connection(
     socket: tokio::net::TcpStream,
@@ -330,23 +372,22 @@ async fn handle_connection(
         return Ok(());
     }
 
-    // SECURITY: Read with timeout and size limit
-    let mut buffer = vec![0u8; 4096]; // Reduced from 8192 for security
-
-    let read_result =
-        tokio::time::timeout(std::time::Duration::from_secs(5), socket.readable()).await;
-
-    if read_result.is_err() {
-        return Err("Read timeout".into());
-    }
-
-    socket.readable().await?;
-    let n = socket.try_read(&mut buffer)?;
-
-    // SECURITY: Validate request size
-    if n == 0 || n > 4096 {
-        return Err("Invalid request size".into());
-    }
+    // SECURITY: Read with timeout and size limit. A single `try_read` could
+    // return a PARTIAL request (the headers split across TCP segments), which
+    // lost the Authorization line and answered a spurious 401; read until the
+    // end of the header block instead, still capped and time-bounded.
+    let mut socket = socket;
+    let buffer = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_request_head(&mut socket, MAX_REQUEST_HEAD_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err("Read timeout".into()),
+    };
+    let n = buffer.len();
 
     let request = String::from_utf8_lossy(&buffer[..n]);
     let lines: Vec<&str> = request.lines().collect();
@@ -365,11 +406,7 @@ async fn handle_connection(
     let (method, path) = (parts[0], parts[1]);
 
     // SECURITY: Extract and validate authorization header
-    let auth_header = lines
-        .iter()
-        .find(|line| line.to_lowercase().starts_with("authorization:"))
-        .and_then(|line| line.split(':').nth(1))
-        .map(|s| s.trim());
+    let auth_header = authorization_header(&lines);
 
     // SECURITY: Allowlist of unauthenticated paths. Everything else
     // (including /metrics, /health, and any future endpoint) requires a
@@ -512,6 +549,48 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_value_keeps_colons() {
+        let lines = ["GET /metrics HTTP/1.1", "Authorization: Bearer abc:def:ghi"];
+        assert_eq!(authorization_header(&lines), Some("Bearer abc:def:ghi"));
+        assert_eq!(authorization_header(&["GET / HTTP/1.1"]), None);
+    }
+
+    #[tokio::test]
+    async fn request_head_split_across_writes_is_read_whole() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(b"GET /metrics HTTP/1.1\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            client
+                .write_all(b"Authorization: Bearer t:k\r\n\r\n")
+                .await
+                .unwrap();
+            client
+        });
+        let head = read_request_head(&mut server, MAX_REQUEST_HEAD_BYTES)
+            .await
+            .unwrap();
+        let text = String::from_utf8(head).unwrap();
+        assert!(text.contains("Authorization: Bearer t:k"), "{text}");
+        drop(writer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn request_head_over_the_cap_is_refused() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        client.write_all(&[b'a'; 5000]).await.unwrap();
+        drop(client);
+        assert!(read_request_head(&mut server, MAX_REQUEST_HEAD_BYTES)
+            .await
+            .is_err());
+    }
 
     #[tokio::test]
     #[ignore]

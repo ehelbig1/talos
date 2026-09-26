@@ -144,7 +144,7 @@ export function useWorkflowSave({
   const saveMutation = useMutation({
     mutationFn: async ({ customName }: { customName?: string }) => {
       const state = useWorkflowStore.getState();
-      const { maxConcurrentExecutions, intent } = state;
+      const { maxConcurrentExecutions, intent, editGeneration } = state;
       const nameToSave = customName || workflowName;
 
       const graphJson = JSON.stringify(buildGraphDocument(state));
@@ -190,17 +190,28 @@ export function useWorkflowSave({
       const saved = result.updateWorkflow || result.createWorkflow;
       if (!saved) throw new Error("Failed to save workflow: no data returned");
       return {
-        id: saved.id,
-        name: saved.name,
-        graphVersion: saved.graphVersion,
-      } as SaveResult;
+        saved: {
+          id: saved.id,
+          name: saved.name,
+          graphVersion: saved.graphVersion,
+        } as SaveResult,
+        // The edit generation the saved graph was read at.
+        editGeneration,
+      };
     },
-    onSuccess: (saved) => {
+    onSuccess: ({ saved, editGeneration }) => {
       setWorkflowMeta(saved.id, saved.name);
       // AFTER setWorkflowMeta, which drops a version from another workflow.
       setGraphVersion(saved.graphVersion);
-      markClean();
-      toast.success("Workflow saved");
+      // Edits made while the request was in flight are NOT in what was
+      // saved: the editor stays dirty rather than claiming they are.
+      if (markClean(editGeneration)) {
+        toast.success("Workflow saved");
+      } else {
+        toast.success(
+          "Workflow saved — changes made during the save are not saved yet",
+        );
+      }
       window.dispatchEvent(new CustomEvent("workflowSaved"));
       onSuccess?.(saved);
     },

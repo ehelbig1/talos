@@ -1,22 +1,3 @@
-// MCP-946 (2026-05-15): kept `#![allow(dead_code)]` deliberately.
-// The crate carries several pre-existing dead items audited in this
-// sweep but not removable in a one-shot doc-style sweep:
-//   * `DLQ_MAX_PENDING` const + `enqueue_webhook_dlq` function:
-//     vestigial OLD-DLQ surface superseded by `DlqService` (stored
-//     on WebhookRouter at line ~245). The old function does
-//     DLP-aware header sanitization that no caller reaches.
-//   * `event_sender: tokio::sync::broadcast::Sender<ExecutionEvent>`
-//     field on WebhookRouter: stored in the constructor but never
-//     read. Either the broadcast logic was supposed to wire up
-//     and didn't, or the field is leftover from a refactor.
-//   * `allow` method in src/rate_limiter.rs: dead implementation
-//     (the WebhookRouter uses the IpRateLimiter via different
-//     plumbing).
-// Each needs careful surgical removal (constructor signature
-// changes ripple to main.rs + tests for event_sender; the DLQ
-// helpers contain non-trivial security logic worth verifying isn't
-// the new path's de-facto contract). Tracked as cleanup follow-ups.
-#![allow(dead_code)]
 //! Webhook router manages incoming webhook requests with security features
 //! including circuit breakers, rate limiting, HMAC verification, and DLQ support.
 

@@ -13,7 +13,7 @@ name: Release
 #
 # Verification (example):
 #   cosign verify \
-#     --certificate-identity-regexp "^https://github.com/ehelbig1/talos/\\.github/workflows/release\\.yml@refs/tags/v.*" \
+#     --certificate-identity-regexp "^https://github\\.com/ehelbig1/talos/\\.github/workflows/release\\.yml@refs/tags/v[^/]+$" \
 #     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
 #     ghcr.io/ehelbig1/talos-controller:1.2.3
 #
@@ -64,6 +64,9 @@ jobs:
   release:
     name: Build & Push
     runs-on: ubuntu-latest
+    # Cold opt-level=3 + thin-LTO workspace builds for two binaries; not yet
+    # measured in CI, so generous rather than tight.
+    timeout-minutes: 120
     outputs:
       # Each service's fully-qualified digest flows to the sign/attest
       # jobs. Signing BY DIGEST (not by tag) is the whole security point:
@@ -82,24 +85,36 @@ jobs:
         with:
           persist-credentials: false
 
-      # Workspace path-deps require the sibling at a path one level
-      # above ${{ github.workspace }}. actions/checkout refuses
-      # out-of-workspace paths, so clone via plain git. Repo is public.
-
       - name: Derive version from tag
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        # workflow_dispatch can target a BRANCH, and `${GITHUB_REF#refs/tags/v}`
+        # on `refs/heads/main` is the whole ref — the images would be pushed as
+        # `:refs/heads/main` and signed under a release identity. Refuse.
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+            echo "::error::release.yml must run on a v* tag (got ${GITHUB_REF})."
+            echo "Dispatch with:  gh workflow run release.yml --ref v<X.Y.Z>"
+            exit 1
+          fi
+          echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
-        with:
-          toolchain: "1.95"
-
-      - name: Build release binaries
-        run: cargo build --release --locked --workspace
-
+      # Images are built from the PRODUCTION Dockerfiles, never via
+      # docker-compose: compose points the frontend at Dockerfile.dev (the
+      # Vite dev server), and builds the Rust images with the fast `docker`
+      # cargo profile. Same shape as main-publish.yml's matrix.
       - name: Build Docker images
-        run: docker compose build controller worker frontend
+        run: |
+          set -euo pipefail
+          for svc in controller worker; do
+            docker build \
+              -f "$svc/Dockerfile" \
+              --build-arg CARGO_PROFILE=dist \
+              --build-arg GIT_SHA_OVERRIDE="${{ github.sha }}" \
+              --build-arg GIT_DIRTY_OVERRIDE=false \
+              -t "talos-$svc" .
+          done
+          docker build -f frontend/Dockerfile -t talos-frontend frontend/
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
@@ -145,6 +160,7 @@ jobs:
     name: Sign + SBOM (${{ matrix.service }})
     needs: [release]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       id-token: write
       packages: write
@@ -262,6 +278,7 @@ jobs:
     name: Promote :latest to signed digest
     needs: [release, sign, provenance]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       packages: write
       contents: read

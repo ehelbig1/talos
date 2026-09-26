@@ -1896,7 +1896,6 @@ dependencies = [
  "talos-workflow-liveness",
  "talos-workflow-manifest",
  "talos-workflow-repository",
- "talos-workflow-signing",
  "talos-workflow-types",
  "talos-workflow-validation",
  "talos-workflow-versions",
@@ -7444,7 +7443,7 @@ dependencies = [
  "talos-workflow-job-protocol",
  "talos-workflow-liveness",
  "talos-workflow-repository",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -7595,6 +7594,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-draft-heuristics",
  "talos-execution-finalizer",
+ "talos-registry",
  "talos-tenancy",
  "talos-text-util",
  "talos-workflow-repository",
@@ -7745,6 +7745,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -7967,6 +7968,7 @@ dependencies = [
  "talos-registry",
  "talos-secrets-manager",
  "talos-workflow-authorization",
+ "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
  "talos-workflow-liveness",
  "talos-workflow-repository",
@@ -7997,6 +7999,7 @@ dependencies = [
  "hex",
  "rand 0.8.6",
  "serde_json",
+ "talos-auth-types",
  "talos-config",
  "tower-cookies",
  "tracing",
@@ -8221,7 +8224,7 @@ dependencies = [
  "talos-workflow-liveness",
  "talos-workflow-repository",
  "talos-workflow-validation",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -8296,7 +8299,7 @@ dependencies = [
  "talos-workflow-engine-core",
  "talos-workflow-repository",
  "talos-workflow-types",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]
@@ -8309,8 +8312,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dashmap 6.2.1",
- "hex",
- "hmac 0.12.1",
  "jsonwebtoken",
  "rand 0.8.6",
  "reqwest",
@@ -8318,11 +8319,9 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "subtle",
  "talos-http-body",
  "talos-http-utils",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "zeroize",
@@ -8547,7 +8546,7 @@ dependencies = [
  "talos-workflow-creation-helpers",
  "talos-workflow-repository",
  "talos-workflow-validation",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -8578,6 +8577,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -8597,7 +8597,7 @@ dependencies = [
  "talos-push-channel-inventory",
  "talos-workflow-liveness",
  "talos-workflow-repository",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]
@@ -8635,7 +8635,7 @@ dependencies = [
  "talos-module-repository",
  "talos-workflow-creation-helpers",
  "talos-workflow-repository",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]
@@ -8739,7 +8739,7 @@ dependencies = [
  "talos-workflow-engine",
  "talos-workflow-engine-core",
  "talos-workflow-types",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]
@@ -8931,7 +8931,7 @@ dependencies = [
  "talos-metrics",
  "talos-text-util",
  "talos-workflow-job-protocol",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -9146,7 +9146,7 @@ dependencies = [
  "chrono",
  "libc",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -9302,6 +9302,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "subtle",
  "talos-capability-world",
@@ -9353,7 +9354,7 @@ dependencies = [
  "talos-workflow-engine",
  "talos-workflow-job-protocol",
  "talos-workflow-repository",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]
@@ -9479,7 +9480,7 @@ dependencies = [
  "talos-http-body",
  "talos-text-util",
  "talos-workflow-repository",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]
@@ -9531,7 +9532,7 @@ dependencies = [
  "talos-tenancy",
  "talos-text-util",
  "talos-workflow-job-protocol",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -9582,7 +9583,7 @@ dependencies = [
  "talos-child-workflow-refs",
  "talos-hygiene-service",
  "talos-search-service",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]
@@ -9792,7 +9793,7 @@ name = "talos-validation"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -10011,7 +10012,7 @@ dependencies = [
  "talos-text-util",
  "talos-workflow-creation-helpers",
  "talos-workflow-repository",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -10144,7 +10145,7 @@ dependencies = [
  "talos-module-repository",
  "talos-secrets-manager",
  "talos-workflow-repository",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -10178,18 +10179,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "talos-workflow-signing"
-version = "0.1.0"
-dependencies = [
- "hex",
- "hmac 0.12.1",
- "sha2 0.10.9",
- "talos-config",
- "tracing",
- "zeroize",
 ]
 
 [[package]]
@@ -12391,6 +12380,7 @@ dependencies = [
  "wat",
  "wit-component 0.224.1",
  "wit-parser 0.224.1",
+ "zeroize",
 ]
 
 [[package]]

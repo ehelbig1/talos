@@ -54,6 +54,10 @@ fn parse_capability_world(label: &str) -> CapabilityWorld {
 /// The 50M cap matches the cap applied to node-config `max_fuel` overrides
 /// elsewhere in the dispatcher; the two ceilings are kept numerically
 /// identical so an operator can't raise one without raising the other.
+/// `modules.max_fuel`'s column DEFAULT, used when a row carries NULL (the
+/// stale-name fallback's `COALESCE(max_fuel, 2000000)` is the same value).
+const MODULE_MAX_FUEL_COLUMN_DEFAULT: i64 = 2_000_000;
+
 fn clamp_execution_fuel(db_max_fuel: i64) -> i64 {
     if db_max_fuel > 0 {
         db_max_fuel.min(50_000_000)
@@ -313,6 +317,14 @@ impl std::fmt::Display for ModuleBytesEvicted {
 }
 
 impl std::error::Error for ModuleBytesEvicted {}
+
+/// May `get_module_for_execution` fall through from a Level-1 failure to the
+/// stale-name lookup? Only for an ABSENT or never-compiled row. A database or
+/// decode error (`sqlx::Error` anywhere in the chain) and an evicted module
+/// must surface as themselves, never as "Module not found".
+fn falls_through_to_stale_name(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<sqlx::Error>().is_none() && e.downcast_ref::<ModuleBytesEvicted>().is_none()
+}
 
 /// The ONE reading of a `modules` row whose `wasm_bytes` is NULL/empty, shared
 /// by `get_module` and the bytes-only reads. Three states, three sentences:
@@ -1036,9 +1048,15 @@ impl ModuleRegistry {
             name: row
                 .try_get("name")
                 .context("modules.name: try_get failed (schema drift?)")?,
+            // `content_hash`, `size_bytes` and `max_fuel` are NULLABLE columns.
+            // Decoding them as non-`Option` made a NULL a decode error, which
+            // the stale-name fallback used to swallow (it reads them as
+            // `Option`); now that a decode error surfaces instead of falling
+            // through, a NULL must decode here. Defaults match that fallback.
             content_hash: row
-                .try_get("content_hash")
-                .context("modules.content_hash: try_get failed (schema drift?)")?,
+                .try_get::<Option<String>, _>("content_hash")
+                .context("modules.content_hash: try_get failed (schema drift?)")?
+                .unwrap_or_default(),
             wasm_bytes,
             source_code: row
                 .try_get("source_code")
@@ -1050,11 +1068,13 @@ impl ModuleRegistry {
                 .try_get("config")
                 .context("modules.config: try_get failed (schema drift?)")?,
             size_bytes: row
-                .try_get("size_bytes")
-                .context("modules.size_bytes: try_get failed (schema drift?)")?,
+                .try_get::<Option<i32>, _>("size_bytes")
+                .context("modules.size_bytes: try_get failed (schema drift?)")?
+                .unwrap_or(0),
             max_fuel: row
-                .try_get("max_fuel")
-                .context("modules.max_fuel: try_get failed (schema drift?)")?,
+                .try_get::<Option<i64>, _>("max_fuel")
+                .context("modules.max_fuel: try_get failed (schema drift?)")?
+                .unwrap_or(MODULE_MAX_FUEL_COLUMN_DEFAULT),
             max_memory_mb: row
                 .try_get("max_memory_mb")
                 .context("modules.max_memory_mb: try_get failed (schema drift?)")?,
@@ -1156,7 +1176,7 @@ impl ModuleRegistry {
             // stale-name lookup would find no row with bytes under that name
             // and report "Module not found", which is false on both clauses.
             // Surface the actionable error instead.
-            Err(e) if e.downcast_ref::<ModuleBytesEvicted>().is_some() => return Err(e),
+            Err(e) if !falls_through_to_stale_name(&e) => return Err(e),
             Err(_) => {}
         }
 
@@ -1165,16 +1185,19 @@ impl ModuleRegistry {
         // or rebuilt under a new id), then find the latest row by that
         // name owned by the user. Two queries, scoped by user_id at every
         // step to prevent cross-user resolution.
+        //
+        // Both reads PROPAGATE a DB error: collapsing one into "no row" reported
+        // a database failure as "Module not found".
         let old_name: Option<String> = sqlx::query_scalar(
             "SELECT name FROM modules \
-             WHERE id = $1 \
+             WHERE id = $1 AND (user_id = $2 OR user_id IS NULL) \
              LIMIT 1",
         )
         .bind(module_id)
+        .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await
-        .ok()
-        .flatten();
+        .context("stale-name fallback: old module name read")?;
 
         if let Some(name) = old_name {
             let successor = sqlx::query(
@@ -1184,14 +1207,14 @@ impl ModuleRegistry {
                  FROM modules \
                  WHERE name = $1 AND (user_id = $2 OR user_id IS NULL) \
                    AND wasm_bytes IS NOT NULL \
-                 ORDER BY compiled_at DESC NULLS LAST LIMIT 1",
+                 ORDER BY (user_id IS NULL), compiled_at DESC NULLS LAST, id \
+                 LIMIT 1",
             )
             .bind(&name)
             .bind(user_id)
             .fetch_optional(&self.db_pool)
             .await
-            .ok()
-            .flatten();
+            .context("stale-name fallback: successor read")?;
 
             if let Some(row) = successor {
                 let new_id: Uuid = row.try_get::<Option<_>, _>("id")?.unwrap_or(module_id);
@@ -2850,5 +2873,40 @@ mod inherited_grants_tests {
             "an empty methods fixture could not tell a carried grant from a \
              dropped one — the whole defect this type exists for"
         );
+    }
+}
+
+#[cfg(test)]
+mod stale_name_fallback_tests {
+    use super::*;
+
+    /// A Level-1 DB failure must surface as itself; only an absent or
+    /// never-compiled row may fall through to the stale-name lookup (which
+    /// would otherwise answer a DB outage with "Module not found").
+    #[test]
+    fn only_absence_falls_through() {
+        let not_found = anyhow::anyhow!("Module not found or access denied");
+        assert!(falls_through_to_stale_name(&not_found));
+        let never_compiled = classify_absent_wasm_bytes(Uuid::nil(), "m", None, None);
+        assert!(falls_through_to_stale_name(&never_compiled));
+
+        let db = anyhow::Error::new(sqlx::Error::PoolTimedOut).context("Failed to query modules");
+        assert!(!falls_through_to_stale_name(&db));
+        let evicted = classify_absent_wasm_bytes(Uuid::nil(), "m", Some(chrono::Utc::now()), None);
+        assert!(!falls_through_to_stale_name(&evicted));
+    }
+
+    /// SOURCE PIN (textual): the fallback reads are tenant-scoped, ordered with
+    /// the caller's own row first and a unique tiebreaker, and propagate errors.
+    #[test]
+    fn fallback_reads_are_scoped_ordered_and_loud() {
+        let src = include_str!("lib.rs");
+        let at = src
+            .find("Level 2: stale module ref by name")
+            .expect("fallback moved");
+        let body = &src[at..at + 3000];
+        assert!(body.contains("WHERE id = $1 AND (user_id = $2 OR user_id IS NULL)"));
+        assert!(body.contains("ORDER BY (user_id IS NULL), compiled_at DESC NULLS LAST, id"));
+        assert!(!body.contains(".ok()\n        .flatten()"));
     }
 }

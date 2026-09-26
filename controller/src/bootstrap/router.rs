@@ -1364,9 +1364,9 @@ pub(crate) async fn seed_csrf_handler(headers: axum::http::HeaderMap) -> axum::r
         let token = hex::encode(bytes);
 
         // Frontend reads this cookie via JS to populate X-CSRF-Token, so it
-        // CANNOT be HttpOnly. Secure in prod (HTTPS only), SameSite=Strict
+        // CANNOT be HttpOnly. Secure outside development, SameSite=Strict
         // mirrors what csrf::csrf_protection writes on the rotation path.
-        let secure_attr = if config::is_production() {
+        let secure_attr = if talos_auth_types::browser_hardening_required() {
             "; Secure"
         } else {
             ""
@@ -1490,10 +1490,11 @@ pub(crate) async fn prometheus_metrics_handler(
                 "invalid prometheus scrape token".to_string(),
             ));
         }
-    } else if crate::config::is_production() {
+    } else if talos_auth_types::browser_hardening_required() {
+        // Every non-development RUST_ENV, staging included.
         return Err((
             axum::http::StatusCode::FORBIDDEN,
-            "PROMETHEUS_SCRAPE_TOKEN must be set in production".to_string(),
+            "PROMETHEUS_SCRAPE_TOKEN must be set outside development".to_string(),
         ));
     }
 
@@ -1680,7 +1681,9 @@ pub(crate) async fn rest_cookie_csrf_gate(
     if cookies.get("talos_access_token").is_none() {
         return Ok(next.run(request).await);
     }
-    csrf::csrf_protection(cookies, request, next).await
+    // The REST routes authenticate by the cookie and never read `X-API-Key`,
+    // so that header must not exempt a request from CSRF here.
+    csrf::csrf_protection_cookie_session(cookies, request, next).await
 }
 
 // ---------- GraphQL HTTP handler ----------
@@ -2726,7 +2729,8 @@ pub(crate) fn build_router(
     // ---------- Axum router ----------
     // Create GraphQL routes with API rate limiting and CSRF protection
     // GraphiQL playground is only enabled in development for security
-    let is_production = config::is_production();
+    // (every non-development RUST_ENV counts as hardened, staging included).
+    let is_production = talos_auth_types::browser_hardening_required();
 
     let graphql_route = if is_production {
         // Production: POST only (no GraphiQL playground)

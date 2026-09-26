@@ -253,6 +253,9 @@ pub struct ModuleExecutionLog {
     pub created_at: DateTime<Utc>,
 }
 
+/// Rows per page of `re_encrypt_module_payloads_to_org` (keyset on `id`).
+const PAYLOAD_SWEEP_PAGE: i64 = 200;
+
 /// Outcome of [`ModuleExecutionService::re_encrypt_module_payloads_to_org`].
 #[derive(Debug, Clone, Default)]
 pub struct ModulePayloadReEncryptStats {
@@ -410,7 +413,14 @@ impl ModuleExecutionService {
         let Some(sm) = self.secrets_manager.clone() else {
             return Ok(ModulePayloadReEncryptStats::default());
         };
-        let rows = sqlx::query(
+        let mut re_encrypted = 0u64;
+        let mut failed = 0u64;
+        // Keyset-paged on `id` (this table is the largest ciphertext table):
+        // one bounded page in memory at a time, and a failed row — still
+        // pending — is stepped over rather than re-read forever.
+        let mut after = Uuid::nil();
+        loop {
+            let page = sqlx::query(
             "SELECT me.id, me.workflow_execution_id, me.payload_enc_key_id, me.payload_format, \
                     me.input_data_enc, me.output_data_enc, me.trigger_metadata_enc \
              FROM module_executions me \
@@ -420,91 +430,101 @@ impl ModuleExecutionService {
                AND me.status NOT IN ('pending', 'running') \
                AND talos_org_dek_pending(me.payload_enc_key_id, w.org_id) \
                AND (me.input_data_enc IS NOT NULL OR me.output_data_enc IS NOT NULL \
-                    OR me.trigger_metadata_enc IS NOT NULL)",
+                    OR me.trigger_metadata_enc IS NOT NULL) \
+               AND me.id > $1 \
+             ORDER BY me.id \
+             LIMIT $2",
         )
+        .bind(after)
+        .bind(PAYLOAD_SWEEP_PAGE)
         .fetch_all(&self.db_pool)
         .await
         .context("re_encrypt_module_payloads_to_org: select stale rows")?;
+            let Some(last) = page.last() else { break };
+            after = last.try_get("id")?;
+            let full_page = page.len() as i64 == PAYLOAD_SWEEP_PAGE;
+            for r in &page {
+                let id: Uuid = r.try_get("id")?;
+                let wei: Option<Uuid> = r.try_get::<Option<_>, _>("workflow_execution_id")?;
+                let key_id: Option<Uuid> = r.try_get::<Option<_>, _>("payload_enc_key_id")?;
+                let old_format: i16 = r.try_get("payload_format")?;
+                let input_enc: Option<Vec<u8>> = r.try_get::<Option<_>, _>("input_data_enc")?;
+                let output_enc: Option<Vec<u8>> = r.try_get::<Option<_>, _>("output_data_enc")?;
+                let trigger_enc: Option<Vec<u8>> =
+                    r.try_get::<Option<_>, _>("trigger_metadata_enc")?;
 
-        let mut re_encrypted = 0u64;
-        let mut failed = 0u64;
-        for r in &rows {
-            let id: Uuid = r.try_get("id")?;
-            let wei: Option<Uuid> = r.try_get::<Option<_>, _>("workflow_execution_id")?;
-            let key_id: Option<Uuid> = r.try_get::<Option<_>, _>("payload_enc_key_id")?;
-            let old_format: i16 = r.try_get("payload_format")?;
-            let input_enc: Option<Vec<u8>> = r.try_get::<Option<_>, _>("input_data_enc")?;
-            let output_enc: Option<Vec<u8>> = r.try_get::<Option<_>, _>("output_data_enc")?;
-            let trigger_enc: Option<Vec<u8>> = r.try_get::<Option<_>, _>("trigger_metadata_enc")?;
+                let res: Result<bool> = async {
+                    // Decrypt each present slot under its current key/format.
+                    let input = self
+                        .read_payload(id, PayloadSlot::Input, None, input_enc, key_id, old_format)
+                        .await?;
+                    let output = self
+                        .read_payload(
+                            id,
+                            PayloadSlot::Output,
+                            None,
+                            output_enc,
+                            key_id,
+                            old_format,
+                        )
+                        .await?;
+                    let trigger = self
+                        .read_payload(
+                            id,
+                            PayloadSlot::Trigger,
+                            None,
+                            trigger_enc,
+                            key_id,
+                            old_format,
+                        )
+                        .await?;
 
-            let res: Result<bool> = async {
-                // Decrypt each present slot under its current key/format.
-                let input = self
-                    .read_payload(id, PayloadSlot::Input, None, input_enc, key_id, old_format)
-                    .await?;
-                let output = self
-                    .read_payload(
+                    // Re-encrypt the whole bundle under the workflow's org DEK (v4).
+                    let bundle = talos_module_payload_encryption::encrypt_payload_bundle(
+                        Some(&sm),
                         id,
-                        PayloadSlot::Output,
-                        None,
-                        output_enc,
-                        key_id,
-                        old_format,
+                        wei,
+                        input.as_ref(),
+                        output.as_ref(),
+                        trigger.as_ref(),
                     )
                     .await?;
-                let trigger = self
-                    .read_payload(
-                        id,
-                        PayloadSlot::Trigger,
-                        None,
-                        trigger_enc,
-                        key_id,
-                        old_format,
-                    )
-                    .await?;
 
-                // Re-encrypt the whole bundle under the workflow's org DEK (v4).
-                let bundle = talos_module_payload_encryption::encrypt_payload_bundle(
-                    Some(&sm),
-                    id,
-                    wei,
-                    input.as_ref(),
-                    output.as_ref(),
-                    trigger.as_ref(),
-                )
-                .await?;
-
-                // Lost-write guard: only update while still on (old_key, old_format).
-                let result = sqlx::query(
-                    "UPDATE module_executions \
+                    // Lost-write guard: only update while still on (old_key, old_format).
+                    let result = sqlx::query(
+                        "UPDATE module_executions \
                      SET input_data_enc = $1, output_data_enc = $2, trigger_metadata_enc = $3, \
                          payload_enc_key_id = $4, payload_format = $5 \
                      WHERE id = $6 AND payload_format = $7 \
                        AND payload_enc_key_id IS NOT DISTINCT FROM $8",
-                )
-                .bind(bundle.input_enc.as_deref())
-                .bind(bundle.output_enc.as_deref())
-                .bind(bundle.trigger_enc.as_deref())
-                .bind(bundle.key_id)
-                .bind(bundle.format_version)
-                .bind(id)
-                .bind(old_format)
-                .bind(key_id)
-                .execute(&self.db_pool)
-                .await?;
-                Ok(result.rows_affected() > 0)
-            }
-            .await;
+                    )
+                    .bind(bundle.input_enc.as_deref())
+                    .bind(bundle.output_enc.as_deref())
+                    .bind(bundle.trigger_enc.as_deref())
+                    .bind(bundle.key_id)
+                    .bind(bundle.format_version)
+                    .bind(id)
+                    .bind(old_format)
+                    .bind(key_id)
+                    .execute(&self.db_pool)
+                    .await?;
+                    Ok(result.rows_affected() > 0)
+                }
+                .await;
 
-            match res {
-                Ok(true) => re_encrypted += 1,
-                Ok(false) => {
-                    tracing::debug!(module_execution_id = %id, "module-payload sweep: row concurrently re-keyed; skipped");
+                match res {
+                    Ok(true) => re_encrypted += 1,
+                    Ok(false) => {
+                        tracing::debug!(module_execution_id = %id, "module-payload sweep: row concurrently re-keyed; skipped");
+                    }
+                    Err(e) => {
+                        tracing::error!(module_execution_id = %id, "module-payload sweep: {e}");
+                        failed += 1;
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(module_execution_id = %id, "module-payload sweep: {e}");
-                    failed += 1;
-                }
+            }
+            if !full_page {
+                break;
             }
         }
 

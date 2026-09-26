@@ -246,7 +246,8 @@ impl WorkflowsQueries {
         Ok(Workflow {
             id: workflow.id,
             name: workflow.name,
-            graph_json: workflow.graph_json,
+            graph_json: Some(workflow.graph_json),
+            graph_counts: None,
             graph_version: workflow.graph_version,
             max_concurrent_executions: workflow.max_concurrent_executions,
             intent: workflow.intent,
@@ -287,6 +288,7 @@ impl WorkflowsQueries {
             .max(0) as i64;
 
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
+        let projection = list_projection(&ctx.look_ahead());
 
         // RFC 0004 M4: scoped tx so the workflows RLS policy backstops the
         // app-layer union filter. The repo method executes on the tx we pass.
@@ -305,6 +307,7 @@ impl WorkflowsQueries {
                 &scope.accessible_org_ids,
                 limit_val,
                 offset_val,
+                projection,
             )
             .await
             .map_err(|e| {
@@ -321,6 +324,9 @@ impl WorkflowsQueries {
                 id: w.id,
                 name: w.name,
                 graph_json: w.graph_json,
+                graph_counts: projection
+                    .graph_counts
+                    .then_some((w.node_count, w.edge_count)),
                 graph_version: w.graph_version,
                 max_concurrent_executions: w.max_concurrent_executions,
                 intent: w.intent,
@@ -1096,6 +1102,21 @@ fn eval_rhai_preview(script: &str, mock_context: &serde_json::Value) -> TestRhai
             output: None,
             error: Some(e.to_string()),
         },
+    }
+}
+
+/// What a `workflows` list selection renders, read from the look-ahead so
+/// the list query neither ships every graph for a caller that only wants the
+/// counts, nor derives counts nobody asked for. Fragments and aliases are
+/// resolved by the look-ahead; a miss would surface as the loud
+/// "graphJson was not loaded" error, never as an empty graph.
+pub(crate) fn list_projection(
+    look_ahead: &async_graphql::Lookahead<'_>,
+) -> talos_workflow_repository::WorkflowListProjection {
+    talos_workflow_repository::WorkflowListProjection {
+        graph_json: look_ahead.field("graphJson").exists(),
+        graph_counts: look_ahead.field("nodeCount").exists()
+            || look_ahead.field("edgeCount").exists(),
     }
 }
 
