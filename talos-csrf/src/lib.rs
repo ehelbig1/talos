@@ -182,7 +182,7 @@ pub fn generate_csrf_token() -> String {
 /// Attributes:
 /// - `HttpOnly = false` — frontend reads this via JS to populate the
 ///   X-CSRF-Token request header (double-submit pattern).
-/// - `Secure = is_production()` — HTTPS-only in prod.
+/// - `Secure = browser_hardening_required()` — every non-development `RUST_ENV`.
 /// - `SameSite = Strict` — never sent on cross-site requests.
 /// - `Path = /` — sent on every same-origin request.
 ///
@@ -194,7 +194,7 @@ pub fn generate_csrf_token() -> String {
 fn build_csrf_cookie(token: String) -> Cookie<'static> {
     let mut cookie = Cookie::new(CSRF_COOKIE_NAME, token);
     cookie.set_http_only(false);
-    cookie.set_secure(talos_config::is_production());
+    cookie.set_secure(talos_auth_types::browser_hardening_required());
     cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
     cookie.set_path("/");
     cookie
@@ -205,6 +205,40 @@ pub async fn csrf_protection(
     cookies: Cookies,
     request: Request<Body>,
     next: Next,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    double_submit(cookies, request, next, ApiKeyExemption::Honoured).await
+}
+
+/// [`csrf_protection`] for a surface that authenticates by the session
+/// COOKIE only and never reads `X-API-Key` (the controller's REST routes).
+/// The API-key exemption is safe only where a present key is authoritative
+/// (see [`is_api_key_request`]); on a cookie-only surface a bogus header would
+/// skip CSRF while the victim's cookie authenticated the request.
+pub async fn csrf_protection_cookie_session(
+    cookies: Cookies,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    double_submit(cookies, request, next, ApiKeyExemption::Refused).await
+}
+
+/// Whether a present `X-API-Key` header exempts a request from CSRF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyExemption {
+    Honoured,
+    Refused,
+}
+
+/// Does this request skip the double-submit check for carrying an API key?
+fn api_key_exempts(exemption: ApiKeyExemption, headers: &axum::http::HeaderMap) -> bool {
+    exemption == ApiKeyExemption::Honoured && is_api_key_request(headers)
+}
+
+async fn double_submit(
+    cookies: Cookies,
+    request: Request<Body>,
+    next: Next,
+    exemption: ApiKeyExemption,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     let method = request.method();
     let path = request.uri().path();
@@ -238,8 +272,9 @@ pub async fn csrf_protection(
         return Ok(response);
     }
 
-    // Skip CSRF for API-key-authenticated requests (see is_api_key_request).
-    if is_api_key_request(request.headers()) {
+    // Skip CSRF for API-key-authenticated requests (see is_api_key_request),
+    // only where the surface honours the key.
+    if api_key_exempts(exemption, request.headers()) {
         let response = next.run(request).await;
         return Ok(response);
     }
@@ -352,7 +387,9 @@ pub async fn csrf_protection_graphql(
     // so any future bypass-consuming site that uses `bool_env_or_default`
     // can't diverge (e.g. accepting `=1` while production startup
     // stays inert).
-    let is_production = talos_config::is_production();
+    // Hardened (no introspection/dev bypass without CSRF) in every
+    // non-development RUST_ENV, staging included.
+    let is_production = talos_auth_types::browser_hardening_required();
     let allow_dev_bypass = !is_production && talos_config::dev_csrf_bypass_enabled();
 
     // L5 (2026-05-28 review): only BUFFER the request body when we actually
@@ -586,8 +623,8 @@ mod tests {
         assert_eq!(cookie.path(), Some("/"), "CSRF cookie must be Path=/");
         assert_eq!(
             cookie.secure(),
-            Some(talos_config::is_production()),
-            "CSRF cookie Secure flag must follow is_production()"
+            Some(talos_auth_types::browser_hardening_required()),
+            "CSRF cookie Secure flag must follow browser_hardening_required()"
         );
         assert_eq!(cookie.name(), CSRF_COOKIE_NAME);
     }
@@ -611,6 +648,19 @@ mod tests {
         let mut csrf_only = HeaderMap::new();
         csrf_only.insert(CSRF_HEADER_NAME, "tok".parse().unwrap());
         assert!(!is_api_key_request(&csrf_only));
+    }
+
+    #[test]
+    fn a_cookie_only_surface_refuses_the_api_key_exemption() {
+        use axum::http::HeaderMap;
+        let mut with_key = HeaderMap::new();
+        with_key.insert("X-API-Key", "bogus".parse().unwrap());
+        assert!(api_key_exempts(ApiKeyExemption::Honoured, &with_key));
+        assert!(!api_key_exempts(ApiKeyExemption::Refused, &with_key));
+        assert!(!api_key_exempts(
+            ApiKeyExemption::Honoured,
+            &HeaderMap::new()
+        ));
     }
 
     #[test]

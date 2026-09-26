@@ -14,6 +14,7 @@ hex = "0.4"
 rand = { version = "0.8", default-features = true, features = ["std"] }
 serde_json.workspace = true
 talos-config = { path = "../talos-config" }
+talos-auth-types = { path = "../talos-auth-types" }
 tower-cookies = "0.11"
 tracing.workspace = true
 

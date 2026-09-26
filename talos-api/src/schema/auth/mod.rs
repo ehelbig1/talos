@@ -16,8 +16,8 @@ use tower_cookies::{Cookie, Cookies};
 ///
 /// Settings locked here:
 /// - HttpOnly: true (defeats XSS extraction)
-/// - Secure: `is_production()` (HTTPS-only in prod; off in dev for
-///   localhost compatibility)
+/// - Secure: `browser_hardening_required()` (every non-development
+///   `RUST_ENV`; off in dev for localhost compatibility)
 /// - SameSite: Strict (defeats CSRF on auth POSTs)
 /// - Path: "/" (visible to all routes)
 /// - Access TTL: 15 min (short — refreshable via the refresh-cookie path)
@@ -37,11 +37,12 @@ use tower_cookies::{Cookie, Cookies};
 /// costs nothing new: present-but-dead falls back to today's path, and
 /// absent-but-alive means one login.
 pub fn set_session_cookies(cookies: &Cookies, access_token: &str, refresh_token: &str) {
-    let is_production = talos_config::is_production();
+    // Every non-development RUST_ENV (staging included), not production only.
+    let secure = talos_auth_types::browser_hardening_required();
 
     let mut access_cookie = Cookie::new("talos_access_token", access_token.to_string());
     access_cookie.set_http_only(true);
-    access_cookie.set_secure(is_production);
+    access_cookie.set_secure(secure);
     access_cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
     access_cookie.set_path("/");
     access_cookie.set_max_age(tower_cookies::cookie::time::Duration::minutes(15));
@@ -49,7 +50,7 @@ pub fn set_session_cookies(cookies: &Cookies, access_token: &str, refresh_token:
 
     let mut refresh_cookie = Cookie::new("talos_refresh_token", refresh_token.to_string());
     refresh_cookie.set_http_only(true);
-    refresh_cookie.set_secure(is_production);
+    refresh_cookie.set_secure(secure);
     refresh_cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
     refresh_cookie.set_path("/");
     refresh_cookie.set_max_age(REFRESH_COOKIE_TTL);
@@ -59,7 +60,7 @@ pub fn set_session_cookies(cookies: &Cookies, access_token: &str, refresh_token:
     // by `the_session_marker_is_readable_secretless_and_lives_as_long_as_the_refresh`.
     let mut marker = Cookie::new(SESSION_PRESENT_COOKIE, SESSION_PRESENT_VALUE);
     marker.set_http_only(false);
-    marker.set_secure(is_production);
+    marker.set_secure(secure);
     marker.set_same_site(tower_cookies::cookie::SameSite::Strict);
     marker.set_path("/");
     marker.set_max_age(REFRESH_COOKIE_TTL);
@@ -118,7 +119,7 @@ pub const OAUTH_SESSION_BINDING_COOKIE: &str = "talos_oauth_session";
 ///
 /// Settings locked here:
 /// - HttpOnly: true (defeats XSS extraction)
-/// - Secure: `is_production()` (HTTPS-only in prod; off in dev)
+/// - Secure: `browser_hardening_required()` (off in dev)
 /// - SameSite: **Lax** — the provider redirect back to the callback is a
 ///   top-level cross-site navigation; `Strict` would withhold the cookie
 ///   and break every login. Lax still blocks the cross-site POST/iframe
@@ -128,7 +129,7 @@ pub const OAUTH_SESSION_BINDING_COOKIE: &str = "talos_oauth_session";
 pub fn set_oauth_session_binding_cookie(cookies: &Cookies, nonce: &str) {
     let mut binding = Cookie::new(OAUTH_SESSION_BINDING_COOKIE, nonce.to_string());
     binding.set_http_only(true);
-    binding.set_secure(talos_config::is_production());
+    binding.set_secure(talos_auth_types::browser_hardening_required());
     binding.set_same_site(tower_cookies::cookie::SameSite::Lax);
     binding.set_path("/");
     binding.set_max_age(tower_cookies::cookie::time::Duration::minutes(10));
@@ -191,8 +192,8 @@ mod cookie_security_tests {
             // http works); assert the tie rather than a fixed value.
             assert_eq!(
                 c.secure(),
-                Some(talos_config::is_production()),
-                "{label} cookie Secure flag must follow is_production()"
+                Some(talos_auth_types::browser_hardening_required()),
+                "{label} cookie Secure flag must follow browser_hardening_required()"
             );
         }
         // Every cookie carrying a TOKEN is HttpOnly; the marker is the one
