@@ -153,6 +153,7 @@ impl OAuthCredentialService {
                 token_expires_at = EXCLUDED.token_expires_at,
                 scope = EXCLUDED.scope,
                 is_active = TRUE,
+                needs_reauth_at = NULL,
                 updated_at = NOW()
             "#,
         )
@@ -754,16 +755,24 @@ impl OAuthCredentialService {
         // workflow execution. Observed incident: gmail/follow-up-detector
         // 401 on 2026-04-11 while the refresh task logged "still valid".
         use super::REFRESH_THRESHOLD_MINUTES;
-        let expiry: Option<DateTime<Utc>> = sqlx::query_scalar(
-            "SELECT token_expires_at FROM integration_credentials \
-             WHERE user_id = $1 AND provider = $2 AND provider_key = $3 AND is_active = TRUE",
-        )
-        .bind(user_id)
-        .bind(provider)
-        .bind(provider_key)
-        .fetch_optional(&self.db_pool)
-        .await?
-        .flatten();
+        let (expiry, needs_reauth_at): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT token_expires_at, needs_reauth_at FROM integration_credentials \
+                 WHERE user_id = $1 AND provider = $2 AND provider_key = $3 AND is_active = TRUE",
+            )
+            .bind(user_id)
+            .bind(provider)
+            .bind(provider_key)
+            .fetch_optional(&self.db_pool)
+            .await?
+            .unwrap_or((None, None));
+
+        // The provider already refused this grant (`invalid_grant`): another
+        // token-endpoint call cannot succeed until the user re-links, which
+        // clears the stamp. Refuse without the round trip.
+        if needs_reauth_at.is_some() {
+            anyhow::bail!("credential needs re-authorization (the provider revoked the grant)");
+        }
 
         // Decision: refresh when the token is (a) within the threshold of
         // expiring, or (b) has NO tracked expiry at all. The NULL case
@@ -964,11 +973,7 @@ impl OAuthCredentialService {
         // redirect-following and fail loudly on TLS init rather than
         // silently re-enabling default redirects via
         // `unwrap_or_else(|_| Client::new())`.
-        let http = talos_http_utils::trusted_client::build_integration_client(
-            std::time::Duration::from_secs(15),
-        );
-
-        let resp = http
+        let resp = refresh_http_client()
             .post(token_url)
             .json(&serde_json::json!({
                 "grant_type": "refresh_token",
@@ -983,6 +988,32 @@ impl OAuthCredentialService {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = talos_http_body::read_error_text_capped(resp).await;
+            if refresh_error_is_revoked_grant(&body) {
+                // Stamp once; the proactive task and every later refresh skip
+                // the credential until it is re-linked. `updated_at` is left
+                // alone (it is the forced path's "someone refreshed" signal).
+                if let Err(e) = sqlx::query(
+                    "UPDATE integration_credentials SET needs_reauth_at = NOW() \
+                     WHERE user_id = $1 AND provider = $2 AND provider_key = $3 \
+                       AND is_active = TRUE AND needs_reauth_at IS NULL",
+                )
+                .bind(user_id)
+                .bind(provider)
+                .bind(provider_key)
+                .execute(&self.db_pool)
+                .await
+                {
+                    tracing::error!(provider, error = %e, "failed to record revoked OAuth grant");
+                }
+                tracing::warn!(
+                    target: "talos_audit",
+                    provider,
+                    user_id = %user_id,
+                    event_kind = "oauth_grant_revoked",
+                    "OAuth refresh refused with invalid_grant; credential needs re-authorization"
+                );
+                anyhow::bail!("Token refresh refused: the grant was revoked; re-link required");
+            }
             // SECURITY: Log body length only — error bodies may echo client_secret or refresh_token.
             tracing::error!(provider, %status, body_len = body.len(), "OAuth token refresh failed");
             anyhow::bail!("Token refresh failed (HTTP {})", status);
@@ -1206,6 +1237,28 @@ fn record_reactive_refresh(outcome: &'static str) {
             .with_label_values(&[outcome])
             .inc();
     }
+}
+
+/// One hardened client for every token refresh (redirects off, connect and
+/// total timeouts), built once rather than per refresh.
+fn refresh_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        talos_http_utils::trusted_client::build_integration_client(std::time::Duration::from_secs(
+            15,
+        ))
+    })
+}
+
+/// Does a token-endpoint error body say the refresh grant itself is dead
+/// (RFC 6749 §5.2 `invalid_grant` — revoked, expired or already rotated)?
+/// Only then is retrying pointless; any other failure may be transient.
+pub(crate) fn refresh_error_is_revoked_grant(body: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct OAuthError {
+        error: String,
+    }
+    serde_json::from_str::<OAuthError>(body).is_ok_and(|e| e.error == "invalid_grant")
 }
 
 #[cfg(test)]

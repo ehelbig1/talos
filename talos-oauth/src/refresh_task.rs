@@ -15,6 +15,10 @@ use super::OAuthCredentialService;
 /// `oauth/credentials.rs`. If the query returns tokens the inner check won't
 /// act on, there's a dead zone where the task does nothing and the token
 /// eventually expires. Currently both sides use 10 minutes.
+/// Most credentials refreshed per tick (each is one token-endpoint round trip
+/// with a 15 s timeout, run serially).
+const REFRESH_BATCH_MAX: i64 = 100;
+
 pub async fn proactive_token_refresh_task(cred_service: Arc<OAuthCredentialService>) {
     let mut ticker = interval(Duration::from_secs(300)); // 5 minutes
 
@@ -25,14 +29,21 @@ pub async fn proactive_token_refresh_task(cred_service: Arc<OAuthCredentialServi
         // The tick interval is 5 minutes and the inner threshold is REFRESH_THRESHOLD_MINUTES,
         // giving headroom before any token actually expires.
         let threshold_mins = super::REFRESH_THRESHOLD_MINUTES as i32;
+        // Revoked grants (`needs_reauth_at`) are skipped until re-linked; the
+        // batch is bounded, soonest expiry first, so a backlog drains over
+        // successive ticks instead of one unbounded pass.
         let expiring: Vec<String> = match sqlx::query_scalar(
             "SELECT access_token_secret_path FROM integration_credentials \
              WHERE is_active = TRUE \
+               AND needs_reauth_at IS NULL \
                AND token_expires_at IS NOT NULL \
                AND token_expires_at < NOW() + make_interval(mins => $1::int) \
-               AND access_token_secret_path IS NOT NULL",
+               AND access_token_secret_path IS NOT NULL \
+             ORDER BY token_expires_at, id \
+             LIMIT $2",
         )
         .bind(threshold_mins)
+        .bind(REFRESH_BATCH_MAX)
         .fetch_all(cred_service.db_pool())
         .await
         {
