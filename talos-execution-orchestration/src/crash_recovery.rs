@@ -350,22 +350,21 @@ pub(crate) async fn resume_one(
                 "{origin_label}: execution resumed"
             );
         }
-        // Fenced: another controller superseded this resume (epoch advanced).
-        // Do NOT mark the row failed — it now belongs to the new owner, or a
-        // reclaim already failed it. Failing here would clobber the new owner's
-        // `resuming` row. Just count it and move on.
         // An operator cancelled the resumed run: the row is already
-        // `cancelled`. Counted as `fenced` (the closest existing outcome — not
-        // a resume failure) until the metric carries a `cancelled` value.
+        // `cancelled`. Its own outcome — not a resume failure, not a fence.
         Err(ref e) if talos_engine::fence::was_cancelled_by_operator(e) => {
             if origin.records_metrics() {
-                record_outcome("fenced", 1);
+                record_outcome("cancelled", 1);
             }
             tracing::info!(
                 execution_id = %exec_id,
                 "{origin_label}: resumed run stopped — the execution was cancelled by an operator"
             );
         }
+        // Fenced: another controller superseded this resume (epoch advanced).
+        // Do NOT mark the row failed — it now belongs to the new owner, or a
+        // reclaim already failed it. Failing here would clobber the new owner's
+        // `resuming` row. Just count it and move on.
         Err(ref e) if talos_engine::fence::was_fenced(e) => {
             if origin.records_metrics() {
                 record_outcome("fenced", 1);
@@ -455,6 +454,28 @@ mod strip_waiting_placeholder_tests {
 
         let out = strip_waiting_placeholder_seeds(seed);
         assert_eq!(out.len(), 3);
+    }
+
+    /// Every label literal passed to `record_outcome` must be a seeded label:
+    /// an unseeded series is absent, and absence reads as "no match". Also
+    /// pins that an operator cancel has its own label rather than `fenced`.
+    #[test]
+    fn every_recorded_outcome_is_a_seeded_label() {
+        let src = include_str!("crash_recovery.rs");
+        let needle = concat!("record_outcome", "(\"");
+        let labels: Vec<&str> = src
+            .split(needle)
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert!(labels.len() >= 5, "scan found too few sites: {labels:?}");
+        for label in &labels {
+            assert!(
+                talos_metrics::CRASH_RECOVERY_OUTCOMES.contains(label),
+                "record_outcome(\"{label}\") is not in CRASH_RECOVERY_OUTCOMES"
+            );
+        }
+        assert!(labels.contains(&"cancelled"), "{labels:?}");
     }
 
     #[test]

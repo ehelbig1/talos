@@ -2726,12 +2726,9 @@ async fn run_scheduled_execution(
             );
         }
         // An operator cancelled the run (here, or seen by the fence): the row
-        // is already `cancelled`, so nothing to mark and nothing to alert. It
-        // is counted as `fenced` — the closest existing outcome (neither a
-        // success nor a failure of this dispatch) until the metric carries a
-        // `cancelled` value; the log line says which it was.
+        // is already `cancelled`, so nothing to mark and nothing to alert.
         Err(e) if talos_engine::fence::was_cancelled_by_operator(&e) => {
-            record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_FENCED);
+            record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_CANCELLED);
             tracing::info!(
                 execution_id = %execution_id,
                 schedule_id = %schedule_id,
@@ -2938,6 +2935,7 @@ mod startup_herd_tests {
             talos_metrics::SCHEDULER_OUTCOME_SKIPPED,
             talos_metrics::SCHEDULER_OUTCOME_DENIED,
             talos_metrics::SCHEDULER_OUTCOME_FENCED,
+            talos_metrics::SCHEDULER_OUTCOME_CANCELLED,
         ] {
             assert!(
                 talos_metrics::SCHEDULER_DISPATCH_OUTCOMES.contains(&outcome),
@@ -2945,12 +2943,12 @@ mod startup_herd_tests {
             );
         }
         // The list above must not drift from the emitting sites either: every
-        // outcome constant this crate can emit is one of the five, and the
+        // outcome constant this crate can emit is one of the six, and the
         // partition claim in the metric's docs depends on the closed set
         // staying closed.
         assert_eq!(
             talos_metrics::SCHEDULER_DISPATCH_OUTCOMES.len(),
-            5,
+            6,
             "a new outcome must be added to this test, to the pre-seed loop, and \
              to the herd alert's outcome selector — an unseeded series is absent, \
              and every `increase(...)` idiom reads absent as 'no match'"
@@ -3615,10 +3613,10 @@ mod startup_herd_tests {
         // too — a policy refusal, not a herd symptom — and its schedule is
         // re-armed so the fire is deferred rather than dropped.
         ("SCHEDULER_OUTCOME_DENIED", 4),
-        // 2 since 2026-09-26: an operator cancel is its own arm (logged as a
-        // cancel, not a fence) and is counted as `fenced` until the metric
-        // carries a `cancelled` value.
-        ("SCHEDULER_OUTCOME_FENCED", 2),
+        ("SCHEDULER_OUTCOME_FENCED", 1),
+        // Since 2026-09-26: an operator cancel is its own arm and its own
+        // outcome, no longer counted as `fenced`.
+        ("SCHEDULER_OUTCOME_CANCELLED", 1),
     ];
 
     #[test]
