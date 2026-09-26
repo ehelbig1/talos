@@ -593,49 +593,81 @@ impl GoogleCalendarService {
             anyhow::bail!("Integration not found or access denied");
         }
 
-        // Cascade: stop every watch channel this integration owns.
-        // Channels live in integration_state; list + iterate + stop.
-        // Errors on individual channels are logged but don't abort
-        // the disconnect — the user-facing intent is "turn it off,"
-        // even if Google's side fails on a given channel.
-        use talos_memory::integration_state_rpc::{IntegrationOp, IntegrationOpResult, ListFilter};
-        if let Ok(IntegrationOpResult::Entries { entries }) = talos_integration_state::execute_op(
-            &self.db_pool,
-            crate::watch::GCAL_INTEGRATION_NAME,
-            user_id,
-            IntegrationOp::List {
-                filter: ListFilter::default(),
-                limit: 500,
-            },
+        // Cascade: stop every watch channel this integration owns. A failure
+        // to READ the channel set is returned (the flip above stands, but the
+        // caller must not be told the watches were stopped); a Google-side
+        // stop failure on one channel is logged and does not abort the rest.
+        // Keys are listed directly (bounded by the per-user row cap) rather
+        // than through the capped `List` op, which has no cursor.
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT key FROM integration_state \
+             WHERE integration_name = $1 AND user_id = $2 AND key LIKE 'channel/%' \
+               AND (expires_at IS NULL OR expires_at > now()) \
+             ORDER BY key",
         )
+        .bind(crate::watch::GCAL_INTEGRATION_NAME)
+        .bind(user_id)
+        .fetch_all(&self.db_pool)
         .await
-        {
-            for entry in entries {
-                // Decode just enough to check ownership + get the
-                // internal uuid — reuse the row type from watch.rs.
-                #[derive(serde::Deserialize)]
-                struct IdOnly {
-                    id: uuid::Uuid,
-                    integration_id: uuid::Uuid,
+        .context("list gcal watch channels for disconnect cascade")?;
+
+        use talos_memory::integration_state_rpc::{IntegrationOp, IntegrationOpResult};
+        let mut unreadable = 0usize;
+        for key in keys {
+            let entry = match talos_integration_state::execute_op(
+                &self.db_pool,
+                crate::watch::GCAL_INTEGRATION_NAME,
+                user_id,
+                IntegrationOp::Get { key },
+            )
+            .await
+            {
+                Ok(IntegrationOpResult::Entry { entry }) => entry,
+                // Gone since the listing (TTL or a concurrent stop): nothing to stop.
+                Err(talos_memory::integration_state_rpc::IntegrationStateError::KeyNotFound) => {
+                    continue
                 }
-                let Ok(ids) = serde_json::from_str::<IdOnly>(&entry.value) else {
+                Ok(_) | Err(_) => {
+                    unreadable += 1;
                     continue;
-                };
-                if ids.integration_id != integration_id {
-                    continue;
                 }
-                if let Err(e) = self.stop_watch_channel(user_id, ids.id).await {
-                    tracing::warn!(
-                        channel_uuid = %ids.id,
-                        error = %e,
-                        "stop_watch_channel failed during disconnect; row may linger until TTL"
-                    );
+            };
+            match channel_owned_by(&entry.value, integration_id) {
+                Some(Some(channel_uuid)) => {
+                    if let Err(e) = self.stop_watch_channel(user_id, channel_uuid).await {
+                        tracing::warn!(
+                            channel_uuid = %channel_uuid,
+                            error = %e,
+                            "stop_watch_channel failed during disconnect; row may linger until TTL"
+                        );
+                    }
                 }
+                Some(None) => {}
+                None => unreadable += 1,
             }
+        }
+        if unreadable > 0 {
+            anyhow::bail!(
+                "integration disconnected, but {unreadable} watch channel row(s) could not be read; \
+                 they were not stopped"
+            );
         }
 
         Ok(())
     }
+}
+
+/// For a stored gcal channel row: `Some(Some(id))` when it belongs to
+/// `integration_id`, `Some(None)` when it belongs to another integration,
+/// `None` when the row cannot be decoded.
+fn channel_owned_by(value: &str, integration_id: Uuid) -> Option<Option<Uuid>> {
+    #[derive(serde::Deserialize)]
+    struct IdOnly {
+        id: Uuid,
+        integration_id: Uuid,
+    }
+    let ids = serde_json::from_str::<IdOnly>(value).ok()?;
+    Some((ids.integration_id == integration_id).then_some(ids.id))
 }
 
 /// Dedicated Google Calendar OAuth flow — mirrors the canonical `talos-slack`
@@ -811,5 +843,20 @@ impl talos_oauth::OAuthIntegration for GoogleCalendarService {
         }
 
         Ok(integration)
+    }
+}
+
+#[cfg(test)]
+mod disconnect_cascade_tests {
+    use super::*;
+
+    #[test]
+    fn channel_ownership_is_three_valued() {
+        let mine = Uuid::from_u128(1);
+        let ch = Uuid::from_u128(2);
+        let row = format!(r#"{{"id":"{ch}","integration_id":"{mine}","x":1}}"#);
+        assert_eq!(channel_owned_by(&row, mine), Some(Some(ch)));
+        assert_eq!(channel_owned_by(&row, Uuid::from_u128(3)), Some(None));
+        assert_eq!(channel_owned_by("not json", mine), None);
     }
 }

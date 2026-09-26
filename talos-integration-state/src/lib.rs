@@ -246,33 +246,8 @@ pub async fn execute_op(
             ttl_seconds,
             slots,
         } => {
-            let value_str = value.to_string();
-            if value_str.len() > 64 * 1024 {
-                return Err(IntegrationStateError::InvalidInput(
-                    "value exceeds 64 KiB cap".into(),
-                ));
-            }
-            // Encrypt at rest when a crypto provider is installed (controller
-            // startup wires one); otherwise store plaintext (unset in unit tests /
-            // pre-wiring). AAD binds the ciphertext to this exact
-            // (integration_name, user_id, key) slot. The `value`/`value_enc`
-            // columns are XOR by DB constraint — exactly one is written.
-            #[allow(clippy::type_complexity)]
-            let (value_plain, value_enc, value_key_id, value_format): (
-                Option<String>,
-                Option<Vec<u8>>,
-                Option<Uuid>,
-                Option<i16>,
-            ) = if let Some(c) = integration_state_crypto() {
-                let aad = integration_state_aad(integration_name, user_id, &key);
-                let (kid, ct, fmt) = c.encrypt(&value_str, user_id, &aad).await.map_err(|e| {
-                    tracing::error!(error = %e, "integration_state value encrypt failed");
-                    IntegrationStateError::Internal("value encryption failed".into())
-                })?;
-                (None, Some(ct), Some(kid), Some(fmt))
-            } else {
-                (Some(value_str), None, None, None)
-            };
+            let (value_plain, value_enc, value_key_id, value_format) =
+                seal_value(integration_name, user_id, &key, &value).await?;
             // MCP-717 (2026-05-13): TOCTOU-safe cap enforcement. Pre-fix
             // the existence + count + INSERT triple ran as three
             // independent statements against the pool — multiple
@@ -457,6 +432,154 @@ pub async fn execute_op(
             Ok(IntegrationOpResult::Entries { entries })
         }
     }
+}
+
+/// A row's stored value columns: exactly one of plaintext `value` or
+/// `value_enc` (+ key id + format) is set — XOR by DB constraint.
+type SealedValue = (Option<String>, Option<Vec<u8>>, Option<Uuid>, Option<i16>);
+
+/// Enforce the 64 KiB cap and encrypt at rest when a crypto provider is
+/// installed (controller startup wires one; unit tests store plaintext). The
+/// AAD binds the ciphertext to this exact (integration_name, user_id, key)
+/// slot.
+async fn seal_value(
+    integration_name: &str,
+    user_id: Uuid,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<SealedValue, IntegrationStateError> {
+    let value_str = value.to_string();
+    if value_str.len() > 64 * 1024 {
+        return Err(IntegrationStateError::InvalidInput(
+            "value exceeds 64 KiB cap".into(),
+        ));
+    }
+    if let Some(c) = integration_state_crypto() {
+        let aad = integration_state_aad(integration_name, user_id, key);
+        let (kid, ct, fmt) = c.encrypt(&value_str, user_id, &aad).await.map_err(|e| {
+            tracing::error!(error = %e, "integration_state value encrypt failed");
+            IntegrationStateError::Internal("value encryption failed".into())
+        })?;
+        Ok((None, Some(ct), Some(kid), Some(fmt)))
+    } else {
+        Ok((Some(value_str), None, None, None))
+    }
+}
+
+/// What an [`update_existing`] mutation decided for the row it was shown.
+pub enum RowUpdate {
+    /// Leave the row exactly as it is.
+    Unchanged,
+    /// Replace the row's value, TTL and indexed slots.
+    Replace {
+        value: serde_json::Value,
+        ttl_seconds: Option<u64>,
+        slots: IndexedSlots,
+    },
+}
+
+/// Result of an [`update_existing`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    Updated,
+    Unchanged,
+    /// No live row: nothing was written (and nothing is ever inserted).
+    Absent,
+}
+
+/// Why an [`update_existing`] call failed.
+#[derive(Debug)]
+pub enum UpdateError<E> {
+    State(IntegrationStateError),
+    Mutation(E),
+}
+
+impl<E> From<IntegrationStateError> for UpdateError<E> {
+    fn from(e: IntegrationStateError) -> Self {
+        UpdateError::State(e)
+    }
+}
+
+/// Controller-local read-modify-write of ONE existing row, atomic against
+/// every other writer: the row is read `FOR UPDATE` inside a transaction,
+/// `mutate` sees the current value, and the write is an `UPDATE` — never an
+/// insert. So a hot-path write that races a delete (a stopped watch) or a
+/// full rewrite (a binding change, a renewal) cannot resurrect the row or
+/// revert the other writer's fields, which a read → `Set` upsert could.
+///
+/// Not an RPC op: the signed `integration_state` wire format is unchanged.
+pub async fn update_existing<F, E>(
+    pool: &PgPool,
+    integration_name: &str,
+    user_id: Uuid,
+    key: &str,
+    mutate: F,
+) -> Result<UpdateOutcome, UpdateError<E>>
+where
+    F: FnOnce(&StoredEntry) -> Result<RowUpdate, E>,
+{
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    let row = sqlx::query(
+        "SELECT key, value, value_enc, value_key_id, value_format, \
+                (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint AS updated_at_ms, \
+                CASE WHEN expires_at IS NULL THEN NULL \
+                     ELSE (EXTRACT(EPOCH FROM expires_at) * 1000)::bigint \
+                END AS expires_at_ms, \
+                idx_str_1, idx_str_2, \
+                CASE WHEN idx_ts_1 IS NULL THEN NULL \
+                     ELSE (EXTRACT(EPOCH FROM idx_ts_1) * 1000)::bigint \
+                END AS idx_ts_1_ms, \
+                idx_int_1 \
+         FROM integration_state \
+         WHERE integration_name = $1 AND user_id = $2 AND key = $3 \
+           AND (expires_at IS NULL OR expires_at > now()) \
+         FOR UPDATE",
+    )
+    .bind(integration_name)
+    .bind(user_id)
+    .bind(key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let Some(row) = row else {
+        return Ok(UpdateOutcome::Absent);
+    };
+    let entry = row_to_entry(integration_name, user_id, &row).await?;
+    let (value, ttl_seconds, slots) = match mutate(&entry).map_err(UpdateError::Mutation)? {
+        RowUpdate::Unchanged => return Ok(UpdateOutcome::Unchanged),
+        RowUpdate::Replace {
+            value,
+            ttl_seconds,
+            slots,
+        } => (value, ttl_seconds, slots),
+    };
+    let (value_plain, value_enc, value_key_id, value_format) =
+        seal_value(integration_name, user_id, key, &value).await?;
+    let expires_at: Option<DateTime<Utc>> =
+        ttl_seconds.map(|secs| Utc::now() + chrono::Duration::seconds(secs as i64));
+    sqlx::query(
+        "UPDATE integration_state SET \
+             value = $4::jsonb, value_enc = $5, value_key_id = $6, value_format = $7, \
+             expires_at = $8, idx_str_1 = $9, idx_str_2 = $10, idx_ts_1 = $11, idx_int_1 = $12 \
+         WHERE integration_name = $1 AND user_id = $2 AND key = $3",
+    )
+    .bind(integration_name)
+    .bind(user_id)
+    .bind(key)
+    .bind(&value_plain)
+    .bind(&value_enc)
+    .bind(value_key_id)
+    .bind(value_format)
+    .bind(expires_at)
+    .bind(slots.idx_str_1)
+    .bind(slots.idx_str_2)
+    .bind(slots.idx_ts_1_ms.and_then(ms_to_datetime))
+    .bind(slots.idx_int_1)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok(UpdateOutcome::Updated)
 }
 
 /// Constant error message for every DB failure. Raw Postgres text never
