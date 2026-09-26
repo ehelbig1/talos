@@ -824,7 +824,7 @@ async fn a_rotated_org_dek_is_pending_until_the_sweep_rekeys_its_rows() {
 }
 
 #[tokio::test]
-async fn a_row_under_another_orgs_active_dek_is_pending_and_moves_to_its_own() {
+async fn a_row_under_another_orgs_active_dek_is_pending_and_refused() {
     set_master_key_for_dek_tests();
     let pool = test_helpers::get_test_db_pool().await;
     let manager = SecretsManager::new(pool.clone()).unwrap();
@@ -874,19 +874,23 @@ async fn a_row_under_another_orgs_active_dek_is_pending_and_moves_to_its_own() {
         settled + 1,
         "a row under another org's active DEK is pending"
     );
-    manager.re_encrypt_secrets_to_org().await.unwrap();
-    let b_key = manager
-        .get_active_dek_for_org(org_b)
-        .await
-        .unwrap()
-        .unwrap()
-        .id;
-    assert_eq!(secret_key_id(&pool, sid).await, (4, b_key));
-    let got = manager
-        .get_secret(&kp, SecretRequestor::System, &[])
-        .await
-        .unwrap();
-    assert_eq!(got, "foreign-val");
+    // No production path moves a secret's `org_id`, so a v4 row naming
+    // another org's DEK is the cross-tenant substitution shape: the sweep
+    // must refuse to decrypt it (counted as a failure) and leave the row on
+    // org A's key, and a read of it must fail closed too.
+    let stats = manager.re_encrypt_secrets_to_org().await.unwrap();
+    assert!(
+        stats.failed_ids.contains(&sid),
+        "the sweep refuses a row whose DEK is outside its org"
+    );
+    assert_eq!(secret_key_id(&pool, sid).await, (4, a_key));
+    assert!(
+        manager
+            .get_secret(&kp, SecretRequestor::System, &[])
+            .await
+            .is_err(),
+        "a row naming another org's DEK does not decrypt"
+    );
 }
 
 #[tokio::test]

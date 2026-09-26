@@ -484,6 +484,10 @@ pub enum SecretRequestor {
 pub struct DataEncryptionKey {
     pub id: Uuid,
     pub key: Zeroizing<Vec<u8>>,
+    /// The org this DEK is the root key of; `None` for the global DEK. Read
+    /// with the key so a row can be checked against the scope of the DEK it
+    /// names ([`dek_scope_matches_row`]).
+    pub org_id: Option<Uuid>,
 }
 
 /// The ML content-fingerprint MAC key (see
@@ -1058,7 +1062,7 @@ impl SecretsManager {
 
         let id: Uuid = record.try_get("id")?;
         let encrypted_key: Vec<u8> = record.try_get("encrypted_key")?;
-        let dek = self.decrypt_dek(id, &encrypted_key).await?;
+        let dek = self.decrypt_dek(id, None, &encrypted_key).await?;
 
         // 3️⃣ Cache the decrypted DEK (write lock — exclusive access)
         {
@@ -1112,15 +1116,15 @@ impl SecretsManager {
         // (→ Database, `#[from]`). `fetch_optional` + explicit None arm
         // rather than mapping `RowNotFound` after the fact so a genuine
         // connection error can't be miscategorised as a missing key.
-        let record = sqlx::query!(
-            "SELECT id, encrypted_key FROM encryption_keys WHERE id = $1",
-            key_id
-        )
-        .fetch_optional(&self.db_pool)
-        .await?
-        .ok_or(SecretsError::MissingDek { key_id })?;
+        let record = sqlx::query("SELECT encrypted_key, org_id FROM encryption_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_optional(&self.db_pool)
+            .await?
+            .ok_or(SecretsError::MissingDek { key_id })?;
+        let encrypted_key: Vec<u8> = record.try_get("encrypted_key")?;
+        let org_id: Option<Uuid> = record.try_get("org_id")?;
 
-        let dek = self.decrypt_dek(record.id, &record.encrypted_key).await?;
+        let dek = self.decrypt_dek(key_id, org_id, &encrypted_key).await?;
 
         // 3️⃣ Cache the decrypted DEK
         self.dek_cache.insert(
@@ -1210,7 +1214,7 @@ impl SecretsManager {
         };
         let id: Uuid = record.try_get("id")?;
         let encrypted_key: Vec<u8> = record.try_get("encrypted_key")?;
-        let dek = self.decrypt_dek(id, &encrypted_key).await?;
+        let dek = self.decrypt_dek(id, Some(org_id), &encrypted_key).await?;
 
         // 3️⃣ Cache it under the org slot.
         self.active_org_dek_cache.insert(
@@ -1299,13 +1303,22 @@ impl SecretsManager {
     /// kept after Phase 5 because it's the cheap insurance that lets a
     /// future provider migration (e.g. Vault → AWS KMS) reuse the same
     /// dual-wrap pattern without code changes here.
-    async fn decrypt_dek(&self, key_id: Uuid, encrypted_key: &[u8]) -> Result<DataEncryptionKey> {
+    async fn decrypt_dek(
+        &self,
+        key_id: Uuid,
+        org_id: Option<Uuid>,
+        encrypted_key: &[u8],
+    ) -> Result<DataEncryptionKey> {
         let active = self.current_kek()?;
         let legacy = self.current_legacy_kek();
         let key =
             unwrap_dek_with_fallback(active.as_ref(), legacy.as_deref(), key_id, encrypted_key)
                 .await?;
-        Ok(DataEncryptionKey { id: key_id, key })
+        Ok(DataEncryptionKey {
+            id: key_id,
+            key,
+            org_id,
+        })
     }
 
     /// Store a new secret.
@@ -1641,6 +1654,7 @@ impl SecretsManager {
                 record.encryption_key_id,
                 &record.encrypted_value,
                 record.encryption_format_version,
+                record.org_id,
             )
             .await?
             .to_string();
@@ -1839,15 +1853,8 @@ impl SecretsManager {
     )]
     pub async fn encrypt_value(&self, value: &str) -> Result<(Uuid, Vec<u8>)> {
         let dek = self.get_active_dek().await?;
-        let cipher = Aes256Gcm::new_from_slice(&dek.key)?;
-        let nonce_bytes = Self::generate_nonce();
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), value.as_bytes())
-            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
-
-        let mut stored = nonce_bytes.to_vec(); // 12-byte nonce prefix
-        stored.extend_from_slice(&ciphertext);
-        Ok((dek.id, stored))
+        // Empty AAD: GCM with no associated data, the v0 layout.
+        Ok((dek.id, aead_seal(&dek.key, value.as_bytes(), &[])?))
     }
 
     /// Decrypt a value that was encrypted by `encrypt_value` with the given DEK.
@@ -2027,13 +2034,37 @@ impl SecretsManager {
     /// v0 (legacy): no AAD; equivalent to `decrypt_value_by_key`.
     /// v1: AAD = `secret_id` bytes (closes ciphertext-substitution gap
     /// per N T2-N1).
+    ///
+    /// `row_org_id` is the row's `org_id`: a derived-format row must name a
+    /// DEK of the matching scope (see [`dek_scope_matches_row`]), so a row
+    /// whose `org_id` was rewritten — or whose ciphertext and key id were
+    /// moved in from another tenant's row — fails closed as a tamper signal
+    /// instead of decrypting under the other tenant's key.
     pub(crate) async fn decrypt_secret_record(
         &self,
         secret_id: Uuid,
         key_id: Uuid,
         encrypted: &[u8],
         format_version: i16,
+        row_org_id: Option<Uuid>,
     ) -> Result<Zeroizing<String>, SecretsError> {
+        let format = crate::SecretFormat::from_version(format_version)?;
+        if matches!(
+            format,
+            crate::SecretFormat::V3Derived | crate::SecretFormat::V4OrgDerived
+        ) {
+            let dek = self.get_dek(key_id).await?;
+            if !dek_scope_matches_row(format, dek.org_id, row_org_id) {
+                tracing::error!(
+                    target: "talos_security",
+                    event_kind = "secret_dek_scope_mismatch",
+                    %secret_id,
+                    %key_id,
+                    "secret row names a DEK outside its org scope — refusing to decrypt"
+                );
+                return Err(SecretsError::Aead);
+            }
+        }
         // 2026-05-28 audit S2#9 follow-up, typed 2026-07-24: the
         // version is validated fail-closed by `SecretFormat::from_version`
         // and dispatched EXHAUSTIVELY — a future v5 variant forces this
@@ -2042,7 +2073,7 @@ impl SecretsManager {
         // (per-context-derived key bound to secret_id; v4's only
         // difference is the IKM is a per-org DEK named by `key_id`,
         // which `get_dek` resolves by id — no org awareness needed).
-        match crate::SecretFormat::from_version(format_version)? {
+        match format {
             crate::SecretFormat::V0Legacy => self.decrypt_value_by_key(key_id, encrypted).await,
             crate::SecretFormat::V1Aad => {
                 self.decrypt_value_by_key_with_aad(key_id, encrypted, secret_id.as_bytes())
@@ -2301,18 +2332,7 @@ impl SecretsManager {
     /// cannot drift from `decrypt_value_derived_with_aad`.
     fn seal_derived(dek_key: &[u8], value: &str, aad: &[u8]) -> Result<Vec<u8>> {
         let subkey = Self::derive_per_context_subkey(dek_key, aad)?;
-        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())?;
-        let nonce_bytes = Self::generate_nonce();
-        let payload = aes_gcm::aead::Payload {
-            msg: value.as_bytes(),
-            aad,
-        };
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), payload)
-            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
-        let mut stored = nonce_bytes.to_vec();
-        stored.extend_from_slice(&ciphertext);
-        Ok(stored)
+        aead_seal(subkey.as_slice(), value.as_bytes(), aad)
     }
 
     /// Resolve the org that owns a `workflow_executions` row — the WORKFLOW's
@@ -2421,32 +2441,13 @@ impl SecretsManager {
         encrypted: &[u8],
         aad: &[u8],
     ) -> Result<Zeroizing<String>, SecretsError> {
-        if encrypted.len() < 12 {
+        if encrypted.len() < AEAD_NONCE_LEN {
             return Err(SecretsError::Aead);
         }
-        let nonce = Nonce::from_slice(&encrypted[..12]);
-        let ciphertext = &encrypted[12..];
-
         let dek = self.get_dek(key_id).await?;
         let subkey = Self::derive_per_context_subkey(&dek.key, aad)
             .map_err(|e| SecretsError::Internal(anyhow!(e)))?;
-        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())
-            .map_err(|e| SecretsError::Internal(anyhow!(e)))?;
-        let payload = aes_gcm::aead::Payload {
-            msg: ciphertext,
-            aad,
-        };
-        // Same plaintext-hygiene discipline as the v1/v2 path: hold the
-        // GCM output in Zeroizing<Vec<u8>> so it is wiped on drop even on
-        // the UTF-8 error branch. Tag mismatch / wrong key / wrong AAD →
-        // SecretsError::Aead (no detail carried).
-        let decrypted: Zeroizing<Vec<u8>> = Zeroizing::new(
-            cipher
-                .decrypt(nonce, payload)
-                .map_err(|_| SecretsError::Aead)?,
-        );
-        let plaintext = std::str::from_utf8(&decrypted).map_err(|_| SecretsError::Serde)?;
-        Ok(Zeroizing::new(plaintext.to_string()))
+        aead_open_utf8(subkey.as_slice(), encrypted, aad)
     }
 
     /// Encrypt a raw value with Additional Authenticated Data (AAD) — the
@@ -2475,18 +2476,7 @@ impl SecretsManager {
     /// it was encrypted with AAD.
     pub async fn encrypt_value_with_aad(&self, value: &str, aad: &[u8]) -> Result<(Uuid, Vec<u8>)> {
         let dek = self.get_active_dek().await?;
-        let cipher = Aes256Gcm::new_from_slice(&dek.key)?;
-        let nonce_bytes = Self::generate_nonce();
-        let payload = aes_gcm::aead::Payload {
-            msg: value.as_bytes(),
-            aad,
-        };
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), payload)
-            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
-        let mut stored = nonce_bytes.to_vec();
-        stored.extend_from_slice(&ciphertext);
-        Ok((dek.id, stored))
+        Ok((dek.id, aead_seal(&dek.key, value.as_bytes(), aad)?))
     }
 
     /// Decrypt a value that was encrypted by `encrypt_value_with_aad`.
@@ -2504,36 +2494,12 @@ impl SecretsManager {
         encrypted: &[u8],
         aad: &[u8],
     ) -> Result<Zeroizing<String>, SecretsError> {
-        // A ciphertext shorter than the 12-byte nonce can never open —
-        // classify as an AEAD failure (tamper/corruption), carrying no
-        // length or byte detail.
-        if encrypted.len() < 12 {
+        // Checked before the DEK read: a too-short blob can never open.
+        if encrypted.len() < AEAD_NONCE_LEN {
             return Err(SecretsError::Aead);
         }
-        let nonce = Nonce::from_slice(&encrypted[..12]);
-        let ciphertext = &encrypted[12..];
-
         let dek = self.get_dek(key_id).await?;
-        // Cipher construction only fails on a wrong-length key, which the
-        // DEK contract guarantees can't happen; treat as Internal.
-        let cipher =
-            Aes256Gcm::new_from_slice(&dek.key).map_err(|e| SecretsError::Internal(anyhow!(e)))?;
-        let payload = aes_gcm::aead::Payload {
-            msg: ciphertext,
-            aad,
-        };
-        // L T2-3 + N T2-N1: keep decrypted bytes in Zeroizing<Vec<u8>>
-        // so the AES-GCM output buffer is wiped on drop, even on the
-        // UTF-8 validation error branch. AES-GCM rejects mismatched
-        // AAD/key/tag with a generic error; we map to SecretsError::Aead
-        // (which carries NO detail) so no oracle leaks.
-        let decrypted: Zeroizing<Vec<u8>> = Zeroizing::new(
-            cipher
-                .decrypt(nonce, payload)
-                .map_err(|_| SecretsError::Aead)?,
-        );
-        let plaintext = std::str::from_utf8(&decrypted).map_err(|_| SecretsError::Serde)?;
-        Ok(Zeroizing::new(plaintext.to_string()))
+        aead_open_utf8(&dek.key, encrypted, aad)
     }
 
     /// Fetch all secrets authorized for a specific module
@@ -2605,7 +2571,7 @@ impl SecretsManager {
             sqlx::query(
                 r#"
                 SELECT id, key_path, encrypted_value, encryption_key_id,
-                       encryption_format_version, expires_at
+                       encryption_format_version, expires_at, org_id
                 FROM secrets
                 WHERE $1 = ANY(allowed_modules)
                   AND (owner_user_id IS NULL OR owner_user_id = $2 OR created_by = $2)
@@ -2619,7 +2585,7 @@ impl SecretsManager {
             sqlx::query(
                 r#"
                 SELECT id, key_path, encrypted_value, encryption_key_id,
-                       encryption_format_version, expires_at
+                       encryption_format_version, expires_at, org_id
                 FROM secrets
                 WHERE $1 = ANY(allowed_modules)
                 "#,
@@ -2640,6 +2606,7 @@ impl SecretsManager {
             let encryption_key_id: Uuid = row.try_get("encryption_key_id")?;
             let encryption_format_version: i16 = row.try_get("encryption_format_version")?;
             let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("expires_at")?;
+            let row_org_id: Option<Uuid> = row.try_get("org_id")?;
 
             if let Some(expires_at) = expires_at {
                 if expires_at < now {
@@ -2665,6 +2632,7 @@ impl SecretsManager {
                     encryption_key_id,
                     &encrypted_value,
                     encryption_format_version,
+                    row_org_id,
                 )
                 .await
             {
@@ -2731,12 +2699,13 @@ impl SecretsManager {
             Uuid,
             i16,
             Option<chrono::DateTime<chrono::Utc>>,
+            Option<Uuid>,
         );
         let records: Vec<PathRecord> = if is_wildcard {
             if let Some(uid) = owner_user_id {
                 sqlx::query_as(
                     "SELECT id, key_path, encrypted_value, encryption_key_id, \
-                            encryption_format_version, expires_at \
+                            encryption_format_version, expires_at, org_id \
                      FROM secrets \
                      WHERE owner_user_id IS NULL OR owner_user_id = $1 OR created_by = $1",
                 )
@@ -2747,7 +2716,7 @@ impl SecretsManager {
                 // No user context — restrict to global/system secrets only.
                 sqlx::query_as(
                     "SELECT id, key_path, encrypted_value, encryption_key_id, \
-                            encryption_format_version, expires_at \
+                            encryption_format_version, expires_at, org_id \
                      FROM secrets WHERE owner_user_id IS NULL",
                 )
                 .fetch_all(&self.db_pool)
@@ -2756,7 +2725,7 @@ impl SecretsManager {
         } else if let Some(uid) = owner_user_id {
             sqlx::query_as(
                 "SELECT id, key_path, encrypted_value, encryption_key_id, \
-                        encryption_format_version, expires_at \
+                        encryption_format_version, expires_at, org_id \
                  FROM secrets \
                  WHERE key_path = ANY($1) \
                    AND (owner_user_id IS NULL OR owner_user_id = $2 OR created_by = $2)",
@@ -2769,7 +2738,7 @@ impl SecretsManager {
             // No user context — restrict to global/system secrets only.
             sqlx::query_as(
                 "SELECT id, key_path, encrypted_value, encryption_key_id, \
-                        encryption_format_version, expires_at \
+                        encryption_format_version, expires_at, org_id \
                  FROM secrets \
                  WHERE key_path = ANY($1) AND owner_user_id IS NULL",
             )
@@ -2788,6 +2757,7 @@ impl SecretsManager {
             encryption_key_id,
             encryption_format_version,
             expires_at,
+            row_org_id,
         ) in records
         {
             if let Some(exp) = expires_at {
@@ -2805,6 +2775,7 @@ impl SecretsManager {
                     encryption_key_id,
                     &encrypted_value,
                     encryption_format_version,
+                    row_org_id,
                 )
                 .await
             {
@@ -4926,6 +4897,7 @@ impl SecretsManager {
                     encryption_key_id,
                     &encrypted_value,
                     encryption_format_version,
+                    None, // v4 rows are excluded above; v0/v1/v3 need no row org
                 )
                 .await
             {
@@ -5096,6 +5068,7 @@ impl SecretsManager {
                     encryption_key_id,
                     &encrypted_value,
                     encryption_format_version,
+                    Some(org_id),
                 )
                 .await
             {
@@ -5621,6 +5594,55 @@ pub fn resolve_secret_references<'a>(
     })
 }
 
+/// Length of the random nonce prefixed to every stored AES-256-GCM value.
+const AEAD_NONCE_LEN: usize = 12;
+
+/// AES-256-GCM seal in the stored layout every DEK-level format shares:
+/// `[12-byte random nonce][ciphertext + 16-byte tag]`. An empty `aad` is GCM
+/// with no associated data (the v0 layout). One home for the framing, so the
+/// v0/v1/v3/v4 writers cannot drift from [`aead_open_utf8`].
+fn aead_seal(key: &[u8], msg: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key)?;
+    let nonce_bytes = SecretsManager::generate_nonce();
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            aes_gcm::aead::Payload { msg, aad },
+        )
+        .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+    let mut stored = Vec::with_capacity(AEAD_NONCE_LEN + ciphertext.len());
+    stored.extend_from_slice(&nonce_bytes);
+    stored.extend_from_slice(&ciphertext);
+    Ok(stored)
+}
+
+/// Open an [`aead_seal`] value as UTF-8. Any open failure — short input,
+/// wrong key/AAD, bad tag — is [`SecretsError::Aead`] with no detail (no
+/// oracle); the GCM output is held in `Zeroizing` so it is wiped on drop,
+/// including on the UTF-8 error branch.
+fn aead_open_utf8(
+    key: &[u8],
+    stored: &[u8],
+    aad: &[u8],
+) -> Result<Zeroizing<String>, SecretsError> {
+    if stored.len() < AEAD_NONCE_LEN {
+        return Err(SecretsError::Aead);
+    }
+    let (nonce, msg) = stored.split_at(AEAD_NONCE_LEN);
+    // Only a wrong-length key fails construction, which the DEK contract rules out.
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| SecretsError::Internal(anyhow!(e)))?;
+    let decrypted: Zeroizing<Vec<u8>> = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(nonce),
+                aes_gcm::aead::Payload { msg, aad },
+            )
+            .map_err(|_| SecretsError::Aead)?,
+    );
+    let plaintext = std::str::from_utf8(&decrypted).map_err(|_| SecretsError::Serde)?;
+    Ok(Zeroizing::new(plaintext.to_string()))
+}
+
 /// Unwrap a DEK with the active KEK, falling back to the legacy one.
 ///
 /// The one unwrap rule for `encrypted_key`: [`SecretsManager::decrypt_dek`]
@@ -5677,6 +5699,24 @@ pub(crate) async fn unwrap_dek_with_fallback(
                 key_id
             ))
         })
+}
+
+/// Whether a derived-format secret row may be decrypted under the DEK it
+/// names. v3 is sealed only under the GLOBAL DEK; v4 only under the row's own
+/// org's DEK (`encrypt_value_aad_v4_or_global` picks v4 exactly when the row
+/// has an org). v0–v2 predate per-org DEKs and are not checked.
+pub(crate) fn dek_scope_matches_row(
+    format: crate::SecretFormat,
+    dek_org_id: Option<Uuid>,
+    row_org_id: Option<Uuid>,
+) -> bool {
+    match format {
+        crate::SecretFormat::V3Derived => dek_org_id.is_none(),
+        crate::SecretFormat::V4OrgDerived => dek_org_id.is_some() && dek_org_id == row_org_id,
+        crate::SecretFormat::V0Legacy
+        | crate::SecretFormat::V1Aad
+        | crate::SecretFormat::V2AadSlotTagged => true,
+    }
 }
 
 /// F7a: `rotate_master_key` is an env→env rotation by construction (it always
@@ -5785,6 +5825,78 @@ pub(crate) async fn rewrap_under_active(
             .map_err(|_| anyhow!("unwrapped DEK has length {}, expected 32", plaintext.len()))?,
     );
     Ok(Some(active.wrap_dek(&dek).await?))
+}
+
+#[cfg(test)]
+mod aead_framing_tests {
+    use super::*;
+
+    /// The pre-consolidation writers framed by hand as `nonce || ct`; values
+    /// they stored must still open, with and without AAD.
+    #[test]
+    fn hand_framed_values_still_open_and_seal_keeps_the_layout() {
+        let key = [9u8; 32];
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce = [4u8; 12];
+        for aad in [&b""[..], &b"row-id"[..]] {
+            let ct = cipher
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    aes_gcm::aead::Payload {
+                        msg: b"hunter2",
+                        aad,
+                    },
+                )
+                .unwrap();
+            let mut legacy = nonce.to_vec();
+            legacy.extend_from_slice(&ct);
+            assert_eq!(
+                aead_open_utf8(&key, &legacy, aad).unwrap().as_str(),
+                "hunter2"
+            );
+
+            let sealed = aead_seal(&key, b"hunter2", aad).unwrap();
+            assert_eq!(sealed.len(), legacy.len(), "same [nonce][ct+tag] layout");
+            let reopened = cipher
+                .decrypt(
+                    Nonce::from_slice(&sealed[..12]),
+                    aes_gcm::aead::Payload {
+                        msg: &sealed[12..],
+                        aad,
+                    },
+                )
+                .unwrap();
+            assert_eq!(reopened, b"hunter2");
+        }
+        assert!(matches!(
+            aead_open_utf8(&key, &[0u8; 11], b""),
+            Err(SecretsError::Aead)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod dek_scope_tests {
+    use super::*;
+    use crate::SecretFormat::*;
+
+    #[test]
+    fn a_derived_row_must_name_a_dek_of_its_own_scope() {
+        let (a, b) = (Some(Uuid::new_v4()), Some(Uuid::new_v4()));
+        // v3 is sealed under the global DEK only — whatever the row's org.
+        assert!(dek_scope_matches_row(V3Derived, None, None));
+        assert!(dek_scope_matches_row(V3Derived, None, a));
+        assert!(!dek_scope_matches_row(V3Derived, a, a));
+        // v4 only under the row's own org's DEK.
+        assert!(dek_scope_matches_row(V4OrgDerived, a, a));
+        assert!(!dek_scope_matches_row(V4OrgDerived, a, b), "org moved");
+        assert!(!dek_scope_matches_row(V4OrgDerived, a, None), "org nulled");
+        assert!(!dek_scope_matches_row(V4OrgDerived, None, None));
+        // Pre-per-org formats are not scope-checked.
+        for f in [V0Legacy, V1Aad, V2AadSlotTagged] {
+            assert!(dek_scope_matches_row(f, a, b));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6409,7 +6521,7 @@ mod aad_binding_tests {
         use crate::errors::SecretsError;
         let sm = super::SecretsManager::test_stub_for_cache();
         let err = sm
-            .decrypt_secret_record(Uuid::nil(), Uuid::nil(), &[0u8; 28], 42)
+            .decrypt_secret_record(Uuid::nil(), Uuid::nil(), &[0u8; 28], 42, None)
             .await
             .expect_err("unknown secrets format_version must fail-closed");
         assert!(
@@ -6961,6 +7073,7 @@ mod tests {
         let dek = DataEncryptionKey {
             id: Uuid::new_v4(),
             key: Zeroizing::new(pattern),
+            org_id: None,
         };
         let ptr = dek.key.as_ptr();
         let len = dek.key.len();
@@ -7033,6 +7146,7 @@ mod tests {
         let original = DataEncryptionKey {
             id: Uuid::new_v4(),
             key: Zeroizing::new(vec![0xCDu8; 32]),
+            org_id: None,
         };
         let clone = original.clone();
         let clone_ptr = clone.key.as_ptr();
@@ -7389,6 +7503,7 @@ mod dek_cache_sweep_tests {
         DataEncryptionKey {
             id: Uuid::new_v4(),
             key: Zeroizing::new(vec![0u8; 32]),
+            org_id: None,
         }
     }
 
@@ -7581,7 +7696,7 @@ mod kek_failure_label_tests {
 
         let (a0, b0) = (read("active"), read("both"));
         assert!(
-            sm.decrypt_dek(Uuid::new_v4(), b"not a valid wrapped DEK")
+            sm.decrypt_dek(Uuid::new_v4(), None, b"not a valid wrapped DEK")
                 .await
                 .is_err(),
             "garbage ciphertext must not unwrap"
