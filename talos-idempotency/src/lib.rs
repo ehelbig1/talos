@@ -492,6 +492,67 @@ fn caller_scope(headers: &axum::http::HeaderMap) -> Vec<u8> {
     scope
 }
 
+/// The request identity an idempotency key is bound to: method, path and
+/// body. A key reused on another route or verb is a `Mismatch`, not a replay.
+#[must_use]
+pub fn hash_idempotent_request(method: &str, path: &str, body: &[u8]) -> String {
+    let mut buf = Vec::with_capacity(method.len() + path.len() + body.len() + 2);
+    buf.extend_from_slice(method.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(path.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(body);
+    IdempotencyService::hash_request(&buf)
+}
+
+/// Did the handler mark its response `Cache-Control: no-store`? Resolvers
+/// that return a credential (a new API key, a TOTP secret, backup codes, an
+/// agent token) set it, so the plaintext is never written to Redis.
+fn marks_no_store(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| {
+            v.split(',')
+                .any(|d| d.trim().eq_ignore_ascii_case("no-store"))
+        })
+}
+
+/// Does a JSON body carry a non-empty top-level `errors` array? A GraphQL
+/// error is answered with HTTP 200, so a transient failure would otherwise be
+/// replayed for the whole TTL. A body that claims JSON, mentions `"errors"`
+/// and does not parse is treated as carrying errors (not cached).
+fn json_body_reports_errors(content_type: Option<&str>, body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        errors: Option<Vec<serde::de::IgnoredAny>>,
+    }
+    let is_json = content_type.is_some_and(|ct| ct.to_ascii_lowercase().contains("json"));
+    // Cheap pre-check: no `"errors"` token, no errors key.
+    if !is_json || !body.windows(8).any(|w| w == b"\"errors\"") {
+        return false;
+    }
+    match serde_json::from_slice::<Probe>(body) {
+        Ok(p) => p.errors.is_some_and(|e| !e.is_empty()),
+        Err(_) => true,
+    }
+}
+
+/// May a handler's response be cached for replay? Not a 5xx, not one that
+/// sets a cookie, not one marked `no-store`, not a JSON body reporting errors.
+#[must_use]
+fn response_is_cacheable(
+    status: u16,
+    sets_cookie: bool,
+    no_store: bool,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> bool {
+    status < 500 && !sets_cookie && !no_store && !json_body_reports_errors(content_type, body)
+}
+
 /// Opt-in idempotency middleware. Requests WITHOUT an `Idempotency-Key` header
 /// take a zero-touch passthrough — so existing traffic (none sends the header)
 /// is entirely unaffected. With the header:
@@ -501,8 +562,10 @@ fn caller_scope(headers: &axum::http::HeaderMap) -> Vec<u8> {
 ///     - `Hit`      → replay the cached response (stamped `idempotent-replayed`).
 ///     - `InFlight` → 409 (a same-key+body request is mid-flight).
 ///     - `Mismatch` → 422 (key reused with a different body).
-///     - `Proceed`  → run the handler; cache the response via `complete()` for
-///       status < 500, or `release()` on 5xx so a retry isn't stuck `InFlight`.
+///     - `Proceed`  → run the handler; cache the response via `complete()`
+///       when [`response_is_cacheable`] (not 5xx, no `Set-Cookie`, no
+///       `Cache-Control: no-store`, no GraphQL `errors`), else `release()` so
+///       a retry re-executes.
 ///   * a Redis error during `begin` fails OPEN (run the handler un-deduped)
 ///     rather than blocking the request.
 pub async fn idempotency_middleware(
@@ -551,7 +614,10 @@ pub async fn idempotency_middleware(
         Ok(b) => b,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response(),
     };
-    let request_hash = IdempotencyService::hash_request(&body_bytes);
+    // Method and path are bound too: one key + body sent to two routes is two
+    // requests, not a replay.
+    let request_hash =
+        hash_idempotent_request(parts.method.as_str(), parts.uri.path(), &body_bytes);
 
     match service.begin(&scoped_key, &request_hash).await {
         Ok(BeginOutcome::Hit(rec)) => {
@@ -604,9 +670,16 @@ pub async fn idempotency_middleware(
             let sets_cookie = resp_parts
                 .headers
                 .contains_key(axum::http::header::SET_COOKIE);
+            let no_store = marks_no_store(&resp_parts.headers);
             match to_bytes(resp_body, MAX_IDEMPOTENT_RESPONSE_BYTES).await {
                 Ok(bytes) => {
-                    if status.as_u16() < 500 && !sets_cookie {
+                    if response_is_cacheable(
+                        status.as_u16(),
+                        sets_cookie,
+                        no_store,
+                        content_type.as_deref(),
+                        &bytes,
+                    ) {
                         let body_str = String::from_utf8_lossy(&bytes).into_owned();
                         if let Err(e) = service
                             .complete(
@@ -621,7 +694,7 @@ pub async fn idempotency_middleware(
                             tracing::warn!(error = %e, "idempotency complete failed; response not cached");
                         }
                     } else if let Err(e) = service.release(&scoped_key, &request_hash).await {
-                        tracing::warn!(error = %e, "idempotency release failed (5xx or Set-Cookie response)");
+                        tracing::warn!(error = %e, "idempotency release failed (uncacheable response)");
                     }
                     Response::from_parts(resp_parts, Body::from(bytes))
                 }
@@ -1052,6 +1125,76 @@ mod tests {
         serde_json::from_str::<BeginPayload>(json)
             .expect("valid begin payload")
             .into_outcome("k", "h")
+    }
+
+    #[test]
+    fn graphql_errors_and_no_store_are_not_cached() {
+        let json = Some("application/json");
+        assert!(response_is_cacheable(
+            200,
+            false,
+            false,
+            json,
+            br#"{"data":{"x":1}}"#
+        ));
+        assert!(response_is_cacheable(
+            200,
+            false,
+            false,
+            json,
+            br#"{"data":null,"errors":[]}"#
+        ));
+        assert!(!response_is_cacheable(
+            200,
+            false,
+            false,
+            json,
+            br#"{"data":null,"errors":[{"message":"db down"}]}"#
+        ));
+        // A mention of "errors" inside data is not a top-level errors key.
+        assert!(response_is_cacheable(
+            200,
+            false,
+            false,
+            json,
+            br#"{"data":{"errors":"none"}}"#
+        ));
+        // Unparsable JSON mentioning errors: not cached.
+        assert!(!response_is_cacheable(
+            200,
+            false,
+            false,
+            json,
+            br#"{"errors":[oops"#
+        ));
+        // Non-JSON bodies are judged by status alone.
+        assert!(response_is_cacheable(
+            200,
+            false,
+            false,
+            Some("text/plain"),
+            b"\"errors\""
+        ));
+        assert!(!response_is_cacheable(200, false, true, json, b"{}"));
+        assert!(!response_is_cacheable(200, true, false, json, b"{}"));
+        assert!(!response_is_cacheable(503, false, false, json, b"{}"));
+
+        let mut h = axum::http::HeaderMap::new();
+        assert!(!marks_no_store(&h));
+        h.insert(
+            axum::http::header::CACHE_CONTROL,
+            "private, No-Store".parse().unwrap(),
+        );
+        assert!(marks_no_store(&h));
+    }
+
+    #[test]
+    fn the_request_hash_binds_method_and_path() {
+        let a = hash_idempotent_request("POST", "/graphql", b"{}");
+        assert_eq!(a, hash_idempotent_request("POST", "/graphql", b"{}"));
+        assert_ne!(a, hash_idempotent_request("POST", "/api/other", b"{}"));
+        assert_ne!(a, hash_idempotent_request("PUT", "/graphql", b"{}"));
+        assert_ne!(a, hash_idempotent_request("POST", "/graphql", b"{ }"));
     }
 
     #[test]
