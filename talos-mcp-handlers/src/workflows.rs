@@ -3399,7 +3399,12 @@ async fn handle_test_workflow_draft(
     // TimeoutPolicy::Honor (default) is correct: parse_graph_document
     // reads `execution_timeout_secs` from the graph during load — the
     // pre-r228 manual extraction was a no-op.
-    let lifted_actor_context = input_payload.get("__actor_context__").cloned();
+    // LIFTED, not copied: the payload is persisted as the output's
+    // `__trigger_input__`, which must never carry decrypted actor memory.
+    let lifted_actor_context =
+        talos_workflow_engine_core::reserved_keys::lift_actor_context_for_storage(
+            &mut input_payload,
+        );
     let opts = talos_engine::builder::EngineOpts::for_run(wf_id, graph_json)
         .with_effective_actor(draft_actor_arg, wf_agent_id)
         .with_actor_context(lifted_actor_context);
@@ -5635,8 +5640,13 @@ async fn handle_call_workflow(
                     &err_str,
                 )
                 .await;
-                crate::utils::dispatch_failure_webhook(&webhook_repo, wf_id, exec_id, &err_str)
-                    .await;
+                talos_execution_orchestration::failure_webhook::dispatch_failure_webhook(
+                    &webhook_repo,
+                    wf_id,
+                    exec_id,
+                    &err_str,
+                )
+                .await;
                 Err(err_str)
             }
         }
@@ -7965,8 +7975,12 @@ async fn handle_test_workflow(
     // node. Without this, only nodes that read `data.__trigger_input__`
     // see the context; nodes that read `data.__actor_context__`
     // (the catalog llm-inference template's INJECT_CONTEXT path)
-    // would silently miss it.
-    let lifted_actor_context = input_payload.get("__actor_context__").cloned();
+    // would silently miss it. Lifted, not copied: the payload never needs to
+    // carry decrypted memory once the engine holds it.
+    let lifted_actor_context =
+        talos_workflow_engine_core::reserved_keys::lift_actor_context_for_storage(
+            &mut input_payload,
+        );
 
     // MCP-269 (2026-05-10): direction-class wrong-type rejection.
     let dry_run = match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {
@@ -13825,5 +13839,28 @@ mod trigger_as_actors_context_pin {
         let merge = format!("insert(\n{}\"__actor_context__\"", " ".repeat(24));
         assert!(!body.contains(&merge));
         assert!(!body.contains(&format!("\"__actor_{}__\".to_string()", "context")));
+    }
+
+    /// SOURCE PIN (textual): the two test paths LIFT the injected context off
+    /// the payload (`test_workflow_draft` persists that payload as the
+    /// output's `__trigger_input__`); a `.get(..).cloned()` copy left the
+    /// decrypted memory in it.
+    #[test]
+    fn test_paths_lift_the_context_off_the_payload() {
+        let src = include_str!("workflows.rs");
+        for handler in [
+            "async fn handle_test_workflow_draft(",
+            "async fn handle_test_workflow(",
+        ] {
+            let at = src.find(handler).unwrap();
+            let end = src[at..].find("\n}\n").unwrap();
+            let body = &src[at..at + end];
+            assert!(
+                body.contains("lift_actor_context_for_storage("),
+                "{handler} must lift the actor context"
+            );
+            let copy = format!("get(\"__actor_{}__\").cloned()", "context");
+            assert!(!body.contains(&copy), "{handler} copies the context");
+        }
     }
 }
