@@ -243,7 +243,7 @@ spec:
             # binaries CAN read these (the worker's env fallback for its LLM
             # host functions), but the worker is credential-free BY DESIGN: LLM
             # provider keys reach it inside the sealed per-job secret envelope
-            # (`build_encrypted_secrets` → `EncryptedSecrets`), never as env,
+            # (`secrets_pipeline::build_encrypted_secrets_for` → `EncryptedSecrets`), never as env,
             # and a tier-1 job never carries them at all. Withholding them here
             # is the control, so check 89(d)'s chart-parity leg is told so.
             {{- $secretKeys := list
@@ -252,6 +252,7 @@ spec:
                 "NATS_USER" "NATS_PASSWORD"
                 "NEO4J_USER" "NEO4J_PASSWORD"
                 "TALOS_MASTER_KEY"
+                "TALOS_MASTER_KEY_PREVIOUS"
                 "VAULT_TOKEN"
                 "JWT_SECRET"
                 "WORKER_SHARED_KEY"

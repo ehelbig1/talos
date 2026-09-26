@@ -448,7 +448,7 @@ async fn handle_list_secret_usage(
                     "rotation_note": "Vault-first resolution per call (post r306) — a value changed via the dashboard or the GraphQL `updateSecret` mutation propagates without restart. Tier-1 actors skip this path entirely.",
                 }),
                 serde_json::json!({
-                    "consumer": "Engine job dispatch (ParallelWorkflowEngine::build_encrypted_secrets)",
+                    "consumer": "Engine job dispatch (secrets_pipeline::build_encrypted_secrets_for)",
                     "purpose": "Pre-fetched into every job's encrypted_secrets so guest LLM Inference modules can resolve the key via the host llm:: WIT interface (Tier-2 actors only).",
                     "rotation_safe": true,
                     "rotation_note": "Resolved per-dispatch from the same vault cache; rotation lands on the next dispatch.",

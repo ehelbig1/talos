@@ -632,6 +632,10 @@ services:
       AWS_S3_FORCE_PATH_STYLE: "true"
       MINIO_BUCKET: audit-logs
       TALOS_MASTER_KEY: ${TALOS_MASTER_KEY:?TALOS_MASTER_KEY required in .env}
+      # Set ONLY during a staged master-key rotation (the OLD key, while
+      # TALOS_MASTER_KEY holds the new one); empty = unset. See
+      # docs/SECRETS_MANAGEMENT.md.
+      TALOS_MASTER_KEY_PREVIOUS: ${TALOS_MASTER_KEY_PREVIOUS:-}
       # KEK provider selection: `env` (default) loads TALOS_MASTER_KEY for
       # local AES-256-GCM. `vault` calls Vault transit; legacy env stays
       # wired for Phase-4 read-fallback + dual-write rollback safety.

@@ -17,7 +17,7 @@ RUN rustup component add rustfmt && \
 # at build time (sqlx-cli would silently jump to 0.9 while the workspace
 # links sqlx 0.8.6).
 RUN cargo install sqlx-cli --version 0.8.6 --locked --features postgres
-RUN cargo install wizer --version 9.0.0 --features="env_logger structopt"
+RUN cargo install wizer --version 9.0.0 --locked --features="env_logger structopt"
 RUN cargo install cargo-component --version 0.21.1 --locked
 # cargo-audit gates every WASM compile in production. The compilation
 # service prefers the talos-builder sandbox image (TALOS_COMPILATION_CONTAINER
