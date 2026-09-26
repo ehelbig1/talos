@@ -749,6 +749,14 @@ impl ExecutionOrchestrationService {
                 // to the resumer, or a reclaim already failed it; clobbering it
                 // would corrupt the new owner's state. Just log and bow out,
                 // mirroring the resume path's `was_fenced` handling.
+                // An operator cancelled the run: the row is already
+                // `cancelled` — no failure write, no alert, no webhook.
+                Err(ref e) if talos_engine::fence::was_cancelled_by_operator(e) => {
+                    tracing::info!(
+                        execution_id = %execution_id,
+                        "trigger: run stopped — the execution was cancelled by an operator"
+                    );
+                }
                 Err(ref e) if talos_engine::fence::was_fenced(e) => {
                     tracing::warn!(
                         execution_id = %execution_id,

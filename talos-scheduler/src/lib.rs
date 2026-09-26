@@ -2725,6 +2725,19 @@ async fn run_scheduled_execution(
                 "Scheduled workflow execution completed"
             );
         }
+        // An operator cancelled the run (here, or seen by the fence): the row
+        // is already `cancelled`, so nothing to mark and nothing to alert. It
+        // is counted as `fenced` — the closest existing outcome (neither a
+        // success nor a failure of this dispatch) until the metric carries a
+        // `cancelled` value; the log line says which it was.
+        Err(e) if talos_engine::fence::was_cancelled_by_operator(&e) => {
+            record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_FENCED);
+            tracing::info!(
+                execution_id = %execution_id,
+                schedule_id = %schedule_id,
+                "Scheduler: run stopped — the execution was cancelled by an operator"
+            );
+        }
         Err(e) if talos_engine::fence::was_fenced(&e) => {
             // FU-1 fence: a fence abort means crash-recovery reclaimed this
             // scheduled run (the row's epoch advanced) — it now belongs to the
@@ -3602,7 +3615,10 @@ mod startup_herd_tests {
         // too — a policy refusal, not a herd symptom — and its schedule is
         // re-armed so the fire is deferred rather than dropped.
         ("SCHEDULER_OUTCOME_DENIED", 4),
-        ("SCHEDULER_OUTCOME_FENCED", 1),
+        // 2 since 2026-09-26: an operator cancel is its own arm (logged as a
+        // cancel, not a fence) and is counted as `fenced` until the metric
+        // carries a `cancelled` value.
+        ("SCHEDULER_OUTCOME_FENCED", 2),
     ];
 
     #[test]

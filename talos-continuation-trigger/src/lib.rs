@@ -641,6 +641,14 @@ pub async fn trigger_continuation_workflow(
                     );
                 }
             }
+            // The row is already `cancelled` and its in-flight module rows
+            // were finalized by the cancel itself: nothing to fail.
+            Err(e) if talos_engine::fence::was_cancelled_by_operator(&e) => {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    "continuation run stopped — the execution was cancelled by an operator"
+                );
+            }
             Err(e) => {
                 // MCP-452: DLP-redact the engine error before
                 // persistence and logging. Same secret-leak class

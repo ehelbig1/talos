@@ -429,8 +429,9 @@ pub async fn run_with_nats(
 ///
 /// The stop is a drop of the run future — exactly what the engine's own
 /// cancellation token does — so no further node is dispatched by this
-/// controller, and the run answers `Cancelled`, which every caller already
-/// treats as "do not mark the row failed". Every production engine run
+/// controller, and the run answers `CancelledByOperator` — distinct from a
+/// fence's `Cancelled`, so callers neither mark the row failed nor count a
+/// fence (`fence::was_cancelled_by_operator`). Every production engine run
 /// enters through one of the three functions below, all of which call this.
 async fn run_tracked<F>(execution_id: Uuid, run: F) -> Result<WorkflowContext, WorkflowEngineError>
 where
@@ -446,7 +447,7 @@ where
                 "execution cancelled: this controller stopped the engine driving it — \
                  no further nodes will be dispatched"
             );
-            Err(WorkflowEngineError::Cancelled)
+            Err(WorkflowEngineError::CancelledByOperator)
         }
         result = run => result,
     }
@@ -766,7 +767,7 @@ mod operator_cancel_tests {
             .expect("the cancel must stop the run promptly, not at its end")
             .expect("run task");
         assert!(
-            matches!(result, Err(WorkflowEngineError::Cancelled)),
+            matches!(result, Err(WorkflowEngineError::CancelledByOperator)),
             "{result:?}"
         );
         assert!(

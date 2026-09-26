@@ -354,6 +354,18 @@ pub(crate) async fn resume_one(
         // Do NOT mark the row failed — it now belongs to the new owner, or a
         // reclaim already failed it. Failing here would clobber the new owner's
         // `resuming` row. Just count it and move on.
+        // An operator cancelled the resumed run: the row is already
+        // `cancelled`. Counted as `fenced` (the closest existing outcome — not
+        // a resume failure) until the metric carries a `cancelled` value.
+        Err(ref e) if talos_engine::fence::was_cancelled_by_operator(e) => {
+            if origin.records_metrics() {
+                record_outcome("fenced", 1);
+            }
+            tracing::info!(
+                execution_id = %exec_id,
+                "{origin_label}: resumed run stopped — the execution was cancelled by an operator"
+            );
+        }
         Err(ref e) if talos_engine::fence::was_fenced(e) => {
             if origin.records_metrics() {
                 record_outcome("fenced", 1);

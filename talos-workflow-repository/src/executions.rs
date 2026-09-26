@@ -2306,6 +2306,8 @@ mod execution_priority_tests {
 pub enum SiblingCancelReason {
     WorkflowFailed,
     WorkflowTimedOut,
+    /// An operator cancelled the workflow execution.
+    WorkflowCancelled,
 }
 
 impl SiblingCancelReason {
@@ -2314,6 +2316,7 @@ impl SiblingCancelReason {
         match self {
             Self::WorkflowFailed => "Workflow failed — parallel sibling cancelled",
             Self::WorkflowTimedOut => "Workflow timed out — parallel sibling cancelled",
+            Self::WorkflowCancelled => "Workflow cancelled — in-flight module execution cancelled",
         }
     }
 }
