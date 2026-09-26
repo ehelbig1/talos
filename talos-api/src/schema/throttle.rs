@@ -12,7 +12,7 @@
 //!
 //! | env var                                   | default | gates                                                        |
 //! |-------------------------------------------|---------|--------------------------------------------------------------|
-//! | `GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN` | 10      | `createWorkflowFromDescription`, `testModule`, `testWorkflow` |
+//! | `GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN` | 10      | `createWorkflowFromDescription`, `generateCode`, `testModule`, `testWorkflow`, `createModuleFromTemplate` |
 //! | `GRAPHQL_RHAI_PER_USER_PER_MIN`           | 60      | `analyzeRhai`, `testRhaiExpression`                          |
 //!
 //! Both are PER CONTROLLER REPLICA (in-memory; see `PerUserThrottle`'s
@@ -231,6 +231,39 @@ mod tests {
             .await;
         assert_eq!(refused.errors.len(), 1);
         assert_eq!(read(), before + 1, "the refusal did not reach the recorder");
+    }
+
+    /// TEXTUAL pin: every heavy resolver in the module-doc table draws from
+    /// the heavy bucket. The bucket is also the alias bound — `{ a: generateCode
+    /// … b: generateCode … }` spends one token per alias.
+    #[test]
+    fn every_heavy_resolver_draws_from_the_heavy_bucket() {
+        let sources = [
+            (
+                include_str!("workflows/mutations.rs"),
+                "async fn generate_code(",
+            ),
+            (
+                include_str!("workflows/mutations.rs"),
+                "async fn create_workflow_from_description(",
+            ),
+            (
+                include_str!("modules/mutations.rs"),
+                "async fn create_module_from_template(",
+            ),
+            (
+                include_str!("modules/mutations.rs"),
+                "async fn test_module(",
+            ),
+        ];
+        for (src, sig) in sources {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} present"));
+            let head: String = src[start..].lines().take(30).collect::<Vec<_>>().join("\n");
+            assert!(
+                head.contains("ThrottleClass::HeavyMutation"),
+                "{sig} must call enforce_user_throttle(HeavyMutation) before its work"
+            );
+        }
     }
 
     #[tokio::test]

@@ -717,6 +717,12 @@ impl WorkflowsMutations {
         // require_2fa + WorkflowsWrite scope mirrors create_workflow's posture.
         crate::schema::require_2fa(ctx)?;
         crate::schema::require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsWrite)?;
+        // An LLM round trip per call (and per alias of it in one request):
+        // per-user token bucket, like `createWorkflowFromDescription`.
+        crate::schema::throttle::enforce_user_throttle(
+            ctx,
+            crate::schema::throttle::ThrottleClass::HeavyMutation,
+        )?;
         let _user_id = ctx
             .data_opt::<Uuid>()
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;

@@ -24,6 +24,11 @@ impl ModulesMutations {
     ) -> Result<WasmModule> {
         require_2fa(ctx)?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsWrite)?;
+        // A cargo compile per call (and per alias of it in one request).
+        crate::schema::throttle::enforce_user_throttle(
+            ctx,
+            crate::schema::throttle::ThrottleClass::HeavyMutation,
+        )?;
 
         let registry: &Arc<ModuleRegistry> = ctx.data::<Arc<ModuleRegistry>>()?;
         let compiler = ctx.data::<Arc<CompilationService>>()?;
