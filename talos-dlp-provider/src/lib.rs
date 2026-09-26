@@ -734,75 +734,174 @@ impl DlpProvider for PassthroughDlpProvider {
 /// 2026-07-19, L8).
 const MAX_DLP_RESPONSE_BYTES: u64 = 1 << 20; // 1 MiB — DLP responses are tiny
 
+/// Requests the external DLP workers may hold before a caller falls back to
+/// the built-in redactor instead of queueing.
+const EXTERNAL_DLP_QUEUE: usize = 64;
+/// Dedicated OS threads that own the blocking HTTP client.
+const EXTERNAL_DLP_WORKERS: usize = 4;
+/// How long a caller waits for a reply (the client's own timeout is 5 s).
+const EXTERNAL_DLP_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+
+struct DlpCall {
+    body: serde_json::Value,
+    reply: std::sync::mpsc::SyncSender<Option<serde_json::Value>>,
+}
+
+/// External DLP over HTTP. The [`DlpProvider`] trait is synchronous and is
+/// called from sync code on every persistence boundary, so the request runs
+/// on a small pool of DEDICATED threads that own a blocking client — built
+/// there, never inside an async runtime (reqwest's blocking client panics
+/// when built or dropped in one). The caller waits on a bounded channel:
+/// inside a multi-thread tokio runtime via `block_in_place`, elsewhere
+/// (including a current-thread runtime, where `block_in_place` panics) by a
+/// plain bounded wait. A full queue, a timeout or any error falls back to
+/// the built-in redactor.
 pub struct ExternalDlpProvider {
-    endpoint: String,
-    client: reqwest::blocking::Client,
-    token: Option<String>,
+    calls: std::sync::mpsc::SyncSender<DlpCall>,
     fallback: BuiltinDlpProvider,
 }
 
 impl ExternalDlpProvider {
     fn new(endpoint: String, token: Option<String>) -> Self {
-        // MCP-497: external DLP provider receives plaintext sensitive
-        // data (the whole point of DLP is to scrub it on the wire).
-        // `Client::new()` re-enables default redirect following — a
-        // 302 from the configured DLP endpoint to a different host
-        // would carry the sensitive payload AND the bearer token to
-        // the redirect target. The endpoint is operator-configured;
-        // a compromised provider with an open-redirect bug becomes a
-        // data exfiltration vector.
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("ExternalDlpProvider: failed to build hardened blocking client");
+        let (calls, rx) = std::sync::mpsc::sync_channel::<DlpCall>(EXTERNAL_DLP_QUEUE);
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        for i in 0..EXTERNAL_DLP_WORKERS {
+            let rx = rx.clone();
+            let endpoint = endpoint.clone();
+            let token = token.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("talos-dlp-external-{i}"))
+                .spawn(move || external_dlp_worker(&endpoint, token.as_deref(), &rx));
+            if let Err(e) = spawned {
+                tracing::error!(error = %e, "ExternalDlpProvider: worker thread spawn failed");
+            }
+        }
         Self {
-            endpoint,
-            client,
-            token,
+            calls,
             fallback: BuiltinDlpProvider,
         }
     }
 
     fn send(&self, body: serde_json::Value) -> Option<serde_json::Value> {
-        let mut req = self.client.post(&self.endpoint).json(&body);
-        if let Some(tok) = &self.token {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        if self.calls.try_send(DlpCall { body, reply }).is_err() {
+            tracing::warn!("ExternalDlpProvider: queue full — using the built-in redactor");
+            return None;
+        }
+        let wait = || answer.recv_timeout(EXTERNAL_DLP_WAIT).ok().flatten();
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(wait)
+            }
+            _ => wait(),
+        }
+    }
+}
+
+fn external_dlp_worker(
+    endpoint: &str,
+    token: Option<&str>,
+    rx: &std::sync::Mutex<std::sync::mpsc::Receiver<DlpCall>>,
+) {
+    // MCP-497: the endpoint receives plaintext sensitive data and the bearer
+    // token, so redirects are never followed (a 302 would carry both to the
+    // redirect target).
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "ExternalDlpProvider: client build failed");
+            return;
+        }
+    };
+    loop {
+        let call = match rx.lock() {
+            Ok(guard) => match guard.recv() {
+                Ok(call) => call,
+                Err(_) => return, // provider dropped
+            },
+            Err(_) => return,
+        };
+        let mut req = client.post(endpoint).json(&call.body);
+        if let Some(tok) = token {
             req = req.header("Authorization", format!("Bearer {tok}"));
         }
-        // block_in_place allows blocking calls inside a tokio multi-threaded runtime.
-        tokio::task::block_in_place(|| {
-            use std::io::Read;
-            let resp = req.send().ok()?;
-            // Security review 2026-07-19 (L8): bound the response body. The DLP
-            // endpoint is operator-configured but could be compromised/buggy;
-            // an unbounded `.json()` on a multi-GB body would OOM the controller.
-            // `talos_http_body` covers async reqwest only, so cap the blocking
-            // read here. A short-circuit on a lying/oversized Content-Length,
-            // plus a hard `take()` bound that also catches a missing one.
-            if resp
-                .content_length()
-                .is_some_and(|len| len > MAX_DLP_RESPONSE_BYTES)
-            {
-                tracing::warn!(
-                    "ExternalDlpProvider: response Content-Length exceeds cap — \
-                     falling back to the built-in redactor"
-                );
-                return None;
-            }
-            let mut buf = Vec::new();
-            resp.take(MAX_DLP_RESPONSE_BYTES + 1)
-                .read_to_end(&mut buf)
-                .ok()?;
-            if buf.len() as u64 > MAX_DLP_RESPONSE_BYTES {
-                tracing::warn!(
-                    "ExternalDlpProvider: response body exceeds cap — falling back \
-                     to the built-in redactor"
-                );
-                return None;
-            }
-            serde_json::from_slice(&buf).ok()
-        })
+        let _ = call
+            .reply
+            .try_send(read_capped_dlp_response(req.send().ok()));
     }
+}
+
+/// Security review 2026-07-19 (L8): bound the response body. The endpoint is
+/// operator-configured but could be compromised/buggy; an unbounded read of a
+/// multi-GB body would OOM the controller. Short-circuit on an oversized
+/// Content-Length, plus a hard `take()` bound that also catches a missing one.
+fn read_capped_dlp_response(
+    resp: Option<reqwest::blocking::Response>,
+) -> Option<serde_json::Value> {
+    use std::io::Read;
+    let resp = resp?;
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_DLP_RESPONSE_BYTES)
+    {
+        tracing::warn!(
+            "ExternalDlpProvider: response Content-Length exceeds cap — \
+             falling back to the built-in redactor"
+        );
+        return None;
+    }
+    let mut buf = Vec::new();
+    resp.take(MAX_DLP_RESPONSE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_DLP_RESPONSE_BYTES {
+        tracing::warn!(
+            "ExternalDlpProvider: response body exceeds cap — falling back \
+             to the built-in redactor"
+        );
+        return None;
+    }
+    serde_json::from_slice(&buf).ok()
+}
+
+/// The key-aware credential pass alone: every value under a credential-shaped
+/// key is redacted (shape-preserving), everything else is walked unchanged.
+/// Applied to an external provider's answer, which must not be trusted to
+/// have done it.
+fn redact_credential_keys(value: &Value, depth: usize) -> Value {
+    if depth > MAX_DLP_REDACT_DEPTH {
+        return value.clone();
+    }
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let v = if is_credential_key(k) {
+                        redact_credential_value(v, depth + 1)
+                    } else {
+                        redact_credential_keys(v, depth + 1)
+                    };
+                    (k.clone(), v)
+                })
+                .collect(),
+        ),
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|v| redact_credential_keys(v, depth + 1))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// May an external DLP endpoint receive unredacted data? Only over TLS in
+/// production: the request body IS the sensitive data, plus a bearer token.
+fn external_dlp_endpoint_permitted(url: &str, production: bool) -> bool {
+    !production || url.starts_with("https://")
 }
 
 impl DlpProvider for ExternalDlpProvider {
@@ -821,10 +920,10 @@ impl DlpProvider for ExternalDlpProvider {
     fn redact_json(&self, value: &Value) -> Value {
         let body = serde_json::json!({ "json": value, "type": "json" });
         match self.send(body) {
-            Some(resp) => resp
-                .get("redacted")
-                .cloned()
-                .unwrap_or_else(|| self.fallback.redact_json(value)),
+            Some(resp) => match resp.get("redacted") {
+                Some(redacted) => redact_credential_keys(redacted, 0),
+                None => self.fallback.redact_json(value),
+            },
             None => self.fallback.redact_json(value),
         }
     }
@@ -894,6 +993,19 @@ impl DlpService {
                     tracing::warn!(
                         "DLP_PROVIDER=external but DLP_WEBHOOK_URL is not set; \
                          falling back to builtin"
+                    );
+                    Arc::new(BuiltinDlpProvider)
+                } else if !external_dlp_endpoint_permitted(&url, talos_config::is_production()) {
+                    // tls-prod-gate-dlp
+                    // The endpoint receives UNREDACTED data and the bearer
+                    // token: refuse a plaintext URL in production. Fail
+                    // closed on EGRESS — nothing is sent; redaction still
+                    // happens in-process with the built-in provider (a
+                    // panic here would take down the first caller to redact).
+                    tracing::error!(
+                        target: "talos_dlp_provider",
+                        event_kind = "dlp_webhook_plaintext_refused",
+                        "DLP_WEBHOOK_URL must be https:// in production — external DLP refused, using builtin"
                     );
                     Arc::new(BuiltinDlpProvider)
                 } else {
@@ -2179,5 +2291,60 @@ mod tests {
         let once = redact_str_failsafe(&raw).into_owned();
         let twice = redact_str_failsafe(&once).into_owned();
         assert_eq!(once, twice, "second pass changed the output");
+    }
+}
+
+#[cfg(test)]
+mod external_provider_tests {
+    use super::*;
+
+    #[test]
+    fn plaintext_endpoint_is_refused_only_in_production() {
+        assert!(!external_dlp_endpoint_permitted(
+            "http://dlp.internal/redact",
+            true
+        ));
+        assert!(external_dlp_endpoint_permitted(
+            "https://dlp.internal/redact",
+            true
+        ));
+        assert!(external_dlp_endpoint_permitted(
+            "http://localhost:9000/redact",
+            false
+        ));
+    }
+
+    #[test]
+    fn external_answers_still_get_the_credential_key_pass() {
+        let answered = serde_json::json!({
+            "user": "alice",
+            "api_key": "sk-plain-but-unmatched",
+            "nested": [{ "client_secret": 1234, "note": "ok" }],
+            "__engine_token": "kept"
+        });
+        let out = redact_credential_keys(&answered, 0);
+        assert_eq!(out["user"], "alice");
+        assert_eq!(out["api_key"], REDACTED_CREDENTIAL);
+        assert_eq!(out["nested"][0]["client_secret"], REDACTED_CREDENTIAL);
+        assert_eq!(out["nested"][0]["note"], "ok");
+        assert_eq!(out["__engine_token"], "kept");
+    }
+
+    /// Pre-fix: the provider built a blocking client (panics inside a
+    /// runtime in debug builds) and called `block_in_place` (panics on a
+    /// current-thread runtime). An unreachable endpoint must now simply fall
+    /// back to the built-in redactor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_runtime_falls_back_without_panicking() {
+        let p = ExternalDlpProvider::new("https://127.0.0.1:1/redact".into(), None);
+        let out = p.redact_json(&serde_json::json!({ "password": "hunter2" }));
+        assert_eq!(out["password"], REDACTED_CREDENTIAL);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_thread_runtime_falls_back_without_panicking() {
+        let p = ExternalDlpProvider::new("https://127.0.0.1:1/redact".into(), None);
+        let out = p.redact_json(&serde_json::json!({ "password": "hunter2" }));
+        assert_eq!(out["password"], REDACTED_CREDENTIAL);
     }
 }
