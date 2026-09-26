@@ -60,6 +60,10 @@ mod sse_connect_failure_tests;
 /// surface, not only `http::fetch` (2026-09-24).
 #[cfg(test)]
 mod vault_body_parity_tests;
+/// `fetch` / `fetch_all` admission, pinned per refusal across the extraction
+/// into `egress_admission`.
+#[cfg(test)]
+mod http_admission_characterization_tests;
 
 mod cache;
 mod crypto;
