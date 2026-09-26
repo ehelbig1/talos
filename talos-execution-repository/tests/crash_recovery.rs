@@ -395,3 +395,46 @@ async fn a_resume_runs_the_pinned_version_not_the_draft() {
         .await;
     cleanup(&pool, user_id, wf_id).await;
 }
+
+/// `list_latest_executions_for_workflows_scoped` (per-workflow LIMIT 1
+/// probes): newest per workflow, one row per workflow even when the id list
+/// repeats, and another user's executions stay invisible.
+#[tokio::test]
+async fn latest_execution_per_workflow_is_the_newest_visible_one() {
+    let Some(url) = db_url() else { return };
+    let _g = SERIAL.lock().await;
+    let pool = connect(&url).await;
+    let (old_exec, wf_id, user_id) = seed_running_exec(&pool, 60).await;
+    let newer = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflow_executions (id,workflow_id,user_id,status,started_at) \
+         VALUES ($1,$2,$3,'completed', NOW() - make_interval(mins => 5))",
+    )
+    .bind(newer)
+    .bind(wf_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let repo = ExecutionRepository::new(pool.clone());
+    let mut conn = pool.acquire().await.unwrap();
+
+    let rows = repo
+        .list_latest_executions_for_workflows_scoped(&mut conn, &[wf_id, wf_id], user_id, &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one row per workflow");
+    assert_eq!(rows[0].id, newer);
+    assert_ne!(rows[0].id, old_exec);
+
+    let stranger = repo
+        .list_latest_executions_for_workflows_scoped(&mut conn, &[wf_id], Uuid::new_v4(), &[])
+        .await
+        .unwrap();
+    assert!(
+        stranger.is_empty(),
+        "another user's executions are invisible"
+    );
+    drop(conn);
+    cleanup(&pool, user_id, wf_id).await;
+}

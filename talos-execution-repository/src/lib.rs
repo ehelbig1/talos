@@ -4093,8 +4093,10 @@ impl ExecutionRepository {
         Ok(BudgetAdmission::Admitted)
     }
 
-    /// Latest execution per workflow (DISTINCT ON) for a batch of
-    /// workflow ids, gated on ownership OR org access. Takes the caller's
+    /// Latest execution per workflow for a batch of workflow ids, gated on
+    /// ownership OR org access. One `LIMIT 1` probe per workflow on
+    /// `(workflow_id, started_at DESC)` — a `DISTINCT ON` over `= ANY($1)`
+    /// visited every live execution of every listed workflow. Takes the caller's
     /// connection: the GraphQL `latestWorkflowExecutions` query runs this
     /// on a `begin_tenant_read_scoped` tx so the workflow_executions RLS
     /// policy backstops the app-layer `we.user_id = $2 OR w.org_id =
@@ -4109,12 +4111,19 @@ impl ExecutionRepository {
     ) -> Result<Vec<LatestExecutionRow>> {
         let rows = sqlx::query_as::<_, LatestExecutionRow>(
             r#"
-            SELECT DISTINCT ON (we.workflow_id)
-                we.id, we.workflow_id, we.status, we.started_at, we.completed_at, we.error_message, we.created_at
-            FROM workflow_executions we
-            LEFT JOIN workflows w ON w.id = we.workflow_id
-            WHERE we.workflow_id = ANY($1) AND (we.user_id = $2 OR w.org_id = ANY($3))
-            ORDER BY we.workflow_id, we.started_at DESC
+            SELECT l.id, l.workflow_id, l.status, l.started_at, l.completed_at,
+                   l.error_message, l.created_at
+            FROM (SELECT DISTINCT u.id FROM unnest($1::uuid[]) AS u(id)) wf
+            LEFT JOIN workflows w ON w.id = wf.id
+            CROSS JOIN LATERAL (
+                SELECT we.id, we.workflow_id, we.status, we.started_at, we.completed_at,
+                       we.error_message, we.created_at
+                FROM workflow_executions we
+                WHERE we.workflow_id = wf.id AND (we.user_id = $2 OR w.org_id = ANY($3))
+                ORDER BY we.started_at DESC, we.id DESC
+                LIMIT 1
+            ) l
+            ORDER BY l.workflow_id
             "#,
         )
         .bind(workflow_ids)
