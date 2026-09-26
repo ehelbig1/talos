@@ -615,7 +615,13 @@ async fn re_encrypt_secrets_to_org_migrates_v3_global_rows_to_v4() {
         stats.re_encrypted >= 1,
         "sweep must migrate at least our row"
     );
-    assert_eq!(stats.failed, 0, "no failures expected");
+    // The sweep is global and this binary shares ONE database, so a sibling
+    // test's deliberately-refused row (a_row_under_another_orgs_active_dek_…)
+    // may be counted too. Assert on THIS test's row, not the global count.
+    assert!(
+        !stats.failed_ids.contains(&sid),
+        "our row must not fail the sweep"
+    );
 
     // After: v4 under the org's DEK, and still decryptable.
     let (fmt, kid): (i16, Uuid) = sqlx::query_as(
@@ -644,7 +650,7 @@ async fn re_encrypt_secrets_to_org_migrates_v3_global_rows_to_v4() {
             .await
             .unwrap();
     assert_eq!(fmt2, 4);
-    assert_eq!(stats2.failed, 0);
+    assert!(!stats2.failed_ids.contains(&sid));
 }
 
 // ── DEK migration status (operational completeness check) ──────────────────
@@ -798,7 +804,8 @@ async fn a_rotated_org_dek_is_pending_until_the_sweep_rekeys_its_rows() {
 
     // The sweep re-keys it onto the new active DEK and the value survives.
     let stats = manager.re_encrypt_secrets_to_org().await.unwrap();
-    assert_eq!(stats.failed, 0);
+    // Row-scoped: the sweep is global over a database this binary shares.
+    assert!(!stats.failed_ids.contains(&sid));
     assert_eq!(
         secret_key_id(&pool, sid).await,
         (4, new_key),
@@ -891,6 +898,13 @@ async fn a_row_under_another_orgs_active_dek_is_pending_and_refused() {
             .is_err(),
         "a row naming another org's DEK does not decrypt"
     );
+    // This row is refused by every later sweep; remove it so a sibling test
+    // sharing this database does not count it.
+    sqlx::query("DELETE FROM secrets WHERE id = $1")
+        .bind(sid)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
