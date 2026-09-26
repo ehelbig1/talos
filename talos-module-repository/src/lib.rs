@@ -57,7 +57,7 @@ pub struct CapabilityChangeAudit<'a> {
 /// `modules.capability_world` is stored in long form (`secrets-node`), which
 /// the worker's `CapabilityWorld` parser reads; compile paths carry the short
 /// form (`secrets`). `trusted` is the legacy name of `automation-node`.
-fn capability_world_long(short: &str) -> String {
+pub fn capability_world_long(short: &str) -> String {
     if short == "trusted" {
         "automation-node".to_string()
     } else if short.ends_with("-node") {
