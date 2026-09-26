@@ -75,8 +75,19 @@ case "$1 $2" in
     cat "$S/secret_b64" 2>/dev/null || true ;;
   "patch secret")
     [ "${KUBE_PATCH_FAIL:-}" = 1 ] && exit 1
+    # Real kubectl takes the patch from `-p <json>` or `--patch-file <path>`;
+    # the chart uses `--patch-file=/dev/stdin` so the token is never on argv.
+    # Every argv is recorded so the test can assert the token is not in it.
+    printf '%s\n' "$*" >> "$S/secret_patch_argv"
     payload=""
-    while [ $# -gt 0 ]; do [ "$1" = "-p" ] && payload="$2"; shift; done
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -p) payload="$2"; shift ;;
+            --patch-file) payload="$(cat "$2")"; shift ;;
+            --patch-file=*) payload="$(cat "${1#--patch-file=}")" ;;
+        esac
+        shift
+    done
     printf '%s' "$payload" | sed -n 's/.*"VAULT_TOKEN":"\([^"]*\)".*/\1/p' > "$S/secret_b64"
     echo x >> "$S/secret_patches" ;;
   "get deployment") exit 0 ;;
@@ -147,6 +158,7 @@ check "the Secret was patched once" 1 "$(wc -l < "$T/state/secret_patches" | tr 
 check "the controller was rolled once" 1 "$(wc -l < "$T/state/rollouts" | tr -d ' ')"
 CTRL="$(base64 -d < "$T/state/secret_b64")"
 check "the patched token is valid" yes "$(token_valid "$CTRL")"
+check "the token never appears on kubectl's argv" 0 "$(grep -cF "$(cat "$T/state/secret_b64")" "$T/state/secret_patch_argv" || true)"
 LOOKUP="$(printf '%s' "$CTRL" | docker exec -i "$NAME" sh -c 'VAULT_TOKEN=$(cat); export VAULT_TOKEN; vault token lookup -format=json' | tr -d '\n ')"
 check "the patched token carries the talos-controller policy" '"default","talos-controller"' "$(printf '%s' "$LOOKUP" | sed -n 's/.*"policies":\[\([^]]*\)\].*/\1/p')"
 check "the patched token is periodic (768h)" 2764800 "$(printf '%s' "$LOOKUP" | sed -n 's/.*"period":\([0-9]*\).*/\1/p')"
