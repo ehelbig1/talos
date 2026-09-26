@@ -1431,6 +1431,15 @@ impl SchedulerService {
         let mut to_spawn: Vec<(Uuid, Uuid, Uuid)> = Vec::with_capacity(due_schedules.len());
 
         for schedule in &due_schedules {
+            // Each row's writes run in a SAVEPOINT. A failed statement aborts
+            // the whole Postgres transaction; COMMIT then answers ROLLBACK
+            // without an error, and every spawn already staged in `to_spawn`
+            // would fire with its `next_trigger_at` advance undone — a double
+            // fire on the next poll. Rolling back to the savepoint confines a
+            // failure to its own row.
+            let mut row_tx = sqlx::Acquire::begin(&mut *tx)
+                .await
+                .map_err(|e| format!("Failed to open per-schedule savepoint: {}", e))?;
             // Calculate next trigger time before releasing the lock.
             let next_trigger = match calculate_next_trigger(
                 &schedule.cron_expression,
@@ -1461,7 +1470,7 @@ impl SchedulerService {
                         "UPDATE workflow_schedules SET is_enabled = false, updated_at = NOW() WHERE id = $1",
                     )
                     .bind(schedule.id)
-                    .execute(&mut *tx)
+                    .execute(&mut *row_tx)
                     .await
                     {
                         tracing::warn!(
@@ -1471,6 +1480,13 @@ impl SchedulerService {
                             disable_error = %de,
                             "Scheduler: failed to disable schedule with unparseable cron — schedule will reappear in next poll and re-fire this WARN until the underlying DB issue resolves"
                         );
+                        row_tx.rollback().await.map_err(|e| {
+                            format!("Failed to roll back per-schedule savepoint: {}", e)
+                        })?;
+                    } else {
+                        row_tx.commit().await.map_err(|e| {
+                            format!("Failed to release per-schedule savepoint: {}", e)
+                        })?;
                     }
                     continue;
                 }
@@ -1488,7 +1504,7 @@ impl SchedulerService {
             )
             .bind(schedule.id)
             .bind(next_trigger)
-            .execute(&mut *tx)
+            .execute(&mut *row_tx)
             .await
             {
                 tracing::error!(
@@ -1496,8 +1512,16 @@ impl SchedulerService {
                     "Failed to update schedule timestamps: {}",
                     e
                 );
+                row_tx
+                    .rollback()
+                    .await
+                    .map_err(|e| format!("Failed to roll back per-schedule savepoint: {}", e))?;
                 continue;
             }
+            row_tx
+                .commit()
+                .await
+                .map_err(|e| format!("Failed to release per-schedule savepoint: {}", e))?;
 
             // MCP-539: stage the spawn, fire it only after commit succeeds.
             to_spawn.push((schedule.workflow_id, schedule.user_id, schedule.id));
