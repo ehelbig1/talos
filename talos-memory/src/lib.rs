@@ -58,6 +58,54 @@ pub const MAX_LIST_LIMIT: i64 = 200;
 /// calling; the batched fn truncates as defense in depth so a future caller
 /// can't fan a single `= ANY($1)` scan across an unbounded actor set.
 pub const MAX_ACTOR_IDS_PER_BATCH: usize = 100;
+
+/// Longest `prefix` / `suffix` a [`MemoryKeyMatch`] accepts, in bytes. Keys
+/// are validated far below this on write; the bound only stops a caller from
+/// binding an arbitrarily large LIKE pattern.
+pub const MAX_KEY_MATCH_BYTES: usize = 256;
+
+/// Escape SQL LIKE metacharacters (`\`, `%`, `_`) so `s` matches literally
+/// under `ESCAPE '\'`. One home for this crate's LIKE-literal escaping.
+#[must_use]
+pub fn escape_like_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Optional literal key restriction for
+/// [`list_memories_with_ciphertext_batched_scoped`]: keep only keys that start
+/// with `prefix` AND end with `suffix` (each `None` = unrestricted). Two
+/// independent predicates rather than one `prefix%suffix` pattern, so a key
+/// where the two overlap (`a/latest` for prefix `a/`, suffix `/latest`) still
+/// matches.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryKeyMatch<'a> {
+    pub prefix: Option<&'a str>,
+    pub suffix: Option<&'a str>,
+}
+
+impl MemoryKeyMatch<'_> {
+    /// The escaped `LIKE` patterns (`prefix%`, `%suffix`), or an error when
+    /// either side exceeds [`MAX_KEY_MATCH_BYTES`].
+    pub fn like_patterns(&self) -> Result<(Option<String>, Option<String>)> {
+        for (name, v) in [("prefix", self.prefix), ("suffix", self.suffix)] {
+            if v.is_some_and(|v| v.len() > MAX_KEY_MATCH_BYTES) {
+                anyhow::bail!("key {name} exceeds {MAX_KEY_MATCH_BYTES} bytes");
+            }
+        }
+        Ok((
+            self.prefix.map(|p| format!("{}%", escape_like_literal(p))),
+            self.suffix.map(|s| format!("%{}", escape_like_literal(s))),
+        ))
+    }
+}
+
 pub const MEMORY_TYPES: &[&str] = &["working", "episodic", "semantic", "scratchpad"];
 
 /// CSV rendering of [`MEMORY_TYPES`] for error messages.
@@ -1701,11 +1749,7 @@ pub async fn list_memories(
     // actor, so not a cross-tenant leak — but a behavioral
     // surprise + DoS surface). `ESCAPE '\\'` added to the SQL so
     // the bound backslash-escaped bytes are interpreted as literal.
-    let escaped_prefix = prefix.map(|p| {
-        p.replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-    });
+    let escaped_prefix = prefix.map(escape_like_literal);
     let rows = sqlx::query(
         "SELECT key, memory_type, expires_at, updated_at, metadata, \
                 octet_length(value_enc) AS value_bytes \
@@ -1815,9 +1859,18 @@ pub async fn decrypt_memory_list_row(row: &MemoryListRowEnc) -> Result<serde_jso
 /// `actor_id = ANY($1)` scan.
 ///
 /// **Per-actor fairness.** A windowed
-/// `ROW_NUMBER() OVER (PARTITION BY actor_id ORDER BY created_at DESC, key ASC)`
-/// caps EACH actor at `limit_per_actor` rows (newest-first) so one
-/// memory-heavy actor can't starve the batch — the single-actor path's
+/// `ROW_NUMBER() OVER (PARTITION BY actor_id ORDER BY updated_at DESC, key ASC)`
+/// caps EACH actor at `limit_per_actor` rows (most recently WRITTEN first) so
+/// one memory-heavy actor can't starve the batch. The window is by
+/// `updated_at`, not `created_at`: an upsert bumps `updated_at` and never
+/// `created_at`, so a creation-time window dropped exactly the keys that are
+/// rewritten on every run (a `<name>/latest` briefing) once an actor held
+/// more rows than the cap.
+///
+/// **Key restriction.** `key_match` narrows the scan in SQL to keys with a
+/// literal prefix and/or suffix (LIKE metacharacters escaped, see
+/// [`MemoryKeyMatch`]), so a caller that wants one key family is not windowed
+/// out by every other row the actor holds — the single-actor path's
 /// per-actor `LIMIT` becomes a per-partition window here. The outer
 /// `ORDER BY actor_id, memory_type, key ASC` reproduces the single-actor
 /// path's within-actor ordering (`memory_type, key ASC`) so the grouped
@@ -1838,11 +1891,13 @@ pub async fn list_memories_with_ciphertext_batched_scoped(
     conn: &mut sqlx::PgConnection,
     actor_ids: &[Uuid],
     memory_type_filter: Option<&str>,
+    key_match: MemoryKeyMatch<'_>,
     limit_per_actor: i64,
 ) -> Result<Vec<MemoryListRowEnc>> {
     if actor_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let (prefix_pattern, suffix_pattern) = key_match.like_patterns()?;
     // Defense in depth: the resolver rejects >MAX_ACTOR_IDS_PER_BATCH ids
     // before calling, so this truncation is unreachable in practice — it
     // bounds the `= ANY($1)` scan for any future direct caller.
@@ -1864,12 +1919,14 @@ pub async fn list_memories_with_ciphertext_batched_scoped(
                     memory_type, expires_at, updated_at, \
                     ROW_NUMBER() OVER ( \
                         PARTITION BY actor_id \
-                        ORDER BY created_at DESC, key ASC \
+                        ORDER BY updated_at DESC, key ASC \
                     ) AS rn \
              FROM actor_memory \
              WHERE actor_id = ANY($1) \
                AND ($2::text IS NULL OR memory_type = $2) \
                AND (expires_at IS NULL OR expires_at > NOW()) \
+               AND ($4::text IS NULL OR key LIKE $4 ESCAPE '\\') \
+               AND ($5::text IS NULL OR key LIKE $5 ESCAPE '\\') \
          ) ranked \
          WHERE rn <= $3 \
          ORDER BY actor_id, memory_type, key ASC",
@@ -1877,6 +1934,8 @@ pub async fn list_memories_with_ciphertext_batched_scoped(
     .bind(capped_ids)
     .bind(memory_type_filter)
     .bind(limit)
+    .bind(prefix_pattern)
+    .bind(suffix_pattern)
     .fetch_all(conn)
     .await
     .context("list_memories_with_ciphertext_batched_scoped")
@@ -1955,10 +2014,7 @@ pub async fn list_keys_with_limit(
     let limit = limit.clamp(1, LIST_KEYS_HARD_CAP);
     let pattern = prefix
         .map(|p| {
-            let escaped = p
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
+            let escaped = escape_like_literal(p);
             format!("{}%", escaped)
         })
         .unwrap_or_else(|| "%".to_string());
@@ -2228,13 +2284,7 @@ async fn recall_keyword_inner(
     // Empty token set (e.g. "what is it?") → fall back to whole-phrase
     // ILIKE so callers don't see a completely empty result set.
     if tokens.is_empty() {
-        let escaped = query
-            .chars()
-            .take(200)
-            .collect::<String>()
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
+        let escaped = escape_like_literal(&query.chars().take(200).collect::<String>());
         let pattern = format!("%{}%", escaped);
         // Phase B: encrypted bytes can't be substring-matched at the DB
         // layer, so keyword fallback now matches `key` only. The vector-
@@ -2273,10 +2323,7 @@ async fn recall_keyword_inner(
     let patterns: Vec<String> = tokens
         .iter()
         .map(|t| {
-            let escaped = t
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
+            let escaped = escape_like_literal(t);
             format!("%{}%", escaped)
         })
         .collect();
@@ -3707,10 +3754,7 @@ pub async fn forget_prefix(
     if prefix.is_empty() {
         anyhow::bail!("forget_prefix requires a non-empty prefix");
     }
-    let escaped = prefix
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
+    let escaped = escape_like_literal(prefix);
     // `RETURNING` the liveness of each removed row makes the reported split a
     // property of the DELETE itself rather than of a second query that could
     // describe a different set — the same discipline as
@@ -6107,5 +6151,63 @@ mod graph_extraction_bound_tests {
         let c = PendingSlot::claim(&COUNTER, 2).expect("a released slot is reusable");
         drop((b, c));
         assert_eq!(COUNTER.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod key_match_tests {
+    use super::{escape_like_literal, MemoryKeyMatch, MAX_KEY_MATCH_BYTES};
+
+    #[test]
+    fn like_metacharacters_are_escaped_literally() {
+        assert_eq!(
+            escape_like_literal("daily_brief/latest"),
+            "daily\\_brief/latest"
+        );
+        assert_eq!(escape_like_literal("100%"), "100\\%");
+        // Backslash is escaped once, and never re-escapes an escape it added.
+        assert_eq!(escape_like_literal("a\\b"), "a\\\\b");
+        assert_eq!(escape_like_literal("\\%"), "\\\\\\%");
+        assert_eq!(escape_like_literal("plain/key"), "plain/key");
+    }
+
+    #[test]
+    fn patterns_anchor_each_side_independently() {
+        let m = MemoryKeyMatch {
+            prefix: Some("crm_"),
+            suffix: Some("/latest"),
+        };
+        assert_eq!(
+            m.like_patterns().unwrap(),
+            (Some("crm\\_%".to_string()), Some("%/latest".to_string()))
+        );
+        assert_eq!(
+            MemoryKeyMatch::default().like_patterns().unwrap(),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn an_oversized_side_is_refused_not_truncated() {
+        let long = "x".repeat(MAX_KEY_MATCH_BYTES + 1);
+        let ok = "x".repeat(MAX_KEY_MATCH_BYTES);
+        assert!(MemoryKeyMatch {
+            prefix: None,
+            suffix: Some(&long)
+        }
+        .like_patterns()
+        .is_err());
+        assert!(MemoryKeyMatch {
+            prefix: Some(&long),
+            suffix: None
+        }
+        .like_patterns()
+        .is_err());
+        assert!(MemoryKeyMatch {
+            prefix: Some(&ok),
+            suffix: Some(&ok)
+        }
+        .like_patterns()
+        .is_ok());
     }
 }

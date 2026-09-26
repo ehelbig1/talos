@@ -377,7 +377,8 @@ impl WorkflowsMutations {
         Ok(Workflow {
             id: workflow_id,
             name: input.name,
-            graph_json: input.graph_json,
+            graph_json: Some(input.graph_json),
+            graph_counts: None,
             graph_version,
             max_concurrent_executions: input.max_concurrent_executions,
             intent: input.intent,
@@ -563,7 +564,8 @@ impl WorkflowsMutations {
         Ok(Workflow {
             id,
             name: input.name,
-            graph_json: input.graph_json,
+            graph_json: Some(input.graph_json),
+            graph_counts: None,
             graph_version,
             max_concurrent_executions: input.max_concurrent_executions,
             intent: input.intent,

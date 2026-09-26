@@ -748,7 +748,11 @@ async fn batched_listing_groups_caps_and_decrypts_across_actors() {
     let ordered = vec![actor_a, actor_b, actor_empty, actor_unknown];
     let mut conn = pool.acquire().await.expect("acquire conn");
     let flat = mem::list_memories_with_ciphertext_batched_scoped(
-        &mut conn, &ordered, None, 2, // per-actor cap
+        &mut conn,
+        &ordered,
+        None,
+        mem::MemoryKeyMatch::default(),
+        2, // per-actor cap
     )
     .await
     .expect("batched listing");
@@ -811,11 +815,77 @@ async fn batched_listing_groups_caps_and_decrypts_across_actors() {
         }
     }
 
-    // Empty actor_ids short-circuits to an empty result.
+    // (f) the cap windows by LAST WRITE: re-writing the oldest row (an upsert
+    // bumps updated_at, never created_at) makes it survive and drops k2.
+    mem::persist_memory(
+        &pool,
+        actor_a,
+        &a_k1,
+        &serde_json::json!({ "v": "A-one-rewritten" }),
+        "episodic",
+        None,
+    )
+    .await
+    .expect("rewrite actor_a k1");
     let mut conn = pool.acquire().await.expect("acquire conn 2");
-    let empty = mem::list_memories_with_ciphertext_batched_scoped(&mut conn, &[], None, 10)
-        .await
-        .expect("empty batch");
+    let rewritten = mem::list_memories_with_ciphertext_batched_scoped(
+        &mut conn,
+        &[actor_a],
+        None,
+        mem::MemoryKeyMatch::default(),
+        2,
+    )
+    .await
+    .expect("batched listing after rewrite");
+    let keys: std::collections::HashSet<&str> = rewritten.iter().map(|r| r.key.as_str()).collect();
+    assert!(
+        keys.contains(a_k1.as_str()) && keys.contains(a_k3.as_str()),
+        "the rewritten k1 and k3 are the two most recently written, got {keys:?}"
+    );
+
+    // (g) the key restriction runs in SQL and matches LITERALLY: `_` in the
+    // suffix is not a wildcard, so `a_k1` does not match the key `a-k1`.
+    let by_suffix = mem::list_memories_with_ciphertext_batched_scoped(
+        &mut conn,
+        &[actor_a, actor_b],
+        None,
+        mem::MemoryKeyMatch {
+            prefix: Some(&prefix),
+            suffix: Some("-k1"),
+        },
+        1000,
+    )
+    .await
+    .expect("suffix-filtered listing");
+    let mut matched: Vec<&str> = by_suffix.iter().map(|r| r.key.as_str()).collect();
+    matched.sort_unstable();
+    let mut want = vec![a_k1.as_str(), b_k1.as_str()];
+    want.sort_unstable();
+    assert_eq!(matched, want);
+    let literal = mem::list_memories_with_ciphertext_batched_scoped(
+        &mut conn,
+        &[actor_a],
+        None,
+        mem::MemoryKeyMatch {
+            prefix: None,
+            suffix: Some("a_k1"),
+        },
+        1000,
+    )
+    .await
+    .expect("literal-underscore listing");
+    assert!(literal.is_empty(), "`_` must not act as a LIKE wildcard");
+
+    // Empty actor_ids short-circuits to an empty result.
+    let empty = mem::list_memories_with_ciphertext_batched_scoped(
+        &mut conn,
+        &[],
+        None,
+        mem::MemoryKeyMatch::default(),
+        10,
+    )
+    .await
+    .expect("empty batch");
     assert!(empty.is_empty(), "empty actor_ids → no rows");
     drop(conn);
 

@@ -624,9 +624,17 @@ impl ActorsQueries {
         #[graphql(desc = "Actors to read (max 100 ids)")] actor_ids: Vec<Uuid>,
         #[graphql(desc = "Filter by type: working | episodic | semantic | scratchpad")]
         memory_type: Option<String>,
-        #[graphql(desc = "Max rows PER ACTOR (default 1000, max 1000)")] limit_per_actor: Option<
-            i32,
-        >,
+        #[graphql(
+            desc = "Max rows PER ACTOR (default 1000, max 1000). The window keeps \
+                          each actor's most recently written rows."
+        )]
+        limit_per_actor: Option<i32>,
+        #[graphql(desc = "Only keys starting with this literal text (max 256 bytes; \
+                          LIKE wildcards are matched literally)")]
+        key_prefix: Option<String>,
+        #[graphql(desc = "Only keys ending with this literal text, e.g. \"/latest\" \
+                          (max 256 bytes; LIKE wildcards are matched literally)")]
+        key_suffix: Option<String>,
     ) -> Result<Vec<ActorMemoryGroup>> {
         require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
         let user_id = ctx
@@ -650,6 +658,19 @@ impl ActorsQueries {
         // MCP-1188 sibling: cap PER-ACTOR rows at 1000 even if the
         // caller passes a larger value; negatives / zero clamp up to 1.
         let limit_val: i64 = i64::from(limit_per_actor.unwrap_or(1000).clamp(1, 1000));
+        let key_match = talos_memory::MemoryKeyMatch {
+            prefix: key_prefix.as_deref(),
+            suffix: key_suffix.as_deref(),
+        };
+        // Refuse an oversized filter loudly, before any read (the same check
+        // talos-memory repeats when it builds the patterns).
+        if key_match.like_patterns().is_err() {
+            return Err(async_graphql::Error::new(format!(
+                "keyPrefix and keySuffix must be at most {} bytes",
+                talos_memory::MAX_KEY_MATCH_BYTES
+            ))
+            .extend_safe());
+        }
 
         // RFC 0005 S3: batched ownership check + memory reads in ONE
         // per-user unit of work (actors are personal), so every read
@@ -681,6 +702,7 @@ impl ActorsQueries {
             uow.conn(),
             &ordered,
             memory_type.as_deref(),
+            key_match,
             limit_val,
         )
         .await

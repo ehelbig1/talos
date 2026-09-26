@@ -246,7 +246,8 @@ impl WorkflowsQueries {
         Ok(Workflow {
             id: workflow.id,
             name: workflow.name,
-            graph_json: workflow.graph_json,
+            graph_json: Some(workflow.graph_json),
+            graph_counts: None,
             graph_version: workflow.graph_version,
             max_concurrent_executions: workflow.max_concurrent_executions,
             intent: workflow.intent,
@@ -287,6 +288,7 @@ impl WorkflowsQueries {
             .max(0) as i64;
 
         let org_ids: Vec<uuid::Uuid> = user_accessible_org_ids(ctx).await?;
+        let projection = list_projection(&ctx.look_ahead());
 
         // RFC 0004 M4: scoped tx so the workflows RLS policy backstops the
         // app-layer union filter. The repo method executes on the tx we pass.
@@ -305,6 +307,7 @@ impl WorkflowsQueries {
                 &scope.accessible_org_ids,
                 limit_val,
                 offset_val,
+                projection,
             )
             .await
             .map_err(|e| {
@@ -321,6 +324,9 @@ impl WorkflowsQueries {
                 id: w.id,
                 name: w.name,
                 graph_json: w.graph_json,
+                graph_counts: projection
+                    .graph_counts
+                    .then_some((w.node_count, w.edge_count)),
                 graph_version: w.graph_version,
                 max_concurrent_executions: w.max_concurrent_executions,
                 intent: w.intent,
@@ -1096,6 +1102,99 @@ fn eval_rhai_preview(script: &str, mock_context: &serde_json::Value) -> TestRhai
             output: None,
             error: Some(e.to_string()),
         },
+    }
+}
+
+/// What a `workflows` list selection renders, read from the look-ahead so
+/// the list query neither ships every graph for a caller that only wants the
+/// counts, nor derives counts nobody asked for. Fragments and aliases are
+/// resolved by the look-ahead; a miss would surface as the loud
+/// "graphJson was not loaded" error, never as an empty graph.
+pub(crate) fn list_projection(
+    look_ahead: &async_graphql::Lookahead<'_>,
+) -> talos_workflow_repository::WorkflowListProjection {
+    talos_workflow_repository::WorkflowListProjection {
+        graph_json: look_ahead.field("graphJson").exists(),
+        graph_counts: look_ahead.field("nodeCount").exists()
+            || look_ahead.field("edgeCount").exists(),
+    }
+}
+
+#[cfg(test)]
+mod list_projection_tests {
+    //! Drives `list_projection` through a real async-graphql execution, with
+    //! the production `Workflow` type, so fragments and aliases are covered.
+    use super::list_projection;
+    use crate::schema::types::Workflow;
+    use async_graphql::{Context, EmptyMutation, EmptySubscription, Object, Schema};
+    use uuid::Uuid;
+
+    struct Root;
+
+    #[Object]
+    impl Root {
+        /// Builds rows exactly as the `workflows` resolver does from a list
+        /// query: `graph_json` only when projected, SQL counts only when
+        /// projected (here `(Some(2), Some(1))`).
+        async fn workflows(&self, ctx: &Context<'_>) -> Vec<Workflow> {
+            let p = list_projection(&ctx.look_ahead());
+            vec![Workflow {
+                id: Uuid::nil(),
+                name: "w".into(),
+                graph_json: p
+                    .graph_json
+                    .then(|| r#"{"nodes":[{},{}],"edges":[{}]}"#.to_string()),
+                graph_counts: p.graph_counts.then_some((Some(2), Some(1))),
+                graph_version: 1,
+                max_concurrent_executions: None,
+                intent: None,
+                actor_id: None,
+            }]
+        }
+    }
+
+    async fn run(q: &str) -> serde_json::Value {
+        let schema = Schema::new(Root, EmptyMutation, EmptySubscription);
+        let resp = schema.execute(q).await;
+        assert!(resp.errors.is_empty(), "{q}: {:?}", resp.errors);
+        resp.data.into_json().unwrap()
+    }
+
+    #[tokio::test]
+    async fn counts_only_skips_the_graph_and_serves_sql_counts() {
+        let d = run("{ workflows { nodeCount edgeCount } }").await;
+        assert_eq!(d["workflows"][0]["nodeCount"], 2);
+        assert_eq!(d["workflows"][0]["edgeCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn graph_json_is_loaded_through_fragments_and_aliases() {
+        for q in [
+            "{ workflows { graphJson } }",
+            "{ workflows { g: graphJson } }",
+            "{ workflows { ...F } } fragment F on Workflow { graphJson }",
+            "{ workflows { ... on Workflow { graphJson nodeCount } } }",
+        ] {
+            let d = run(q).await;
+            let w = &d["workflows"][0];
+            let g = w.get("graphJson").or_else(|| w.get("g")).unwrap();
+            assert!(g.as_str().unwrap().contains("nodes"), "{q}");
+        }
+    }
+
+    #[test]
+    fn a_workflow_without_sql_counts_derives_them_from_its_graph() {
+        let w = Workflow {
+            id: Uuid::nil(),
+            name: "w".into(),
+            graph_json: Some(r#"{"nodes":[1,2,3],"edges":"bad"}"#.into()),
+            graph_counts: None,
+            graph_version: 1,
+            max_concurrent_executions: None,
+            intent: None,
+            actor_id: None,
+        };
+        assert_eq!(w.counts(), (Some(3), None));
     }
 }
 

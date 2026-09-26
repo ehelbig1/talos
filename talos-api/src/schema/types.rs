@@ -13,8 +13,14 @@ use crate::schema::SafeErrorExtensions;
 pub struct Workflow {
     pub id: Uuid,
     pub name: String,
-    /// Serialized representation of the graph (flexible JSON).
-    pub graph_json: String,
+    /// The stored graph. `None` only on a list read whose selection did not
+    /// ask for `graphJson` (see `workflows`), so it is never rendered empty.
+    #[graphql(skip)]
+    pub graph_json: Option<String>,
+    /// Node/edge counts the list query derived in SQL; `None` means derive
+    /// them from `graph_json` on demand (single-workflow reads, mutations).
+    #[graphql(skip)]
+    pub graph_counts: Option<(Option<i32>, Option<i32>)>,
     /// The version `graphJson` is at. Advances whenever the graph changes,
     /// through ANY writer (this API, MCP tools, rollback). Pass it back as
     /// `updateWorkflow(expectedGraphVersion:)` so a save made from a stale
@@ -933,6 +939,26 @@ fn loader_err(
 
 #[ComplexObject]
 impl Workflow {
+    /// Serialized representation of the graph (flexible JSON).
+    async fn graph_json(&self) -> Result<&str> {
+        self.graph_json.as_deref().ok_or_else(|| {
+            async_graphql::Error::new("graphJson was not loaded for this read").extend_safe()
+        })
+    }
+
+    /// Number of nodes in the graph (its top-level `nodes` array). Null when
+    /// the stored graph has no such array or is not valid JSON. Cheaper than
+    /// selecting `graphJson` when only the size is needed.
+    async fn node_count(&self) -> Option<i32> {
+        self.counts().0
+    }
+
+    /// Number of edges in the graph (its top-level `edges` array). Null when
+    /// the stored graph has no such array or is not valid JSON.
+    async fn edge_count(&self) -> Option<i32> {
+        self.counts().1
+    }
+
     /// Display name of the owning actor (null when unbound, or when the
     /// actor belongs to another user). Batched via [`ActorNameLoader`].
     async fn actor_name(&self, ctx: &Context<'_>) -> Result<Option<String>> {
@@ -960,6 +986,17 @@ impl Workflow {
             })
             .await
             .map_err(loader_err("latest execution"))
+    }
+}
+
+impl Workflow {
+    pub(crate) fn counts(&self) -> (Option<i32>, Option<i32>) {
+        self.graph_counts.unwrap_or_else(|| {
+            self.graph_json.as_deref().map_or(
+                (None, None),
+                talos_workflow_repository::graph_counts_from_json,
+            )
+        })
     }
 }
 

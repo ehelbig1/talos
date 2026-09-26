@@ -1432,9 +1432,17 @@ type QueryRoot {
 		"""
 		memoryType: String,
 		"""
-		Max rows PER ACTOR (default 1000, max 1000)
+		Max rows PER ACTOR (default 1000, max 1000). The window keeps each actor's most recently written rows.
 		"""
-		limitPerActor: Int
+		limitPerActor: Int,
+		"""
+		Only keys starting with this literal text (max 256 bytes; LIKE wildcards are matched literally)
+		"""
+		keyPrefix: String,
+		"""
+		Only keys ending with this literal text, e.g. "/latest" (max 256 bytes; LIKE wildcards are matched literally)
+		"""
+		keySuffix: String
 	): [ActorMemoryGroup!]!
 	"""
 	MCP-1190 (2026-05-17): `limit` arg added with default 100 and
@@ -1695,9 +1703,10 @@ type SubscriptionRoot {
 	"""
 	Stream LLM completion tokens as they are generated.
 	
-	Subscribes to a NATS topic for the given execution and streams
-	partial text chunks as they arrive from the worker. The worker
-	publishes chunks to `talos.llm.stream.{execution_id}`.
+	Relays text chunks published to `talos.llm.stream.{execution_id}`.
+	Nothing publishes there today: the worker's `llm-streaming` host
+	interface streams to the guest only, and the worker's NATS
+	credential is denied this subject. Chunks carry no node id.
 	"""
 	llmStream(executionId: UUID!): String!
 	"""
@@ -1961,10 +1970,6 @@ type Workflow {
 	id: UUID!
 	name: String!
 	"""
-	Serialized representation of the graph (flexible JSON).
-	"""
-	graphJson: String!
-	"""
 	The version `graphJson` is at. Advances whenever the graph changes,
 	through ANY writer (this API, MCP tools, rollback). Pass it back as
 	`updateWorkflow(expectedGraphVersion:)` so a save made from a stale
@@ -1983,6 +1988,21 @@ type Workflow {
 	Actor that owns this workflow, if any.
 	"""
 	actorId: UUID
+	"""
+	Serialized representation of the graph (flexible JSON).
+	"""
+	graphJson: String!
+	"""
+	Number of nodes in the graph (its top-level `nodes` array). Null when
+	the stored graph has no such array or is not valid JSON. Cheaper than
+	selecting `graphJson` when only the size is needed.
+	"""
+	nodeCount: Int
+	"""
+	Number of edges in the graph (its top-level `edges` array). Null when
+	the stored graph has no such array or is not valid JSON.
+	"""
+	edgeCount: Int
 	"""
 	Display name of the owning actor (null when unbound, or when the
 	actor belongs to another user). Batched via [`ActorNameLoader`].

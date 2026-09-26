@@ -1798,6 +1798,8 @@ export type QueryRootActorWorkflowsSummaryArgs = {
 
 export type QueryRootActorsMemoriesArgs = {
   actorIds: Array<Scalars["UUID"]["input"]>;
+  keyPrefix?: InputMaybe<Scalars["String"]["input"]>;
+  keySuffix?: InputMaybe<Scalars["String"]["input"]>;
   limitPerActor?: InputMaybe<Scalars["Int"]["input"]>;
   memoryType?: InputMaybe<Scalars["String"]["input"]>;
 };
@@ -2071,9 +2073,10 @@ export type SubscriptionRoot = {
   /**
    * Stream LLM completion tokens as they are generated.
    *
-   * Subscribes to a NATS topic for the given execution and streams
-   * partial text chunks as they arrive from the worker. The worker
-   * publishes chunks to `talos.llm.stream.{execution_id}`.
+   * Relays text chunks published to `talos.llm.stream.{execution_id}`.
+   * Nothing publishes there today: the worker's `llm-streaming` host
+   * interface streams to the guest only, and the worker's NATS
+   * credential is denied this subject. Chunks carry no node id.
    */
   llmStream: Scalars["String"]["output"];
   /**
@@ -2282,6 +2285,11 @@ export type Workflow = {
    * actor belongs to another user). Batched via [`ActorNameLoader`].
    */
   actorName?: Maybe<Scalars["String"]["output"]>;
+  /**
+   * Number of edges in the graph (its top-level `edges` array). Null when
+   * the stored graph has no such array or is not valid JSON.
+   */
+  edgeCount?: Maybe<Scalars["Int"]["output"]>;
   /** Serialized representation of the graph (flexible JSON). */
   graphJson: Scalars["String"]["output"];
   /**
@@ -2303,6 +2311,12 @@ export type Workflow = {
   /** Maximum number of concurrent executions allowed (null = unlimited). */
   maxConcurrentExecutions?: Maybe<Scalars["Int"]["output"]>;
   name: Scalars["String"]["output"];
+  /**
+   * Number of nodes in the graph (its top-level `nodes` array). Null when
+   * the stored graph has no such array or is not valid JSON. Cheaper than
+   * selecting `graphJson` when only the size is needed.
+   */
+  nodeCount?: Maybe<Scalars["Int"]["output"]>;
 };
 
 export type WorkflowExecution = {

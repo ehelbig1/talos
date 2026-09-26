@@ -21,9 +21,9 @@ import {
 //
 // "Results" are the curated outputs workflows persist to actor memory under a
 // `<name>/latest` key (the __memory_write__ convention). We fan out across the
-// user's actors, pull their episodic memories, and surface every `*/latest`
-// entry — so any workflow that follows the convention shows up here with no
-// per-workflow wiring.
+// user's actors, read their episodic `*/latest` memories (filtered by the
+// server), and surface every one — so any workflow that follows the
+// convention shows up here with no per-workflow wiring.
 
 interface Briefing {
   actorId: string;
@@ -61,14 +61,16 @@ function parseMemoryValue(raw: string): unknown {
 /** The server's per-actor row cap on `actorsMemories` (default = max). */
 export const MEMORIES_PER_ACTOR_CAP = 1000;
 const ACTOR_CHUNK = 100;
+/** The briefing key convention; the server filters on it. */
+export const BRIEFING_KEY_SUFFIX = "/latest";
 
 export interface BriefingsLoad {
   briefings: Briefing[];
   /** Actors whose memories could not be read (their chunk failed). */
   unreadableActors: string[];
-  /** Actors that returned the per-actor cap: older `/latest` rows may be
-   *  missing, because the window is by creation time and an upsert does
-   *  not move it. */
+  /** Actors that returned the per-actor cap. The read is already limited
+   *  to `/latest` keys and windowed by last write, so this needs more than
+   *  1000 distinct briefing keys on one actor — reported, not assumed away. */
   possiblyTruncatedActors: string[];
 }
 
@@ -101,7 +103,8 @@ export function summarizeBriefings(
   const briefings = groups
     .flatMap((group) =>
       group.memories
-        .filter((e) => e.key.endsWith("/latest"))
+        // The server already filtered on the suffix; kept as a cheap guard.
+        .filter((e) => e.key.endsWith(BRIEFING_KEY_SUFFIX))
         .map<Briefing>((e) => ({
           actorId: group.actorId,
           actorName: name(group.actorId),
@@ -115,17 +118,18 @@ export function summarizeBriefings(
   return { briefings, unreadableActors, possiblyTruncatedActors };
 }
 
-async function loadBriefings(): Promise<BriefingsLoad> {
+export async function loadBriefings(): Promise<BriefingsLoad> {
   const actors = await listActors();
-  // Batched read, chunked at the server's 100-id cap. There is no key
-  // filter on `actorsMemories`, so every episodic row is read and the
-  // `/latest` keys are picked out here.
+  // Batched read, chunked at the server's 100-id cap, restricted in SQL to
+  // `*/latest` keys so an actor's other memories cannot window them out.
   const chunks: string[][] = [];
   for (let i = 0; i < actors.length; i += ACTOR_CHUNK) {
     chunks.push(actors.slice(i, i + ACTOR_CHUNK).map((a) => a.id));
   }
   const results = await Promise.allSettled(
-    chunks.map((ids) => listActorsMemories(ids, "episodic")),
+    chunks.map((ids) =>
+      listActorsMemories(ids, "episodic", BRIEFING_KEY_SUFFIX),
+    ),
   );
   // Nothing readable at all is the page's error state, not "no results".
   const firstFailure = results.find((r) => r.status === "rejected");

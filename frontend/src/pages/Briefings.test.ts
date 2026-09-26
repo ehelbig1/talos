@@ -3,8 +3,20 @@
  * briefings" (it was `.catch(() => [])`), and an actor that returned the
  * per-actor row cap is flagged as possibly missing older `/latest` rows.
  */
-import { describe, expect, it } from "vitest";
-import { MEMORIES_PER_ACTOR_CAP, summarizeBriefings } from "./Briefings";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/graphqlApi", () => ({
+  listActors: vi.fn(),
+  listActorsMemories: vi.fn(),
+}));
+
+import { listActors, listActorsMemories } from "@/lib/graphqlApi";
+import {
+  BRIEFING_KEY_SUFFIX,
+  MEMORIES_PER_ACTOR_CAP,
+  loadBriefings,
+  summarizeBriefings,
+} from "./Briefings";
 
 const mem = (key: string, updatedAt = "2026-09-25T00:00:00Z") =>
   ({ key, value: '"x"', updatedAt }) as never;
@@ -47,5 +59,29 @@ describe("summarizeBriefings", () => {
     );
     expect(out.briefings).toEqual([]);
     expect(out.possiblyTruncatedActors).toEqual(["Alpha"]);
+  });
+});
+
+describe("loadBriefings", () => {
+  it("asks the server for `/latest` keys only, chunked at 100 actors", async () => {
+    const actors = Array.from({ length: 101 }, (_, i) => ({
+      id: `a${i}`,
+      name: `A${i}`,
+    }));
+    vi.mocked(listActors).mockResolvedValue(actors as never);
+    vi.mocked(listActorsMemories).mockImplementation(async (ids) =>
+      ids.map((actorId) => ({
+        actorId,
+        memories: [mem("daily_brief/latest")],
+      })),
+    );
+    const out = await loadBriefings();
+    expect(BRIEFING_KEY_SUFFIX).toBe("/latest");
+    expect(vi.mocked(listActorsMemories).mock.calls).toEqual([
+      [actors.slice(0, 100).map((a) => a.id), "episodic", "/latest"],
+      [["a100"], "episodic", "/latest"],
+    ]);
+    expect(out.briefings).toHaveLength(101);
+    expect(out.unreadableActors).toEqual([]);
   });
 });

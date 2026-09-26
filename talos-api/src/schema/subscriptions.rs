@@ -299,9 +299,10 @@ impl SubscriptionRoot {
 
     /// Stream LLM completion tokens as they are generated.
     ///
-    /// Subscribes to a NATS topic for the given execution and streams
-    /// partial text chunks as they arrive from the worker. The worker
-    /// publishes chunks to `talos.llm.stream.{execution_id}`.
+    /// Relays text chunks published to `talos.llm.stream.{execution_id}`.
+    /// Nothing publishes there today: the worker's `llm-streaming` host
+    /// interface streams to the guest only, and the worker's NATS
+    /// credential is denied this subject. Chunks carry no node id.
     async fn llm_stream(
         &self,
         ctx: &Context<'_>,

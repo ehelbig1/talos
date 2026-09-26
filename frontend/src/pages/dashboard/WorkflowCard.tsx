@@ -19,9 +19,9 @@ export interface Workflow {
   id: string;
   name: string;
   actorId?: string | null;
-  /** Counted once when the list is fetched, never per render. */
-  nodeCount: number;
-  edgeCount: number;
+  /** Counted by the server; null when the stored graph could not be read. */
+  nodeCount: number | null;
+  edgeCount: number | null;
 }
 
 export interface WorkflowSchedule {
@@ -53,8 +53,8 @@ export default function WorkflowCard({
   schedule,
   actorName,
 }: WorkflowCardProps) {
-  const nodes = workflow.nodeCount;
-  const edges = workflow.edgeCount;
+  const nodes = workflow.nodeCount ?? "—";
+  const edges = workflow.edgeCount ?? "—";
   const isRunning = runStatus?.status === "running";
 
   const statusLabel = !runStatus

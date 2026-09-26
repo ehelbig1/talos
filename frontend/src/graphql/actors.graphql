@@ -172,8 +172,16 @@ query GetActorMemories($actorId: UUID!, $memoryType: String, $limit: Int) {
   }
 }
 
-query GetActorsMemories($actorIds: [UUID!]!, $memoryType: String) {
-  actorsMemories(actorIds: $actorIds, memoryType: $memoryType) {
+query GetActorsMemories(
+  $actorIds: [UUID!]!
+  $memoryType: String
+  $keySuffix: String
+) {
+  actorsMemories(
+    actorIds: $actorIds
+    memoryType: $memoryType
+    keySuffix: $keySuffix
+  ) {
     actorId
     memories {
       key

@@ -5,9 +5,9 @@
  * - `workflows` is paged (the server's default page is 100, so the dashboard
  *   silently showed the first 100) up to `DASHBOARD_WORKFLOW_CAP`, with the
  *   truncation reported rather than implied away.
- * - The graph is parsed ONCE per fetch into node/edge counts and dropped, so
- *   a card never parses it on render. (The server has no count fields yet, so
- *   the full `graphJson` is still downloaded.)
+ * - Node/edge counts come from the server (`nodeCount` / `edgeCount`,
+ *   derived in SQL); the full `graphJson` is not downloaded. A null count
+ *   (a graph the server could not read) renders as unknown, not as 0.
  * - `latestWorkflowExecutions` refuses more than 200 ids, so it is chunked.
  */
 import { useQuery } from "@tanstack/react-query";
@@ -25,7 +25,8 @@ const DASHBOARD_WORKFLOWS_QUERY = `query DashboardWorkflows($pagination: Paginat
   workflows(pagination: $pagination) {
     id
     name
-    graphJson
+    nodeCount
+    edgeCount
     actorId
   }
 }`;
@@ -34,8 +35,9 @@ export interface DashboardWorkflow {
   id: string;
   name: string;
   actorId?: string | null;
-  nodeCount: number;
-  edgeCount: number;
+  /** Null when the stored graph could not be counted. */
+  nodeCount: number | null;
+  edgeCount: number | null;
 }
 
 export interface DashboardWorkflows {
@@ -49,21 +51,6 @@ type Request = <T>(
   variables?: Record<string, unknown>,
 ) => Promise<T>;
 
-export function graphCounts(graphJson: string): {
-  nodeCount: number;
-  edgeCount: number;
-} {
-  try {
-    const g = JSON.parse(graphJson) as { nodes?: unknown; edges?: unknown };
-    return {
-      nodeCount: Array.isArray(g.nodes) ? g.nodes.length : 0,
-      edgeCount: Array.isArray(g.edges) ? g.edges.length : 0,
-    };
-  } catch {
-    return { nodeCount: 0, edgeCount: 0 };
-  }
-}
-
 export async function fetchDashboardWorkflows(
   request: Request = graphqlRequest,
 ): Promise<DashboardWorkflows> {
@@ -74,7 +61,8 @@ export async function fetchDashboardWorkflows(
       workflows: Array<{
         id: string;
         name: string;
-        graphJson: string;
+        nodeCount?: number | null;
+        edgeCount?: number | null;
         actorId?: string | null;
       }>;
     }>(DASHBOARD_WORKFLOWS_QUERY, { pagination: { limit, offset } });
@@ -83,7 +71,8 @@ export async function fetchDashboardWorkflows(
         id: w.id,
         name: w.name,
         actorId: w.actorId,
-        ...graphCounts(w.graphJson),
+        nodeCount: w.nodeCount ?? null,
+        edgeCount: w.edgeCount ?? null,
       });
     }
     if (page.workflows.length < limit) {
