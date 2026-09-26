@@ -91,7 +91,7 @@ impl SigstoreRegexpRejection {
                 "TALOS_SIGSTORE_IDENTITY_REGEXP looks like a GitHub workflow pattern \
                  but is missing the trailing `@` anchor — a fork named \
                  `workflow.yml-evil.yml` could match the same prefix. \
-                 End the pattern with `@` to anchor at the ref separator."
+                 End the pattern with the pinned ref, e.g. `@refs/heads/main$`."
             }
             Self::MissingGithubWorkflowPath => {
                 "TALOS_SIGSTORE_IDENTITY_REGEXP targets `github.com` but does not \
@@ -139,9 +139,12 @@ impl SigstoreRegexpRejection {
 ///    defeat verification.
 /// 3. The pattern must compile as a regex.
 /// 4. Patterns targeting `github.com/.../.github/workflows/...`
-///    MUST end with `@` (per the workflow-URL anchor convention
-///    documented in CLAUDE.md). Missing this trailing `@` is
-///    spoofable via a fork repo named `workflow.yml-evil.yml`.
+///    MUST carry the `@` ref separator after the workflow file.
+///    Missing it is spoofable via a fork repo named
+///    `workflow.yml-evil.yml`. This STRUCTURAL check accepts a bare
+///    trailing `@`; the ref itself (`@refs/heads/main$`) is required
+///    under `Required` by [`validate_sigstore_identity_regexp_for_policy`]
+///    — callers must use that entry point.
 /// 5. `github.com` patterns must reference `.github/workflows/` and
 ///    pin the owner/repo literally (no wildcard between host and the
 ///    workflow path).
@@ -179,9 +182,9 @@ pub fn validate_sigstore_identity_regexp(regexp: &str) -> Result<(), SigstoreReg
     // `workflow.yml-evil.yml` would match the same prefix.
     //
     // The check looks for the `@` to appear AFTER `workflows/` in the
-    // pattern source. Both the "ends with @" form (e.g.
-    // `…template-publish\.yml@`) and the ref-pinned form (e.g.
-    // `…template-publish\.yml@refs/heads/main$`) satisfy it.
+    // pattern source. Whether the REF after it is pinned is decided by
+    // `workflow_ref_is_pinned` (policy-aware): the canonical form is
+    // `…template-publish\.yml@refs/heads/main$`.
     if let Some(workflows_idx) = regexp.find(".github/workflows/") {
         // Slice past the `workflows/` literal so any preceding `@`
         // (would be unusual but harmless) doesn't accidentally
@@ -460,10 +463,17 @@ mod tests {
         );
     }
 
+    /// STRUCTURAL pass only: the ref-less `@` form is still refused under
+    /// Required by the policy-aware entry point (see
+    /// `a_workflow_pin_without_a_ref_is_refused_under_required`).
     #[test]
     fn pinned_owner_repo_is_accepted() {
-        let pattern =
-            "^https://github\\.com/ehelbig1/talos/\\.github/workflows/template-publish\\.yml@";
+        let pattern = "^https://github\\.com/ehelbig1/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$";
+        assert!(
+            validate_sigstore_identity_regexp_for_policy(pattern, SigstorePolicy::Required)
+                == Ok(None),
+            "canonical pinned form must pass under Required"
+        );
         assert!(
             validate_sigstore_identity_regexp(pattern).is_ok(),
             "{:?}",
@@ -473,7 +483,8 @@ mod tests {
 
     #[test]
     fn escaped_dot_in_owner_repo_is_literal() {
-        let pattern = "^https://github\\.com/my\\.org/my\\.repo/\\.github/workflows/x\\.yml@";
+        let pattern =
+            "^https://github\\.com/my\\.org/my\\.repo/\\.github/workflows/x\\.yml@refs/heads/main$";
         assert!(
             validate_sigstore_identity_regexp(pattern).is_ok(),
             "{:?}",
