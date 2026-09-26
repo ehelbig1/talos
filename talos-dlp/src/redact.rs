@@ -13,8 +13,9 @@
 //! - **In-place mutation** via `&mut Value` avoids cloning a large payload
 //!   twice. Callers that need the original should clone before calling.
 //! - **Recursion depth is bounded** to 256 levels. JSON nested deeper than
-//!   that is almost certainly adversarial; the function returns early and
-//!   leaves remaining deep levels untouched rather than stack-overflowing.
+//!   that is almost certainly adversarial; the whole subtree below the cap is
+//!   replaced by the placeholder (fail closed) rather than walked — leaving it
+//!   untouched would pass any credential key hidden below the cap.
 //! - **Array handling**: we recurse into array elements so that arrays of
 //!   objects get their sensitive child keys redacted. The array itself is
 //!   never treated as a sensitive key (arrays have no key).
@@ -55,13 +56,18 @@ const MAX_REDACT_DEPTH: usize = 256;
 /// - Primitives at the root: left unchanged — there's no key to compare.
 ///
 /// Recursion depth is capped at 256 levels to prevent stack overflow on
-/// adversarially-nested input. Levels beyond the cap are left untouched.
+/// adversarially-nested input. An object or array beyond the cap is
+/// replaced whole by the placeholder — it was not inspected, so it is not
+/// passed through.
 pub fn redact_sensitive_keys(value: &mut Value) {
     redact_recursive(value, 0);
 }
 
 fn redact_recursive(value: &mut Value, depth: usize) {
     if depth >= MAX_REDACT_DEPTH {
+        if matches!(value, Value::Object(_) | Value::Array(_)) {
+            *value = Value::String(REDACTED_PLACEHOLDER.to_string());
+        }
         return;
     }
     match value {
@@ -199,6 +205,19 @@ mod tests {
         // Top-level api_key is within the depth cap, so it should be
         // redacted.
         assert_eq!(current["api_key"], "[REDACTED]");
+    }
+
+    #[test]
+    fn a_subtree_below_the_depth_cap_is_redacted_not_passed_through() {
+        // A credential key nested past the cap was left in place pre-fix.
+        let mut current = json!({"api_key": "deep-secret"});
+        for _ in 0..(MAX_REDACT_DEPTH + 10) {
+            current = json!({"nested": current});
+        }
+        redact_sensitive_keys(&mut current);
+        assert!(!current.to_string().contains("deep-secret"));
+        // Shallow structure above the cap is kept.
+        assert!(current["nested"]["nested"].is_object());
     }
 
     #[test]
