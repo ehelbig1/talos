@@ -37,7 +37,7 @@ talos-text-util = { path = "../talos-text-util" }
 # registry — so RPC signing shares the same keypair the worker uses for result
 # signing. No cycle: job-protocol does not depend on talos-memory.
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1.8"

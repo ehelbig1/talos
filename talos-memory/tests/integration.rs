@@ -1361,7 +1361,10 @@ async fn overwrite_replaces_metadata_and_never_keeps_a_stale_embedding() {
     .fetch_one(&pool)
     .await
     .expect("read back");
-    assert_eq!(metadata, None, "omitted metadata must not inherit the old kind");
+    assert_eq!(
+        metadata, None,
+        "omitted metadata must not inherit the old kind"
+    );
     assert_ne!(
         model.as_deref(),
         Some("stale-sentinel"),

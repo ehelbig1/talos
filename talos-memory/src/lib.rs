@@ -195,6 +195,44 @@ pub fn validate_memory_type(memory_type: &str) -> Result<&'static str> {
 static GRAPH_EXTRACTION_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(5));
 
+/// Most write-path extractions queued or running at once. Each holds a
+/// cloned memory value while it waits for one of the 5 permits, so without a
+/// cap a write burst queued without limit. Past it the extraction is dropped
+/// (logged); `graph_backfill` re-derives it later.
+const MAX_PENDING_GRAPH_EXTRACTIONS: usize = 64;
+
+/// Wall-clock bound on one extraction (LLM call with retries + Neo4j
+/// upserts), so a hung backend releases its permit instead of starving the
+/// other writes.
+const GRAPH_EXTRACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+static PENDING_GRAPH_EXTRACTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DROPPED_GRAPH_EXTRACTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A slot in a bounded pending counter, released on drop.
+struct PendingSlot(&'static std::sync::atomic::AtomicUsize);
+
+impl PendingSlot {
+    /// Claim a slot unless `cap` are already taken.
+    fn claim(counter: &'static std::sync::atomic::AtomicUsize, cap: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering::AcqRel;
+        counter
+            .fetch_update(AcqRel, std::sync::atomic::Ordering::Acquire, |n| {
+                (n < cap).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| PendingSlot(counter))
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Graph extraction callback. Controllers wire this at startup via
 /// [`register_graph_hook`]; the worker never registers one (so graph
 /// extraction is a controller-only concern even though memory writes
@@ -525,15 +563,45 @@ pub fn spawn_graph_extraction(
     let Some(hook) = GRAPH_HOOK.get().cloned() else {
         return;
     };
+    let Some(slot) = PendingSlot::claim(&PENDING_GRAPH_EXTRACTIONS, MAX_PENDING_GRAPH_EXTRACTIONS)
+    else {
+        let dropped =
+            DROPPED_GRAPH_EXTRACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Logarithmic: one line at 1, 2, 4, 8 … drops, each carrying the total.
+        if dropped.is_power_of_two() {
+            tracing::warn!(
+                actor_id = %actor_id,
+                key = %key,
+                dropped_total = dropped,
+                cap = MAX_PENDING_GRAPH_EXTRACTIONS,
+                "Graph extraction queue full — skipping this write's extraction \
+                 (graph_backfill can re-derive it)"
+            );
+        }
+        return;
+    };
     tokio::spawn(async move {
+        let _slot = slot;
         let _permit = GRAPH_EXTRACTION_SEMAPHORE.acquire().await;
-        if let Err(e) = hook.extract(actor_id, key.clone(), value).await {
-            tracing::debug!(
+        let outcome = tokio::time::timeout(
+            GRAPH_EXTRACTION_TIMEOUT,
+            hook.extract(actor_id, key.clone(), value),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!(
                 actor_id = %actor_id,
                 key = %key,
                 error = %e,
                 "Graph entity extraction failed (non-fatal)"
-            );
+            ),
+            Err(_) => tracing::warn!(
+                actor_id = %actor_id,
+                key = %key,
+                timeout_secs = GRAPH_EXTRACTION_TIMEOUT.as_secs(),
+                "Graph entity extraction timed out — permit released"
+            ),
         }
     });
 }
@@ -6022,5 +6090,22 @@ mod forget_prefix_scope_pins {
              preview; purged tombstones then inflate deleted_count past the \
              previewed set for a reason the operator cannot attribute"
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_extraction_bound_tests {
+    use super::*;
+
+    #[test]
+    fn pending_slots_are_capped_and_released_on_drop() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let a = PendingSlot::claim(&COUNTER, 2).expect("first slot");
+        let b = PendingSlot::claim(&COUNTER, 2).expect("second slot");
+        assert!(PendingSlot::claim(&COUNTER, 2).is_none(), "cap reached");
+        drop(a);
+        let c = PendingSlot::claim(&COUNTER, 2).expect("a released slot is reusable");
+        drop((b, c));
+        assert_eq!(COUNTER.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 }

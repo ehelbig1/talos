@@ -6,6 +6,7 @@ use std::time::Duration;
 use tracing::{error, warn};
 use zeroize::Zeroizing;
 
+pub mod anthropic;
 pub mod usage;
 pub mod warmup;
 
@@ -16,11 +17,8 @@ pub mod warmup;
 // an operator tuning latency budgets which knob covers which path, and a
 // future change won't drift one site out of sync with the others.
 
-/// Anthropic / external-LLM HTTP client default timeout. Covers a single
-/// completion call including connect + body. Anthropic typically responds
-/// in 1–10 s for a paragraph and up to 30 s for very long completions;
-/// 30 s is the practical 99th-percentile ceiling.
-const ANTHROPIC_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+// The Anthropic client's timeouts live in `anthropic` with the rest of that
+// transport.
 
 /// Default Ollama HTTP client timeout for completions. Local Ollama is
 /// fast on a warm model (sub-second) but a cold-start with a 7B+ model
@@ -124,12 +122,9 @@ impl LlmClient {
         // talos-slack). Without it, a black-holed api.anthropic.com
         // (DNS failure, network partition) can hold the connection pool
         // until ANTHROPIC_HTTP_TIMEOUT fires.
-        Client::builder()
-            .timeout(ANTHROPIC_HTTP_TIMEOUT)
-            .connect_timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("talos-llm: failed to build hardened Anthropic HTTP client")
+        // One process-wide client (shared connection pool) — see
+        // `anthropic::http_client`.
+        anthropic::http_client()
     }
 
     /// Resolve the current Anthropic API key. Vault-backed clients hit
@@ -208,88 +203,20 @@ impl LlmClient {
         let user_prompt = format!("Current code:\n{}\n\nPrompt: {}", current_code, prompt);
 
         let api_key = self.resolve_api_key().await?;
-        let mut retries = 0;
-        let max_retries = 3;
-        // Named so the usage-record call below can't drift from the request.
-        const MODEL: &str = "claude-sonnet-4-6";
-
-        let response = loop {
-            let req = self
-                .client
-                .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", api_key.as_str())
-                .header("anthropic-version", "2023-06-01")
-                .json(&json!({
-                    "model": MODEL,
-                    "max_tokens": 4096,
-                    "system": &system_prompt,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": &user_prompt
-                        }
-                    ]
-                }));
-
-            let resp = req.send().await?;
-
-            if resp.status().is_success() {
-                break resp;
-            }
-
-            let status = resp.status();
-
-            // Retry on 529 Overloaded or other 5xx server errors
-            if status.as_u16() == 529 || status.is_server_error() || status.as_u16() == 429 {
-                if retries >= max_retries {
-                    // MCP-454: log full body server-side (audit), but
-                    // return only the status to the caller. Anthropic
-                    // error responses can echo parts of the user
-                    // prompt (especially content-moderation errors
-                    // that quote the offending input) — if the caller
-                    // is an MCP handler whose error surfaces to the
-                    // operator, that body could leak. Same pattern as
-                    // OllamaClient::complete just below.
-                    let text = talos_http_body::read_error_text_capped(resp).await;
-                    let redacted = talos_dlp_provider::redact_str(&text);
-                    error!(
-                        status = %status,
-                        body_len = text.len(),
-                        retries,
-                        body = %redacted,
-                        "Anthropic API error after retries"
-                    );
-                    return Err(anyhow!(
-                        "Failed to generate code from LLM API: HTTP {}",
-                        status
-                    ));
-                }
-
-                retries += 1;
-                let backoff_secs = 2_u64.pow(retries);
-                warn!(
-                    "Anthropic API returned {}. Retrying in {}s... ({}/{})",
-                    status, backoff_secs, retries, max_retries
-                );
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                continue;
-            }
-
-            // Non-retriable error — same redaction posture as the
-            // retry-exhausted branch above (MCP-454).
-            let text = talos_http_body::read_error_text_capped(resp).await;
-            let redacted = talos_dlp_provider::redact_str(&text);
-            error!(
-                status = %status,
-                body_len = text.len(),
-                body = %redacted,
-                "Anthropic API error"
-            );
-            return Err(anyhow!(
-                "Failed to generate code from LLM API: HTTP {}",
-                status
-            ));
-        };
+        const MODEL: &str = anthropic::GENERATION_MODEL;
+        let request = json!({
+            "model": MODEL,
+            "max_tokens": 4096,
+            "system": &system_prompt,
+            "messages": [{ "role": "user", "content": &user_prompt }]
+        });
+        let response = anthropic::send_with_retry(
+            || anthropic::messages_request(&self.client, &api_key, &request),
+            3,
+            "generate_code",
+        )
+        .await
+        .map_err(|e| e.into_anyhow("Failed to generate code from LLM API"))?;
 
         let body: serde_json::Value = talos_http_body::read_json_capped(response).await?;
         usage::record_anthropic(MODEL, &body);
@@ -318,57 +245,20 @@ impl LlmClient {
     /// Used for lightweight AI-powered hints (e.g., config value suggestions).
     pub async fn generate_text(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
         let api_key = self.resolve_api_key().await?;
-        let mut retries = 0u32;
-        let max_retries = 2u32;
-        // Named so the usage-record call below can't drift from the request.
-        const MODEL: &str = "claude-haiku-4-5-20251001";
-
-        let response = loop {
-            let req = self
-                .client
-                .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", api_key.as_str())
-                .header("anthropic-version", "2023-06-01")
-                .json(&json!({
-                    "model": MODEL,
-                    "max_tokens": 512,
-                    "system": system_prompt,
-                    "messages": [{ "role": "user", "content": user_prompt }]
-                }));
-
-            let resp = req.send().await?;
-            if resp.status().is_success() {
-                break resp;
-            }
-            let status = resp.status();
-            if (status.as_u16() == 529 || status.is_server_error() || status.as_u16() == 429)
-                && retries < max_retries
-            {
-                retries += 1;
-                let backoff = 2_u64.pow(retries);
-                warn!(
-                    "generate_text: API {} — retry {}/{} in {}s",
-                    status, retries, max_retries, backoff
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                continue;
-            }
-            // MCP-454: log full body server-side, return status to caller.
-            // MCP-527: DLP-redact the body before logging — Anthropic
-            // moderation responses can echo prompt content verbatim
-            // (including embedded secrets a user pasted into a workflow
-            // description). Log aggregators downstream are often shared
-            // surfaces; full echo would leak via that path.
-            let text = talos_http_body::read_error_text_capped(resp).await;
-            let redacted = talos_dlp_provider::redact_str(&text);
-            error!(
-                status = %status,
-                body_len = text.len(),
-                body = %redacted,
-                "generate_text API error"
-            );
-            return Err(anyhow!("LLM API error: HTTP {}", status));
-        };
+        const MODEL: &str = anthropic::FAST_MODEL;
+        let request = json!({
+            "model": MODEL,
+            "max_tokens": 512,
+            "system": system_prompt,
+            "messages": [{ "role": "user", "content": user_prompt }]
+        });
+        let response = anthropic::send_with_retry(
+            || anthropic::messages_request(&self.client, &api_key, &request),
+            2,
+            "generate_text",
+        )
+        .await
+        .map_err(|e| e.into_anyhow("LLM API error"))?;
 
         let body: serde_json::Value = talos_http_body::read_json_capped(response).await?;
         usage::record_anthropic(MODEL, &body);
@@ -408,59 +298,27 @@ impl LlmClient {
         tool_name: &str,
     ) -> Result<String> {
         let api_key = self.resolve_api_key().await?;
-        let mut retries = 0u32;
-        let max_retries = 2u32;
-        const MODEL: &str = "claude-haiku-4-5-20251001";
-
-        let response = loop {
-            let req = self
-                .client
-                .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", api_key.as_str())
-                .header("anthropic-version", "2023-06-01")
-                .json(&json!({
-                    "model": MODEL,
-                    "max_tokens": 2048,
-                    "system": system_prompt,
-                    "messages": [{ "role": "user", "content": user_prompt }],
-                    "tools": [{
-                        "name": tool_name,
-                        "description": "Record the structured result. Populate every field per the schema.",
-                        "input_schema": schema,
-                    }],
-                    // Force the model to emit exactly this tool's schema-shaped input.
-                    "tool_choice": { "type": "tool", "name": tool_name },
-                }));
-
-            let resp = req.send().await?;
-            if resp.status().is_success() {
-                break resp;
-            }
-            let status = resp.status();
-            if (status.as_u16() == 529 || status.is_server_error() || status.as_u16() == 429)
-                && retries < max_retries
-            {
-                retries += 1;
-                let backoff = 2_u64.pow(retries);
-                warn!(
-                    "generate_with_schema: API {} — retry {}/{} in {}s",
-                    status, retries, max_retries, backoff
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                continue;
-            }
-            // Same DLP-redacted server-side logging / opaque caller error as
-            // `generate_text` (MCP-454/527).
-            let text = talos_http_body::read_error_text_capped(resp).await;
-            let redacted = talos_dlp_provider::redact_str(&text);
-            error!(
-                status = %status,
-                body_len = text.len(),
-                body = %redacted,
-                "generate_with_schema API error"
-            );
-            return Err(anyhow!("LLM API error: HTTP {}", status));
-        };
+        const MODEL: &str = anthropic::FAST_MODEL;
+        let request = json!({
+            "model": MODEL,
+            "max_tokens": 2048,
+            "system": system_prompt,
+            "messages": [{ "role": "user", "content": user_prompt }],
+            "tools": [{
+                "name": tool_name,
+                "description": "Record the structured result. Populate every field per the schema.",
+                "input_schema": schema,
+            }],
+            // Force the model to emit exactly this tool's schema-shaped input.
+            "tool_choice": { "type": "tool", "name": tool_name },
+        });
+        let response = anthropic::send_with_retry(
+            || anthropic::messages_request(&self.client, &api_key, &request),
+            2,
+            "generate_with_schema",
+        )
+        .await
+        .map_err(|e| e.into_anyhow("LLM API error"))?;
 
         let body: serde_json::Value = talos_http_body::read_json_capped(response).await?;
         usage::record_anthropic(MODEL, &body);
@@ -536,68 +394,20 @@ impl LlmClient {
         );
 
         let api_key = self.resolve_api_key().await?;
-        let mut retries = 0;
-        let max_retries = 3;
-        // Named so the usage-record call below can't drift from the request.
-        const MODEL: &str = "claude-sonnet-4-6";
-
-        let response = loop {
-            let req = self
-                .client
-                .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", api_key.as_str())
-                .header("anthropic-version", "2023-06-01")
-                .json(&json!({
-                    "model": MODEL,
-                    "max_tokens": 2048,
-                    "system": system_prompt,
-                    "messages": [{ "role": "user", "content": &user_prompt }]
-                }));
-
-            let resp = req.send().await?;
-
-            if resp.status().is_success() {
-                break resp;
-            }
-
-            let status = resp.status();
-            if status.as_u16() == 529 || status.is_server_error() || status.as_u16() == 429 {
-                if retries >= max_retries {
-                    // MCP-454: log full body server-side, return status to caller.
-                    // MCP-527: DLP-redact before tracing — see generate_text.
-                    let text = talos_http_body::read_error_text_capped(resp).await;
-                    let redacted = talos_dlp_provider::redact_str(&text);
-                    error!(
-                        status = %status,
-                        body_len = text.len(),
-                        retries,
-                        body = %redacted,
-                        "scaffold_workflow API error after retries"
-                    );
-                    return Err(anyhow!("LLM API error: HTTP {}", status));
-                }
-                retries += 1;
-                let backoff_secs = 2_u64.pow(retries);
-                warn!(
-                    "scaffold_workflow: API returned {}. Retry {}/{} in {}s",
-                    status, retries, max_retries, backoff_secs
-                );
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                continue;
-            }
-
-            // MCP-454: log full body server-side, return status to caller.
-            // MCP-527: DLP-redact before tracing — see generate_text.
-            let text = talos_http_body::read_error_text_capped(resp).await;
-            let redacted = talos_dlp_provider::redact_str(&text);
-            error!(
-                status = %status,
-                body_len = text.len(),
-                body = %redacted,
-                "scaffold_workflow API error"
-            );
-            return Err(anyhow!("LLM API error: HTTP {}", status));
-        };
+        const MODEL: &str = anthropic::GENERATION_MODEL;
+        let request = json!({
+            "model": MODEL,
+            "max_tokens": 2048,
+            "system": system_prompt,
+            "messages": [{ "role": "user", "content": &user_prompt }]
+        });
+        let response = anthropic::send_with_retry(
+            || anthropic::messages_request(&self.client, &api_key, &request),
+            3,
+            "scaffold_workflow",
+        )
+        .await
+        .map_err(|e| e.into_anyhow("LLM API error"))?;
 
         let body: serde_json::Value = talos_http_body::read_json_capped(response).await?;
         usage::record_anthropic(MODEL, &body);

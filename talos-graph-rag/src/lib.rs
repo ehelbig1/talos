@@ -284,9 +284,12 @@ impl GraphRagService {
             .build()
             .context("Failed to build Neo4j config")?;
 
-        let graph = neo4rs::Graph::connect(config)
-            .await
-            .context("Failed to connect to Neo4j")?;
+        let graph = with_deadline(NEO4J_CONNECT_TIMEOUT, "connect", async {
+            neo4rs::Graph::connect(config)
+                .await
+                .context("Failed to connect to Neo4j")
+        })
+        .await?;
 
         let service = Self {
             graph: Arc::new(graph),
@@ -339,6 +342,16 @@ impl GraphRagService {
         }
     }
 
+    /// One schema statement under the query deadline — a hung Neo4j must not
+    /// hold controller boot; a timeout counts as a failed statement.
+    async fn run_schema_statement(&self, cypher: &str) -> Result<()> {
+        with_deadline(NEO4J_QUERY_TIMEOUT, "schema statement", async {
+            self.graph.run(neo4rs::query(cypher)).await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Create indexes and constraints for the knowledge graph schema.
     ///
     /// Everything here is derived from [`ALLOWED_NODE_LABELS`] so a label
@@ -376,7 +389,7 @@ impl GraphRagService {
             let cypher = format!(
                 "CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE (n.actor_id, n.name) IS UNIQUE"
             );
-            if let Err(e) = self.graph.run(neo4rs::query(&cypher)).await {
+            if let Err(e) = self.run_schema_statement(&cypher).await {
                 tracing::warn!(cypher = %cypher, error = %e, "Neo4j schema init: constraint failed");
                 failed.push(format!("constraint {label}"));
             }
@@ -392,20 +405,23 @@ impl GraphRagService {
         // Read the existing index's labels (if any) so we only DROP when the
         // label set actually changed.
         let mut existing_labels: Option<Vec<String>> = None;
-        match self
-            .graph
-            .execute(neo4rs::query(
-                "SHOW FULLTEXT INDEXES YIELD name, labelsOrTypes \
-                 WHERE name = 'entity_name_fulltext' RETURN labelsOrTypes",
-            ))
-            .await
-        {
-            Ok(mut rows) => {
-                while let Ok(Some(row)) = rows.next().await {
-                    let labels: Vec<String> = row.get("labelsOrTypes").unwrap_or_default();
-                    existing_labels = Some(labels);
-                }
+        let show = with_deadline(NEO4J_QUERY_TIMEOUT, "SHOW FULLTEXT INDEXES", async {
+            let mut rows = self
+                .graph
+                .execute(neo4rs::query(
+                    "SHOW FULLTEXT INDEXES YIELD name, labelsOrTypes \
+                     WHERE name = 'entity_name_fulltext' RETURN labelsOrTypes",
+                ))
+                .await?;
+            let mut found: Option<Vec<String>> = None;
+            while let Ok(Some(row)) = rows.next().await {
+                found = Some(row.get("labelsOrTypes").unwrap_or_default());
             }
+            Ok(found)
+        })
+        .await;
+        match show {
+            Ok(found) => existing_labels = found,
             Err(e) => {
                 // Not counted as a schema failure: nothing was changed, and
                 // the create below still runs. Say why the drop was skipped.
@@ -425,8 +441,7 @@ impl GraphRagService {
                     "Neo4j schema init: fulltext index label set changed — dropping entity_name_fulltext to recreate it"
                 );
                 if let Err(e) = self
-                    .graph
-                    .run(neo4rs::query("DROP INDEX entity_name_fulltext IF EXISTS"))
+                    .run_schema_statement("DROP INDEX entity_name_fulltext IF EXISTS")
                     .await
                 {
                     tracing::warn!(error = %e, "Neo4j schema init: DROP INDEX entity_name_fulltext failed");
@@ -435,7 +450,7 @@ impl GraphRagService {
             }
         }
 
-        if let Err(e) = self.graph.run(neo4rs::query(&create_fulltext)).await {
+        if let Err(e) = self.run_schema_statement(&create_fulltext).await {
             tracing::warn!(cypher = %create_fulltext, error = %e, "Neo4j schema init: fulltext index create failed");
             failed.push("create fulltext index".to_string());
         }
@@ -880,7 +895,7 @@ impl GraphRagService {
                 // `actor_tier_decision` only returns LocalOnly when the
                 // extractor is wired; the `else` covers a future drift.
                 if let Some(extractor) = &self.ollama {
-                    self.run_ollama_extraction(extractor, memory_key, value_str)
+                    self.run_ollama_extraction(actor_id, extractor, memory_key, value_str)
                         .await
                 } else {
                     EXTRACTION_METRICS.skipped_no_backend.fetch_add(1, Relaxed);
@@ -937,7 +952,7 @@ impl GraphRagService {
                 //    is set.
                 if let Some(extractor) = &self.ollama {
                     return self
-                        .run_ollama_extraction(extractor, memory_key, value_str)
+                        .run_ollama_extraction(actor_id, extractor, memory_key, value_str)
                         .await;
                 }
 
@@ -972,15 +987,21 @@ impl GraphRagService {
     /// so the failure accounting can't drift between them.
     async fn run_ollama_extraction(
         &self,
+        actor_id: Uuid,
         extractor: &OllamaExtractor,
         memory_key: &str,
         value_str: &str,
     ) -> Vec<Triple> {
         use std::sync::atomic::Ordering::Relaxed;
         EXTRACTION_METRICS.llm_attempts.fetch_add(1, Relaxed);
-        match self
-            .extract_triples_ollama(extractor, memory_key, value_str)
-            .await
+        // Attributed to the actor (the Anthropic leg records its spend
+        // explicitly), so local extraction counts in its token ledger.
+        match talos_llm::usage::scoped_actor(
+            actor_id,
+            None,
+            self.extract_triples_ollama(extractor, memory_key, value_str),
+        )
+        .await
         {
             Ok(triples) => triples,
             Err(e) => {
@@ -1050,23 +1071,9 @@ impl GraphRagService {
              empty list if nothing is extractable. Maximum 20 triples.",
         );
 
-        // MCP-497: same hardened-build-or-fail as MCP-496. This client
-        // posts to api.anthropic.com with `x-api-key` — a custom
-        // header that reqwest does NOT strip on cross-origin redirect.
-        // A 302 from api.anthropic.com (MITM'd or via a future URL
-        // change) would carry the Anthropic API key to wherever the
-        // redirect points. `Client::new()` re-enables the default
-        // 10-hop redirect policy.
-        // MCP-1058 (2026-05-15): pair `.timeout()` with
-        // `.connect_timeout()`. Triple-extractor posts to
-        // api.anthropic.com — a stalled TLS handshake would otherwise
-        // consume the full 30s budget before bailing.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("graph-rag triple-extractor: failed to build hardened reqwest client");
+        // The shared process-wide hardened client (redirects off, bounded
+        // timeouts) — was rebuilt per extraction (MCP-497/1058).
+        let client = talos_llm::anthropic::http_client();
 
         let body = serde_json::json!({
             "model": ANTHROPIC_EXTRACTION_MODEL,
@@ -1100,19 +1107,15 @@ impl GraphRagService {
             "tool_choice": {"type": "tool", "name": "extract_triples"}
         });
 
-        let resp = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("LLM extraction request failed")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("LLM extraction returned HTTP {}", resp.status());
-        }
+        // Transient statuses retry with the shared policy (honours
+        // `Retry-After`); a failed extraction is best-effort either way.
+        let resp = talos_llm::anthropic::send_with_retry(
+            || talos_llm::anthropic::messages_request(&client, api_key, &body),
+            ANTHROPIC_EXTRACTION_RETRIES,
+            "graph_rag_extraction",
+        )
+        .await
+        .map_err(|e| e.into_anyhow("LLM extraction failed"))?;
 
         let response: serde_json::Value = talos_http_body::read_json_capped(resp).await?;
         self.record_anthropic_usage(actor_id, &response).await;
@@ -1276,10 +1279,13 @@ impl GraphRagService {
                 .param("now", now.as_str())
                 .param("rows", neo4rs::BoltType::List(rows));
 
-            self.graph
-                .run(q)
-                .await
-                .context("Neo4j batched upsert failed")?;
+            with_deadline(NEO4J_QUERY_TIMEOUT, "batched upsert", async {
+                self.graph
+                    .run(q)
+                    .await
+                    .context("Neo4j batched upsert failed")
+            })
+            .await?;
         }
         Ok(())
     }
@@ -1345,10 +1351,10 @@ impl GraphRagService {
             .param("now", now.as_str())
             .param("props", neo4rs::BoltType::Map(bolt_props));
 
-        self.graph
-            .run(q)
-            .await
-            .context("Neo4j node upsert failed")?;
+        with_deadline(NEO4J_QUERY_TIMEOUT, "node upsert", async {
+            self.graph.run(q).await.context("Neo4j node upsert failed")
+        })
+        .await?;
         tracing::debug!(
             actor_id = %actor_id,
             label = %label,
@@ -1409,41 +1415,28 @@ impl GraphRagService {
         max_hops: usize,
         max_nodes: usize,
     ) -> Result<serde_json::Value> {
+        with_deadline(
+            NEO4J_QUERY_TIMEOUT,
+            "graph context query",
+            self.get_graph_context_unbounded(actor_id, query, max_hops, max_nodes),
+        )
+        .await
+    }
+
+    async fn get_graph_context_unbounded(
+        &self,
+        actor_id: Uuid,
+        query: &str,
+        max_hops: usize,
+        max_nodes: usize,
+    ) -> Result<serde_json::Value> {
         let actor_str = actor_id.to_string();
         let hops = max_hops.min(3) as i64; // Cap at 3 to prevent expensive traversals
         let limit = max_nodes.min(50) as i64;
 
-        // Build a Lucene fulltext query that handles hyphenated identifiers
-        // (e.g., "SECP-11779"). Lucene tokenizes on hyphens, so "SECP-11779"
-        // becomes tokens ["SECP", "11779"]. We search for each token with a
-        // wildcard suffix so partial matches work, AND we do an exact-match
-        // fallback via `WHERE n.name = $exact` for cases where the fulltext
-        // index can't match (e.g., single hyphenated tokens tokenized away).
-        let escaped = escape_lucene(query);
-        let wildcard_query = format!(
-            "{}*",
-            escaped.split_whitespace().collect::<Vec<_>>().join("* ")
-        );
-
-        // Also build a query from the raw alphanumeric parts of each word.
-        // "SECP-11779" → "SECP* 11779*" which matches the tokenized index.
-        let token_query: String = query
-            .split_whitespace()
-            .flat_map(|word| {
-                word.split(|c: char| !c.is_ascii_alphanumeric())
-                    .filter(|t| !t.is_empty())
-                    .map(|t| format!("{}*", escape_lucene(t)))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // Prefer the token query (handles hyphens), fall back to wildcard.
-        let search_query = if token_query != wildcard_query && !token_query.is_empty() {
-            token_query
-        } else {
-            wildcard_query
-        };
+        // Tokens under MIN_FULLTEXT_TOKEN_CHARS are dropped; with none left the
+        // fulltext seed is skipped and only the exact-name match below runs.
+        let search_query = fulltext_search_query(query);
 
         let cypher = format!(
             "CALL db.index.fulltext.queryNodes('entity_name_fulltext', $query) \
@@ -1463,28 +1456,30 @@ impl GraphRagService {
             hops, limit
         );
 
-        let mut result = self
-            .graph
-            .execute(
-                neo4rs::query(&cypher)
-                    .param("query", search_query.as_str())
-                    .param("actor_id", actor_str.as_str())
-                    .param("limit", limit),
-            )
-            .await
-            .context("Neo4j graph context query failed")?;
-
         let mut entities: Vec<serde_json::Value> = Vec::new();
-        while let Ok(Some(row)) = result.next().await {
-            let labels: Vec<String> = row.get("labels").unwrap_or_default();
-            let name: String = row.get("name").unwrap_or_default();
-            let rels: Vec<serde_json::Value> = row.get("rels").unwrap_or_default();
+        if let Some(search_query) = search_query {
+            let mut result = self
+                .graph
+                .execute(
+                    neo4rs::query(&cypher)
+                        .param("query", search_query.as_str())
+                        .param("actor_id", actor_str.as_str())
+                        .param("limit", limit),
+                )
+                .await
+                .context("Neo4j graph context query failed")?;
 
-            entities.push(serde_json::json!({
-                "type": labels.first().unwrap_or(&"Unknown".to_string()),
-                "name": name,
-                "relationships": rels,
-            }));
+            while let Ok(Some(row)) = result.next().await {
+                let labels: Vec<String> = row.get("labels").unwrap_or_default();
+                let name: String = row.get("name").unwrap_or_default();
+                let rels: Vec<serde_json::Value> = row.get("rels").unwrap_or_default();
+
+                entities.push(serde_json::json!({
+                    "type": labels.first().unwrap_or(&"Unknown".to_string()),
+                    "name": name,
+                    "relationships": rels,
+                }));
+            }
         }
 
         // Fallback: if fulltext returned nothing, try exact name match.
@@ -1562,6 +1557,15 @@ impl GraphRagService {
 
     /// Get graph statistics for the hygiene report.
     pub async fn get_stats(&self, actor_id: Uuid) -> Result<serde_json::Value> {
+        with_deadline(
+            NEO4J_QUERY_TIMEOUT,
+            "graph stats query",
+            self.get_stats_unbounded(actor_id),
+        )
+        .await
+    }
+
+    async fn get_stats_unbounded(&self, actor_id: Uuid) -> Result<serde_json::Value> {
         let actor_str = actor_id.to_string();
         // Label-constrained (2026-09-10): label-less `MATCH (n {actor_id})`
         // was an AllNodesScan across every tenant's nodes.
@@ -1621,6 +1625,19 @@ impl GraphRagService {
     /// relationship_count}`. The caller renders
     /// `relationship_limit` beside it so a full page reads as a page.
     pub async fn get_entity_context(
+        &self,
+        actor_id: Uuid,
+        entity_name: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        with_deadline(
+            NEO4J_QUERY_TIMEOUT,
+            "entity context query",
+            self.get_entity_context_unbounded(actor_id, entity_name),
+        )
+        .await
+    }
+
+    async fn get_entity_context_unbounded(
         &self,
         actor_id: Uuid,
         entity_name: &str,
@@ -1834,6 +1851,26 @@ fn build_node_upsert_cypher(label: &str) -> String {
     )
 }
 
+/// Shortest token kept in a fulltext seed query. A one- or two-character
+/// prefix (`a*`, `is*`) matches most of an actor's entities, so it seeds the
+/// traversal with noise and makes Lucene expand a huge term set.
+const MIN_FULLTEXT_TOKEN_CHARS: usize = 3;
+
+/// The Lucene query `get_graph_context` seeds with: the query split on
+/// non-alphanumerics (Lucene tokenises `SECP-11779` into `SECP`, `11779`),
+/// ASCII tokens shorter than [`MIN_FULLTEXT_TOKEN_CHARS`] dropped, each token
+/// escaped and prefix-wildcarded. Non-ASCII tokens keep any length (a CJK name
+/// is often two characters). `None` when no token survives — the caller then
+/// skips the fulltext query and relies on the exact-name match.
+fn fulltext_search_query(query: &str) -> Option<String> {
+    let tokens: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty() && (!t.is_ascii() || t.len() >= MIN_FULLTEXT_TOKEN_CHARS))
+        .map(|t| format!("{}*", escape_lucene(t)))
+        .collect();
+    (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
 /// Escape Lucene special characters in a fulltext query string.
 ///
 /// Neo4j's fulltext indexes use Lucene under the hood. Even though the
@@ -1944,9 +1981,37 @@ fn build_entity_context_cypher() -> String {
     )
 }
 
-/// Model the Anthropic extraction leg calls. Still hardcoded (H6, recorded):
-/// the platform-level `LlmClient` default is not threaded here.
-const ANTHROPIC_EXTRACTION_MODEL: &str = "claude-sonnet-4-20250514";
+/// Deadline for one graph-RAG Neo4j operation, row streaming included.
+/// neo4rs has no statement timeout, and the engine awaits `get_graph_context`
+/// inline while assembling `__actor_context__`, so a hung Neo4j used to stall
+/// every node that asked for graph context (and hold extraction permits).
+pub const NEO4J_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Deadline for the initial Bolt connection at boot.
+const NEO4J_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `fut` under `limit`; a timeout is an `Err` naming the operation.
+async fn with_deadline<T>(
+    limit: std::time::Duration,
+    what: &'static str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "Neo4j {what} timed out after {}s",
+            limit.as_secs()
+        )),
+    }
+}
+
+/// Model the Anthropic extraction leg calls: the platform's generation model,
+/// one home in `talos_llm::anthropic` (was a separate, older dated pin).
+const ANTHROPIC_EXTRACTION_MODEL: &str = talos_llm::anthropic::GENERATION_MODEL;
+
+/// Retries for a transient extraction error. Kept low: extraction is a
+/// background, best-effort write and holds one of the write path's permits.
+const ANTHROPIC_EXTRACTION_RETRIES: u32 = 2;
 
 /// Build the `(system, user)` prompts for LLM triple extraction. Shared by
 /// the Anthropic and Ollama backends so the spotlighting cannot drift
@@ -3143,5 +3208,47 @@ mod rule_based_cap_tests {
         let value = jira_value_with_n_issues(7);
         let triples = svc.extract_triples_rule_based("jira_work_context", &value);
         assert_eq!(triples.len(), 7, "under-cap syncs are untouched");
+    }
+}
+
+#[cfg(test)]
+mod neo4j_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn short_ascii_tokens_are_dropped_from_the_fulltext_seed() {
+        assert_eq!(
+            fulltext_search_query("SECP-11779").as_deref(),
+            Some("SECP* 11779*")
+        );
+        assert_eq!(
+            fulltext_search_query("is a PR by Jo on the roadmap").as_deref(),
+            Some("the* roadmap*")
+        );
+        // Nothing long enough: no fulltext seed at all (exact match only),
+        // where the old builder sent `a*` / `is*`.
+        assert_eq!(fulltext_search_query("a"), None);
+        assert_eq!(fulltext_search_query("is it"), None);
+        assert_eq!(fulltext_search_query("  -- "), None);
+        // Non-ASCII tokens keep any length and are not split mid-word.
+        assert_eq!(fulltext_search_query("東京").as_deref(), Some("東京*"));
+        assert_eq!(fulltext_search_query("José").as_deref(), Some("José*"));
+    }
+
+    #[tokio::test]
+    async fn a_neo4j_operation_that_never_answers_is_an_error_not_a_hang() {
+        let r: Result<()> = with_deadline(
+            std::time::Duration::from_millis(20),
+            "probe",
+            std::future::pending(),
+        )
+        .await;
+        let msg = r.expect_err("pending future must time out").to_string();
+        assert!(msg.contains("probe timed out"), "{msg}");
+        let ok: Result<u8> = with_deadline(std::time::Duration::from_millis(20), "probe", async {
+            Ok(7)
+        })
+        .await;
+        assert_eq!(ok.unwrap(), 7);
     }
 }
