@@ -161,9 +161,10 @@ pub async fn callback_handler(
     let frontend_url = talos_config::get_frontend_url();
 
     if let Some(error) = params.error {
-        tracing::warn!("Atlassian OAuth error: {}", error);
-        // MCP-1094: sanitise provider-supplied error.
+        // MCP-1094: sanitise the caller-supplied error BEFORE logging or
+        // reflecting it (raw, it is attacker-chosen content).
         let safe_error = talos_config::sanitize_oauth_error_code(&error);
+        tracing::warn!("Atlassian OAuth error: {}", safe_error);
         return Redirect::to(&format!(
             "{}/settings?atlassian_error={}#integrations",
             frontend_url,

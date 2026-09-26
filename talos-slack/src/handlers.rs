@@ -223,10 +223,11 @@ pub async fn slack_callback_handler(
 
     // Check for OAuth errors
     if let Some(error) = params.error {
-        tracing::warn!("Slack OAuth error: {}", error);
-        // MCP-1094: sanitise provider-supplied error to RFC 6749 enum
-        // shape before reflecting into the dashboard redirect URL.
+        // MCP-1094: sanitise the caller-supplied error to RFC 6749 enum shape
+        // BEFORE it is logged (raw, it is attacker-chosen log content) or
+        // reflected into the dashboard redirect URL.
         let safe_error = talos_config::sanitize_oauth_error_code(&error);
+        tracing::warn!("Slack OAuth error: {}", safe_error);
         return Redirect::to(&format!(
             "{}/settings?slack_error={}",
             frontend_url,
