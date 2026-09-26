@@ -712,7 +712,9 @@ mod cache_budget_tests {
         let src = include_str!("cache.rs");
         let start = src.find("impl wit_cache::Host for TalosContext").unwrap();
         // Production region only: this test's own needles must not match.
-        let end = src.find("#[cfg(test)]\nmod namespaced_cache_key_tests").unwrap();
+        let end = src
+            .find("#[cfg(test)]\nmod namespaced_cache_key_tests")
+            .unwrap();
         let body = &src[start..end];
         for op in [
             "\"cache-get\", &key, 0",
