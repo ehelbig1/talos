@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::schema::types::*;
 use crate::schema::{
     require_2fa, require_scope, validate_resource_name, validate_secret_value,
-    validate_vault_key_path, ApiKeyOrgScope, SafeErrorExtensions,
+    validate_vault_key_path, SafeErrorExtensions,
 };
 // Removed unused imports: CompilationService, ParallelWorkflowEngine, encrypt_checkpoint
 
@@ -101,16 +101,13 @@ impl SecretsMutations {
             .data_opt::<Uuid>()
             .ok_or_else(|| async_graphql::Error::new("Authentication required"))?;
 
-        // If the request is org-scoped (org API key), assign the secret to that org.
-        // Otherwise honor the caller-supplied org_id but verify the caller is a
+        // Honor the caller-supplied org_id but verify the caller is a
         // writable member of that org — without this check, any user could plant
         // a secret with an arbitrary org_id (e.g. `key_path=anthropic/api_key,
         // org_id=<some other org>`), and members of that org reading the same
         // key_path via their workflows would resolve the attacker's controlled
         // value: cross-org credential injection.
-        let org_id = if let Ok(org_scope) = ctx.data::<ApiKeyOrgScope>() {
-            Some(org_scope.0)
-        } else if let Some(target_org) = input.org_id {
+        let org_id = if let Some(target_org) = input.org_id {
             let writable = crate::schema::user_writable_org_ids(ctx).await?;
             if !writable.contains(&target_org) {
                 // MCP-918: .extend_safe()

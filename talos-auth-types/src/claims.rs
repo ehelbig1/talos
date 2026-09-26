@@ -29,15 +29,11 @@ pub struct Claims {
     pub iss: String,
     #[serde(default)]
     pub aud: Option<String>,
-    /// Active organization (the tenant, per RFC 0004) this token operates
-    /// under — a UUID string, set to the user's personal org by default
-    /// or to a shared org the user has switched into. The controller
-    /// stamps `SET LOCAL app.current_org_id` from this for RLS.
-    ///
-    /// `#[serde(default)]` keeps it backward-compatible: tokens minted
-    /// before this field existed deserialize with `org == ""`, and the
-    /// resolution path falls back to the user's personal org. So a
-    /// rollout never invalidates in-flight tokens.
+    /// Reserved for the active organization (RFC 0004 org switching). NOT
+    /// WIRED: every minting site writes `""` and nothing reads it — tenancy
+    /// comes from the database (`user_accessible_org_ids`), never from this
+    /// claim. Kept on the wire so tokens stay decodable across versions;
+    /// `#[serde(default)]` lets a token without it deserialize.
     #[serde(default)]
     pub org: String,
 }

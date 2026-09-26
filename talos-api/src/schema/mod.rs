@@ -48,11 +48,6 @@ pub struct IsTwoFactorVerified(pub bool);
 /// API-key request carries none, and absence reads as `false`.
 pub struct SecondFactorVerified(pub bool);
 
-/// When present in the GraphQL context, indicates the API key is scoped
-/// to a specific organization. Resolvers should restrict resource access
-/// to only resources within this org (or owned by the user directly).
-pub struct ApiKeyOrgScope(pub Uuid);
-
 /// Cross-crate MCP bearer-token cache invalidation hook (2026-07-24).
 ///
 /// The bcrypt verification cache lives in `talos-mcp-handlers::auth`
@@ -229,6 +224,14 @@ pub fn require_scope(ctx: &Context<'_>, required_scope: talos_api_keys::ApiKeySc
     }
 
     Ok(())
+}
+
+/// Mark this response `Cache-Control: no-store`. Every resolver that returns
+/// a credential in its body (a new API key, an agent token, a TOTP secret,
+/// backup codes) calls it, so the idempotency middleware never writes the
+/// plaintext to Redis and no intermediary caches it.
+pub fn mark_response_no_store(ctx: &Context<'_>) {
+    ctx.insert_http_header(axum::http::header::CACHE_CONTROL, "no-store");
 }
 
 pub fn require_2fa(ctx: &Context<'_>) -> Result<()> {
@@ -681,15 +684,7 @@ async fn evaluate_platform_admin(
 ///
 /// Used by list queries to include org-owned resources alongside personally
 /// owned ones: `WHERE user_id = $1 OR org_id = ANY($2)`.
-///
-/// When the request uses an org-scoped API key (`ApiKeyOrgScope`), the result
-/// is restricted to that single org — even if the user belongs to other orgs.
 pub async fn user_accessible_org_ids(ctx: &Context<'_>) -> Result<Vec<Uuid>> {
-    // If API key is org-scoped, restrict to that org only
-    if let Ok(org_scope) = ctx.data::<ApiKeyOrgScope>() {
-        return Ok(vec![org_scope.0]);
-    }
-
     // Fast path: if already computed for this request, return cached value.
     if let Ok(cached) = ctx.data::<UserOrgIds>() {
         return Ok(cached.0.clone());
@@ -731,10 +726,6 @@ pub async fn user_accessible_org_ids(ctx: &Context<'_>) -> Result<Vec<Uuid>> {
 /// plain `user_accessible_org_ids` returns every org the user belongs to
 /// regardless of role — which is correct for reads (Viewer can see) but
 /// would let a Viewer update or delete org-shared resources.
-///
-/// Org-scoped API keys still get a single-org result; if that org's role
-/// (looked up here) is Viewer, the result is empty — meaning the API key
-/// can read org-shared resources but not write them.
 pub async fn user_writable_org_ids(ctx: &Context<'_>) -> Result<Vec<Uuid>> {
     let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?;
     let user_id = ctx
@@ -751,7 +742,7 @@ pub async fn user_writable_org_ids(ctx: &Context<'_>) -> Result<Vec<Uuid>> {
     // naming class) would make EVERY write to org-shared resources
     // silently 403 with no operator-facing signal. Logging at error!
     // level surfaces the actual cause so the regression is investigable.
-    let mut org_ids: Vec<Uuid> =
+    let org_ids: Vec<Uuid> =
         match talos_organizations::OrganizationService::list_user_writable_org_ids(
             db_pool, *user_id,
         )
@@ -768,24 +759,11 @@ pub async fn user_writable_org_ids(ctx: &Context<'_>) -> Result<Vec<Uuid>> {
             }
         };
 
-    // If API key is org-scoped, intersect with that single org so the
-    // key can't escape its scope by piggybacking on the user's other
-    // memberships.
-    if let Ok(org_scope) = ctx.data::<ApiKeyOrgScope>() {
-        org_ids.retain(|id| *id == org_scope.0);
-    }
-
     Ok(org_ids)
 }
 
 /// Cached org IDs for the current request.
 pub struct UserOrgIds(pub Vec<Uuid>);
-
-/// Returns `true` if the current request is restricted to a specific org (org-scoped API key).
-/// When true, queries should NOT include personal (user_id-owned) resources.
-pub fn is_org_scoped(ctx: &Context<'_>) -> bool {
-    ctx.data::<ApiKeyOrgScope>().is_ok()
-}
 
 /// Verify that the authenticated user can access a resource (owns it or has org access).
 /// For mutations, pass `write = true` to require Member+ role; for reads, Viewer suffices.
