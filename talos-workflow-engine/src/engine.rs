@@ -2069,16 +2069,57 @@ impl ParallelWorkflowEngine {
         // have had the pause come one iteration later. A sibling FAILURE during
         // the drain propagates as the run's error (`?`) rather than pausing —
         // a run that has already failed must not be parked as "waiting".
+        // Completions a module future produced while the reactor was awaiting
+        // an inline system node (see `await_polling_in_flight!`), with the
+        // instant each arrived. Routed ahead of any newer completion.
+        let mut early_done: VecDeque<(NodeIndex, Result<JsonValue, String>, std::time::Instant)> =
+            VecDeque::new();
+        // The next completion: a buffered one first, else the pool.
+        macro_rules! next_completion {
+            () => {{
+                match early_done.pop_front() {
+                    Some(done) => Some(done),
+                    None => executing
+                        .next()
+                        .await
+                        .map(|(idx, res)| (idx, res, std::time::Instant::now())),
+                }
+            }};
+        }
+        // Await an inline system-node dispatch (judge, ensemble, sub-workflow
+        // batch, digests, …) while STILL polling the in-flight module pool.
+        // Awaiting it bare left `executing` unpolled for its whole duration:
+        // module replies and retry backoffs stalled and their wall time was
+        // inflated by the system node's. A completion that lands meanwhile is
+        // buffered (the future holds `&results`, so it cannot be routed yet)
+        // and routed by the loop exactly as if it had arrived next.
+        macro_rules! await_polling_in_flight {
+            ($fut:expr) => {{
+                // Heap-pinned: a stack pin kept the system node's (possibly
+                // recursive sub-workflow) future inside this frame and
+                // overflowed the stack on nested sub-workflows.
+                let mut fut = Box::pin($fut);
+                loop {
+                    tokio::select! {
+                        biased;
+                        out = &mut fut => break out,
+                        Some((idx, res)) = executing.next(), if !executing.is_empty() => {
+                            early_done.push_back((idx, res, std::time::Instant::now()));
+                        }
+                    }
+                }
+            }};
+        }
         macro_rules! drain_in_flight_before_pause {
             () => {{
-                while let Some((finished_idx, exec_result)) = executing.next().await {
+                while let Some((finished_idx, exec_result, done_at)) = next_completion!() {
                     if self.progress.run_aborted() {
                         return Err(RUN_STOPPED.into());
                     }
                     self.progress.mark_finished(self.graph[finished_idx]);
                     let wall_time_ms = node_start_times
                         .remove(&finished_idx)
-                        .map(|start| start.elapsed().as_millis() as u64)
+                        .map(|start| done_at.saturating_duration_since(start).as_millis() as u64)
                         .unwrap_or(0);
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
@@ -2106,7 +2147,7 @@ impl ParallelWorkflowEngine {
         let max_concurrent_nodes = *MAX_CONCURRENT_NODE_DISPATCH;
 
         // Main reactor loop.
-        while !ready.is_empty() || !executing.is_empty() {
+        while !ready.is_empty() || !executing.is_empty() || !early_done.is_empty() {
             // M5: stop pulling new work from `ready` once the in-flight pool is
             // full; fall through to `executing.next().await` below to drain a
             // slot first. Deadlock-safe: we only stop early while `executing` is
@@ -2198,10 +2239,9 @@ impl ParallelWorkflowEngine {
                 // pure-local nodes. No worker dispatch and no secrets:
                 // the `encrypted_secrets` discipline does not apply here
                 // by construction (nothing leaves the controller).
-                if let Some(output) = self
-                    .try_dispatch_ops_alerts_digest(node_id, execution_id)
-                    .await
-                {
+                if let Some(output) = await_polling_in_flight!(
+                    self.try_dispatch_ops_alerts_digest(node_id, execution_id)
+                ) {
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
@@ -2227,10 +2267,9 @@ impl ParallelWorkflowEngine {
                 // as the ops-alerts digest above. No worker dispatch and no
                 // secrets on the wire — the capability URLs are minted
                 // controller-side and flow downstream as node output.
-                if let Some(output) = self
-                    .try_dispatch_pending_approvals(node_id, execution_id)
-                    .await
-                {
+                if let Some(output) = await_polling_in_flight!(
+                    self.try_dispatch_pending_approvals(node_id, execution_id)
+                ) {
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
@@ -2254,10 +2293,9 @@ impl ParallelWorkflowEngine {
                 // ── Assistant report (controller-side weekly snapshot) ───────
                 // Same async + route-downstream + degrade-not-fail contract
                 // as the ops-alerts digest above.
-                if let Some(output) = self
-                    .try_dispatch_assistant_report(node_id, execution_id)
-                    .await
-                {
+                if let Some(output) = await_polling_in_flight!(
+                    self.try_dispatch_assistant_report(node_id, execution_id)
+                ) {
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
@@ -2281,10 +2319,9 @@ impl ParallelWorkflowEngine {
                 // ── Operator digest (controller-side autonomy cockpit) ───────
                 // Same async + route-downstream + degrade-not-fail contract
                 // as the assistant report above.
-                if let Some(output) = self
-                    .try_dispatch_operator_digest(node_id, execution_id)
-                    .await
-                {
+                if let Some(output) = await_polling_in_flight!(
+                    self.try_dispatch_operator_digest(node_id, execution_id)
+                ) {
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
@@ -2404,17 +2441,14 @@ impl ParallelWorkflowEngine {
 
                 // ── Judge dispatch (LLM-as-Judge evaluation) ─────────────────
                 #[cfg(feature = "llm-primitives")]
-                if let Some(output) = self
-                    .try_dispatch_judge(
-                        node_idx,
-                        node_id,
-                        execution_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
+                if let Some(output) = await_polling_in_flight!(self.try_dispatch_judge(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    &dispatcher,
+                    &worker_shared_key,
+                    &results,
+                )) {
                     // Observe-only: record the verdict for the weekly
                     // self-report before the output is routed onward.
                     self.record_judge_score(node_id, execution_id, &output);
@@ -2440,17 +2474,14 @@ impl ParallelWorkflowEngine {
 
                 // ── Ensemble dispatch (self-consistency / ensemble voting) ────
                 #[cfg(feature = "llm-primitives")]
-                if let Some(output) = self
-                    .try_dispatch_ensemble(
-                        node_idx,
-                        node_id,
-                        execution_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
+                if let Some(output) = await_polling_in_flight!(self.try_dispatch_ensemble(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    &dispatcher,
+                    &worker_shared_key,
+                    &results,
+                )) {
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
@@ -2473,10 +2504,12 @@ impl ParallelWorkflowEngine {
 
                 // ── ConfidenceGate dispatch ───────────────────────────────────
                 #[cfg(feature = "llm-primitives")]
-                if let Some(outcome) = self
-                    .try_dispatch_confidence_gate(node_idx, node_id, execution_id, &results)
-                    .await
-                {
+                if let Some(outcome) = await_polling_in_flight!(self.try_dispatch_confidence_gate(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    &results
+                )) {
                     use crate::scheduler_handlers::ConfidenceGateOutcome;
                     match outcome {
                         ConfidenceGateOutcome::Proceed(output) => {
@@ -2522,17 +2555,14 @@ impl ParallelWorkflowEngine {
 
                 // ── ReflectiveRetry dispatch ──────────────────────────────────
                 #[cfg(feature = "llm-primitives")]
-                if let Some(output) = self
-                    .try_dispatch_reflective_retry(
-                        node_idx,
-                        node_id,
-                        execution_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
+                if let Some(output) = await_polling_in_flight!(self.try_dispatch_reflective_retry(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    &dispatcher,
+                    &worker_shared_key,
+                    &results,
+                )) {
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
@@ -2555,17 +2585,14 @@ impl ParallelWorkflowEngine {
 
                 // ── LlmDispatch dispatch (LLM-based routing) ──────────────────
                 #[cfg(feature = "llm-primitives")]
-                if let Some(output) = self
-                    .try_dispatch_llm_dispatch(
-                        node_idx,
-                        node_id,
-                        execution_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
+                if let Some(output) = await_polling_in_flight!(self.try_dispatch_llm_dispatch(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    &dispatcher,
+                    &worker_shared_key,
+                    &results,
+                )) {
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
@@ -2603,17 +2630,14 @@ impl ParallelWorkflowEngine {
                 // top-level, so a loop that survives a bad iteration still
                 // reads as a success here — unchanged.
                 #[cfg(feature = "llm-primitives")]
-                if let Some(output) = self
-                    .try_dispatch_agent_loop(
-                        node_idx,
-                        node_id,
-                        execution_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
+                if let Some(output) = await_polling_in_flight!(self.try_dispatch_agent_loop(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    &dispatcher,
+                    &worker_shared_key,
+                    &results,
+                )) {
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
@@ -2727,10 +2751,9 @@ impl ParallelWorkflowEngine {
                     // `sub_wf_batch.zip(outputs)` mapping below stays correct
                     // (unlike `buffer_unordered`).
                     let outputs: Vec<Option<(JsonValue, u64)>> =
-                        futures::stream::iter(dispatch_futs)
+                        await_polling_in_flight!(futures::stream::iter(dispatch_futs)
                             .buffered(max_concurrent_nodes)
-                            .collect()
-                            .await;
+                            .collect::<Vec<_>>());
 
                     // A sub-workflow that came back reporting an error takes
                     // the SAME failure path as every other node kind, rather
@@ -2783,17 +2806,14 @@ impl ParallelWorkflowEngine {
                 // and let the workflow return `completed` despite the
                 // dispatch failing — misleading output with no path for
                 // downstream recovery.
-                if let Some(outcome) = self
-                    .try_dispatch_dynamic_dispatch(
-                        node_idx,
-                        node_id,
-                        execution_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
+                if let Some(outcome) = await_polling_in_flight!(self.try_dispatch_dynamic_dispatch(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    &dispatcher,
+                    &worker_shared_key,
+                    &results,
+                )) {
                     match outcome {
                         Ok(output) => {
                             commit_and_release!(node_idx, node_id, output, Release::Succeeded);
@@ -2822,7 +2842,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── CapabilityDispatch (match workflow by capability tags) ──
-                if let Some(output) = self
+                if let Some(output) = await_polling_in_flight!(self
                     .try_dispatch_capability_dispatch(
                         node_idx,
                         node_id,
@@ -2830,8 +2850,7 @@ impl ParallelWorkflowEngine {
                         &dispatcher,
                         &worker_shared_key,
                         &results,
-                    )
-                    .await
+                    ))
                 {
                     if output_reports_error(&output) {
                         let continue_on_error = self
@@ -2868,17 +2887,14 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── Loop dispatch (re-dispatches body node) ──────────────────
-                if let Some(output) = self
-                    .try_dispatch_loop(
-                        node_idx,
-                        node_id,
-                        execution_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
+                if let Some(output) = await_polling_in_flight!(self.try_dispatch_loop(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    &dispatcher,
+                    &worker_shared_key,
+                    &results,
+                )) {
                     // `run_loop_iterations` lifts `__error`/`error_message`
                     // to the top level when the loop terminated from a
                     // body failure (vs. condition-false / max-iterations).
@@ -3013,7 +3029,7 @@ impl ParallelWorkflowEngine {
             // the shared post-completion handler. Chain context is
             // passed only when chain detection actually ran
             // (fresh-run path); seeded runs supply `None`.
-            if let Some((finished_idx, exec_result)) = executing.next().await {
+            if let Some((finished_idx, exec_result, done_at)) = next_completion!() {
                 // A completion that arrives after the run was stopped — the
                 // refused dispatch itself among them — is not routed: no
                 // failure event, no DLQ entry, no error-edge handler for a
@@ -3027,7 +3043,7 @@ impl ParallelWorkflowEngine {
                 // `node_start_times`).
                 self.progress.mark_finished(self.graph[finished_idx]);
                 let wall_time_ms = if let Some(start) = node_start_times.remove(&finished_idx) {
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    let elapsed_ms = done_at.saturating_duration_since(start).as_millis() as u64;
                     let label = self
                         .node_labels
                         .get(&self.graph[finished_idx])

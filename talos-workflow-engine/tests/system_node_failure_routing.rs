@@ -817,3 +817,75 @@ async fn an_oversized_module_output_fails_the_run() {
     };
     assert!(err.contains("too large"), "{err}");
 }
+
+// ── In-flight modules keep being polled while a system node is awaited ──
+
+/// Sleeps per module id before answering, so a test controls which branch
+/// finishes first.
+struct DelayedDispatcher(HashMap<Uuid, Duration>);
+
+#[async_trait]
+impl NodeDispatcher for DelayedDispatcher {
+    async fn dispatch(&self, job: DispatchJob) -> Result<DispatchResult, BoxError> {
+        tokio::time::sleep(self.0.get(&job.module_id).copied().unwrap_or_default()).await;
+        Ok(DispatchResult {
+            output: json!({ "ok": true }),
+        })
+    }
+}
+
+/// A sub-workflow node is awaited inline by the reactor. Before the fix the
+/// in-flight module pool was not polled meanwhile, so a sibling module that
+/// finished in 20 ms was only observed once the 600 ms child returned — and
+/// its recorded wall time was the child's.
+#[tokio::test]
+async fn a_module_finishing_during_an_inline_sub_workflow_keeps_its_own_wall_time() {
+    let sub_wf_id = Uuid::new_v4();
+    let fast = Uuid::new_v4();
+    let slow = Uuid::new_v4();
+    let parent = WorkflowGraphBuilder::new()
+        .add_module("fast", fast, None)
+        .add_system_node(
+            "call_child",
+            SystemNodeKind::SubWorkflow {
+                workflow_id: sub_wf_id,
+                timeout_secs: 30,
+            },
+        )
+        .build()
+        .expect("parent graph builds");
+
+    let mut engine = engine_for(&parent, Some(child_graph(slow)), fast, None);
+    engine.set_module_fetcher(Arc::new(
+        InMemoryModuleFetcher::new()
+            .with_module(fast, stub_artifact(fast))
+            .with_module(slow, stub_artifact(slow)),
+    ));
+    let hook = Arc::new(talos_workflow_engine_test_utils::capture::CaptureNodeLifecycleHook::new());
+    engine.set_node_hook(hook.clone());
+    let dispatcher = Arc::new(DelayedDispatcher(HashMap::from([
+        (fast, Duration::from_millis(20)),
+        (slow, Duration::from_millis(600)),
+    ])));
+    engine
+        .run_with_transport(dispatcher, None, Uuid::new_v4())
+        .await
+        .expect("the run completes");
+
+    let fast_wall_ms = hook
+        .calls()
+        .into_iter()
+        .find_map(|c| match c {
+            talos_workflow_engine_test_utils::capture::LifecycleCall::Completed {
+                node_label,
+                wall_time_ms,
+                ..
+            } if node_label.as_deref() == Some("fast") => Some(wall_time_ms),
+            _ => None,
+        })
+        .expect("the fast module completes");
+    assert!(
+        fast_wall_ms < 400,
+        "the fast module's wall time must not include the sub-workflow's: {fast_wall_ms} ms"
+    );
+}
