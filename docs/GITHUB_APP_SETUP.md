@@ -14,10 +14,11 @@ How to register a GitHub App and wire it into Talos for the connect/install flow
 > `admin_event_log`). **Why the extra hop (2026-09-25):** GitHub documents that
 > the Setup-URL `installation_id` can be spoofed; before this, any Talos user
 > could claim — and mint tokens for — another user's installation by naming its
-> id. A claim never reassigns an installation another Talos user holds actively. The App-JWT minting,
-> the 1-hour installation-token cache (`InstallationTokenCache`), and the webhook
-> signature verifier (`verify_app_webhook_signature`) are implemented + unit
-> tested. **Not yet wired:** the GitHub *modules* don't consume installation
+> id. A claim never reassigns an installation another Talos user holds actively. The App-JWT minting
+> and the 1-hour installation-token cache (`InstallationTokenCache`) are
+> implemented + unit tested. (A never-called App webhook signature verifier was
+> deleted 2026-09-26; a receiver should reuse the Phase-A GitHub verifier in
+> `talos_webhooks::signature` against `GithubAppConfig::webhook_secret`.) **Not yet wired:** the GitHub *modules* don't consume installation
 > tokens yet (B4), there's no App-webhook *receiver* endpoint yet (B5-wiring),
 > and there's no frontend "Connect GitHub" button yet. So today you can validate
 > credentials + the connect flow; outbound module auth and inbound App webhooks

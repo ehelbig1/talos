@@ -42,7 +42,6 @@ mod installation_token;
 #[cfg(feature = "client")]
 mod token_cache;
 mod user_auth;
-mod webhook;
 
 pub use app_jwt::{AppSigningKey, MAX_APP_JWT_TTL_SECS};
 #[cfg(feature = "client")]
@@ -64,4 +63,3 @@ pub use user_auth::{
     UserInstallationsPage, GITHUB_WEB_BASE, USER_INSTALLATIONS_MAX_PAGES,
     USER_INSTALLATIONS_PER_PAGE,
 };
-pub use webhook::verify_app_webhook_signature;
