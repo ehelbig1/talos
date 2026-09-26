@@ -98,7 +98,6 @@ mod worker_manager;
 mod workflow_authorization;
 mod workflow_creation_helpers;
 mod workflow_repository;
-mod workflow_signing;
 mod workflow_validation;
 mod workflow_versions;
 mod ws_auth;
@@ -267,6 +266,10 @@ async fn main() -> anyhow::Result<()> {
     // already installed; we ignore that to stay tolerant of test setups.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Before anything else (subcommands compile templates too): make this
+    // process non-dumpable so a same-UID child cannot read our environment.
+    let non_dumpable = make_process_non_dumpable();
+
     // Subcommand dispatch — ALWAYS the very first thing in main() so build /
     // CI flows that need the controller binary as a tool (not a server) don't
     // pay the cost of full server initialisation. Subcommands run to
@@ -407,6 +410,12 @@ async fn main() -> anyhow::Result<()> {
     // counter it touches is the same object either way, so a panic between
     // the two calls is still counted.
     talos_task_supervision::install_panic_hook("controller");
+
+    enforce_non_dumpable_posture(
+        non_dumpable,
+        config::is_production(),
+        talos_compilation::container::host_fallback_allowed(),
+    )?;
 
     // Verify essential environment configuration early (fail-fast gate).
     validate_startup_config()?;
@@ -606,7 +615,8 @@ async fn main() -> anyhow::Result<()> {
     //    generate_text / scaffold_workflow / OllamaClient::complete record
     //    here. user_id arrives via the `talos_llm::usage::scoped_user`
     //    task-local when the call site knows the requesting user; NULL
-    //    user/actor rows are platform-attributed (documented in the
+    //    user rows are platform-attributed; `scoped_actor` carries the
+    //    actor for background loops acting on one (documented in the
     //    llm_usage migration).
     {
         let usage_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
@@ -620,9 +630,12 @@ async fn main() -> anyhow::Result<()> {
                     completion_tokens: i64::try_from(rec.completion_tokens).unwrap_or(i64::MAX),
                     calls: 1,
                 };
-                let user_id = rec.user_id;
+                let (user_id, actor_id) = (rec.user_id, rec.actor_id);
                 tokio::spawn(async move {
-                    if let Err(e) = repo.record_llm_usage(None, None, user_id, &[entry]).await {
+                    if let Err(e) = repo
+                        .record_llm_usage(None, actor_id, user_id, &[entry])
+                        .await
+                    {
                         tracing::warn!(error = %e, "failed to record controller LLM usage");
                     }
                 });
@@ -856,6 +869,61 @@ async fn main() -> anyhow::Result<()> {
 
     crate::trace::shutdown_tracing();
     Ok(())
+}
+
+/// `prctl(PR_SET_DUMPABLE, 0)` on Linux.
+///
+/// The controller's environment holds `TALOS_MASTER_KEY`, `WORKER_SHARED_KEY`,
+/// `JWT_SECRET` and more. On the host-fallback compile path a user module's
+/// `build.rs` / proc-macro runs as the controller's UID, and `env_clear()`
+/// only scrubs the CHILD's environment — the child could still read the
+/// parent's `/proc/<ppid>/environ`. A non-dumpable process has its `/proc`
+/// entries owned by root, closing that read for a non-root controller.
+///
+/// Side effects, accepted: no core dumps, and a same-UID debugger cannot
+/// ptrace-attach (use root / CAP_SYS_PTRACE). The process still reads its
+/// own `/proc/self`. `execve` resets the flag, so compiler children are
+/// unaffected. Returns `Ok(())` off Linux (no `/proc/<pid>/environ` there).
+fn make_process_non_dumpable() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
+        }
+        const PR_SET_DUMPABLE: std::ffi::c_int = 4;
+        // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes one integer argument and
+        // touches no caller memory.
+        let rc = unsafe { prctl(PR_SET_DUMPABLE, 0 as std::ffi::c_ulong) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Log the outcome of [`make_process_non_dumpable`]; refuse to boot when it
+/// failed in the one configuration that exposes the environment to user
+/// code — production with the unsandboxed host compile fallback enabled.
+fn enforce_non_dumpable_posture(
+    result: Result<(), String>,
+    production: bool,
+    host_fallback: bool,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => {
+            tracing::info!("process marked non-dumpable (PR_SET_DUMPABLE=0)");
+            Ok(())
+        }
+        Err(e) if production && host_fallback => Err(anyhow::anyhow!(
+            "could not mark the controller non-dumpable ({e}) while the unsandboxed \
+             host compile fallback is enabled — user build scripts could read this \
+             process's secrets from /proc; refusing to start"
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not mark the process non-dumpable");
+            Ok(())
+        }
+    }
 }
 
 /// Install the fmt/OTLP tracing subscriber. Extracted verbatim from the top
@@ -1102,3 +1170,29 @@ mod rpc_subscribers;
 // build test 1773350690
 
 mod tenancy;
+
+#[cfg(test)]
+mod non_dumpable_tests {
+    use super::*;
+
+    #[test]
+    fn failure_refuses_boot_only_in_production_with_host_fallback() {
+        let failed = || Err("EPERM".to_string());
+        assert!(enforce_non_dumpable_posture(failed(), true, true).is_err());
+        assert!(enforce_non_dumpable_posture(failed(), true, false).is_ok());
+        assert!(enforce_non_dumpable_posture(failed(), false, true).is_ok());
+        assert!(enforce_non_dumpable_posture(Ok(()), true, true).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_process_is_non_dumpable_afterwards() {
+        extern "C" {
+            fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
+        }
+        const PR_GET_DUMPABLE: std::ffi::c_int = 3;
+        make_process_non_dumpable().expect("prctl");
+        // SAFETY: PR_GET_DUMPABLE takes no further arguments.
+        assert_eq!(unsafe { prctl(PR_GET_DUMPABLE) }, 0);
+    }
+}
