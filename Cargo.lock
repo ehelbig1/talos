@@ -7594,6 +7594,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-draft-heuristics",
  "talos-execution-finalizer",
+ "talos-registry",
  "talos-tenancy",
  "talos-text-util",
  "talos-workflow-repository",
@@ -7997,6 +7998,7 @@ dependencies = [
  "hex",
  "rand 0.8.6",
  "serde_json",
+ "talos-auth-types",
  "talos-config",
  "tower-cookies",
  "tracing",
@@ -12380,6 +12382,7 @@ dependencies = [
  "wat",
  "wit-component 0.224.1",
  "wit-parser 0.224.1",
+ "zeroize",
 ]
 
 [[package]]
