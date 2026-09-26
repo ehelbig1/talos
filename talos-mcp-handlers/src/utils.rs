@@ -1700,6 +1700,18 @@ pub fn parse_embedding_array(arr: &[serde_json::Value]) -> Result<Vec<f64>, Stri
     Ok(out)
 }
 
+/// ONE failure-webhook client per process (built lazily; `None` if TLS init
+/// failed, which the caller logs per fire rather than panicking).
+static FAILURE_WEBHOOK_CLIENT: std::sync::LazyLock<Option<reqwest::Client>> =
+    std::sync::LazyLock::new(|| {
+        talos_http_utils::outbound::build_outbound_webhook_client_with_timeout(
+            "talos-failure-webhook/1.0",
+            std::time::Duration::from_secs(5),
+        )
+        .map_err(|e| tracing::error!(error = %e, "failure-webhook HTTP client build failed"))
+        .ok()
+    });
+
 /// Best-effort outbound POST to the workflow's failure webhook (if set).
 ///
 /// Looks up `get_workflow_failure_webhook(wf_id)`; if a URL is configured,
@@ -1707,12 +1719,13 @@ pub fn parse_embedding_array(arr: &[serde_json::Value]) -> Result<Vec<f64>, Stri
 /// URLs stored before the SSRF rules were tightened) and POSTs a
 /// `workflow_failed` JSON payload with a 5-second timeout.
 ///
-/// All failures are silently swallowed — this is a notification path,
+/// Failures are logged, never propagated — this is a notification path,
 /// not part of the request-response contract.
 ///
-/// Replaces the same 25-LoC inline block that previously appeared in
-/// handle_trigger_workflow, handle_call_workflow (×2), and
-/// handle_replay_execution.
+/// LIVE: `call_workflow` uses it. It duplicates
+/// `talos-execution-orchestration`'s private `failure_webhook` module; until
+/// that is made `pub` this copy shares its shape, including ONE process-wide
+/// client (it built a fresh client — TLS context and pool — per call).
 pub async fn dispatch_failure_webhook(
     workflow_repo: &talos_workflow_repository::WorkflowRepository,
     workflow_id: uuid::Uuid,
@@ -1724,7 +1737,16 @@ pub async fn dispatch_failure_webhook(
         .await
     {
         Ok(Some(u)) => u,
-        _ => return,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                target: "talos_rpc",
+                workflow_id = %workflow_id,
+                error = %e,
+                "dispatch_failure_webhook (utils): webhook URL unreadable — operator notification skipped"
+            );
+            return;
+        }
     };
     if check_outbound_url_no_ssrf(&url).is_err() {
         tracing::warn!(
@@ -1740,38 +1762,15 @@ pub async fn dispatch_failure_webhook(
         "error": error,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    // MCP-470: prophylactic — this helper is currently unreferenced
-    // (the live failure-webhook path moved to
-    // `talos-execution-orchestration::failure_webhook`) but is `pub`
-    // and could be re-discovered. Built via the shared SSRF-safe builder
-    // so a future caller inherits redirect(none) AND the connect-time
-    // ControllerSsrfResolver (DNS-rebinding gate) — not just the
-    // redirect-pivot defense MCP-469/470 added here.
-    let client = match talos_http_utils::outbound::build_outbound_webhook_client_with_timeout(
-        "talos-failure-webhook/1.0",
-        std::time::Duration::from_secs(5),
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                workflow_id = %workflow_id,
-                error = %e,
-                "dispatch_failure_webhook (utils): reqwest client build failed; skipping"
-            );
-            return;
-        }
+    // Shared SSRF-safe builder: redirect(none) + the connect-time
+    // ControllerSsrfResolver (DNS-rebinding gate).
+    let Some(client) = FAILURE_WEBHOOK_CLIENT.as_ref() else {
+        tracing::warn!(
+            workflow_id = %workflow_id,
+            "dispatch_failure_webhook (utils): HTTP client unavailable (TLS init failed); skipping"
+        );
+        return;
     };
-    // MCP-775 (2026-05-13): log delivery failures even on this currently-
-    // unreferenced helper. The comment on the helper noted it's `pub` and
-    // could be re-discovered; if a future caller wires it back in, the
-    // pre-fix `let _ = ...await` would silently inherit the swallowed-error
-    // regression that MCP-742 closed on the LIVE
-    // `talos-execution-orchestration::failure_webhook::dispatch_failure_webhook`
-    // path. Same three-arm match shape: Ok/2xx → debug, Ok/non-2xx → WARN,
-    // Err → WARN, all with stable `target: "talos_rpc"` so dashboards
-    // correlate delivery-failure rate with controller health. Defense-in-depth
-    // for the orphan; keeps the two siblings in lockstep so the next person
-    // to remove the "unreferenced" comment doesn't reintroduce the gap.
     match client.post(&url).json(&alert_payload).send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!(

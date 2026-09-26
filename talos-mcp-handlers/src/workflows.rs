@@ -7162,9 +7162,13 @@ async fn handle_trigger_workflow_as_actors(
             "status": "queued"
         }));
 
-        // Build per-actor input: shared input + optionally injected actor memories
-        // Uses workflow description as relevance hint for semantic matching.
-        let per_actor_input = if inject_memory {
+        // Per-actor memory context (workflow description as the relevance
+        // hint). It travels on the ENGINE (`with_actor_context`), like the
+        // other trigger paths — never merged into the trigger input: the
+        // engine strips engine-authored keys from the seed, so a merged copy
+        // reached no node and was persisted, decrypted, under
+        // `__trigger_input__`.
+        let actor_context: Option<serde_json::Value> = if inject_memory {
             match talos_actor_memory_service::actor_context::get_relevant_actor_context(
                 &state.workflow_repo,
                 actor_id,
@@ -7176,19 +7180,15 @@ async fn handle_trigger_workflow_as_actors(
             )
             .await
             {
-                Ok(context) if !context.is_empty() => {
-                    let mut merged = shared_input.as_object().cloned().unwrap_or_default();
-                    merged.insert(
-                        "__actor_context__".to_string(),
-                        talos_memory::actor_context::assemble_payload(actor_id, &context),
-                    );
-                    serde_json::Value::Object(merged)
-                }
-                _ => shared_input.clone(),
+                Ok(context) if !context.is_empty() => Some(
+                    talos_memory::actor_context::assemble_payload(actor_id, &context),
+                ),
+                _ => None,
             }
         } else {
-            shared_input.clone()
+            None
         };
+        let per_actor_input = shared_input.clone();
 
         // Log the trigger against this actor's action log
         crate::actor::spawn_log_action(
@@ -7216,15 +7216,12 @@ async fn handle_trigger_workflow_as_actors(
             // `with_actor_id`, not `with_effective_actor` — the actor identity
             // is required and explicit, not a fallback).
             //
-            // NOTE on actor_context: per_actor_input may carry __actor_context__
-            // (when inject_memory is true), but we DO NOT lift it onto the
-            // engine via set_actor_context here — only the root trigger node
-            // sees it. This differs from trigger_workflow / test_workflow_draft
-            // which both lift. Preserving the existing asymmetry; whether to
-            // unify is a separate product decision. Drops the redundant pre-
-            // load timeout extraction (TimeoutPolicy::Honor default).
+            // The actor context is lifted onto the engine exactly as
+            // trigger_workflow / test_workflow_draft do (TimeoutPolicy::Honor
+            // default).
             let opts = talos_engine::builder::EngineOpts::for_run(wf_id, graph_json_clone)
-                .with_actor_id(actor_id);
+                .with_actor_id(actor_id)
+                .with_actor_context(actor_context);
             let mut engine = match talos_engine::builder::for_workflow(
                 registry,
                 secrets_manager,
@@ -13807,5 +13804,26 @@ mod cleanup_reply_tests {
             .as_str()
             .unwrap()
             .contains("workflows matched"));
+    }
+}
+
+#[cfg(test)]
+mod trigger_as_actors_context_pin {
+    /// SOURCE PIN (textual): `trigger_workflow_as_actors` lifts the actor
+    /// context onto the engine and does not merge it into the trigger input —
+    /// the engine strips engine-authored keys from the seed, so a merged copy
+    /// reached no node while being persisted, decrypted, as trigger input.
+    #[test]
+    fn actor_context_travels_on_the_engine_not_the_input() {
+        let src = include_str!("workflows.rs");
+        let at = src
+            .find("async fn handle_trigger_workflow_as_actors(")
+            .unwrap();
+        let end = src[at..].find("\n}\n").unwrap();
+        let body = &src[at..at + end];
+        assert!(body.contains(".with_actor_context(actor_context)"));
+        let merge = format!("insert(\n{}\"__actor_context__\"", " ".repeat(24));
+        assert!(!body.contains(&merge));
+        assert!(!body.contains(&format!("\"__actor_{}__\".to_string()", "context")));
     }
 }

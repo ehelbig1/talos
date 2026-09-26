@@ -1839,10 +1839,16 @@ async fn handle_disagreements(
         Err(refusal) => return refusal.response(req_id),
     };
     // Which classes are actually blocking promotion, so the queue can lead
-    // with rows that can move a gate. Best-effort: no policy, no eval yet, or
-    // a read failure simply means no prioritisation — never a failed review.
-    let blocking = match ModelRegistry::list_versions(&mut tx, model.model_id).await {
-        Ok(versions) => {
+    // with rows that can move a gate. No policy / no eval yet is a real empty
+    // list; a READ FAILURE is not — it renders `null` and is disclosed, never
+    // `[]` (whose documented meaning is "no gate unmet").
+    let mut readings = talos_measurement::Readings::new();
+    let blocking: Option<Vec<String>> = readings
+        .record(
+            "blocking_classes",
+            ModelRegistry::list_versions(&mut tx, model.model_id).await,
+        )
+        .map(|versions| {
             let latest = versions.first().map(|v| &v.metrics_json);
             match model
                 .policy_json
@@ -1855,69 +1861,87 @@ async fn handle_disagreements(
                 ),
                 None => Vec::new(),
             }
-        }
-        Err(_) => Vec::new(),
-    };
-    // Cross-protocol parity with `MlDisagreementFeed.labelVocabulary`. Since
-    // an unknown label is now a hard rejection, a caller that cannot see the
-    // valid classes can only discover them by failing — and an MCP caller is
-    // typically an agent typing a label, i.e. exactly who needs the list up
-    // front. Best-effort: a missing dataset or read failure omits the hint
-    // rather than failing the review.
-    let label_vocabulary: Vec<String> = match model.dataset_id {
-        Some(ds) => dataset_service(state)
-            .label_vocabulary(&mut tx, ds)
-            .await
-            .unwrap_or_default(),
-        None => Vec::new(),
+        });
+    // Cross-protocol parity with `MlDisagreementFeed.labelVocabulary` — the
+    // ONLY values ml_resolve_disagreement accepts. A model with no dataset has
+    // an empty vocabulary; a failed read is `null` + disclosed.
+    let label_vocabulary: Option<Vec<String>> = match model.dataset_id {
+        Some(ds) => readings.record(
+            "label_vocabulary",
+            dataset_service(state).label_vocabulary(&mut tx, ds).await,
+        ),
+        None => Some(Vec::new()),
     };
     match svc
         .pending_disagreements(&mut tx, model.model_id, user_id, limit)
         .await
     {
-        Ok(items) => {
-            let total = items.len();
-            let items = talos_ml::prioritize_disagreements(items, &blocking);
-            let leading = items
-                .iter()
-                .filter(|r| {
-                    blocking
-                        .iter()
-                        .any(|c| r.llm_label == *c || r.fast_label.as_deref() == Some(c.as_str()))
-                })
-                .count();
-            let next_step = if blocking.is_empty() {
-                "for each: ml_resolve_disagreement with correct_label (appends a gold \
-                 correction) or without (dismiss)"
-                    .to_string()
-            } else {
-                format!(
-                    "{leading} of {total} rows below touch a class that is BLOCKING promotion \
-                     ({}) and are listed first — labelling those moves a gate; the rest do not. \
-                     For each: ml_resolve_disagreement with correct_label (appends a gold \
-                     correction) or without (dismiss).",
-                    blocking.join(", ")
-                )
-            };
-            mcp_text(
-                req_id,
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "model_id": model.model_id.to_string(),
-                    "lifecycle_state": model.lifecycle_state,
-                    // Classes whose latest-eval recall is under the policy floor.
-                    // Empty = no per-class gate is currently unmet.
-                    "blocking_classes": blocking,
-                    // The dataset's classes — the ONLY values
-                    // ml_resolve_disagreement accepts for correct_label.
-                    "label_vocabulary": label_vocabulary,
-                    "pending": items,
-                    "next_step": next_step,
-                }))
-                .unwrap_or_default(),
-            )
-        }
+        Ok(items) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&render_disagreements(
+                model.model_id,
+                &model.lifecycle_state,
+                blocking,
+                label_vocabulary,
+                items,
+                &readings,
+            ))
+            .unwrap_or_default(),
+        ),
         Err(e) => internal(req_id, "disagreements", &e),
     }
+}
+
+/// Pure renderer for `ml_disagreements`. `blocking` / `vocabulary` are `None`
+/// when their read failed: rendered `null`, disclosed under `measurement`, and
+/// the queue is left unprioritised rather than claimed gate-free.
+fn render_disagreements(
+    model_id: Uuid,
+    lifecycle_state: &str,
+    blocking: Option<Vec<String>>,
+    label_vocabulary: Option<Vec<String>>,
+    items: Vec<talos_ml::lifecycle::PendingDisagreement>,
+    readings: &talos_measurement::Readings,
+) -> Value {
+    let total = items.len();
+    let gates = blocking.as_deref().unwrap_or(&[]);
+    let items = talos_ml::prioritize_disagreements(items, gates);
+    let leading = items
+        .iter()
+        .filter(|r| {
+            gates
+                .iter()
+                .any(|c| r.llm_label == *c || r.fast_label.as_deref() == Some(c.as_str()))
+        })
+        .count();
+    const HOW: &str = "For each: ml_resolve_disagreement with correct_label (appends a gold \
+                       correction) or without (dismiss).";
+    let next_step = match &blocking {
+        None => format!(
+            "The promotion gates could not be read, so these rows are NOT prioritised by \
+             gate impact. {HOW}"
+        ),
+        Some(b) if b.is_empty() => HOW.to_string(),
+        Some(b) => format!(
+            "{leading} of {total} rows below touch a class that is BLOCKING promotion \
+             ({}) and are listed first — labelling those moves a gate; the rest do not. {HOW}",
+            b.join(", ")
+        ),
+    };
+    let mut report = serde_json::json!({
+        "model_id": model_id.to_string(),
+        "lifecycle_state": lifecycle_state,
+        // Classes whose latest-eval recall is under the policy floor.
+        // `[]` = no per-class gate unmet; `null` = could not be read.
+        "blocking_classes": blocking,
+        // The dataset's classes — the ONLY values ml_resolve_disagreement
+        // accepts for correct_label. `null` = could not be read.
+        "label_vocabulary": label_vocabulary,
+        "pending": items,
+        "next_step": next_step,
+    });
+    readings.attach(&mut report);
+    report
 }
 
 /// One-tap digest verdict. With `correct_label`, the SYSTEM stamps a
@@ -2506,5 +2530,44 @@ mod model_lookup_tests {
         let wire = |r: &talos_mcp::JsonRpcResponse| serde_json::to_string(r).expect("serialize");
         assert!(!wire(&a).contains("error_kind"));
         assert!(!wire(&b).contains("errorKind"));
+    }
+}
+
+#[cfg(test)]
+mod disagreements_render_tests {
+    use super::*;
+
+    /// A failed gate read renders `null` and is disclosed — never `[]`, whose
+    /// documented meaning is "no per-class gate is unmet".
+    #[test]
+    fn unread_gates_render_null_not_empty() {
+        let mut readings = talos_measurement::Readings::new();
+        let blocking: Option<Vec<String>> =
+            readings.record("blocking_classes", Err::<Vec<String>, _>("db down"));
+        let vocab: Option<Vec<String>> =
+            readings.record("label_vocabulary", Err::<Vec<String>, _>("db down"));
+        let r = render_disagreements(Uuid::nil(), "shadow", blocking, vocab, vec![], &readings);
+        assert!(r["blocking_classes"].is_null());
+        assert!(r["label_vocabulary"].is_null());
+        assert_eq!(r["measurement"]["complete"], false);
+        assert!(r["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("could not be read"));
+    }
+
+    #[test]
+    fn measured_empty_gates_stay_empty_and_undisclosed() {
+        let readings = talos_measurement::Readings::new();
+        let r = render_disagreements(
+            Uuid::nil(),
+            "shadow",
+            Some(vec![]),
+            Some(vec!["a".into()]),
+            vec![],
+            &readings,
+        );
+        assert_eq!(r["blocking_classes"], serde_json::json!([]));
+        assert!(r.get("measurement").is_none());
     }
 }
