@@ -32,6 +32,13 @@ pub const BACKEND_NAME: &str = "logistic-regression";
 /// mis-reading weights).
 const ARTIFACT_VERSION: u32 = 1;
 
+/// Upper bound on the rows one linear fit trains on (class-stratified
+/// sample, see `DatasetService::load_train_embeddings_with_source`). The fit
+/// runs while the eval's transaction holds the dataset advisory lock and sits
+/// idle, so its wall time must stay well inside the pool's 60 s
+/// `idle_in_transaction_session_timeout`.
+pub const MAX_TRAIN_EXAMPLES: i64 = 2_000;
+
 /// Training hyperparameters. Defaults are tuned for L2-normalized
 /// embedding features; they converge well under sub-second budgets.
 #[derive(Debug, Clone, Copy)]
@@ -225,9 +232,11 @@ pub fn fit_weighted(train: &[(Vec<f32>, String, f32)], opts: FitOpts) -> Result<
     // ~epochs×n heap allocations of a tiny Vec on the eval hot path.
     let mut probs = vec![0.0f32; n_classes];
 
-    for _ in 0..opts.epochs {
+    let mut stop = ConvergenceStop::default();
+    for epoch in 0..opts.epochs {
         grad_w.iter_mut().for_each(|g| *g = 0.0);
         grad_b.iter_mut().for_each(|g| *g = 0.0);
+        let mut loss = 0.0f64;
         for ((x, &y), &sw) in xs.iter().zip(ys.iter()).zip(sws.iter()) {
             // logits = W·x + b, then softmax (probs overwritten in full).
             for (c, prob) in probs.iter_mut().enumerate() {
@@ -236,6 +245,7 @@ pub fn fit_weighted(train: &[(Vec<f32>, String, f32)], opts: FitOpts) -> Result<
             }
             softmax_inplace(&mut probs);
             let w = class_weight[y] * sw;
+            loss -= f64::from(w) * f64::from(probs[y].max(1e-30)).ln();
             for (c, gb) in grad_b.iter_mut().enumerate() {
                 // dL/dz_c = w * (p_c - 1{c==y}); backprop into W_c, b_c.
                 let err = w * (probs[c] - if c == y { 1.0 } else { 0.0 });
@@ -257,8 +267,12 @@ pub fn fit_weighted(train: &[(Vec<f32>, String, f32)], opts: FitOpts) -> Result<
                 *wd -= scale * gd + opts.lr * opts.l2 * *wd;
             }
         }
+        if stop.converged(epoch, loss / f64::from(weight_sum)) {
+            break;
+        }
     }
 
+    ensure_finite(&weights, &bias)?;
     Ok(LinearModel {
         version: ARTIFACT_VERSION,
         classes,
@@ -266,6 +280,46 @@ pub fn fit_weighted(train: &[(Vec<f32>, String, f32)], opts: FitOpts) -> Result<
         weights,
         bias,
     })
+}
+
+/// Early stop: the weighted mean training loss has changed by less than
+/// [`CONVERGENCE_REL_TOL`] (relative) for [`CONVERGENCE_PATIENCE`]
+/// consecutive epochs, after at least [`CONVERGENCE_MIN_EPOCHS`]. The
+/// tolerance sits well below where the 300-epoch under-training showed up,
+/// so a still-improving fit is never cut short; a flat one stops early.
+const CONVERGENCE_MIN_EPOCHS: usize = 100;
+const CONVERGENCE_PATIENCE: usize = 20;
+const CONVERGENCE_REL_TOL: f64 = 1e-6;
+
+#[derive(Default)]
+struct ConvergenceStop {
+    prev: Option<f64>,
+    flat: usize,
+}
+
+impl ConvergenceStop {
+    fn converged(&mut self, epoch: usize, loss: f64) -> bool {
+        if let Some(prev) = self.prev {
+            if (prev - loss).abs() <= CONVERGENCE_REL_TOL * prev.abs().max(1e-12) {
+                self.flat += 1;
+            } else {
+                self.flat = 0;
+            }
+        }
+        self.prev = Some(loss);
+        epoch + 1 >= CONVERGENCE_MIN_EPOCHS && self.flat >= CONVERGENCE_PATIENCE
+    }
+}
+
+/// A NaN/Inf weight or bias makes every prediction NaN-driven (argmax over
+/// NaN picks an arbitrary class at full "confidence"). Refused at fit end
+/// and again when an artifact is opened, like the memory ranker's model.
+fn ensure_finite(weights: &[f32], bias: &[f32]) -> Result<()> {
+    anyhow::ensure!(
+        weights.iter().chain(bias.iter()).all(|v| v.is_finite()),
+        "linear model has non-finite weights or bias"
+    );
+    Ok(())
 }
 
 impl LinearModel {
@@ -318,6 +372,7 @@ impl LinearModel {
                 && model.bias.len() == model.classes.len(),
             "linear artifact shape mismatch"
         );
+        ensure_finite(&model.weights, &model.bias)?;
         Ok(model)
     }
 }
@@ -415,5 +470,49 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&bad).unwrap();
         assert!(LinearModel::open(&bytes).is_err());
+    }
+
+    #[test]
+    fn open_rejects_non_finite_weights() {
+        // 1e39 overflows f32 to +inf on parse — a well-formed artifact that
+        // would score every row NaN/inf-driven.
+        let bytes =
+            br#"{"version":1,"classes":["a","b"],"dims":2,"weights":[1e39,0,0,0],"bias":[0,0]}"#;
+        let err = LinearModel::open(bytes).unwrap_err().to_string();
+        assert!(err.contains("non-finite"), "{err}");
+        let ok = br#"{"version":1,"classes":["a","b"],"dims":2,"weights":[1,0,0,1],"bias":[0,0]}"#;
+        assert!(LinearModel::open(ok).is_ok());
+    }
+
+    #[test]
+    fn a_diverged_fit_is_refused_not_returned() {
+        let train: Vec<(Vec<f32>, String, f32)> = (0..20)
+            .map(|i| {
+                let label = if i % 2 == 0 { "a" } else { "b" };
+                (vec![i as f32, 1.0, -(i as f32)], label.to_string(), 1.0)
+            })
+            .collect();
+        let opts = FitOpts {
+            lr: f32::MAX,
+            epochs: 50,
+            ..FitOpts::default()
+        };
+        let err = fit_weighted(&train, opts).unwrap_err().to_string();
+        assert!(err.contains("non-finite"), "{err}");
+    }
+
+    #[test]
+    fn convergence_stop_waits_for_min_epochs_and_patience() {
+        let mut stop = ConvergenceStop::default();
+        // Flat loss from the start: not before the minimum epoch count.
+        for epoch in 0..CONVERGENCE_MIN_EPOCHS - 1 {
+            assert!(!stop.converged(epoch, 0.5));
+        }
+        assert!(stop.converged(CONVERGENCE_MIN_EPOCHS - 1, 0.5));
+        // A still-improving loss never stops.
+        let mut stop = ConvergenceStop::default();
+        for epoch in 0..2000 {
+            assert!(!stop.converged(epoch, 1.0 / (epoch as f64 + 1.0)));
+        }
     }
 }

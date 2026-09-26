@@ -1160,7 +1160,7 @@ impl DatasetService {
         dataset_id: Uuid,
     ) -> Result<Vec<(Vec<f32>, String)>> {
         Ok(self
-            .load_train_embeddings_with_source(conn, dataset_id)
+            .load_train_embeddings_with_source(conn, dataset_id, crate::linear::MAX_TRAIN_EXAMPLES)
             .await?
             .into_iter()
             .map(|(emb, label, _)| (emb, label))
@@ -1170,20 +1170,37 @@ impl DatasetService {
     /// [`Self::load_train_embeddings`] plus an `is_correction` flag per
     /// row so the weighted fit can emphasize human corrections
     /// (corrections-as-training, 2026-07-19).
+    ///
+    /// Bounded at `cap` rows by a deterministic CLASS-STRATIFIED sample:
+    /// rows are ranked within their class (corrections first, then newest,
+    /// then id) and taken rank by rank across classes, so a minority class
+    /// keeps every row while a majority class is trimmed. The cap is in the
+    /// SQL — the full train split is never loaded.
     pub async fn load_train_embeddings_with_source(
         &self,
         conn: &mut PgConnection,
         dataset_id: Uuid,
+        cap: i64,
     ) -> Result<Vec<(Vec<f32>, String, bool)>> {
         let rows: Vec<(Option<pgvector::Vector>, Option<String>, bool)> = sqlx::query_as(
-            "SELECT embedding, label_json->>'label', source = 'correction' \
-             FROM ml_examples \
-             WHERE dataset_id = $1 AND split = 'train' \
-               AND embedding IS NOT NULL AND embedding_model = $2 \
-               AND label_json ? 'label'",
+            "SELECT embedding, label, is_correction FROM ( \
+                 SELECT embedding, label_json->>'label' AS label, \
+                        source = 'correction' AS is_correction, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY label_json->>'label' \
+                            ORDER BY (source = 'correction') DESC, created_at DESC, id \
+                        ) AS class_rank \
+                 FROM ml_examples \
+                 WHERE dataset_id = $1 AND split = 'train' \
+                   AND embedding IS NOT NULL AND embedding_model = $2 \
+                   AND label_json ? 'label' \
+             ) ranked \
+             ORDER BY class_rank, label \
+             LIMIT $3",
         )
         .bind(dataset_id)
         .bind(talos_memory::embedding::active_embedding_model())
+        .bind(cap.max(1))
         .fetch_all(&mut *conn)
         .await
         .context("load train embeddings")?;
