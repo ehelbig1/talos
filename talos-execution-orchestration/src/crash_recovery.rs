@@ -204,17 +204,17 @@ pub(crate) async fn resume_one(
     let exec_id = row.id;
     let origin_label = origin.label();
 
-    // The workflow was deleted between the original run and this restart — we
-    // have no graph to resume against. Fail terminally.
+    // The workflow — or the version this run was started on — was deleted
+    // before this resume: there is no graph to resume against. Fail terminally.
     let Some(graph_json) = row.graph_json else {
         fail(
             &deps,
             exec_id,
             origin,
-            &format!("{origin_label}: workflow was deleted before resume"),
+            &format!("{origin_label}: workflow or its pinned version was deleted before resume"),
         )
         .await;
-        tracing::warn!(execution_id = %exec_id, "{origin_label}: workflow deleted — marked failed");
+        tracing::warn!(execution_id = %exec_id, "{origin_label}: workflow or pinned version deleted — marked failed");
         return;
     };
 
