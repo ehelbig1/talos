@@ -291,6 +291,7 @@ fn run_bounded(cmd: &str, secs: u64) -> R<String> {
         Ok(buf) => buf,
         Err(_) => {
             // SAFETY: negative pid targets the process group we created.
+            #[allow(unsafe_code)] // see SAFETY above.
             unsafe {
                 libc::kill(-pgid, libc::SIGTERM);
                 std::thread::sleep(std::time::Duration::from_secs(2));

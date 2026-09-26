@@ -7065,6 +7065,7 @@ mod tests {
     /// back to `Vec<u8>` would silently re-introduce the leak —
     /// `cargo check` is blind to it. This test fails loud.
     #[test]
+    #[allow(unsafe_code)] // reads the freed buffer to prove it was zeroed.
     fn dek_key_zeroizes_on_drop() {
         // Capture the heap pointer + capacity so we can inspect the
         // buffer after the wrapper is dropped. Using Vec::as_ptr keeps
@@ -7115,6 +7116,7 @@ mod tests {
     /// the largest single pool of plaintext secret material in the
     /// controller process.
     #[test]
+    #[allow(unsafe_code)] // reads the freed buffer to prove it was zeroed.
     fn llm_key_cache_value_zeroizes_on_drop() {
         let pattern_key = format!("sk-{}", "a".repeat(32));
         let zeroizing = Zeroizing::new(pattern_key);
@@ -7142,6 +7144,7 @@ mod tests {
     /// Regression guard against a future change that derives Clone in
     /// a way that loses the wrapper (e.g. cloning the inner Vec out).
     #[test]
+    #[allow(unsafe_code)] // reads the freed buffer to prove it was zeroed.
     fn dek_clone_also_zeroizes() {
         let original = DataEncryptionKey {
             id: Uuid::new_v4(),

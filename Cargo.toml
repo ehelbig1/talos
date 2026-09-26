@@ -217,6 +217,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # When adding a new allow, write a one-liner justification next to it.
 # When removing one, run `cargo clippy --workspace -- -D warnings` to
 # confirm no regressions.
+[workspace.lints.rust]
+# Every `unsafe` block needs a local `#[allow(unsafe_code)]` beside its SAFETY
+# comment. Crates that do not inherit workspace lints (the engine/protocol
+# crates) get no coverage from this line.
+unsafe_code = "deny"
+
 [workspace.lints.clippy]
 # API-shape lints — flagging an opinionated style of structuring code,
 # not a bug. We accept the natural shape and document at call-sites.

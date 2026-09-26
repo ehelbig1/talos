@@ -5931,6 +5931,7 @@ impl TalosRuntime {
         // (version, expected_cap, serialized), so this point is reached only
         // when the serialized bytes were produced locally for this exact
         // cap-world.
+        #[allow(unsafe_code)] // HMAC-verified blob; see SAFETY above.
         let component = unsafe { Component::deserialize(&self.engine, serialized)? };
 
         tracing::info!(

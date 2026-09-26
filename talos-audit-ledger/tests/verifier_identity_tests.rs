@@ -19,6 +19,7 @@
 //! 2026-09-06: `mc ls` with those credentials answers `Access Denied`, and the
 //! controller had logged 37 unverifiable executions in an hour and zero
 //! verified chains in its entire history.
+#![allow(unsafe_code)] // env mutation; this binary owns its process (see above).
 
 use talos_audit_ledger::VerifierClient;
 

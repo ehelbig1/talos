@@ -893,6 +893,7 @@ fn make_process_non_dumpable() -> Result<(), String> {
         const PR_SET_DUMPABLE: std::ffi::c_int = 4;
         // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes one integer argument and
         // touches no caller memory.
+        #[allow(unsafe_code)] // see SAFETY above.
         let rc = unsafe { prctl(PR_SET_DUMPABLE, 0 as std::ffi::c_ulong) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error().to_string());
@@ -1186,6 +1187,7 @@ mod non_dumpable_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[allow(unsafe_code)] // prctl(PR_GET_DUMPABLE) FFI read.
     fn the_process_is_non_dumpable_afterwards() {
         extern "C" {
             fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;

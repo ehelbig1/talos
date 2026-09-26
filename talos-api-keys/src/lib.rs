@@ -1087,6 +1087,7 @@ mod tests {
     /// inspection (the match arms in `resolve_bcrypt_cost` are
     /// exhaustive).
     #[test]
+    #[allow(unsafe_code)] // env mutation (unsafe from edition 2024).
     fn bcrypt_cost_defaults_when_env_unset() {
         // Best-effort: scoped removal so concurrent tests in this file
         // don't disturb our read. SAFETY: env-var manipulation is
