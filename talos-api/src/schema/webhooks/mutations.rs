@@ -292,8 +292,17 @@ impl WebhooksMutations {
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: webhook trigger insert failed");
                 async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?
+            .ok_or_else(|| {
+                async_graphql::Error::new(format!(
+                    "Webhook limit reached ({}). Delete unused webhooks before creating new ones.",
+                    talos_webhook_repository::MAX_WEBHOOKS_PER_USER
+                ))
+                .extend_safe()
             })?;
 
+        // The body returns the verification token.
+        crate::schema::mark_response_no_store(ctx);
         Ok(WebhookTrigger {
             id: listener_id,
             module_id: Some(input.module_id),
