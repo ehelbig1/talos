@@ -23,7 +23,7 @@ use worker::error_sanitize::sanitize_error_message;
 use worker::job_span::JobSpan;
 use worker::module_fetcher::{
     self, enforce_production_sigstore_policy_explicit, parse_cosign_version, parse_semver_triple,
-    resolve_and_hash_cosign_binary, validate_sigstore_identity_regexp, FetchedModule,
+    resolve_and_hash_cosign_binary, validate_sigstore_identity_regexp_for_policy, FetchedModule,
     SigstorePolicy,
 };
 use worker::runtime::{PipelineStepSpec, RetryPolicy, SecurityPolicy};
@@ -2325,11 +2325,24 @@ async fn main() -> anyhow::Result<()> {
         let sigstore_policy_at_startup = SigstorePolicy::from_env();
         if sigstore_policy_at_startup != SigstorePolicy::Disabled {
             let regexp = std::env::var("TALOS_SIGSTORE_IDENTITY_REGEXP").unwrap_or_default();
-            match validate_sigstore_identity_regexp(&regexp) {
-                Ok(()) => {
+            // The policy-aware validator also refuses, under Required, a
+            // workflow pin that does not pin the git ref (`…\.yml@` alone
+            // admits a signature from any branch); Audit gets the warning.
+            match validate_sigstore_identity_regexp_for_policy(&regexp, sigstore_policy_at_startup)
+            {
+                Ok(None) => {
                     ::tracing::info!(
                         policy = ?sigstore_policy_at_startup,
                         "Sigstore identity regexp validated at startup"
+                    );
+                }
+                Ok(Some(warning)) => {
+                    ::tracing::warn!(
+                        policy = ?sigstore_policy_at_startup,
+                        rejection = ?warning,
+                        reason = %warning.human_reason(),
+                        "TALOS_SIGSTORE_IDENTITY_REGEXP accepted with a warning — \
+                         would fail closed under Required"
                     );
                 }
                 Err(rejection) => match sigstore_policy_at_startup {

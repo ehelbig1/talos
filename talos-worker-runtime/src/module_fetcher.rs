@@ -162,7 +162,10 @@ pub fn enforce_production_sigstore_policy_explicit() -> anyhow::Result<SigstoreP
 /// review 2026-07-19, P4). Re-exported here to keep existing worker call
 /// sites and tests (`validate_sigstore_identity_regexp`, `SigstoreRegexpRejection`,
 /// `.human_reason()`) unchanged.
-pub use talos_sigstore_policy::{validate_sigstore_identity_regexp, SigstoreRegexpRejection};
+pub use talos_sigstore_policy::{
+    validate_sigstore_identity_regexp, validate_sigstore_identity_regexp_for_policy,
+    SigstoreRegexpRejection,
+};
 
 /// Build the `cosign verify` argv for a given OCI reference. Pure
 /// (no env reads, no I/O) so the security-critical command construction
