@@ -25,6 +25,7 @@ impl ActorsMutations {
     ) -> Result<McpAgentCreated> {
         require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+        crate::schema::mark_response_no_store(ctx);
 
         let user_id = ctx
             .data_opt::<Uuid>()

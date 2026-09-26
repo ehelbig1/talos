@@ -26,6 +26,7 @@ impl SecurityMutations {
     ) -> Result<ApiKeyCreated> {
         require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+        crate::schema::mark_response_no_store(ctx);
 
         let api_key_service = ctx.data::<Arc<talos_api_keys::ApiKeyService>>()?;
 
@@ -192,6 +193,7 @@ impl SecurityMutations {
     async fn rotate_api_key(&self, ctx: &Context<'_>, key_id: Uuid) -> Result<ApiKeyCreated> {
         require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+        crate::schema::mark_response_no_store(ctx);
 
         let api_key_service = ctx.data::<Arc<talos_api_keys::ApiKeyService>>()?;
 
@@ -543,7 +545,11 @@ impl SecurityMutations {
             .await
             .map_err(|e| {
                 tracing::error!("Failed to rotate master key: {}", e);
-                async_graphql::Error::new("Failed to rotate master key").extend_safe()
+                // A staged-posture refusal is operator guidance with no key
+                // material: surface exactly one of the fixed texts, never an
+                // arbitrary error string.
+                let msg = master_key_rotation_refusal(&e).unwrap_or("Failed to rotate master key");
+                async_graphql::Error::new(msg).extend_safe()
             })?;
 
         info!(
@@ -555,8 +561,8 @@ impl SecurityMutations {
         Ok(MasterKeyRotationResult {
             re_encrypted_dek_count: count,
             message: format!(
-                "Master key rotated successfully. {} DEKs re-encrypted. \
-                 Update TALOS_MASTER_KEY env var to the new value before next restart.",
+                "{} DEKs rewrapped under the new master key. Remove \
+                 TALOS_MASTER_KEY_PREVIOUS from every controller and roll.",
                 count
             ),
         })
@@ -904,6 +910,80 @@ mod output_sweep_message_tests {
             output_sweep_message(&partial),
             "7 execution outputs migrated to per-org DEKs (3 of them archived); 2 failed \
              (still on the prior DEK). Inspect server logs and re-run."
+        );
+    }
+}
+
+/// The operator-facing refusal text when `err` is one of
+/// `rotate_master_key`'s staged-posture refusals; `None` for anything else.
+/// Matching the closed set of fixed texts means no other error string can
+/// reach the caller.
+fn master_key_rotation_refusal(err: &anyhow::Error) -> Option<&'static str> {
+    use talos_secrets_manager::MasterKeyRotationPosture as P;
+    let text = err.to_string();
+    [P::NotStaged, P::AlreadyComplete, P::IdentityUnknown]
+        .into_iter()
+        .map(P::refusal)
+        .find(|r| *r == text)
+}
+
+#[cfg(test)]
+mod master_key_refusal_tests {
+    use super::master_key_rotation_refusal;
+    use talos_secrets_manager::MasterKeyRotationPosture as P;
+
+    /// TEXTUAL pin: every resolver that returns a credential in its body
+    /// marks the response `no-store`, which is what keeps the idempotency
+    /// middleware from writing the plaintext to Redis.
+    #[test]
+    fn credential_minting_resolvers_mark_the_response_no_store() {
+        let sites = [
+            (include_str!("mutations.rs"), "async fn create_api_key("),
+            (include_str!("mutations.rs"), "async fn rotate_api_key("),
+            (
+                include_str!("../actors/mutations.rs"),
+                "async fn register_mcp_agent(",
+            ),
+            (
+                include_str!("../auth/mutations.rs"),
+                "async fn setup_two_factor(",
+            ),
+            (
+                include_str!("../auth/mutations.rs"),
+                "async fn enable_two_factor(",
+            ),
+            (
+                include_str!("../webhooks/mutations.rs"),
+                "async fn create_webhook_trigger(",
+            ),
+        ];
+        for (src, sig) in sites {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} present"));
+            let rest = &src[start..];
+            let end = rest.find("\n    }\n").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("mark_response_no_store(ctx)"),
+                "{sig} returns a credential and must mark the response no-store"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_fixed_refusal_texts_are_surfaced() {
+        let staged = anyhow::anyhow!(P::NotStaged.refusal());
+        assert_eq!(
+            master_key_rotation_refusal(&staged),
+            Some(P::NotStaged.refusal())
+        );
+        assert_eq!(
+            master_key_rotation_refusal(&anyhow::anyhow!(
+                "relation \"encryption_keys\" does not exist"
+            )),
+            None
+        );
+        assert_eq!(
+            master_key_rotation_refusal(&anyhow::anyhow!(P::Staged.refusal())),
+            None
         );
     }
 }
