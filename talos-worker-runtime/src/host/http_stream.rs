@@ -614,167 +614,34 @@ impl wit_http_stream::Host for TalosContext {
                 SSE_STREAM_IDLE_TIMEOUT_SECS,
             ));
 
-        let reader = tokio::spawn(async move {
-            use crate::context::{SseChannelItem, SseStreamEnd};
-
-            // Why an abnormal ending is ANNOUNCED rather than just logged: a
-            // mid-stream reset, a byte-cap trip and a clean upstream close are
-            // all `next_event -> None` to the guest, and `option<sse-event>`
-            // cannot be widened without invalidating every catalog template's
-            // checked-in bindings. So the reader posts one terminal marker on
-            // the channel it already owns and `next_event` converts it into a
-            // single operator diagnostic. A CLEAN close posts nothing — it
-            // simply drops `tx` — so the signal means "this stream died", not
-            // "this stream finished".
-            //
-            // `try_send` on a full channel would drop the marker, and
-            // `send().await` is correct here: ordering after the last event is
-            // the whole point, and an `Err` just means the guest already
-            // stopped listening.
-            async fn announce(tx: &tokio::sync::mpsc::Sender<SseChannelItem>, end: SseStreamEnd) {
-                let _ = tx.send(SseChannelItem::End(end)).await;
-            }
-
-            // Parse SSE stream: accumulate lines, emit on blank lines.
-            //
-            // SECURITY: cap both the incoming-byte buffer and the
-            // per-event accumulated data. A misbehaving server that
-            // never emits a blank line would otherwise grow `data_lines`
-            // monotonically until the worker OOMs. Likewise, an attacker
-            // streaming a single huge line with no `\n` could grow
-            // `buffer` unbounded. Both caps are 1 MiB by default; set
-            // TALOS_SSE_MAX_EVENT_BYTES to override per-deploy.
-            // MCP-670: `=0`-safe env helper. `TALOS_SSE_MAX_EVENT_BYTES=0`
-            // would abort every SSE stream on the first received byte
-            // (`buffer.len() > 0` is true immediately), so the whole
-            // streaming surface silently breaks under helm misconfig.
-            const DEFAULT_SSE_MAX_BYTES: usize = 1024 * 1024;
-            let max_event_bytes: usize = talos_config::positive_env_or_default::<usize>(
-                "TALOS_SSE_MAX_EVENT_BYTES",
-                DEFAULT_SSE_MAX_BYTES,
-            );
-
-            let mut stream = response.bytes_stream();
-            let mut lines = super::line_reader::LineReader::new(max_event_bytes);
-            let mut event_type: Option<String> = None;
-            let mut data_lines: Vec<String> = Vec::new();
-            let mut data_bytes: usize = 0;
-            let mut event_id: Option<String> = None;
-            let mut last_byte_at = std::time::Instant::now();
-
-            loop {
-                // Wasm-security review 2026-05-23 (M): bound the
-                // bytes-stream wait so a slow-trickle upstream can't
-                // keep this task alive past execution-end. The
-                // `tokio::select!` races the next chunk against:
-                //   - a short periodic wake (200 ms) that checks the
-                //     execution's cancellation flag,
-                //   - the cancellation flag itself flipping mid-wait
-                //     (cooperative — we ALSO short-circuit on the
-                //     wake-tick if the flag is set, so no race window).
-                // The periodic wake is cheap (200 ms = 5 polls/sec)
-                // and gives the task at most 200 ms of slack between
-                // cancellation and exit.
-                let chunk_result = tokio::select! {
-                    chunk = futures_util::StreamExt::next(&mut stream) => chunk,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
-                        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                            tracing::debug!(
-                                url = %url_owned,
-                                "SSE stream task observed execution cancellation — exiting"
-                            );
-                            announce(&tx, SseStreamEnd::Cancelled).await;
-                            return;
-                        }
-                        // Idle window (see `SSE_STREAM_IDLE_TIMEOUT_SECS`):
-                        // checked on the same tick, so a silent-but-open
-                        // upstream cannot hold this task past the window.
-                        if last_byte_at.elapsed() >= idle_timeout {
-                            tracing::warn!(
-                                url = %url_owned,
-                                idle_secs = idle_timeout.as_secs(),
-                                "SSE stream idle timeout — no bytes received within window; closing"
-                            );
-                            announce(&tx, SseStreamEnd::IdleTimeout).await;
-                            return;
-                        }
-                        continue;
-                    }
-                };
-                last_byte_at = std::time::Instant::now();
-                let chunk_result = match chunk_result {
-                    // Clean upstream close: the ONLY ending that announces
-                    // nothing, because it is the only one where an empty tail
-                    // is the honest answer.
-                    Some(c) => c,
-                    None => break,
-                };
-                let chunk = match chunk_result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        // Pre-2026-09 this was a bare `Err(_) => break` — the
-                        // ONE failure mode on this surface that logged nothing
-                        // ANYWHERE, host or guest. Bounded: it terminates the
-                        // loop, so at most one line per stream and at most
-                        // MAX_SSE_STREAMS_PER_EXECUTION per execution.
-                        tracing::warn!(
-                            url = %url_owned,
-                            detail = %reason_class::sanitized_transport_detail(&e),
-                            "SSE stream failed mid-body (sanitized transport detail)"
-                        );
-                        announce(&tx, SseStreamEnd::TransportError).await;
-                        return;
-                    }
-                };
-                if let Err(e) = lines.push(&chunk) {
-                    tracing::warn!(
-                        url = %url_owned,
-                        max_bytes = max_event_bytes,
-                        actual_bytes = e.tail_bytes,
-                        "SSE buffer exceeded max event size with no newline; aborting stream"
-                    );
-                    announce(&tx, SseStreamEnd::EventBytesCap).await;
-                    return;
-                }
-
-                while let Some(line) = lines.next_line() {
-                    if line.is_empty() {
-                        // Blank line = event boundary
-                        if !data_lines.is_empty() {
-                            let event = crate::context::SseEventInternal {
-                                event_type: event_type.take(),
-                                data: data_lines.join("\n"),
-                                id: event_id.take(),
-                            };
-                            if tx.send(SseChannelItem::Event(event)).await.is_err() {
-                                return; // Receiver dropped (close called)
-                            }
-                            data_lines.clear();
-                            data_bytes = 0;
-                        }
-                    } else if let Some(value) = line.strip_prefix("data:") {
-                        let v = value.trim_start().to_string();
-                        data_bytes = data_bytes.saturating_add(v.len()).saturating_add(1);
-                        if data_bytes > max_event_bytes {
-                            tracing::warn!(
-                                url = %url_owned,
-                                max_bytes = max_event_bytes,
-                                accumulated_bytes = data_bytes,
-                                "SSE event data exceeded max size before blank-line boundary; aborting stream"
-                            );
-                            announce(&tx, SseStreamEnd::EventBytesCap).await;
-                            return;
-                        }
-                        data_lines.push(v);
-                    } else if let Some(value) = line.strip_prefix("event:") {
-                        event_type = Some(value.trim_start().to_string());
-                    } else if let Some(value) = line.strip_prefix("id:") {
-                        event_id = Some(value.trim_start().to_string());
-                    }
-                    // Skip comments (lines starting with :) and retry: fields
-                }
-            }
+        // MCP-670: `=0`-safe env helper. `TALOS_SSE_MAX_EVENT_BYTES=0`
+        // would abort every SSE stream on the first received byte, so the
+        // whole streaming surface silently breaks under helm misconfig.
+        const DEFAULT_SSE_MAX_BYTES: usize = 1024 * 1024;
+        let max_event_bytes: usize = talos_config::positive_env_or_default::<usize>(
+            "TALOS_SSE_MAX_EVENT_BYTES",
+            DEFAULT_SSE_MAX_BYTES,
+        );
+        // The raw `reqwest::Error` never crosses into the reader's logic: each
+        // body error is reduced to the SANITIZED detail here, which is all the
+        // reader ever logged.
+        let body = futures_util::StreamExt::map(response.bytes_stream(), |r| {
+            r.map_err(|e| reason_class::sanitized_transport_detail(&e).to_string())
         });
+        let buffered_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            MAX_SSE_BUFFERED_BYTES_PER_STREAM,
+        ));
+        let reader = tokio::spawn(run_sse_reader(
+            body,
+            tx,
+            SseReaderConfig {
+                url: url_owned,
+                cancelled,
+                idle_timeout,
+                max_event_bytes,
+                buffered_budget,
+            },
+        ));
         // Keep the handle so `close()` and registry drop (execution end) can
         // ABORT the reader — see `StreamRegistry::sse_tasks`.
         self.streams.register_sse_task(&stream_id, reader);
@@ -837,5 +704,507 @@ impl wit_http_stream::Host for TalosContext {
             streams.remove(&stream_id);
         }
         self.streams.abort_sse_task(&stream_id);
+    }
+}
+
+/// Bytes of parsed-but-undelivered events one SSE stream may hold (2026-09-25).
+///
+/// The reader parses ahead of the guest into an mpsc channel of capacity 1 000,
+/// and a single event may be up to `TALOS_SSE_MAX_EVENT_BYTES` (1 MiB default):
+/// ~1 GiB per stream, ×`MAX_SSE_STREAMS_PER_EXECUTION`, parked in worker memory
+/// for a guest that simply stops calling `next-event`. Each event now holds a
+/// share of this budget (one permit per byte) until the guest RECEIVES it, so
+/// once 4 MiB are queued the reader stops reading the socket and TCP pushes
+/// back on the server. The channel's item count still bounds tiny events.
+pub(crate) const MAX_SSE_BUFFERED_BYTES_PER_STREAM: usize = 4 * 1024 * 1024;
+
+/// Everything the SSE reader needs besides the body and the channel.
+pub(crate) struct SseReaderConfig {
+    pub(crate) url: String,
+    pub(crate) cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) idle_timeout: std::time::Duration,
+    pub(crate) max_event_bytes: usize,
+    pub(crate) buffered_budget: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+/// The spawned body of one SSE stream: read the body, parse events, deliver
+/// them in order, and announce an abnormal ending. A free function over a
+/// byte stream (not a `reqwest::Response`) so it is testable with a synthetic
+/// body; errors arrive already sanitized.
+pub(crate) async fn run_sse_reader<S>(
+    mut stream: S,
+    tx: tokio::sync::mpsc::Sender<crate::context::SseChannelItem>,
+    config: SseReaderConfig,
+) where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, String>> + Unpin,
+{
+    use crate::context::{SseChannelItem, SseStreamEnd};
+    let SseReaderConfig {
+        url: url_owned,
+        cancelled,
+        idle_timeout,
+        max_event_bytes,
+        buffered_budget,
+    } = config;
+
+    // Why an abnormal ending is ANNOUNCED rather than just logged: a
+    // mid-stream reset, a byte-cap trip and a clean upstream close are
+    // all `next_event -> None` to the guest, and `option<sse-event>`
+    // cannot be widened without invalidating every catalog template's
+    // checked-in bindings. So the reader posts one terminal marker on
+    // the channel it already owns and `next_event` converts it into a
+    // single operator diagnostic. A CLEAN close posts nothing — it
+    // simply drops `tx` — so the signal means "this stream died", not
+    // "this stream finished".
+    //
+    // `try_send` on a full channel would drop the marker, and
+    // `send().await` is correct here: ordering after the last event is
+    // the whole point, and an `Err` just means the guest already
+    // stopped listening.
+    async fn announce(tx: &tokio::sync::mpsc::Sender<SseChannelItem>, end: SseStreamEnd) {
+        let _ = tx.send(SseChannelItem::End(end)).await;
+    }
+
+    let mut parser = SseParser::new(max_event_bytes);
+    let mut last_byte_at = std::time::Instant::now();
+
+    loop {
+        // Wasm-security review 2026-05-23 (M): bound the
+        // bytes-stream wait so a slow-trickle upstream can't
+        // keep this task alive past execution-end. The
+        // `tokio::select!` races the next chunk against:
+        //   - a short periodic wake (200 ms) that checks the
+        //     execution's cancellation flag,
+        //   - the cancellation flag itself flipping mid-wait
+        //     (cooperative — we ALSO short-circuit on the
+        //     wake-tick if the flag is set, so no race window).
+        // The periodic wake is cheap (200 ms = 5 polls/sec)
+        // and gives the task at most 200 ms of slack between
+        // cancellation and exit.
+        let chunk_result = tokio::select! {
+            chunk = futures_util::StreamExt::next(&mut stream) => chunk,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::debug!(
+                        url = %url_owned,
+                        "SSE stream task observed execution cancellation — exiting"
+                    );
+                    announce(&tx, SseStreamEnd::Cancelled).await;
+                    return;
+                }
+                // Idle window (see `SSE_STREAM_IDLE_TIMEOUT_SECS`):
+                // checked on the same tick, so a silent-but-open
+                // upstream cannot hold this task past the window.
+                if last_byte_at.elapsed() >= idle_timeout {
+                    tracing::warn!(
+                        url = %url_owned,
+                        idle_secs = idle_timeout.as_secs(),
+                        "SSE stream idle timeout — no bytes received within window; closing"
+                    );
+                    announce(&tx, SseStreamEnd::IdleTimeout).await;
+                    return;
+                }
+                continue;
+            }
+        };
+        last_byte_at = std::time::Instant::now();
+        let chunk_result = match chunk_result {
+            // Clean upstream close: the ONLY ending that announces
+            // nothing, because it is the only one where an empty tail
+            // is the honest answer.
+            Some(c) => c,
+            None => break,
+        };
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(detail) => {
+                // Pre-2026-09 this was a bare `Err(_) => break` — the
+                // ONE failure mode on this surface that logged nothing
+                // ANYWHERE, host or guest. Bounded: it terminates the
+                // loop, so at most one line per stream and at most
+                // MAX_SSE_STREAMS_PER_EXECUTION per execution.
+                tracing::warn!(
+                    url = %url_owned,
+                    detail = %detail,
+                    "SSE stream failed mid-body (sanitized transport detail)"
+                );
+                announce(&tx, SseStreamEnd::TransportError).await;
+                return;
+            }
+        };
+
+        let (events, abort) = parser.feed(&chunk);
+        for mut event in events {
+            // Hold a share of the stream's buffered-bytes budget until the
+            // guest receives this event (see MAX_SSE_BUFFERED_BYTES_PER_STREAM).
+            // Clamped to the whole budget so an event larger than it (possible
+            // when TALOS_SSE_MAX_EVENT_BYTES is raised) waits for an empty
+            // queue instead of deadlocking.
+            let cost = event
+                .buffered_len()
+                .clamp(1, MAX_SSE_BUFFERED_BYTES_PER_STREAM);
+            let Ok(permit) = buffered_budget
+                .clone()
+                .acquire_many_owned(u32::try_from(cost).unwrap_or(u32::MAX))
+                .await
+            else {
+                return; // budget closed: nothing is listening
+            };
+            event.buffered = Some(permit);
+            if tx.send(SseChannelItem::Event(event)).await.is_err() {
+                return; // Receiver dropped (close called)
+            }
+        }
+        if let Some(abort) = abort {
+            tracing::warn!(
+                url = %url_owned,
+                max_bytes = max_event_bytes,
+                "SSE stream exceeded max event size (unterminated line or oversized \
+                 data before a blank-line boundary); aborting stream"
+            );
+            announce(&tx, abort).await;
+            return;
+        }
+    }
+}
+
+/// The SSE line protocol, fed one body chunk at a time.
+///
+/// **Linear since 2026-09-25.** The reader used to consume each complete line
+/// with `buffer = buffer[nl_pos + 1..].to_string()` — a fresh copy of the WHOLE
+/// remaining buffer per line — so a chunk of many short lines cost
+/// O(lines × buffer): half a million `\n` in a 1 MiB buffer is ~2.5·10¹¹ bytes
+/// of memcpy. Lines are now read through a cursor and the consumed prefix is
+/// drained ONCE per chunk. The semantics are unchanged byte for byte (pinned
+/// against the retained per-line reference by
+/// `the_cursor_parser_agrees_with_the_copying_reference`), including both caps:
+/// an un-newlined buffer over `max_event_bytes` aborts before any of its lines
+/// are read, and accumulated `data:` over `max_event_bytes` aborts at the line
+/// that crosses it, after delivering the events completed before it.
+pub(crate) struct SseParser {
+    /// Raw BYTES, decoded one complete line at a time: decoding each network
+    /// chunk on its own turned a multi-byte UTF-8 character split across two
+    /// chunks into two U+FFFD replacement characters.
+    buffer: Vec<u8>,
+    event_type: Option<String>,
+    data_lines: Vec<String>,
+    data_bytes: usize,
+    event_id: Option<String>,
+    max_event_bytes: usize,
+}
+
+impl SseParser {
+    pub(crate) fn new(max_event_bytes: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            event_type: None,
+            data_lines: Vec::new(),
+            data_bytes: 0,
+            event_id: None,
+            max_event_bytes,
+        }
+    }
+
+    /// Append `chunk` and return the events it completed, plus the abort the
+    /// chunk triggered, if any (the events are still delivered first).
+    pub(crate) fn feed(
+        &mut self,
+        chunk: &[u8],
+    ) -> (
+        Vec<crate::context::SseEventInternal>,
+        Option<crate::context::SseStreamEnd>,
+    ) {
+        use crate::context::SseStreamEnd;
+        // SECURITY: cap both the incoming-byte buffer and the per-event
+        // accumulated data. A misbehaving server that never emits a blank
+        // line would otherwise grow `data_lines` monotonically until the
+        // worker OOMs, and one huge line with no `\n` would grow `buffer`.
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        if self.buffer.len() > self.max_event_bytes {
+            return (events, Some(SseStreamEnd::EventBytesCap));
+        }
+        let mut consumed = 0usize;
+        let mut abort = None;
+        while let Some(rel) = self.buffer[consumed..].iter().position(|&b| b == b'\n') {
+            let nl_pos = consumed + rel;
+            let mut raw = &self.buffer[consumed..nl_pos];
+            while let [rest @ .., b'\r'] = raw {
+                raw = rest;
+            }
+            let decoded = String::from_utf8_lossy(raw);
+            let line: &str = &decoded;
+            consumed = nl_pos + 1;
+            if line.is_empty() {
+                // Blank line = event boundary
+                if !self.data_lines.is_empty() {
+                    events.push(crate::context::SseEventInternal {
+                        event_type: self.event_type.take(),
+                        data: self.data_lines.join("\n"),
+                        id: self.event_id.take(),
+                        buffered: None,
+                    });
+                    self.data_lines.clear();
+                    self.data_bytes = 0;
+                }
+            } else if let Some(value) = line.strip_prefix("data:") {
+                let v = value.trim_start().to_string();
+                self.data_bytes = self.data_bytes.saturating_add(v.len()).saturating_add(1);
+                if self.data_bytes > self.max_event_bytes {
+                    abort = Some(SseStreamEnd::EventBytesCap);
+                    break;
+                }
+                self.data_lines.push(v);
+            } else if let Some(value) = line.strip_prefix("event:") {
+                self.event_type = Some(value.trim_start().to_string());
+            } else if let Some(value) = line.strip_prefix("id:") {
+                self.event_id = Some(value.trim_start().to_string());
+            }
+            // Skip comments (lines starting with :) and retry: fields
+        }
+        self.buffer.drain(..consumed);
+        (events, abort)
+    }
+}
+
+#[cfg(test)]
+mod sse_reader_bound_tests {
+    use super::*;
+    use crate::context::{SseChannelItem, SseEventInternal, SseStreamEnd};
+    use std::time::{Duration, Instant};
+
+    /// The pre-2026-09-25 per-line parse, verbatim in its string handling,
+    /// kept only as the reference the cursor parser is checked against.
+    struct CopyingReference {
+        buffer: String,
+        event_type: Option<String>,
+        data_lines: Vec<String>,
+        data_bytes: usize,
+        event_id: Option<String>,
+        max: usize,
+    }
+
+    impl CopyingReference {
+        fn feed(&mut self, chunk: &[u8]) -> (Vec<(Option<String>, String, Option<String>)>, bool) {
+            let mut out = Vec::new();
+            self.buffer.push_str(&String::from_utf8_lossy(chunk));
+            if self.buffer.len() > self.max {
+                return (out, true);
+            }
+            while let Some(nl_pos) = self.buffer.find('\n') {
+                let line = self.buffer[..nl_pos].trim_end_matches('\r').to_string();
+                self.buffer = self.buffer[nl_pos + 1..].to_string();
+                if line.is_empty() {
+                    if !self.data_lines.is_empty() {
+                        out.push((
+                            self.event_type.take(),
+                            self.data_lines.join("\n"),
+                            self.event_id.take(),
+                        ));
+                        self.data_lines.clear();
+                        self.data_bytes = 0;
+                    }
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    let v = value.trim_start().to_string();
+                    self.data_bytes = self.data_bytes.saturating_add(v.len()).saturating_add(1);
+                    if self.data_bytes > self.max {
+                        return (out, true);
+                    }
+                    self.data_lines.push(v);
+                } else if let Some(value) = line.strip_prefix("event:") {
+                    self.event_type = Some(value.trim_start().to_string());
+                } else if let Some(value) = line.strip_prefix("id:") {
+                    self.event_id = Some(value.trim_start().to_string());
+                }
+            }
+            (out, false)
+        }
+    }
+
+    fn triple(e: &SseEventInternal) -> (Option<String>, String, Option<String>) {
+        (e.event_type.clone(), e.data.clone(), e.id.clone())
+    }
+
+    #[test]
+    fn the_cursor_parser_agrees_with_the_copying_reference() {
+        const PIECES: &[&str] = &[
+            "data:", "data: x", "event: e", "id: 7", ": c", "\n", "\r\n", "\n\n", "ab", "retry: 1",
+            "data:yy",
+        ];
+        let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let mut events_seen = 0usize;
+        for _ in 0..2_000 {
+            let max = 16 + (next() % 64) as usize;
+            let mut new = SseParser::new(max);
+            let mut old = CopyingReference {
+                buffer: String::new(),
+                event_type: None,
+                data_lines: Vec::new(),
+                data_bytes: 0,
+                event_id: None,
+                max,
+            };
+            for _ in 0..(next() % 12) {
+                let chunk: String = (0..(next() % 6))
+                    .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+                    .collect();
+                let (a_events, a_abort) = new.feed(chunk.as_bytes());
+                let (b_events, b_abort) = old.feed(chunk.as_bytes());
+                let a: Vec<_> = a_events.iter().map(triple).collect();
+                assert_eq!(a, b_events, "events differ for chunk {chunk:?}");
+                assert_eq!(
+                    a_abort.is_some(),
+                    b_abort,
+                    "abort differs for chunk {chunk:?}"
+                );
+                events_seen += a.len();
+                if b_abort {
+                    break;
+                }
+            }
+        }
+        assert!(
+            events_seen >= 200,
+            "the generator must produce events ({events_seen})"
+        );
+    }
+
+    /// A million short lines in one 4 MiB buffer (TALOS_SSE_MAX_EVENT_BYTES is
+    /// operator-raisable; 4 MiB is a plausible setting). The copying parser
+    /// re-copied the remaining buffer per line: ~2·10¹² bytes of memcpy here,
+    /// minutes of CPU. The cursor parser is one pass.
+    ///
+    /// Measured at the 1 MiB DEFAULT the quadratic parser is not slow enough
+    /// to catch on a fast machine: ~1.25·10¹¹ bytes of cache-resident memcpy
+    /// took ~1.5 s here, so a 1 MiB fixture passed with the per-line copy
+    /// restored. That is still a ~10⁵× byte amplification a server can repeat
+    /// per chunk; it is just not a reliable test signal. Run on its own thread
+    /// with a watchdog so a regression FAILS instead of hanging the suite.
+    #[test]
+    fn a_chunk_of_many_short_lines_parses_in_linear_time() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let chunk = ": c\n".repeat(1_048_576); // 4 MiB, all comment lines
+            let mut p = SseParser::new(5 * 1024 * 1024);
+            let start = Instant::now();
+            let (events, abort) = p.feed(chunk.as_bytes());
+            let _ = tx.send((events.len(), abort.is_some(), start.elapsed()));
+        });
+        let (events, aborted, elapsed) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a 4 MiB chunk of short lines must parse in one pass, not quadratically");
+        assert_eq!((events, aborted), (0, false));
+        assert!(elapsed < Duration::from_secs(10), "({elapsed:?})");
+    }
+
+    /// A multi-byte character split across two network chunks decodes
+    /// intact: the parser buffers bytes and decodes a line only once complete.
+    #[test]
+    fn a_multibyte_character_split_across_chunks_decodes_intact() {
+        let bytes = "data: caf\u{e9} \u{2014} ok\n\n".as_bytes();
+        let split = bytes.iter().position(|&b| b == 0xE2).unwrap() + 1;
+        let mut p = SseParser::new(1024);
+        let (first, _) = p.feed(&bytes[..split]);
+        assert!(first.is_empty());
+        let (events, abort) = p.feed(&bytes[split..]);
+        assert!(abort.is_none());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "caf\u{e9} \u{2014} ok");
+    }
+
+    /// The bounded-MEMORY assertion: a server streaming 1 MiB events to a
+    /// guest that never calls `next-event` fills the stream's byte budget and
+    /// then the reader STOPS — it does not park 1 000 × 1 MiB in the channel.
+    #[tokio::test]
+    async fn a_stalled_guest_caps_the_bytes_the_reader_buffers() {
+        let one_event = format!("data: {}\n\n", "z".repeat(1024 * 1024 - 64));
+        let body = futures_util::stream::iter(
+            (0..50).map(move |_| Ok::<_, String>(bytes::Bytes::from(one_event.clone()))),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1_000);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            MAX_SSE_BUFFERED_BYTES_PER_STREAM,
+        ));
+        let reader = tokio::spawn(run_sse_reader(
+            body,
+            tx,
+            SseReaderConfig {
+                url: "https://example.test/".to_string(),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                idle_timeout: Duration::from_secs(60),
+                max_event_bytes: 2 * 1024 * 1024,
+                buffered_budget: budget.clone(),
+            },
+        ));
+        // Give the reader every chance to run ahead.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let queued = rx.len();
+        let queued_bytes = MAX_SSE_BUFFERED_BYTES_PER_STREAM - budget.available_permits();
+        assert!(
+            queued_bytes <= MAX_SSE_BUFFERED_BYTES_PER_STREAM,
+            "queued {queued_bytes} bytes"
+        );
+        assert!(
+            queued <= 4,
+            "a stalled guest must hold at most the budget's worth of 1 MiB events, got {queued}"
+        );
+        assert!(
+            !reader.is_finished(),
+            "the reader must be waiting, not done"
+        );
+        // Draining releases the budget and the reader moves on.
+        let mut received = 0;
+        while let Some(item) = rx.recv().await {
+            if let SseChannelItem::Event(_) = item {
+                received += 1;
+            }
+            if received == 50 {
+                break;
+            }
+        }
+        assert_eq!(received, 50, "every event is still delivered, in time");
+        reader.await.unwrap();
+        assert_eq!(
+            budget.available_permits(),
+            MAX_SSE_BUFFERED_BYTES_PER_STREAM
+        );
+    }
+
+    /// An event larger than the whole budget still gets through (it waits for
+    /// an empty queue instead of deadlocking), when the operator has raised
+    /// TALOS_SSE_MAX_EVENT_BYTES above the budget.
+    #[tokio::test]
+    async fn an_event_larger_than_the_budget_does_not_deadlock() {
+        let big = format!(
+            "data: {}\n\n",
+            "q".repeat(MAX_SSE_BUFFERED_BYTES_PER_STREAM + 10)
+        );
+        let body = futures_util::stream::iter(vec![Ok::<_, String>(bytes::Bytes::from(big))]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let reader = tokio::spawn(run_sse_reader(
+            body,
+            tx,
+            SseReaderConfig {
+                url: "https://example.test/".to_string(),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                idle_timeout: Duration::from_secs(60),
+                max_event_bytes: 16 * 1024 * 1024,
+                buffered_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    MAX_SSE_BUFFERED_BYTES_PER_STREAM,
+                )),
+            },
+        ));
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("must not deadlock");
+        assert!(matches!(got, Some(SseChannelItem::Event(_))));
+        reader.await.unwrap();
+        let _ = SseStreamEnd::EventBytesCap;
     }
 }

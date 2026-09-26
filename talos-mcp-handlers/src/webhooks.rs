@@ -79,7 +79,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_webhook_security_stats",
-            "description": "Return security statistics for webhooks: auth failure counts, rate-limit hits, and success counts per trigger (last 24h), plus a list of IPs currently blocked by the circuit breaker.",
+            "description": "Return security statistics for webhooks: auth failure counts, rate-limit hits, and success counts per trigger (last 24h), plus the (IP, trigger) pairs currently blocked by the circuit breaker.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -87,11 +87,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "reset_webhook_circuit_breaker",
-            "description": "Manually clear the circuit breaker block for a specific IP address, allowing it to attempt webhook authentication again.",
+            "description": "Manually clear the circuit breaker for a specific IP address, allowing it to attempt webhook authentication again. The breaker is keyed by (IP, trigger): a block covers one trigger. Omit trigger_id to clear every trigger's record for the IP. The reply reports how many records and active blocks were actually removed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "ip_address": { "type": "string", "description": "IPv4 or IPv6 address to unblock (e.g., '1.2.3.4' or '::1')" }
+                    "ip_address": { "type": "string", "description": "IPv4 or IPv6 address to unblock (e.g., '1.2.3.4' or '::1')" },
+                    "trigger_id": { "type": "string", "description": "Optional: clear only this trigger's record for the IP" }
                 },
                 "required": ["ip_address"]
             }
@@ -818,10 +819,16 @@ async fn handle_get_webhook_security_stats(
             .circuit_breaker
             .blocked_ips()
             .into_iter()
-            .map(|(ip, blocked_until)| {
+            .map(|(ip, trigger_id, blocked_until)| {
                 let remaining_secs = blocked_until.saturating_duration_since(now).as_secs();
+                // The breaker is keyed by (source, trigger) since 2026-09-25: a
+                // credential-failure block covers ONE trigger, so the entry
+                // names it. `trigger_id: null` is the source-wide block opened
+                // by probing many unknown trigger ids; it covers every trigger.
+                // An IPv6 source is its /64.
                 serde_json::json!({
                     "ip": ip.to_string(),
+                    "trigger_id": trigger_id.map(|t| t.to_string()),
                     "remaining_seconds": remaining_secs,
                 })
             })
@@ -895,15 +902,54 @@ async fn handle_reset_webhook_circuit_breaker(
         }
     };
 
-    state.circuit_breaker.record_success(ip);
-    tracing::info!(ip = %ip, "MCP operator reset webhook circuit breaker for IP");
+    let trigger_id: Option<Uuid> = match args.get("trigger_id").and_then(|v| v.as_str()) {
+        None | Some("") => None,
+        Some(t) => match Uuid::parse_str(t) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("'{}' is not a valid trigger_id UUID", t),
+                )
+            }
+        },
+    };
 
+    // A REAL reset. Until 2026-09-25 this called `record_success(ip)`, which
+    // MCP-439 had made a deliberate no-op (a success must not wipe failure
+    // history), and then answered `"cleared": true` regardless — the block was
+    // never cleared, it simply expired on its own. `reset_ip` removes the
+    // records and reports how many, so the reply can no longer claim a reset
+    // that did not happen.
+    let outcome = state.circuit_breaker.reset_ip(ip, trigger_id);
+    tracing::info!(
+        target: "talos_audit",
+        event_kind = "webhook_circuit_breaker_reset",
+        ip = %ip,
+        trigger_id = ?trigger_id,
+        records_removed = outcome.records_removed,
+        active_blocks_removed = outcome.active_blocks_removed,
+        "MCP operator reset webhook circuit breaker"
+    );
+
+    let message = if outcome.active_blocks_removed > 0 {
+        "Circuit breaker reset: the listed block(s) were removed. The IP may now attempt \
+         webhook authentication again."
+    } else if outcome.records_removed > 0 {
+        "No active block existed for this IP; its accumulated failure history was cleared."
+    } else {
+        "Nothing to reset: the circuit breaker held no record for this IP."
+    };
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&serde_json::json!({
-            "cleared": true,
+            "cleared": outcome.active_blocks_removed > 0,
             "ip": ip.to_string(),
-            "message": "Circuit breaker reset. The IP may now attempt webhook authentication again.",
+            "trigger_id": trigger_id.map(|t| t.to_string()),
+            "records_removed": outcome.records_removed,
+            "active_blocks_removed": outcome.active_blocks_removed,
+            "message": message,
         }))
         .unwrap_or_default(),
     )

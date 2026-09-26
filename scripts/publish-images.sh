@@ -176,7 +176,8 @@ echo
 # ── CI-green gate ─────────────────────────────────────────────────────
 # The local publish path has no CI between code and a production image;
 # quality.yml (full test suite + integration tests + RUSTSEC scan) runs
-# on PRs and nightly, but nothing previously verified the image being
+# on PRs, in the merge queue (on the exact commit that lands on main) and
+# nightly, but nothing previously verified the image being
 # pushed came from a commit that PASSED it. Require a successful
 # quality.yml conclusion for HEAD before pushing. Skipped for --no-push
 # (smoke builds publish nothing). Override: --skip-ci-check /

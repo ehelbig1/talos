@@ -223,6 +223,8 @@ impl SandboxProfile {
 ///   keeps evaluating to the same verdict. Disabling the symbol would
 ///   turn it into a PARSE ERROR and convert a working stored expression
 ///   into a node failure on deploy.
+// disallowed-method: rhai::Engine::new — this IS the sandbox builder every other engine comes from
+#[allow(clippy::disallowed_methods)]
 #[must_use]
 pub fn sandboxed_engine(profile: SandboxProfile) -> Engine {
     let mut engine = Engine::new();
@@ -334,6 +336,8 @@ mod sandbox_behaviour_tests {
     /// `base_path` for an absolute path, so this import SUCCEEDS on an
     /// `Engine::new()` default resolver and can only fail on the dummy —
     /// which is what makes the assertion load-bearing.
+    // disallowed-method: rhai::Engine::new — the control: rhai's default resolver DOES read the file
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn module_import_cannot_reach_a_real_file_on_disk() {
         let dir = std::env::temp_dir().join(format!(
@@ -458,6 +462,8 @@ mod why_the_size_caps_matter {
     /// not copy it; production engines come from
     /// [`super::sandboxed_engine`]. (Lint check 63 skips this file, which is
     /// why it compiles here and nowhere else.)
+    // disallowed-method: rhai::Engine::new — a deliberately UNCAPPED engine, to prove the caps matter
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn an_uncapped_engine_grows_megabytes_inside_the_operation_budget() {
         let mut e = rhai::Engine::new();

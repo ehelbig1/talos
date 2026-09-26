@@ -110,9 +110,13 @@ jobs:
   # CI analogue of publish-images.sh's gate: nothing else stands between
   # this workflow and a production image, so refuse to build unless the
   # heavy correctness gates (full test suite, integration tests, RUSTSEC
-  # scan) passed for the EXACT commit being published. quality.yml runs on
-  # push:main, so every squash-merged commit has a run bound to its own
-  # SHA. Bypass: the `skip_ci_check` dispatch input — explicit, visible in
+  # scan) passed for the EXACT commit being published. The merge queue runs
+  # quality.yml on the merge commit that becomes main's HEAD, so every merged
+  # commit has a run bound to its own SHA (a queue run for a change that
+  # touches no Rust skips the Rust jobs — the Rust tree it publishes is the
+  # one the previous commit's run tested). A commit that reached main without
+  # the queue has no run: dispatch one (`gh workflow run quality.yml --ref
+  # main`). Bypass: the `skip_ci_check` dispatch input — explicit, visible in
   # the run log.
   ci-gate:
     name: Publish gate (quality.yml green)

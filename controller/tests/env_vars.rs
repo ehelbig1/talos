@@ -1,3 +1,4 @@
+// ci-runner: integration-serial — needs the controller DB env, one thread (scripts/ci_test_targets.py)
 //! Tests that the application panics when required environment variables are missing.
 
 #[cfg(test)]

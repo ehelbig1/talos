@@ -44,6 +44,8 @@ use uuid::Uuid;
 /// on a transient Postgres error would silently route a sensitive actor's
 /// data to Anthropic, or run a module above its ceiling — NOT acceptable
 /// for a privacy / capability ceiling.
+// disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — apply_actor_to_engine: the actor-application path itself
+#[allow(clippy::disallowed_methods)]
 pub async fn apply_actor_to_engine(
     repo: &ActorRepository,
     engine: &mut ParallelWorkflowEngine,

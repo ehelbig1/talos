@@ -1,39 +1,30 @@
 name: Quality (heavy gates)
 
-# The correctness gates that are too slow or too network-dependent for the
-# local pre-push hook (`make lint` + `make lint-frontend`), so they need a CI
-# home or they silently rot — exactly how the RLS isolation suite sat red on
-# main for days (PR #181/#182). Lean by design: it runs ONLY the correctness
-# gates. The expensive image builds (docker / sandbox-image) stay in ci.yml,
-# which remains workflow_dispatch-only.
+# The authoritative correctness gates. Local hooks are deliberately a FAST
+# subset (rustfmt, the structural lints, eslint/prettier — see .githooks/); this
+# workflow is the one place clippy, the test suites, the integration suite and
+# the networked advisory scan run, so nothing is checked twice per change.
 #
-# Unique value over the pre-push hook:
-#   * full Rust workspace test suite (unit) — too slow for pre-push
-#   * env-gated INTEGRATION tests (RLS isolation, crash-recovery, …) — the
-#     pre-push hook can't spin up Postgres/Redis; `cargo nextest` alone SKIPS
-#     them (they no-op unless TALOS_TEST_*_URL is set)
-#   * networked RUSTSEC advisory scan — pre-push runs only the OFFLINE
-#     cargo-deny checks (bans/licenses/sources)
-#   * frontend lint + test as an unbypassable backstop for contributors who
-#     skip `make hooks`
-#   * rustfmt, the structural lints (`scripts/lint-structural.sh`, 90 checks)
-#     and `cargo clippy -D warnings` — since 2026-09-12. Until then they lived
-#     ONLY in ci.yml, which is workflow_dispatch-only and had run ZERO times in
-#     the repository's history (quality.yml: 1 362 runs), and in the pre-push
-#     hook, which `git push --no-verify` skips. Every "lint green" in the
-#     engineering log before that date was a local run. The frontend line
-#     above gives the reason it was wrong to leave them out: the same
-#     "contributors who skip `make hooks`" bypass the Rust gates too.
+# How a change moves through it (docs/ci.md has the full picture):
+#   * pull_request — every push to a PR branch; a newer push cancels the older
+#     run. Job groups the diff cannot affect are skipped (`changes`).
+#   * merge_group  — the merge queue runs it ONCE on the merge commit that will
+#     land on main; that run is the per-SHA green run the publish gate reads.
+#   * schedule / workflow_dispatch — everything, unconditionally.
+# Branch protection requires ONE check: "Quality gate" (the `gate` job).
 on:
   pull_request:
     branches: [main]
-  # push:main exists for the publish gate (2026-07-01): publish-images.sh
-  # refuses to push an image unless `gh run list --commit HEAD` shows a
-  # green quality.yml run. PR runs attach to the PR *head* SHA, so a
-  # squash-merged commit on main would otherwise never have a run for its
-  # own SHA and the gate could never pass. Cost: one extra run per merge.
-  push:
-    branches: [main]
+  # The merge queue is the ONE run a change gets on the tree it will become
+  # (2026-09-25). The queue builds the merge commit that lands on main, so its
+  # run is bound to main's SHA — which is what the publish gate
+  # (`gh run list --commit <sha>`) looks up. That replaces `push: main`, which
+  # re-ran the full suite on a tree the PR run had just tested and, with
+  # cancel-in-progress, cancelled itself when merges landed close together
+  # (2 of 5 main runs on 2026-09-25, leaving those SHAs with no green run).
+  # Requires the repository's merge queue to be enabled for `main` with
+  # "Quality gate" as the required check — see docs/ci.md.
+  merge_group:
   schedule:
     - cron: "0 7 * * *" # nightly 07:00 UTC — catches new RUSTSEC advisories within 24h
   workflow_dispatch:
@@ -48,10 +39,50 @@ env:
   RUST_TOOLCHAIN: "1.95"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only PR runs cancel each other (a newer push to the branch supersedes the
+  # older run). A merge-queue, nightly or dispatched run is never cancelled:
+  # each is the only run its commit will get.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # ── Which job groups can this change affect? ───────────────────────────────
+  # PR and merge-queue runs skip job groups a change cannot reach (a CLAUDE.md
+  # or frontend-only change does not rebuild the Rust workspace). Skipped jobs
+  # count as passing in the "Quality gate" job below. Nightly and dispatched
+  # runs, and any change to the CI plumbing itself, run everything
+  # (scripts/ci-changed-areas.sh).
+  changes:
+    name: Changed areas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.areas.outputs.rust }}
+      frontend: ${{ steps.areas.outputs.frontend }}
+      observability: ${{ steps.areas.outputs.observability }}
+      migrations: ${{ steps.areas.outputs.migrations }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Classify the diff
+        id: areas
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+          MQ_HEAD: ${{ github.event.merge_group.head_sha }}
+        # pipefail: a crash in the classifier must FAIL this job (the gate then
+        # fails on it) rather than leave empty outputs that skip every job.
+        run: |
+          set -o pipefail
+          case "$EVENT" in
+            pull_request) bash scripts/ci-changed-areas.sh "$PR_BASE" "$(git rev-parse HEAD)" ;;
+            merge_group)  bash scripts/ci-changed-areas.sh "$MQ_BASE" "$MQ_HEAD" ;;
+            *)            bash scripts/ci-changed-areas.sh --all ;;
+          esac | tee -a "$GITHUB_OUTPUT"
+
   # ── Supply-chain: networked RUSTSEC advisories + bans/licenses/sources ─────
   # `make audit` = cargo-deny (advisories + bans + licenses + sources) + the
   # secret-pattern scan + migration-idempotency checks. The advisory DB fetch
@@ -133,6 +164,8 @@ jobs:
   # workflow nor `scripts/test-integration.sh`.
   test:
     name: Rust tests (unit / lib)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -212,121 +245,11 @@ jobs:
         # a guard that exists and is never consulted.
         run: cargo nextest run --workspace --lib --bins --no-fail-fast
 
-      - name: Run module-template catalog tests
-        # An integration binary (so NOT covered by --lib above), but DB-free: it
-        # exercises talos_module_templates::all_templates disk discovery, reading
-        # `module-templates/` straight from the checkout. Brought into CI once the
-        # CARGO_MANIFEST_DIR path-resolution bug was fixed (the discovery fallback
-        # had silently resolved to a non-existent dir since the May-2026 crate move,
-        # so every get_template() returned None). The OTHER tests/-dir binaries are
-        # still excluded here — they need a built WASM sandbox / full-app DB
-        # harness (tracked in docs/backlog.md).
-        run: cargo nextest run -p controller --test module_template_tests
-
-      - name: Run worker sandbox security tests
-        # Integration binary, DB-free: exercises the WASM sandbox security
-        # boundaries (path-traversal rejection, capability gates, SSRF host
-        # allow/deny, resource caps) via an in-process TalosContext — no network
-        # or DB required. Brought into CI after the stale path-traversal tests
-        # were corrected to the post-MCP-586 capability contract (PR #192). These
-        # are tenant-isolation/sandbox-escape guards — exactly the class that
-        # must not silently rot, which it did while never-in-CI.
-        run: cargo nextest run -p worker --test sandbox_security_tests
-
-      - name: Run DB-free security integration binaries
-        # More tests/-dir binaries that need NO database or container — pure
-        # logic / in-process harnesses, like the two steps above. They never ran
-        # in CI (only --lib + the two explicit binaries did), so they were free
-        # to rot. All verified green. Run via nextest specifically because
-        # `csrf_integration_tests` mutates process-global env (RUST_ENV,
-        # ALLOW_DEV_UNSAFE_CSRF_BYPASS) — under `cargo test`'s thread parallelism
-        # a sibling test's env write races and falsely "bypasses" CSRF; nextest's
-        # process-per-test isolation makes each test's env private, so the gate is
-        # stable. Covers: JWT security, CSRF protection, input validation,
-        # MCP-safety, webhook security (controller); tier-1 LLM egress + agentic
-        # safety (worker); signed job-protocol security (HMAC/replay/wire-format).
-        run: |
-          cargo nextest run -p controller \
-            --test jwt_security_tests \
-            --test webhook_security_tests \
-            --test webhooks_hmac_test \
-            --test csrf_integration_tests \
-            --test input_validation_tests \
-            --test mcp_safety_tests
-          cargo nextest run -p worker \
-            --test tier1_llm_enforcement_tests \
-            --test agentic_safety_tests
-          cargo nextest run -p talos-workflow-job-protocol --test security_tests
-
-      - name: Run DB-free engine + protocol + remaining integration binaries
-        # The rest of the workspace's DB-free tests/-dir binaries — engine
-        # behaviour (cancellation, checkpointing, fan-in, subflow recursion,
-        # wait/pause/resume, timeouts, rate-limit, precheck, trigger input),
-        # signed job-protocol serialization + wire-format snapshots, worker
-        # runtime/trap/kill-switch, and controller circuit-breaker /
-        # execution-event / JS-compilation / NATS-topic / rhai / worker-manager.
-        # All verified green and need no DB or container.
-        #
-        # `kill_switch_tests` joined 2026-07-30. It is DB-free and its WASM
-        # fixtures are built IN-PROCESS from WAT (`wat` + `wit_component`
-        # dev-deps reading `wit/talos.wit` out of the checkout) — no
-        # talos-builder image, no cargo-component, no network — so it belongs
-        # here beside its six already-gated worker siblings rather than in the
-        # `integration` job. Same rationale as `sandbox_security_tests`: these
-        # are the fuel/epoch/cancellation guards the entire sandbox design
-        # leans on, exactly the class that must not silently rot.
-        #
-        # Every `tests/`-dir binary in the workspace is now named by either
-        # this workflow or `scripts/test-integration.sh`, EXCEPT the handful
-        # carrying an explicit `// ci-ungated: <reason>` marker (they need a
-        # builder image, a live Ollama/Neo4j, a real TLS nats-server, or a
-        # configured embedding provider). Structural lint check 64 fails the
-        # build if a new binary appears in neither place.
-        run: |
-          cargo nextest run -p talos-workflow-engine \
-            --test cancellation \
-            --test chain_dispatch_gate \
-            --test checkpointing \
-            --test child_run_dispatch_recording \
-            --test degraded_inputs \
-            --test edge_routing \
-            --test ensemble_vote_key \
-            --test fan_in_join \
-            --test loop_body_gates \
-            --test precheck_errors \
-            --test rate_limit_store \
-            --test subflow_fuel_attribution \
-            --test subflow_recursion \
-            --test system_node_failure_routing \
-            --test trigger_input \
-            --test wait_pause_resume \
-            --test workflow_timeout
-          cargo nextest run -p talos-workflow-job-protocol \
-            --test serialization \
-            --test wire_format_snapshots
-          # talos-memory has a SAME-NAMED `wire_format_snapshots` binary (the
-          # memory/integration-state signed-wire surface, #612). It needs its
-          # own `-p` invocation: the name collision with the job-protocol one
-          # above is precisely what hid the fact that it ran nowhere. DB-free
-          # — literal JSON + literal MAC hex, no Postgres.
-          cargo nextest run -p talos-memory --test wire_format_snapshots
-          # DB-free and store-free: it MUTATES PROCESS ENV (AWS_* vs the
-          # verifier's own variables) to pin that the audit-chain verifier
-          # never falls back to the write-only writer's credentials, so it owns
-          # its process — one test, one binary. Same isolation reason as
-          # csrf_integration_tests two steps up.
-          cargo nextest run -p talos-audit-ledger --test verifier_identity_tests
-          cargo nextest run -p worker \
-            --test runtime_test \
-            --test runtime_integration_test \
-            --test trap_test \
-            --test kill_switch_tests
-          cargo nextest run -p controller \
-            --test execution_event_tests \
-            --test js_compilation_tests \
-            --test nats_topic_tests \
-            --test rhai_check \
-            --test worker_manager_tests
+      # Every tests/ binary that needs no service: discovered by
+      # scripts/ci_test_targets.py (`dbfree`), so a new test file registers
+      # itself — no hand-kept `--test` list for parallel PRs to collide on.
+      - name: Run DB-free integration-test binaries
+        run: bash scripts/ci-run-dbfree-tests.sh
 
       - name: Run doctests
         # nextest does NOT run doctests (a documented limitation), so the steps
@@ -352,6 +275,8 @@ jobs:
   # command locally and here. A sweep is not a gate (check 64); this is the gate.
   alert-rules:
     name: Alert rules (promtool check + unit tests)
+    needs: changes
+    if: needs.changes.outputs.observability == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -365,6 +290,8 @@ jobs:
 
   catalog:
     name: Catalog templates compile
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -399,9 +326,20 @@ jobs:
   # This is the gate that catches what `cargo nextest` SKIPS — e.g. the RLS
   # write-isolation regression in PR #181/#182.
   integration:
-    name: Rust tests (integration / DB)
+    name: Rust tests (integration / DB) ${{ matrix.shard }}/3
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # One ~23-minute serial job was the whole run's critical path. The work
+    # list partitions exactly (scripts/test-integration.sh, TALOS_IT_SHARD),
+    # so three runners each compile and run a third of it.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      TALOS_IT_SHARD: "${{ matrix.shard }}/3"
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -454,6 +392,10 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: quality-integration
+          # Three shards share one key; letting all three save races for the
+          # same cache entry. Shard 1 saves; the dependency graph it caches is
+          # what the other two reuse.
+          save-if: ${{ matrix.shard == 1 }}
 
       - name: Install sqlx-cli
         # `make test-integration` provisions its migrated DBs from the RFC 0009
@@ -473,6 +415,8 @@ jobs:
   # ── Frontend: lint + typecheck + tests (backstop for non-`make hooks` devs) ─
   frontend:
     name: Frontend (lint + test)
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     # 10 left no headroom: `npm ci` is normally 1m02s-2m34s but was measured
     # at 7m02s on 2026-09-04 against a degraded registry, which alone spent 70%
@@ -643,6 +587,8 @@ jobs:
   # 20260702160000).
   schema-baseline:
     name: Migration baseline verifier (RFC 0009)
+    needs: changes
+    if: needs.changes.outputs.migrations == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -711,6 +657,8 @@ jobs:
 
   sqlx-cache:
     name: sqlx offline cache (compile-checked queries)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     # Guards the committed `.sqlx/` metadata against drift: every `sqlx::query!`
     # in the workspace is re-validated against a freshly-migrated schema, and the
     # cache must already match (no regeneration needed). If it's stale, the build
@@ -831,24 +779,26 @@ jobs:
       - name: helm must be present (check 5 skips without it)
         run: helm version
 
-      - name: rustfmt --check
-        run: cargo fmt --all -- --check
-
-      - name: Structural lints
+      # rustfmt and the WIT drift diff used to be separate steps here AND
+      # structural checks 35 and 16 — every PR ran each of them twice. The
+      # structural copies are the ones kept: they name the offending files.
+      - name: Structural lints (incl. rustfmt = check 35, WIT drift = check 16)
         run: bash scripts/lint-structural.sh
 
-      - name: WIT drift check
+      - name: Changelog fragments are well-formed
         run: |
-          diff -q wit/talos.wit module-templates/wit/talos.wit \
-            || { echo "::error::wit/talos.wit and module-templates/wit/talos.wit have drifted"; exit 1; }
+          python3 scripts/changelog-fragments.py self-test
+          python3 scripts/changelog-fragments.py check
 
   # ── Clippy: workspace lint with -D warnings ────────────────────────────────
   # Separate from `test` so the two run in parallel; cargo cannot share
   # metadata across `--cfg test` and non-test invocations, so merging them
   # re-type-checks every dependency (ci.yml's own measurement). Scope matches
-  # `make lint` (check 7): bin+lib, `--no-deps`, not `--all-targets`.
+  # `make lint-full` (check 7): `--all-targets --no-deps` (since package DO).
   clippy:
     name: Clippy (-D warnings)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -906,4 +856,39 @@ jobs:
       # compiling the test targets, which the cache below already holds for
       # the test job.
       - name: cargo clippy --workspace --all-targets --no-deps -- -D warnings
-        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+        # clippy.toml's disallowed-methods rules (checks 29/53/63/78) fail
+        # this step at any unsanctioned call. A rule whose path stopped
+        # resolving is only a WARNING that -D warnings does not fail, so the
+        # log is checked for it: that rule would otherwise be silently off.
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --no-deps -- -D warnings 2>&1 | tee "$RUNNER_TEMP/clippy.log"
+          if grep -q 'does not refer to a reachable function' "$RUNNER_TEMP/clippy.log"; then
+            echo "::error::a clippy.toml disallowed-methods path no longer resolves — that rule is off"
+            grep -A3 'does not refer to a reachable function' "$RUNNER_TEMP/clippy.log"
+            exit 1
+          fi
+
+  # ── The one required check ──────────────────────────────────────────────────
+  # Branch protection and the merge queue require THIS job only. It passes
+  # when every job above passed or was skipped as unaffected by the change
+  # (see `changes`), and fails on any failure or cancellation — so adding a
+  # job above needs no settings change, just an entry in `needs`.
+  gate:
+    name: Quality gate
+    if: always()
+    needs: [changes, audit, test, alert-rules, catalog, integration, frontend, schema-baseline, sqlx-cache, lint, clippy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed or was skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a required job ended '$r'"; exit 1 ;;
+            esac
+          done

@@ -3629,6 +3629,8 @@ mod loop_iteration_execution_row_tests {
 
     /// Engine wired with the in-memory adapters a loop dispatch needs:
     /// a module fetcher, a user, an actor, and a recording execution store.
+    // disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — test fixture: an engine with an arbitrary actor, no ceilings in play
+    #[allow(clippy::disallowed_methods)]
     fn engine_with_loop(
         loop_node: Uuid,
         body_node: Uuid,
@@ -3637,12 +3639,6 @@ mod loop_iteration_execution_row_tests {
     ) -> ParallelWorkflowEngine {
         let mut engine = ParallelWorkflowEngine::new();
         engine.set_user_id(Uuid::new_v4());
-        // Bare `set_actor_id` needs no opt-out here: lint check 29 excludes
-        // `talos-workflow-engine/**` wholesale, and check 3 (whose
-        // `allow-agent-context-key` marker an earlier draft pasted onto this
-        // line) only greps `__agent_context__`, in other crates. An inert
-        // opt-out reads as "this tripped a lint and was excused" — a claim
-        // neither check would ever make.
         engine.set_actor_id(Uuid::new_v4());
         // A bare engine has no evaluator, and `eval_bool` fail-closes to
         // false — which would silently stop every loop after one iteration

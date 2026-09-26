@@ -2198,6 +2198,22 @@ pub fn is_tier2_llm_vault_path(vault_path: &str) -> bool {
 ///   shadowing) and the validator can't disambiguate from the AST alone;
 ///   the role-wrap (M-2) is the fence for that case.
 ///
+/// 4. **Session state that outlives the transaction.** Guest SQL runs
+///    inside `BEGIN … COMMIT` on a POOLED connection, and two function
+///    families leave state the transaction boundary does not clear —
+///    denied by FAMILY in [`DISALLOWED_SQL_FUNCTION_PREFIXES`], not by
+///    enumerating today's names. A SESSION-level advisory lock
+///    (`pg_advisory_lock(k)`) survives COMMIT and ROLLBACK, so the
+///    connection went back to the pool still holding it — for the rest
+///    of that connection's life — and the controller takes its own
+///    advisory locks on the same pool (budget admission, secret upsert,
+///    the Google Calendar fleet lock). Large-object writers
+///    (`lo_create`, `lo_from_bytea`, `lo_put`, `lowrite`) create rows in
+///    `pg_largeobject` that outlive the transaction and every tenant
+///    boundary: storage nothing reaps. `loread` / `lowrite` are the two
+///    members spelled without the `lo_` prefix, so they are listed
+///    exactly.
+///
 /// **Extending the list.** Adding a new entry requires updating both the
 /// worker tests (`worker/src/sql_validator.rs`) and the controller-side
 /// mirror tests (`talos-rpc-subscribers`). The deliberate-duplication
@@ -2225,8 +2241,16 @@ pub const DISALLOWED_SQL_FUNCTIONS: &[&str] = &[
     "pg_rotate_logfile",
     "pg_promote",
     // ── Large object FS I/O (lo_import / lo_export) ─────────────────────
+    // Also covered by the `lo_` FAMILY prefix below; kept by name because
+    // they are the worst members (server-side filesystem I/O) and the
+    // categorical tests name them.
     "lo_import",
     "lo_export",
+    // ── Large-object members WITHOUT the `lo_` prefix ───────────────────
+    // The rest of the family (`lo_create`, `lo_from_bytea`, `lo_put`,
+    // `lo_open`, …) is denied by `DISALLOWED_SQL_FUNCTION_PREFIXES`.
+    "loread",
+    "lowrite",
     // ── adminpack filesystem write/delete ───────────────────────────────
     // The read side (pg_read_file/…) is covered above; adminpack adds the
     // MUTATION side, which is strictly worse. Typically not installed, but
@@ -2318,22 +2342,55 @@ pub const DISALLOWED_SQL_FUNCTIONS: &[&str] = &[
     "xmltable",
 ];
 
+/// Function-name FAMILIES guest SQL must never invoke, matched as a
+/// case-insensitive prefix of the (schema-stripped) name. Risk class 4 on
+/// [`DISALLOWED_SQL_FUNCTIONS`]: state that outlives the guest's
+/// transaction on a pooled connection.
+///
+/// * `pg_advisory_` / `pg_try_advisory_` — every advisory-lock function.
+///   The SESSION-level ones survive COMMIT/ROLLBACK; the xact-level ones
+///   are denied with them because a guest has no legitimate use for
+///   either and a key that collides with the controller's own
+///   `pg_advisory_xact_lock` callers blocks those paths for the length of
+///   the guest's statement.
+/// * `lo_` — every large-object function (`lo_create`, `lo_creat`,
+///   `lo_from_bytea`, `lo_put`, `lo_open`, `lo_unlink`, `lo_get`, …).
+///   Created objects persist in `pg_largeobject` after the transaction.
+///
+/// A PREFIX, not today's names, so a Postgres release that adds a family
+/// member is denied the day it ships; the pinned list in this crate's
+/// tests is what proves the prefix covers every name the server has
+/// today. Deliberately narrow: `pg_` alone would deny `pg_typeof`, and
+/// `lo` without the underscore would deny `lower` / `log`.
+pub const DISALLOWED_SQL_FUNCTION_PREFIXES: &[&str] = &["pg_advisory_", "pg_try_advisory_", "lo_"];
+
 /// True iff `name` (case-insensitive, schema component already stripped)
-/// appears in [`DISALLOWED_SQL_FUNCTIONS`]. The schema strip is the
+/// appears in [`DISALLOWED_SQL_FUNCTIONS`] OR starts with one of the
+/// [`DISALLOWED_SQL_FUNCTION_PREFIXES`] families. The schema strip is the
 /// caller's responsibility — the AST visitor walks `ObjectName` and
 /// passes the trailing identifier here, also re-checking the `pg_catalog`
 /// qualified form because user code may write `pg_catalog.pg_sleep` to
 /// bypass search-path tricks.
 ///
+/// This is the ONE matcher: the worker validator
+/// (`talos-worker-runtime::sql_validator`) and the controller's
+/// `talos.database.query` re-parse (`talos-rpc-subscribers`) both call it,
+/// so the family match reaches both fences from this one function. Never
+/// test `DISALLOWED_SQL_FUNCTIONS.contains(..)` directly — that is the
+/// exact-only match and misses every family.
+///
 /// Constant-time match isn't needed — function names are not secrets and
-/// the entire deny-list is public. The linear scan over ~25 short strings
-/// is faster than the hash-table setup cost.
+/// the entire deny-list is public. The linear scan over ~65 short strings
+/// plus three prefixes is faster than the hash-table setup cost.
 pub fn is_disallowed_sql_function(name: &str) -> bool {
     // Lowercase comparison. PG normalises unquoted identifiers to lower
     // at parse time, but sqlparser preserves the original case so we
     // normalise here for the comparison.
     let lower = name.to_ascii_lowercase();
     DISALLOWED_SQL_FUNCTIONS.contains(&lower.as_str())
+        || DISALLOWED_SQL_FUNCTION_PREFIXES
+            .iter()
+            .any(|family| lower.starts_with(family))
 }
 
 /// True iff `path` is consumed by a controller-internal subsystem (LLM
@@ -2717,6 +2774,154 @@ mod disallowed_sql_function_tests {
             assert!(
                 is_disallowed_sql_function(f),
                 "io/dblink `{f}` must be denied"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Session-state families (advisory locks + large objects): denied by PREFIX
+// ============================================================================
+#[cfg(test)]
+mod disallowed_sql_function_family_tests {
+    use super::{
+        is_disallowed_sql_function, DISALLOWED_SQL_FUNCTIONS, DISALLOWED_SQL_FUNCTION_PREFIXES,
+    };
+
+    /// EVERY `pg_catalog` function of the two families on PostgreSQL 17.11
+    /// (the version `migrations/.baseline/schema.sql` is dumped from and the
+    /// dev/CI image runs), read from the server rather than from docs:
+    ///
+    /// ```sql
+    /// SELECT DISTINCT proname FROM pg_proc p
+    ///   JOIN pg_namespace n ON n.oid = p.pronamespace
+    ///  WHERE n.nspname = 'pg_catalog'
+    ///    AND (proname LIKE 'pg\_advisory%' OR proname LIKE 'pg\_try\_advisory%'
+    ///         OR proname LIKE 'lo\_%' OR proname IN ('loread', 'lowrite'))
+    /// ```
+    ///
+    /// 29 names / 41 overloads (the lock functions each have a `(bigint)` and
+    /// an `(integer, integer)` form). Migration
+    /// `20260925160000_revoke_advisory_and_lo_from_public.sql` walks the same
+    /// predicate, so this list and the REVOKE cover one population.
+    const PG17_SESSION_STATE_FAMILY: &[&str] = &[
+        "lo_close",
+        "lo_creat",
+        "lo_create",
+        "lo_export",
+        "lo_from_bytea",
+        "lo_get",
+        "lo_import",
+        "lo_lseek",
+        "lo_lseek64",
+        "lo_open",
+        "lo_put",
+        "lo_tell",
+        "lo_tell64",
+        "lo_truncate",
+        "lo_truncate64",
+        "lo_unlink",
+        "loread",
+        "lowrite",
+        "pg_advisory_lock",
+        "pg_advisory_lock_shared",
+        "pg_advisory_unlock",
+        "pg_advisory_unlock_all",
+        "pg_advisory_unlock_shared",
+        "pg_advisory_xact_lock",
+        "pg_advisory_xact_lock_shared",
+        "pg_try_advisory_lock",
+        "pg_try_advisory_lock_shared",
+        "pg_try_advisory_xact_lock",
+        "pg_try_advisory_xact_lock_shared",
+    ];
+
+    #[test]
+    fn every_pg17_family_member_is_denied_in_any_case() {
+        for f in PG17_SESSION_STATE_FAMILY {
+            assert!(is_disallowed_sql_function(f), "`{f}` must be denied");
+            assert!(
+                is_disallowed_sql_function(&f.to_ascii_uppercase()),
+                "`{}` must be denied (Postgres folds unquoted identifiers)",
+                f.to_ascii_uppercase()
+            );
+            // Mixed case: capitalise every other character.
+            let mixed: String = f
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            assert!(
+                is_disallowed_sql_function(&mixed),
+                "`{mixed}` must be denied"
+            );
+        }
+    }
+
+    /// The PREFIX is load-bearing, and this is the test that says so: most of
+    /// the family is deliberately NOT in the exact list, so a refactor back to
+    /// `DISALLOWED_SQL_FUNCTIONS.contains(..)` alone fails here rather than
+    /// silently re-admitting `pg_advisory_lock`.
+    #[test]
+    fn the_family_is_denied_by_prefix_not_by_enumeration() {
+        let prefix_only: Vec<&&str> = PG17_SESSION_STATE_FAMILY
+            .iter()
+            .filter(|f| !DISALLOWED_SQL_FUNCTIONS.contains(f))
+            .collect();
+        assert!(
+            prefix_only.len() >= 20,
+            "most of the family must be covered by the prefix alone, got {prefix_only:?}"
+        );
+        for f in &prefix_only {
+            assert!(
+                DISALLOWED_SQL_FUNCTION_PREFIXES
+                    .iter()
+                    .any(|p| f.starts_with(p)),
+                "`{f}` is in neither the exact list nor a family prefix"
+            );
+            assert!(is_disallowed_sql_function(f), "`{f}` must be denied");
+        }
+        // A family member a FUTURE Postgres might add is denied today.
+        for future in [
+            "pg_advisory_lock_timeout",
+            "pg_try_advisory_session_lock",
+            "lo_compress",
+        ] {
+            assert!(
+                is_disallowed_sql_function(future),
+                "a new family member `{future}` must be denied by the prefix"
+            );
+        }
+    }
+
+    /// Real `pg_catalog` functions that share a stem with a family but are not
+    /// in it (read from the same server: every `lo%` / `%advisory%` proname
+    /// outside the families is one of `log`, `log10`, `lower`, `lower_inc`,
+    /// `lower_inf`), plus the prefixes minus their separator. The prefixes end
+    /// in `_` precisely so these stay callable.
+    #[test]
+    fn near_misses_are_not_denied() {
+        for f in [
+            "log",
+            "log10",
+            "lower",
+            "lower_inc",
+            "lower_inf",
+            "lo",
+            "pg_advisory",
+            "pg_try_advisory",
+            "pg_advisorylock",
+            "pg_typeof",
+        ] {
+            assert!(
+                !is_disallowed_sql_function(f),
+                "`{f}` is not a family member and must stay callable"
             );
         }
     }

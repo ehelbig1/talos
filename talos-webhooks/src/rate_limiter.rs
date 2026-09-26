@@ -299,6 +299,7 @@ impl CircuitBreaker {
         let Some(scope) = failure_type.breaker_scope(trigger_id) else {
             tracing::debug!(
                 ip = %ip,
+                trigger_id = %trigger_id,
                 failure_type = %failure_type,
                 "Circuit breaker: trigger-state failure not counted (shared sender IPs)"
             );
@@ -380,17 +381,37 @@ impl CircuitBreaker {
     /// attacker holding one valid trigger could otherwise interleave successes
     /// with failed probes to keep the counter below the threshold forever.
     /// Failures decay only via the `CB_FAILURE_WINDOW` quiet window.
-    pub fn record_success(&self, _ip: IpAddr) {
+    pub fn record_success(&self, _ip: IpAddr, _trigger_id: Uuid) {
         // Intentionally no-op.
     }
 
-    /// Operator reset: forget every record for `ip`'s source (all scopes),
-    /// unblocking it. Returns how many records were removed.
-    pub fn reset_source(&self, ip: IpAddr) -> usize {
+    /// Operator reset: forget every record for `ip`'s source (the /64 for an
+    /// IPv6 address, see [`breaker_source`]) — its record against one trigger
+    /// when `trigger_id` is given, or every record including the source-wide
+    /// enumeration block otherwise. Returns how many
+    /// records were removed and how many of those were an ACTIVE block, so the
+    /// caller can say what it actually did.
+    ///
+    /// This exists because the MCP `reset_webhook_circuit_breaker` tool used to
+    /// call [`Self::record_success`] — which MCP-439 had made a deliberate
+    /// no-op — and then answer `"cleared": true`. The reset never cleared
+    /// anything; the block simply expired on its own a minute later.
+    pub fn reset_ip(&self, ip: IpAddr, trigger_id: Option<Uuid>) -> ResetOutcome {
+        let now = Instant::now();
         let source = breaker_source(ip);
-        let before = self.records.len();
-        self.records.retain(|k, _| k.source != source);
-        before.saturating_sub(self.records.len())
+        let mut outcome = ResetOutcome::default();
+        self.records.retain(|key, record| {
+            let matches = key.source == source
+                && trigger_id.is_none_or(|t| key.scope == BreakerScope::Trigger(t));
+            if matches {
+                outcome.records_removed += 1;
+                if record.blocked_until.is_some_and(|until| until > now) {
+                    outcome.active_blocks_removed += 1;
+                }
+            }
+            !matches
+        });
+        outcome
     }
 
     /// Remove stale entries where `last_failure + max_age <= now`.
@@ -401,23 +422,35 @@ impl CircuitBreaker {
             .retain(|_, r| now.duration_since(r.last_failure) < max_age);
     }
 
-    /// Currently-blocked sources for observability, one entry per source
-    /// (the latest `blocked_until` across its scopes). A source blocked for a
-    /// single trigger is listed too — the entry does not say which trigger.
-    pub fn blocked_ips(&self) -> Vec<(IpAddr, Instant)> {
+    /// Currently-blocked records for observability: (source, trigger id,
+    /// blocked_until). The trigger id is `None` for a source-wide
+    /// (enumeration) block, which covers every trigger.
+    pub fn blocked_ips(&self) -> Vec<(IpAddr, Option<Uuid>, Instant)> {
         let now = Instant::now();
-        let mut by_source: std::collections::HashMap<IpAddr, Instant> =
-            std::collections::HashMap::new();
-        for entry in self.records.iter() {
-            if let Some(until) = entry.blocked_until.filter(|&until| until > now) {
-                let slot = by_source.entry(entry.key().source).or_insert(until);
-                if until > *slot {
-                    *slot = until;
-                }
-            }
-        }
-        by_source.into_iter().collect()
+        self.records
+            .iter()
+            .filter_map(|entry| {
+                let key = *entry.key();
+                let trigger = match key.scope {
+                    BreakerScope::Trigger(t) => Some(t),
+                    BreakerScope::SourceWide => None,
+                };
+                entry
+                    .blocked_until
+                    .filter(|&until| until > now)
+                    .map(|until| (key.source, trigger, until))
+            })
+            .collect()
     }
+}
+
+/// What [`CircuitBreaker::reset_ip`] removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResetOutcome {
+    /// Records forgotten (failure history, blocked or not).
+    pub records_removed: usize,
+    /// Of those, how many were an active block at the time of the reset.
+    pub active_blocks_removed: usize,
 }
 
 #[cfg(test)]
@@ -656,17 +689,77 @@ mod tests {
         );
     }
 
+    /// The operator reset really resets, and says what it removed. Its MCP
+    /// caller used to call the no-op `record_success` and report success.
     #[test]
-    fn reset_source_clears_every_scope() {
+    fn reset_ip_removes_the_records_it_reports() {
         let cb = CircuitBreaker::new();
-        let ip: IpAddr = "140.82.112.3".parse().unwrap();
+        let ip: IpAddr = "10.9.8.7".parse().unwrap();
+        let blocked = Uuid::new_v4();
+        let probing = Uuid::new_v4();
         for _ in 0..CB_OPEN_THRESHOLD {
-            cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
+            cb.record_failure_with_type(ip, blocked, CircuitBreakerFailureType::InvalidSignature);
         }
-        assert!(cb.is_blocked(ip, T));
-        assert_eq!(cb.blocked_ips().len(), 1);
-        assert_eq!(cb.reset_source(ip), 1);
-        assert!(!cb.is_blocked(ip, T));
+        cb.record_failure_with_type(ip, probing, CircuitBreakerFailureType::InvalidSignature);
+        let other_ip: IpAddr = "10.9.8.8".parse().unwrap();
+        for _ in 0..CB_OPEN_THRESHOLD {
+            cb.record_failure_with_type(
+                other_ip,
+                blocked,
+                CircuitBreakerFailureType::InvalidSignature,
+            );
+        }
+        assert!(cb.is_blocked(ip, blocked));
+        assert!(cb
+            .blocked_ips()
+            .iter()
+            .any(|(s, t, _)| *s == ip && *t == Some(blocked)));
+
+        // Narrowed to one trigger: only that record goes.
+        let one = cb.reset_ip(ip, Some(blocked));
+        assert_eq!(
+            one,
+            ResetOutcome {
+                records_removed: 1,
+                active_blocks_removed: 1
+            }
+        );
+        assert!(!cb.is_blocked(ip, blocked));
+
+        // Whole IP: the remaining record for it goes; the other IP is untouched.
+        let all = cb.reset_ip(ip, None);
+        assert_eq!(
+            all,
+            ResetOutcome {
+                records_removed: 1,
+                active_blocks_removed: 0
+            }
+        );
+        assert!(
+            cb.is_blocked(other_ip, blocked),
+            "a reset is scoped to its IP"
+        );
+        assert_eq!(cb.reset_ip(ip, None), ResetOutcome::default());
+    }
+
+    /// A whole-source reset also clears the source-wide enumeration block,
+    /// and an IPv6 reset covers the /64 the breaker keyed on.
+    #[test]
+    fn reset_ip_clears_the_source_wide_block_for_the_whole_64() {
+        let cb = CircuitBreaker::new();
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2::ffff".parse().unwrap();
+        for _ in 0..CB_IP_WIDE_DISTINCT_UNKNOWN {
+            cb.record_failure_with_type(
+                a,
+                Uuid::new_v4(),
+                CircuitBreakerFailureType::TriggerNotFound,
+            );
+        }
+        assert!(cb.is_blocked(b, T));
+        assert!(cb.blocked_ips().iter().any(|(_, t, _)| t.is_none()));
+        assert_eq!(cb.reset_ip(b, None).active_blocks_removed, 1);
+        assert!(!cb.is_blocked(a, T));
     }
 
     #[test]
@@ -704,7 +797,7 @@ mod tests {
         assert!(!cb.is_blocked(ip, T), "9 failures should not yet block");
 
         // A success must NOT wipe the failure history.
-        cb.record_success(ip);
+        cb.record_success(ip, T);
         assert!(!cb.is_blocked(ip, T), "success alone does not block");
 
         // ONE more failure must trip the breaker — proving the 9 prior
@@ -781,14 +874,14 @@ mod tests {
 
         // 5 cycles of (1 success, 1 failure). 5 failures total.
         for _ in 0..5 {
-            cb.record_success(ip);
+            cb.record_success(ip, T);
             cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         }
         assert!(!cb.is_blocked(ip, T), "5 failures < threshold");
 
         // 5 more cycles. Now 10 failures total.
         for _ in 0..5 {
-            cb.record_success(ip);
+            cb.record_success(ip, T);
             cb.record_failure_with_type(ip, T, CircuitBreakerFailureType::InvalidSignature);
         }
         assert!(

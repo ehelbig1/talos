@@ -1,8 +1,9 @@
 //! Byte-level `\n`-delimited line reader for streamed HTTP bodies (SSE).
 //!
-//! Shared by the guest SSE reader (`http_stream`) and the LLM stream reader
-//! (`llm_streaming`). Two defects it replaces, both from decoding each network
-//! chunk on its own and re-slicing a `String`:
+//! Used by the LLM stream reader (`llm_streaming`). The guest SSE reader
+//! (`http_stream::SseParser`) applies the same two fixes in its own parser,
+//! which keeps its whole-buffer cap semantics. Two defects it replaces, both
+//! from decoding each network chunk on its own and re-slicing a `String`:
 //!
 //! * a multi-byte UTF-8 character split across two chunks was decoded as two
 //!   U+FFFD replacement characters — bytes are buffered and a line is decoded

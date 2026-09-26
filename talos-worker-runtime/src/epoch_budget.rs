@@ -59,12 +59,34 @@
 //! It costs one `Instant::now()` per callback — no allocation, no lock, no
 //! logging — at most ten per second of guest execution.
 //!
+//! # Why every extension YIELDS (2026-09-25)
+//!
+//! A `Continue` extension keeps the guest running on the executor thread
+//! without ever returning to it. `call_async` is only a *potentially* yielding
+//! future: a guest that makes no host call never returns `Pending`, so the
+//! `tokio::time::timeout` wrapped around it cannot fire, a dropped request
+//! cannot cancel it, and the tokio worker thread it occupies is lost to every
+//! other task until the epoch budget runs out. In the controller — which runs
+//! `run_sandbox` / `test_module` / module replay on its own request-serving
+//! runtime — that is a caller-supplied module holding a request thread for its
+//! whole budget. [`UpdateDeadline::Yield`] grants the same ticks AFTER one
+//! trip through the executor, so the future is `Pending` at least once per tick
+//! of guest execution: an outer timeout or a drop now takes effect within one
+//! tick, and other tasks on the thread get scheduled. The budget arithmetic is
+//! unchanged — `Yield(n)` extends by exactly the `n` a `Continue(n)` would.
+//!
+//! `Yield` traps if the guest was entered with a SYNCHRONOUS call. Every store
+//! this module arms is entered with `instantiate_async` / `call_async` (the
+//! four `Store::try_new` sites in [`crate::runtime`]); a future synchronous
+//! entry point must not reuse [`arm_epoch_deadline`].
+//!
 //! # Cost on the non-cancelled path
 //!
 //! An `Ordering::Relaxed` atomic load, one `Instant` comparison, one
-//! subtraction. The callback body allocates nothing and logs nothing; the only
-//! allocation in this module is the abort message, built once, on the path that
-//! is about to trap the guest anyway.
+//! subtraction, and one executor round trip per tick (at most ten per second of
+//! guest execution). The callback body allocates nothing and logs nothing; the
+//! only allocation in this module is the abort message, built once, on the path
+//! that is about to trap the guest anyway.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -126,7 +148,8 @@ pub(crate) enum EpochDecision {
     /// The budget is spent — trap exactly as wasmtime's default
     /// (`epoch_deadline_trap`) behaviour would have.
     AbortExhausted,
-    /// Extend the deadline by this many ticks and keep running.
+    /// Extend the deadline by this many ticks and keep running — after one
+    /// trip through the async executor (see "Why every extension YIELDS").
     Continue(u64),
 }
 
@@ -246,7 +269,9 @@ pub(crate) fn arm_epoch_deadline(store: &mut Store<TalosContext>, timeout: Durat
             Instant::now() >= wall_clock_deadline,
         );
         match decision {
-            EpochDecision::Continue(ticks) => Ok(UpdateDeadline::Continue(ticks)),
+            // `Yield`, never `Continue`: see the module docs. The ticks
+            // granted are identical, so the budget invariant is untouched.
+            EpochDecision::Continue(ticks) => Ok(update_for_continue(ticks)),
             // Byte-for-byte what wasmtime's default (no-callback) behaviour
             // returns for an expired deadline: `Trap::Interrupt`.
             EpochDecision::AbortExhausted => Ok(UpdateDeadline::Interrupt),
@@ -262,6 +287,15 @@ pub(crate) fn arm_epoch_deadline(store: &mut Store<TalosContext>, timeout: Durat
             }
         }
     });
+}
+
+/// The wasmtime deadline update for a [`EpochDecision::Continue`] grant.
+///
+/// One home so the choice is testable without a store: it MUST be a yielding
+/// extension (see the module docs), and it must extend by exactly the ticks
+/// the budget granted.
+fn update_for_continue(ticks: u64) -> UpdateDeadline {
+    UpdateDeadline::Yield(ticks)
 }
 
 /// Whether an error is the abort this module raised.
@@ -475,6 +509,27 @@ mod tests {
         assert!(!is_cancel_preempt_error(&anyhow::anyhow!(
             "WASM execution timed out after 120s"
         )));
+    }
+
+    /// A granted slice must YIELD to the executor, by exactly the granted
+    /// ticks. A `Continue` here compiles, passes every budget test above, and
+    /// silently restores a guest that can hold a tokio worker thread for its
+    /// whole timeout — so the variant is pinned directly.
+    #[test]
+    fn a_granted_slice_yields_to_the_executor() {
+        for ticks in [1u64, 7, 1200] {
+            match update_for_continue(ticks) {
+                UpdateDeadline::Yield(n) => assert_eq!(n, ticks),
+                other => panic!(
+                    "a granted slice must yield, got a non-yielding update: {}",
+                    match other {
+                        UpdateDeadline::Continue(_) => "Continue",
+                        UpdateDeadline::Interrupt => "Interrupt",
+                        _ => "another variant",
+                    }
+                ),
+            }
+        }
     }
 
     /// The tick budget handed to the callback is exactly what the pre-callback

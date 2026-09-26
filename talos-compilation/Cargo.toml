@@ -27,6 +27,11 @@ tokio = { version = "1", features = ["sync", "rt", "macros", "process", "time", 
 tracing.workspace = true
 uuid.workspace = true
 
+# `killpg(SIGKILL)` of a timed-out host-mode sandbox child's process group
+# (see `sandbox_run`); tokio exposes `process_group` but no group kill.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 

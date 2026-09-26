@@ -3732,9 +3732,12 @@ impl TalosMetrics {
             prometheus::Opts::new(
                 "talos_memory_write_failures_total",
                 "actor_memory writes that produced no row. Labels: \
-                 reason=crypto|db|validation|other|write_ceiling. The first \
-                 four are PERSISTENCE FAILURES of a __memory_write__ envelope \
-                 (a sustained bump means node outputs are being lost to disk); \
+                 reason=crypto|db|validation|other|quota|write_ceiling. The \
+                 first four are PERSISTENCE FAILURES of a __memory_write__ \
+                 envelope (a sustained bump means node outputs are being lost \
+                 to disk); quota is the per-actor row cap refusing a NEW key \
+                 (the actor already holds MAX_MEMORIES_PER_ACTOR rows, e.g. a \
+                 module writing a fresh key per run and never deleting); \
                  write_ceiling is a POLICY REFUSAL working as designed, \
                  expected to be non-zero wherever TALOS_WRITE_CEILING_ENFORCED \
                  is set and readonly actors run, and do not alert on it. \
@@ -3747,9 +3750,13 @@ impl TalosMetrics {
             &["reason"],
         )?;
         registry.register(Box::new(memory_write_failures_total.clone()))?;
-        // Closed set, and every value has a live emitter. Four come from
-        // `MemoryWriteError::metric_label()`, whose variants are exhaustively
-        // matched at the two `__memory_write__` hook sites in talos-engine.
+        // Closed set, and every value has a live emitter. Five come from
+        // `MemoryWriteError::metric_label()` (`quota` since 2026-09-25: the
+        // per-actor row cap enforced inside the persist statement), emitted
+        // at the `__memory_write__` hook site in talos-engine. This crate
+        // cannot depend on talos-memory, so the five below are a COPY of
+        // `MemoryWriteError::METRIC_LABELS`, pinned by
+        // `every_metric_label_is_pre_seeded_at_zero` in talos-memory.
         //
         // `write_ceiling` is the fifth and is NOT from that enum: it is the
         // literal stamped by `ControllerNodeHook::record_memory_write_refusal`
@@ -3768,7 +3775,14 @@ impl TalosMetrics {
         // memory write" was indistinguishable from the wiring not existing.
         // Absent is not zero — the same rule that motivated this whole seed
         // loop, applied to the label the loop had not been told about.
-        for reason in ["crypto", "db", "validation", "other", "write_ceiling"] {
+        for reason in [
+            "crypto",
+            "db",
+            "validation",
+            "other",
+            "quota",
+            "write_ceiling",
+        ] {
             memory_write_failures_total
                 .with_label_values(&[reason])
                 .inc_by(0.0);
@@ -5248,6 +5262,9 @@ mod tests {
             r#"talos_memory_write_failures_total{reason="db"} 0"#,
             r#"talos_memory_write_failures_total{reason="validation"} 0"#,
             r#"talos_memory_write_failures_total{reason="other"} 0"#,
+            // The per-actor row cap (2026-09-25), a `MemoryWriteError`
+            // variant like the four above.
+            r#"talos_memory_write_failures_total{reason="quota"} 0"#,
             // #750's policy refusal. Not a `MemoryWriteError` variant — the
             // one emitter is `ControllerNodeHook::record_memory_write_refusal`
             // — and it was unseeded until 2026-09-05, so the series only

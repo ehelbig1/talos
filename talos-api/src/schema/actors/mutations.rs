@@ -864,6 +864,16 @@ impl ActorsMutations {
         )
         .await
         .map_err(|e| {
+            // The per-actor row cap (enforced inside the persist statement
+            // since 2026-09-25) refused a NEW key. Its message names the
+            // limit and the remedy and carries no internal detail, so it is
+            // safe to hand back — "Failed to write memory" would hide the one
+            // fact the caller can act on.
+            if let Some(quota @ talos_memory::MemoryWriteError::QuotaExceeded { .. }) =
+                e.downcast_ref::<talos_memory::MemoryWriteError>()
+            {
+                return async_graphql::Error::new(quota.to_string()).extend_safe();
+            }
             tracing::error!("write_actor_memory failed: {}", e);
             async_graphql::Error::new("Failed to write memory").extend_safe()
         })?;

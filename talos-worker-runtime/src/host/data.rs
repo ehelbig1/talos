@@ -407,6 +407,62 @@ const MAX_CSV_COLUMNS: usize = 1_000;
 /// uniformity. Same defense-in-depth class as MCP-1005/MCP-1006
 /// (input caps at trust boundaries).
 const MAX_XML_BYTES: usize = 10_000_000;
+/// Output ceiling for `csv_to_json` and `json_to_csv` (2026-09-25).
+///
+/// The INPUT caps above do not bound the OUTPUT, and both directions amplify.
+/// `csv_to_json` with headers repeats every header name in every row, so a
+/// 10 MB CSV whose header row is 1 000 × 9 KB names followed by rows of bare
+/// delimiters emits ~9 MB per row — tens of GB, all of it materialised as a
+/// `Vec<Value>` before serialisation even started. `json_to_csv` takes its
+/// header row from the FIRST object and writes every one of those columns for
+/// every later row, so `[{1 000 keys}, {}, {}, …]` turns a few MB into GB.
+/// 64 MiB is half the 128 MiB guest memory slot: a result larger than that
+/// cannot be received by the guest alongside its own input anyway, so nothing
+/// that worked before is refused.
+const MAX_TRANSFORM_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// A byte sink that refuses to grow past `cap` — the "count bytes while
+/// building" half of every data-transform output bound. Serializers write
+/// through it, so the refusal happens at the write that would cross the cap,
+/// never after a full-size buffer already exists.
+struct BoundedBuf {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl BoundedBuf {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            cap,
+        }
+    }
+
+    /// Append `bytes`, or fail without writing any of them.
+    fn push(&mut self, bytes: &[u8]) -> Result<(), OutputCapExceeded> {
+        if self.buf.len().saturating_add(bytes.len()) > self.cap {
+            return Err(OutputCapExceeded);
+        }
+        self.buf.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl std::io::Write for BoundedBuf {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.push(bytes)
+            .map_err(|_| std::io::Error::other("data-transform output cap exceeded"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A transform's output would have crossed its cap.
+#[derive(Debug)]
+struct OutputCapExceeded;
 
 impl wit_data_transform::Host for TalosContext {
     async fn csv_to_json(
@@ -452,9 +508,14 @@ impl wit_data_transform::Host for TalosContext {
                 return Err(wit_data_transform::Error::Invalidformat);
             }
 
-            let mut rows = Vec::new();
+            // Each row is serialised into the bounded sink as soon as it is
+            // read, so neither the rows nor the output can outgrow the cap.
+            // The bytes are identical to serialising the whole `Vec<Value>`:
+            // compact `serde_json` output of an array is `[` + items joined by
+            // `,` + `]`, and each item is serialised by the same code.
+            let mut out = CsvJsonWriter::new();
             for result in rdr.records() {
-                if rows.len() >= MAX_CSV_ROWS {
+                if out.rows >= MAX_CSV_ROWS {
                     return Err(wit_data_transform::Error::Invalidformat);
                 }
                 let record = result.map_err(|_| wit_data_transform::Error::Parseerror)?;
@@ -466,13 +527,13 @@ impl wit_data_transform::Host for TalosContext {
                         serde_json::Value::String(field.to_string()),
                     );
                 }
-                rows.push(serde_json::Value::Object(map));
+                out.push_row(&serde_json::Value::Object(map))?;
             }
-            serde_json::to_string(&rows).map_err(|_| wit_data_transform::Error::Parseerror)
+            out.finish()
         } else {
-            let mut rows = Vec::new();
+            let mut out = CsvJsonWriter::new();
             for result in rdr.records() {
-                if rows.len() >= MAX_CSV_ROWS {
+                if out.rows >= MAX_CSV_ROWS {
                     return Err(wit_data_transform::Error::Invalidformat);
                 }
                 let record = result.map_err(|_| wit_data_transform::Error::Parseerror)?;
@@ -480,9 +541,9 @@ impl wit_data_transform::Host for TalosContext {
                     .iter()
                     .map(|f| serde_json::Value::String(f.to_string()))
                     .collect();
-                rows.push(serde_json::Value::Array(arr));
+                out.push_row(&serde_json::Value::Array(arr))?;
             }
-            serde_json::to_string(&rows).map_err(|_| wit_data_transform::Error::Parseerror)
+            out.finish()
         }
     }
 
@@ -500,7 +561,9 @@ impl wit_data_transform::Host for TalosContext {
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(&json_input).map_err(|_| wit_data_transform::Error::Parseerror)?;
 
-        let mut output = Vec::new();
+        // Written through the bounded sink: see MAX_TRANSFORM_OUTPUT_BYTES for
+        // the `[{1 000 keys}, {}, {}, …]` amplification this stops.
+        let mut output = BoundedBuf::new(MAX_TRANSFORM_OUTPUT_BYTES);
         {
             let mut wtr = csv::WriterBuilder::new()
                 .delimiter(delimiter)
@@ -539,7 +602,7 @@ impl wit_data_transform::Host for TalosContext {
                 .map_err(|_| wit_data_transform::Error::Ioerror)?;
         }
 
-        String::from_utf8(output).map_err(|_| wit_data_transform::Error::Invalidformat)
+        String::from_utf8(output.buf).map_err(|_| wit_data_transform::Error::Invalidformat)
     }
 
     async fn xml_to_json(&mut self, xml: String) -> Result<String, wit_data_transform::Error> {
@@ -578,21 +641,25 @@ impl wit_data_transform::Host for TalosContext {
         }
         let value: serde_json::Value =
             serde_json::from_str(&json).map_err(|_| wit_data_transform::Error::Parseerror)?;
-        let xml = json_value_to_xml(&value, &root_element);
-        // 2026-05-28 audit F2: input cap doesn't bound the OUTPUT —
-        // wrapper-tag-per-node amplification can 2-4× the byte count
-        // on deeply nested JSON. With a 10 MB input cap, worst-case
-        // host materialisation is ~40 MB. Add an output-side cap so
-        // the host doesn't return a string larger than the input
-        // ceiling regardless of nesting structure.
-        if xml.len() > MAX_XML_BYTES {
+        // 2026-05-28 audit F2 put a cap on the OUTPUT, but checked it AFTER
+        // building the whole string — and the amplification is not 2-4× as
+        // that note estimated. An array repeats its element NAME per item, and
+        // the name is a key (or, at the top level, the guest-chosen
+        // `root_element`, of any length): `{"<1 MB key>": [0, 0, …]}` emits
+        // 2 MB per array item, TB-scale from a 10 MB input, materialised in
+        // full before the check could run. The cap is now enforced at the
+        // write that would cross it (2026-09-25), so the host never holds more
+        // than MAX_XML_BYTES of output. Same bytes, same boundary (`== cap` is
+        // accepted, `> cap` refused), same error.
+        let mut out = BoundedBuf::new(MAX_XML_BYTES);
+        if write_json_as_xml(&value, &root_element, &mut out).is_err() {
             tracing::warn!(
-                "json_to_xml output exceeded {} bytes (post-inflation: {})",
-                MAX_XML_BYTES,
-                xml.len()
+                "json_to_xml output would exceed {} bytes; refused while building",
+                MAX_XML_BYTES
             );
             return Err(wit_data_transform::Error::Parseerror);
         }
+        let xml = String::from_utf8(out.buf).map_err(|_| wit_data_transform::Error::Parseerror)?;
         Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{}", xml))
     }
 }
@@ -722,16 +789,133 @@ fn xml_string_to_json(xml: &str) -> Result<serde_json::Value, wit_data_transform
     root.ok_or(wit_data_transform::Error::Parseerror)
 }
 
-/// Simple JSON → XML serialiser.
-fn json_value_to_xml(value: &serde_json::Value, element: &str) -> String {
+/// Rows of `csv_to_json` output, serialised one at a time into a bounded sink.
+struct CsvJsonWriter {
+    out: BoundedBuf,
+    rows: usize,
+}
+
+impl CsvJsonWriter {
+    fn new() -> Self {
+        Self {
+            out: BoundedBuf::new(MAX_TRANSFORM_OUTPUT_BYTES),
+            rows: 0,
+        }
+    }
+
+    fn push_row(&mut self, row: &serde_json::Value) -> Result<(), wit_data_transform::Error> {
+        let sep: &[u8] = if self.rows == 0 { b"[" } else { b"," };
+        let written = self
+            .out
+            .push(sep)
+            .ok()
+            .and_then(|()| serde_json::to_writer(&mut self.out, row).ok());
+        if written.is_none() {
+            tracing::warn!(
+                "csv_to_json output would exceed {} bytes; refused while building",
+                MAX_TRANSFORM_OUTPUT_BYTES
+            );
+            return Err(wit_data_transform::Error::Parseerror);
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<String, wit_data_transform::Error> {
+        let close: &[u8] = if self.rows == 0 { b"[]" } else { b"]" };
+        if self.out.push(close).is_err() {
+            return Err(wit_data_transform::Error::Parseerror);
+        }
+        String::from_utf8(self.out.buf).map_err(|_| wit_data_transform::Error::Parseerror)
+    }
+}
+
+/// Simple JSON → XML serialiser, writing into a bounded sink. The bytes are
+/// exactly those of the pre-2026-09-25 `format!`-per-node version (pinned by
+/// `json_to_xml_bytes_are_unchanged`); only the moment of refusal moved.
+fn write_json_as_xml(
+    value: &serde_json::Value,
+    element: &str,
+    out: &mut BoundedBuf,
+) -> Result<(), OutputCapExceeded> {
+    fn open(out: &mut BoundedBuf, element: &str) -> Result<(), OutputCapExceeded> {
+        out.push(b"<")?;
+        out.push(element.as_bytes())?;
+        out.push(b">")
+    }
+    fn close(out: &mut BoundedBuf, element: &str) -> Result<(), OutputCapExceeded> {
+        out.push(b"</")?;
+        out.push(element.as_bytes())?;
+        out.push(b">")
+    }
     match value {
         serde_json::Value::Object(map) => {
-            let inner: String = map.iter().map(|(k, v)| json_value_to_xml(v, k)).collect();
-            format!("<{}>{}</{}>", element, inner, element)
+            open(out, element)?;
+            for (k, v) in map {
+                write_json_as_xml(v, k, out)?;
+            }
+            close(out, element)
         }
         serde_json::Value::Array(arr) => {
-            arr.iter().map(|v| json_value_to_xml(v, element)).collect()
+            for v in arr {
+                write_json_as_xml(v, element, out)?;
+            }
+            Ok(())
         }
+        serde_json::Value::String(s) => {
+            open(out, element)?;
+            write_escaped_xml(s, out)?;
+            close(out, element)
+        }
+        other => {
+            open(out, element)?;
+            out.push(other.to_string().as_bytes())?;
+            close(out, element)
+        }
+    }
+}
+
+/// The five XML escapes, written straight into the sink.
+fn write_escaped_xml(s: &str, out: &mut BoundedBuf) -> Result<(), OutputCapExceeded> {
+    let mut rest = s;
+    while let Some(pos) = rest.find(['&', '<', '>', '"', '\'']) {
+        out.push(&rest.as_bytes()[..pos])?;
+        let escaped: &[u8] = match rest.as_bytes()[pos] {
+            b'&' => b"&amp;",
+            b'<' => b"&lt;",
+            b'>' => b"&gt;",
+            b'"' => b"&quot;",
+            _ => b"&apos;",
+        };
+        out.push(escaped)?;
+        rest = &rest[pos + 1..];
+    }
+    out.push(rest.as_bytes())
+}
+
+/// The pre-2026-09-25 unbounded serialiser, kept only as the reference the
+/// bounded one is checked against.
+#[cfg(test)]
+fn json_value_to_xml_reference(value: &serde_json::Value, element: &str) -> String {
+    fn escape_xml(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            let inner: String = map
+                .iter()
+                .map(|(k, v)| json_value_to_xml_reference(v, k))
+                .collect();
+            format!("<{}>{}</{}>", element, inner, element)
+        }
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .map(|v| json_value_to_xml_reference(v, element))
+            .collect(),
         serde_json::Value::String(s) => {
             format!("<{}>{}</{}>", element, escape_xml(s), element)
         }
@@ -739,10 +923,205 @@ fn json_value_to_xml(value: &serde_json::Value, element: &str) -> String {
     }
 }
 
-fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+#[cfg(test)]
+mod data_transform_output_bound_tests {
+    use super::*;
+    use crate::bindings::talos::core::data_transform::Host as _;
+    use crate::wit_inspector::CapabilityWorld;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    fn ctx() -> TalosContext {
+        TalosContext::new(
+            CapabilityWorld::Minimal,
+            vec![],
+            vec![],
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            talos_workflow_job_protocol::LlmTier::default(),
+            None,
+        )
+        .expect("test context")
+    }
+
+    /// The bounded serialiser emits exactly the bytes the unbounded one did.
+    #[test]
+    fn json_to_xml_bytes_are_unchanged() {
+        let cases = [
+            serde_json::json!({"a": 1, "b": [true, null, 2.5], "c": {"d": "x"}}),
+            serde_json::json!({"s": "a&b<c>d\"e'f — ünïcode &amp;"}),
+            serde_json::json!([1, "two", {"three": [3, 3]}]),
+            serde_json::json!("plain"),
+            serde_json::json!({}),
+            serde_json::json!({"k": []}),
+        ];
+        for v in &cases {
+            let mut out = BoundedBuf::new(usize::MAX);
+            write_json_as_xml(v, "root", &mut out).expect("unbounded");
+            assert_eq!(
+                String::from_utf8(out.buf).unwrap(),
+                json_value_to_xml_reference(v, "root"),
+                "bytes changed for {v}"
+            );
+        }
+    }
+
+    /// The boundary did not move: an output of EXACTLY the cap is accepted and
+    /// one byte over is refused — the pre-fix post-build check's semantics.
+    #[test]
+    fn the_xml_cap_boundary_is_unchanged() {
+        let v = serde_json::json!("x".repeat(100));
+        let exact = json_value_to_xml_reference(&v, "r").len();
+        let mut at_cap = BoundedBuf::new(exact);
+        assert!(write_json_as_xml(&v, "r", &mut at_cap).is_ok());
+        let mut under = BoundedBuf::new(exact - 1);
+        assert!(write_json_as_xml(&v, "r", &mut under).is_err());
+    }
+
+    /// The amplification the input cap never bounded: an array repeats its
+    /// element NAME per item. A ~110 KB input here would have produced ~2 GB
+    /// before the old post-build check could refuse it; the bounded sink
+    /// refuses at 10 MB, fast, holding at most the cap.
+    #[tokio::test]
+    async fn json_to_xml_amplification_is_refused_while_building() {
+        let key = "k".repeat(100_000);
+        let items = vec![0; 10_000];
+        let json = serde_json::json!({ key: items }).to_string();
+        assert!(
+            json.len() < MAX_XML_BYTES,
+            "the input itself is under the input cap"
+        );
+        let start = Instant::now();
+        let r = ctx().json_to_xml(json, "root".to_string()).await;
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(r, Err(wit_data_transform::Error::Parseerror)),
+            "{r:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "refusal must come at the cap, not after building the whole output ({elapsed:?})"
+        );
+    }
+
+    /// The bounded-MEMORY claim, stated directly: when the serialiser refuses,
+    /// the buffer it built never exceeded the cap. (The host-level test above
+    /// cannot see memory — an unbounded rebuild of its ~2 GB output is only a
+    /// memcpy and finishes inside the same time bound; mutation D1 showed it.)
+    #[test]
+    fn a_refused_xml_build_never_held_more_than_the_cap() {
+        let key = "k".repeat(100_000);
+        let v = serde_json::json!({ key: vec![0; 10_000] });
+        let mut out = BoundedBuf::new(MAX_XML_BYTES);
+        assert!(write_json_as_xml(&v, "root", &mut out).is_err());
+        assert!(
+            out.buf.len() <= MAX_XML_BYTES,
+            "held {} bytes past a {MAX_XML_BYTES}-byte cap",
+            out.buf.len()
+        );
+        assert!(
+            out.buf.capacity() <= 2 * MAX_XML_BYTES,
+            "allocated {} bytes for a {MAX_XML_BYTES}-byte cap",
+            out.buf.capacity()
+        );
+    }
+
+    /// The call-site half: the host methods must build into a sink capped at
+    /// the constant, not an unbounded one. Pinned in the source because no
+    /// behavioural test can observe the allocation (see above). Split at this
+    /// module so the test's own text cannot satisfy it.
+    #[test]
+    fn the_host_methods_build_into_capped_sinks() {
+        let src = include_str!("data.rs");
+        let prod = &src[..src
+            .find("mod data_transform_output_bound_tests")
+            .expect("test module present")];
+        for needle in [
+            ["BoundedBuf::new(MAX_", "XML_BYTES)"].concat(),
+            ["BoundedBuf::new(MAX_", "TRANSFORM_OUTPUT_BYTES)"].concat(),
+        ] {
+            assert!(prod.contains(&needle), "missing capped sink `{needle}`");
+        }
+        assert_eq!(
+            prod.matches(&["BoundedBuf::new(MAX_", "TRANSFORM_OUTPUT_BYTES)"].concat())
+                .count(),
+            2,
+            "csv_to_json (via CsvJsonWriter) and json_to_csv each build into one"
+        );
+        assert!(
+            !prod.contains(&["BoundedBuf::new(usize", "::MAX)"].concat()),
+            "no production sink may be unbounded"
+        );
+    }
+
+    /// `csv_to_json` repeats every header in every row. 100 × 10 KB headers
+    /// and 1 500 rows of bare delimiters (a ~1.2 MB input) would be ~1.5 GB of
+    /// JSON — and, pre-fix, a `Vec<Value>` of the same size built first.
+    #[tokio::test]
+    async fn csv_to_json_header_amplification_is_refused_while_building() {
+        let header: Vec<String> = (0..100).map(|i| format!("{i:0>10000}")).collect();
+        let mut csv = header.join(",");
+        let blank_row = ",".repeat(99);
+        for _ in 0..1_500 {
+            csv.push('\n');
+            csv.push_str(&blank_row);
+        }
+        assert!(csv.len() < MAX_CSV_BYTES);
+        let start = Instant::now();
+        let r = ctx().csv_to_json(csv, None).await;
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(r, Err(wit_data_transform::Error::Parseerror)),
+            "{r:?}"
+        );
+        assert!(elapsed < Duration::from_secs(5), "({elapsed:?})");
+    }
+
+    /// Ordinary CSV → JSON is untouched, byte for byte.
+    #[tokio::test]
+    async fn csv_to_json_output_is_unchanged_under_the_cap() {
+        let csv = "a,b\n1,2\n3,\"x,y\"".to_string();
+        let got = ctx().csv_to_json(csv, None).await.expect("small csv");
+        assert_eq!(got, r#"[{"a":"1","b":"2"},{"a":"3","b":"x,y"}]"#);
+        let got = ctx()
+            .csv_to_json(
+                "1,2\n3,4".to_string(),
+                Some(wit_data_transform::CsvOptions {
+                    delimiter: None,
+                    has_headers: false,
+                    skip_rows: None,
+                }),
+            )
+            .await
+            .expect("headerless");
+        assert_eq!(got, r#"[["1","2"],["3","4"]]"#);
+        let got = ctx()
+            .csv_to_json("a,b".to_string(), None)
+            .await
+            .expect("headers only");
+        assert_eq!(got, "[]");
+    }
+
+    /// `json_to_csv` writes every column of the FIRST object for every row, so
+    /// `[{1 000 keys}, {}, {}, …]` turns ~300 KB into ~100 MB.
+    #[tokio::test]
+    async fn json_to_csv_column_amplification_is_refused_while_building() {
+        let first: serde_json::Map<String, serde_json::Value> = (0..1_000)
+            .map(|i| (format!("col{i:05}"), serde_json::Value::from(1)))
+            .collect();
+        let mut rows = vec![serde_json::Value::Object(first)];
+        rows.extend(std::iter::repeat_n(serde_json::json!({}), 100_000));
+        let json = serde_json::Value::Array(rows).to_string();
+        let r = ctx().json_to_csv(json, None).await;
+        assert!(
+            r.is_err(),
+            "a 100 MB CSV must be refused, got {} bytes",
+            r.map(|s| s.len()).unwrap_or(0)
+        );
+    }
 }

@@ -2811,18 +2811,13 @@ async fn main() -> anyhow::Result<()> {
     )?);
     println!("      Runtime created with NATS logging enabled (worker is credential-free; database access via NATS-RPC)");
 
-    // M1 (2026-05-22): start the epoch-interruption ticker. Wasmtime
-    // checks the engine's epoch counter at every loop backedge and
-    // function entry; without a ticker the counter never advances and
-    // the per-Store `set_epoch_deadline(N)` calls below would either
-    // (a) never trip (deadline always in the future) or (b) trip at
-    // the first yield (deadline == current epoch == 0). The ticker
-    // gives the worker a third independent kill switch alongside fuel
-    // + tokio wall-clock timeout. Cheap (one atomic increment per
-    // EPOCH_TICK_INTERVAL_MS) and the JoinHandle is dropped so the
-    // task runs for the lifetime of the process.
-    let _epoch_ticker_handle = worker::runtime::spawn_epoch_ticker(runtime.engine_handle());
-    println!("      Epoch-interruption ticker started (third kill switch alongside fuel + wall-clock timeout)");
+    // The epoch-interruption ticker (the third kill switch alongside fuel +
+    // wall-clock timeout) is started by `TalosRuntime::with_resources`
+    // itself since 2026-09-25 — on a dedicated OS thread, so compute-bound
+    // guests cannot starve it — and must NOT be started again here: a second
+    // ticker would advance the epoch twice per interval and halve every
+    // job's wall-clock budget.
+    println!("      Epoch-interruption ticker started by the runtime (third kill switch alongside fuel + wall-clock timeout)");
 
     // ========================================================================
     // METRICS SERVER

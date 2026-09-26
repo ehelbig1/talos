@@ -1,6 +1,7 @@
-use super::{CompilationError, CompilationService};
+use super::{CompilationError, CompilationService, CompileSlot};
 use anyhow::{Context, Result};
-use std::process::Stdio;
+use std::path::Path;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Static source-level lint that detects known WASM fuel anti-patterns.
@@ -401,12 +402,49 @@ impl CompilationService {
         // Run static lints first (instant, no compilation needed)
         let mut lint_warnings = lint_source_code(source_code);
 
+        // 2026-09-25: `analyze_code` spawns `cargo component check` over
+        // caller-supplied source (reachable from GraphQL) and took NO compile
+        // slot, so its children were outside the concurrency bound entirely.
+        // It now waits for a slot like the lint path (same semaphore, same
+        // 60 s wait) and every child it runs holds that slot until it is dead.
+        let slot = tokio::time::timeout(Duration::from_secs(60), super::acquire_compile_slot())
+            .await
+            .map_err(|_| anyhow::anyhow!("Source analysis queue full. Try again shortly."))?
+            .map_err(|_| anyhow::anyhow!("Compilation semaphore closed"))?;
+
         let job_id = Uuid::new_v4();
 
         let (workspace, _package_name) = self
             .create_workspace(job_id, name, source_code, None)
             .await?;
 
+        // L-37 inner/outer: the ONE cleanup below covers every exit of the
+        // check. Until 2026-09-25 a timeout `?`-returned past the cleanup and
+        // leaked the workspace directory.
+        let result = self.analyze_in_workspace(&workspace, &slot).await;
+        tokio::fs::remove_dir_all(&workspace).await.ok();
+        let mut errors = result?;
+
+        // Prepend lint warnings to compiler diagnostics
+        lint_warnings.append(&mut errors);
+        let all = lint_warnings;
+
+        tracing::info!(
+            "Analyzer returning {} diagnostics ({} lint warnings) for {}",
+            all.len(),
+            all.iter().filter(|e| e.severity == "warning").count(),
+            name
+        );
+        Ok(all)
+    }
+
+    /// Inner analysis body — the caller owns workspace cleanup, so every
+    /// early return here is leak-free.
+    async fn analyze_in_workspace(
+        &self,
+        workspace: &Path,
+        slot: &CompileSlot,
+    ) -> Result<Vec<CompilationError>> {
         // MCP-744 (2026-05-13): cap `cargo component check` at 30s.
         // Pre-fix this Command::new(...).output().await ran unbounded —
         // pathological untrusted source (infinite macro expansion,
@@ -435,30 +473,28 @@ impl CompilationService {
             .wit_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let mut cmd =
-            match crate::container::build_command(&workspace, &cargo_registry_cache, wit_dir, None)
-            {
-                Ok(cmd) => cmd,
-                Err(e) => {
-                    tokio::fs::remove_dir_all(&workspace).await.ok();
-                    return Err(e).context(
-                        "Source analysis requires the compilation sandbox (or an explicit \
+        let mut cmd = match crate::container::build_command(
+            workspace,
+            &cargo_registry_cache,
+            wit_dir,
+            None,
+        ) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return Err(e).context(
+                    "Source analysis requires the compilation sandbox (or an explicit \
                      host-fallback opt-in); refusing to run `cargo component check` on the host",
-                    );
-                }
-            };
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            cmd.arg("component")
-                .arg("check")
-                .arg("--message-format=json")
-                .current_dir(&workspace)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
-        )
-        .await
-        .context("Source analysis timed out after 30 seconds")??;
+                );
+            }
+        };
+        cmd.arg("component")
+            .arg("check")
+            .arg("--message-format=json")
+            .current_dir(workspace);
+        let output = cmd
+            .run(Duration::from_secs(30), slot)
+            .await
+            .map_err(|e| e.with_timeout_context("Source analysis timed out after 30 seconds"))?;
 
         let mut errors = Vec::new();
 
@@ -551,19 +587,7 @@ impl CompilationService {
             });
         }
 
-        tokio::fs::remove_dir_all(&workspace).await.ok();
-
-        // Prepend lint warnings to compiler diagnostics
-        lint_warnings.append(&mut errors);
-        let all = lint_warnings;
-
-        tracing::info!(
-            "Analyzer returning {} diagnostics ({} lint warnings) for {}",
-            all.len(),
-            all.iter().filter(|e| e.severity == "warning").count(),
-            name
-        );
-        Ok(all)
+        Ok(errors)
     }
 }
 

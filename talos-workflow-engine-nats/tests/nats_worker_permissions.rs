@@ -1,3 +1,4 @@
+// ci-store: services — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Drives the RENDERED worker permission config on a LIVE nats-server and
 //! checks that the broker's answer on every subject matches the Rust model
 //! in `talos_workflow_job_protocol::nats_permissions`.

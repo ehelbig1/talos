@@ -2332,6 +2332,8 @@ mod p3_full_loop_tests {
     /// but the lock keeps the tests robust under the default parallel runner.
     static NATS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    // disallowed-method: talos_workflow_engine_nats::NatsNodeDispatcher::new — test in the type's own crate: a dispatcher against a local NATS
+    #[allow(clippy::disallowed_methods)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_claim_loop_over_live_nats() {
         let Some(url) = nats_url() else {
@@ -2527,6 +2529,8 @@ mod p3_full_loop_tests {
     /// step's `encrypted_secrets` empty and NO plaintext on the wire; the signed
     /// sealing fields verify; ONE claim yields the per-step secret vector aligned
     /// to the steps; the seal context is consumed after.
+    // disallowed-method: talos_workflow_engine_nats::NatsNodeDispatcher::new — test in the type's own crate: a dispatcher against a local NATS
+    #[allow(clippy::disallowed_methods)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_pipeline_claim_loop_over_live_nats() {
         use super::get_pipeline_job_topic;
@@ -2716,6 +2720,8 @@ mod p3_full_loop_tests {
     /// wired (a misconfiguration — sealing on without the controller Ed25519 key),
     /// the dispatcher MUST refuse rather than let plaintext fall onto the wire.
     /// The transport panics if used, proving nothing is sent.
+    // disallowed-method: talos_workflow_engine_nats::NatsNodeDispatcher::new — test in the type's own crate: a dispatcher with a panicking transport
+    #[allow(clippy::disallowed_methods)]
     #[tokio::test]
     async fn dispatch_with_plaintext_but_no_envelope_handle_fails_closed() {
         use async_trait::async_trait;
@@ -3419,6 +3425,8 @@ mod budget_clamp_loop_tests {
 
     /// Drive the PRODUCTION `dispatch()` for one job and return the
     /// `dispatch_attempt` of every send, in order.
+    // disallowed-method: talos_workflow_engine_nats::NatsNodeDispatcher::new — test in the type's own crate: a dispatcher against a local NATS
+    #[allow(clippy::disallowed_methods)]
     async fn wire_attempts_for(
         dispatch_attempt_base: u32,
         as_delivery_errors: bool,

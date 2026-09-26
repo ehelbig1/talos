@@ -15,6 +15,7 @@ pub mod catalog;
 pub mod container;
 pub mod dependency_allowlist;
 pub mod js_templates;
+pub mod sandbox_run;
 pub mod scaffold;
 pub mod source_entities;
 mod target_cache;
@@ -24,10 +25,11 @@ mod target_cache;
 // `validate_dependencies` from a stable location.
 pub use catalog::{CatalogTemplate, CatalogTemplateError};
 pub use dependency_allowlist::{get_allowed_dependencies, validate_dependencies};
+pub use sandbox_run::{CompileSlot, RunError, SandboxCommand};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use talos_capability_world::CapabilityWorld;
-use tokio::process::Command;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -402,8 +404,12 @@ fn require_host_lang_toolchain_allowed(language: &str) -> Result<()> {
 /// forever and operators see compile jobs accumulate with no log
 /// signal pointing at the misconfiguration. Sibling to the same fix
 /// in `talos-execution-orchestration::trigger::exec_semaphore`.
-fn compilation_semaphore() -> &'static Semaphore {
-    static SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+///
+/// An `Arc` so a permit can be OWNED ([`CompileSlot`]): a detached container
+/// reaper keeps the slot until the container it is removing is gone (see
+/// `sandbox_run`).
+fn compilation_semaphore() -> &'static Arc<Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SEMAPHORE.get_or_init(|| {
         let raw = std::env::var("TALOS_MAX_COMPILATIONS")
             .ok()
@@ -427,8 +433,14 @@ fn compilation_semaphore() -> &'static Semaphore {
             max_compilations = max,
             "Compilation concurrency guard initialized"
         );
-        Semaphore::new(max)
+        Arc::new(Semaphore::new(max))
     })
+}
+
+/// Wait (unbounded — callers wrap it in their own timeout) for a compile
+/// slot on the process-wide [`compilation_semaphore`].
+async fn acquire_compile_slot() -> std::result::Result<CompileSlot, tokio::sync::AcquireError> {
+    CompileSlot::acquire(Arc::clone(compilation_semaphore())).await
 }
 
 pub struct CompilationService {
@@ -786,10 +798,12 @@ impl CompilationService {
             Some(0.05),
         );
 
-        // Acquire compilation permit with timeout (backpressure if at capacity)
-        let _permit = tokio::time::timeout(
+        // Acquire compilation permit with timeout (backpressure if at capacity).
+        // The slot is passed to every sandbox child this compile runs, so the
+        // permit is held until each child (and its container) is dead.
+        let slot = tokio::time::timeout(
             std::time::Duration::from_secs(120), // 2 min wait for compilation slot
-            compilation_semaphore().acquire(),
+            acquire_compile_slot(),
         )
         .await
         .map_err(|_| {
@@ -890,6 +904,7 @@ impl CompilationService {
                 lint_warnings,
                 compile_start,
                 &declared_world,
+                &slot,
             )
             .await;
 
@@ -918,6 +933,8 @@ impl CompilationService {
         // Compared against the binary-inspected world after compilation
         // to detect declared/actual mismatches (see step 8).
         declared_world: &str,
+        // The caller's compile slot; every sandbox child below holds it.
+        slot: &CompileSlot,
     ) -> Result<CompilationResult> {
         // 1.4. Pre-generate `Cargo.lock` so `cargo audit --no-fetch`
         // (which runs inside `--network=none`) has a real lockfile to
@@ -962,13 +979,9 @@ impl CompilationService {
             container::build_command(workspace, &cargo_registry_cache, wit_dir, None);
         let lockfile_result = match lockfile_cmd {
             Ok(mut cmd) => {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    cmd.args(["generate-lockfile", "--offline", "--quiet"])
-                        .current_dir(workspace)
-                        .output(),
-                )
-                .await
+                cmd.args(["generate-lockfile", "--offline", "--quiet"])
+                    .current_dir(workspace);
+                cmd.run(Duration::from_secs(30), slot).await
             }
             Err(e) => {
                 // 2026-09-10: PROPAGATE. `build_command` returns `Err` for
@@ -987,14 +1000,14 @@ impl CompilationService {
             }
         };
         match &lockfile_result {
-            Ok(Ok(out)) if out.status.success() => {
+            Ok(out) if out.status.success() => {
                 tracing::debug!(
                     target: "talos_compilation",
                     event_kind = "lockfile_generated",
                     "Pre-audit Cargo.lock generated"
                 );
             }
-            Ok(Ok(out)) => {
+            Ok(out) => {
                 tracing::warn!(
                     target: "talos_compilation",
                     event_kind = "lockfile_generation_failed",
@@ -1005,7 +1018,7 @@ impl CompilationService {
                      missing-lockfile (production fails closed, dev warns)"
                 );
             }
-            Err(_) | Ok(Err(_)) => {
+            Err(_) => {
                 tracing::warn!(
                     target: "talos_compilation",
                     event_kind = "lockfile_generation_failed",
@@ -1052,11 +1065,8 @@ impl CompilationService {
         let audit_args = ["audit", "--db", audit_db, "--json", "--no-fetch"];
         let audit_result = match audit_cmd {
             Ok(mut cmd) => {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    cmd.args(audit_args).current_dir(&workspace).output(),
-                )
-                .await
+                cmd.args(audit_args).current_dir(workspace);
+                cmd.run(Duration::from_secs(30), slot).await
             }
             Err(e) => {
                 // 2026-09-10: PROPAGATE rather than fall back to host cargo —
@@ -1073,7 +1083,7 @@ impl CompilationService {
         };
 
         match audit_result {
-            Ok(Ok(ref out)) if !out.status.success() => {
+            Ok(ref out) if !out.status.success() => {
                 let summary = parse_audit_summary(&out.stdout);
                 // L-finding-4: surface informational advisories (unmaintained
                 // / unsound / notice) in BOTH the blocking and non-blocking
@@ -1158,7 +1168,7 @@ impl CompilationService {
                      will reliably trip this branch."
                 );
             }
-            Err(_) | Ok(Err(_)) => {
+            Err(_) => {
                 if talos_config::is_production() {
                     self.send_event(
                         user_id,
@@ -1177,7 +1187,7 @@ impl CompilationService {
                 }
                 tracing::warn!("cargo-audit not available or timed out — skipping CVE scan in non-production mode");
             }
-            Ok(Ok(ref out)) => {
+            Ok(ref out) => {
                 // Clean audit (exit 0). Without `--deny=informational`,
                 // cargo-audit exits 0 even when informational advisories
                 // are present — surface them so operators still see the
@@ -1252,24 +1262,22 @@ impl CompilationService {
         );
         let output = match build_cmd {
             Ok(mut cmd) => {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(60), // 60s for large worlds like automation-node
-                    cmd.args(&[
-                        "component",
-                        "build",
-                        "--release",
-                        "--target",
-                        "wasm32-wasip2",
-                        "--manifest-path",
-                        workspace
-                            .join("Cargo.toml")
-                            .to_str()
-                            .unwrap_or("Cargo.toml"),
-                    ])
-                    .output(),
-                )
-                .await
-                .context("Compilation timed out after 60 seconds")?
+                cmd.args([
+                    "component",
+                    "build",
+                    "--release",
+                    "--target",
+                    "wasm32-wasip2",
+                    "--manifest-path",
+                    workspace
+                        .join("Cargo.toml")
+                        .to_str()
+                        .unwrap_or("Cargo.toml"),
+                ]);
+                // 60s for large worlds like automation-node
+                cmd.run(Duration::from_secs(60), slot)
+                    .await
+                    .map_err(|e| e.with_timeout_context("Compilation timed out after 60 seconds"))?
             }
             Err(e) => {
                 self.send_event(
@@ -1283,7 +1291,7 @@ impl CompilationService {
                 // (cleanup handled by outer compile_to_wasm_with_config)
                 return Err(e.context("Container compilation setup failed"));
             }
-        }?;
+        };
 
         tracing::info!(
             elapsed_ms = compile_start.elapsed().as_millis() as u64,
@@ -2339,15 +2347,14 @@ impl CompilationService {
             require_host_lang_toolchain_allowed("javascript")?;
         }
 
-        let _permit = compilation_semaphore()
-            .acquire()
+        let slot = acquire_compile_slot()
             .await
             .map_err(|_| anyhow::anyhow!("Compilation queue full — try again later"))?;
 
         let workspace = self.workspace_root.join(format!("js-{}", job_id));
         tokio::fs::create_dir_all(&workspace).await?;
         let out = self
-            .compile_js_in_workspace(&workspace, js_source, world)
+            .compile_js_in_workspace(&workspace, js_source, world, &slot)
             .await;
         let _ = tokio::fs::remove_dir_all(&workspace).await;
         let wasm_bytes = out?;
@@ -2376,6 +2383,7 @@ impl CompilationService {
         workspace: &Path,
         js_source: &str,
         world: &str,
+        slot: &CompileSlot,
     ) -> Result<Vec<u8>> {
         // Write JS source + the WIT the world resolves against. Tool args are
         // RELATIVE to the workspace: the sandbox mounts it at /build with
@@ -2417,9 +2425,10 @@ impl CompilationService {
         if !world_grants_raw_wasi_http(world) {
             cmd.args(["--disable", "http"]);
         }
-        let result = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
+        let result = cmd
+            .run(Duration::from_secs(120), slot)
             .await
-            .map_err(|_| anyhow::anyhow!("JS compilation timed out after 120s"))??;
+            .map_err(|e| e.with_timeout_message("JS compilation timed out after 120s"))?;
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -2457,15 +2466,14 @@ impl CompilationService {
             require_host_lang_toolchain_allowed("python")?;
         }
 
-        let _permit = compilation_semaphore()
-            .acquire()
+        let slot = acquire_compile_slot()
             .await
             .map_err(|_| anyhow::anyhow!("Compilation queue full — try again later"))?;
 
         let workspace = self.workspace_root.join(format!("py-{}", job_id));
         tokio::fs::create_dir_all(&workspace).await?;
         let out = self
-            .compile_python_in_workspace(&workspace, python_source, world)
+            .compile_python_in_workspace(&workspace, python_source, world, &slot)
             .await;
         let _ = tokio::fs::remove_dir_all(&workspace).await;
         let wasm_bytes = out?;
@@ -2486,6 +2494,7 @@ impl CompilationService {
         workspace: &Path,
         python_source: &str,
         world: &str,
+        slot: &CompileSlot,
     ) -> Result<Vec<u8>> {
         // componentize-py binds a world-level `export run: func(...)` to a
         // protocol class named `WitWorld` on the app module. The Python SDK's
@@ -2511,22 +2520,20 @@ impl CompilationService {
 
         let mut cmd = container::tool_command("componentize-py", workspace)
             .context("Python compilation sandbox setup failed")?;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            cmd.args([
-                "-d",
-                "wit",
-                "-w",
-                world,
-                "componentize",
-                "app",
-                "-o",
-                "module.wasm",
-            ])
-            .output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Python compilation timed out after 120s"))??;
+        cmd.args([
+            "-d",
+            "wit",
+            "-w",
+            world,
+            "componentize",
+            "app",
+            "-o",
+            "module.wasm",
+        ]);
+        let result = cmd
+            .run(Duration::from_secs(120), slot)
+            .await
+            .map_err(|e| e.with_timeout_message("Python compilation timed out after 120s"))?;
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -2757,13 +2764,10 @@ impl CompilationService {
         }
 
         // Acquire compilation permit (same semaphore as full builds)
-        let _permit = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            compilation_semaphore().acquire(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Lint queue full. Try again shortly."))?
-        .map_err(|_| anyhow::anyhow!("Compilation semaphore closed"))?;
+        let slot = tokio::time::timeout(std::time::Duration::from_secs(60), acquire_compile_slot())
+            .await
+            .map_err(|_| anyhow::anyhow!("Lint queue full. Try again shortly."))?
+            .map_err(|_| anyhow::anyhow!("Compilation semaphore closed"))?;
 
         // Inject the talos_node macro preamble only when the source does not
         // already carry a proc-macro annotation.  The sandbox codegen in
@@ -2814,97 +2818,104 @@ impl CompilationService {
             .create_workspace(job_id, name, &full_source, dependencies)
             .await?;
 
-        // Run `cargo component check` (NOT plain `cargo check`).
-        // Plain `cargo check` does not invoke cargo-component's build pipeline, so
-        // `src/bindings.rs` is never generated. The proc macro
-        // `#[talos_module]` expands to `include!(concat!(..., "/src/bindings.rs"))`,
-        // which fails with "No such file or directory" — manifesting as a confusing
-        // lint error on every run_sandbox call. `cargo component check` generates
-        // bindings first, then delegates to `cargo check` for the type check.
-        //
-        // When container isolation is enabled, lint also runs inside the builder
-        // container for consistency (same toolchain, same isolation).
-        let cargo_registry_cache = dirs_next::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-            .join(".cargo/registry");
-        let wit_dir = self
-            .wit_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        // Same per-user target cache as the full compile: `cargo component
-        // check` builds the dependency graph's rmeta, which dominates the
-        // 30 s lint budget when cold. Anonymous callers lint uncached.
-        let lint_target_cache = user_id.and_then(target_cache::resolve_for);
-        let lint_cmd = container::build_command(
-            &workspace,
-            &cargo_registry_cache,
-            wit_dir,
-            lint_target_cache.as_deref(),
-        );
-        let output = match lint_cmd {
-            Ok(mut cmd) => tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                cmd.args(&[
-                    "component",
-                    "check",
-                    "--target",
-                    "wasm32-wasip2",
-                    "--manifest-path",
-                    workspace
-                        .join("Cargo.toml")
-                        .to_str()
-                        .unwrap_or("Cargo.toml"),
-                ])
-                .output(),
-            )
-            .await
-            .context("Lint check timed out after 30 seconds")?,
-            Err(e) => {
-                // MCP-148 (2026-05-08): Honor the production fail-closed
-                // policy. `container::build_command` already bails with a
-                // clear "install podman/docker OR set
-                // TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true" message in
-                // production-no-runtime mode. Pre-fix this arm silently
-                // ran direct cargo on the host (running build.rs +
-                // proc-macros from talos_sdk_macros + any user deps OUTSIDE
-                // any sandbox), and the static-only-lints emptiness made
-                // the response look like "lint passed" even though the
-                // cargo check never ran the way the policy required.
-                // Match compile_custom_sandbox: propagate the bail in
-                // production unless the operator opted into host
-                // fallback. Non-production stays on the legacy direct
-                // cargo path.
-                // 2026-09-10: the non-production arm no longer runs a bare
-                // host `cargo` either. `build_command` already returns a
-                // scrubbed host command whenever host mode is CONFIGURED
-                // (container disabled, or dev without a runtime), so an `Err`
-                // here is a genuine refusal or misconfiguration, and the
-                // pre-fix fallback would have masked it with an unscrubbed
-                // host spawn.
-                return Err(e).context(
-                    "Lint check requires the compilation sandbox (container::build_command \
-                     refused to build a host command)",
-                );
-            }
-        }?;
-
-        let errors = if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let workspace_prefix = workspace.to_str().unwrap_or("");
-            let sanitized_stderr = if workspace_prefix.is_empty() {
-                stderr.to_string()
-            } else {
-                stderr.replace(workspace_prefix, "<workspace>")
+        // L-37 inner/outer: every exit of the check below — a timeout and a
+        // sandbox refusal included — reaches the ONE workspace cleanup after
+        // it. Until 2026-09-25 both of those `?`-returned past the cleanup and
+        // leaked the workspace directory.
+        let result: Result<Vec<CompilationError>> = async {
+            // Run `cargo component check` (NOT plain `cargo check`).
+            // Plain `cargo check` does not invoke cargo-component's build pipeline, so
+            // `src/bindings.rs` is never generated. The proc macro
+            // `#[talos_module]` expands to `include!(concat!(..., "/src/bindings.rs"))`,
+            // which fails with "No such file or directory" — manifesting as a confusing
+            // lint error on every run_sandbox call. `cargo component check` generates
+            // bindings first, then delegates to `cargo check` for the type check.
+            //
+            // When container isolation is enabled, lint also runs inside the builder
+            // container for consistency (same toolchain, same isolation).
+            let cargo_registry_cache = dirs_next::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join(".cargo/registry");
+            let wit_dir = self
+                .wit_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            // Same per-user target cache as the full compile: `cargo component
+            // check` builds the dependency graph's rmeta, which dominates the
+            // 30 s lint budget when cold. Anonymous callers lint uncached.
+            let lint_target_cache = user_id.and_then(target_cache::resolve_for);
+            let lint_cmd = container::build_command(
+                &workspace,
+                &cargo_registry_cache,
+                wit_dir,
+                lint_target_cache.as_deref(),
+            );
+            let output = match lint_cmd {
+                Ok(mut cmd) => {
+                    cmd.args([
+                        "component",
+                        "check",
+                        "--target",
+                        "wasm32-wasip2",
+                        "--manifest-path",
+                        workspace
+                            .join("Cargo.toml")
+                            .to_str()
+                            .unwrap_or("Cargo.toml"),
+                    ]);
+                    cmd.run(Duration::from_secs(30), &slot).await.map_err(|e| {
+                        e.with_timeout_context("Lint check timed out after 30 seconds")
+                    })?
+                }
+                Err(e) => {
+                    // MCP-148 (2026-05-08): Honor the production fail-closed
+                    // policy. `container::build_command` already bails with a
+                    // clear "install podman/docker OR set
+                    // TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true" message in
+                    // production-no-runtime mode. Pre-fix this arm silently
+                    // ran direct cargo on the host (running build.rs +
+                    // proc-macros from talos_sdk_macros + any user deps OUTSIDE
+                    // any sandbox), and the static-only-lints emptiness made
+                    // the response look like "lint passed" even though the
+                    // cargo check never ran the way the policy required.
+                    // Match compile_custom_sandbox: propagate the bail in
+                    // production unless the operator opted into host
+                    // fallback. Non-production stays on the legacy direct
+                    // cargo path.
+                    // 2026-09-10: the non-production arm no longer runs a bare
+                    // host `cargo` either. `build_command` already returns a
+                    // scrubbed host command whenever host mode is CONFIGURED
+                    // (container disabled, or dev without a runtime), so an `Err`
+                    // here is a genuine refusal or misconfiguration, and the
+                    // pre-fix fallback would have masked it with an unscrubbed
+                    // host spawn.
+                    return Err(e).context(
+                        "Lint check requires the compilation sandbox (container::build_command \
+                         refused to build a host command)",
+                    );
+                }
             };
-            self.parse_errors_with_offset(&sanitized_stderr, preamble_lines as i32)
-        } else {
-            vec![]
-        };
 
-        // Clean up workspace
+            let errors = if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let workspace_prefix = workspace.to_str().unwrap_or("");
+                let sanitized_stderr = if workspace_prefix.is_empty() {
+                    stderr.to_string()
+                } else {
+                    stderr.replace(workspace_prefix, "<workspace>")
+                };
+                self.parse_errors_with_offset(&sanitized_stderr, preamble_lines as i32)
+            } else {
+                vec![]
+            };
+
+            Ok(errors)
+        }
+        .await;
+
         tokio::fs::remove_dir_all(&workspace).await.ok();
 
-        Ok(errors)
+        result
     }
 
     /// Compile source to WASM with an explicit language override.
@@ -3112,22 +3123,20 @@ impl CompilationService {
             Some("Initializing Python compilation environment...".to_string()),
             Some(0.05),
         );
-        let _permit = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            compilation_semaphore().acquire(),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Python compilation queue full (max {} concurrent). Try again later.",
-                compilation_semaphore().available_permits()
-                    + std::env::var("TALOS_MAX_COMPILATIONS")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(3)
-            )
-        })?
-        .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+        let slot =
+            tokio::time::timeout(std::time::Duration::from_secs(120), acquire_compile_slot())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Python compilation queue full (max {} concurrent). Try again later.",
+                        compilation_semaphore().available_permits()
+                            + std::env::var("TALOS_MAX_COMPILATIONS")
+                                .ok()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(3)
+                    )
+                })?
+                .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
         // Create temp workspace
         let workspace = self
@@ -3145,6 +3154,7 @@ impl CompilationService {
                 config,
                 &workspace,
                 world_override,
+                &slot,
             )
             .await;
 
@@ -3172,6 +3182,7 @@ impl CompilationService {
         _config: &serde_json::Value,
         workspace: &std::path::Path,
         world_override: Option<&str>,
+        slot: &CompileSlot,
     ) -> Result<CompilationResult> {
         self.send_event(
             user_id,
@@ -3199,7 +3210,7 @@ impl CompilationService {
         );
 
         let wasm_bytes = match self
-            .compile_python_in_workspace(workspace, source_code, &world)
+            .compile_python_in_workspace(workspace, source_code, &world, slot)
             .await
         {
             Ok(bytes) => bytes,

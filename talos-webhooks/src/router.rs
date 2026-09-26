@@ -1730,9 +1730,10 @@ impl WebhookRouter {
 
             let (response_body, success, error_msg) = match result {
                 Ok(Ok(output)) => {
-                    // Auth passed and execution succeeded — clear any CB failures for this IP.
+                    // Auth passed and execution succeeded. `record_success` is a deliberate
+                    // no-op (MCP-439: a success must not wipe failure history).
                     if let Some(ip) = source_ip {
-                        self.circuit_breaker.record_success(ip);
+                        self.circuit_breaker.record_success(ip, trigger_id);
                     }
                     (output, true, None)
                 }

@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Integration tests for RFC 0004 personal-org + active-org resolution,
 //! against a live Postgres with the full migration chain applied.
 //!

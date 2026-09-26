@@ -11,15 +11,19 @@ archive the STORY and keep the DECISION. An age-based sweep would take the
 decisions with it, and the record of what has already been tried and rejected is
 the only thing that stops the next session redoing it.
 
-**Adding an entry.** Write the decisions into the CLAUDE.md digest that owns the
-class and the narrative into that class's file here (or a new file plus a row
-below). If you cannot tell whether a paragraph is a rule or a story, it is a
-rule — leave it in `CLAUDE.md`.
+**Adding an entry** (since 2026-09-25). A package writes its record to its OWN
+file under [`packages/`](packages/README.md) — never a bullet in `CLAUDE.md` and
+never an append to a shared file, because parallel PRs conflicted at exactly
+those lines. `CLAUDE.md` changes only when a package creates or changes a RULE a
+future session must follow. If you cannot tell whether a paragraph is a rule or
+a story, it is a rule — leave it in `CLAUDE.md`.
 
-**The guard.** `python3 scripts/check-engineering-log.py` proves two things
-mechanically: every line removed from `CLAUDE.md` still appears verbatim in some
-file here, and every decision-marker line in the archive is named by the digest
-that replaced it. Run it after any move.
+**The guard.** `python3 scripts/check-engineering-log.py` (structural check 96)
+proves, for each split listed in its `BASES`, that every line the split removed
+from `CLAUDE.md` still appears verbatim and in order in some file here, and that
+every decision-marker line it archived is named by the digest that replaced it.
+A later ordinary edit to `CLAUDE.md` is not a split and is not charged to one.
+Moving text out of `CLAUDE.md`? Add a `BASES` entry for your change.
 
 | File | Class | What it holds |
 |---|---|---|
@@ -34,3 +38,4 @@ that replaced it. Run it after any move.
 | [`2026-09-09-the-timeout-that-was-not-per-call.md`](2026-09-09-the-timeout-that-was-not-per-call.md) | a per-call budget spent on somebody else's work | the 12:00 UTC LLM herd: where the serialization actually is (`OLLAMA_NUM_PARALLEL:1`, on a host process Talos does not ship), the dose-response curve, and why a bound beat jitter |
 | [`2026-09-10-the-collection-nobody-read.md`](2026-09-10-the-collection-nobody-read.md) | a collection turned on with no reader | `pg_stat_statements`: what it does and does not normalise, why `talos_guest` is not the tenancy axis, the five availability states, and the cost that is not the reason |
 | [`2026-09-10-whole-codebase-review.md`](2026-09-10-whole-codebase-review.md) | the classes above, at the sites the per-class sweeps had not reached; since 2026-09-22 also the VERBATIM CLAUDE.md bullet of every follow-up package (C → DM), moved here when the section was compressed to decisions (package DN, check 96) | fourteen domain reviews + eight fix packages: the verification log, the consolidated pre-fix findings, and every package summary verbatim |
+| [`structural-lint-checks.md`](structural-lint-checks.md) | the long per-check entries of CLAUDE.md's lint list | every check's CLAUDE.md entry as it stood on 2026-09-25, moved verbatim when the list became a one-line index; the script's comment blocks are the specification |

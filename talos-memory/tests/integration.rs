@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Integration tests against a live Postgres.
 //!
 //! Gated on `TALOS_TEST_DATABASE_URL` being set — without it, each
@@ -1441,4 +1442,241 @@ async fn overwrite_replaces_metadata_and_never_keeps_a_stale_embedding() {
         "the old content's embedding must not survive the overwrite"
     );
     cleanup_prefix(&pool, actor_id, &prefix).await;
+}
+
+// ── Per-actor row cap at the persist chokepoint (2026-09-25) ────────────────
+//
+// `MAX_MEMORIES_PER_ACTOR` used to be checked only by the MCP `actor_remember`
+// handler; the engine envelope, the signed memory RPC and GraphQL all reached
+// `persist_memory*` with no count at all. These drive the two persist entry
+// points directly — the ones every writer shares — against a real schema.
+
+/// A fresh actor of its own, so the cap tests never share rows with the
+/// suite's common actor (which `TALOS_TEST_ACTOR_ID` may pin to a real one).
+async fn fresh_cap_actor(pool: &Pool<Postgres>) -> Uuid {
+    let actor_id = Uuid::new_v4();
+    let user_id = Uuid::from_u128(0x7e57_0000_0000_4000_8000_0000_0000_00aa);
+    sqlx::query("INSERT INTO actors (id, user_id, name) VALUES ($1, $2, $3)")
+        .bind(actor_id)
+        .bind(user_id)
+        .bind(format!("mem-cap-{actor_id}"))
+        .execute(pool)
+        .await
+        .expect("seed cap actor");
+    actor_id
+}
+
+/// Fill the actor to exactly the cap in ONE statement. The ciphertext is a
+/// dummy byte: nothing in these tests decrypts a seeded row (the overwrite
+/// replaces it with real ciphertext before it is read back).
+async fn seed_to_cap(pool: &Pool<Postgres>, actor_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type) \
+         SELECT $1, 'cap-seed/' || g, '\\x00'::bytea, $2, 1, 'semantic' \
+         FROM generate_series(1, $3::int) AS g",
+    )
+    .bind(actor_id)
+    .bind(test_crypto::key_id())
+    .bind(mem::MAX_MEMORIES_PER_ACTOR as i32)
+    .execute(pool)
+    .await
+    .expect("seed actor to the cap");
+}
+
+async fn row_count(pool: &Pool<Postgres>, actor_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM actor_memory WHERE actor_id = $1")
+        .bind(actor_id)
+        .fetch_one(pool)
+        .await
+        .expect("count rows")
+}
+
+async fn drop_cap_actor(pool: &Pool<Postgres>, actor_id: Uuid) {
+    // `actor_memory.actor_id` cascades on actor delete.
+    let _ = sqlx::query("DELETE FROM actors WHERE id = $1")
+        .bind(actor_id)
+        .execute(pool)
+        .await;
+}
+
+fn is_quota(err: &mem::MemoryWriteError) -> bool {
+    matches!(err, mem::MemoryWriteError::QuotaExceeded { limit } if *limit == mem::MAX_MEMORIES_PER_ACTOR)
+}
+
+#[tokio::test]
+async fn the_persist_chokepoint_caps_new_keys_admits_overwrites_and_reclaims_expired_rows() {
+    let Some((pool, _)) = test_pool_or_skip().await else {
+        return;
+    };
+    let actor_id = fresh_cap_actor(&pool).await;
+    seed_to_cap(&pool, actor_id).await;
+    let cap = mem::MAX_MEMORIES_PER_ACTOR;
+    assert_eq!(row_count(&pool, actor_id).await, cap, "seeded to the cap");
+
+    // 1. A NEW key at the cap is refused, typed, and writes nothing.
+    let started = std::time::Instant::now();
+    let err = mem::persist_memory_with_metadata_typed(
+        &pool,
+        actor_id,
+        "cap/new-key",
+        &serde_json::json!({ "v": 1 }),
+        None,
+        "semantic",
+        None,
+    )
+    .await
+    .expect_err("a new key at the cap must be refused");
+    eprintln!(
+        "refused write at the cap (count scan of {cap} rows + an empty reclaim): {:?}",
+        started.elapsed()
+    );
+    assert!(is_quota(&err), "want QuotaExceeded, got {err:?}");
+    assert_eq!(err.metric_label(), "quota");
+    assert_eq!(
+        row_count(&pool, actor_id).await,
+        cap,
+        "a refusal writes nothing"
+    );
+    // The anyhow wrapper every other caller uses carries the same variant.
+    let wrapped = mem::persist_memory(
+        &pool,
+        actor_id,
+        "cap/new-key",
+        &serde_json::json!({ "v": 1 }),
+        "semantic",
+        None,
+    )
+    .await
+    .expect_err("the anyhow wrapper refuses too");
+    assert!(wrapped
+        .downcast_ref::<mem::MemoryWriteError>()
+        .is_some_and(is_quota));
+
+    // 2. An OVERWRITE of an existing key is not growth: admitted at the cap,
+    //    and the ON CONFLICT arm really replaced the row (it now decrypts).
+    let started = std::time::Instant::now();
+    mem::persist_memory_with_metadata_typed(
+        &pool,
+        actor_id,
+        "cap-seed/1",
+        &serde_json::json!({ "v": "overwritten" }),
+        None,
+        "semantic",
+        None,
+    )
+    .await
+    .expect("an overwrite at the cap is admitted");
+    eprintln!(
+        "admitted overwrite at the cap (EXISTS probe, no count): {:?}",
+        started.elapsed()
+    );
+    assert_eq!(row_count(&pool, actor_id).await, cap);
+    let row = mem::recall_exact(&pool, actor_id, "cap-seed/1")
+        .await
+        .expect("recall overwritten")
+        .expect("overwritten row present");
+    assert_eq!(row.value, serde_json::json!({ "v": "overwritten" }));
+
+    // 3. Expired rows still COUNT (they are physical rows until the sweep),
+    //    but a refused write reclaims this actor's expired rows once and
+    //    retries — so the new key lands and the expired rows are gone.
+    sqlx::query(
+        "UPDATE actor_memory SET expires_at = now() - interval '1 minute' \
+         WHERE actor_id = $1 AND key IN ('cap-seed/2', 'cap-seed/3', 'cap-seed/4')",
+    )
+    .bind(actor_id)
+    .execute(&pool)
+    .await
+    .expect("expire three rows");
+    assert_eq!(
+        row_count(&pool, actor_id).await,
+        cap,
+        "expired rows still count"
+    );
+    mem::persist_memory_with_metadata_typed(
+        &pool,
+        actor_id,
+        "cap/new-key",
+        &serde_json::json!({ "v": 2 }),
+        None,
+        "semantic",
+        None,
+    )
+    .await
+    .expect("after reclaiming expired rows the new key is admitted");
+    assert_eq!(
+        row_count(&pool, actor_id).await,
+        cap - 3 + 1,
+        "three expired rows reclaimed, one new row written"
+    );
+    let expired_left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM actor_memory \
+         WHERE actor_id = $1 AND expires_at IS NOT NULL AND expires_at <= now()",
+    )
+    .bind(actor_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count expired");
+    assert_eq!(expired_left, 0, "the reclaim removed every expired row");
+    assert!(mem::recall_exact(&pool, actor_id, "cap/new-key")
+        .await
+        .expect("recall new")
+        .is_some());
+
+    drop_cap_actor(&pool, actor_id).await;
+}
+
+/// The same cap on the transaction-aware variant — the path consolidation
+/// summaries and `compress_actor_context` replacements take — and it counts
+/// rows as the CALLER's transaction sees them, so a retirement earlier in the
+/// same transaction makes room.
+#[tokio::test]
+async fn the_in_tx_persist_is_capped_and_sees_its_own_transactions_deletes() {
+    let Some((pool, _)) = test_pool_or_skip().await else {
+        return;
+    };
+    let actor_id = fresh_cap_actor(&pool).await;
+    seed_to_cap(&pool, actor_id).await;
+    let cap = mem::MAX_MEMORIES_PER_ACTOR;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let err = mem::persist_memory_in_tx_with_metadata(
+        &mut tx,
+        actor_id,
+        "cap/tx-new",
+        &serde_json::json!({ "v": 1 }),
+        None,
+        "semantic",
+        None,
+    )
+    .await
+    .expect_err("a new key at the cap is refused inside a transaction too");
+    assert!(err
+        .downcast_ref::<mem::MemoryWriteError>()
+        .is_some_and(is_quota));
+    tx.rollback().await.expect("rollback");
+    assert_eq!(row_count(&pool, actor_id).await, cap);
+
+    let mut tx = pool.begin().await.expect("begin");
+    assert_eq!(
+        mem::forget_exact_in_tx(&mut tx, actor_id, "cap-seed/10")
+            .await
+            .expect("retire one"),
+        1
+    );
+    mem::persist_memory_in_tx_with_metadata(
+        &mut tx,
+        actor_id,
+        "cap/tx-new",
+        &serde_json::json!({ "v": 2 }),
+        None,
+        "semantic",
+        None,
+    )
+    .await
+    .expect("the transaction's own retirement makes room");
+    tx.commit().await.expect("commit");
+    assert_eq!(row_count(&pool, actor_id).await, cap);
+
+    drop_cap_actor(&pool, actor_id).await;
 }

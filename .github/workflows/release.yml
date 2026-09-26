@@ -51,9 +51,9 @@ jobs:
   #   * quality.yml runs on every PR to main (cargo-deny advisories, lib +
   #     DB-integration tests, frontend) — so main is always green before a
   #     release is cut from it;
-  #   * the canonical pre-publish gate is local `make ci` (lint + audit +
-  #     test + check-catalog), per CLAUDE.md "Image publishing";
-  #   * the pre-push hook runs `make lint` + `make lint-frontend`.
+  #   * the canonical pre-publish gate is local `make ci` (lint-full +
+  #     audit + test + check-catalog), per CLAUDE.md "Image publishing";
+  #   * the pre-push hook runs the fast `make lint` + `make lint-frontend`.
   # An inline `uses: ./.github/workflows/ci.yml` gate was removed: ci.yml is
   # workflow_dispatch-only (no `workflow_call:` trigger — paid GHA auto-runs
   # are disabled for cost) AND it rebuilds the controller/worker/sandbox

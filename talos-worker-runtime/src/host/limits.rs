@@ -157,6 +157,12 @@ pub(crate) const MAX_WEBHOOK_RETRIES_PER_SEND: u32 = 10;
 /// unbounded retry count, a single send() could block a worker
 /// indefinitely. Matches `wit_graphql`'s 30s backoff cap.
 pub(crate) const MAX_WEBHOOK_RETRY_DELAY_MS: u32 = 30_000;
+/// Per-call cap on `wit_graphql::execute_with_retry`'s guest-supplied
+/// `max_retries` (2026-09-25). The sibling of MAX_WEBHOOK_RETRIES_PER_SEND,
+/// tighter because GraphQL backs off exponentially from 100 ms (5 retries is
+/// ~3 s of backoff) and every retry re-sends the full query to a third-party
+/// host on the single rate-limit charge the call paid.
+pub(crate) const MAX_GRAPHQL_RETRIES_PER_CALL: u32 = 5;
 /// MCP-584: per-call cap on `wit_http::fetch` / `wit_http::fetch_all`
 /// / `wit_graphql::execute` `timeout_ms`. Pre-fix the WIT contract
 /// exposes these as `option<u32>` so a module could pass `u32::MAX`
