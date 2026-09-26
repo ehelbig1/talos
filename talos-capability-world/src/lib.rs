@@ -745,6 +745,109 @@ pub fn write_gated_ops_str(world: &str) -> Vec<&'static str> {
     write_gated_ops(&parsed)
 }
 
+/// How the world a compiled binary IMPORTS relates to the world its source
+/// DECLARED. One home for the compile-time check, so the verdict is decided on
+/// parsed worlds and not on their spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldDeclaration {
+    /// The same world, in either spelling (`agent` / `agent-node`).
+    Matches,
+    /// The binary needs strictly less than the source declared. Benign; the
+    /// declaration could be tightened.
+    OverDeclared,
+    /// The binary needs something the declaration does not grant, or either
+    /// side is `Unknown`. Fails closed.
+    Escalation,
+}
+
+/// Classify a source-declared world against the world detected from the
+/// binary's imports.
+///
+/// `CapabilityWorld`'s `Display` is the SHORT form (`agent`) while sources
+/// declare the `-node` form (`agent-node`), so comparing the two as strings
+/// called every exact match an over-declaration. The parsed comparison runs
+/// only when the declaration parses to a known world: `Unknown == Unknown`
+/// must never read as a match.
+pub fn classify_world_declaration(declared: &str, detected: &CapabilityWorld) -> WorldDeclaration {
+    if detected.to_string().eq_ignore_ascii_case(declared) {
+        return WorldDeclaration::Matches;
+    }
+    let declared: CapabilityWorld = declared.parse().unwrap_or(CapabilityWorld::Unknown);
+    if declared != CapabilityWorld::Unknown && declared == *detected {
+        WorldDeclaration::Matches
+    } else if detected.is_subset_of(&declared) {
+        WorldDeclaration::OverDeclared
+    } else {
+        WorldDeclaration::Escalation
+    }
+}
+
+#[cfg(test)]
+mod world_declaration_tests {
+    use super::*;
+
+    #[test]
+    fn both_spellings_of_every_world_match() {
+        for world in CapabilityWorld::ALL {
+            assert_eq!(
+                world.to_string(),
+                world.as_str(),
+                "Display is the short form"
+            );
+            for declared in [world.as_str(), world.as_node_str()] {
+                assert_eq!(
+                    classify_world_declaration(declared, world),
+                    WorldDeclaration::Matches,
+                    "{declared} declared, {world} detected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_strictly_smaller_binary_is_over_declared() {
+        assert_eq!(
+            classify_world_declaration("agent-node", &CapabilityWorld::Http),
+            WorldDeclaration::OverDeclared
+        );
+        assert_eq!(
+            classify_world_declaration("secrets-node", &CapabilityWorld::Minimal),
+            WorldDeclaration::OverDeclared
+        );
+    }
+
+    #[test]
+    fn a_larger_or_incomparable_binary_is_an_escalation() {
+        assert_eq!(
+            classify_world_declaration("minimal-node", &CapabilityWorld::Http),
+            WorldDeclaration::Escalation
+        );
+        // Database and Agent are incomparable.
+        assert_eq!(
+            classify_world_declaration("database-node", &CapabilityWorld::Agent),
+            WorldDeclaration::Escalation
+        );
+    }
+
+    #[test]
+    fn unknown_on_either_side_fails_closed() {
+        assert_eq!(
+            classify_world_declaration("not-a-world", &CapabilityWorld::Http),
+            WorldDeclaration::Escalation
+        );
+        assert_eq!(
+            classify_world_declaration("http-node", &CapabilityWorld::Unknown),
+            WorldDeclaration::Escalation
+        );
+        // Two unparseable spellings are not a match just because both parse
+        // to Unknown.
+        assert_eq!(
+            classify_world_declaration("not-a-world", &CapabilityWorld::Unknown),
+            WorldDeclaration::Escalation
+        );
+    }
+}
+
 #[cfg(test)]
 mod mutation_profile_tests {
     use super::*;
