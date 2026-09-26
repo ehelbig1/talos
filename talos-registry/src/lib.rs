@@ -54,6 +54,10 @@ fn parse_capability_world(label: &str) -> CapabilityWorld {
 /// The 50M cap matches the cap applied to node-config `max_fuel` overrides
 /// elsewhere in the dispatcher; the two ceilings are kept numerically
 /// identical so an operator can't raise one without raising the other.
+/// `modules.max_fuel`'s column DEFAULT, used when a row carries NULL (the
+/// stale-name fallback's `COALESCE(max_fuel, 2000000)` is the same value).
+const MODULE_MAX_FUEL_COLUMN_DEFAULT: i64 = 2_000_000;
+
 fn clamp_execution_fuel(db_max_fuel: i64) -> i64 {
     if db_max_fuel > 0 {
         db_max_fuel.min(50_000_000)
@@ -1044,9 +1048,15 @@ impl ModuleRegistry {
             name: row
                 .try_get("name")
                 .context("modules.name: try_get failed (schema drift?)")?,
+            // `content_hash`, `size_bytes` and `max_fuel` are NULLABLE columns.
+            // Decoding them as non-`Option` made a NULL a decode error, which
+            // the stale-name fallback used to swallow (it reads them as
+            // `Option`); now that a decode error surfaces instead of falling
+            // through, a NULL must decode here. Defaults match that fallback.
             content_hash: row
-                .try_get("content_hash")
-                .context("modules.content_hash: try_get failed (schema drift?)")?,
+                .try_get::<Option<String>, _>("content_hash")
+                .context("modules.content_hash: try_get failed (schema drift?)")?
+                .unwrap_or_default(),
             wasm_bytes,
             source_code: row
                 .try_get("source_code")
@@ -1058,11 +1068,13 @@ impl ModuleRegistry {
                 .try_get("config")
                 .context("modules.config: try_get failed (schema drift?)")?,
             size_bytes: row
-                .try_get("size_bytes")
-                .context("modules.size_bytes: try_get failed (schema drift?)")?,
+                .try_get::<Option<i32>, _>("size_bytes")
+                .context("modules.size_bytes: try_get failed (schema drift?)")?
+                .unwrap_or(0),
             max_fuel: row
-                .try_get("max_fuel")
-                .context("modules.max_fuel: try_get failed (schema drift?)")?,
+                .try_get::<Option<i64>, _>("max_fuel")
+                .context("modules.max_fuel: try_get failed (schema drift?)")?
+                .unwrap_or(MODULE_MAX_FUEL_COLUMN_DEFAULT),
             max_memory_mb: row
                 .try_get("max_memory_mb")
                 .context("modules.max_memory_mb: try_get failed (schema drift?)")?,
