@@ -57,7 +57,9 @@ pub(crate) async fn init_database() -> anyhow::Result<sqlx::Pool<sqlx::Postgres>
 
     {
         let migrate_start = std::time::Instant::now();
-        match sqlx::migrate!("../migrations").run(&db_pool).await {
+        // Dedicated connection, bounded lock_timeout + migration-sized
+        // statement_timeout, retried on lock timeout (talos_db::migrate).
+        match talos_db::migrate::run_migrations(&db_pool, &sqlx::migrate!("../migrations")).await {
             Ok(()) => {
                 tracing::info!(
                     elapsed_ms = migrate_start.elapsed().as_millis() as u64,
@@ -317,7 +319,7 @@ pub(crate) async fn resolve_kek_providers() -> anyhow::Result<ResolvedKek> {
             }
             (
                 crate::secrets::kek_provider::env_kek_provider_from_environment()?,
-                None,
+                crate::secrets::kek_provider::env_kek_legacy_provider_from_environment()?,
             )
         }
         "vault" => {
@@ -2653,12 +2655,13 @@ pub(crate) async fn seed_marketplace(pool: &sqlx::PgPool) {
     }
 
     // Step 2: Publish first-party catalog modules not yet listed.
-    // Phase 5.1: canonical modules.id only. Dedup on (name, version)
-    // rather than module_id because pre-5.0 runs published with
-    // `COALESCE(legacy_template_id, m.id)` which for catalog modules
-    // resolved to the legacy template id — different from m.id but
-    // same (name, version), so a module_id-only EXISTS check would
-    // miss those rows and trip the unique constraint.
+    // Phase 5.1: canonical modules.id only. Dedup on the SYSTEM publisher's
+    // (name, version) rather than module_id because pre-5.0 runs published
+    // with `COALESCE(legacy_template_id, m.id)`, which for catalog modules
+    // resolved to the legacy template id — different from m.id but same
+    // (name, version). Scoped to the system publisher since the unique key
+    // became (publisher_id, name, version) (20260926130000): a user listing
+    // of the same name must not pre-empt the first-party one.
     match sqlx::query(
         "INSERT INTO module_marketplace
              (id, module_id, publisher_id, name, description, capability_world,
@@ -2676,8 +2679,10 @@ pub(crate) async fn seed_marketplace(pool: &sqlx::PgPool) {
            AND m.description != ''
            AND NOT EXISTS (
                SELECT 1 FROM module_marketplace mm
-               WHERE mm.name = m.name AND mm.version = '1.0.0'
-           )",
+               WHERE mm.publisher_id = '00000000-0000-0000-0000-000000000000'::uuid
+                 AND mm.name = m.name AND mm.version = '1.0.0'
+           )
+         ON CONFLICT (publisher_id, name, version) DO NOTHING",
     )
     .execute(pool)
     .await
