@@ -4,6 +4,7 @@
 #[allow(clippy::module_inception)]
 #[cfg(test)]
 mod tests {
+    use crate::empty_env_shadows_a_file;
     use crate::{
         bool_env, bool_env_or_default, env_var_is_set_nonempty, execution_retention_days,
         get_allowed_origins, get_env, get_frontend_url, is_allowed_origin, positive_env_or_default,
@@ -1112,5 +1113,16 @@ mod tests {
             crate::parse_allowed_origins("https://app.example.com", true),
             Ok(vec!["https://app.example.com".to_string()])
         );
+    }
+
+    /// An empty `<VAR>` is worth a WARN only when it sits in front of a
+    /// configured `<VAR>_FILE` (MCP-597). With no file configured it is the
+    /// steady state of an optional variable transported as `${VAR:-}`, and a
+    /// WARN would fire on every boot.
+    #[test]
+    fn an_empty_env_var_warns_only_when_a_file_is_configured() {
+        assert!(empty_env_shadows_a_file(Some("/run/secrets/key")));
+        assert!(!empty_env_shadows_a_file(None));
+        assert!(!empty_env_shadows_a_file(Some("")));
     }
 }
