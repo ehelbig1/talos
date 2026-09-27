@@ -91,8 +91,17 @@ probe() {
 # ── 1. Plain probes (no auth required) ───────────────────────────────
 bold "1. Public health + probe endpoints"
 
+# A 200 alone is not the controller: a proxy with no /health route falls
+# through to the SPA, which answers every path with index.html and a 200. The
+# controller's body is always `{"status": …}`, so the check reads the body.
 read -r status _ body < <(probe GET /health)
-[ "$status" = "200" ] && ok "/health → 200"        || bad "/health → $status (expected 200)"
+if [ "$status" = "200" ] && grep -q '"status"' "$body"; then
+    ok "/health → 200 (controller JSON)"
+elif [ "$status" = "200" ] && grep -qiE '<!doctype|<html' "$body"; then
+    bad "/health → 200 but HTML: answered by the SPA fallback, not the controller (the proxy has no /health route)"
+else
+    bad "/health → $status (expected 200 with the controller's JSON status body)"
+fi
 rm -f "$body"
 
 # /live + /ready are kubelet-only; hitting them externally returns 200
