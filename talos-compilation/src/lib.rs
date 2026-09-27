@@ -29,7 +29,7 @@ pub use sandbox_run::{CompileSlot, RunError, SandboxCommand};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use talos_capability_world::CapabilityWorld;
+use talos_capability_world::{classify_world_declaration, CapabilityWorld, WorldDeclaration};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -1609,66 +1609,10 @@ impl CompilationService {
         // privileges in source but doesn't actually use them) remains
         // a WARN. The dangerous case (detected > declared, or worlds
         // are incomparable) is a compile error.
-        let detected_world_str = inspection.capability_world.to_string();
-        if !declared_world.is_empty() && !detected_world_str.eq_ignore_ascii_case(declared_world) {
-            let declared_enum: CapabilityWorld =
-                declared_world.parse().unwrap_or(CapabilityWorld::Unknown);
-            // `is_subset_of` returns false when either side is
-            // `Unknown`, so an unparseable declared string falls into
-            // the fail-closed branch alongside genuine privilege
-            // escalations — that is the safer default.
-            let detected_is_subset = inspection.capability_world.is_subset_of(&declared_enum);
-            if !detected_is_subset {
-                let err_msg = format!(
-                    "world-mismatch: source declares `{declared_world}` but the \
-                     compiled binary imports `{detected_world_str}` capabilities \
-                     ({interfaces}). The binary requests MORE privileges than \
-                     the source attribute declares — refusing to ship. Fix the \
-                     source `world = \"...\"` attribute to match what the \
-                     module actually uses, or remove the unused imports.",
-                    declared_world = declared_world,
-                    detected_world_str = detected_world_str,
-                    interfaces = inspection.imported_interfaces.join(", "),
-                );
-                tracing::error!(
-                    declared_world = %declared_world,
-                    detected_world = %detected_world_str,
-                    interfaces = %inspection.imported_interfaces.join(", "),
-                    module_name = %name,
-                    "world-mismatch (escalation): detected world is not a \
-                     subset of declared world — refusing to emit binary"
-                );
-                return Ok(CompilationResult {
-                    success: false,
-                    wasm_bytes: None,
-                    errors: vec![CompilationError {
-                        line: None,
-                        column: None,
-                        end_line: None,
-                        end_column: None,
-                        message: err_msg,
-                        severity: "error".to_string(),
-                    }],
-                    size_bytes: 0,
-                    content_hash: String::new(),
-                    capability_world: inspection.capability_world,
-                    imported_interfaces: inspection.imported_interfaces,
-                });
-            }
-            // Benign over-declaration — source asked for more than the
-            // binary uses. Still flag at WARN for operator visibility.
-            tracing::warn!(
-                declared_world = %declared_world,
-                detected_world = %detected_world_str,
-                interfaces = %inspection.imported_interfaces.join(", "),
-                module_name = %name,
-                "WIT world over-declared: source-declared world is more \
-                 privileged than the binary actually requires. This is \
-                 benign (defense in depth) but the source declaration \
-                 should be tightened to the least-privilege world the \
-                 module actually needs."
-            );
-        }
+        let inspection = match reconcile_declared_world(name, declared_world, inspection) {
+            Ok(inspection) => inspection,
+            Err(refused) => return Ok(refused),
+        };
 
         // 9. (workspace cleanup handled by outer compile_to_wasm_with_config)
         let size_bytes = wasm_bytes.len() as i32;
@@ -2064,6 +2008,82 @@ fn sanitize_package_name(name: &str, job_suffix: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// Step 8a of a compile: reconcile the world the source DECLARED with the world
+/// the binary IMPORTS. An escalation (the binary needs more than declared, or
+/// either side is unknown) refuses the compile, returned as the failed
+/// `CompilationResult`; an over-declaration is logged and the compile goes on.
+/// A free function so the refusal is testable without a `cargo component`
+/// build.
+fn reconcile_declared_world(
+    name: &str,
+    declared_world: &str,
+    inspection: talos_wit_inspector::ComponentInspection,
+) -> Result<talos_wit_inspector::ComponentInspection, CompilationResult> {
+    let detected_world_str = inspection.capability_world.to_string();
+    // The verdict compares PARSED worlds: `Display` is the short form
+    // (`agent`) while sources declare `agent-node`, so a string compare
+    // reported every exact match as an over-declaration. `Unknown` on either
+    // side is an escalation (fail closed), as before.
+    let verdict = if declared_world.is_empty() {
+        WorldDeclaration::Matches
+    } else {
+        classify_world_declaration(declared_world, &inspection.capability_world)
+    };
+    if verdict != WorldDeclaration::Matches {
+        if verdict == WorldDeclaration::Escalation {
+            let err_msg = format!(
+                "world-mismatch: source declares `{declared_world}` but the \
+                 compiled binary imports `{detected_world_str}` capabilities \
+                 ({interfaces}). The binary requests MORE privileges than \
+                 the source attribute declares — refusing to ship. Fix the \
+                 source `world = \"...\"` attribute to match what the \
+                 module actually uses, or remove the unused imports.",
+                declared_world = declared_world,
+                detected_world_str = detected_world_str,
+                interfaces = inspection.imported_interfaces.join(", "),
+            );
+            tracing::error!(
+                declared_world = %declared_world,
+                detected_world = %detected_world_str,
+                interfaces = %inspection.imported_interfaces.join(", "),
+                module_name = %name,
+                "world-mismatch (escalation): detected world is not a \
+                 subset of declared world — refusing to emit binary"
+            );
+            return Err(CompilationResult {
+                success: false,
+                wasm_bytes: None,
+                errors: vec![CompilationError {
+                    line: None,
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message: err_msg,
+                    severity: "error".to_string(),
+                }],
+                size_bytes: 0,
+                content_hash: String::new(),
+                capability_world: inspection.capability_world,
+                imported_interfaces: inspection.imported_interfaces,
+            });
+        }
+        // Benign over-declaration — source asked for more than the
+        // binary uses. Still flag at WARN for operator visibility.
+        tracing::warn!(
+            declared_world = %declared_world,
+            detected_world = %detected_world_str,
+            interfaces = %inspection.imported_interfaces.join(", "),
+            module_name = %name,
+            "WIT world over-declared: source-declared world is more \
+             privileged than the binary actually requires. This is \
+             benign (defense in depth) but the source declaration \
+             should be tightened to the least-privilege world the \
+             module actually needs."
+        );
+    }
+    Ok(inspection)
 }
 
 fn extract_wit_world(source: &str) -> String {
@@ -3921,5 +3941,57 @@ mod m13_gate_tests {
             Some(v) => std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", v),
             None => std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK"),
         }
+    }
+}
+
+#[cfg(test)]
+mod reconcile_declared_world_tests {
+    use super::*;
+    use talos_wit_inspector::ComponentInspection;
+
+    fn inspection(world: CapabilityWorld) -> ComponentInspection {
+        ComponentInspection {
+            capability_world: world,
+            imported_interfaces: vec!["talos:core/llm".to_string()],
+            is_talos_node: true,
+        }
+    }
+
+    #[test]
+    fn a_node_suffixed_declaration_of_the_detected_world_compiles() {
+        let kept = reconcile_declared_world("m", "agent-node", inspection(CapabilityWorld::Agent))
+            .expect("same world, other spelling: not a mismatch");
+        assert_eq!(kept.capability_world, CapabilityWorld::Agent);
+    }
+
+    #[test]
+    fn an_over_declaration_compiles() {
+        assert!(
+            reconcile_declared_world("m", "agent-node", inspection(CapabilityWorld::Http)).is_ok()
+        );
+    }
+
+    #[test]
+    fn no_declaration_compiles() {
+        assert!(reconcile_declared_world("m", "", inspection(CapabilityWorld::Trusted)).is_ok());
+    }
+
+    #[test]
+    fn an_escalation_refuses_the_compile() {
+        let refused =
+            reconcile_declared_world("m", "minimal-node", inspection(CapabilityWorld::Http))
+                .expect_err("the binary needs more than the source declared");
+        assert!(!refused.success);
+        assert!(refused.wasm_bytes.is_none());
+        assert!(refused.errors[0].message.starts_with("world-mismatch:"));
+        assert_eq!(refused.capability_world, CapabilityWorld::Http);
+    }
+
+    #[test]
+    fn an_unknown_detected_world_refuses_the_compile() {
+        assert!(
+            reconcile_declared_world("m", "agent-node", inspection(CapabilityWorld::Unknown))
+                .is_err()
+        );
     }
 }
