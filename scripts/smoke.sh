@@ -156,29 +156,28 @@ rm -f "$body" "$gql_jar"
 # ── 4. WebSocket upgrade ─────────────────────────────────────────────
 bold "4. WebSocket /ws"
 
-# The trick: on a 101 Switching Protocols, curl hangs waiting for WS
-# frames it'll never get from this synthetic upgrade. We use a short
-# --max-time and capture only the FIRST HTTP status line from the
-# header dump (-D -). Even if curl exits non-zero on the timeout, the
-# status header is what we actually care about.
-ws_headers="$(curl -sS -D - -o /dev/null --max-time 3 --http1.1 \
-                   -H 'Connection: Upgrade' \
-                   -H 'Upgrade: websocket' \
-                   -H 'Sec-WebSocket-Version: 13' \
-                   -H 'Sec-WebSocket-Key: dGVzdC13ZWJzb2NrZXQ=' \
-                   -H "Origin: $BASE_URL" \
-                   "$BASE_URL/ws" 2>/dev/null || true)"
-status="$(echo "$ws_headers" | awk '/^HTTP\// { print $2; exit }')"
-status="${status:-000}"
-case "$status" in
-    101) ok "/ws → 101 Switching Protocols (handshake completed)" ;;
-    400|401|403)
-        ok "/ws → $status (handshake reached controller; auth blocked it as expected without a session)"
-        ;;
-    405) bad "/ws → 405 (nginx returned 405 — missing /ws location in ConfigMap)" ;;
-    000) bad "/ws → no response within 3s (network or proxy issue)" ;;
-    *)   bad "/ws → $status (expected 101 or auth 4xx)" ;;
-esac
+# A 101 proves only that /ws reached the controller. The controller refuses a
+# disallowed Origin AFTER the upgrade (an immediate close — what a browser shows
+# as "WebSocket connection failed"), so the probe goes one frame further: it
+# sends graphql-ws `connection_init` with no session and reads the answer.
+# `auth-required` = origin accepted, authentication reached. Stdlib Python, like
+# leg 7's crawl.
+if ! command -v python3 >/dev/null 2>&1; then
+    skip "/ws — python3 not found (needed by scripts/lib/ws_probe.py)"
+else
+    ws_verdict="$(python3 "$(dirname "${BASH_SOURCE[0]}")/lib/ws_probe.py" "$BASE_URL" 2>/dev/null || true)"
+    case "$ws_verdict" in
+        auth-required|acked)
+            ok "/ws → upgraded, Origin accepted, reached authentication ($ws_verdict)" ;;
+        closed)
+            bad "/ws → upgraded, then closed before authentication: the controller refused Origin $BASE_URL (is it in ALLOWED_ORIGIN?)" ;;
+        "http 400"|"http 401"|"http 403")
+            ok "/ws → ${ws_verdict#http } (handshake reached controller; auth blocked it as expected without a session)" ;;
+        "http 405")
+            bad "/ws → 405 (nginx returned 405 — missing /ws location in ConfigMap)" ;;
+        *)  bad "/ws → ${ws_verdict:-no answer} (expected an upgrade that reaches authentication)" ;;
+    esac
+fi
 
 # ── 5. MCP endpoint ──────────────────────────────────────────────────
 bold "5. MCP endpoint"
