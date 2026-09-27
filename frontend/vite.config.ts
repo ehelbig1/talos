@@ -1,6 +1,30 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type ProxyOptions } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+
+const proxyTarget = process.env.API_PROXY_TARGET || 'http://localhost:8000';
+
+/**
+ * One HTTP proxy entry to the controller. Every non-WebSocket entry was the
+ * same object literal, copied per path.
+ */
+function controllerProxy(): ProxyOptions {
+  return {
+    target: proxyTarget,
+    changeOrigin: true,
+    // Only disable TLS cert verification in development.  Never set this
+    // to false in a production build — it opens the door to MITM attacks.
+    secure: process.env.NODE_ENV === 'production',
+    cookieDomainRewrite: 'localhost',
+    configure: (proxy) => {
+      proxy.on('proxyReq', (proxyReq, req) => {
+        if (req.headers.cookie) {
+          proxyReq.setHeader('cookie', req.headers.cookie);
+        }
+      });
+    },
+  };
+}
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -18,68 +42,28 @@ export default defineConfig({
     // Vite dev server transparently forwards to API_PROXY_TARGET.
     // Outside Docker, set API_PROXY_TARGET=http://localhost:8000 in your shell.
     proxy: {
-      '/graphql': {
-        target: process.env.API_PROXY_TARGET || 'http://localhost:8000',
-        changeOrigin: true,
-        // Only disable TLS cert verification in development.  Never set this
-        // to false in a production build — it opens the door to MITM attacks.
-        secure: process.env.NODE_ENV === 'production',
-        cookieDomainRewrite: 'localhost',
-        configure: (proxy, _options) => {
-          proxy.on('proxyReq', (proxyReq, req, _res) => {
-            if (req.headers.cookie) {
-              proxyReq.setHeader('cookie', req.headers.cookie);
-            }
-          });
-        },
-      },
-      '/api': {
-        target: process.env.API_PROXY_TARGET || 'http://localhost:8000',
-        changeOrigin: true,
-        secure: process.env.NODE_ENV === 'production',
-        cookieDomainRewrite: 'localhost',
-        configure: (proxy, _options) => {
-          proxy.on('proxyReq', (proxyReq, req, _res) => {
-            if (req.headers.cookie) {
-              proxyReq.setHeader('cookie', req.headers.cookie);
-            }
-          });
-        },
-      },
-      '/auth/oauth': {
-        target: process.env.API_PROXY_TARGET || 'http://localhost:8000',
-        changeOrigin: true,
-        secure: process.env.NODE_ENV === 'production',
-        cookieDomainRewrite: 'localhost',
-        configure: (proxy, _options) => {
-          proxy.on('proxyReq', (proxyReq, req, _res) => {
-            if (req.headers.cookie) {
-              proxyReq.setHeader('cookie', req.headers.cookie);
-            }
-          });
-        },
-      },
+      '/graphql': controllerProxy(),
+      '/api': controllerProxy(),
+      '/auth/oauth': controllerProxy(),
       // /auth/csrf seeds the talos_csrf_token cookie (graphqlClient.seedCsrfCookie
       // GETs it before any mutation). It MUST reach the controller, not the SPA —
       // an unproxied /auth/csrf returns index.html with no Set-Cookie, so every
       // signup/login fails with "CSRF token required (cookie missing)". In prod
       // nginx proxies all of /auth/*; this mirrors that for dev. Keep it a
       // specific path so client-side /auth routes (OAuth callback) aren't captured.
-      '/auth/csrf': {
-        target: process.env.API_PROXY_TARGET || 'http://localhost:8000',
-        changeOrigin: true,
-        secure: process.env.NODE_ENV === 'production',
-        cookieDomainRewrite: 'localhost',
-        configure: (proxy, _options) => {
-          proxy.on('proxyReq', (proxyReq, req, _res) => {
-            if (req.headers.cookie) {
-              proxyReq.setHeader('cookie', req.headers.cookie);
-            }
-          });
-        },
-      },
+      '/auth/csrf': controllerProxy(),
+      // The rest of production nginx's controller locations (frontend/nginx.conf,
+      // pinned by devProxyParity.test.ts). Without them the dev server answers
+      // these paths with index.html and a 200, so a probe of /health "passed"
+      // without reaching the controller and /mcp was a 404.
+      '/health': controllerProxy(),
+      '/mcp': controllerProxy(),
+      '/webhooks/': controllerProxy(),
+      '/approvals/': controllerProxy(),
+      '/approval-actions/': controllerProxy(),
+      '/corrections/': controllerProxy(),
       '/ws': {
-        target: process.env.API_PROXY_TARGET || 'http://localhost:8000',
+        target: proxyTarget,
         changeOrigin: true,
         secure: process.env.NODE_ENV === 'production',
         ws: true,

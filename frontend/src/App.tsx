@@ -300,7 +300,7 @@ function AuthenticatedApp() {
             <Tooltip>
               <TooltipTrigger asChild>
                 <NavLink
-                  to="/health"
+                  to="/system-health"
                   className={({ isActive }) =>
                     cn(
                       "p-2.5 rounded-2xl transition-premium border relative group",
@@ -368,7 +368,7 @@ function AuthenticatedApp() {
                   path="/modules"
                   element={<Navigate to="/library#installed" replace />}
                 />
-                <Route path="/health" element={<Health />} />
+                <Route path="/system-health" element={<Health />} />
                 <Route path="/settings" element={<Settings />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Routes>
