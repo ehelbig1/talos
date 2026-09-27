@@ -53,6 +53,24 @@ read-only against the live stack:
 Full vitest 401/401 pass (1 skipped), `make lint-frontend` and `tsc --noEmit`
 clean.
 
+## The same class on `/ws` (found while verifying this package)
+
+`smoke.sh` passed `/ws` on a `101`. The controller refuses a disallowed `Origin`
+AFTER the upgrade, with an immediate close, which browsers report as
+"WebSocket connection failed". CLAUDE.md records that failure for a handler that
+passed no Origin. Found live: my smoke runs against `:8000` and `:3099`
+(origins not in `ALLOWED_ORIGIN`) printed `✓ /ws → 101` while
+`talos_ws_handshakes_total{outcome="origin_not_allowed"}` went 0 → 2.
+
+`scripts/lib/ws_probe.py` (stdlib, the same dependency as leg 7's crawl)
+completes the upgrade with `Origin: <base URL>`, sends graphql-ws
+`connection_init` without a session, and reads the first frame:
+`connection_error` means the origin was accepted and authentication was reached
+(`auth-required`); a close with no text means it was refused (`closed`). This is
+deterministic, not a timing bet, because the server answers `connection_init`
+at once. Live: `:3002` gives `auth-required` and `:8000` gives `closed`, and the
+server's counters moved by exactly one `no_token` and one `origin_not_allowed`.
+
 **Deliberately NOT done.**
 - Reformatting `vite.config.ts` with Prettier: it was not Prettier-clean
   before, and it sits outside the `src/**` lint scope.
