@@ -410,8 +410,15 @@ fn a_compute_bound_guest_yields_its_thread_to_the_executor() {
         elapsed < Duration::from_secs(5),
         "the outer timeout must fire within about a tick of 1 s (elapsed {elapsed:?})"
     );
+    // The floor is about YIELDING, not about how fast the runner is. Under a
+    // `Continue` extension the guest's future never returns `Pending`, so the
+    // heartbeat cannot be polled at all: 0 beats. Under `Yield` it beats about
+    // once per ~200 ms — measured 5 of 5 runs at exactly 5 beats in ~1.1 s on
+    // an idle 16-core machine and under full CPU load — so a floor of 5 had no
+    // margin, and CI runners failed it (2 of the 3 quality runs after it
+    // landed). Two beats prove the guest yielded repeatedly, not once.
     assert!(
-        beats >= 5,
+        beats >= 2,
         "a sibling task on the same thread must keep running while the guest computes \
          (heartbeat beat {beats} times in {elapsed:?})"
     );
