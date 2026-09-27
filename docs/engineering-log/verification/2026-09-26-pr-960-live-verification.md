@@ -37,18 +37,18 @@ No `ERROR` line in either process. Six distinct WARN lines:
 | A6 | Pre-seeded series | PASS | `absent()` empty for all four; `count(talos_scheduler_dispatches_total) = 18`, 3 with `outcome="cancelled"`. |
 | B1 | Workflow outcomes vs 24 h earlier | PASS | Post: 28 completed / 0 failed. Previous window: 32 / 0. Six workflows ran in both windows at matching rates. 7-day baseline: 29 failed of 2 756. |
 | B2 | Module executions | PASS | Post: 88 completed, 0 failed (previous window 104/0). No `reason_class`/capability-denied line since T0. |
-| B3 | Tier-1 actors still work under the stricter resolver | PASS / partly UNVERIFIED | `personal-assistant` (tier1 + public): 27 runs since T0, all completed, 112 Gmail OAuth resolutions, HTTP 200s to `gmail.googleapis.com`. `personal-finance` (tier1 + public): no run since T0 (draft, manual only) → UNVERIFIED. `content-pipeline` (tier1, egress NULL → **local**, the posture the change affects): its only node is `LLM Inference` (secrets-node, no `allowed_hosts`). By code, `llm::complete*` to Ollama uses the dedicated `local_llm_http_client()`, NOT the guest SSRF resolver, so it is unaffected. Live proof is its next run, 2026-09-28 12:00Z. 0 modules grant a private/LAN/internal host. |
+| B3 | Tier-1 actors still work under the stricter resolver | PASS / one pending | `personal-assistant` (tier1 + public): 27 runs since T0, all completed, 112 Gmail OAuth resolutions, HTTP 200s to `gmail.googleapis.com`. `personal-finance` (tier1 + public): the operator ran `personal-finance-daily` 2026-09-27 19:03:50Z, completed in 4 s. `content-pipeline` (tier1, egress NULL → **local**, the posture the change affects): its only node is `LLM Inference` (secrets-node, no `allowed_hosts`), and `llm::complete*` to Ollama uses the dedicated `local_llm_http_client()`, not the guest SSRF resolver. Live proof is its scheduled run, 2026-09-28 12:00Z. 0 modules grant a private/LAN/internal host. |
 | B4 | `module_uri` refusal | N/A (dev) | `RUST_ENV` unset → the refusal is inactive. The fleet dispatches `redis:wasm:…` URIs, which would pass in production too. |
 | B5 | Sigstore boot lines | N/A | Policy `Disabled` (unset). The boot validates a regexp only when one is configured, so there is no line to find; the `Required` refusal is unit-tested only. |
 | C1 | MCP agent-token auth | PASS | This session's Talos MCP calls (`session_start`, `security_audit`, …) authenticated; unauthenticated `POST :8000/mcp` → 401. |
 | C2 | Legacy API keys upgrade to `key_digest` | N/A | `api_keys` has 0 rows. |
-| C3 | Refresh rotation atomic | UNVERIFIED (needs operator) | No browser session since 2026-09-24 17:14Z: `rotated_session_audit` last row then, 0 `auth_audit_log` events since T0, all `talos_auth_token_reuse_total` outcomes 0. |
+| C3 | Refresh rotation atomic | PASS | Operator session 2026-09-27 from 19:02Z with several tabs: 2 rotations (19:02:03, 19:16:03), each one `token_refresh` row, a single refresh shared by the tabs. `talos_auth_token_reuse_total` all 0, including `detected`. |
 | C4 | Browser hardening | N/A | `RUST_ENV` unset → hardening off by design; login over `http://localhost:3002` unaffected. |
-| C5 | WebSocket hub | UNVERIFIED (needs operator) | `talos_ws_active_sessions = 0`, all handshake outcomes 0 since T0: no page open. |
+| C5 | WebSocket hub | PASS | `talos_ws_active_sessions = 3`, steady. Authenticated handshakes 0→2→3 at 19:03–19:04Z, then 3→6 at 19:18Z; `talos_ws_session_ends_total{reason="token_expired"} = 3` at that moment, so every socket closed at its 15-minute access-token expiry and reconnected once on the token refreshed at 19:16Z. No other growth while idle, so no reconnect loop. The 4 `origin_not_allowed` and 3 `no_token` are my own smoke/probe runs (non-allowed origins, no cookie), matched by timestamp. |
 | D1 | Secrets decrypt | PASS | 0 `secret_dek_scope_mismatch`; 112 Gmail OAuth resolutions; `pa-ask-email` completed 15×. 0 of 17 secrets and 0 of 19 memories pending an org DEK (`talos_org_dek_pending`). |
 | D2 | `__actor_context__` never persisted | PASS (forward) | `workflow_executions.input_data` (the continuation writer, `pa-ask-email`): **848 of 848** rows in the prior 7 days carried `__actor_context__`, the last at 16:10:37Z; **0 of 8** since T0. `output_data` is encrypted on 32/32 post rows; a sampled post-T0 output via `get_execution_output` held neither `__actor_context__` nor `__trigger_input__`. `module_executions` payloads are 100% encrypted. **Residue (forward-only, as the record states):** 3 245 live + 1 804 archived rows still hold decrypted actor memory in plaintext `input_data`. See FAIL list. |
 | D3 | Memory overwrite takes the new write's metadata/embedding | PASS, not discriminating | `personal-assistant/inbox_organizer/latest` rewritten 17:25:25Z by `pa-inbox-organizer-work`: `kind=inbox_organizer` (matches its writer's envelope), embedding present (`mxbai-embed-large`). The old and new kind are identical, so this cannot tell the new semantics from the old. The integration tests are the proof. |
-| D4 | GraphQL Briefings / dashboard counts | UNVERIFIED (needs operator) | `pg_stat_statements` holds no statement using `pg_input_is_valid` or the key-suffix `LIKE … ESCAPE` since the stats window began: the pages have not been loaded. |
+| D4 | GraphQL Briefings / dashboard counts | PASS | Since the operator's session: the batched memory read with the key-suffix `LIKE … ESCAPE` predicate ran 19 times (Briefings, `keySuffix: "/latest"`), and the workflow list ran 3 times in its new shape, which projects `graph_json` only `CASE WHEN $5` (the look-ahead). Parameter values are not visible in `pg_stat_statements`, so "$5 was false" is inferred, not read. |
 | E1 | Webhook breaker `trigger_id` rendering | PASS (not exercised) | `get_webhook_security_stats`: `blocked_ips: []`, before and after the route crawl. |
 | E2 | OAuth `needs_reauth_at` | PASS | 0 of 7 credentials flagged; all refreshed within the last hour. |
 | E3 | Security audit | PASS | Grade C, 70/100, 0 fail / 0 warn; the 30 forfeited points are the three dev-posture `info` items (production mode, ephemeral AOT key, plaintext Redis). Write-ceiling controller gate exercised (`round_trip`); audit chain 122/122 job chains verified. Matches the last recorded posture ("grade C at fail:0"). |
@@ -89,15 +89,27 @@ summary and `pa_recall` sees whichever ran last.
 
 | Item | Action |
 |---|---|
-| C3 refresh rotation, C5 WS hub, D4 Briefings + dashboard counts | Open `http://localhost:3002`, log in, visit the workflow dashboard and the Briefings page, and leave one tab open for 20 min plus a second tab for 5 min. Then I read `rotated_session_audit`, `talos_auth_token_reuse_total{outcome="detected"}` (must stay 0), `talos_ws_active_sessions` (≈ open tabs), `talos_ws_handshakes_total` (must not climb while idle) and `pg_stat_statements` for the count and suffix SQL. In devtools → Network → WS: one socket, no reconnect loop. |
+| ~~C3, C5, D4~~ (done 2026-09-27) | Open `http://localhost:3002`, log in, visit the workflow dashboard and the Briefings page, and leave one tab open for 20 min plus a second tab for 5 min. Then I read `rotated_session_audit`, `talos_auth_token_reuse_total{outcome="detected"}` (must stay 0), `talos_ws_active_sessions` (≈ open tabs), `talos_ws_handshakes_total` (must not climb while idle) and `pg_stat_statements` for the count and suffix SQL. In devtools → Network → WS: one socket, no reconnect loop. |
 | B3 `content-pipeline` (tier1, local egress) | None. It runs on schedule 2026-09-28 12:00Z; I read its execution then. |
-| B3 `personal-finance` (Plaid, tier1 + public) | Run `personal-finance-daily` once when convenient (it reads Plaid sandbox). |
+| ~~B3 `personal-finance`~~ (done 2026-09-27) | Run `personal-finance-daily` once when convenient (it reads Plaid sandbox). |
 | C2 API-key digest upgrade | None possible: no API keys exist. |
 
 ## Verified / Fixed / Open
 
-- **Verified:** A1–A6, B1, B2, B3 (personal-assistant), C1, D1, D2 (forward), E2, E3, E5.
-- **Fixed (PR pending):** finding 1 — migration `20260926170000` (package
-  `2026-09-26-scrub-persisted-actor-context`), which also covers 22 264
-  `node_input` previews in `execution_events` found while measuring it.
-- **Open:** findings 2–4 above; UNVERIFIED items C3, C5, D4, B3 (content-pipeline, personal-finance), D3 (discriminating case).
+- **Verified:** A1–A6, B1, B2, B3 (personal-assistant, personal-finance), C1,
+  C3, C5, D1, D2 (forward), D4, E2, E3, E5.
+- **Fixed:**
+  - finding 1: migration `20260926170000`, #961 (also covers 22 264
+    `node_input` previews found while measuring it);
+  - findings 3 and 4: #962, merged;
+  - finding 2: #964, merged, and the `/ws` twin #966 (found while verifying #964);
+  - the nightly red on the #960 merge commit (`worker::kill_switch_tests`
+    yield test, 3 of 4 quality runs, 4 beats against a floor of 5): #963.
+- **Closed by measurement:** `module_executions.input_data` plaintext fallback.
+  Every production path installs the encrypting store (`for_workflow` →
+  `build_controller_engine`, sub-engines copy it,
+  `ModuleExecutionService::new(..).with_encryption(..)` at bootstrap); 0 of
+  71 962 module rows hold plaintext. Latent; no code change.
+- **Proposed:** DEK wrap AAD, RFC 0013 (#965), awaiting the operator's answers.
+- **Open:** B3 `content-pipeline` (scheduled 2026-09-28 12:00Z); D3's
+  discriminating case (a rewrite whose new write lacks metadata).
