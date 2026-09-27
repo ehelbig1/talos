@@ -74,21 +74,31 @@ pub fn env_var_is_set_nonempty(var: &str) -> bool {
 /// here the failure mode is misleading-error rather than auth bypass,
 /// but the symmetry between the two paths is worth preserving.
 pub fn read_env_or_file(var: &str) -> Option<String> {
-    if let Ok(val) = env::var(var) {
-        if !val.is_empty() {
-            return Some(val);
-        }
-        // Empty env var — let the file path take its turn rather than
-        // shadowing it. Log so the operator sees that the env was set
-        // (presumably unintentionally) and the file path is being used
-        // instead.
-        tracing::warn!(
-            "{} env var is set to empty — treating as missing; falling back to {}_FILE",
-            var,
-            var
-        );
-    }
+    // allow-empty-env-presence: empty is still treated as unset (the function
+    // returns `None` for it below); `env_set_empty` only picks the log level.
+    let env_set_empty = match env::var(var) {
+        Ok(val) if !val.is_empty() => return Some(val),
+        Ok(_) => true,
+        Err(_) => false,
+    };
     let file_var = format!("{}_FILE", var);
+    if env_set_empty {
+        // Empty env var — let the file path take its turn rather than
+        // shadowing it.
+        if empty_env_shadows_a_file(env::var(&file_var).ok().as_deref()) {
+            tracing::warn!(
+                "{} env var is set to empty — treating as missing; falling back to {}_FILE",
+                var,
+                var
+            );
+        } else {
+            tracing::debug!(
+                "{} env var is set to empty and {}_FILE is unset — treating as not configured",
+                var,
+                var
+            );
+        }
+    }
     // 2026-08-28: the `.filter(|v| !v.is_empty())` makes this function's own
     // doc comment true. It claims "Empty values are treated as missing on BOTH
     // paths", and that held for the file's CONTENTS (below) but not for the
@@ -119,6 +129,19 @@ pub fn read_env_or_file(var: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Whether an EMPTY `<VAR>` beside this `<VAR>_FILE` value is worth a WARN.
+///
+/// Only when the file variant is configured: that is the MCP-597 case, where
+/// an empty env var (usually a template placeholder) sits in front of a real
+/// secrets mount and the operator should know which one was used. With no
+/// file configured, empty means "not configured", exactly as for an unset
+/// variable, and is the steady state of any deployment that transports an
+/// optional variable as `${VAR:-}` (compose's `TALOS_MASTER_KEY_PREVIOUS`
+/// outside a key rotation). A WARN there fires on every boot and says nothing.
+fn empty_env_shadows_a_file(file_var_value: Option<&str>) -> bool {
+    file_var_value.is_some_and(|path| !path.is_empty())
 }
 
 pub fn is_production() -> bool {
