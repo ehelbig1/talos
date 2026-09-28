@@ -5,13 +5,16 @@
 //! * [`stream`]: one exchange, streamed and bounded by progress deadlines
 //!   ([`deadlines`]) instead of a total clock, reassembled into the
 //!   non-streaming response body.
+//! * [`fleet`]: the queue shared by every process calling one backend (P3b).
 //! * [`line_reader`]: the byte-level line reader the stream is built on.
 //!
 //! Two callers: the worker's `llm::complete*` host functions (since P1/P2) and
 //! the controller's `talos_llm::OllamaClient` (since P3a). They are different
-//! processes, so each has its own gate; a queue shared across processes is P3b.
+//! processes, so each has its own gate; since P3b a [`fleet`] queue in Redis,
+//! taken after the process gate, bounds them together.
 
 pub mod deadlines;
+pub mod fleet;
 pub mod gate;
 pub mod line_reader;
 pub mod stream;

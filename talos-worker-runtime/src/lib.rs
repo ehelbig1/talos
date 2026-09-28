@@ -21,6 +21,7 @@ pub mod host_impl;
 pub mod inference_wait;
 pub mod job_idempotency;
 pub mod job_span;
+pub mod local_llm_fleet;
 pub mod metrics;
 pub mod module_fetcher;
 pub mod reason_class;

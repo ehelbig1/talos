@@ -8,20 +8,25 @@ publish.workspace = true
 
 # Admission and progress deadlines for LOCAL (Ollama) inference, shared by the
 # worker's `llm::complete*` host functions and the controller's
-# `talos_llm::OllamaClient` (RFC 0014 P3a). A leaf: nothing Talos-specific
-# above the HTTP body cap and the DLP redactor.
+# `talos_llm::OllamaClient` (RFC 0014 P3a), and the fleet-wide queue both
+# take in Redis (P3b). A leaf: nothing Talos-specific above the HTTP body cap,
+# the DLP redactor and the shared env vocabulary.
 [dependencies]
 futures-util = "0.3"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "script", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
+talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "test-util"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 # RFC 0014 — Local inference that does not depend on the schedule
 
-**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28; P2c measured and not built 2026-09-28; P3a (the controller gated and on progress deadlines) 2026-09-28
+**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28; P2c measured and not built 2026-09-28; P3a (the controller gated and on progress deadlines) 2026-09-28; P3b (one queue across processes) 2026-09-28
 **Author:** Platform
 **Date:** 2026-09-28
 
@@ -295,12 +295,57 @@ controller's `llm_usage` rows; `scripts/measurements/rfc0014-controller-ollama-o
 - **No controller metric.** `talos-llm` has no metrics edge. The gate logs a
   queued call at INFO and an expired wait at WARN; P3b's broker adds series.
 
-### P3b — fleet-wide admission (proposed)
+### P3b — one queue across processes (2026-09-28)
 
-1. A Redis-backed lease semaphore (TTL-renewed, fenced by a token), keyed per
-   backend, taken by every worker replica **and** the controller's `OllamaClient`.
-2. **The broker never refuses**, like the gate: if Redis is unreachable, a caller
-   falls back to its per-process gate and logs it.
+**Why.** After P3a the controller and each worker still had a gate EACH, so the
+backend saw one request per process: the 108 worker requests that arrived while
+a controller call held the backend (P3a's measurement) were unchanged.
+
+**Decided.**
+
+1. **A counting semaphore in Redis, keyed per backend** (`talos_local_inference::fleet`):
+   holders scored by lease expiry, waiters scored by an `INCR` ticket (FIFO
+   across processes), and each waiter's liveness. One Lua script does every
+   transition on **Redis's own clock** (`TIME`), so no two hosts' clocks are
+   compared. The four keys share a hash tag (one cluster slot) and expire when
+   idle. The key is the SHA-256 of the normalised backend URL, so a URL carrying
+   credentials never reaches a key name.
+2. **Taken after the process gate.** A process has at most `cap` callers in the
+   fleet queue; its other calls queue locally with no Redis round trip. One wait
+   budget (`LOCAL_LLM_QUEUE_WAIT_SECS`) covers both stages, and a wait at either
+   stage is reported once to the worker's P2a ledger, so the job's deadlines
+   stand still for a fleet wait too.
+3. **One cap.** `TALOS_LOCAL_LLM_MAX_IN_FLIGHT` is the backend's slot count, now
+   applied fleet-wide as well as per process.
+4. **It never refuses, and Redis is not on the critical path.**
+   - Every Redis call is bounded (2 s). A Redis error or a slow call proceeds on
+     the process gate (P3a), logged once per outage, not per call.
+   - A fleet wait past the cap proceeds ungated, releasing the process permit,
+     exactly as an expired process wait does.
+   - Leases live 30 s and are renewed every 10 s: a holder that dies frees its
+     slot within 30 s. A waiter that gives up leaves the queue at once; one that
+     dies leaves within 5 s.
+   - A lease that cannot be renewed in time is counted (`lease_lost`); the call
+     is not interrupted.
+   - Over-admission is the only failure mode and it is harmless: Ollama queues
+     what it cannot serve, which is what happened before. **No fencing token**,
+     because Ollama cannot check one; the lease token only stops a holder
+     renewing a lease it lost.
+5. **Installed at boot** in both processes from `REDIS_URL`; not installed with
+   no Redis, a cap of 0, `TALOS_LOCAL_LLM_FLEET_ADMISSION=false`, or a Redis
+   unreachable at boot. Every case leaves calls on the process gate.
+6. **Series**, closed label set `leased | wait_expired | unavailable |
+   lease_lost`, pre-seeded: `talos_local_llm_fleet_admission_total` (controller)
+   and `wasm_llm_fleet_admission_total` (worker). No alert: no baseline yet.
+
+**Not done, stated.**
+
+- **Two processes naming one backend by different URLs get different queues**
+  and fall back to P3a's bound against each other. Dev and the chart give both
+  processes the same `OLLAMA_URL`.
+- **A Redis that restarts** loses the queue's state; calls in flight keep their
+  process permits and new calls start a fresh queue.
+- **Processes with different caps** each apply their own to the shared queue.
 
 ### P4 — classification and visibility (proposed)
 
@@ -333,5 +378,7 @@ controller's `llm_usage` rows; `scripts/measurements/rfc0014-controller-ollama-o
   reports, and a new controller hearing none behaves exactly as before.
 - **P3a** needs no migration and no wire change; the controller rolls
   independently. It changes only the controller's own calls.
-- **P3b** adds a Redis dependency on the local-inference path. The fallback keeps
-  a Redis outage from becoming an inference outage.
+- **P3b** adds a Redis dependency on the local-inference path, bounded to 2 s per
+  call. The fallback keeps a Redis outage from becoming an inference outage. No
+  wire change, no migration; processes roll in any order (a process without P3b
+  simply is not in the queue).

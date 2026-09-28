@@ -2886,6 +2886,9 @@ async fn main() -> anyhow::Result<()> {
     // behavior), never an error.
     if let Some(ref client) = redis_client {
         worker::job_idempotency::init_redis(client.as_ref().clone()).await;
+        // RFC 0014 P3b: queue local LLM calls with the controller and the
+        // other workers, not only within this process. Never fatal.
+        worker::local_llm_fleet::install(client.as_ref().clone()).await;
     }
 
     // PostgreSQL connection block removed Phase 2.10. Worker is now

@@ -83,6 +83,12 @@ mod limits;
 mod line_reader;
 mod llm;
 pub(crate) mod llm_gate;
+
+/// The local LLM backend this worker calls (`OLLAMA_URL`), for the fleet
+/// queue's key (RFC 0014 P3b).
+pub fn local_llm_backend_url() -> &'static str {
+    llm::ollama_base_url()
+}
 /// RFC 0014 P1: progress-based deadlines for a local (Ollama) exchange.
 mod llm_local_stream;
 pub(crate) mod llm_providers;
