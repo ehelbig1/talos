@@ -2084,3 +2084,143 @@ fn the_accumulated_memo_hits_until_results_are_mutated() {
         "a commit rebuilds the snapshot"
     );
 }
+
+// ---------------------------------------------------------------------------
+// RFC 0014 P2b — the run's budget stands still while its jobs are queued
+// ---------------------------------------------------------------------------
+
+fn test_now() -> std::time::Instant {
+    tokio::time::Instant::now().into_std()
+}
+
+/// A run with a 30 s budget does 25 s of work but spends 60 s of it queued for
+/// the local-inference slot (reported on the run's clock, as the dispatcher
+/// does). It finishes: the queue was not the run's work.
+#[tokio::test(start_paused = true)]
+async fn a_run_budget_stands_still_while_a_job_is_queued() {
+    let progress = ExecutionProgress::default();
+    let p = progress.clone();
+    let run = async move {
+        let clock = p.run_waits().expect("stamped before the reactor runs");
+        let job = Uuid::new_v4();
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        clock.begin(job, test_now());
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        clock.end(job, test_now());
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        Ok(talos_workflow_engine_core::WorkflowContext::default())
+    };
+    let started = tokio::time::Instant::now();
+    let out = run_with_workflow_timeout(30, None, progress, None, run).await;
+    assert!(out.is_ok(), "{:?}", out.err());
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(85));
+}
+
+/// The control: the same 85 s run with nothing reported times out at 30 s.
+#[tokio::test(start_paused = true)]
+async fn without_reported_waits_the_same_run_times_out() {
+    let progress = ExecutionProgress::default();
+    let run = async move {
+        tokio::time::sleep(std::time::Duration::from_secs(85)).await;
+        Ok(talos_workflow_engine_core::WorkflowContext::default())
+    };
+    let started = tokio::time::Instant::now();
+    let out = run_with_workflow_timeout(30, None, progress, None, run).await;
+    assert!(matches!(
+        out,
+        Err(crate::WorkflowEngineError::Timeout { secs: 30, .. })
+    ));
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
+}
+
+/// A queue that never closes holds the run open for the cap, no longer.
+#[tokio::test(start_paused = true)]
+async fn an_unclosed_run_wait_is_capped() {
+    let progress = ExecutionProgress::default();
+    let p = progress.clone();
+    let run = async move {
+        p.run_waits().unwrap().begin(Uuid::new_v4(), test_now());
+        tokio::time::sleep(std::time::Duration::from_secs(10_000)).await;
+        Ok(talos_workflow_engine_core::WorkflowContext::default())
+    };
+    let started = tokio::time::Instant::now();
+    let out = run_with_workflow_timeout(30, None, progress, None, run).await;
+    assert!(matches!(
+        out,
+        Err(crate::WorkflowEngineError::Timeout { .. })
+    ));
+    assert_eq!(
+        started.elapsed(),
+        std::time::Duration::from_secs(
+            30 + talos_workflow_engine_core::LOCAL_INFERENCE_WAIT_CREDIT_CAP_SECS
+        )
+    );
+}
+
+/// Each run gets a FRESH clock: a reused engine handle does not inherit the
+/// previous run's excluded time.
+#[tokio::test(start_paused = true)]
+async fn every_run_gets_a_fresh_run_clock() {
+    let progress = ExecutionProgress::default();
+    let p = progress.clone();
+    let first = async move {
+        let c = p.run_waits().unwrap();
+        c.begin(Uuid::new_v4(), test_now());
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        Ok(talos_workflow_engine_core::WorkflowContext::default())
+    };
+    run_with_workflow_timeout(30, None, progress.clone(), None, first)
+        .await
+        .unwrap();
+    let p = progress.clone();
+    let second = async move {
+        assert_eq!(
+            p.run_waits().unwrap().excluded(test_now()),
+            std::time::Duration::ZERO
+        );
+        Ok(talos_workflow_engine_core::WorkflowContext::default())
+    };
+    run_with_workflow_timeout(30, None, progress, None, second)
+        .await
+        .unwrap();
+}
+
+/// A sub-engine built from the parent's adapter set carries the parent RUN's
+/// clock, and the child run's clock forwards to it: a job queued inside the
+/// sub-workflow pauses the parent's budget.
+#[tokio::test(start_paused = true)]
+async fn a_sub_workflow_run_forwards_its_waits_to_the_parent_run() {
+    let parent = ParallelWorkflowEngine::new();
+    let parent_clock = Arc::new(talos_workflow_engine_core::RunWaitClock::new(None));
+    parent.progress.set_run_waits(parent_clock.clone());
+    let child = parent.adapter_set().into_engine();
+    assert!(Arc::ptr_eq(
+        child
+            .parent_run_waits
+            .as_ref()
+            .expect("the parent link travels"),
+        &parent_clock
+    ));
+    let p = child.progress.clone();
+    let run = async move {
+        let c = p.run_waits().unwrap();
+        let job = Uuid::new_v4();
+        c.begin(job, test_now());
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        c.end(job, test_now());
+        Ok(talos_workflow_engine_core::WorkflowContext::default())
+    };
+    run_with_workflow_timeout(
+        0,
+        None,
+        child.progress.clone(),
+        child.parent_run_waits.clone(),
+        run,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        parent_clock.excluded(test_now()),
+        std::time::Duration::from_secs(45)
+    );
+}

@@ -31,7 +31,9 @@
 
 use std::time::{Duration, Instant};
 
-use talos_workflow_engine_core::{BoxError, JobTransport, WaitAccounting, WorkerKeyRing};
+use talos_workflow_engine_core::{
+    BoxError, JobTransport, RunWaitClock, WaitAccounting, WorkerKeyRing,
+};
 use talos_workflow_job_protocol::{subjects, JobProgress, JobProgressState};
 use uuid::Uuid;
 
@@ -168,8 +170,40 @@ impl AttemptProgress {
 /// The clock every instant here is read from: tokio's, as `std`. In production
 /// the two are the same clock; under a paused test clock only tokio's moves,
 /// and the timers below sleep on it.
-fn now() -> Instant {
+pub(crate) fn now() -> Instant {
     tokio::time::Instant::now().into_std()
+}
+
+/// The run's LIVE deadline: the stamped one pushed back by the run's excluded
+/// local-inference queueing (RFC 0014 P2b). One home, shared by the attempt
+/// clamp and the attempt window.
+pub(crate) fn live_run_deadline(
+    stamped: Option<Instant>,
+    waits: Option<&RunWaitClock>,
+) -> Option<Instant> {
+    stamped.map(|d| match waits {
+        Some(w) => w.deadline(d, now()),
+        None => d,
+    })
+}
+
+/// What bounds an attempt from ABOVE: the run's deadline less the reserve,
+/// re-read live every time the window is evaluated (P2b), so the run's own
+/// pause lets the attempt run on.
+pub(crate) struct RunLimit<'a> {
+    /// The run's STAMPED deadline; `None` when the run has no cap.
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) reserve: Duration,
+    /// The run's waiting account; this attempt's verified waits are reported
+    /// here too, keyed by the job id.
+    pub(crate) waits: Option<&'a RunWaitClock>,
+}
+
+impl RunLimit<'_> {
+    fn at(&self) -> Option<Instant> {
+        live_run_deadline(self.deadline, self.waits)
+            .map(|d| d.checked_sub(self.reserve).unwrap_or(d))
+    }
 }
 
 /// Send one attempt and wait for its reply under a window of `attempt_secs`,
@@ -184,7 +218,7 @@ pub(crate) async fn await_attempt(
     reply_inbox: Option<&str>,
     payload: Vec<u8>,
     attempt_secs: u64,
-    limit: Option<Instant>,
+    limit: RunLimit<'_>,
     check: ProgressCheck<'_>,
 ) -> Result<Result<Vec<u8>, BoxError>, AttemptElapsed> {
     let window = Duration::from_secs(attempt_secs);
@@ -215,22 +249,37 @@ pub(crate) async fn await_attempt(
 
     let base = now() + window;
     let mut progress = AttemptProgress::new(WaitAccounting::new());
-    loop {
-        let deadline = progress.deadline(base, limit, now());
+    let outcome = loop {
+        let deadline = progress.deadline(base, limit.at(), now());
         tokio::select! {
-            reply = &mut send => return Ok(reply),
+            reply = &mut send => break Ok(reply),
             Some(bytes) = rx.recv() => {
                 let verdict = progress.apply(&bytes, &check, now());
+                // RFC 0014 P2b: a VERIFIED report also moves the run's clock,
+                // so the run's budget and its siblings' windows see the wait.
+                if let (ProgressVerdict::Applied(state), Some(run)) = (&verdict, limit.waits) {
+                    match state {
+                        JobProgressState::Waiting => run.begin(check.expected_job_id, now()),
+                        JobProgressState::Admitted => run.end(check.expected_job_id, now()),
+                    }
+                }
                 log_verdict(&verdict, &check, progress.excluded(now()));
             }
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 let now = now();
-                if now >= progress.deadline(base, limit, now) {
-                    return Err(AttemptElapsed { excluded: progress.excluded(now) });
+                if now >= progress.deadline(base, limit.at(), now) {
+                    break Err(AttemptElapsed { excluded: progress.excluded(now) });
                 }
             }
         }
+    };
+    // However the attempt ended, this job is no longer waiting: a lost
+    // `admitted` must not hold the RUN open (it cannot hold the attempt open,
+    // which has just ended). Idempotent when the wait was already closed.
+    if let Some(run) = limit.waits {
+        run.end(check.expected_job_id, now());
     }
+    outcome
 }
 
 fn log_verdict(verdict: &ProgressVerdict, check: &ProgressCheck<'_>, excluded: Duration) {

@@ -78,6 +78,8 @@ tokio-util = { version = "0.7", default-features = false }
 # on is asserted against rather than assumed. Dev-only — the engine never
 # installs a subscriber itself.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+# `tokio::time::pause`/`advance` for the RFC 0014 P2b run-budget tests.
+tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util"] }
 
 [[bench]]
 name = "scheduler"

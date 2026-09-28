@@ -162,6 +162,12 @@ struct ProgressInner {
     /// own handle. `None` only on a handle no run has started through the
     /// wrapper, where `abort_run` is a no-op and `run_aborted` is `false`.
     run_abort: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    /// RFC 0014 P2b: this run's waiting account — the union of its jobs'
+    /// reported local-inference queueing. The run's LIVE deadline is `deadline`
+    /// plus this clock's excluded time. A fresh clock is stamped per run by
+    /// [`crate::engine::run_with_workflow_timeout`] (same lifetime rules as
+    /// `deadline`); a sub-workflow run's clock forwards to its parent's.
+    run_waits: std::sync::Mutex<Option<Arc<talos_workflow_engine_core::RunWaitClock>>>,
 }
 
 impl ExecutionProgress {
@@ -222,6 +228,34 @@ impl ExecutionProgress {
                     .map(tokio_util::sync::CancellationToken::is_cancelled)
             })
             .unwrap_or(false)
+    }
+
+    /// Stamp this run's waiting account. Called only from
+    /// [`crate::engine::run_with_workflow_timeout`].
+    pub(crate) fn set_run_waits(&self, clock: Arc<talos_workflow_engine_core::RunWaitClock>) {
+        if let Ok(mut slot) = self.inner.run_waits.lock() {
+            *slot = Some(clock);
+        }
+    }
+
+    /// This run's waiting account, if a run has started through the wrapper.
+    pub(crate) fn run_waits(&self) -> Option<Arc<talos_workflow_engine_core::RunWaitClock>> {
+        self.inner
+            .run_waits
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// This run's LIVE deadline at `now`: the stamped deadline pushed back by
+    /// the run's excluded local-inference queueing (RFC 0014 P2b). Same
+    /// fail-open contract as [`Self::deadline`].
+    pub(crate) fn live_deadline(&self, now: Instant) -> Option<Instant> {
+        let base = self.deadline()?;
+        Some(match self.run_waits() {
+            Some(w) => w.deadline(base, now),
+            None => base,
+        })
     }
 
     /// This run's absolute wall-clock deadline, if it has one.

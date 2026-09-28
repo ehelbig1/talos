@@ -1,6 +1,6 @@
 # RFC 0014 — Local inference that does not depend on the schedule
 
-**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28
+**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28
 **Author:** Platform
 **Date:** 2026-09-28
 
@@ -184,11 +184,36 @@ of those waits was charged to the job's deadlines.
 pipeline jobs (dormant by config) report nothing; a job whose `waiting` message is
 lost is abandoned at its window exactly as before P2.
 
-### P2b — the run's budget pauses too (proposed)
+### P2b — the run's budget pauses too (2026-09-28)
 
-`ExecutionProgress` records the union of its jobs' reported waits on the
-controller's clock and the run-level timeout reads a live deadline; dispatches
-read the run deadline live instead of a snapshot taken at dispatch.
+1. **One clock per run, the union of its jobs' waits.**
+   `talos_workflow_engine_core::RunWaitClock`, keyed by job id, measured on the
+   controller's clock:
+   - it pauses while ANY of the run's jobs is queued for the slot;
+   - two parallel queued branches pause the run once, not twice;
+   - it is capped at the same 300 s as a job.
+
+   A fresh clock is stamped per run beside the deadline.
+2. **Every timer that bounds the run reads the LIVE deadline** (stamped deadline
+   plus the clock's excluded time):
+   - the run-level timeout in `run_with_workflow_timeout`, re-read each time it
+     is reached;
+   - the dispatcher's per-attempt clamp and the attempt window's upper limit;
+   - the inline child window (`bounded_child`) for sub-workflow, judge and
+     ensemble nodes.
+3. **The dispatcher reports into the run's clock.** Each VERIFIED `waiting` /
+   `admitted` for an attempt also moves the run clock (`DispatchJob::run_waits`,
+   carried by the single-node and loop-body dispatches). Whenever an attempt
+   ends, its wait on the run is closed, so a lost `admitted` cannot hold the
+   run open.
+4. **Sub-workflows.** A child run's clock forwards to its parent's (carried by
+   `AdapterSet`), so a job queued inside `pa-chief-of-staff`'s sub-workflow
+   pauses the parent's budget too.
+
+**Stated limits:**
+- The child window pauses on the RUN's union, so a sibling branch's queueing
+  also holds it. That errs toward more time, and is bounded by the cap.
+- Pipeline jobs (dormant) carry no clock.
 
 ### P2c — fair, model-aware admission (proposed)
 

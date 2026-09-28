@@ -674,6 +674,11 @@ pub(crate) async fn execute_job_with_retry(
     // t=0) is indistinguishable from one caused by the run having spent
     // its budget, and the first fires on every healthy run.
     budget_secs: Option<u64>,
+    // RFC 0014 P2b: the run's waiting account (`DispatchJob::run_waits`).
+    // `deadline` is the STAMPED run deadline; the live one is `deadline` plus
+    // this clock's excluded time, re-read at every clamp. `None` keeps the
+    // stamped deadline as the live one, exactly as before P2b.
+    run_waits: Option<std::sync::Arc<talos_workflow_engine_core::RunWaitClock>>,
 ) -> Result<serde_json::Value, String> {
     let mut attempts: u32 = 0;
     // Re-dispatches spent on LIVENESS failures — a job the receiver refused
@@ -702,29 +707,32 @@ pub(crate) async fn execute_job_with_retry(
         //
         // Computing this once before the loop would be the same bug one
         // level up: attempt 3 must see the budget attempts 1 and 2 spent.
-        let (attempt_secs, budget_clamped) =
-            match clamp_attempt_timeout(timeout_secs, deadline, std::time::Instant::now()) {
-                AttemptWindow::Wait { secs, clamped } => (secs, clamped),
-                AttemptWindow::BudgetExhausted { remaining_secs } => {
-                    // Fail NOW rather than dispatch into a budget that
-                    // cannot hold the round-trip: this both avoids work
-                    // that cannot land and preserves the reserve the
-                    // engine's failure path needs. Strictly fewer
-                    // attempts than before, never more. No send happened,
-                    // so no nonce was minted and no seal was re-armed.
-                    tracing::warn!(
-                        attempt = attempts + 1,
-                        remaining_secs,
-                        node_allowance_secs = timeout_secs,
-                        "workflow budget exhausted — not starting another attempt"
-                    );
-                    return Err(budget_exhausted_message(
-                        attempts + 1,
-                        remaining_secs,
-                        timeout_secs,
-                    ));
-                }
-            };
+        let (attempt_secs, budget_clamped) = match clamp_attempt_timeout(
+            timeout_secs,
+            crate::attempt_wait::live_run_deadline(deadline, run_waits.as_deref()),
+            crate::attempt_wait::now(),
+        ) {
+            AttemptWindow::Wait { secs, clamped } => (secs, clamped),
+            AttemptWindow::BudgetExhausted { remaining_secs } => {
+                // Fail NOW rather than dispatch into a budget that
+                // cannot hold the round-trip: this both avoids work
+                // that cannot land and preserves the reserve the
+                // engine's failure path needs. Strictly fewer
+                // attempts than before, never more. No send happened,
+                // so no nonce was minted and no seal was re-armed.
+                tracing::warn!(
+                    attempt = attempts + 1,
+                    remaining_secs,
+                    node_allowance_secs = timeout_secs,
+                    "workflow budget exhausted — not starting another attempt"
+                );
+                return Err(budget_exhausted_message(
+                    attempts + 1,
+                    remaining_secs,
+                    timeout_secs,
+                ));
+            }
+        };
         if budget_clamped {
             // ATTRIBUTED, because the two causes deserve opposite
             // attention and the noisy one was drowning the other.
@@ -774,17 +782,17 @@ pub(crate) async fn execute_job_with_retry(
         // is queued for the local-inference slot — never past the run's own
         // deadline less the reserve, which bounds the window exactly as the
         // clamp above bounds it at the start. See `crate::attempt_wait`.
-        let run_limit = deadline.map(|d| {
-            d.checked_sub(std::time::Duration::from_secs(BUDGET_RESERVE_SECS))
-                .unwrap_or(d)
-        });
         let result = crate::attempt_wait::await_attempt(
             transport,
             &topic,
             reply_inbox.as_deref(),
             current_payload.clone(),
             attempt_secs,
-            run_limit,
+            crate::attempt_wait::RunLimit {
+                deadline,
+                reserve: std::time::Duration::from_secs(BUDGET_RESERVE_SECS),
+                waits: run_waits.as_deref(),
+            },
             crate::attempt_wait::ProgressCheck {
                 expected_job_id,
                 sent_payload: &current_payload,
@@ -1945,6 +1953,8 @@ impl NodeDispatcher for NatsNodeDispatcher {
             job.deadline,
             // Total budget, for log ATTRIBUTION only (see the clamp site).
             job.budget_secs,
+            // RFC 0014 P2b: the run's waiting account.
+            job.run_waits.clone(),
         )
         .await;
 
@@ -3204,6 +3214,28 @@ mod budget_clamp_loop_tests {
         deadline: Option<Instant>,
         budget_secs: Option<u64>,
     ) -> Result<serde_json::Value, String> {
+        run_loop_in_run(
+            transport,
+            timeout_secs,
+            max_retries,
+            deadline,
+            budget_secs,
+            None,
+        )
+        .await
+    }
+
+    /// [`run_loop_with_budget`] inside a run whose waiting account is
+    /// `run_waits` (RFC 0014 P2b).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_loop_in_run(
+        transport: &dyn JobTransport,
+        timeout_secs: u64,
+        max_retries: u32,
+        deadline: Option<Instant>,
+        budget_secs: Option<u64>,
+        run_waits: Option<Arc<talos_workflow_engine_core::RunWaitClock>>,
+    ) -> Result<serde_json::Value, String> {
         let classifier = AlwaysTransient;
         let evaluator = NoExpr;
         // A REAL signed request, not `b"{}"`: the loop reads the dispatched
@@ -3230,8 +3262,47 @@ mod budget_clamp_loop_tests {
             None,
             deadline,
             budget_secs,
+            run_waits,
         )
         .await
+    }
+
+    /// RFC 0014 P2b: each attempt is clamped against the run's LIVE deadline.
+    /// The run's stamped deadline is already (almost) spent, but the run stood
+    /// still for 100 s while one of its jobs was queued for local inference, so
+    /// it has ~100 s left and the attempt is dispatched. The control, with the
+    /// same stamped deadline and no run clock, is refused before the wire.
+    #[tokio::test]
+    async fn the_attempt_clamp_reads_the_runs_live_deadline() {
+        let now = Instant::now();
+        let stamped = now + std::time::Duration::from_secs(1);
+
+        let refused = RecordingTransport {
+            payloads: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_first: 0,
+        };
+        assert!(
+            run_loop_with_budget(&refused, 30, 0, Some(stamped), Some(300))
+                .await
+                .is_err(),
+            "the control: a spent stamped deadline refuses the attempt"
+        );
+        assert!(refused.payloads.lock().unwrap().is_empty());
+
+        let clock = Arc::new(talos_workflow_engine_core::RunWaitClock::new(None));
+        let queued = uuid::Uuid::new_v4();
+        // A closed 100 s wait (recorded as an interval; which instants bound it
+        // does not matter to the clamp, only its length).
+        clock.begin(queued, now);
+        clock.end(queued, now + std::time::Duration::from_secs(100));
+        let sent = RecordingTransport {
+            payloads: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_first: 0,
+        };
+        run_loop_in_run(&sent, 30, 0, Some(stamped), Some(300), Some(clock))
+            .await
+            .expect("the run's pause leaves room for the attempt");
+        assert_eq!(sent.payloads.lock().unwrap().len(), 1);
     }
 
     /// Transport that records every payload it is handed and fails the first
@@ -3367,6 +3438,7 @@ mod budget_clamp_loop_tests {
             None,
             None,
             None,
+            None, // run_waits
         )
         .await
         .expect("third dispatch succeeds");
@@ -3943,6 +4015,7 @@ mod liveness_redispatch_tests {
             None,
             None,
             None,
+            None, // run_waits
         )
         .await
     }
@@ -4113,6 +4186,7 @@ mod liveness_redispatch_tests {
             // to come back for a second after the liveness backoff.
             Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
             Some(300),
+            None, // run_waits
         )
         .await
         .expect_err("an exhausted budget must stop the loop");
