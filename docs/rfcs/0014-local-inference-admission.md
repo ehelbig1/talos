@@ -1,6 +1,6 @@
 # RFC 0014 — Local inference that does not depend on the schedule
 
-**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28; P2c measured and not built 2026-09-28; P3a (the controller gated and on progress deadlines) 2026-09-28; P3b (one queue across processes) 2026-09-28
+**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28; P2c measured and not built 2026-09-28; P3a (the controller gated and on progress deadlines) 2026-09-28; P3b (one queue across processes) 2026-09-28; P4a (timeouts classified and counted by kind) 2026-09-28
 **Author:** Platform
 **Date:** 2026-09-28
 
@@ -347,16 +347,69 @@ a controller call held the backend (P3a's measurement) were unchanged.
   process permits and new calls start a fresh queue.
 - **Processes with different caps** each apply their own to the shared queue.
 
-### P4 — classification and visibility (proposed)
+### P4a — timeouts classified and counted by kind (2026-09-28)
 
-1. Retry by timeout kind:
-   - a first-byte timeout under contention is transient;
-   - an idle timeout after progress is a stuck backend, retried once;
-   - a ceiling timeout is not retried.
-2. Series with closed label sets, pre-seeded:
-   - `wasm_llm_timeouts_total{kind}`;
-   - per-model queue depth;
-   - swap count, derived from the adapter's knowledge of the last-served model.
+**Measured first.** The host Ollama's request log, 2026-09-21 to 2026-09-28:
+every local LLM failure was either the old 60 s total cut (11) or an HTTP 500
+(2). P1 removed that cut, and since P1–P3 deployed there have been none. So
+retry-by-kind had nothing to act on when it was built. It was built on the
+operator's decision (all of P4), with the counter below as the instrument that
+will show whether it ever acts.
+
+**Decided.**
+
+1. **Three classes, stamped where the worker already stamps a cause.** A local
+   exchange cut by a deadline latches `inference-first-byte-timeout`,
+   `inference-idle-timeout` or `inference-ceiling-timeout` on the egress latch
+   (`TalosContext::record_inference_timeout`), and the node failure carries
+   `[reason_class=…]` exactly as HTTP failures do. No WIT change: the guest
+   still sees `timeout`.
+   - The pairing accepts both spellings the guest's message carries: the
+     variant's `Timeout` and the `llm-inference` template's "timed out"
+     (`Reason::explains`, an `|`-separated set).
+   - Only a timeout latches. The other local-exchange failures surface as
+     `api-error(…)`, which no class explains, and clearing on them could remove
+     an earlier non-transient HTTP marker.
+   - A later HTTP failure overwrites the latch (the four HTTP surfaces latch or
+     clear on every failing return), so an LLM class cannot ride one.
+2. **The retry decision** (`talos_retry_intelligence`, with arms above the
+   generic `timed out` arm):
+   - `inference_first_byte_timeout` — transient, the node's own count;
+   - `inference_idle_timeout` — transient, **at most one retry**
+     (`retry_cap_for`, applied by the dispatcher through a new
+     `RetryClassifier::retry_cap`, which can only lower the count);
+   - `inference_ceiling_timeout` — **not retried**: the call was still making
+     progress for the whole backstop. The worker's own check reads it the same
+     way (`NON_TRANSIENT`).
+   - A capped retry that stops early writes a `retry_skipped` event carrying
+     `error_class`.
+3. **Mirrors kept in step:** `talos-reason-class` (tokens, `Family::Timeout` for
+   all three) and the failure-analysis and ops self-monitor tables. To an
+   operator all three still read as a timeout.
+4. **Series**, closed set `first_byte | idle | ceiling`, pre-seeded, counted at
+   the exchange's one deadline site (`stream::set_timeout_sink`), so a timeout
+   the caller swallows is still counted:
+   - worker `wasm_llm_timeouts_total{kind}`;
+   - controller `talos_local_llm_timeouts_total{kind}` (the controller's own
+     `OllamaClient` calls).
+   - No alert: no baseline.
+
+**Not done, stated.**
+
+- **A `retry_condition` bypasses the classifier**, and so the cap, as it does
+  for every class. Authors can match the new tokens in it.
+- **A module that rewrites the LLM error without "timeout" or "timed out"**
+  loses the marker, and its failure reads as it did before.
+- **The controller's `OllamaClient` callers do not retry** by kind; they are
+  counted only.
+- **Pipeline steps** (dormant by config) read the worker's own check, which
+  treats only the ceiling differently.
+
+### P4b — queue depth and model switches (proposed)
+
+1. Fleet queue depth, sampled from the Redis queue.
+2. A model-switch count kept in Redis: consecutive admitted calls to different
+   models, the proxy for the swaps P2c measured.
 
 ## Operator items (not code)
 

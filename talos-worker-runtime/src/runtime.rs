@@ -2297,7 +2297,7 @@ pub(crate) fn last_network_reason_suffix(
     // Cheap containment check on the WIT enum's rendered name. The generated
     // bindings render `Error { code: 2, name: "networkerror", message: "" }`;
     // a `{:?}` of the enum renders `Networkerror`. Lowercase covers both.
-    if !guest_error.to_lowercase().contains(reason.wit) {
+    if !reason.explains(&guest_error.to_lowercase()) {
         return String::new();
     }
     format!(" {}", crate::reason_class::marker(reason.class))
@@ -6383,6 +6383,29 @@ pub struct RuntimeHealthStatus {
 mod pipeline_step_retry_tests {
     use super::*;
     use std::time::Duration;
+
+    /// RFC 0014 P4a: of the three local-LLM deadline classes, only the
+    /// ceiling is non-transient here too — the same reading as the
+    /// controller's classifier.
+    #[test]
+    fn only_a_ceiling_inference_timeout_is_non_transient() {
+        let msg = |class: &str| {
+            format!(
+                "Component returned error: LLM provider 'ollama' timed out: the host \
+                 stopped waiting. {}",
+                crate::reason_class::marker(class)
+            )
+        };
+        assert!(is_transient_error_text(&msg(
+            crate::reason_class::INFERENCE_FIRST_BYTE_TIMEOUT
+        )));
+        assert!(is_transient_error_text(&msg(
+            crate::reason_class::INFERENCE_IDLE_TIMEOUT
+        )));
+        assert!(!is_transient_error_text(&msg(
+            crate::reason_class::INFERENCE_CEILING_TIMEOUT
+        )));
+    }
 
     #[test]
     fn transient_text_matches_both_timeout_spellings() {

@@ -650,6 +650,8 @@ async fn main() -> anyhow::Result<()> {
     // in-cluster default rather than producing a base-URL-less client.
     let ollama_url = talos_config::get_env("OLLAMA_URL", "http://ollama:11434");
     let ollama_client = std::sync::Arc::new(talos_llm::OllamaClient::new(ollama_url.clone()));
+    // RFC 0014 P4a: count local LLM timeouts by which deadline fired.
+    bootstrap::local_llm_fleet::install_timeout_series();
     // RFC 0014 P3b: the controller's local LLM calls queue with the workers',
     // not only within this process. Never fatal.
     if let Some(ref client) = redis_client {

@@ -1,6 +1,9 @@
-//! The worker's half of RFC 0014 P3b: install the fleet-wide local-inference
-//! queue (`talos_local_inference::fleet`) against the worker's Redis, with
-//! `wasm_llm_fleet_admission_total{outcome}` as its series.
+//! The worker's local-inference series and the fleet queue:
+//!
+//! * RFC 0014 P3b: install the fleet-wide queue (`talos_local_inference::fleet`)
+//!   against the worker's Redis, with `wasm_llm_fleet_admission_total{outcome}`;
+//! * RFC 0014 P4a: count every local exchange cut by a progress deadline, by
+//!   which one fired, as `wasm_llm_timeouts_total{kind}`.
 //!
 //! The counter is built from the process-global meter rather than held on
 //! [`crate::metrics::RuntimeMetrics`]: the queue is installed at boot, before
@@ -11,6 +14,7 @@ use std::sync::Arc;
 
 use opentelemetry::{global, KeyValue};
 use talos_local_inference::fleet::{FleetOutcome, FleetSink};
+use talos_local_inference::stream::StallKind;
 
 /// Install the fleet queue for this worker's local backend (`OLLAMA_URL`).
 /// Never fatal: every failure leaves calls on the worker's own gate.
@@ -46,4 +50,29 @@ fn fleet_sink() -> Arc<FleetSink> {
     Arc::new(move |outcome: FleetOutcome| {
         counter.add(1, &[KeyValue::new("outcome", outcome.as_str())]);
     })
+}
+
+/// → `wasm_llm_timeouts_total{kind}`, `kind` ∈ `first_byte | idle | ceiling`,
+/// every kind pre-seeded at 0. Counted at the exchange's one deadline site, so
+/// a timeout the guest swallows is still counted. Call once at boot,
+/// independent of Redis.
+///
+/// SECURITY: `kind` is `StallKind::as_str`, a closed compile-time set.
+///
+/// Deliberately NOT alerted on: no baseline yet. This is the series that says
+/// whether first-byte, idle or ceiling timeouts happen at all.
+pub fn install_timeout_series() {
+    let counter = global::meter("talos-wasm-runtime")
+        .u64_counter("wasm.llm.timeouts")
+        .with_description(
+            "Local-LLM exchanges cut by a progress deadline, by kind \
+             (first_byte | idle | ceiling)",
+        )
+        .build();
+    for kind in StallKind::ALL {
+        counter.add(0, &[KeyValue::new("kind", kind.as_str())]);
+    }
+    talos_local_inference::stream::set_timeout_sink(Arc::new(move |kind: StallKind| {
+        counter.add(1, &[KeyValue::new("kind", kind.as_str())]);
+    }));
 }

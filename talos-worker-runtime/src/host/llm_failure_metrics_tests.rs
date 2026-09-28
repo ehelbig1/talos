@@ -80,6 +80,12 @@ fn stall_signal() -> &'static tokio::sync::Semaphore {
     S.get_or_init(|| tokio::sync::Semaphore::new(0))
 }
 
+/// Released by `mock-idle` once it has written its first chunk.
+fn idle_signal() -> &'static tokio::sync::Semaphore {
+    static S: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    S.get_or_init(|| tokio::sync::Semaphore::new(0))
+}
+
 static REQUESTS_SERVED: AtomicU64 = AtomicU64::new(0);
 
 /// Requests the mock received with `"stream":true` in the body. RFC 0014 P1:
@@ -206,6 +212,17 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
         // timeout wrapper is the only thing that can end this.
         "mock-stall" => {
             stall_signal().add_permits(1);
+            std::future::pending::<()>().await
+        }
+        // One chunk of the answer, then nothing: the IDLE deadline is the only
+        // thing that can end this (RFC 0014 P4a).
+        "mock-idle" => {
+            let _ = stream.write_all(NDJSON_HEAD.as_bytes()).await;
+            let _ = stream
+                .write_all(content_line("partial", false).as_bytes())
+                .await;
+            let _ = stream.flush().await;
+            idle_signal().add_permits(1);
             std::future::pending::<()>().await
         }
         // Holds the connection open long enough that a SECOND simultaneous
@@ -622,6 +639,7 @@ fn a_stalled_exchange_is_counted_as_timeout() {
         let before = failure_count(label, LlmFailure::Timeout).unwrap_or(0);
 
         let mut ctx = context_with_metrics(LlmTier::Tier1);
+        let latch = ctx.network_reason_handle();
         let fut = <TalosContext as wit_llm::Host>::complete(
             &mut ctx,
             request(wit_llm::Provider::Ollama, "mock-stall"),
@@ -651,6 +669,80 @@ fn a_stalled_exchange_is_counted_as_timeout() {
             "the timeout wrapper sits OUTSIDE the async block, so its error is \
              the one most easily left unclassified"
         );
+        // RFC 0014 P4a: which deadline fired reaches the node failure.
+        assert_inference_timeout_marked(
+            &latch,
+            &err,
+            crate::reason_class::INFERENCE_FIRST_BYTE_TIMEOUT,
+        );
+    });
+}
+
+/// The node failure a module builds from `err` — its `Debug`, and the
+/// `llm-inference` template's prose — carries `[reason_class=<class>]`.
+fn assert_inference_timeout_marked(
+    latch: &Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>>,
+    err: &wit_llm::Error,
+    class: &str,
+) {
+    let marker = crate::reason_class::marker(class);
+    for guest_error in [
+        format!("Component returned error: {err:?}"),
+        "Component returned error: LLM provider 'ollama' timed out: the host stopped \
+         waiting because the response made no progress in time."
+            .to_string(),
+    ] {
+        let suffix = crate::runtime::last_network_reason_suffix(latch, &guest_error);
+        assert!(
+            suffix.contains(&marker),
+            "{guest_error:?} got suffix {suffix:?}, want {marker}"
+        );
+    }
+}
+
+/// RFC 0014 P4a: an exchange that made progress and then stopped is cut at
+/// the IDLE deadline and marked as such — the class the retry decision caps
+/// at one retry.
+#[test]
+fn a_stall_after_progress_is_marked_idle() {
+    let _g = guard();
+    let label = llm_provider_label(wit_llm::Provider::Ollama);
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        let before = failure_count(label, LlmFailure::Timeout).unwrap_or(0);
+
+        let mut ctx = context_with_metrics(LlmTier::Tier1);
+        let latch = ctx.network_reason_handle();
+        let fut = <TalosContext as wit_llm::Host>::complete(
+            &mut ctx,
+            request(wit_llm::Provider::Ollama, "mock-idle"),
+        );
+        tokio::pin!(fut);
+
+        tokio::select! {
+            r = &mut fut => panic!("returned before the provider sent its first chunk: {r:?}"),
+            p = idle_signal().acquire() => { p.expect("semaphore").forget(); }
+        }
+        // Let the client read the chunk before time is frozen.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(
+            super::LOCAL_LLM_IDLE_TIMEOUT_SECS + 1,
+        ))
+        .await;
+        let err = fut.await.expect_err("a stalled exchange must not complete");
+        tokio::time::resume();
+
+        assert!(matches!(err, wit_llm::Error::Timeout), "{err:?}");
+        assert_eq!(
+            failure_count(label, LlmFailure::Timeout).unwrap_or(0),
+            before + 1
+        );
+        assert_inference_timeout_marked(&latch, &err, crate::reason_class::INFERENCE_IDLE_TIMEOUT);
     });
 }
 
@@ -1009,6 +1101,50 @@ fn a_steady_local_answer_longer_than_the_old_total_completes() {
         );
         let resp = result.expect("a steady answer must complete, however long it takes");
         assert_eq!(resp.text, "01234");
+    });
+}
+
+/// RFC 0014 P4a, the tool-calling call site: an idle stall there is marked
+/// the same way as on `complete`.
+#[test]
+fn a_tool_call_stall_after_progress_is_marked_idle() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        let mut ctx = context_with_metrics_in_world(LlmTier::Tier1, CapabilityWorld::Secrets);
+        let latch = ctx.network_reason_handle();
+        let fut = <TalosContext as wit_llm_tools::Host>::complete_with_tools(
+            &mut ctx,
+            tool_request("mock-idle"),
+        );
+        tokio::pin!(fut);
+
+        tokio::select! {
+            r = &mut fut => panic!("returned before the provider sent its first chunk: {r:?}"),
+            p = idle_signal().acquire() => { p.expect("semaphore").forget(); }
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(
+            super::LOCAL_LLM_IDLE_TIMEOUT_SECS + 1,
+        ))
+        .await;
+        let err = fut.await.expect_err("a stalled exchange must not complete");
+        tokio::time::resume();
+
+        assert!(matches!(err, wit_llm_tools::Error::Timeout), "{err:?}");
+        let guest_error = format!("Component returned error: {err:?}");
+        let suffix = crate::runtime::last_network_reason_suffix(&latch, &guest_error);
+        assert!(
+            suffix.contains(&crate::reason_class::marker(
+                crate::reason_class::INFERENCE_IDLE_TIMEOUT
+            )),
+            "{guest_error:?} got {suffix:?}"
+        );
     });
 }
 

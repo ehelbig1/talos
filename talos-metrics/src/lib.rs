@@ -28,7 +28,7 @@ pub use actor_budget::{BudgetCap, BudgetMode};
 pub use execution::ModuleExecutionOutcome;
 pub use execution_pause::{PauseGatePath, PauseRefusal};
 pub use google_push::{JwkRefreshOutcome, PushDeferReason, PushIntegration, PushRefusalReason};
-pub use local_llm::LocalLlmFleetOutcome;
+pub use local_llm::{LocalLlmFleetOutcome, LocalLlmTimeoutKind};
 pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
@@ -749,6 +749,22 @@ pub fn record_local_llm_fleet_admission_on(metrics: &TalosMetrics, outcome: Loca
     metrics
         .local_llm_fleet_admission_total
         .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
+/// Count one controller-side local LLM exchange cut by a progress deadline
+/// (RFC 0014 P4a). Inert without [`set_global`].
+pub fn record_local_llm_timeout(kind: LocalLlmTimeoutKind) {
+    if let Some(m) = global() {
+        record_local_llm_timeout_on(m, kind);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_local_llm_timeout_on(metrics: &TalosMetrics, kind: LocalLlmTimeoutKind) {
+    metrics
+        .local_llm_timeouts_total
+        .with_label_values(&[kind.as_str()])
         .inc();
 }
 
@@ -1934,6 +1950,10 @@ pub struct TalosMetrics {
     /// local LLM calls through the fleet-wide queue (RFC 0014 P3b).
     /// `LocalLlmFleetOutcome::ALL`, seeded at 0.
     pub local_llm_fleet_admission_total: CounterVec,
+    /// `talos_local_llm_timeouts_total{kind}` — the controller's local LLM
+    /// exchanges cut by a progress deadline (RFC 0014 P4a).
+    /// `LocalLlmTimeoutKind::ALL`, seeded at 0.
+    pub local_llm_timeouts_total: CounterVec,
     /// `talos_google_push_deferred_total{integration,reason}` — pushes handed
     /// back to the transport for redelivery because Talos could not answer.
     /// `PushIntegration::ALL` x `PushDeferReason::ALL`, seeded at 0. Package ES.
@@ -3587,6 +3607,24 @@ impl TalosMetrics {
                 .with_label_values(&[outcome.as_str()])
                 .inc_by(0.0);
         }
+        let local_llm_timeouts_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_local_llm_timeouts_total",
+                "The controller's local LLM exchanges (OllamaClient) cut by a progress \
+                 deadline, by kind: first_byte (nothing arrived in time), idle (the answer \
+                 stopped mid-way), ceiling (the whole exchange ran past its backstop). \
+                 Counted where the deadline fires, so a timeout the caller then handles is \
+                 counted too. Closed set, pre-seeded at 0. Not alerted: no baseline yet. \
+                 The worker's series is wasm_llm_timeouts_total.",
+            ),
+            &["kind"],
+        )?;
+        registry.register(Box::new(local_llm_timeouts_total.clone()))?;
+        for kind in LocalLlmTimeoutKind::ALL {
+            local_llm_timeouts_total
+                .with_label_values(&[kind.as_str()])
+                .inc_by(0.0);
+        }
         let google_push_deferred_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_google_push_deferred_total",
@@ -4217,6 +4255,7 @@ impl TalosMetrics {
             google_push_refusals_total,
             google_push_accepted_total,
             local_llm_fleet_admission_total,
+            local_llm_timeouts_total,
             google_push_deferred_total,
             execution_pause_refusals_total,
             webhook_duplicate_suppressed_total,
@@ -4804,6 +4843,24 @@ mod tests {
         let warm = m.render_prometheus().expect("render");
         assert!(warm.contains("talos_local_llm_fleet_admission_total{outcome=\"unavailable\"} 1"));
         assert!(warm.contains("talos_local_llm_fleet_admission_total{outcome=\"leased\"} 0"));
+    }
+
+    /// The local-LLM timeout counter (RFC 0014 P4a) is seeded for every kind
+    /// and moved by exactly the kind it was given.
+    #[test]
+    fn local_llm_timeouts_are_seeded_and_moved_by_kind() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        for k in LocalLlmTimeoutKind::ALL {
+            assert!(cold.contains(&format!(
+                "talos_local_llm_timeouts_total{{kind=\"{}\"}} 0",
+                k.as_str()
+            )));
+        }
+        record_local_llm_timeout_on(&m, LocalLlmTimeoutKind::Idle);
+        let warm = m.render_prometheus().expect("render");
+        assert!(warm.contains("talos_local_llm_timeouts_total{kind=\"idle\"} 1"));
+        assert!(warm.contains("talos_local_llm_timeouts_total{kind=\"first_byte\"} 0"));
     }
 
     /// The accepted-push counter (2026-09-18) is seeded for every

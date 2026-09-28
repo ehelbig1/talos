@@ -706,7 +706,13 @@ impl TalosContext {
                 MAX_LLM_BODY_BYTES,
             )
             .await
-            .map_err(local_exchange_failure)?
+            .map_err(|e| {
+                // RFC 0014 P4a: which deadline fired reaches the retry decision.
+                if let super::llm_local_stream::LocalExchangeError::Timeout(kind) = &e {
+                    self.record_inference_timeout(*kind);
+                }
+                local_exchange_failure(e)
+            })?
         } else {
             tokio::time::timeout(
             std::time::Duration::from_secs(EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS),

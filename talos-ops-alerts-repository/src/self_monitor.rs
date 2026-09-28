@@ -1276,6 +1276,9 @@ mod tests {
             ("send-failed", "network", "low"),
             ("response-stream", "network", "low"),
             ("timeout", "timeout", "medium"),
+            ("inference-first-byte-timeout", "timeout", "medium"),
+            ("inference-idle-timeout", "timeout", "medium"),
+            ("inference-ceiling-timeout", "timeout", "medium"),
             // KEPT on the pre-existing class so the common denial does not
             // fork its dedup key.
             ("no-allowlist", "egress_denied", "high"),

@@ -2076,6 +2076,23 @@ impl TalosContext {
         self.record_network_outcome(Some(crate::reason_class::Reason { class, wit }));
     }
 
+    /// RFC 0014 P4a: latch which progress deadline cut a LOCAL LLM exchange,
+    /// so a node that fails on it carries `[reason_class=inference-*-timeout]`
+    /// and the retry decision can tell first-byte, idle and ceiling apart.
+    ///
+    /// Shares the egress latch deliberately. Every failing return on the four
+    /// HTTP surfaces latches or clears it (the totality rule), so a later HTTP
+    /// failure overwrites this class and it can never ride one. Only a TIMEOUT
+    /// latches here: the other local-exchange failures surface as
+    /// `api-error(…)`, which no class explains, and clearing on them could
+    /// remove an earlier NON-transient HTTP marker — the forbidden direction.
+    pub(crate) fn record_inference_timeout(&self, kind: talos_local_inference::stream::StallKind) {
+        self.record_network_outcome(Some(crate::reason_class::Reason {
+            class: crate::reason_class::inference_timeout_class(kind),
+            wit: crate::reason_class::WIT_LLM_TIMEOUT,
+        }));
+    }
+
     /// Record the class of the latest host-side HTTP outcome — `Some(class)`
     /// for a failure, `None` to CLEAR after a success. See
     /// [`Self::last_network_reason`] for why success must clear.
