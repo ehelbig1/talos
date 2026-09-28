@@ -14,7 +14,8 @@
  * The hub owns: the lazily opened socket, the registry of live
  * subscriptions keyed by a page-unique id, replay of every live `start`
  * after each `connection_ack` (so a reconnect resubscribes everything), a
- * `stop` on unsubscribe, an idle close when the last subscription leaves,
+ * `stop` on unsubscribe, an idle close when the last subscription has been
+ * gone for `IDLE_CLOSE_GRACE_MS`,
  * ONE auth-recovery site through the session's refresh epoch (DS's rule:
  * a refresh that succeeded since this socket was opened is reused, not
  * repeated), the reconnect backoff (5 attempts before a first ack, 30
@@ -58,6 +59,16 @@ const MAX_ATTEMPTS_BEFORE_FIRST_ACK = 5;
 const MAX_ATTEMPTS_AFTER_ACK = 30;
 const MAX_BACKOFF_MS = 30_000;
 const AUTH_RECOVERY_MIN_INTERVAL_MS = 30_000;
+/**
+ * How long the socket stays open after the last subscription leaves. Closing
+ * at once closed a socket that was still CONNECTING whenever a component
+ * unsubscribed and resubscribed in the same breath: React StrictMode's
+ * double-mounted effects in dev, and any route change between two pages that
+ * both subscribe. Each one cost a wasted handshake and printed "WebSocket is
+ * closed before the connection is established". A resubscription inside the
+ * grace keeps the socket.
+ */
+export const IDLE_CLOSE_GRACE_MS = 5_000;
 /** Refusals after a SUCCESSFUL recovery (with no ack in between) before the
  *  hub gives up: the fresh cookie is evidently not reaching the socket. */
 const MAX_REFUSALS_AFTER_RECOVERY = 2;
@@ -86,6 +97,8 @@ export class SubscriptionHub {
   private closedByHub = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Pending idle close; cancelled by any new subscription. */
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private connectedAt = 0;
   private epochAtConnect = 0;
   private lastRecoveryAt = Number.NEGATIVE_INFINITY;
@@ -99,6 +112,7 @@ export class SubscriptionHub {
     onEvent: (event: T) => void,
     dataKey: string,
   ): () => void {
+    this.cancelIdleClose();
     const id = String(this.nextId++);
     this.subs.set(id, {
       query,
@@ -130,10 +144,26 @@ export class SubscriptionHub {
       this.ws.send(JSON.stringify({ id, type: "stop" }));
     }
     this.started.delete(id);
-    if (this.subs.size === 0) this.closeIdle();
+    if (this.subs.size === 0) this.scheduleIdleClose();
+  }
+
+  private scheduleIdleClose(): void {
+    this.cancelIdleClose();
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      if (this.subs.size === 0) this.closeIdle();
+    }, IDLE_CLOSE_GRACE_MS);
+  }
+
+  private cancelIdleClose(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
   }
 
   private closeIdle(): void {
+    this.cancelIdleClose();
     this.clearReconnect();
     const ws = this.ws;
     this.detach();
