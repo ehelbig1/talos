@@ -310,52 +310,6 @@ impl SecurityMutations {
         }
     }
 
-    /// Bind every DEK wrap to its own `encryption_keys` row (RFC 0013). A
-    /// wrapped DEK copied into another row then fails to unwrap instead of
-    /// silently serving another tenant's key. The DEK bytes do not change, so no
-    /// data is re-encrypted. Idempotent and resumable; `remainingUnbound` (also
-    /// `dekMigrationStatus`'s `encryption_keys.wrap`) reads what is left.
-    ///
-    /// Run it only once EVERY controller runs a release that reads
-    /// `wrap_format`: an older build cannot open a bound row.
-    async fn rebind_dek_wraps(&self, ctx: &Context<'_>) -> Result<DekRebindResult> {
-        require_second_factor(ctx).await?;
-        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
-        // System-wide key material: the same authority as every other key
-        // operation (package CE decision), a platform admin.
-        require_platform_admin(ctx).await?;
-
-        let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
-        let user_id = ctx
-            .data_opt::<Uuid>()
-            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
-
-        let rebound_count = secrets_manager
-            .rebind_dek_wraps(Some(*user_id))
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to rebind DEK wraps: {}", e);
-                async_graphql::Error::new("Failed to rebind DEK wraps").extend_safe()
-            })?;
-        let remaining_unbound = secrets_manager
-            .count_unbound_dek_wraps()
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to count unbound DEK wraps: {}", e);
-                async_graphql::Error::new(
-                    "DEK wraps were rebound, but the remaining count could not be read",
-                )
-                .extend_safe()
-            })?;
-        Ok(DekRebindResult {
-            rebound_count,
-            remaining_unbound,
-            message: format!(
-                "{rebound_count} DEK wrap(s) bound to their rows; {remaining_unbound} still unbound."
-            ),
-        })
-    }
-
     async fn re_encrypt_secrets(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
         require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
@@ -933,32 +887,6 @@ mod rotate_org_dek_gate_pins {
             ),
             "a missing organization must be answered as not found"
         );
-    }
-}
-
-#[cfg(test)]
-mod rebind_dek_wraps_gate_pins {
-    #[test]
-    fn the_rebind_is_gated_before_it_rewraps() {
-        let src = include_str!("mutations.rs");
-        let start = src
-            .find("async fn rebind_dek_wraps(")
-            .expect("rebindDekWraps resolver present");
-        let rest = &src[start..];
-        let body = &rest[..rest.find("\n    }\n").expect("resolver body ends")];
-        let rebind = body
-            .find(".rebind_dek_wraps(")
-            .expect("the resolver rebinds through the manager");
-        for gate in [
-            "require_second_factor(ctx).await?",
-            "require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?",
-            "require_platform_admin(ctx).await?",
-        ] {
-            let at = body
-                .find(gate)
-                .unwrap_or_else(|| panic!("rebindDekWraps must call `{gate}`"));
-            assert!(at < rebind, "`{gate}` must run before the rebind");
-        }
     }
 }
 

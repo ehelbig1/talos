@@ -1306,84 +1306,112 @@ async fn an_org_dek_copied_into_another_orgs_row_does_not_open() {
     assert_eq!(again.key.as_slice(), dek_a.key.as_slice());
 }
 
-/// Phase 2: a pre-RFC (unbound) row still reads, `rebind_dek_wraps` binds it
-/// under the same DEK bytes (so data survives), records one audit row naming
-/// the org in the same transaction, and a second run rewrites nothing.
+/// Phase 3: the schema refuses an unbound wrap. Marking a row unbound — the
+/// first step of planting an unbound blob copied from another row — fails with
+/// the CHECK, and so does inserting one.
 #[tokio::test]
-async fn rebind_binds_a_legacy_row_keeps_its_data_and_is_idempotent() {
+async fn the_schema_refuses_an_unbound_dek_wrap() {
     set_master_key_for_dek_tests();
     let pool = test_helpers::get_test_db_pool().await;
     let manager = fresh_manager(&pool);
     manager.initialize().await.unwrap();
     let org = create_test_org(&pool).await;
     let dek = manager.get_or_create_dek_for_org(org).await.unwrap();
-    let ctx = Uuid::new_v4();
-    let (kid, ct, ver) = manager
-        .encrypt_value_aad_v4_org("survives-the-rebind", org, ctx.as_bytes())
-        .await
-        .unwrap();
 
-    // Make the row what every pre-RFC row is: the same DEK, wrapped unbound.
-    use talos_secrets_manager::kek_provider::{EnvKekProvider, KekProvider};
-    let kek = EnvKekProvider::from_hex(DEK_TEST_MASTER_KEY).unwrap();
-    let dek_bytes: [u8; 32] = dek.key.as_slice().try_into().unwrap();
-    let legacy = kek.wrap_dek(&dek_bytes, &[]).await.unwrap();
-    sqlx::query("UPDATE encryption_keys SET encrypted_key = $1, wrap_format = 1 WHERE id = $2")
-        .bind(&legacy)
+    let err = sqlx::query("UPDATE encryption_keys SET wrap_format = 1 WHERE id = $1")
+        .bind(dek.id)
+        .execute(&pool)
+        .await
+        .expect_err("an unbound wrap_format must be refused");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23514"),
+        "refused by the CHECK constraint: {err}"
+    );
+    let err = sqlx::query(
+        "INSERT INTO encryption_keys (encrypted_key, algorithm, active, wrap_format) \
+         VALUES ('\\x00', 'AES-256-GCM', false, 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("an unbound row must not be insertable");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23514")
+    );
+    // Control: the row is untouched and still reads.
+    assert_eq!(dek_row(&pool, dek.id).await.1, 2);
+    fresh_manager(&pool)
+        .get_active_dek_for_org(org)
+        .await
+        .unwrap()
+        .expect("org DEK");
+}
+
+/// The phase-3 migration stops with an instruction on a database that still
+/// holds an unbound row (a deployment that skipped the phase-2 rebind), rather
+/// than failing on a bare CHECK or booting a controller that cannot read its
+/// keys. Replays the migration's own SQL.
+#[tokio::test]
+async fn the_phase_3_migration_refuses_a_database_with_an_unbound_row() {
+    const MIGRATION: &str =
+        include_str!("../../migrations/20260928100000_encryption_keys_wrap_format_bound_only.sql");
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = fresh_manager(&pool);
+    manager.initialize().await.unwrap();
+    let org = create_test_org(&pool).await;
+    let dek = manager.get_or_create_dek_for_org(org).await.unwrap();
+
+    // Recreate the phase-2 world: the permissive CHECK and one unbound row.
+    sqlx::raw_sql(
+        "ALTER TABLE encryption_keys DROP CONSTRAINT encryption_keys_wrap_format_check; \
+         ALTER TABLE encryption_keys ADD CONSTRAINT encryption_keys_wrap_format_check \
+             CHECK (wrap_format IN (1, 2));",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE encryption_keys SET wrap_format = 1 WHERE id = $1")
         .bind(dek.id)
         .execute(&pool)
         .await
         .unwrap();
 
-    // Legacy rows keep reading, and the status counts it.
-    let legacy_read = fresh_manager(&pool);
-    assert_eq!(
-        legacy_read
-            .decrypt_versioned(kid, &ct, ctx.as_bytes(), ver)
-            .await
-            .unwrap()
-            .as_str(),
-        "survives-the-rebind"
-    );
+    let err = sqlx::raw_sql(MIGRATION)
+        .execute(&pool)
+        .await
+        .expect_err("the migration must refuse an unbound row");
     assert!(
-        pending_for(
-            &legacy_read.dek_migration_status().await.unwrap(),
-            "encryption_keys.wrap"
-        ) >= 1
+        err.to_string().contains("rebindDekWraps"),
+        "the refusal names the fix: {err}"
     );
 
-    let rebound = manager
-        .rebind_dek_wraps(Some(SYSTEM_USER_ID))
+    // Once the row is bound again the migration applies, and the strict
+    // CHECK is back for the tests that follow.
+    sqlx::query("UPDATE encryption_keys SET wrap_format = 2 WHERE id = $1")
+        .bind(dek.id)
+        .execute(&pool)
         .await
         .unwrap();
-    // Global across a database this binary shares, so row-scoped from here.
-    assert!(rebound >= 1);
-    let (_, format, xmin) = dek_row(&pool, dek.id).await;
-    assert_eq!(format, 2, "the legacy row is bound");
-    assert_eq!(
-        fresh_manager(&pool)
-            .decrypt_versioned(kid, &ct, ctx.as_bytes(), ver)
-            .await
-            .unwrap()
-            .as_str(),
-        "survives-the-rebind",
-        "the DEK bytes are unchanged, so existing ciphertext still decrypts"
-    );
-    let audit: Vec<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
-        "SELECT actor_id, org_id FROM secret_audit_log \
-         WHERE action = 'DEK_WRAP_REBOUND' AND org_id = $1",
+    sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap();
+    let check: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conname = 'encryption_keys_wrap_format_check'",
     )
-    .bind(org)
-    .fetch_all(&pool)
+    .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(audit, vec![(Some(SYSTEM_USER_ID), Some(org))]);
-
-    // Idempotent: the bound row is not rewritten by a second run.
-    manager
-        .rebind_dek_wraps(Some(SYSTEM_USER_ID))
-        .await
-        .unwrap();
-    assert_eq!(dek_row(&pool, dek.id).await.2, xmin, "no new row version");
-    assert_eq!(manager.count_unbound_dek_wraps().await.unwrap(), 0);
+    assert_eq!(check, "CHECK ((wrap_format = 2))");
+    let default: String = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns \
+         WHERE table_name = 'encryption_keys' AND column_name = 'wrap_format'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        default, "2",
+        "a writer that omits the column gets a bound format"
+    );
 }

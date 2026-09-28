@@ -133,10 +133,9 @@ Each wrapped DEK is bound to its own `encryption_keys` row (RFC 0013): the KEK
 wrap authenticates the row's `(id, org_id)` as associated data
 (`talos-secrets-manager/src/dek_wrap.rs`), so a wrapped DEK copied into another
 row — another organization's, or across the global/org boundary — fails to
-unwrap instead of silently serving the wrong tenant's key. `wrap_format` records
-whether a row is bound (2) or predates the binding (1); the platform-admin
-`rebindDekWraps` mutation binds the latter, and `dekMigrationStatus` counts what
-remains as `encryption_keys.wrap`.
+unwrap instead of silently serving the wrong tenant's key. Every row is bound:
+`CHECK (encryption_keys.wrap_format = 2)` refuses an unbound one, and the reader
+refuses it too (`dek_wrap::ensure_bound`).
 
 OAuth access and refresh tokens are not a separate table: they are stored as
 encrypted rows in `secrets` at `oauth/<provider>/<user_id>/<provider_key>/…`

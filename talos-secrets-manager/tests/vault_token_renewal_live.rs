@@ -180,7 +180,9 @@ async fn transit_binds_a_wrap_to_its_row_and_keeps_unbound_wraps_readable() {
         "transit must refuse a bound wrap read without associated data"
     );
 
-    // Pre-RFC rows: an unbound wrap still opens with an empty AAD.
+    // Provider level only: an empty AAD is still a well-formed transit request
+    // (byte-identical to the pre-RFC body). Since phase 3 no `encryption_keys`
+    // row may be unbound, so no production path sends one.
     let unbound = kek.wrap_dek(&dek, &[]).await.unwrap();
     assert_eq!(
         kek.unwrap_dek(&unbound, &[]).await.unwrap().as_slice(),
