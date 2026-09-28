@@ -549,6 +549,20 @@ export type DekMigrationStatusEntry = {
   table: Scalars["String"]["output"];
 };
 
+/** Result of `rebindDekWraps` (RFC 0013): DEK wraps bound to their rows. */
+export type DekRebindResult = {
+  __typename?: "DekRebindResult";
+  /** Human-readable status message. */
+  message: Scalars["String"]["output"];
+  /** Number of `encryption_keys` rows this call rewrapped bound to their row. */
+  reboundCount: Scalars["Int"]["output"];
+  /**
+   * Rows still unbound after this call, read back from the database. 0 means
+   * every DEK wrap is bound; phase 3 can then refuse the unbound format.
+   */
+  remainingUnbound: Scalars["Int"]["output"];
+};
+
 /** Result of a DEK rotation operation. */
 export type DekRotationResult = {
   __typename?: "DekRotationResult";
@@ -1055,6 +1069,17 @@ export type MutationRoot = {
    * intentionally left global.
    */
   reEncryptSecretsToOrg: ReEncryptionResult;
+  /**
+   * Bind every DEK wrap to its own `encryption_keys` row (RFC 0013). A
+   * wrapped DEK copied into another row then fails to unwrap instead of
+   * silently serving another tenant's key. The DEK bytes do not change, so no
+   * data is re-encrypted. Idempotent and resumable; `remainingUnbound` (also
+   * `dekMigrationStatus`'s `encryption_keys.wrap`) reads what is left.
+   *
+   * Run it only once EVERY controller runs a release that reads
+   * `wrap_format`: an older build cannot open a bound row.
+   */
+  rebindDekWraps: DekRebindResult;
   refreshToken: AuthPayload;
   registerMcpAgent: McpAgentCreated;
   removeMember: Scalars["Boolean"]["output"];

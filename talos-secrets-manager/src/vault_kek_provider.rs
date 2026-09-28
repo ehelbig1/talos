@@ -71,14 +71,26 @@ pub struct VaultTransitProvider {
     display_name: String,
 }
 
+/// `associated_data` is base64 AAD, authenticated by transit's AEAD key types
+/// (the deployment's default `aes256-gcm96`). Omitted when empty, so an
+/// unbound (pre-RFC-0013) request is byte-identical to the old one.
 #[derive(Serialize)]
 struct EncryptRequest<'a> {
     plaintext: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    associated_data: Option<String>,
 }
 
 #[derive(Serialize)]
 struct DecryptRequest<'a> {
     ciphertext: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    associated_data: Option<String>,
+}
+
+/// Transit's `associated_data` field for `aad`: `None` when empty.
+fn transit_associated_data(aad: &[u8]) -> Option<String> {
+    (!aad.is_empty()).then(|| B64.encode(aad))
 }
 
 #[derive(Deserialize)]
@@ -521,10 +533,13 @@ impl VaultTransitProvider {
         let mut probe = [0u8; 32];
         use rand::RngCore;
         rand::rngs::OsRng.fill_bytes(&mut probe);
-        let wrapped = self.wrap_dek(&probe).await
+        // Bound like a real row (RFC 0013), so the probe exercises transit's
+        // `associated_data` path — the one every new DEK now takes.
+        let probe_aad = crate::dek_wrap::DekRowIdentity::new(uuid::Uuid::nil(), None).bound_aad();
+        let wrapped = self.wrap_dek(&probe, &probe_aad).await
             .context("Vault transit encrypt probe failed (token missing transit/encrypt cap, or key not initialized?)")?;
         let unwrapped = self
-            .unwrap_dek(&wrapped)
+            .unwrap_dek(&wrapped, &probe_aad)
             .await
             .context("Vault transit decrypt probe failed (token missing transit/decrypt cap?)")?;
         if unwrapped.as_slice() != probe {
@@ -728,7 +743,9 @@ impl KekProvider for VaultTransitProvider {
     fn wrap_dek(
         &self,
         dek: &[u8; 32],
+        aad: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>> {
+        let associated_data = transit_associated_data(aad);
         // The base64 of the plaintext DEK is as sensitive as the DEK bytes
         // themselves — keep it in Zeroizing so the heap allocation is wiped
         // on drop rather than lingering until the allocator reuses the page.
@@ -742,6 +759,7 @@ impl KekProvider for VaultTransitProvider {
                 .header("X-Vault-Token", self.token.as_str())
                 .json(&EncryptRequest {
                     plaintext: plaintext_b64.as_str(),
+                    associated_data,
                 })
                 .send()
                 .await
@@ -774,7 +792,9 @@ impl KekProvider for VaultTransitProvider {
     fn unwrap_dek(
         &self,
         wrapped: &[u8],
+        aad: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Zeroizing<Vec<u8>>>> + Send + '_>> {
+        let associated_data = transit_associated_data(aad);
         // Reconstruct the `vault:vN:<base64>` string from stored bytes.
         // On corruption (non-UTF-8 row), fail closed — this would
         // indicate a row written by EnvKekProvider being read with
@@ -805,6 +825,7 @@ impl KekProvider for VaultTransitProvider {
                 .header("X-Vault-Token", self.token.as_str())
                 .json(&DecryptRequest {
                     ciphertext: &ciphertext,
+                    associated_data,
                 })
                 .send()
                 .await
@@ -934,7 +955,7 @@ mod tests {
         // Invalid UTF-8 — should fail BEFORE any HTTP call, so no
         // network access is needed for this test.
         let bad = vec![0xff, 0xfe, 0xfd];
-        assert!(provider.unwrap_dek(&bad).await.is_err());
+        assert!(provider.unwrap_dek(&bad, &[]).await.is_err());
     }
 
     #[tokio::test]
@@ -944,6 +965,37 @@ mod tests {
                 .unwrap();
         // Missing `vault:` prefix — should fail BEFORE any HTTP call.
         let bad = b"not-a-vault-ciphertext";
-        assert!(provider.unwrap_dek(bad).await.is_err());
+        assert!(provider.unwrap_dek(bad, &[]).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod associated_data_wire_tests {
+    use super::*;
+
+    #[test]
+    fn an_unbound_request_is_byte_identical_to_the_pre_rfc_body() {
+        let enc = serde_json::to_string(&EncryptRequest {
+            plaintext: "cA==",
+            associated_data: transit_associated_data(&[]),
+        })
+        .unwrap();
+        assert_eq!(enc, r#"{"plaintext":"cA=="}"#);
+        let dec = serde_json::to_string(&DecryptRequest {
+            ciphertext: "vault:v1:x",
+            associated_data: transit_associated_data(&[]),
+        })
+        .unwrap();
+        assert_eq!(dec, r#"{"ciphertext":"vault:v1:x"}"#);
+    }
+
+    #[test]
+    fn a_bound_request_carries_base64_associated_data() {
+        let enc = serde_json::to_string(&EncryptRequest {
+            plaintext: "cA==",
+            associated_data: transit_associated_data(b"row"),
+        })
+        .unwrap();
+        assert_eq!(enc, r#"{"plaintext":"cA==","associated_data":"cm93"}"#);
     }
 }

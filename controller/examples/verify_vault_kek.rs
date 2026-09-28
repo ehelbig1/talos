@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
     // Independent round-trip with a known DEK so we can assert the
     // decrypted bytes match the input.
     let dek: [u8; 32] = [0x42; 32];
-    let wrapped = provider.wrap_dek(&dek).await?;
+    let wrapped = provider.wrap_dek(&dek, &[]).await?;
     println!(
         "✓ wrap_dek returned {} bytes (vault:vN:<base64>)",
         wrapped.len()
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
         "wire format invariant: stored bytes must start with `vault:`"
     );
 
-    let unwrapped = provider.unwrap_dek(&wrapped).await?;
+    let unwrapped = provider.unwrap_dek(&wrapped, &[]).await?;
     assert_eq!(unwrapped.as_slice(), &dek, "round-trip mismatch");
     println!("✓ unwrap_dek returned exact 32-byte DEK input");
 
@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     // non-`vault:`-prefixed bytes loudly so we catch confused-provider
     // configs at request time, not silent corruption.
     let env_format = vec![0u8; 60]; // looks like an Env-wrapped DEK (12-byte nonce + ciphertext)
-    let result = provider.unwrap_dek(&env_format).await;
+    let result = provider.unwrap_dek(&env_format, &[]).await;
     assert!(
         result.is_err(),
         "Vault unwrap should reject Env-format ciphertext"

@@ -1,6 +1,6 @@
 # RFC 0013 — Bind each wrapped DEK to its own row
 
-**Status:** Draft
+**Status:** In progress — P1 + P2 implemented (2026-09-27); P3 waits for the rebind to run
 **Author:** Platform
 **Date:** 2026-09-26
 
@@ -122,7 +122,20 @@ format 1 is refused:
   guard.
 - Round trips for both providers; the Vault one in the live-Vault test binary.
 
-## Open questions for the operator
+## Decisions (operator, 2026-09-27)
+
+1. **An explicit, audited rebind**, not waiting for a master-key rotation.
+   `rebindDekWraps` rewraps under the exclusive rotation lock and writes one
+   `DEK_WRAP_REBOUND` `secret_audit_log` row per DEK (naming its org) in the
+   transaction that rewraps it. A master-key rotation binds too: it shares the
+   same rewrap routine.
+2. **P3 follows one release after the rebind has run**: `CHECK (wrap_format = 2)`
+   and the format-1 unwrap arm removed.
+3. **Platform admin with a verified second factor, API keys refused**
+   (`require_second_factor` + `require_scope(Admin)` + `require_platform_admin`),
+   the same authority as every other key operation.
+
+## Open questions for the operator (answered above)
 
 1. **Rebind operation, or piggyback on the next master-key rotation only?**
    The recommendation is the explicit rebind (above).

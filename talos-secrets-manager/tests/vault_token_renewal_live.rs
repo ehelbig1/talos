@@ -13,10 +13,15 @@
 //! both are exercised through `wrap_dek` the whole time. After 10 seconds the
 //! renewed one still wraps and the control is refused — which is the defect
 //! (use does not renew) and its fix in one run.
+//!
+//! Also (RFC 0013): transit's `associated_data` binds a DEK wrap to its
+//! `encryption_keys` row. That a blob refuses a DIFFERENT row's AAD is a fact
+//! about Vault, so it is proven against Vault here, not against a mock.
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use talos_secrets_manager::dek_wrap::DekRowIdentity;
 use talos_secrets_manager::kek_provider::KekProvider;
 use talos_secrets_manager::vault_kek_provider::{RenewalSchedule, VaultTransitProvider};
 
@@ -97,10 +102,10 @@ async fn renewal_keeps_a_periodic_token_alive_that_use_alone_lets_expire() {
         let mut control_refused_at = None;
         for i in 0..20 {
             renewed
-                .wrap_dek(&dek)
+                .wrap_dek(&dek, &[])
                 .await
                 .expect("the renewed token must keep working");
-            if control.wrap_dek(&dek).await.is_err() && control_refused_at.is_none() {
+            if control.wrap_dek(&dek, &[]).await.is_err() && control_refused_at.is_none() {
                 control_refused_at = Some(i);
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -139,4 +144,46 @@ async fn renewal_keeps_a_periodic_token_alive_that_use_alone_lets_expire() {
         .get();
     assert!(renewals >= 10.0, "renewed {renewals} times in 10 s");
     eprintln!("control refused at iteration {refused}; renewed {renewals} times");
+}
+
+#[tokio::test]
+async fn transit_binds_a_wrap_to_its_row_and_keeps_unbound_wraps_readable() {
+    if std::env::var("TALOS_VAULT_LIVE_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set TALOS_VAULT_LIVE_TEST=1 with a live dev Vault");
+        return;
+    }
+    let addr = std::env::var("VAULT_ADDR").expect("VAULT_ADDR");
+    let root = std::env::var("VAULT_TOKEN").expect("VAULT_TOKEN");
+    let kek = VaultTransitProvider::new(&addr, root, "transit", "talos-kek").unwrap();
+
+    let dek = [42u8; 32];
+    let org_a = uuid::Uuid::new_v4();
+    let row = DekRowIdentity::new(uuid::Uuid::new_v4(), Some(org_a));
+    let bound = kek.wrap_dek(&dek, &row.bound_aad()).await.unwrap();
+    assert_eq!(
+        kek.unwrap_dek(&bound, &row.bound_aad())
+            .await
+            .unwrap()
+            .as_slice(),
+        &dek,
+        "a bound wrap opens under its own row"
+    );
+    let other_org = DekRowIdentity::new(row.key_id, Some(uuid::Uuid::new_v4()));
+    assert!(
+        kek.unwrap_dek(&bound, &other_org.bound_aad())
+            .await
+            .is_err(),
+        "transit must refuse another row's associated data"
+    );
+    assert!(
+        kek.unwrap_dek(&bound, &[]).await.is_err(),
+        "transit must refuse a bound wrap read without associated data"
+    );
+
+    // Pre-RFC rows: an unbound wrap still opens with an empty AAD.
+    let unbound = kek.wrap_dek(&dek, &[]).await.unwrap();
+    assert_eq!(
+        kek.unwrap_dek(&unbound, &[]).await.unwrap().as_slice(),
+        &dek
+    );
 }
