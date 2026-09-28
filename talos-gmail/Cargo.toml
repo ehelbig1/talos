@@ -61,6 +61,9 @@ urlencoding = "2.1"
 uuid.workspace = true
 
 [dev-dependencies]
+# api::tests captures the request users.stop puts on the wire with a loopback
+# listener (TcpListener + async read/write).
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros"] }
 # pubsub_jwt::tests reads talos_google_push_accepted_total back from the
 # global registry.
 talos-metrics = { path = "../talos-metrics" }

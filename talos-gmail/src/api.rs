@@ -122,6 +122,16 @@ impl GmailWatchApiClient {
         }
     }
 
+    /// The production client pointed at another base URL, for tests that
+    /// capture the request a call puts on the wire.
+    #[cfg(test)]
+    fn with_base_url(base_url: &str) -> Self {
+        Self {
+            base_url: base_url.to_string(),
+            ..Self::new()
+        }
+    }
+
     /// Register a push subscription for the user's mailbox. `labels`
     /// is the optional filter (`[]` = deliver everything).
     pub async fn users_watch(
@@ -169,10 +179,15 @@ impl GmailWatchApiClient {
     /// calling stop when no watch is active is harmless.
     pub async fn users_stop(&self, access_token: &str) -> Result<()> {
         let url = format!("{}/users/me/stop", self.base_url);
+        // users.stop takes no body, but Google's front end refuses a POST that
+        // carries no `Content-Length` with `411 Length Required` — which every
+        // call got until 2026-09-28, so a disconnect deleted our row and left
+        // Google pushing to Pub/Sub until the watch expired.
         let resp = self
             .client
             .post(&url)
             .bearer_auth(access_token)
+            .header(reqwest::header::CONTENT_LENGTH, "0")
             .send()
             .await
             .context("users.stop request failed")?;
@@ -339,5 +354,52 @@ mod tests {
         let t = truncate(&"x".repeat(1000), 50);
         assert_eq!(t.chars().count(), 51);
         assert!(t.ends_with('…'));
+    }
+
+    /// Accept ONE connection on a loopback listener, return the request head
+    /// the client sent (lower-cased), and answer 204.
+    async fn capture_one_request(listener: tokio::net::TcpListener) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if sock.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        sock.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&head).to_ascii_lowercase()
+    }
+
+    /// Google's front end refuses a POST without a `Content-Length` with
+    /// `411 Length Required`, which is what `users.stop` got on every call:
+    /// it posted no body, so no length went on the wire. On disconnect the
+    /// row is deleted anyway, leaving Google pushing to Pub/Sub until the
+    /// watch expires. The request must carry exactly one `content-length: 0`.
+    #[tokio::test]
+    async fn users_stop_sends_an_explicit_zero_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(capture_one_request(listener));
+
+        GmailWatchApiClient::with_base_url(&base)
+            .users_stop("test-token")
+            .await
+            .expect("a 204 is success");
+        let head = server.await.unwrap();
+
+        assert!(
+            head.starts_with("post /users/me/stop "),
+            "the stop endpoint: {head}"
+        );
+        let lengths: Vec<&str> = head
+            .lines()
+            .filter(|l| l.starts_with("content-length:"))
+            .collect();
+        assert_eq!(lengths, vec!["content-length: 0"], "request head: {head}");
     }
 }
