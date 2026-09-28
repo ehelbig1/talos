@@ -256,6 +256,10 @@ pub(crate) fn arm_epoch_deadline(store: &mut Store<TalosContext>, timeout: Durat
     // Same Arc as the registry's — see the doc comment above.
     let cancelled: Arc<AtomicBool> = store.data().cancelled.clone();
     let metrics = store.data().metrics.clone();
+    // RFC 0014 P2: time queued for the local-inference slot is not charged to
+    // this bound either (the tick budget is untouched — ticks only burn while the
+    // guest runs, one slice per callback, so a wait costs one slice at most).
+    let inference_wait = store.data().inference_wait.clone();
     let wall_clock_deadline = Instant::now() + timeout;
 
     let (first_slice, mut budget) = EpochBudget::new(total);
@@ -266,7 +270,11 @@ pub(crate) fn arm_epoch_deadline(store: &mut Store<TalosContext>, timeout: Durat
         // subtraction. No allocation, no lock, no logging.
         let decision = budget.decide(
             cancelled.load(Ordering::Relaxed),
-            Instant::now() >= wall_clock_deadline,
+            wall_clock_expired(
+                Instant::now(),
+                wall_clock_deadline,
+                inference_wait.as_deref(),
+            ),
         );
         match decision {
             // `Yield`, never `Continue`: see the module docs. The ticks
@@ -287,6 +295,26 @@ pub(crate) fn arm_epoch_deadline(store: &mut Store<TalosContext>, timeout: Durat
             }
         }
     });
+}
+
+/// Whether the job's wall-clock bound has passed at `now`.
+///
+/// The fixed deadline is checked first and the ledger ONLY when it has passed,
+/// so the hot path — every tick of guest execution — stays one `Instant`
+/// comparison with no lock. Past the fixed deadline, time the job spent queued
+/// for the local-inference slot (RFC 0014 P2) pushes it back.
+fn wall_clock_expired(
+    now: Instant,
+    deadline: Instant,
+    inference_wait: Option<&crate::inference_wait::InferenceWaitLedger>,
+) -> bool {
+    if now < deadline {
+        return false;
+    }
+    match inference_wait {
+        Some(w) => now >= deadline + w.excluded(),
+        None => true,
+    }
 }
 
 /// The wasmtime deadline update for a [`EpochDecision::Continue`] grant.
@@ -322,6 +350,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 0014 P2: the wall-clock bound stands still while the job waits for
+    /// the local-inference slot, and only then.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_wait_pushes_the_wall_clock_bound_back() {
+        let ledger = crate::inference_wait::InferenceWaitLedger::new(None);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let t = |secs| tokio::time::Instant::now().into_std() + Duration::from_secs(secs);
+        assert!(!wall_clock_expired(t(10), deadline, Some(&ledger)));
+        assert!(
+            wall_clock_expired(t(31), deadline, Some(&ledger)),
+            "no wait: expires on time"
+        );
+        ledger.begin_wait().await;
+        tokio::time::advance(Duration::from_secs(45)).await;
+        ledger.end_wait().await;
+        // 45 s were spent waiting, so the bound now sits at 75 s.
+        let now = tokio::time::Instant::now().into_std();
+        assert!(
+            !wall_clock_expired(now, deadline, Some(&ledger)),
+            "t=45 < 75"
+        );
+        assert!(
+            wall_clock_expired(now + Duration::from_secs(31), deadline, Some(&ledger)),
+            "t=76 > 75"
+        );
+        assert!(
+            wall_clock_expired(now, deadline, None),
+            "without a ledger it expired at 30"
+        );
+    }
 
     /// THE budget invariant. Every slice the type ever grants, summed with the
     /// slice armed on the store, must equal the original budget exactly — not

@@ -10082,6 +10082,7 @@ dependencies = [
  "async-trait",
  "futures",
  "rand 0.8.6",
+ "serde",
  "serde_json",
  "talos-config",
  "talos-envelope-seal",

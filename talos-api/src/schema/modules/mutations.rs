@@ -663,6 +663,7 @@ impl ModulesMutations {
                 None,              // llm_usage_out — internal test path doesn't collect usage
                 None,              // host_diag_out — no in-process diagnostic sink on this path
                 0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
+                None, // inference_wait (RFC 0014 P2): no controller is timing this call
             )
             .await;
 

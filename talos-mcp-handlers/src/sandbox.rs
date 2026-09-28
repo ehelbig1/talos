@@ -2198,7 +2198,8 @@ async fn handle_run_sandbox(
             egress.egress_scope, // egress_scope — Some(Public): private ranges DENIED in-process
             None,                // llm_usage_out — internal sandbox path doesn't collect usage
             Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
-            0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
+            0,    // dispatch_attempt — an operator-invoked run, no controller retry loop above it
+            None, // inference_wait (RFC 0014 P2): no controller is timing this call
         )
         .await;
 
@@ -3814,7 +3815,8 @@ async fn handle_test_module(
             egress.egress_scope, // egress_scope — Some(Public): private ranges DENIED in-process
             None,              // llm_usage_out — internal sandbox path doesn't collect usage
             Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
-            0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
+            0,    // dispatch_attempt — an operator-invoked run, no controller retry loop above it
+            None, // inference_wait (RFC 0014 P2): no controller is timing this call
         )
         .await;
     let duration_ms = start.elapsed().as_millis();

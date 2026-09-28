@@ -68,9 +68,11 @@
 //!   of a stream would deadlock the two gated paths behind it.
 
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::inference_wait::InferenceWaitLedger;
 
 /// Simultaneous LOCAL LLM exchanges permitted per worker process.
 ///
@@ -112,6 +114,11 @@ pub(crate) const MAX_IN_FLIGHT_ENV: &str = "TALOS_LOCAL_LLM_MAX_IN_FLIGHT";
 /// intent explicit: the gate never decides a job's fate; if a job is going to
 /// die of old age it dies at its own deadline, on the timeout that already
 /// existed, with the message it already had.
+///
+/// Since RFC 0014 P2 the wait itself is no longer charged to the job timeout
+/// (it is recorded on the job's `InferenceWaitLedger`), so this constant is now
+/// the bound on ONE call's queueing, and `LOCAL_INFERENCE_WAIT_CREDIT_CAP_SECS`
+/// (300 s) bounds a job's queueing in total.
 pub(crate) const LOCAL_LLM_QUEUE_WAIT_SECS: u64 = 120;
 
 /// Why a call is running without a permit.
@@ -211,12 +218,48 @@ fn gate_permits() -> Option<&'static Arc<Semaphore>> {
 /// Returns the slot and how long the wait took. **Call this BEFORE starting
 /// the exchange timeout**: the entire point is that queue time is not charged
 /// to a budget that is supposed to measure one call's own service time.
-pub(crate) async fn acquire_local_llm_slot() -> (LocalLlmSlot, Duration) {
-    acquire_from(
+///
+/// RFC 0014 P2: when the call has to QUEUE, the wait is recorded on `wait` —
+/// the job's [`InferenceWaitLedger`] — so the job's own deadlines stand still
+/// while it lasts, and the ledger's notifier tells the controller so the
+/// attempt window stands still too. A slot that is free is taken without
+/// touching the ledger: no wait, nothing to report.
+pub(crate) async fn acquire_local_llm_slot(
+    wait: Option<&InferenceWaitLedger>,
+) -> (LocalLlmSlot, Duration) {
+    acquire_reporting_from(
         gate_permits(),
         Duration::from_secs(LOCAL_LLM_QUEUE_WAIT_SECS),
+        wait,
     )
     .await
+}
+
+/// [`acquire_from`] plus the wait report — the whole decision with the
+/// semaphore and wait cap supplied, for the same testability reason.
+///
+/// `try_acquire_owned` first: a tokio semaphore hands a released permit to the
+/// longest waiter, so a free permit here means nobody is queued and taking it
+/// jumps no one. Only when it is NOT free does the call open a wait.
+pub(crate) async fn acquire_reporting_from(
+    permits: Option<&Arc<Semaphore>>,
+    wait_cap: Duration,
+    wait: Option<&InferenceWaitLedger>,
+) -> (LocalLlmSlot, Duration) {
+    let Some(sem) = permits else {
+        return (LocalLlmSlot::Ungated(Ungated::Disabled), Duration::ZERO);
+    };
+    if let Ok(permit) = sem.clone().try_acquire_owned() {
+        return (LocalLlmSlot::Held(permit), Duration::ZERO);
+    }
+    if let Some(w) = wait {
+        w.begin_wait().await;
+    }
+    let out = acquire_from(permits, wait_cap).await;
+    if let Some(w) = wait {
+        w.end_wait().await;
+    }
+    out
 }
 
 /// The whole decision, with the semaphore and the wait cap supplied.
@@ -233,7 +276,9 @@ pub(crate) async fn acquire_from(
     let Some(sem) = permits else {
         return (LocalLlmSlot::Ungated(Ungated::Disabled), Duration::ZERO);
     };
-    let started = Instant::now();
+    // tokio's clock (the same clock as `std` in production) so the reported
+    // wait and the job's `InferenceWaitLedger` measure the same interval.
+    let started = tokio::time::Instant::now();
     let slot = match tokio::time::timeout(wait_cap, sem.clone().acquire_owned()).await {
         Ok(Ok(permit)) => LocalLlmSlot::Held(permit),
         // `acquire_owned` errors only when the semaphore is CLOSED, and

@@ -33,6 +33,8 @@ use worker::{circuit_breaker, metrics, metrics_server, sql_validator};
 
 use worker::runtime::TalosRuntime;
 
+#[cfg(test)]
+mod inference_wait_pin;
 mod rejected_jobs;
 #[cfg(test)]
 mod retry_policy_pin;
@@ -1226,6 +1228,75 @@ fn cached_result_verify_keys(
     keys
 }
 
+/// RFC 0014 P2: sign a `JobProgress` exactly as a `JobResult` is signed — the
+/// worker's Ed25519 key when configured, the fleet HMAC otherwise — so the
+/// dispatcher verifies both with the same key material.
+fn sign_job_progress(
+    progress: &mut talos_workflow_job_protocol::JobProgress,
+    shared_key: &talos_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    match worker_result_signing_key() {
+        Some(sk) => progress.sign_ed25519_with_worker_id(sk, worker_identity()),
+        None => {
+            progress.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity())
+        }
+    }
+}
+
+/// RFC 0014 P2: tells the dispatcher a job is waiting for (then has) the
+/// local-inference slot, so its attempt window stands still while it queues.
+///
+/// Publishes a signed `JobProgress` to `<reply_inbox>.progress`, derived from
+/// the job's SIGNED `reply_topic` — the same controller the result will reach.
+/// A controller that predates P2 does not subscribe there and the message is
+/// dropped by the broker, so no rollout order is required. A failed publish is
+/// logged and otherwise ignored: the worker's own deadlines move regardless,
+/// and a controller that never hears about the wait gives up on the attempt
+/// exactly as it did before P2.
+struct NatsProgressNotifier {
+    nc: async_nats::Client,
+    subject: String,
+    job_id: uuid::Uuid,
+    dispatch_attempt: u32,
+    shared_key: talos_workflow_engine_core::WorkerKeyRing,
+}
+
+impl worker::inference_wait::WaitNotifier for NatsProgressNotifier {
+    fn notify(
+        &self,
+        state: talos_workflow_job_protocol::JobProgressState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let mut progress = talos_workflow_job_protocol::JobProgress::new(
+                self.job_id,
+                self.dispatch_attempt,
+                state,
+            );
+            if let Err(e) = sign_job_progress(&mut progress, &self.shared_key) {
+                ::tracing::warn!(job_id = %self.job_id, error = %e, "job progress not signed; not sent");
+                return;
+            }
+            let bytes = match serde_json::to_vec(&progress) {
+                Ok(b) => b,
+                Err(e) => {
+                    ::tracing::warn!(job_id = %self.job_id, error = %e, "job progress not serialized; not sent");
+                    return;
+                }
+            };
+            if let Err(e) = self.nc.publish(self.subject.clone(), bytes.into()).await {
+                ::tracing::warn!(job_id = %self.job_id, error = %e, "job progress publish failed");
+                return;
+            }
+            ::tracing::info!(
+                job_id = %self.job_id,
+                dispatch_attempt = self.dispatch_attempt,
+                state = state.as_str(),
+                "reported local-inference wait to the dispatcher"
+            );
+        })
+    }
+}
+
 /// Ed25519-preferring signer for `PipelineJobResult`; see [`sign_job_result`].
 fn sign_pipeline_result(
     result: &mut PipelineJobResult,
@@ -1592,8 +1663,26 @@ async fn execute_job(
     // (success, failure, timeout) — tokens spent before a trap are spent.
     let llm_usage_acc: worker::context::LlmUsageAcc =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    match tokio::time::timeout(
+    // RFC 0014 P2: this job's waiting-for-the-local-inference-slot account.
+    // Every deadline below — this outer one, the runtime's inner one and the
+    // epoch wall-clock bound — stands still while the job queues for the slot,
+    // and the notifier tells the dispatcher so its attempt window does too.
+    // Only a job with a SIGNED reply inbox has a dispatcher waiting on it; a
+    // fire-and-forget dispatch gets the ledger without a notifier.
+    let inference_wait = std::sync::Arc::new(worker::inference_wait::InferenceWaitLedger::new(
+        req.reply_topic.as_deref().map(|inbox| {
+            std::sync::Arc::new(NatsProgressNotifier {
+                nc: nc.clone(),
+                subject: talos_workflow_job_protocol::subjects::job_progress_for(inbox),
+                job_id: req.job_id,
+                dispatch_attempt: req.dispatch_attempt,
+                shared_key: shared_key.clone(),
+            }) as std::sync::Arc<dyn worker::inference_wait::WaitNotifier>
+        }),
+    ));
+    match worker::inference_wait::with_pausable_deadline(
         job_timeout,
+        Some(&inference_wait),
         runtime.execute_job_with_full_features(
             &wasm_bytes,
             req.allowed_hosts.clone(),
@@ -1646,6 +1735,7 @@ async fn execute_job(
             // so a re-dispatch's fresh chain is legible as a second attempt
             // rather than as a duplicated sequence in the first.
             req.dispatch_attempt,
+            Some(inference_wait.clone()),
         ),
     )
     .await

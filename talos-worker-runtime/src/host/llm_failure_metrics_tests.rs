@@ -1047,3 +1047,116 @@ fn a_streamed_tool_call_reaches_the_guest() {
         assert_eq!((usage.input_tokens, usage.output_tokens), (3, 1));
     });
 }
+
+// ---------------------------------------------------------------------------
+// RFC 0014 P2 — a queued call records its wait on the JOB's ledger, at both
+// production call sites
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct HeardWaits {
+    waiting: AtomicU64,
+    admitted: AtomicU64,
+}
+
+impl crate::inference_wait::WaitNotifier for HeardWaits {
+    fn notify(
+        &self,
+        state: talos_workflow_job_protocol::JobProgressState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        match state {
+            talos_workflow_job_protocol::JobProgressState::Waiting => {
+                self.waiting.fetch_add(1, Ordering::SeqCst)
+            }
+            talos_workflow_job_protocol::JobProgressState::Admitted => {
+                self.admitted.fetch_add(1, Ordering::SeqCst)
+            }
+        };
+        Box::pin(async {})
+    }
+}
+
+fn with_ledger(mut ctx: TalosContext, heard: &Arc<HeardWaits>) -> TalosContext {
+    ctx.inference_wait = Some(Arc::new(crate::inference_wait::InferenceWaitLedger::new(
+        Some(heard.clone() as Arc<dyn crate::inference_wait::WaitNotifier>),
+    )));
+    ctx
+}
+
+/// Two simultaneous local completions on a cap of 1: exactly ONE of them
+/// queues, so exactly one wait is opened and closed across the two jobs'
+/// ledgers. A call site that stopped passing `self.inference_wait` to the gate
+/// would record none — and the job's deadlines would be charged for its queue.
+#[test]
+fn a_queued_completion_records_its_wait_on_the_jobs_ledger() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        let heard = Arc::new(HeardWaits::default());
+        let mut a = with_ledger(context_with_metrics(LlmTier::Tier1), &heard);
+        let mut b = with_ledger(context_with_metrics(LlmTier::Tier1), &heard);
+        let (ra, rb) = futures_util::future::join(
+            <TalosContext as wit_llm::Host>::complete(
+                &mut a,
+                request(wit_llm::Provider::Ollama, "mock-slow"),
+            ),
+            <TalosContext as wit_llm::Host>::complete(
+                &mut b,
+                request(wit_llm::Provider::Ollama, "mock-slow"),
+            ),
+        )
+        .await;
+        assert!(ra.is_ok() && rb.is_ok(), "{ra:?} {rb:?}");
+        assert_eq!(
+            heard.waiting.load(Ordering::SeqCst),
+            1,
+            "exactly one call queued"
+        );
+        assert_eq!(heard.admitted.load(Ordering::SeqCst), 1);
+        let waited: Vec<_> = [&a, &b]
+            .iter()
+            .map(|c| c.inference_wait.as_ref().unwrap().excluded())
+            .collect();
+        assert_eq!(
+            waited.iter().filter(|w| !w.is_zero()).count(),
+            1,
+            "the queued job's ledger excludes its wait, the other's excludes nothing: {waited:?}"
+        );
+    });
+}
+
+/// The same property at the SECOND call site, `llm-tools::complete-with-tools`.
+#[test]
+fn a_queued_tool_completion_records_its_wait_on_the_jobs_ledger() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        let heard = Arc::new(HeardWaits::default());
+        let mut a = with_ledger(
+            context_with_metrics_in_world(LlmTier::Tier1, CapabilityWorld::Secrets),
+            &heard,
+        );
+        let mut b = with_ledger(
+            context_with_metrics_in_world(LlmTier::Tier1, CapabilityWorld::Secrets),
+            &heard,
+        );
+        let (ra, rb) = futures_util::future::join(
+            <TalosContext as wit_llm_tools::Host>::complete_with_tools(
+                &mut a,
+                tool_request("mock-slow"),
+            ),
+            <TalosContext as wit_llm_tools::Host>::complete_with_tools(
+                &mut b,
+                tool_request("mock-slow"),
+            ),
+        )
+        .await;
+        assert!(ra.is_ok() && rb.is_ok(), "{ra:?} {rb:?}");
+        assert_eq!(
+            heard.waiting.load(Ordering::SeqCst),
+            1,
+            "exactly one call queued"
+        );
+        assert_eq!(heard.admitted.load(Ordering::SeqCst), 1);
+    });
+}

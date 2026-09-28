@@ -227,7 +227,8 @@ impl wit_llm_tools::Host for TalosContext {
         // time is not charged to a budget that measures one call's own service
         // time. BOUND, never `_`: dropping the value releases the permit.
         let _llm_slot_tools = if is_local_tools {
-            let (slot, waited) = crate::host::llm_gate::acquire_local_llm_slot().await;
+            let (slot, waited) =
+                crate::host::llm_gate::acquire_local_llm_slot(self.inference_wait.as_deref()).await;
             if let Some(ref m) = self.metrics {
                 m.record_llm_gate(slot.outcome_label(), waited.as_secs_f64() * 1000.0);
             }
