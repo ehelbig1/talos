@@ -272,9 +272,36 @@ pub(crate) const MAX_PROVIDER_OPTIONS_BYTES: usize = 8 * 1024;
 /// synthesize node ran for 5+ minutes with no progress after MCP-1212
 /// re-sign fix unmasked the underlying hang). 120s covers reasonable
 /// Claude/GPT-4 latency for long outputs; legitimate calls finish in
-/// seconds. Ollama (local) uses LOCAL_LLM_EXCHANGE_TIMEOUT_SECS.
+/// seconds. Ollama (local) is bounded by PROGRESS instead — the three
+/// `LOCAL_LLM_*` deadlines below.
 pub(crate) const EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS: u64 = 120;
-pub(crate) const LOCAL_LLM_EXCHANGE_TIMEOUT_SECS: u64 = 60;
+/// RFC 0014 P1: a local (Ollama) exchange is STREAMED and cut when it stops
+/// making progress, not when a total clock runs out. Until 2026-09-28 it had
+/// one 60 s total deadline over load + prompt evaluation + generation, which
+/// cannot tell a slow answer from a stuck one: measured over 32 days, 47
+/// requests were cut at exactly 60 s, and on 2026-09-28 the flagship
+/// briefing's first attempt was cut while it was the only request on a
+/// loaded model. See `host::llm_local_stream`.
+///
+/// Until any byte of the answer arrives: send, model load, prompt evaluation.
+pub(crate) const LOCAL_LLM_FIRST_BYTE_TIMEOUT_SECS: u64 = 60;
+/// Between any two chunks of the answer.
+pub(crate) const LOCAL_LLM_IDLE_TIMEOUT_SECS: u64 = 60;
+/// The whole exchange — a backstop, not the working bound. The node's attempt
+/// window (120 s by default) is expected to end a long call first.
+pub(crate) const LOCAL_LLM_EXCHANGE_CEILING_SECS: u64 = 600;
+/// The Pareto property of RFC 0014 P1, pinned at compile time: a call that
+/// finished inside the old 60 s total deadline received its first byte within
+/// 60 s and never waited more than 60 s between chunks, so it passes the new
+/// rule. Lowering either deadline below the old total would break that
+/// guarantee — Ollama sends nothing while it buffers a tool call's text — and
+/// must be argued from measurement, not tuned here.
+const PRE_RFC_0014_LOCAL_TOTAL_SECS: u64 = 60;
+const _: () = assert!(
+    LOCAL_LLM_FIRST_BYTE_TIMEOUT_SECS >= PRE_RFC_0014_LOCAL_TOTAL_SECS
+        && LOCAL_LLM_IDLE_TIMEOUT_SECS >= PRE_RFC_0014_LOCAL_TOTAL_SECS
+        && LOCAL_LLM_EXCHANGE_CEILING_SECS >= PRE_RFC_0014_LOCAL_TOTAL_SECS
+);
 /// MCP-1215 (2026-05-18): connect-phase timeout for the SSE-based
 /// streaming LLM path (`wit_llm_streaming::spawn_sse_stream`). Pre-fix
 /// the spawned task's `req_builder.json(&body).send().await` was bare

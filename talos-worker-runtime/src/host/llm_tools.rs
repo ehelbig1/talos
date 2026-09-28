@@ -168,7 +168,7 @@ impl wit_llm_tools::Host for TalosContext {
             })
             .collect();
 
-        let body = adapter
+        let mut body = adapter
             .build_tools_body(&llm_providers::ToolCompletionParams {
                 model: &model,
                 messages: &messages,
@@ -179,6 +179,12 @@ impl wit_llm_tools::Host for TalosContext {
                 force_tool: req.force_tool.as_deref(),
             })
             .map_err(wit_llm_tools::Error::NotConfigured)?;
+
+        // RFC 0014 P1: a LOCAL exchange streams so it can be bounded by
+        // progress; the chunks are reassembled before the adapter parses them.
+        if is_local_tools {
+            super::llm_local_stream::request_streaming(&mut body);
+        }
 
         let url = adapter.completion_url(&model);
         let auth_headers = adapter.auth_headers(&api_key);
@@ -229,61 +235,67 @@ impl wit_llm_tools::Host for TalosContext {
         } else {
             None
         };
-        let timeout_secs_tools: u64 = if is_local_tools {
-            LOCAL_LLM_EXCHANGE_TIMEOUT_SECS
-        } else {
-            EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS
-        };
         let mut http_req_tools = client.post(&url).header("Content-Type", "application/json");
         // Adapter-owned auth + protocol-version headers (empty for local
         // providers). Values may embed the API key — never logged.
         for (name, value) in &auth_headers {
             http_req_tools = http_req_tools.header(*name, value);
         }
-        let resp_bytes: Vec<u8> = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs_tools),
-            async move {
-                let response = http_req_tools.body(body_bytes).send().await.map_err(|e| {
-                    tracing::error!(error = %e, "LLM tool-use API request failed");
-                    wit_llm_tools::Error::ApiError(format!("Network error: {e}"))
-                })?;
+        let resp_bytes: Vec<u8> = if is_local_tools {
+            // RFC 0014 P1: bounded by PROGRESS, not one total clock.
+            super::llm_local_stream::exchange_local_stream(
+                http_req_tools.body(body_bytes),
+                super::llm_local_stream::ProgressDeadlines::LOCAL,
+                MAX_LLM_BODY_BYTES,
+            )
+            .await
+            .map_err(local_tools_exchange_failure)?
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS),
+                async move {
+                    let response = http_req_tools.body(body_bytes).send().await.map_err(|e| {
+                        tracing::error!(error = %e, "LLM tool-use API request failed");
+                        wit_llm_tools::Error::ApiError(format!("Network error: {e}"))
+                    })?;
 
-                if !response.status().is_success() {
-                    let status = response.status().as_u16();
-                    tracing::warn!(status, "LLM tool-use API returned error status");
-                    if status == 429 {
-                        return Err(wit_llm_tools::Error::RateLimited);
+                    if !response.status().is_success() {
+                        let status = response.status().as_u16();
+                        tracing::warn!(status, "LLM tool-use API returned error status");
+                        if status == 429 {
+                            return Err(wit_llm_tools::Error::RateLimited);
+                        }
+                        let preview_bytes =
+                            read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+                                .await
+                                .unwrap_or_default();
+                        let body_preview = String::from_utf8_lossy(&preview_bytes);
+                        let preview_truncated: String = body_preview.chars().take(500).collect();
+                        let preview_redacted = talos_dlp_provider::redact_str(&preview_truncated);
+                        tracing::warn!(
+                            status,
+                            body_len = preview_bytes.len(),
+                            body_preview = %preview_redacted,
+                            "LLM tool-use API returned error"
+                        );
+                        return Err(wit_llm_tools::Error::ApiError(format!(
+                            "LLM API returned HTTP {status}"
+                        )));
                     }
-                    let preview_bytes =
-                        read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
-                            .await
-                            .unwrap_or_default();
-                    let body_preview = String::from_utf8_lossy(&preview_bytes);
-                    let preview_truncated: String = body_preview.chars().take(500).collect();
-                    let preview_redacted = talos_dlp_provider::redact_str(&preview_truncated);
-                    tracing::warn!(
-                        status,
-                        body_len = preview_bytes.len(),
-                        body_preview = %preview_redacted,
-                        "LLM tool-use API returned error"
-                    );
-                    return Err(wit_llm_tools::Error::ApiError(format!(
-                        "LLM API returned HTTP {status}"
-                    )));
-                }
 
-                read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
-                    .await
-                    .ok_or_else(|| {
-                        wit_llm_tools::Error::ApiError(format!(
-                            "LLM tool-use response exceeded {} bytes; aborted body read",
-                            MAX_LLM_BODY_BYTES
-                        ))
-                    })
-            },
-        )
-        .await
-        .map_err(|_| wit_llm_tools::Error::Timeout)??;
+                    read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+                        .await
+                        .ok_or_else(|| {
+                            wit_llm_tools::Error::ApiError(format!(
+                                "LLM tool-use response exceeded {} bytes; aborted body read",
+                                MAX_LLM_BODY_BYTES
+                            ))
+                        })
+                },
+            )
+            .await
+            .map_err(|_| wit_llm_tools::Error::Timeout)??
+        };
 
         // 9. Adapter-owned parse into canonical blocks. `arguments` is
         //    ALWAYS the JSON string form here — the native-Ollama wire
@@ -335,5 +347,29 @@ impl wit_llm_tools::Host for TalosContext {
             usage,
             stop_reason: parsed.stop_reason,
         })
+    }
+}
+
+/// Map a local exchange's failure onto `llm-tools`' WIT error — the same
+/// classification as `llm::complete*` (RFC 0014 P1); the provider's own text
+/// is never returned to the guest.
+fn local_tools_exchange_failure(
+    e: super::llm_local_stream::LocalExchangeError,
+) -> wit_llm_tools::Error {
+    use super::llm_local_stream::LocalExchangeError as E;
+    match e {
+        E::Network(m) => wit_llm_tools::Error::ApiError(format!("Network error: {m}")),
+        E::Timeout(_) => wit_llm_tools::Error::Timeout,
+        E::RateLimited => wit_llm_tools::Error::RateLimited,
+        E::HttpStatus(status) => {
+            wit_llm_tools::Error::ApiError(format!("LLM API returned HTTP {status}"))
+        }
+        E::ProviderError => {
+            wit_llm_tools::Error::ApiError("LLM API reported an error mid-response".to_string())
+        }
+        E::Oversized => wit_llm_tools::Error::ApiError(format!(
+            "LLM tool-use response exceeded {MAX_LLM_BODY_BYTES} bytes; aborted body read"
+        )),
+        E::Decode(m) => wit_llm_tools::Error::ApiError(m),
     }
 }

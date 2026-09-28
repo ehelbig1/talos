@@ -847,12 +847,12 @@ mod tests {
              (120 s) — below it, the tail an operator would react to is one \
              undifferentiated overflow bucket: {b:?}"
         );
-        // The local exchange timeout must be representable too: on this
-        // deployment every LLM call is local Ollama, so `le=60000` is the mark
-        // beyond which no successful local call can land.
+        // The old local exchange total (60 s) stays a boundary: since RFC 0014
+        // P1 it separates the local calls that would have been cut before
+        // progress deadlines from the rest.
         assert!(
             b.contains(&60_000.0),
-            "LOCAL_LLM_EXCHANGE_TIMEOUT_SECS (60 s) must be a boundary: {b:?}"
+            "the old local 60 s total must be a boundary: {b:?}"
         );
         // Measured: the mode is (500, 1000], holding ~74 % of all calls, and
         // 750 is what splits it (44.8 % / 29.2 %). Dropping it collapses the

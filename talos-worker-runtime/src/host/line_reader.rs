@@ -86,6 +86,16 @@ impl LineReader {
             }
         }
     }
+
+    /// At end of stream: the unterminated last line, if it holds anything
+    /// but whitespace. Call only after `next_line` has returned `None`.
+    pub(crate) fn take_tail(&mut self) -> Option<String> {
+        let tail = String::from_utf8_lossy(&self.buf[self.pos..]).into_owned();
+        self.pos = self.buf.len();
+        self.scan = self.pos;
+        self.tail_start = self.pos;
+        (!tail.trim().is_empty()).then_some(tail)
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +125,18 @@ mod tests {
         r.push(b"c\n").unwrap();
         assert_eq!(drain(&mut r), vec!["bc"]);
         assert_eq!(r.next_line(), None);
+    }
+
+    #[test]
+    fn the_unterminated_tail_is_returned_once_at_end_of_stream() {
+        let mut r = LineReader::new(1024);
+        r.push(b"a\nb").unwrap();
+        assert_eq!(drain(&mut r), vec!["a"]);
+        assert_eq!(r.take_tail().as_deref(), Some("b"));
+        assert_eq!(r.take_tail(), None);
+        r.push(b"x\n  ").unwrap();
+        assert_eq!(drain(&mut r), vec!["x"]);
+        assert_eq!(r.take_tail(), None, "a whitespace-only tail is not a line");
     }
 
     #[test]

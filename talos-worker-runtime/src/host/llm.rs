@@ -238,6 +238,39 @@ pub(crate) fn json_token_count_as_u32(field: Option<&serde_json::Value>, default
     }
 }
 
+/// Map a local exchange's failure onto `llm::complete*`'s WIT error and
+/// `wasm_llm_failures_total` outcome. The classification is the one the
+/// non-streaming exchange used (RFC 0014 P1): an error line mid-stream is the
+/// same provider failure that arrived as an HTTP 500 before, and its text is
+/// never returned to the guest.
+fn local_exchange_failure(e: super::llm_local_stream::LocalExchangeError) -> LlmCallFailure {
+    use super::llm_local_stream::LocalExchangeError as E;
+    use crate::metrics::LlmFailure as F;
+    match e {
+        E::Network(m) => LlmCallFailure::new(
+            F::Network,
+            wit_llm::Error::ApiError(format!("Network error: {m}")),
+        ),
+        E::Timeout(_) => LlmCallFailure::new(F::Timeout, wit_llm::Error::Timeout),
+        E::RateLimited => LlmCallFailure::new(F::RateLimited, wit_llm::Error::RateLimited),
+        E::HttpStatus(status) => LlmCallFailure::new(
+            F::HttpStatus,
+            wit_llm::Error::ApiError(format!("LLM API returned HTTP {status}")),
+        ),
+        E::ProviderError => LlmCallFailure::new(
+            F::HttpStatus,
+            wit_llm::Error::ApiError("LLM API reported an error mid-response".to_string()),
+        ),
+        E::Oversized => LlmCallFailure::new(
+            F::OversizedResponse,
+            wit_llm::Error::ApiError(format!(
+                "LLM response exceeded {MAX_LLM_BODY_BYTES} bytes; aborted body read"
+            )),
+        ),
+        E::Decode(m) => LlmCallFailure::new(F::Decode, wit_llm::Error::ApiError(m)),
+    }
+}
+
 /// MCP-1213 (2026-05-18): bounded-body read for LLM responses.
 /// Streams chunks from `response.bytes_stream()` until either the body
 /// completes or `max_bytes` is exceeded.  Returns `Some(body_bytes)`
@@ -591,12 +624,18 @@ impl TalosContext {
         // re-asserts the fields that carry prompt integrity + transport
         // correctness. Net effect: options can only TUNE the request (seed,
         // top_p, stop, think, num_ctx, …) — they can never replace the
-        // SPOTLIGHTING-wrapped prompt or switch on streaming (which would
-        // make the single-shot response body unparseable). Auth + URL live
+        // SPOTLIGHTING-wrapped prompt or switch on streaming. Auth + URL live
         // in headers / worker config and are never in the body, so options
         // can't reach them.
         if let Some(serde_json::Value::Object(opts)) = extra_options {
             adapter.apply_provider_options(&mut body, opts);
+        }
+        // RFC 0014 P1: a LOCAL exchange streams, so it can be bounded by
+        // progress instead of a total clock. The host decides this after the
+        // options merge, never the guest; the chunks are reassembled into the
+        // single-shot body before the adapter parses it.
+        if is_local {
+            super::llm_local_stream::request_streaming(&mut body);
         }
 
         let url = adapter.completion_url(&model);
@@ -630,9 +669,10 @@ impl TalosContext {
         // `.json()` / `.text()` could hang indefinitely on a slow
         // body stream. Real prod symptom: daily-brief synthesize hung
         // 5+ minutes after the MCP-1212 re-sign fix unmasked it.
-        // Local-LLM in-flight gate. Taken BEFORE the exchange timeout starts,
-        // which is the entire point: `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` is
-        // documented as a bound on ONE call's own service time, and while this
+        // Local-LLM in-flight gate. Taken BEFORE the exchange deadlines start,
+        // which is the entire point: the exchange's deadlines (then one 60 s
+        // total, now RFC 0014's progress deadlines) bound ONE call's own
+        // service time, and while this
         // worker could issue unbounded simultaneous requests to a backend that
         // serves them one at a time it was nothing of the sort — a call could
         // spend the whole 60 s waiting for somebody else's inference and time
@@ -650,19 +690,25 @@ impl TalosContext {
         } else {
             None
         };
-        let timeout_secs: u64 = if is_local {
-            LOCAL_LLM_EXCHANGE_TIMEOUT_SECS
-        } else {
-            EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS
-        };
         let mut http_req = client.post(&url).header("Content-Type", "application/json");
         // Adapter-owned auth + protocol-version headers (empty for local
         // providers). Values may embed the API key — never logged.
         for (name, value) in &auth_headers {
             http_req = http_req.header(*name, value);
         }
-        let resp_bytes: Vec<u8> = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
+        let resp_bytes: Vec<u8> = if is_local {
+            // RFC 0014 P1: bounded by PROGRESS (first byte, then between
+            // chunks, under a ceiling) rather than one total clock.
+            super::llm_local_stream::exchange_local_stream(
+                http_req.body(body_bytes),
+                super::llm_local_stream::ProgressDeadlines::LOCAL,
+                MAX_LLM_BODY_BYTES,
+            )
+            .await
+            .map_err(local_exchange_failure)?
+        } else {
+            tokio::time::timeout(
+            std::time::Duration::from_secs(EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS),
             async move {
                 let response = http_req
                     .body(body_bytes)
@@ -732,7 +778,8 @@ impl TalosContext {
         .await
         .map_err(|_| {
             LlmCallFailure::new(crate::metrics::LlmFailure::Timeout, wit_llm::Error::Timeout)
-        })??;
+        })??
+        };
 
         // Typed, adapter-owned parse (2026-05-28 audit Perf#1 lineage:
         // format-specific serde structs, no full `Value` tree). The
