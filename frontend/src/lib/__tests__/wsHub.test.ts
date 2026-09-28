@@ -23,7 +23,7 @@ import {
   subscribeExecution,
   subscribeWorkflowExecutions,
 } from "../graphqlClient";
-import { resetSubscriptionHubForTests } from "../wsHub";
+import { IDLE_CLOSE_GRACE_MS, resetSubscriptionHubForTests } from "../wsHub";
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
@@ -94,6 +94,7 @@ describe("one shared WebSocket for every subscription", () => {
   });
 
   it("three subscriptions open ONE socket, start with distinct ids after the ack, and route data by id", () => {
+    vi.useFakeTimers();
     const seen: Record<string, unknown[]> = { exec: [], wf: [], dlq: [] };
     const unExec = subscribeExecution("e1", (ev) => seen.exec.push(ev));
     const unWf = subscribeWorkflowExecutions((ev) => seen.wf.push(ev));
@@ -137,9 +138,11 @@ describe("one shared WebSocket for every subscription", () => {
     });
     expect(seen.wf).toHaveLength(1);
 
-    // The last one out closes the socket, once, cleanly.
+    // The last one out closes the socket, once, cleanly — after the grace.
     unExec();
     unDlq();
+    expect(ws.closes).toHaveLength(0);
+    vi.advanceTimersByTime(IDLE_CLOSE_GRACE_MS);
     expect(ws.closes).toEqual([{ code: 1000, reason: "idle" }]);
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
@@ -172,6 +175,7 @@ describe("one shared WebSocket for every subscription", () => {
   });
 
   it("a subscription added while the socket is live starts immediately; one added after idle close reopens", () => {
+    vi.useFakeTimers();
     const un1 = subscribeDlqUpdates(() => {});
     const ws = FakeWebSocket.instances[0];
     ws.open();
@@ -182,9 +186,39 @@ describe("one shared WebSocket for every subscription", () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
     un1();
     un2();
+    vi.advanceTimersByTime(IDLE_CLOSE_GRACE_MS);
     expect(ws.closes).toHaveLength(1);
     subscribeDlqUpdates(() => {});
     expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  it("a resubscription inside the grace keeps a socket that is still CONNECTING (React StrictMode's double mount)", () => {
+    vi.useFakeTimers();
+    // Mount, unmount, mount again before the socket has even opened.
+    const unFirst = subscribeDlqUpdates(() => {});
+    const ws = FakeWebSocket.instances[0];
+    unFirst();
+    subscribeDlqUpdates(() => {});
+    vi.advanceTimersByTime(IDLE_CLOSE_GRACE_MS * 2);
+    expect(ws.closes).toHaveLength(0);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    // The same socket carries the live subscription, and only that one.
+    ws.open();
+    ws.ack();
+    expect(ws.starts()).toHaveLength(1);
+  });
+
+  it("an idle socket closes exactly when the grace expires, not before", () => {
+    vi.useFakeTimers();
+    const un = subscribeDlqUpdates(() => {});
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    ws.ack();
+    un();
+    vi.advanceTimersByTime(IDLE_CLOSE_GRACE_MS - 1);
+    expect(ws.closes).toHaveLength(0);
+    vi.advanceTimersByTime(1);
+    expect(ws.closes).toEqual([{ code: 1000, reason: "idle" }]);
   });
 
   it("an abnormal close reconnects with backoff and replays EVERY live subscription", () => {
