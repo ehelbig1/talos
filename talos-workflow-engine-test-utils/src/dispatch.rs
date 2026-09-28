@@ -151,6 +151,7 @@ mod tests {
             // reference dispatcher's clamp is then a no-op.
             deadline: None,
             budget_secs: None,
+            run_waits: None,
             allowed_hosts: vec![],
             allowed_methods: vec![],
             allowed_secrets: vec![],

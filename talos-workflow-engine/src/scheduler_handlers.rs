@@ -2692,6 +2692,8 @@ impl ParallelWorkflowEngine {
                 deadline: self.progress.deadline(),
                 // Attribution only — never clamps. See `DispatchJob::budget_secs`.
                 budget_secs: self.progress.budget_secs(),
+                // RFC 0014 P2b: see the single-node path.
+                run_waits: self.progress.run_waits(),
                 // Per-node fuel precedence: the loop-body node's graph-JSON
                 // `data.max_fuel` override (if set) > module-row default, then
                 // the adaptive learned ceiling as a floor, clamped to the
@@ -3074,11 +3076,14 @@ impl ParallelWorkflowEngine {
         child: impl std::future::Future<Output = T>,
     ) -> Result<T, String> {
         use talos_workflow_engine_core::MIN_REMAINING_FOR_ATTEMPT_SECS;
-        match child_dispatch_window(
-            node_timeout_secs,
-            self.progress.deadline(),
-            std::time::Instant::now(),
-        ) {
+        // RFC 0014 P2b: the window is computed against the run's LIVE deadline
+        // and, below, stands still while the run is waiting on local inference
+        // (which includes a sub-workflow child's jobs — its run clock forwards
+        // to this one). The run clock is the union of the run's waits, so a
+        // sibling branch's queueing also holds this window: lenient in the
+        // bounded direction (capped per run), never shorter than before.
+        let now = tokio::time::Instant::now().into_std();
+        match child_dispatch_window(node_timeout_secs, self.progress.live_deadline(now), now) {
             ChildDispatchWindow::Unbounded => Ok(child.await),
             ChildDispatchWindow::BudgetExhausted { remaining_secs } => {
                 tracing::warn!(
@@ -3095,9 +3100,9 @@ impl ParallelWorkflowEngine {
             ChildDispatchWindow::Wait {
                 secs,
                 from_node_cap,
-            } => match tokio::time::timeout(std::time::Duration::from_secs(secs), child).await {
+            } => match self.pausable_child_wait(secs, child).await {
                 Ok(v) => Ok(v),
-                Err(_) => {
+                Err(()) => {
                     tracing::warn!(
                         %node_id,
                         kind,
@@ -3115,6 +3120,39 @@ impl ParallelWorkflowEngine {
                     })
                 }
             },
+        }
+    }
+}
+
+impl ParallelWorkflowEngine {
+    /// `tokio::time::timeout(secs, child)`, except that the run's excluded
+    /// local-inference queueing that accrues DURING the wait pushes the window
+    /// back (RFC 0014 P2b). With no run clock it is the plain timeout.
+    async fn pausable_child_wait<T>(
+        &self,
+        secs: u64,
+        child: impl std::future::Future<Output = T>,
+    ) -> Result<T, ()> {
+        let window = std::time::Duration::from_secs(secs);
+        let Some(waits) = self.progress.run_waits() else {
+            return tokio::time::timeout(window, child).await.map_err(|_| ());
+        };
+        let now = || tokio::time::Instant::now().into_std();
+        let start = now();
+        let excluded_at_start = waits.excluded(start);
+        let deadline = |at| start + window + waits.excluded(at).saturating_sub(excluded_at_start);
+        tokio::pin!(child);
+        loop {
+            let d = deadline(now());
+            tokio::select! {
+                out = &mut child => return Ok(out),
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(d)) => {
+                    let n = now();
+                    if n >= deadline(n) {
+                        return Err(());
+                    }
+                }
+            }
         }
     }
 }
@@ -4064,5 +4102,97 @@ mod child_dispatch_window_tests {
             child_dispatch_window(45, Some(now - Duration::from_secs(5)), now),
             ChildDispatchWindow::BudgetExhausted { remaining_secs: 0 }
         ));
+    }
+}
+
+#[cfg(test)]
+mod pausable_child_wait_tests {
+    //! RFC 0014 P2b: the inline child window (sub-workflow / judge / ensemble)
+    //! stands still while the run is queued for local inference.
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::ParallelWorkflowEngine;
+
+    fn now() -> std::time::Instant {
+        tokio::time::Instant::now().into_std()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_child_window_pauses_while_the_run_waits() {
+        let engine = ParallelWorkflowEngine::new();
+        let clock = Arc::new(talos_workflow_engine_core::RunWaitClock::new(None));
+        engine.progress.set_run_waits(clock.clone());
+        let child = async {
+            let job = uuid::Uuid::new_v4();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            clock.begin(job, now());
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            clock.end(job, now());
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            "done"
+        };
+        assert_eq!(engine.pausable_child_wait(30, child).await, Ok("done"));
+    }
+
+    /// The control: nothing reported, the same child is cut at 30 s.
+    #[tokio::test(start_paused = true)]
+    async fn without_waits_the_child_window_is_the_plain_timeout() {
+        let engine = ParallelWorkflowEngine::new();
+        engine
+            .progress
+            .set_run_waits(Arc::new(talos_workflow_engine_core::RunWaitClock::new(
+                None,
+            )));
+        let child = async {
+            tokio::time::sleep(Duration::from_secs(85)).await;
+            "done"
+        };
+        let started = tokio::time::Instant::now();
+        assert_eq!(engine.pausable_child_wait(30, child).await, Err(()));
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+    }
+
+    /// Through the CALL SITE: `bounded_child` (the inline sub-workflow / judge /
+    /// ensemble window) with a node cap of 30 s, the child queued 60 s in the
+    /// middle. A call site that went back to the plain `tokio::time::timeout`
+    /// passes every test of the helper above and fails this one.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_child_pauses_while_the_run_waits() {
+        let engine = ParallelWorkflowEngine::new();
+        let clock = Arc::new(talos_workflow_engine_core::RunWaitClock::new(None));
+        engine.progress.set_run_waits(clock.clone());
+        let child = async {
+            let job = uuid::Uuid::new_v4();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            clock.begin(job, now());
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            clock.end(job, now());
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            "done"
+        };
+        let out = engine
+            .bounded_child(uuid::Uuid::new_v4(), "sub_workflow", 30, child)
+            .await;
+        assert_eq!(out, Ok("done"));
+    }
+
+    /// Waits that happened BEFORE the child started do not lengthen its window.
+    #[tokio::test(start_paused = true)]
+    async fn earlier_waits_do_not_lengthen_a_later_child() {
+        let engine = ParallelWorkflowEngine::new();
+        let clock = Arc::new(talos_workflow_engine_core::RunWaitClock::new(None));
+        engine.progress.set_run_waits(clock.clone());
+        let job = uuid::Uuid::new_v4();
+        clock.begin(job, now());
+        tokio::time::advance(Duration::from_secs(100)).await;
+        clock.end(job, now());
+        let started = tokio::time::Instant::now();
+        let child = async {
+            tokio::time::sleep(Duration::from_secs(85)).await;
+            "done"
+        };
+        assert_eq!(engine.pausable_child_wait(30, child).await, Err(()));
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
     }
 }

@@ -125,6 +125,105 @@ impl Default for WaitAccounting {
     }
 }
 
+/// One RUN's waiting account: the union of its jobs' reported waits, measured
+/// on the controller's clock — RFC 0014 P2b.
+///
+/// A run's wall-clock budget stands still while ANY of its jobs is queued for
+/// the local-inference slot, and runs again once none is. Two parallel branches
+/// queued at the same time pause the budget once, not twice: the run lost that
+/// interval once. Capped at [`LOCAL_INFERENCE_WAIT_CREDIT_CAP_SECS`] per run,
+/// the same cap as a job, so a busy period can hold a run open at most that much
+/// longer than its budget.
+///
+/// **Sub-workflows.** A child run gets its own clock with its parent's as
+/// `parent`; every `begin`/`end` is forwarded, keyed by the same job id, so the
+/// parent's budget pauses while the child's job waits. Job ids are unique across
+/// runs, so forwarded waits cannot collide with the parent's own.
+///
+/// `begin` / `end` are keyed and idempotent: a duplicated report cannot open two
+/// intervals, and `end` for a job that is not waiting changes nothing.
+#[derive(Debug)]
+pub struct RunWaitClock {
+    parent: Option<std::sync::Arc<RunWaitClock>>,
+    state: std::sync::Mutex<RunWaits>,
+}
+
+#[derive(Debug)]
+struct RunWaits {
+    waiting: std::collections::HashSet<uuid::Uuid>,
+    account: WaitAccounting,
+}
+
+impl RunWaitClock {
+    /// A run clock with the production cap, forwarding to `parent` if any.
+    #[must_use]
+    pub fn new(parent: Option<std::sync::Arc<RunWaitClock>>) -> Self {
+        Self::with_account(WaitAccounting::new(), parent)
+    }
+
+    /// A run clock over explicit accounting (tests set a small cap).
+    #[must_use]
+    pub fn with_account(
+        account: WaitAccounting,
+        parent: Option<std::sync::Arc<RunWaitClock>>,
+    ) -> Self {
+        Self {
+            parent,
+            state: std::sync::Mutex::new(RunWaits {
+                waiting: std::collections::HashSet::new(),
+                account,
+            }),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, RunWaits> {
+        // Nothing below can panic while holding the lock; recover rather than
+        // turn a deadline read into a run failure.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `job` started waiting at `now`.
+    pub fn begin(&self, job: uuid::Uuid, now: Instant) {
+        {
+            let mut s = self.state();
+            if s.waiting.insert(job) && s.waiting.len() == 1 {
+                s.account.begin(now);
+            }
+        }
+        if let Some(p) = &self.parent {
+            p.begin(job, now);
+        }
+    }
+
+    /// `job` stopped waiting at `now` (also called when its attempt ends, so a
+    /// lost `admitted` cannot hold the run open).
+    pub fn end(&self, job: uuid::Uuid, now: Instant) {
+        {
+            let mut s = self.state();
+            if s.waiting.remove(&job) && s.waiting.is_empty() {
+                s.account.end(now);
+            }
+        }
+        if let Some(p) = &self.parent {
+            p.end(job, now);
+        }
+    }
+
+    /// The run's excluded waiting time as of `now`, capped.
+    #[must_use]
+    pub fn excluded(&self, now: Instant) -> Duration {
+        self.state().account.excluded(now)
+    }
+
+    /// `base` (the run's stamped deadline) pushed back by the excluded time.
+    #[must_use]
+    pub fn deadline(&self, base: Instant, now: Instant) -> Instant {
+        base + self.excluded(now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +299,63 @@ mod tests {
         assert_eq!(w.excluded(at(t0, 1000)), Duration::from_secs(50));
         w.end(at(t0, 1000));
         assert_eq!(w.excluded(at(t0, 2000)), Duration::from_secs(50));
+    }
+
+    fn job(n: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn a_run_pauses_while_any_of_its_jobs_waits_and_counts_overlap_once() {
+        let t0 = Instant::now();
+        let run = RunWaitClock::new(None);
+        run.begin(job(1), at(t0, 10));
+        run.begin(job(2), at(t0, 20)); // overlaps job 1
+        run.end(job(1), at(t0, 40));
+        assert_eq!(
+            run.excluded(at(t0, 50)),
+            Duration::from_secs(40),
+            "still open via job 2"
+        );
+        run.end(job(2), at(t0, 60));
+        // The union is 10..60: 50 s, not 30 + 40.
+        assert_eq!(run.excluded(at(t0, 500)), Duration::from_secs(50));
+        assert_eq!(run.deadline(at(t0, 300), at(t0, 500)), at(t0, 350));
+    }
+
+    #[test]
+    fn duplicate_and_unknown_job_reports_change_nothing_on_a_run() {
+        let t0 = Instant::now();
+        let run = RunWaitClock::new(None);
+        run.end(job(9), at(t0, 1));
+        run.begin(job(1), at(t0, 10));
+        run.begin(job(1), at(t0, 20));
+        run.end(job(9), at(t0, 30)); // another job ending does not close job 1's wait
+        run.end(job(1), at(t0, 40));
+        run.end(job(1), at(t0, 90));
+        assert_eq!(run.excluded(at(t0, 100)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_child_run_forwards_its_waits_to_its_parent() {
+        let t0 = Instant::now();
+        let parent = std::sync::Arc::new(RunWaitClock::new(None));
+        let child = RunWaitClock::new(Some(parent.clone()));
+        parent.begin(job(1), at(t0, 0));
+        child.begin(job(2), at(t0, 5));
+        parent.end(job(1), at(t0, 10)); // parent still waiting via the child's job
+        child.end(job(2), at(t0, 30));
+        assert_eq!(child.excluded(at(t0, 100)), Duration::from_secs(25));
+        assert_eq!(parent.excluded(at(t0, 100)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_run_is_capped_like_a_job() {
+        let t0 = Instant::now();
+        let run =
+            RunWaitClock::with_account(WaitAccounting::with_cap(Duration::from_secs(20)), None);
+        run.begin(job(1), t0);
+        assert_eq!(run.excluded(at(t0, 1000)), Duration::from_secs(20));
     }
 
     #[test]

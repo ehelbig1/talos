@@ -253,6 +253,16 @@ async fn run(
     attempt_secs: u64,
     limit: Option<Duration>,
 ) -> (Result<Result<Vec<u8>, BoxError>, AttemptElapsed>, Duration) {
+    run_in(t, attempt_secs, limit, None).await
+}
+
+/// [`run`] inside a run whose waiting account is `waits` (RFC 0014 P2b).
+async fn run_in(
+    t: QueueingTransport,
+    attempt_secs: u64,
+    limit: Option<Duration>,
+    waits: Option<&RunWaitClock>,
+) -> (Result<Result<Vec<u8>, BoxError>, AttemptElapsed>, Duration) {
     let ring = ring();
     let payload = sent(1);
     let started = tokio::time::Instant::now();
@@ -263,7 +273,11 @@ async fn run(
         Some("_INBOX.t"),
         payload.clone(),
         attempt_secs,
-        limit,
+        RunLimit {
+            deadline: limit,
+            reserve: Duration::ZERO,
+            waits,
+        },
         ProgressCheck {
             expected_job_id: job(),
             sent_payload: &payload,
@@ -362,7 +376,11 @@ async fn without_an_inbox_the_window_is_the_plain_timeout() {
         None,
         payload.clone(),
         30,
-        None,
+        RunLimit {
+            deadline: None,
+            reserve: Duration::ZERO,
+            waits: None,
+        },
         ProgressCheck {
             expected_job_id: job(),
             sent_payload: &payload,
@@ -372,4 +390,65 @@ async fn without_an_inbox_the_window_is_the_plain_timeout() {
     .await;
     assert!(out.is_err());
     assert_eq!(started.elapsed(), secs(30));
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0014 P2b — the RUN's clock
+// ---------------------------------------------------------------------------
+
+/// A verified wait is reported to the run's clock, and closed with the attempt.
+#[tokio::test(start_paused = true)]
+async fn verified_waits_are_reported_to_the_run_clock() {
+    let run_clock = RunWaitClock::new(None);
+    let (out, _) = run_in(transport(90, 20, true), 30, None, Some(&run_clock)).await;
+    assert!(out.is_ok());
+    assert_eq!(run_clock.excluded(now()), secs(90));
+}
+
+/// THE P2b regression at the attempt: the run's stamped deadline is 60 s away,
+/// but the run itself stands still while this job is queued, so the attempt
+/// may run past the STAMPED limit. Before P2b it was cut at 60 s (the control,
+/// `the_run_limit_bounds_a_paused_window`, still is when there is no run clock).
+#[tokio::test(start_paused = true)]
+async fn the_run_limit_moves_with_the_runs_own_pause() {
+    let run_clock = RunWaitClock::new(None);
+    let (out, took) = run_in(
+        transport(90, 20, true),
+        30,
+        Some(secs(60)),
+        Some(&run_clock),
+    )
+    .await;
+    assert_eq!(
+        out.expect("run budget paused while queued").unwrap(),
+        b"reply"
+    );
+    assert_eq!(took, secs(110));
+}
+
+/// A lost `admitted` cannot hold the run open once the attempt is over.
+#[tokio::test(start_paused = true)]
+async fn an_attempt_that_ends_closes_its_wait_on_the_run() {
+    let run_clock = RunWaitClock::new(None);
+    let mut t = transport(10, 5, true);
+    t.admitted = false;
+    let (out, _) = run_in(t, 30, None, Some(&run_clock)).await;
+    assert!(out.is_ok());
+    let at_end = run_clock.excluded(now());
+    tokio::time::advance(secs(100)).await;
+    assert_eq!(
+        run_clock.excluded(now()),
+        at_end,
+        "the run's wait was closed with the attempt"
+    );
+}
+
+/// A forged report moves neither clock.
+#[tokio::test(start_paused = true)]
+async fn a_forged_report_does_not_move_the_run() {
+    let run_clock = RunWaitClock::new(None);
+    let mut t = transport(90, 20, true);
+    t.key = vec![0x13u8; 32];
+    let _ = run_in(t, 30, None, Some(&run_clock)).await;
+    assert_eq!(run_clock.excluded(now()), Duration::ZERO);
 }

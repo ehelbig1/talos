@@ -67,6 +67,9 @@ async fn run_with_workflow_timeout(
     secs: u64,
     cancel: Option<tokio_util::sync::CancellationToken>,
     progress: ExecutionProgress,
+    // RFC 0014 P2b: the parent run's waiting account when this is a
+    // sub-workflow run, so the child's queued jobs pause the parent's budget.
+    parent_waits: Option<Arc<talos_workflow_engine_core::RunWaitClock>>,
     fut: impl std::future::Future<Output = Result<talos_workflow_engine_core::WorkflowContext, String>>,
 ) -> Result<talos_workflow_engine_core::WorkflowContext, crate::WorkflowEngineError> {
     // Race the inner scheduler against:
@@ -96,7 +99,15 @@ async fn run_with_workflow_timeout(
     // handle whose previous run HAD a cap cannot inherit a stale
     // deadline — the stamp happens on every entry, not only when a cap
     // exists.
-    progress.set_deadline(timeout_dur.map(|d| (std::time::Instant::now() + d, secs)));
+    // RFC 0014 P2b: the budget stands still while any of this run's jobs is
+    // queued for the local-inference slot. One clock per run (a reused handle
+    // gets a fresh one), stamped with the deadline so the two describe the
+    // same run. Instants come from tokio's clock as `std` — the same clock in
+    // production, and the one a paused test clock moves.
+    let run_waits = Arc::new(talos_workflow_engine_core::RunWaitClock::new(parent_waits));
+    progress.set_run_waits(run_waits.clone());
+    let stamped = timeout_dur.map(|d| tokio::time::Instant::now().into_std() + d);
+    progress.set_deadline(stamped.map(|at| (at, secs)));
 
     // The run's OWN abort token: a child of the caller's token when there is
     // one (so the caller's cancel still reaches it), a fresh token otherwise.
@@ -109,17 +120,34 @@ async fn run_with_workflow_timeout(
     });
     progress.set_run_abort(run_token.clone());
 
-    let inner_result: Result<Result<_, String>, ()> = match timeout_dur {
-        Some(dur) => tokio::select! {
-            biased; // honour cancellation before timeout if both fire same tick
-            () = run_token.cancelled() => return Err(crate::WorkflowEngineError::Cancelled),
-            r = tokio::time::timeout(dur, &mut fut) => match r {
-                Ok(inner) => Ok(inner),
-                Err(_) => return Err(crate::WorkflowEngineError::Timeout {
-                    secs,
-                    attribution: progress.describe(),
-                }),
-            },
+    let inner_result: Result<Result<_, String>, ()> = match stamped {
+        // The deadline is re-read every time it is reached: if a queued job
+        // pushed it back, sleep again; otherwise the run has used its budget.
+        Some(base) => loop {
+            let now = tokio::time::Instant::now().into_std();
+            let deadline = run_waits.deadline(base, now);
+            tokio::select! {
+                biased; // honour cancellation before timeout if both fire same tick
+                () = run_token.cancelled() => return Err(crate::WorkflowEngineError::Cancelled),
+                inner = &mut fut => break Ok(inner),
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    let now = tokio::time::Instant::now().into_std();
+                    if now >= run_waits.deadline(base, now) {
+                        let excluded = run_waits.excluded(now);
+                        if !excluded.is_zero() {
+                            tracing::warn!(
+                                budget_secs = secs,
+                                excluded_ms = excluded.as_millis() as u64,
+                                "workflow budget elapsed after excluding local-inference queueing"
+                            );
+                        }
+                        return Err(crate::WorkflowEngineError::Timeout {
+                            secs,
+                            attribution: progress.describe(),
+                        });
+                    }
+                }
+            }
         },
         None => tokio::select! {
             biased;
@@ -908,6 +936,10 @@ pub struct ParallelWorkflowEngine {
     /// sub-engine gets a fresh handle so a sub-workflow's timeout
     /// attributes its OWN nodes, not the parent's.
     pub(crate) progress: ExecutionProgress,
+    /// RFC 0014 P2b: the PARENT run's waiting account when this engine runs a
+    /// sub-workflow (carried in by [`AdapterSet`]); `None` for a top-level
+    /// run. The run clock this engine stamps forwards to it.
+    pub(crate) parent_run_waits: Option<Arc<talos_workflow_engine_core::RunWaitClock>>,
 }
 
 impl Default for ParallelWorkflowEngine {
@@ -929,6 +961,9 @@ impl Default for ParallelWorkflowEngine {
 /// per-iteration inside an agent loop.
 #[derive(Clone)]
 pub struct AdapterSet {
+    /// RFC 0014 P2b: the building engine's CURRENT run clock, so a sub-engine's
+    /// run forwards its jobs' queueing to the parent run's budget.
+    parent_run_waits: Option<Arc<talos_workflow_engine_core::RunWaitClock>>,
     module_fetcher: Option<Arc<dyn ModuleFetcher>>,
     event_sink: Option<Arc<dyn EventSink>>,
     node_hook: Option<Arc<dyn NodeLifecycleHook>>,
@@ -1039,6 +1074,7 @@ impl AdapterSet {
     #[must_use]
     pub fn into_engine(self) -> ParallelWorkflowEngine {
         let mut engine = ParallelWorkflowEngine::new();
+        engine.parent_run_waits = self.parent_run_waits;
         engine.module_fetcher = self.module_fetcher;
         engine.event_sink = self.event_sink;
         engine.node_hook = self.node_hook;
@@ -1181,6 +1217,7 @@ impl ParallelWorkflowEngine {
             max_subflow_depth: DEFAULT_MAX_SUBFLOW_DEPTH,
             current_subflow_depth: 0,
             progress: ExecutionProgress::default(),
+            parent_run_waits: None,
         }
     }
 
@@ -1196,6 +1233,7 @@ impl ParallelWorkflowEngine {
     #[must_use]
     pub fn adapter_set(&self) -> AdapterSet {
         AdapterSet {
+            parent_run_waits: self.progress.run_waits(),
             module_fetcher: self.module_fetcher.clone(),
             event_sink: self.event_sink.clone(),
             node_hook: self.node_hook.clone(),
@@ -1451,6 +1489,7 @@ impl ParallelWorkflowEngine {
             self.execution_timeout_secs,
             self.cancellation_token.clone(),
             self.progress.clone(),
+            self.parent_run_waits.clone(),
             // The ONE entry point that batches chains — and the one no
             // production caller in this workspace uses. See `ChainDispatch`.
             self.run_inner(
@@ -1498,6 +1537,7 @@ impl ParallelWorkflowEngine {
             self.execution_timeout_secs,
             Some(cancel),
             self.progress.clone(),
+            self.parent_run_waits.clone(),
             self.run_inner(
                 dispatcher,
                 worker_shared_key,
@@ -1597,6 +1637,7 @@ impl ParallelWorkflowEngine {
         // propagation, see set_cancellation_token.
         let cancel = cancel_override.or_else(|| self.cancellation_token.clone());
         let progress = self.progress.clone();
+        let parent_waits = self.parent_run_waits.clone();
         let inner = self.run_inner(
             dispatcher,
             worker_shared_key,
@@ -1604,9 +1645,9 @@ impl ParallelWorkflowEngine {
             execution_id,
             chain_dispatch,
         );
-        Box::pin(
-            async move { run_with_workflow_timeout(timeout_secs, cancel, progress, inner).await },
-        )
+        Box::pin(async move {
+            run_with_workflow_timeout(timeout_secs, cancel, progress, parent_waits, inner).await
+        })
     }
 
     /// Cancellable variant of

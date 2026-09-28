@@ -198,6 +198,19 @@ pub struct DispatchJob {
     /// not track one, and yields [`crate::ClampCause::Unknown`] — the
     /// loud direction, never a demotion.
     pub budget_secs: Option<u64>,
+    /// RFC 0014 P2b: the RUN's waiting account. [`Self::deadline`] is the
+    /// deadline the run was stamped with; the run's LIVE deadline is that plus
+    /// this clock's excluded time, because the run's budget stands still while
+    /// any of its jobs is queued for the local-inference slot.
+    ///
+    /// An impl that clamps with [`Self::deadline`] should read the live value
+    /// (`deadline + run_waits.excluded(now)`) each time it clamps, and report its
+    /// own job's verified waits here (`begin` / `end`, keyed by the job id) so
+    /// the run's budget and its siblings' windows see them. `None` means no run
+    /// clock: the stamped deadline is the live one, exactly as before P2b.
+    ///
+    /// Process-internal and never serialized, like `deadline`.
+    pub run_waits: Option<std::sync::Arc<crate::RunWaitClock>>,
 
     // ── Capability grants ────────────────────────────────────────────
     /// Hostnames the worker permits outbound HTTP to.
@@ -387,6 +400,7 @@ impl Default for DispatchJob {
             // behaviour: impls clamp nothing.
             deadline: None,
             budget_secs: None,
+            run_waits: None,
             allowed_hosts: Vec::new(),
             allowed_methods: Vec::new(),
             allowed_secrets: Vec::new(),
@@ -633,6 +647,12 @@ impl DispatchJobBuilder {
         self
     }
 
+    /// The run's waiting account — see [`DispatchJob::run_waits`].
+    pub fn run_waits(mut self, run_waits: std::sync::Arc<crate::RunWaitClock>) -> Self {
+        self.inner.run_waits = Some(run_waits);
+        self
+    }
+
     /// Hostnames the worker permits outbound HTTP to.
     pub fn allowed_hosts(mut self, hosts: Vec<String>) -> Self {
         self.inner.allowed_hosts = hosts;
@@ -789,6 +809,7 @@ impl fmt::Debug for DispatchJob {
             .field("max_fuel", &self.max_fuel)
             .field("deadline", &self.deadline)
             .field("budget_secs", &self.budget_secs)
+            .field("run_waits", &self.run_waits.is_some())
             .field("allowed_hosts", &self.allowed_hosts)
             .field("allowed_methods", &self.allowed_methods)
             .field("allowed_secrets", &self.allowed_secrets)

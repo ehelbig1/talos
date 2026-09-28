@@ -270,3 +270,36 @@ async fn a_loop_bodys_explicit_retry_policy_is_honoured() {
         assert_eq!(j.backoff_ms, 1234, "and so does their backoff");
     }
 }
+
+// ── RFC 0014 P2b: the run clock ─────────────────────────────────────
+
+/// Every loop-body job AND the body's own single-node run carry the RUN's
+/// waiting account — the same clock — so a loop iteration queued for local
+/// inference pauses the run's budget like any other job.
+#[tokio::test]
+async fn loop_body_and_single_node_jobs_carry_the_same_run_clock() {
+    let body = Uuid::new_v4();
+    let fetcher =
+        InMemoryModuleFetcher::new().with_module(body, artifact(body, "minimal-node", &[]));
+    let mut engine = engine_with(fetcher, &loop_graph(body, None)).await;
+    engine.set_execution_timeout_secs(300);
+    let d = Arc::new(ScriptedDispatcher::new().with_response(body, json!({"ok": true})));
+    run(&mut engine, &d).await.expect("the loop runs");
+
+    let jobs = d.jobs();
+    let loop_jobs: Vec<_> = jobs.iter().filter(|j| !j.emit_retry_events).collect();
+    let single: Vec<_> = jobs.iter().filter(|j| j.emit_retry_events).collect();
+    assert_eq!(loop_jobs.len(), ITERATIONS as usize);
+    assert_eq!(single.len(), 1, "the body's own run after the loop");
+    let clock = single[0]
+        .run_waits
+        .clone()
+        .expect("the single-node dispatch carries the run clock");
+    for j in &loop_jobs {
+        let c = j
+            .run_waits
+            .as_ref()
+            .expect("a loop-body dispatch carries the run clock");
+        assert!(Arc::ptr_eq(c, &clock), "one run, one clock");
+    }
+}

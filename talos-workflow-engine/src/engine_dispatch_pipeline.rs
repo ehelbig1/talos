@@ -412,6 +412,8 @@ impl ParallelWorkflowEngine {
                 // No deadline on this path (above), so nothing to
                 // attribute: `dispatch_chain` reads neither field.
                 budget_secs: None,
+                // No deadline on this path, so no run clock to report to.
+                run_waits: None,
                 timeout: std::time::Duration::from_secs(
                     self.node_timeouts.get(&step_node_id).copied().unwrap_or(30),
                 ),

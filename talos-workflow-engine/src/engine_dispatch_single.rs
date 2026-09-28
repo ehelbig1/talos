@@ -639,6 +639,9 @@ impl ParallelWorkflowEngine {
             deadline: self.progress.deadline(),
             // Attribution only — never clamps. See `DispatchJob::budget_secs`.
             budget_secs: self.progress.budget_secs(),
+            // RFC 0014 P2b: the run's waiting account, so the dispatcher clamps
+            // against the LIVE deadline and reports this job's queueing to it.
+            run_waits: self.progress.run_waits(),
             allowed_hosts: wasm_module.allowed_hosts.clone(),
             allowed_methods: wasm_module.allowed_methods.clone(),
             allowed_secrets: wasm_module.allowed_secrets.clone(),

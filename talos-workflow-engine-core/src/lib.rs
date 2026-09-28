@@ -179,7 +179,7 @@ pub use egress_scope::EgressScope;
 pub use event_sink::{EventSink, NodeEventWrite};
 pub use expression::ExpressionEvaluator;
 pub use graph_store::{GraphLookup, WorkflowGraphStore};
-pub use inference_wait::{WaitAccounting, LOCAL_INFERENCE_WAIT_CREDIT_CAP_SECS};
+pub use inference_wait::{RunWaitClock, WaitAccounting, LOCAL_INFERENCE_WAIT_CREDIT_CAP_SECS};
 pub use judge_score_recorder::JudgeScoreRecorder;
 pub use llm_tier::LlmTier;
 pub use memory_freshness::MemoryFreshnessResolver;
