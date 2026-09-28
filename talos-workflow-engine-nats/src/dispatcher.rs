@@ -1029,6 +1029,9 @@ pub(crate) async fn execute_job_with_retry(
                     // Smart retry default: when no explicit retry_condition is set,
                     // classify the error and skip retries for non-transient failures
                     // (auth errors, fuel exhaustion, missing secrets, etc.).
+                    // RFC 0014 P4a: a class may cap its own retries below the
+                    // node's count (a local LLM call stuck mid-answer earns one).
+                    let mut class_cap: Option<(String, u32)> = None;
                     if retry_condition.is_none() && max_retries > 0 {
                         let err_for_classify = job_result
                             .output_payload
@@ -1066,9 +1069,53 @@ pub(crate) async fn execute_job_with_retry(
                                 classification, err_for_classify
                             ));
                         }
+                        if let Some(cap) = retry_classifier.retry_cap(&classification) {
+                            class_cap = Some((classification, cap));
+                        }
                     }
 
                     attempts += 1;
+                    if let Some((class, cap)) = class_cap.as_ref() {
+                        if attempts > *cap && attempts <= max_retries {
+                            let err_msg = job_result
+                                .output_payload
+                                .value()
+                                .get("error")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("");
+                            tracing::info!(
+                                error_type = %class,
+                                cap = *cap,
+                                max_retries,
+                                "Retry cap for this error class reached — no further retries"
+                            );
+                            emit_event_spawn(
+                                &event_sink,
+                                NodeEventWrite {
+                                    execution_id: event_execution_id,
+                                    event_type: "retry_skipped".to_string(),
+                                    node_id: Some(event_node_id),
+                                    status: "Failed".to_string(),
+                                    log_message: Some(format!(
+                                        "Retry skipped: '{}' earns at most {} retr{}",
+                                        class,
+                                        cap,
+                                        if *cap == 1 { "y" } else { "ies" }
+                                    )),
+                                    iteration_index: None,
+                                    error_class: Some(class.clone()),
+                                    duration_ms: None,
+                                },
+                            );
+                            return Err(format!(
+                                "Job failed (retry cap for {}: {} retr{}): {}",
+                                class,
+                                cap,
+                                if *cap == 1 { "y" } else { "ies" },
+                                err_msg
+                            ));
+                        }
+                    }
                     if attempts > max_retries {
                         let err_msg = job_result
                             .output_payload
@@ -3265,6 +3312,105 @@ mod budget_clamp_loop_tests {
             run_waits,
         )
         .await
+    }
+
+    /// A classifier that reads every failure as one transient class, capped
+    /// at `cap` retries (RFC 0014 P4a).
+    struct CappedClass(Option<u32>);
+    impl RetryClassifier for CappedClass {
+        fn classify(&self, _error: &str) -> String {
+            "stuck".to_string()
+        }
+        fn is_transient(&self, _class: &str) -> bool {
+            true
+        }
+        fn retry_cap(&self, _class: &str) -> Option<u32> {
+            self.0
+        }
+    }
+
+    async fn run_loop_classified(
+        transport: &dyn JobTransport,
+        max_retries: u32,
+        classifier: &dyn RetryClassifier,
+    ) -> Result<serde_json::Value, String> {
+        let evaluator = NoExpr;
+        let payload = super::resign_payload_tests::signed_request(&[9u8; 32]);
+        execute_job_with_retry(
+            transport,
+            "test.topic".to_string(),
+            payload,
+            5,
+            max_retries,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            classifier,
+            &evaluator,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// RFC 0014 P4a: a class capped at one retry stops after its one retry,
+    /// although the node allows three; the control (no cap) uses all three.
+    #[tokio::test]
+    async fn a_class_retry_cap_stops_below_the_nodes_count() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let t = SlowTransport {
+            delay: Duration::ZERO,
+            calls: calls.clone(),
+            succeed: false,
+        };
+        let err = run_loop_classified(&t, 3, &CappedClass(Some(1)))
+            .await
+            .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one attempt and one retry");
+        assert!(err.contains("retry cap for stuck"), "{err}");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let t = SlowTransport {
+            delay: Duration::ZERO,
+            calls: calls.clone(),
+            succeed: false,
+        };
+        let err = run_loop_classified(&t, 3, &CappedClass(None))
+            .await
+            .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "the node's three retries");
+        assert!(err.contains("after 4 attempts"), "{err}");
+    }
+
+    /// A cap never RAISES the count: a node allowing no retries gets none.
+    #[tokio::test]
+    async fn a_class_retry_cap_never_raises_the_nodes_count() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let t = SlowTransport {
+            delay: Duration::ZERO,
+            calls: calls.clone(),
+            succeed: false,
+        };
+        let _ = run_loop_classified(&t, 0, &CappedClass(Some(5))).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let t = SlowTransport {
+            delay: Duration::ZERO,
+            calls: calls.clone(),
+            succeed: false,
+        };
+        let _ = run_loop_classified(&t, 1, &CappedClass(Some(5))).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     /// RFC 0014 P2b: each attempt is clamped against the run's LIVE deadline.

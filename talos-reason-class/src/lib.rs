@@ -97,6 +97,9 @@ pub const ALL: &[&str] = &[
     "request-body-cap",
     "graphql-introspection",
     "sse-stream-cap",
+    "inference-first-byte-timeout",
+    "inference-idle-timeout",
+    "inference-ceiling-timeout",
 ];
 
 /// The rendered marker key. Public because a consumer's own doc-comments and
@@ -222,7 +225,13 @@ pub fn family(token: &str) -> Option<Family> {
     Some(match token {
         "dns" | "tls" | "connect-refused" | "connect-failed" | "send-failed"
         | "response-stream" => Family::Transport,
-        "timeout" => Family::Timeout,
+        // RFC 0014 P4a: which progress deadline cut a local LLM exchange. All
+        // three are timeouts; whether one is retried is the retry
+        // classifier's call, not a family's.
+        "timeout"
+        | "inference-first-byte-timeout"
+        | "inference-idle-timeout"
+        | "inference-ceiling-timeout" => Family::Timeout,
         "circuit-open" => Family::CircuitOpen,
         "cancelled" => Family::Cancelled,
         "secret-lookup" => Family::SecretLookup,
@@ -332,9 +341,12 @@ mod tests {
                 "request-body-cap",
                 "graphql-introspection",
                 "sse-stream-cap",
+                "inference-first-byte-timeout",
+                "inference-idle-timeout",
+                "inference-ceiling-timeout",
             ]
         );
-        assert_eq!(ALL.len(), 31);
+        assert_eq!(ALL.len(), 34);
     }
 
     /// TOTALITY. A token in [`ALL`] with no family would be a token every

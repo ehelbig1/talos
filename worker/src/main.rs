@@ -2884,6 +2884,8 @@ async fn main() -> anyhow::Result<()> {
     // effects. Backing the cache with the same Redis makes dedup fleet-wide;
     // absent/unreachable Redis degrades to same-worker-only (the old
     // behavior), never an error.
+    // RFC 0014 P4a: count local LLM timeouts by which deadline fired.
+    worker::local_llm_fleet::install_timeout_series();
     if let Some(ref client) = redis_client {
         worker::job_idempotency::init_redis(client.as_ref().clone()).await;
         // RFC 0014 P3b: queue local LLM calls with the controller and the

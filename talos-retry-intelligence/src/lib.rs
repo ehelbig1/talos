@@ -201,6 +201,21 @@ pub fn classify_error(error_msg: &str) -> String {
     if lower.contains("reason_class=cancelled") {
         return "cancelled".to_string();
     }
+    // RFC 0014 P4a: which progress deadline cut a LOCAL LLM exchange. Hoisted
+    // above the generic `timed out` arm, which every one of these messages
+    // also matches: the ceiling kind must NOT read transient (the call was
+    // making progress for the whole backstop; the same request produces the
+    // same long answer), and the idle kind carries its own retry cap
+    // ([`retry_cap_for`]).
+    if lower.contains("reason_class=inference-ceiling-timeout") {
+        return "inference_ceiling_timeout".to_string();
+    }
+    if lower.contains("reason_class=inference-idle-timeout") {
+        return "inference_idle_timeout".to_string();
+    }
+    if lower.contains("reason_class=inference-first-byte-timeout") {
+        return "inference_first_byte_timeout".to_string();
+    }
     // A missing / ungranted vault slot is a configuration error, not a
     // network blip — even though the host had to report it as `networkerror`.
     // Hoisted above the `missing_secret` bucket's own position for the same
@@ -369,8 +384,27 @@ pub fn classify_error(error_msg: &str) -> String {
 pub fn is_transient_error_type(error_type: &str) -> bool {
     matches!(
         error_type,
-        "rate_limit" | "network_transient" | "timeout" | "database_transient"
+        "rate_limit"
+            | "network_transient"
+            | "timeout"
+            | "database_transient"
+            | "inference_first_byte_timeout"
+            | "inference_idle_timeout"
     )
+}
+
+/// The most retries an error class may earn, whatever the node's own
+/// `max_retries` — `None` means the node's own count applies.
+///
+/// RFC 0014 P4a: a local LLM exchange that made progress and then STOPPED
+/// (`inference_idle_timeout`) points at a stuck backend. One retry gives it a
+/// chance to recover; a backend that sticks twice is not unsticking, and each
+/// further attempt spends another idle deadline (60 s) of the run's budget.
+pub fn retry_cap_for(error_type: &str) -> Option<u32> {
+    match error_type {
+        "inference_idle_timeout" => Some(1),
+        _ => None,
+    }
 }
 
 /// Diagnose failures for a workflow using historical execution data.
@@ -900,6 +934,17 @@ name: \"networkerror\", message: \"\" }";
             ("header-cap", "capability_denied", false),
             ("secret-lookup", "missing_secret", false),
             ("timeout", "timeout", true),
+            (
+                "inference-first-byte-timeout",
+                "inference_first_byte_timeout",
+                true,
+            ),
+            ("inference-idle-timeout", "inference_idle_timeout", true),
+            (
+                "inference-ceiling-timeout",
+                "inference_ceiling_timeout",
+                false,
+            ),
         ];
         for (token, expected, transient) in cases {
             // `timeout` is the one token paired with `wit_http::Error::Timeout`
@@ -907,14 +952,24 @@ name: \"networkerror\", message: \"\" }";
             // enum name. Building the realistic pairing keeps the case honest
             // (an artificial `networkerror` + `reason_class=timeout` message
             // would classify network_transient — same transience, wrong class).
-            let wit_name = if *token == "timeout" {
-                "timeout"
+            let msg = if token.starts_with("inference-") {
+                // The llm-inference template's own words, as the node failure
+                // carries them — the realistic pairing for an LLM timeout.
+                format!(
+                    "Component returned error: LLM provider 'ollama' timed out: the host \
+                     stopped waiting because the response made no progress in time. \
+                     [reason_class={token}]"
+                )
             } else {
-                "networkerror"
+                let wit_name = if *token == "timeout" {
+                    "timeout"
+                } else {
+                    "networkerror"
+                };
+                format!(
+                    r#"Component returned error: fetch: Error {{ code: 2, name: "{wit_name}", message: "" }} [reason_class={token}]"#
+                )
             };
-            let msg = format!(
-                r#"Component returned error: fetch: Error {{ code: 2, name: "{wit_name}", message: "" }} [reason_class={token}]"#
-            );
             let c = classify_error(&msg);
             assert_eq!(&c, expected, "token {token:?} classified {c:?}");
             assert_eq!(
@@ -923,6 +978,26 @@ name: \"networkerror\", message: \"\" }";
                 "token {token:?} transience"
             );
         }
+    }
+
+    /// RFC 0014 P4a: only the idle kind is capped, at one retry; an unmarked
+    /// LLM timeout keeps today's reading (transient, the node's own count).
+    #[test]
+    fn only_an_idle_inference_timeout_is_capped() {
+        assert_eq!(retry_cap_for("inference_idle_timeout"), Some(1));
+        for c in [
+            "inference_first_byte_timeout",
+            "inference_ceiling_timeout",
+            "timeout",
+            "network_transient",
+            "unknown",
+        ] {
+            assert_eq!(retry_cap_for(c), None, "{c}");
+        }
+        let unmarked = "Component returned error: LLM provider 'ollama' timed out: the host \
+                        stopped waiting because the response made no progress in time.";
+        assert_eq!(classify_error(unmarked), "timeout");
+        assert!(is_transient_error_type("timeout"));
     }
 
     /// The `invalidurl` / `forbiddenhost` half of the closed set, in the

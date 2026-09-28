@@ -28,4 +28,11 @@ pub trait RetryClassifier: Send + Sync {
     ///
     /// [`classify`]: Self::classify
     fn is_transient(&self, class: &str) -> bool;
+
+    /// The most retries a failure of this class may earn, whatever the node's
+    /// own `max_retries`. `None` (the default) means the node's count applies.
+    /// Only ever LOWERS the count: the dispatcher takes the smaller of the two.
+    fn retry_cap(&self, _class: &str) -> Option<u32> {
+        None
+    }
 }

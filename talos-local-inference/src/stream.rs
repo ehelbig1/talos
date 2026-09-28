@@ -29,7 +29,8 @@
 //!
 //! ## Classification (unchanged from the non-streaming exchange)
 //!
-//! * a deadline → `Timeout` (which one is logged, not a label — RFC 0014 P4);
+//! * a deadline → `Timeout(kind)`, counted by kind through [`TimeoutSink`]
+//!   (RFC 0014 P4a);
 //! * an `{"error": …}` line → the provider reporting a failure, classified as
 //!   the HTTP 500 the same failure produced without streaming; its text is
 //!   logged DLP-redacted and never returned to the caller;
@@ -75,6 +76,9 @@ pub enum StallKind {
 }
 
 impl StallKind {
+    /// Every kind, for metric pre-seeding.
+    pub const ALL: [StallKind; 3] = [StallKind::FirstByte, StallKind::Idle, StallKind::Ceiling];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             StallKind::FirstByte => "first_byte",
@@ -84,6 +88,19 @@ impl StallKind {
     }
 }
 
+/// Where each process counts a deadline that fired (RFC 0014 P4a): the worker
+/// into `wasm_llm_timeouts_total{kind}`, the controller into
+/// `talos_local_llm_timeouts_total{kind}`. Installed once at boot; unset means
+/// nothing is counted (tests, tools).
+pub type TimeoutSink = dyn Fn(StallKind) + Send + Sync;
+
+static TIMEOUT_SINK: std::sync::OnceLock<std::sync::Arc<TimeoutSink>> = std::sync::OnceLock::new();
+
+/// Install this process's [`TimeoutSink`]. The first caller wins.
+pub fn set_timeout_sink(sink: std::sync::Arc<TimeoutSink>) {
+    let _ = TIMEOUT_SINK.set(sink);
+}
+
 /// Why a local exchange produced no completion. Each caller maps this to its
 /// own error: the worker to a WIT error and an `LlmFailure` label, the
 /// controller's `OllamaClient` to an `anyhow` message.
@@ -91,8 +108,9 @@ impl StallKind {
 pub enum LocalExchangeError {
     /// The request failed on the wire, or the stream ended before `done`.
     Network(String),
-    /// Which deadline fired. It is already in the exchange's WARN line; it
-    /// becomes a metric label in RFC 0014 P4.
+    /// Which deadline fired. Counted through [`TimeoutSink`] and, in the
+    /// worker, stamped on the node failure as a `reason_class` so the retry
+    /// decision can tell the three apart (RFC 0014 P4a).
     Timeout(StallKind),
     RateLimited,
     HttpStatus(u16),
@@ -262,6 +280,11 @@ pub async fn exchange_local_stream(
     let mut wire_bytes: usize = 0;
 
     let stalled = |kind: StallKind, chunks: u64, wire_bytes: usize| {
+        // The ONE place a deadline is counted, so the worker and the
+        // controller count by one rule.
+        if let Some(sink) = TIMEOUT_SINK.get() {
+            sink(kind);
+        }
         tracing::warn!(
             stall = kind.as_str(),
             elapsed_ms = started.elapsed().as_millis() as u64,

@@ -176,6 +176,31 @@ pub const RESPONSE_STREAM: &str = "response-stream";
 /// The request timed out. Paired with `wit_http::Error::Timeout` (not
 /// `networkerror`) but carried through the same channel for uniformity.
 pub const TIMEOUT: &str = "timeout";
+/// RFC 0014 P4a: a LOCAL (Ollama) LLM exchange was cut because nothing
+/// arrived before its FIRST-BYTE deadline — send, model load and prompt
+/// evaluation took too long. Transient: under contention or a cold model load
+/// the next attempt usually finds the model warm.
+pub const INFERENCE_FIRST_BYTE_TIMEOUT: &str = "inference-first-byte-timeout";
+/// RFC 0014 P4a: a local exchange that HAD made progress stopped sending
+/// chunks for longer than its IDLE deadline — a stuck backend. Transient, but
+/// retried at most ONCE (`talos_retry_intelligence::retry_cap_for`): a backend
+/// that sticks twice is not unsticking.
+pub const INFERENCE_IDLE_TIMEOUT: &str = "inference-idle-timeout";
+/// RFC 0014 P4a: a local exchange hit its CEILING — it kept making progress
+/// for the whole backstop. NON-transient: the same request produces the same
+/// long answer.
+pub const INFERENCE_CEILING_TIMEOUT: &str = "inference-ceiling-timeout";
+
+/// The class for a local exchange cut by `kind`.
+pub fn inference_timeout_class(kind: talos_local_inference::stream::StallKind) -> &'static str {
+    use talos_local_inference::stream::StallKind;
+    match kind {
+        StallKind::FirstByte => INFERENCE_FIRST_BYTE_TIMEOUT,
+        StallKind::Idle => INFERENCE_IDLE_TIMEOUT,
+        StallKind::Ceiling => INFERENCE_CEILING_TIMEOUT,
+    }
+}
+
 /// A `fetch-with-bearer` / `fetch-with-header` secret slot could not be
 /// resolved, so the request was never built.
 ///
@@ -397,6 +422,11 @@ pub const WIT_INVALID_URL_HYPHENATED: &str = "invalid-url";
 pub const WIT_CONNECTION_FAILED: &str = "connection-failed";
 /// `wit_http_stream::Error::RateLimited`.
 pub const WIT_RATE_LIMITED: &str = "rate-limited";
+/// `wit_llm::Error::Timeout`, as the guest's failure message carries it: the
+/// variant's `Debug` (`Timeout`) or the `llm-inference` template's prose
+/// ("… timed out: …"). Two spellings, so this pairing is an `|`-separated set
+/// (see [`Reason::explains`]).
+pub const WIT_LLM_TIMEOUT: &str = "timeout|timed out";
 
 /// A latched host-side failure: the [`reason_class`](self) token PLUS the WIT
 /// discriminant it is allowed to explain.
@@ -418,6 +448,14 @@ pub struct Reason {
 }
 
 impl Reason {
+    /// Whether `lowercased_guest_error` carries the discriminant this class
+    /// explains. `wit` may list alternatives separated by `|`.
+    pub fn explains(&self, lowercased_guest_error: &str) -> bool {
+        self.wit
+            .split('|')
+            .any(|w| lowercased_guest_error.contains(w))
+    }
+
     /// A class raised at a site returning `wit_http::Error::Networkerror`.
     pub const fn network(class: &'static str) -> Self {
         Self {
@@ -599,6 +637,9 @@ pub const ALL: &[&str] = &[
     REQUEST_BODY_CAP,
     GRAPHQL_INTROSPECTION,
     SSE_STREAM_CAP,
+    INFERENCE_FIRST_BYTE_TIMEOUT,
+    INFERENCE_IDLE_TIMEOUT,
+    INFERENCE_CEILING_TIMEOUT,
 ];
 
 /// Tokens whose cause is deterministic — a retry re-runs the same policy
@@ -633,6 +674,9 @@ pub const NON_TRANSIENT: &[&str] = &[
     REQUEST_BODY_CAP,
     GRAPHQL_INTROSPECTION,
     SSE_STREAM_CAP,
+    // A local exchange that ran to its ceiling was still making progress: the
+    // same request produces the same long answer.
+    INFERENCE_CEILING_TIMEOUT,
 ];
 
 /// The rendered marker appended to a node-failure message, e.g.
@@ -993,6 +1037,9 @@ mod tests {
                 "request-body-cap",
                 "graphql-introspection",
                 "sse-stream-cap",
+                "inference-first-byte-timeout",
+                "inference-idle-timeout",
+                "inference-ceiling-timeout",
             ]
         );
         assert_eq!(
@@ -1022,6 +1069,7 @@ mod tests {
                 "request-body-cap",
                 "graphql-introspection",
                 "sse-stream-cap",
+                "inference-ceiling-timeout",
             ]
         );
     }
@@ -1164,7 +1212,23 @@ mod tests {
         // ABOVE every prose needle, so no token can drag a message anywhere.
         // The needle stays listed so a FUTURE token minted with `llm` in it —
         // which would have no such arm protecting it — still fails here.
-        const EXEMPT: &[&str] = &[DNS, TLS, TIMEOUT, SECRET_LOOKUP, TIER1_LLM_EGRESS];
+        //
+        // The three `inference-*-timeout` classes (RFC 0014 P4a) are exempt
+        // for the same reason as `timeout`: they ARE timeouts, stamped only on
+        // a message that already says "timed out", so the timeout bucket is
+        // where they belong. The one that must NOT read transient
+        // (`inference-ceiling-timeout`) has its own arm ABOVE the generic
+        // timeout needle in both retry classifiers, and is in NON_TRANSIENT.
+        const EXEMPT: &[&str] = &[
+            DNS,
+            TLS,
+            TIMEOUT,
+            SECRET_LOOKUP,
+            TIER1_LLM_EGRESS,
+            INFERENCE_FIRST_BYTE_TIMEOUT,
+            INFERENCE_IDLE_TIMEOUT,
+            INFERENCE_CEILING_TIMEOUT,
+        ];
         for t in EXEMPT {
             assert!(ALL.contains(t), "exemption names a token not in ALL: {t:?}");
         }

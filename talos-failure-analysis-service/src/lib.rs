@@ -2095,6 +2095,11 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
             ("response-stream", "network_error"),
             // Reuse: the existing playbooks are already right.
             ("timeout", "timeout"),
+            // RFC 0014 P4a: which deadline cut a local LLM call. Still a
+            // timeout to the operator; the retry decision is what differs.
+            ("inference-first-byte-timeout", "timeout"),
+            ("inference-idle-timeout", "timeout"),
+            ("inference-ceiling-timeout", "timeout"),
             ("secret-lookup", "missing_secret"),
             ("no-allowlist", "host_not_allowed"),
             ("allowed-hosts", "host_not_allowed"),
@@ -2153,7 +2158,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
                  to its pre-marker bucket for it"
             );
         }
-        assert_eq!(talos_reason_class::ALL.len(), 31);
+        assert_eq!(talos_reason_class::ALL.len(), 34);
     }
 
     /// A token this build has never heard of — an older controller reading a
