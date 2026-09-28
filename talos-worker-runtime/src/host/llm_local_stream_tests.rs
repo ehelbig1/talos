@@ -8,6 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 use crate::host::llm_providers::{adapter_for, ParsedToolBlock};
+use talos_local_inference::deadlines::{
+    LOCAL_LLM_EXCHANGE_CEILING_SECS, LOCAL_LLM_FIRST_BYTE_TIMEOUT_SECS, LOCAL_LLM_IDLE_TIMEOUT_SECS,
+};
 
 fn line(v: serde_json::Value) -> String {
     format!("{v}\n")

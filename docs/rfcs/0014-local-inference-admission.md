@@ -1,6 +1,6 @@
 # RFC 0014 — Local inference that does not depend on the schedule
 
-**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28; P2c measured and not built 2026-09-28
+**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28; P2c measured and not built 2026-09-28; P3a (the controller gated and on progress deadlines) 2026-09-28
 **Author:** Platform
 **Date:** 2026-09-28
 
@@ -243,17 +243,64 @@ call's model attributed from its workflow node's `MODEL`.
    item below.
 
 **Revisit when** a workflow fans out parallel local LLM calls within one run,
-worker replicas grow past one (the gate is per process; P3), or overlapping
+worker replicas grow past one (the gate is per process; P3b), or overlapping
 mixed-model calls become common. Re-run the same measurement first.
 
-### P3 — fleet-wide admission (proposed)
+### P3a — the controller's own Ollama client (2026-09-28)
+
+**Measured first** (30 days, the host Ollama's request log joined to the
+controller's `llm_usage` rows; `scripts/measurements/rfc0014-controller-ollama-overlap.py`):
+
+- 1 072 controller calls (1 053 matched to a request): p50 2.2 s, p90 6.3 s,
+  p99 25.4 s, max 46.3 s — consolidation, reflection, graph-RAG extraction,
+  evaluation, the teacher audit and `local_llm_complete`.
+- **106 started while another controller call held the backend.** Nothing
+  bounded them: `OllamaClient` had no gate.
+- **108 worker requests arrived while a controller call held the backend**,
+  1 472 s of overlap in total (~14 s each), 3 of them failed; 8 of the 33
+  worker requests cut at exactly 60 s overlapped a controller call.
+- `OllamaClient` was non-streaming under one 60 s client-wide timeout — P1's
+  defect, in the other process. No controller call is RECORDED past 46 s, but a
+  failed call writes no `llm_usage` row, so controller calls cut at 60 s cannot
+  be counted from here.
+
+**Decided.**
+
+1. **One crate for both processes.** The gate, the streamed exchange, its
+   deadlines and the line reader moved from `talos-worker-runtime` into the leaf
+   crate `talos-local-inference`; the worker keeps thin re-exports, so its paths
+   and behaviour are unchanged. The worker's P2a ledger reporting stays in the
+   worker, behind a `QueueWaitObserver` trait the gate is generic over.
+2. **The controller takes the gate.** `OllamaClient::chat` — the one method
+   every `complete*` call goes through — takes its process's gate before its
+   deadlines start, like the worker. Same cap, same env var
+   (`TALOS_LOCAL_LLM_MAX_IN_FLIGHT`), same 120 s wait after which a call proceeds
+   ungated. It never refuses.
+3. **The controller streams, under P1's deadlines.** The request sets
+   `stream: true` and is cut on first byte / idle / ceiling; the chunks are
+   reassembled into the non-streaming body, so the parse is unchanged. A
+   per-request timeout above the ceiling overrides the 60 s client-wide timeout,
+   which would otherwise still cut every streamed answer at 60 s total.
+4. **Error wording is kept**: an HTTP status still reads
+   `Ollama returned HTTP <status>`, which the `think` retry matches on.
+
+**Not done, stated.**
+
+- **The controller and the workers still do not queue against each other.** Each
+  process has its own gate, so the 108 controller-vs-worker overlaps are
+  unchanged by P3a; that is P3b.
+- **`warm_model` is not gated.** It runs once at boot under a task timeout that
+  would then count the queue wait; `pull` / `show` / `list` / `delete` are not
+  inference.
+- **No controller metric.** `talos-llm` has no metrics edge. The gate logs a
+  queued call at INFO and an expired wait at WARN; P3b's broker adds series.
+
+### P3b — fleet-wide admission (proposed)
 
 1. A Redis-backed lease semaphore (TTL-renewed, fenced by a token), keyed per
    backend, taken by every worker replica **and** the controller's `OllamaClient`.
 2. **The broker never refuses**, like the gate: if Redis is unreachable, a caller
    falls back to its per-process gate and logs it.
-3. The controller's `OllamaClient` moves to the same streaming progress deadlines
-   as P1.
 
 ### P4 — classification and visibility (proposed)
 
@@ -284,5 +331,7 @@ mixed-model calls become common. Re-run the same measurement first.
 - **P2a** adds a signed message type on a new subject and no request field, so
   workers and controllers roll in any order: an old controller ignores the
   reports, and a new controller hearing none behaves exactly as before.
-- **P3** adds a Redis dependency on the local-inference path. The fallback keeps
+- **P3a** needs no migration and no wire change; the controller rolls
+  independently. It changes only the controller's own calls.
+- **P3b** adds a Redis dependency on the local-inference path. The fallback keeps
   a Redis outage from becoming an inference outage.

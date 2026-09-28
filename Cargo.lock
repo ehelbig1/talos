@@ -8753,11 +8753,26 @@ dependencies = [
  "serde_json",
  "talos-dlp-provider",
  "talos-http-body",
+ "talos-local-inference",
  "talos-secrets-manager",
  "tokio",
  "tracing",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "talos-local-inference"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "talos-dlp-provider",
+ "talos-http-body",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -9957,6 +9972,7 @@ dependencies = [
  "talos-config",
  "talos-dlp-provider",
  "talos-idempotency",
+ "talos-local-inference",
  "talos-memory",
  "talos-secrets",
  "talos-sigstore-policy",

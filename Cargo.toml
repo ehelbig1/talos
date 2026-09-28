@@ -24,6 +24,7 @@ members = [
     # unit-testable with no bucket, no credentials and no passphrase.
     "talos-offhost-backup",
     "talos-http-body",
+    "talos-local-inference",
     "talos-memory",
     "talos-mcp",
     "talos-auth-types",

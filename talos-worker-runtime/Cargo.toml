@@ -16,6 +16,7 @@ license = "MIT OR Apache-2.0"
 # plus a re-export shim lib.
 
 [dependencies]
+talos-local-inference = { path = "../talos-local-inference" }
 # Core async runtime
 tokio = { version = "1.41", features = ["full"] }
 async-nats = "0.47"

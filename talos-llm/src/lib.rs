@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, warn};
+use tracing::warn;
 use zeroize::Zeroizing;
 
 pub mod anthropic;
@@ -25,6 +25,16 @@ pub mod warmup;
 /// can take 20–40 s while the model loads into VRAM. 60 s gives headroom
 /// without masking an actually-stuck call.
 const OLLAMA_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Per-request backstop on one `/api/chat` exchange (RFC 0014 P3a). The
+/// exchange is bounded by PROGRESS — first byte, then between chunks, under a
+/// ceiling (`talos_local_inference::deadlines`) — and this only has to sit
+/// above that ceiling so the classified deadline always fires first. Without
+/// the per-request override the client-wide [`OLLAMA_HTTP_TIMEOUT`] would
+/// still cut every streamed answer at 60 s total, which is exactly the rule
+/// progress deadlines replace.
+const OLLAMA_CHAT_REQUEST_BACKSTOP: Duration =
+    Duration::from_secs(talos_local_inference::deadlines::LOCAL_LLM_EXCHANGE_CEILING_SECS + 30);
 
 /// Per-request override for `ollama pull` — model downloads are 0.5–8 GB
 /// and can take minutes on a cold registry. 10 minutes is the longest a
@@ -475,6 +485,25 @@ fn build_chat_body(
     body
 }
 
+/// Map a failed local exchange to the controller's error. The HTTP-status
+/// wording is load-bearing (see [`OllamaClient::complete_structured`]); the
+/// provider's own text is never included — the exchange logs it DLP-redacted.
+fn ollama_exchange_error(e: talos_local_inference::stream::LocalExchangeError) -> anyhow::Error {
+    use talos_local_inference::stream::LocalExchangeError as E;
+    match e {
+        E::HttpStatus(status) => anyhow!("Ollama returned HTTP {status}"),
+        E::RateLimited => anyhow!("Ollama returned HTTP 429"),
+        E::Timeout(kind) => anyhow!(
+            "Ollama made no progress within its {} deadline",
+            kind.as_str()
+        ),
+        E::Network(msg) => anyhow!("Ollama request failed: {msg}"),
+        E::ProviderError => anyhow!("Ollama reported an error mid-stream"),
+        E::Oversized => anyhow!("Ollama response exceeded the size cap"),
+        E::Decode(msg) => anyhow!(msg),
+    }
+}
+
 /// Client for local Ollama inference. Data never leaves the network — no DLP
 /// needed. Used for quick, frequent, simple tasks (classification, extraction,
 /// summarization) and for processing sensitive data that must stay on-prem.
@@ -482,6 +511,13 @@ fn build_chat_body(
 pub struct OllamaClient {
     client: Client,
     base_url: String,
+    /// Progress deadlines of one chat exchange. `ProgressDeadlines::LOCAL` in
+    /// production, the same values the worker uses; a field only so the tests
+    /// can drive the exchange at millisecond scale.
+    deadlines: talos_local_inference::stream::ProgressDeadlines,
+    /// Per-request timeout on a chat exchange; see
+    /// [`OLLAMA_CHAT_REQUEST_BACKSTOP`].
+    chat_backstop: Duration,
 }
 
 impl OllamaClient {
@@ -503,7 +539,34 @@ impl OllamaClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("talos-llm: failed to build Ollama HTTP client");
-        Self { client, base_url }
+        Self {
+            client,
+            base_url,
+            deadlines: talos_local_inference::stream::ProgressDeadlines::LOCAL,
+            chat_backstop: OLLAMA_CHAT_REQUEST_BACKSTOP,
+        }
+    }
+
+    /// A client whose client-wide timeout and chat deadlines are given, so a
+    /// test can stand in for the 60 s client timeout at millisecond scale.
+    #[cfg(test)]
+    fn for_tests(
+        base_url: String,
+        client_timeout: Duration,
+        deadlines: talos_local_inference::stream::ProgressDeadlines,
+        chat_backstop: Duration,
+    ) -> Self {
+        let client = Client::builder()
+            .timeout(client_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test Ollama client");
+        Self {
+            client,
+            base_url,
+            deadlines,
+            chat_backstop,
+        }
     }
 
     /// Run a chat completion against a local Ollama model.
@@ -617,26 +680,65 @@ impl OllamaClient {
         }
     }
 
-    /// Shared native `/api/chat` round-trip: POST → status check (body
-    /// logged server-side only, length-capped) → usage record → content
-    /// extraction.
-    async fn chat(&self, model: &str, body: serde_json::Value) -> Result<String> {
-        let resp = self
+    /// Shared native `/api/chat` round-trip.
+    ///
+    /// RFC 0014 P3a, two changes, both what the worker has done since P1/P2:
+    ///
+    /// * **Admission.** The call takes this process's local-inference gate
+    ///   (`talos_local_inference::gate`, cap 1 by default) BEFORE its deadlines
+    ///   start. The controller's callers — consolidation, reflection, graph-RAG
+    ///   extraction, evaluation, the teacher audit, `local_llm_complete` — used
+    ///   to reach the backend with no bound at all; measured over 30 days, 106
+    ///   controller calls overlapped another controller call on a backend that
+    ///   serves one request at a time. They now queue here instead of in
+    ///   Ollama, where the queue time was charged to their 60 s. The gate never
+    ///   refuses: after `LOCAL_LLM_QUEUE_WAIT_SECS` the call proceeds ungated.
+    /// * **Progress deadlines.** The request streams and is cut when it stops
+    ///   making progress (first byte, then between chunks, under a ceiling),
+    ///   not at a 60 s total. The chunks are reassembled into the
+    ///   non-streaming body, so the parse below is unchanged. Any call that
+    ///   finished inside the old 60 s still finishes (the P1 Pareto argument,
+    ///   pinned in `talos_local_inference::deadlines`).
+    ///
+    /// Error strings keep their shape: an HTTP status still reads
+    /// `Ollama returned HTTP <status>`, which `complete_structured` and
+    /// `complete_with_schema` match on for their `think` retry.
+    async fn chat(&self, model: &str, mut body: serde_json::Value) -> Result<String> {
+        use talos_local_inference::{gate, stream};
+
+        // Bound, never `_`: the permit is released on drop, and it must be
+        // held for the whole exchange.
+        let (_slot, waited) = gate::acquire_process_slot::<gate::NoWaitObserver>(None).await;
+        match &_slot {
+            gate::LocalLlmSlot::Ungated(gate::Ungated::WaitExpired) => warn!(
+                model,
+                waited_ms = waited.as_millis() as u64,
+                "controller local LLM call waited out the gate; proceeding ungated"
+            ),
+            _ if !waited.is_zero() => tracing::info!(
+                model,
+                waited_ms = waited.as_millis() as u64,
+                "controller local LLM call queued for the gate"
+            ),
+            _ => {}
+        }
+
+        stream::request_streaming(&mut body);
+        let request = self
             .client
             .post(format!("{}/api/chat", self.base_url))
             .json(&body)
-            .send()
-            .await?;
+            .timeout(self.chat_backstop);
+        let bytes = stream::exchange_local_stream(
+            request,
+            self.deadlines,
+            talos_http_body::DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .await
+        .map_err(ollama_exchange_error)?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = talos_http_body::read_error_text_capped(resp).await;
-            // SECURITY: don't leak full response to caller — log server-side only
-            error!(status = %status, body_len = text.len(), "Ollama API error");
-            return Err(anyhow!("Ollama returned HTTP {}", status));
-        }
-
-        let body: serde_json::Value = talos_http_body::read_json_capped(resp).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow!("Failed to parse Ollama response: {e}"))?;
         usage::record_ollama(model, &body);
         let text = body
             .get("message")
@@ -763,6 +865,10 @@ impl OllamaClient {
         talos_http_body::read_json_capped(resp).await
     }
 }
+
+#[cfg(test)]
+#[path = "ollama_chat_tests.rs"]
+mod ollama_chat_tests;
 
 #[cfg(test)]
 mod chat_body_tests {
