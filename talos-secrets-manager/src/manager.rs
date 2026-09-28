@@ -18,7 +18,7 @@
 // because they pull in axum / oauth respectively; this crate is the
 // transport-free core (envelope encryption, KEK providers, DEK cache).
 
-use crate::dek_wrap::{DekRowIdentity, WrapFormat};
+use crate::dek_wrap::{self, DekRowIdentity, BOUND_WRAP_FORMAT};
 use crate::errors::SecretsError;
 use crate::kek_provider;
 
@@ -1026,7 +1026,7 @@ impl SecretsManager {
         )
         .bind(id)
         .bind(&active_wrap)
-        .bind(WrapFormat::Bound.as_db())
+        .bind(BOUND_WRAP_FORMAT)
         .execute(&mut *tx)
         .await
         .context("Failed to insert new DEK")?;
@@ -1072,9 +1072,9 @@ impl SecretsManager {
 
         let id: Uuid = record.try_get("id")?;
         let encrypted_key: Vec<u8> = record.try_get("encrypted_key")?;
-        let format = WrapFormat::from_db(record.try_get("wrap_format")?)?;
+        dek_wrap::ensure_bound(record.try_get("wrap_format")?)?;
         let dek = self
-            .decrypt_dek(DekRowIdentity::new(id, None), format, &encrypted_key)
+            .decrypt_dek(DekRowIdentity::new(id, None), &encrypted_key)
             .await?;
 
         // 3️⃣ Cache the decrypted DEK (write lock — exclusive access)
@@ -1138,10 +1138,10 @@ impl SecretsManager {
         .ok_or(SecretsError::MissingDek { key_id })?;
         let encrypted_key: Vec<u8> = record.try_get("encrypted_key")?;
         let org_id: Option<Uuid> = record.try_get("org_id")?;
-        let format = WrapFormat::from_db(record.try_get("wrap_format")?)?;
+        dek_wrap::ensure_bound(record.try_get("wrap_format")?)?;
 
         let dek = self
-            .decrypt_dek(DekRowIdentity::new(key_id, org_id), format, &encrypted_key)
+            .decrypt_dek(DekRowIdentity::new(key_id, org_id), &encrypted_key)
             .await?;
 
         // 3️⃣ Cache the decrypted DEK
@@ -1233,13 +1233,9 @@ impl SecretsManager {
         };
         let id: Uuid = record.try_get("id")?;
         let encrypted_key: Vec<u8> = record.try_get("encrypted_key")?;
-        let format = WrapFormat::from_db(record.try_get("wrap_format")?)?;
+        dek_wrap::ensure_bound(record.try_get("wrap_format")?)?;
         let dek = self
-            .decrypt_dek(
-                DekRowIdentity::new(id, Some(org_id)),
-                format,
-                &encrypted_key,
-            )
+            .decrypt_dek(DekRowIdentity::new(id, Some(org_id)), &encrypted_key)
             .await?;
 
         // 3️⃣ Cache it under the org slot.
@@ -1307,7 +1303,7 @@ impl SecretsManager {
         .bind(new_dek_id)
         .bind(&active_wrap)
         .bind(org_id)
-        .bind(WrapFormat::Bound.as_db())
+        .bind(BOUND_WRAP_FORMAT)
         .execute(&mut *tx)
         .await
         .context("Failed to insert new per-org DEK")?;
@@ -1338,13 +1334,13 @@ impl SecretsManager {
     /// future provider migration (e.g. Vault → AWS KMS) reuse the same
     /// dual-wrap pattern without code changes here.
     ///
-    /// The unwrap authenticates the row's identity for a
-    /// [`WrapFormat::Bound`] row (RFC 0013), so a blob copied in from another
-    /// row — another org, or across the global/org boundary — fails here.
+    /// The unwrap authenticates the row's identity (RFC 0013), so a blob
+    /// copied in from another row — another org, or across the global/org
+    /// boundary — fails here. The caller has checked the row is bound
+    /// ([`dek_wrap::ensure_bound`]).
     async fn decrypt_dek(
         &self,
         row: DekRowIdentity,
-        format: WrapFormat,
         encrypted_key: &[u8],
     ) -> Result<DataEncryptionKey> {
         let active = self.current_kek()?;
@@ -1354,7 +1350,7 @@ impl SecretsManager {
             legacy.as_deref(),
             row.key_id,
             encrypted_key,
-            &row.aad_for(format),
+            &row.bound_aad(),
         )
         .await?;
         Ok(DataEncryptionKey {
@@ -4696,7 +4692,7 @@ impl SecretsManager {
         )
         .bind(new_dek_id)
         .bind(&active_wrap)
-        .bind(WrapFormat::Bound.as_db())
+        .bind(BOUND_WRAP_FORMAT)
         .execute(&mut *tx)
         .await
         .context("Failed to insert new DEK")?;
@@ -4816,7 +4812,7 @@ impl SecretsManager {
         .bind(new_dek_id)
         .bind(&active_wrap)
         .bind(org_id)
-        .bind(WrapFormat::Bound.as_db())
+        .bind(BOUND_WRAP_FORMAT)
         .execute(&mut *tx)
         .await
         .context("Failed to insert new per-org DEK")?;
@@ -5258,12 +5254,6 @@ impl SecretsManager {
             SELECT 'user_audit_settings.auth_headers', false, COUNT(*)
               FROM user_audit_settings
              WHERE auth_headers_encrypted IS NOT NULL AND auth_headers_format <> 4
-            UNION ALL
-            -- RFC 0013: DEK wraps not yet bound to their row
-            -- (`rebindDekWraps` is the sweep).
-            SELECT 'encryption_keys.wrap', true, COUNT(*)
-              FROM encryption_keys
-             WHERE wrap_format = 1
             "#,
         )
         .fetch_all(&self.db_pool)
@@ -5342,11 +5332,11 @@ impl SecretsManager {
         let rotation_result: Result<u64> = self
             .with_exclusive_rotation_lock("rotate_master_key", async {
                 tracing::info!(auditor = ?auditor, "Starting master key rewrap");
-                // Every row that does not open, bound, under the new key is
-                // rewrapped onto it — so a rotation also binds unbound rows
-                // (RFC 0013). Audited once, below, as MASTER_KEY_ROTATED.
+                // Every row that does not open under the new key is rewrapped
+                // onto it, bound to its row (RFC 0013). Audited once, below, as
+                // MASTER_KEY_ROTATED.
                 let rewrapped = self
-                    .rewrap_deks_bound(active.as_ref(), Some(legacy.as_ref()), false, None)
+                    .rewrap_deks_under_active(active.as_ref(), legacy.as_ref())
                     .await?;
 
                 // Every row now opens under the active key; keeping the previous
@@ -5407,71 +5397,21 @@ impl SecretsManager {
         rotation_result
     }
 
-    /// Bind every unbound DEK wrap to its own `encryption_keys` row (RFC 0013,
-    /// phase 2): each `wrap_format = 1` row is unwrapped with the empty AAD and
-    /// rewrapped under the ACTIVE KEK bound to `(id, org_id)`. The DEK bytes do
-    /// not change, so no data row is re-encrypted and every DEK cache stays
-    /// valid. Returns the number of rows rebound by THIS call.
-    ///
-    /// Idempotent and resumable: a row is selected only while it is unbound,
-    /// and each batch commits on its own, so an interrupted run leaves every
-    /// row readable (bound rows under their AAD, the rest unbound) and a retry
-    /// continues. Every rebound row writes a `DEK_WRAP_REBOUND`
-    /// `secret_audit_log` row naming its org, in the SAME transaction as its
-    /// rewrap: a rebind that cannot be recorded does not happen.
-    ///
-    /// Holds the exclusive master-key rotation lock for the whole walk, so no
-    /// DEK is created, rotated or rewrapped concurrently. Every controller must
-    /// run a release that reads `wrap_format` before this is called: an older
-    /// build unwraps a bound row with no AAD, and fails.
-    pub async fn rebind_dek_wraps(&self, auditor: Option<Uuid>) -> Result<u64> {
-        let active = self.current_kek()?;
-        let legacy = self.current_legacy_kek();
-        let rebound = self
-            .with_exclusive_rotation_lock(
-                "rebind_dek_wraps",
-                self.rewrap_deks_bound(
-                    active.as_ref(),
-                    legacy.as_deref(),
-                    true,
-                    Some(("DEK_WRAP_REBOUND", auditor)),
-                ),
-            )
-            .await?;
-        tracing::info!(rebound, auditor = ?auditor, "DEK wraps bound to their rows");
-        Ok(rebound)
-    }
-
-    /// Rows in `encryption_keys` still wrapped UNBOUND (`wrap_format = 1`):
-    /// the remaining work for [`Self::rebind_dek_wraps`].
-    pub async fn count_unbound_dek_wraps(&self) -> Result<i64> {
-        sqlx::query_scalar("SELECT COUNT(*) FROM encryption_keys WHERE wrap_format = 1")
-            .fetch_one(&self.db_pool)
-            .await
-            .context("Failed to count unbound DEK wraps")
-    }
-
-    /// Rewrap, in batches, every `encryption_keys` row that does not already
-    /// open under `active` BOUND to its own row. `unbound_only` restricts the
-    /// walk to `wrap_format = 1` rows. With `per_row_audit` set, each rewrapped
-    /// row writes a `secret_audit_log` row (the action, the actor, the DEK's
-    /// org) inside the transaction that stores it.
+    /// Rewrap, in batches, every `encryption_keys` row that does not open
+    /// under `active` onto it, bound to its own row (RFC 0013). A row that does
+    /// not open under `active` must open under `previous`, or the walk fails.
     ///
     /// The caller holds the exclusive rotation lock
     /// ([`Self::with_exclusive_rotation_lock`]); every DEK writer takes it
     /// shared, so the snapshot below cannot grow while it is walked.
-    async fn rewrap_deks_bound(
+    async fn rewrap_deks_under_active(
         &self,
         active: &dyn kek_provider::KekProvider,
-        previous: Option<&dyn kek_provider::KekProvider>,
-        unbound_only: bool,
-        per_row_audit: Option<(&'static str, Option<Uuid>)>,
+        previous: &dyn kek_provider::KekProvider,
     ) -> Result<u64> {
         let ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM encryption_keys WHERE (NOT $1 OR wrap_format = 1) \
-             ORDER BY created_at ASC, id ASC",
+            "SELECT id FROM encryption_keys ORDER BY created_at ASC, id ASC",
         )
-        .bind(unbound_only)
         .fetch_all(&self.db_pool)
         .await
         .context("Failed to fetch encryption key IDs")?;
@@ -5493,40 +5433,23 @@ impl SecretsManager {
                 .fetch_one(&mut *tx)
                 .await
                 .with_context(|| format!("Failed to fetch DEK {dek_id} for rewrap"))?;
+                dek_wrap::ensure_bound(row.try_get("wrap_format")?)?;
                 let encrypted_key: Vec<u8> = row.try_get("encrypted_key")?;
                 let org_id: Option<Uuid> = row.try_get("org_id")?;
-                let format = WrapFormat::from_db(row.try_get("wrap_format")?)?;
                 let identity = DekRowIdentity::new(dek_id, org_id);
                 let Some(new_stored) =
-                    rewrap_bound_under_active(active, previous, identity, format, &encrypted_key)
+                    rewrap_bound_under_active(active, previous, identity, &encrypted_key)
                         .await
                         .with_context(|| format!("Failed to rewrap DEK {dek_id}"))?
                 else {
                     continue;
                 };
-                sqlx::query(
-                    "UPDATE encryption_keys SET encrypted_key = $1, wrap_format = $2 WHERE id = $3",
-                )
-                .bind(&new_stored)
-                .bind(WrapFormat::Bound.as_db())
-                .bind(dek_id)
-                .execute(&mut *tx)
-                .await
-                .with_context(|| format!("Failed to store rewrapped DEK {dek_id}"))?;
-                if let Some((action, actor)) = per_row_audit {
-                    let actor_type = if actor.is_some() { "user" } else { "system" };
-                    sqlx::query(
-                        "INSERT INTO secret_audit_log (action, actor_type, actor_id, success, org_id) \
-                         VALUES ($1, $2, $3, true, $4)",
-                    )
-                    .bind(action)
-                    .bind(actor_type)
-                    .bind(actor)
-                    .bind(org_id)
+                sqlx::query("UPDATE encryption_keys SET encrypted_key = $1 WHERE id = $2")
+                    .bind(&new_stored)
+                    .bind(dek_id)
                     .execute(&mut *tx)
                     .await
-                    .with_context(|| format!("Failed to audit rewrap of DEK {dek_id}"))?;
-                }
+                    .with_context(|| format!("Failed to store rewrapped DEK {dek_id}"))?;
                 rewrapped += 1;
             }
             tx.commit()
@@ -5963,37 +5886,31 @@ impl MasterKeyRotationPosture {
     }
 }
 
-/// Rewrap one stored DEK so it opens under `active` BOUND to its own row
-/// (RFC 0013). `Ok(None)` when it already does, so a resumed rotation or rebind
-/// skips it. Otherwise it is opened with the AAD its `format` was written with,
-/// under `active` or else `previous`, and rewrapped with the row's bound AAD.
-/// Fails closed when neither key opens it.
+/// Rewrap one stored DEK onto `active`, bound to its own row (RFC 0013).
+/// `Ok(None)` when it already opens under `active`, so a resumed rotation skips
+/// it; otherwise it must open under `previous`. Fails closed when neither key
+/// opens it.
 pub(crate) async fn rewrap_bound_under_active(
     active: &dyn kek_provider::KekProvider,
-    previous: Option<&dyn kek_provider::KekProvider>,
+    previous: &dyn kek_provider::KekProvider,
     row: DekRowIdentity,
-    format: WrapFormat,
     encrypted_key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    let stored_aad = row.aad_for(format);
-    let plaintext = match active.unwrap_dek(encrypted_key, &stored_aad).await {
-        Ok(_) if format == WrapFormat::Bound => return Ok(None),
-        Ok(plaintext) => plaintext,
-        Err(active_err) => match previous {
-            Some(previous) => previous
-                .unwrap_dek(encrypted_key, &stored_aad)
-                .await
-                .context("DEK opens under neither the active nor the previous master key")?,
-            None => return Err(active_err.context("DEK does not open under the active master key")),
-        },
-    };
+    let aad = row.bound_aad();
+    if active.unwrap_dek(encrypted_key, &aad).await.is_ok() {
+        return Ok(None);
+    }
+    let plaintext = previous
+        .unwrap_dek(encrypted_key, &aad)
+        .await
+        .context("DEK opens under neither the active nor the previous master key")?;
     let dek: Zeroizing<[u8; 32]> = Zeroizing::new(
         plaintext
             .as_slice()
             .try_into()
             .map_err(|_| anyhow!("unwrapped DEK has length {}, expected 32", plaintext.len()))?,
     );
-    Ok(Some(active.wrap_dek(&dek, &row.bound_aad()).await?))
+    Ok(Some(active.wrap_dek(&dek, &aad).await?))
 }
 
 #[cfg(test)]
@@ -6157,28 +6074,27 @@ mod master_key_rotation_gate_tests {
         );
     }
 
-    /// A stored `encryption_keys` row, as the rewrap sees it.
+    /// A stored `encryption_keys` row, as the rewrap sees it (always bound
+    /// since RFC 0013 phase 3).
     struct Row {
         identity: DekRowIdentity,
-        format: WrapFormat,
         blob: Vec<u8>,
     }
 
     /// C1: a rewrap interrupted mid-loop leaves every DEK readable through
-    /// the runtime unwrap rule (each row with the AAD its format names), and a
-    /// retry resumes and finishes with every row BOUND under the new key.
+    /// the runtime unwrap rule, and a retry resumes and finishes with every row
+    /// under the new key, still bound to its row.
     #[tokio::test]
     async fn interrupted_rewrap_stays_readable_and_a_retry_completes() {
         let old = env(1);
         let deks: Vec<[u8; 32]> = (0..5u8).map(|i| [i + 10; 32]).collect();
         let mut rows = Vec::new();
         for (i, d) in deks.iter().enumerate() {
-            // Pre-RFC rows: unbound under the old key; one of them an org DEK.
-            let org = (i == 2).then(Uuid::new_v4);
+            // One of the rows is an org DEK.
+            let identity = DekRowIdentity::new(Uuid::new_v4(), (i == 2).then(Uuid::new_v4));
             rows.push(Row {
-                identity: DekRowIdentity::new(Uuid::new_v4(), org),
-                format: WrapFormat::Unbound,
-                blob: old.wrap_dek(d, &[]).await.unwrap(),
+                identity,
+                blob: old.wrap_dek(d, &identity.bound_aad()).await.unwrap(),
             });
         }
         async fn readable(
@@ -6188,11 +6104,15 @@ mod master_key_rotation_gate_tests {
             legacy: Option<&dyn KekProvider>,
         ) {
             for (row, dek) in rows.iter().zip(deks.iter()) {
-                let aad = row.identity.aad_for(row.format);
-                let got =
-                    unwrap_dek_with_fallback(active, legacy, row.identity.key_id, &row.blob, &aad)
-                        .await
-                        .unwrap();
+                let got = unwrap_dek_with_fallback(
+                    active,
+                    legacy,
+                    row.identity.key_id,
+                    &row.blob,
+                    &row.identity.bound_aad(),
+                )
+                .await
+                .unwrap();
                 assert_eq!(got.as_slice(), dek);
             }
         }
@@ -6204,13 +6124,8 @@ mod master_key_rotation_gate_tests {
         };
         let mut failed = false;
         for row in rows.iter_mut() {
-            match rewrap_bound_under_active(&flaky, Some(&old), row.identity, row.format, &row.blob)
-                .await
-            {
-                Ok(Some(new)) => {
-                    row.blob = new;
-                    row.format = WrapFormat::Bound;
-                }
+            match rewrap_bound_under_active(&flaky, &old, row.identity, &row.blob).await {
+                Ok(Some(new)) => row.blob = new,
                 Ok(None) => {}
                 Err(_) => {
                     failed = true;
@@ -6229,13 +6144,11 @@ mod master_key_rotation_gate_tests {
         );
         let mut rewrapped = 0;
         for row in rows.iter_mut() {
-            if let Some(n) =
-                rewrap_bound_under_active(&new, Some(&old), row.identity, row.format, &row.blob)
-                    .await
-                    .unwrap()
+            if let Some(n) = rewrap_bound_under_active(&new, &old, row.identity, &row.blob)
+                .await
+                .unwrap()
             {
                 row.blob = n;
-                row.format = WrapFormat::Bound;
                 rewrapped += 1;
             }
         }
@@ -6243,64 +6156,40 @@ mod master_key_rotation_gate_tests {
             rewrapped, 3,
             "the two rows done before the failure are skipped"
         );
-        // Done: every row is bound and opens with the new key alone.
-        assert!(rows.iter().all(|r| r.format == WrapFormat::Bound));
+        // Done: every row opens with the new key alone, bound to its row.
         readable(&rows, &deks, &new, None).await;
     }
 
     #[tokio::test]
     async fn rewrap_fails_closed_when_neither_key_opens_the_row() {
         let row = DekRowIdentity::new(Uuid::new_v4(), None);
-        let stranger = env(9).wrap_dek(&[1u8; 32], &[]).await.unwrap();
-        assert!(rewrap_bound_under_active(
-            &env(2),
-            Some(&env(1)),
-            row,
-            WrapFormat::Unbound,
-            &stranger
-        )
-        .await
-        .is_err());
-        // Without a previous key, a row the active key cannot open fails too.
-        assert!(
-            rewrap_bound_under_active(&env(2), None, row, WrapFormat::Unbound, &stranger)
-                .await
-                .is_err()
-        );
+        let stranger = env(9).wrap_dek(&[1u8; 32], &row.bound_aad()).await.unwrap();
+        assert!(rewrap_bound_under_active(&env(2), &env(1), row, &stranger)
+            .await
+            .is_err());
     }
 
-    /// The rebind (phase 2): an unbound row that already opens under the
-    /// active key is REWRAPPED bound to its row; a bound row is skipped.
+    /// A rotation never widens a row's binding: the rewrapped blob opens only
+    /// under the SAME row's AAD — not under another row's, and not unbound.
     #[tokio::test]
-    async fn an_unbound_row_is_bound_and_a_bound_row_is_skipped() {
-        let kek = env(5);
-        let dek = [8u8; 32];
+    async fn a_rotated_wrap_stays_bound_to_its_row() {
+        let (old, new) = (env(3), env(4));
         let row = DekRowIdentity::new(Uuid::new_v4(), Some(Uuid::new_v4()));
-        let unbound = kek.wrap_dek(&dek, &[]).await.unwrap();
-
-        let bound = rewrap_bound_under_active(&kek, None, row, WrapFormat::Unbound, &unbound)
+        let blob = old.wrap_dek(&[8u8; 32], &row.bound_aad()).await.unwrap();
+        let rotated = rewrap_bound_under_active(&new, &old, row, &blob)
             .await
             .unwrap()
-            .expect("an unbound row is rebound even under the same key");
+            .expect("a row under the old key is rewrapped");
         assert_eq!(
-            kek.unwrap_dek(&bound, &row.bound_aad())
+            new.unwrap_dek(&rotated, &row.bound_aad())
                 .await
                 .unwrap()
                 .as_slice(),
-            &dek
+            &[8u8; 32]
         );
-        assert!(
-            kek.unwrap_dek(&bound, &[]).await.is_err(),
-            "no longer unbound"
-        );
-
-        assert!(
-            rewrap_bound_under_active(&kek, None, row, WrapFormat::Bound, &bound)
-                .await
-                .unwrap()
-                .is_none(),
-            "a bound row that opens is left alone"
-        );
+        let other = DekRowIdentity::new(Uuid::new_v4(), row.org_id);
+        assert!(new.unwrap_dek(&rotated, &other.bound_aad()).await.is_err());
+        assert!(new.unwrap_dek(&rotated, &[]).await.is_err());
     }
 
     /// The attack RFC 0013 closes: a wrapped DEK copied into ANOTHER row does
@@ -7991,7 +7880,6 @@ mod kek_failure_label_tests {
         assert!(
             sm.decrypt_dek(
                 crate::dek_wrap::DekRowIdentity::new(Uuid::new_v4(), None),
-                crate::dek_wrap::WrapFormat::Unbound,
                 b"not a valid wrapped DEK"
             )
             .await

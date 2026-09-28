@@ -168,18 +168,6 @@ pub struct DekRotationResult {
     pub message: String,
 }
 
-/// Result of `rebindDekWraps` (RFC 0013): DEK wraps bound to their rows.
-#[derive(SimpleObject, Clone)]
-pub struct DekRebindResult {
-    /// Number of `encryption_keys` rows this call rewrapped bound to their row.
-    pub rebound_count: u64,
-    /// Rows still unbound after this call, read back from the database. 0 means
-    /// every DEK wrap is bound; phase 3 can then refuse the unbound format.
-    pub remaining_unbound: i64,
-    /// Human-readable status message.
-    pub message: String,
-}
-
 /// Result of a re-encryption operation.
 #[derive(SimpleObject, Clone)]
 pub struct ReEncryptionResult {

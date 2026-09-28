@@ -14,35 +14,21 @@ use uuid::Uuid;
 /// encoding cannot collide with this one.
 pub const DEK_WRAP_AAD_TAG: &[u8] = b"talos-dek-wrap/v2";
 
-/// How a stored `encryption_keys.encrypted_key` was wrapped
-/// (`encryption_keys.wrap_format`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WrapFormat {
-    /// `1`: no associated data — every row written before RFC 0013.
-    Unbound,
-    /// `2`: bound to the row's `(id, org_id)` via [`DekRowIdentity::bound_aad`].
-    Bound,
-}
+/// `encryption_keys.wrap_format` of a bound wrap — the only format a row may
+/// have since RFC 0013 phase 3 (`CHECK (wrap_format = 2)`).
+pub const BOUND_WRAP_FORMAT: i16 = 2;
 
-impl WrapFormat {
-    /// Parse the stored column. An unknown value is an error, never a guess:
-    /// reading it as either format would be choosing an AAD for a row nobody
-    /// knows how to read.
-    pub fn from_db(value: i16) -> Result<Self> {
-        match value {
-            1 => Ok(Self::Unbound),
-            2 => Ok(Self::Bound),
-            other => Err(anyhow!("unknown encryption_keys.wrap_format {other}")),
-        }
-    }
-
-    /// The stored column value.
-    #[must_use]
-    pub const fn as_db(self) -> i16 {
-        match self {
-            Self::Unbound => 1,
-            Self::Bound => 2,
-        }
+/// Refuse a row whose wrap is not bound to it. The schema's CHECK already
+/// forbids one; this is the reader's own guard, so a dropped constraint cannot
+/// quietly bring back an unbound read — the swap RFC 0013 exists to stop.
+pub fn ensure_bound(wrap_format: i16) -> Result<()> {
+    if wrap_format == BOUND_WRAP_FORMAT {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "encryption_keys.wrap_format {wrap_format} refused: only DEK wraps bound to their \
+             row ({BOUND_WRAP_FORMAT}) are read since RFC 0013 phase 3"
+        ))
     }
 }
 
@@ -79,16 +65,6 @@ impl DekRowIdentity {
         }
         aad
     }
-
-    /// The AAD a row stored in `format` was wrapped with: empty for
-    /// [`WrapFormat::Unbound`] (byte-identical to the pre-RFC wrap).
-    #[must_use]
-    pub fn aad_for(&self, format: WrapFormat) -> Vec<u8> {
-        match format {
-            WrapFormat::Unbound => Vec::new(),
-            WrapFormat::Bound => self.bound_aad(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -123,18 +99,10 @@ mod tests {
     }
 
     #[test]
-    fn unbound_rows_read_with_an_empty_aad() {
-        let id = DekRowIdentity::new(A, Some(B));
-        assert!(id.aad_for(WrapFormat::Unbound).is_empty());
-        assert_eq!(id.aad_for(WrapFormat::Bound), id.bound_aad());
-    }
-
-    #[test]
-    fn the_column_round_trips_and_refuses_unknown_values() {
-        for f in [WrapFormat::Unbound, WrapFormat::Bound] {
-            assert_eq!(WrapFormat::from_db(f.as_db()).unwrap(), f);
+    fn only_a_bound_wrap_is_accepted() {
+        assert!(ensure_bound(BOUND_WRAP_FORMAT).is_ok());
+        for refused in [0, 1, 3] {
+            assert!(ensure_bound(refused).is_err(), "format {refused}");
         }
-        assert!(WrapFormat::from_db(0).is_err());
-        assert!(WrapFormat::from_db(3).is_err());
     }
 }

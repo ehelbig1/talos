@@ -1,6 +1,6 @@
 # RFC 0013 — Bind each wrapped DEK to its own row
 
-**Status:** In progress — P1 + P2 implemented (2026-09-27); P3 waits for the rebind to run
+**Status:** Shipped — P1 + P2 2026-09-27 (#967); rebind run on the reference fleet 2026-09-28 (2 of 2 rows); P3 2026-09-28
 **Author:** Platform
 **Date:** 2026-09-26
 

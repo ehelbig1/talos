@@ -2260,9 +2260,9 @@ re-encrypt sweep to skip `format = 4` (don't downgrade org rows).
 **Every DEK wrap is bound to its `encryption_keys` row (RFC 0013).** A new
 writer of `encryption_keys` wraps with `DekRowIdentity::new(id, org_id).bound_aad()`
 (`talos_secrets_manager::dek_wrap`), generates the `id` BEFORE wrapping, and
-stamps `wrap_format = 2`; a reader passes `aad_for(WrapFormat::from_db(..))`.
-`KekProvider::{wrap_dek, unwrap_dek}` take the AAD as a required argument — an
-empty one is the legacy unbound format, never a default.
+stamps `BOUND_WRAP_FORMAT` (2, the only value `CHECK` allows); a reader calls
+`dek_wrap::ensure_bound(wrap_format)` and unwraps with the row's `bound_aad()`.
+`KekProvider::{wrap_dek, unwrap_dek}` take the AAD as a required argument.
 
 **Migrating EXISTING rows to per-org** (the cutover only converts NEW writes):
 per-table sweeps `SecretsManager::re_encrypt_*_to_org` /

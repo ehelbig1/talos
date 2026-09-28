@@ -1502,13 +1502,12 @@ mod second_factor_tests {
                 .map_or(src.len(), |e| i + 1 + e);
             &src[i..end]
         };
-        const PRIVILEGED: [&str; 16] = [
+        const PRIVILEGED: [&str; 15] = [
             "create_api_key",
             "rotate_api_key",
             "register_mcp_agent",
             "rotate_dek",
             "rotate_org_dek",
-            "rebind_dek_wraps",
             "rotate_master_key",
             "rotate_encryption_key",
             "re_encrypt_secrets",
