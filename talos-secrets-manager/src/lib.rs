@@ -21,6 +21,7 @@
 //! re-exported by `controller::secrets::vault_resolver` for convenience.
 
 pub mod aad;
+pub mod dek_wrap;
 pub mod errors;
 pub mod integration_state_crypto;
 pub mod kek_provider;

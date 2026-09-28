@@ -1212,3 +1212,178 @@ async fn webhook_try_create_under_cap_writes_v4_under_owner_personal_org_dek() {
         .unwrap();
     assert_eq!(pt.as_str(), "whsec_super_secret");
 }
+
+// ── RFC 0013: each wrapped DEK is bound to its own `encryption_keys` row ────
+
+const DEK_TEST_MASTER_KEY: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+async fn dek_row(pool: &sqlx::Pool<sqlx::Postgres>, id: Uuid) -> (Vec<u8>, i16, String) {
+    sqlx::query_as(
+        "SELECT encrypted_key, wrap_format, xmin::text FROM encryption_keys WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A manager with empty DEK caches, so the next read goes to the row.
+fn fresh_manager(pool: &sqlx::Pool<sqlx::Postgres>) -> SecretsManager {
+    SecretsManager::new(pool.clone()).unwrap()
+}
+
+#[tokio::test]
+async fn a_new_org_dek_is_written_bound_to_its_row() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = fresh_manager(&pool);
+    manager.initialize().await.unwrap();
+    let org = create_test_org(&pool).await;
+
+    let dek = manager.get_or_create_dek_for_org(org).await.unwrap();
+    let (blob, format, _) = dek_row(&pool, dek.id).await;
+    assert_eq!(format, 2, "a new DEK is stamped bound");
+
+    // It opens under its own row's AAD and under no other.
+    use talos_secrets_manager::dek_wrap::DekRowIdentity;
+    use talos_secrets_manager::kek_provider::{EnvKekProvider, KekProvider};
+    let kek = EnvKekProvider::from_hex(DEK_TEST_MASTER_KEY).unwrap();
+    let own = DekRowIdentity::new(dek.id, Some(org)).bound_aad();
+    assert_eq!(
+        kek.unwrap_dek(&blob, &own).await.unwrap().as_slice(),
+        dek.key.as_slice()
+    );
+    assert!(kek.unwrap_dek(&blob, &[]).await.is_err(), "not unbound");
+
+    let rotated = manager
+        .rotate_dek_for_org(org, Some(SYSTEM_USER_ID))
+        .await
+        .unwrap()
+        .expect("the org exists");
+    assert_eq!(
+        dek_row(&pool, rotated).await.1,
+        2,
+        "a rotated DEK is bound too"
+    );
+}
+
+/// The attack RFC 0013 closes, end to end: org A's wrapped DEK copied into
+/// org B's active row. Unbound, B's reads would silently use A's key; bound,
+/// the unwrap fails.
+#[tokio::test]
+async fn an_org_dek_copied_into_another_orgs_row_does_not_open() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = fresh_manager(&pool);
+    manager.initialize().await.unwrap();
+    let org_a = create_test_org(&pool).await;
+    let org_b = create_test_org(&pool).await;
+    let dek_a = manager.get_or_create_dek_for_org(org_a).await.unwrap();
+    let dek_b = manager.get_or_create_dek_for_org(org_b).await.unwrap();
+
+    let (blob_a, _, _) = dek_row(&pool, dek_a.id).await;
+    sqlx::query("UPDATE encryption_keys SET encrypted_key = $1 WHERE id = $2")
+        .bind(&blob_a)
+        .bind(dek_b.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        fresh_manager(&pool)
+            .get_active_dek_for_org(org_b)
+            .await
+            .is_err(),
+        "org B's row must not open with org A's wrapped DEK"
+    );
+    // Control: org A's own row still opens.
+    let again = fresh_manager(&pool)
+        .get_active_dek_for_org(org_a)
+        .await
+        .unwrap()
+        .expect("org A's DEK");
+    assert_eq!(again.key.as_slice(), dek_a.key.as_slice());
+}
+
+/// Phase 2: a pre-RFC (unbound) row still reads, `rebind_dek_wraps` binds it
+/// under the same DEK bytes (so data survives), records one audit row naming
+/// the org in the same transaction, and a second run rewrites nothing.
+#[tokio::test]
+async fn rebind_binds_a_legacy_row_keeps_its_data_and_is_idempotent() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = fresh_manager(&pool);
+    manager.initialize().await.unwrap();
+    let org = create_test_org(&pool).await;
+    let dek = manager.get_or_create_dek_for_org(org).await.unwrap();
+    let ctx = Uuid::new_v4();
+    let (kid, ct, ver) = manager
+        .encrypt_value_aad_v4_org("survives-the-rebind", org, ctx.as_bytes())
+        .await
+        .unwrap();
+
+    // Make the row what every pre-RFC row is: the same DEK, wrapped unbound.
+    use talos_secrets_manager::kek_provider::{EnvKekProvider, KekProvider};
+    let kek = EnvKekProvider::from_hex(DEK_TEST_MASTER_KEY).unwrap();
+    let dek_bytes: [u8; 32] = dek.key.as_slice().try_into().unwrap();
+    let legacy = kek.wrap_dek(&dek_bytes, &[]).await.unwrap();
+    sqlx::query("UPDATE encryption_keys SET encrypted_key = $1, wrap_format = 1 WHERE id = $2")
+        .bind(&legacy)
+        .bind(dek.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Legacy rows keep reading, and the status counts it.
+    let legacy_read = fresh_manager(&pool);
+    assert_eq!(
+        legacy_read
+            .decrypt_versioned(kid, &ct, ctx.as_bytes(), ver)
+            .await
+            .unwrap()
+            .as_str(),
+        "survives-the-rebind"
+    );
+    assert!(
+        pending_for(
+            &legacy_read.dek_migration_status().await.unwrap(),
+            "encryption_keys.wrap"
+        ) >= 1
+    );
+
+    let rebound = manager
+        .rebind_dek_wraps(Some(SYSTEM_USER_ID))
+        .await
+        .unwrap();
+    // Global across a database this binary shares, so row-scoped from here.
+    assert!(rebound >= 1);
+    let (_, format, xmin) = dek_row(&pool, dek.id).await;
+    assert_eq!(format, 2, "the legacy row is bound");
+    assert_eq!(
+        fresh_manager(&pool)
+            .decrypt_versioned(kid, &ct, ctx.as_bytes(), ver)
+            .await
+            .unwrap()
+            .as_str(),
+        "survives-the-rebind",
+        "the DEK bytes are unchanged, so existing ciphertext still decrypts"
+    );
+    let audit: Vec<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT actor_id, org_id FROM secret_audit_log \
+         WHERE action = 'DEK_WRAP_REBOUND' AND org_id = $1",
+    )
+    .bind(org)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audit, vec![(Some(SYSTEM_USER_ID), Some(org))]);
+
+    // Idempotent: the bound row is not rewritten by a second run.
+    manager
+        .rebind_dek_wraps(Some(SYSTEM_USER_ID))
+        .await
+        .unwrap();
+    assert_eq!(dek_row(&pool, dek.id).await.2, xmin, "no new row version");
+    assert_eq!(manager.count_unbound_dek_wraps().await.unwrap(), 0);
+}

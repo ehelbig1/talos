@@ -660,12 +660,23 @@ controller replicas, and the next restart, holding only the old key:
    `TALOS_MASTER_KEY_PREVIOUS=<old>`, then roll the fleet. Each replica wraps
    new DEKs under the new key and unwraps new-then-previous.
 2. Call the `rotateMasterKey(newMasterKey: <new>)` mutation (platform admin +
-   second factor). It rewraps every DEK the new key cannot open and skips the
-   rest; it refuses unless step 1 is in place. If it fails partway, every DEK
+   second factor). It rewraps every DEK the new key cannot open, or that is not
+   yet bound to its row (RFC 0013), and skips the rest; it refuses unless step 1
+   is in place. If it fails partway, every DEK
    is still readable — re-run it; rows already rewrapped are skipped.
 3. Remove `TALOS_MASTER_KEY_PREVIOUS` and roll again.
 
 Vault transit keys rotate in Vault (`vault write -f transit/keys/<name>/rotate`).
+
+**Binding DEK wraps to their rows (RFC 0013).** Every DEK wrap written by this
+release authenticates its `encryption_keys` row `(id, org_id)` as associated
+data, so a wrap copied into another row fails to unwrap. Rows written before it
+are `wrap_format = 1` (unbound) and still read. Once EVERY controller runs this
+release, call `rebindDekWraps` (platform admin + second factor) to bind them. It
+is idempotent and resumable, never changes the DEK bytes (no data is
+re-encrypted), and writes one `DEK_WRAP_REBOUND` row to `secret_audit_log` per
+DEK. `dekMigrationStatus` reports what remains as `encryption_keys.wrap`. A later
+release refuses unbound rows outright.
 
 ### 2. Never Log Secrets
 

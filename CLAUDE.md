@@ -2257,6 +2257,13 @@ table's `*_format` CHECK to include 4. If a table has its OWN decrypt dispatch
 re-encrypt sweep to skip `format = 4` (don't downgrade org rows).
 **A row sealed across more than one write** (a `module_executions` row seals input at start and output at completion under one shared key id and format) must seal every later slot under the key and format the row ALREADY names — `SecretsManager::encrypt_value_aad_under_row_key`, via `encrypt_output_for_row` — never a freshly resolved one (package CJ).
 
+**Every DEK wrap is bound to its `encryption_keys` row (RFC 0013).** A new
+writer of `encryption_keys` wraps with `DekRowIdentity::new(id, org_id).bound_aad()`
+(`talos_secrets_manager::dek_wrap`), generates the `id` BEFORE wrapping, and
+stamps `wrap_format = 2`; a reader passes `aad_for(WrapFormat::from_db(..))`.
+`KekProvider::{wrap_dek, unwrap_dek}` take the AAD as a required argument — an
+empty one is the legacy unbound format, never a default.
+
 **Migrating EXISTING rows to per-org** (the cutover only converts NEW writes):
 per-table sweeps `SecretsManager::re_encrypt_*_to_org` /
 `ModuleExecutionService::re_encrypt_module_payloads_to_org` /

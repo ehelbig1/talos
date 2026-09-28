@@ -37,7 +37,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
@@ -49,17 +49,26 @@ use zeroize::Zeroizing;
 /// `TALOS_MASTER_KEY`), `VaultTransitProvider` (Phase 2), `AwsKmsProvider`
 /// (deferred), `GcpKmsProvider` (deferred).
 pub trait KekProvider: Send + Sync + 'static {
-    /// Wrap a 32-byte DEK. Returns provider-defined opaque bytes.
+    /// Wrap a 32-byte DEK, authenticating `aad` with it. Returns
+    /// provider-defined opaque bytes.
+    ///
+    /// `aad` is REQUIRED, not optional: an `encryption_keys` row passes
+    /// [`crate::dek_wrap::DekRowIdentity::bound_aad`] so the blob only opens
+    /// under that row's identity (RFC 0013). An empty `aad` is the pre-RFC
+    /// unbound wrap, byte-identical to what every provider produced before.
     fn wrap_dek(
         &self,
         dek: &[u8; 32],
+        aad: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>>;
 
-    /// Unwrap previously-wrapped bytes back to a 32-byte DEK.
+    /// Unwrap previously-wrapped bytes back to a 32-byte DEK, with the same
+    /// `aad` they were wrapped with; any other `aad` fails closed.
     /// Returned via `Zeroizing` so the plaintext key is wiped on drop.
     fn unwrap_dek(
         &self,
         wrapped: &[u8],
+        aad: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Zeroizing<Vec<u8>>>> + Send + '_>>;
 
     /// Identifier reported in startup logs / health checks (`env`,
@@ -183,16 +192,26 @@ impl KekProvider for EnvKekProvider {
     fn wrap_dek(
         &self,
         dek: &[u8; 32],
+        aad: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>> {
         // Owned copy for the future, wiped when the future drops.
         let dek = Zeroizing::new(*dek);
+        let aad = aad.to_vec();
         Box::pin(async move {
             let cipher = Aes256Gcm::new_from_slice(&self.master_key)
                 .context("Failed to construct master cipher")?;
             let mut nonce_bytes = [0u8; 12];
             rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+            // An empty `aad` authenticates nothing extra, so the output is
+            // byte-identical to the pre-RFC-0013 `encrypt(nonce, dek)`.
             let ciphertext = cipher
-                .encrypt(Nonce::from_slice(&nonce_bytes), dek.as_ref())
+                .encrypt(
+                    Nonce::from_slice(&nonce_bytes),
+                    Payload {
+                        msg: dek.as_ref(),
+                        aad: &aad,
+                    },
+                )
                 .map_err(|e| anyhow!("Failed to wrap DEK: {}", e))?;
             // Wire format: nonce (12 bytes) || ciphertext (variable).
             // Matches the pre-refactor on-disk layout exactly so existing
@@ -206,8 +225,10 @@ impl KekProvider for EnvKekProvider {
     fn unwrap_dek(
         &self,
         wrapped: &[u8],
+        aad: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Zeroizing<Vec<u8>>>> + Send + '_>> {
         let wrapped = wrapped.to_vec();
+        let aad = aad.to_vec();
         Box::pin(async move {
             if wrapped.len() < 12 {
                 return Err(anyhow!(
@@ -221,7 +242,13 @@ impl KekProvider for EnvKekProvider {
             let ciphertext = &wrapped[12..];
             let plaintext = Zeroizing::new(
                 cipher
-                    .decrypt(nonce, ciphertext)
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: ciphertext,
+                            aad: &aad,
+                        },
+                    )
                     .map_err(|e| anyhow!("Failed to unwrap DEK: {}", e))?,
             );
             // Same contract the Vault provider enforces: a DEK is 32 bytes.
@@ -291,10 +318,10 @@ mod tests {
     async fn env_kek_round_trip() {
         let kek = EnvKekProvider::from_raw_bytes(vec![1u8; 32]);
         let dek = [42u8; 32];
-        let wrapped = kek.wrap_dek(&dek).await.unwrap();
+        let wrapped = kek.wrap_dek(&dek, &[]).await.unwrap();
         // Wire format guarantee: 12-byte nonce + ≥16-byte GCM tag = ≥28 bytes.
         assert!(wrapped.len() >= 12 + 32 + 16);
-        let unwrapped = kek.unwrap_dek(&wrapped).await.unwrap();
+        let unwrapped = kek.unwrap_dek(&wrapped, &[]).await.unwrap();
         assert_eq!(unwrapped.as_slice(), &dek);
     }
 
@@ -305,8 +332,8 @@ mod tests {
         // checking the leading 12 bytes differ.
         let kek = EnvKekProvider::from_raw_bytes(vec![7u8; 32]);
         let dek = [9u8; 32];
-        let a = kek.wrap_dek(&dek).await.unwrap();
-        let b = kek.wrap_dek(&dek).await.unwrap();
+        let a = kek.wrap_dek(&dek, &[]).await.unwrap();
+        let b = kek.wrap_dek(&dek, &[]).await.unwrap();
         assert_ne!(a[..12], b[..12], "GCM nonce was reused across wraps");
     }
 
@@ -324,24 +351,59 @@ mod tests {
                 .encrypt(Nonce::from_slice(&nonce), &[7u8; 16][..])
                 .unwrap(),
         );
-        assert!(kek.unwrap_dek(&wrapped).await.is_err());
+        assert!(kek.unwrap_dek(&wrapped, &[]).await.is_err());
     }
 
     #[tokio::test]
     async fn env_kek_rejects_truncated_wrapped() {
         let kek = EnvKekProvider::from_raw_bytes(vec![3u8; 32]);
-        assert!(kek.unwrap_dek(b"short").await.is_err());
+        assert!(kek.unwrap_dek(b"short", &[]).await.is_err());
     }
 
     #[tokio::test]
     async fn env_kek_rejects_corrupted_ciphertext() {
         let kek = EnvKekProvider::from_raw_bytes(vec![5u8; 32]);
         let dek = [11u8; 32];
-        let mut wrapped = kek.wrap_dek(&dek).await.unwrap();
+        let mut wrapped = kek.wrap_dek(&dek, &[]).await.unwrap();
         let last = wrapped.len() - 1;
         wrapped[last] ^= 0xff;
         // GCM auth-tag check must fail closed on tampered ciphertext.
-        assert!(kek.unwrap_dek(&wrapped).await.is_err());
+        assert!(kek.unwrap_dek(&wrapped, &[]).await.is_err());
+    }
+
+    /// The legacy wire format survives the AAD parameter: an unbound wrap is
+    /// exactly `nonce || encrypt(nonce, dek)` with no associated data, so a
+    /// row written before RFC 0013 still opens with an empty `aad`.
+    #[tokio::test]
+    async fn an_empty_aad_is_the_pre_rfc_wrap() {
+        let key = [31u8; 32];
+        let kek = EnvKekProvider::from_raw_bytes(key.to_vec());
+        let dek = [4u8; 32];
+        let nonce = [9u8; 12];
+        let mut legacy = nonce.to_vec();
+        legacy.extend(
+            Aes256Gcm::new_from_slice(&key)
+                .unwrap()
+                .encrypt(Nonce::from_slice(&nonce), &dek[..])
+                .unwrap(),
+        );
+        assert_eq!(kek.unwrap_dek(&legacy, &[]).await.unwrap().as_slice(), &dek);
+    }
+
+    #[tokio::test]
+    async fn a_bound_wrap_opens_only_under_its_own_aad() {
+        let kek = EnvKekProvider::from_raw_bytes(vec![17u8; 32]);
+        let dek = [6u8; 32];
+        let wrapped = kek.wrap_dek(&dek, b"row-a").await.unwrap();
+        assert_eq!(
+            kek.unwrap_dek(&wrapped, b"row-a").await.unwrap().as_slice(),
+            &dek
+        );
+        assert!(kek.unwrap_dek(&wrapped, b"row-b").await.is_err());
+        assert!(kek.unwrap_dek(&wrapped, &[]).await.is_err());
+        // And an unbound blob does not open under a bound AAD.
+        let unbound = kek.wrap_dek(&dek, &[]).await.unwrap();
+        assert!(kek.unwrap_dek(&unbound, b"row-a").await.is_err());
     }
 
     #[test]

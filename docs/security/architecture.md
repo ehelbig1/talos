@@ -114,7 +114,9 @@ worker runs with `TALOS_DISPATCH_REQUIRE_ED25519` (`worker/src/main.rs`).
   | Plaintext |   .wrap_dek()       | Wrapped DEK  | ----------------->
   |   DEK     |  ----------------> | (opaque bytes)|   encryption_keys
   +-----------+   (Vault transit    +--------------+   table
-                  OR local AES-GCM)
+                  OR local AES-GCM;
+                  AAD = the row's
+                  (id, org_id))
 
   Per-row data storage (every column carrying user data):
   +----------+   DEK → per-context   +-------------+    stored in DB
@@ -126,6 +128,15 @@ worker runs with `TALOS_DISPATCH_REQUIRE_ED25519` (`worker/src/main.rs`).
                                                          output,trigger_metadata}_enc,
                                                        workflow_executions.output_data_enc
 ```
+
+Each wrapped DEK is bound to its own `encryption_keys` row (RFC 0013): the KEK
+wrap authenticates the row's `(id, org_id)` as associated data
+(`talos-secrets-manager/src/dek_wrap.rs`), so a wrapped DEK copied into another
+row — another organization's, or across the global/org boundary — fails to
+unwrap instead of silently serving the wrong tenant's key. `wrap_format` records
+whether a row is bound (2) or predates the binding (1); the platform-admin
+`rebindDekWraps` mutation binds the latter, and `dekMigrationStatus` counts what
+remains as `encryption_keys.wrap`.
 
 OAuth access and refresh tokens are not a separate table: they are stored as
 encrypted rows in `secrets` at `oauth/<provider>/<user_id>/<provider_key>/…`
