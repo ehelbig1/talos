@@ -17,6 +17,7 @@ pub mod actor_budget;
 pub mod execution;
 pub mod execution_pause;
 pub mod google_push;
+pub mod local_llm;
 pub mod mcp;
 pub mod outcome_class;
 pub mod rpc;
@@ -27,6 +28,7 @@ pub use actor_budget::{BudgetCap, BudgetMode};
 pub use execution::ModuleExecutionOutcome;
 pub use execution_pause::{PauseGatePath, PauseRefusal};
 pub use google_push::{JwkRefreshOutcome, PushDeferReason, PushIntegration, PushRefusalReason};
+pub use local_llm::LocalLlmFleetOutcome;
 pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
@@ -731,6 +733,22 @@ pub fn record_google_push_accepted_on(metrics: &TalosMetrics, integration: PushI
     metrics
         .google_push_accepted_total
         .with_label_values(&[integration.as_str()])
+        .inc();
+}
+
+/// Count one fleet-queue outcome for a local LLM call (RFC 0014 P3b). Inert
+/// without [`set_global`].
+pub fn record_local_llm_fleet_admission(outcome: LocalLlmFleetOutcome) {
+    if let Some(m) = global() {
+        record_local_llm_fleet_admission_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_local_llm_fleet_admission_on(metrics: &TalosMetrics, outcome: LocalLlmFleetOutcome) {
+    metrics
+        .local_llm_fleet_admission_total
+        .with_label_values(&[outcome.as_str()])
         .inc();
 }
 
@@ -1912,6 +1930,10 @@ pub struct TalosMetrics {
     // seeded over their closed sets (`google_push`).
     pub google_push_refusals_total: CounterVec,
     pub google_push_accepted_total: CounterVec,
+    /// `talos_local_llm_fleet_admission_total{outcome}` — the controller's
+    /// local LLM calls through the fleet-wide queue (RFC 0014 P3b).
+    /// `LocalLlmFleetOutcome::ALL`, seeded at 0.
+    pub local_llm_fleet_admission_total: CounterVec,
     /// `talos_google_push_deferred_total{integration,reason}` — pushes handed
     /// back to the transport for redelivery because Talos could not answer.
     /// `PushIntegration::ALL` x `PushDeferReason::ALL`, seeded at 0. Package ES.
@@ -3544,6 +3566,27 @@ impl TalosMetrics {
                 .with_label_values(&[integration.as_str()])
                 .inc_by(0.0);
         }
+        let local_llm_fleet_admission_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_local_llm_fleet_admission_total",
+                "The controller's local LLM calls through the fleet-wide admission queue \
+                 (RFC 0014 P3b), by outcome: leased (admitted by the queue), wait_expired \
+                 (not admitted within the wait cap; proceeded ungated), unavailable (Redis \
+                 failed or was slow; proceeded on the controller's own gate), lease_lost (a \
+                 held lease expired before it could be renewed). None of these refuses a call. \
+                 Absent entirely when the queue is not installed (no Redis, a cap of 0, or \
+                 TALOS_LOCAL_LLM_FLEET_ADMISSION=false). Closed set, pre-seeded at 0. Not \
+                 alerted: no baseline yet. The worker's series is \
+                 wasm_llm_fleet_admission_total.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(local_llm_fleet_admission_total.clone()))?;
+        for outcome in LocalLlmFleetOutcome::ALL {
+            local_llm_fleet_admission_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
         let google_push_deferred_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_google_push_deferred_total",
@@ -4173,6 +4216,7 @@ impl TalosMetrics {
             platform_admin_checks_total,
             google_push_refusals_total,
             google_push_accepted_total,
+            local_llm_fleet_admission_total,
             google_push_deferred_total,
             execution_pause_refusals_total,
             webhook_duplicate_suppressed_total,
@@ -4742,6 +4786,24 @@ mod tests {
             ),
             "the refusal counter must be untouched by a deferral"
         );
+    }
+
+    /// The fleet-admission counter (RFC 0014 P3b) is seeded for every outcome
+    /// and moved by exactly the outcome it was given.
+    #[test]
+    fn local_llm_fleet_admission_is_seeded_and_moved_by_outcome() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        for o in LocalLlmFleetOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_local_llm_fleet_admission_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+        }
+        record_local_llm_fleet_admission_on(&m, LocalLlmFleetOutcome::Unavailable);
+        let warm = m.render_prometheus().expect("render");
+        assert!(warm.contains("talos_local_llm_fleet_admission_total{outcome=\"unavailable\"} 1"));
+        assert!(warm.contains("talos_local_llm_fleet_admission_total{outcome=\"leased\"} 0"));
     }
 
     /// The accepted-push counter (2026-09-18) is seeded for every

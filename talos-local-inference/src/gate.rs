@@ -59,12 +59,13 @@
 //!   effective ceiling against a shared backend is `replicas × cap`. Stated
 //!   rather than implied: on a two-worker fleet a cap of 1 still permits two
 //!   simultaneous exchanges.
-//! * **Not a bound ACROSS processes.** Since RFC 0014 P3a the controller's
-//!   `talos_llm::OllamaClient` — memory consolidation, graph-RAG entity
-//!   extraction, evaluation, the teacher audit — takes this gate too, but its
-//!   OWN copy: the semaphore is process-global, so the controller serializes
-//!   against itself and the worker against itself, never one against the
-//!   other. A cross-process queue is RFC 0014 P3b.
+//! * **Not, by itself, a bound ACROSS processes.** Since RFC 0014 P3a the
+//!   controller's `talos_llm::OllamaClient` — memory consolidation, graph-RAG
+//!   entity extraction, evaluation, the teacher audit — takes this gate too,
+//!   but its OWN copy: the semaphore is process-global. Since P3b a call that
+//!   gets its process permit then queues in [`crate::fleet`], shared by every
+//!   process calling the backend; when that queue is not installed or Redis
+//!   does not answer, this gate is the whole bound again.
 //! * **Not applied to external providers.** Anthropic / OpenAI / Gemini serve
 //!   requests in parallel and bill per token; serializing them would be a
 //!   straight latency regression for no benefit. The gate keys on exactly the
@@ -76,7 +77,11 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::fleet::{FleetAcquire, FleetAdmission, FleetLease};
 
 /// Simultaneous LOCAL LLM exchanges permitted per process (worker or
 /// controller).
@@ -164,8 +169,25 @@ pub enum Ungated {
               the whole LLM exchange or the gate does nothing"]
 #[derive(Debug)]
 pub enum LocalLlmSlot {
-    Held(#[allow(dead_code)] OwnedSemaphorePermit),
+    Held(Admitted),
     Ungated(Ungated),
+}
+
+/// What an admitted call holds for the whole exchange: its process's permit
+/// and, when the fleet queue is installed and Redis answered, its fleet lease
+/// (RFC 0014 P3b). Both are released on drop.
+#[derive(Debug)]
+pub struct Admitted {
+    _local: OwnedSemaphorePermit,
+    _fleet: Option<FleetLease>,
+}
+
+impl Admitted {
+    /// Whether this call also holds a fleet lease — `false` when the fleet
+    /// queue is not installed or Redis did not answer.
+    pub fn holds_fleet_lease(&self) -> bool {
+        self._fleet.is_some()
+    }
 }
 
 /// Label for the worker's `RuntimeMetrics::record_llm_gate`. Closed,
@@ -240,55 +262,118 @@ impl QueueWaitObserver for NoWaitObserver {
     }
 }
 
-/// Take a slot on this process's gate, waiting up to
-/// [`LOCAL_LLM_QUEUE_WAIT_SECS`].
+/// Take a slot on this process's gate — and, when [`crate::fleet::install`]
+/// found Redis, on the fleet queue for the backend — waiting up to
+/// [`LOCAL_LLM_QUEUE_WAIT_SECS`] across both.
 ///
 /// Returns the slot and how long the wait took. **Call this BEFORE starting
 /// the exchange's deadlines**: the entire point is that queue time is not
 /// charged to a budget that is supposed to measure one call's own service
 /// time.
 ///
-/// When the call has to QUEUE, the wait is reported to `wait`. A slot that is
-/// free is taken without reporting: no wait, nothing to say.
+/// When the call has to QUEUE at either stage, the wait is reported to `wait`
+/// once. A slot that is free is taken without reporting.
 pub async fn acquire_process_slot<W: QueueWaitObserver>(
     wait: Option<&W>,
 ) -> (LocalLlmSlot, Duration) {
-    acquire_reporting_from(
+    admit(
         process_gate(),
+        crate::fleet::installed(),
         Duration::from_secs(LOCAL_LLM_QUEUE_WAIT_SECS),
         wait,
     )
     .await
 }
 
-/// [`acquire_from`] plus the wait report — the whole decision with the
-/// semaphore and wait cap supplied, for the same testability reason.
+/// The whole decision, with the semaphore, the fleet queue and the wait cap
+/// supplied — for the same testability reason as [`acquire_from`].
 ///
-/// `try_acquire_owned` first: a tokio semaphore hands a released permit to the
-/// longest waiter, so a free permit here means nobody is queued and taking it
-/// jumps no one. Only when it is NOT free does the call open a wait.
-pub async fn acquire_reporting_from<W: QueueWaitObserver>(
+/// 1. **The process's own gate first.** `try_acquire_owned` first: a tokio
+///    semaphore hands a released permit to the longest waiter, so a free
+///    permit means nobody is queued and taking it jumps no one. A process
+///    therefore has at most `cap` callers in the fleet queue; its other calls
+///    queue here, with no Redis round trip.
+/// 2. **Then the fleet queue**, until the same deadline. Redis unavailable →
+///    the call proceeds on its process permit (the P3a behaviour); the fleet
+///    wait expired → the call proceeds ungated, releasing its process permit,
+///    exactly as an expired process wait does.
+pub async fn admit<W: QueueWaitObserver>(
     permits: Option<&Arc<Semaphore>>,
+    fleet: Option<&FleetAdmission>,
     wait_cap: Duration,
     wait: Option<&W>,
 ) -> (LocalLlmSlot, Duration) {
     let Some(sem) = permits else {
         return (LocalLlmSlot::Ungated(Ungated::Disabled), Duration::ZERO);
     };
-    if let Ok(permit) = sem.clone().try_acquire_owned() {
-        return (LocalLlmSlot::Held(permit), Duration::ZERO);
-    }
-    if let Some(w) = wait {
-        w.begin_wait().await;
-    }
-    let out = acquire_from(permits, wait_cap).await;
-    if let Some(w) = wait {
-        w.end_wait().await;
-    }
-    out
+    // tokio's clock (the same clock as `std` in production) so the reported
+    // wait and the job's `InferenceWaitLedger` measure the same interval.
+    let started = tokio::time::Instant::now();
+    let deadline = started + wait_cap;
+    let reported = AtomicBool::new(false);
+    let report = || async {
+        if !reported.swap(true, Ordering::Relaxed) {
+            if let Some(w) = wait {
+                w.begin_wait().await;
+            }
+        }
+    };
+    let finish = |slot: LocalLlmSlot| async {
+        if reported.load(Ordering::Relaxed) {
+            if let Some(w) = wait {
+                w.end_wait().await;
+            }
+        }
+        (slot, started.elapsed())
+    };
+
+    let permit = match sem.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            report().await;
+            match tokio::time::timeout_at(deadline, sem.clone().acquire_owned()).await {
+                Ok(Ok(p)) => p,
+                // `acquire_owned` errors only when the semaphore is CLOSED, and
+                // nothing in this process ever closes it. Rendered as
+                // `WaitExpired` rather than unwrapped, because a panic inside a
+                // host function unwinds the whole job — and rather than as
+                // `Disabled`, which would report a closed semaphore as an
+                // operator's configuration choice.
+                Ok(Err(_)) | Err(_) => {
+                    return finish(LocalLlmSlot::Ungated(Ungated::WaitExpired)).await;
+                }
+            }
+        }
+    };
+
+    let lease = match fleet {
+        None => None,
+        Some(f) => match f.acquire(deadline, report).await {
+            FleetAcquire::Leased(lease) => Some(lease),
+            FleetAcquire::Unavailable => None,
+            FleetAcquire::WaitExpired => {
+                drop(permit);
+                return finish(LocalLlmSlot::Ungated(Ungated::WaitExpired)).await;
+            }
+        },
+    };
+    finish(LocalLlmSlot::Held(Admitted {
+        _local: permit,
+        _fleet: lease,
+    }))
+    .await
 }
 
-/// The whole decision, with the semaphore and the wait cap supplied.
+/// [`admit`] on the process gate alone, with a wait report.
+pub async fn acquire_reporting_from<W: QueueWaitObserver>(
+    permits: Option<&Arc<Semaphore>>,
+    wait_cap: Duration,
+    wait: Option<&W>,
+) -> (LocalLlmSlot, Duration) {
+    admit(permits, None, wait_cap, wait).await
+}
+
+/// [`admit`] on the process gate alone, reporting nothing.
 ///
 /// Exists so the BEHAVIOUR is testable: `process_gate()` and `max_in_flight()`
 /// are process-global `OnceLock`s, so a suite that drove only the public
@@ -299,22 +384,7 @@ pub async fn acquire_from(
     permits: Option<&Arc<Semaphore>>,
     wait_cap: Duration,
 ) -> (LocalLlmSlot, Duration) {
-    let Some(sem) = permits else {
-        return (LocalLlmSlot::Ungated(Ungated::Disabled), Duration::ZERO);
-    };
-    // tokio's clock (the same clock as `std` in production) so the reported
-    // wait and the job's `InferenceWaitLedger` measure the same interval.
-    let started = tokio::time::Instant::now();
-    let slot = match tokio::time::timeout(wait_cap, sem.clone().acquire_owned()).await {
-        Ok(Ok(permit)) => LocalLlmSlot::Held(permit),
-        // `acquire_owned` errors only when the semaphore is CLOSED, and
-        // nothing in this process ever closes it. Rendered as `WaitExpired`
-        // rather than unwrapped, because a panic inside a host function
-        // unwinds the whole job — and rather than as `Disabled`, which would
-        // report a closed semaphore as an operator's configuration choice.
-        Ok(Err(_)) | Err(_) => LocalLlmSlot::Ungated(Ungated::WaitExpired),
-    };
-    (slot, started.elapsed())
+    admit::<NoWaitObserver>(permits, None, wait_cap, None).await
 }
 
 #[cfg(test)]

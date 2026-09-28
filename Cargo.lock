@@ -1832,6 +1832,7 @@ dependencies = [
  "talos-job-result-observer",
  "talos-judge-probe",
  "talos-llm",
+ "talos-local-inference",
  "talos-mcp",
  "talos-mcp-handlers",
  "talos-mcp-tool-schema",
@@ -8766,13 +8767,17 @@ name = "talos-local-inference"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "redis",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "talos-config",
  "talos-dlp-provider",
  "talos-http-body",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

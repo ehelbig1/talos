@@ -648,10 +648,13 @@ async fn main() -> anyhow::Result<()> {
     // scheduler below, so they share one reqwest connection pool. MCP-630
     // idiom: a Helm placeholder `OLLAMA_URL=""` falls through to the
     // in-cluster default rather than producing a base-URL-less client.
-    let ollama_client = std::sync::Arc::new(talos_llm::OllamaClient::new(talos_config::get_env(
-        "OLLAMA_URL",
-        "http://ollama:11434",
-    )));
+    let ollama_url = talos_config::get_env("OLLAMA_URL", "http://ollama:11434");
+    let ollama_client = std::sync::Arc::new(talos_llm::OllamaClient::new(ollama_url.clone()));
+    // RFC 0014 P3b: the controller's local LLM calls queue with the workers',
+    // not only within this process. Never fatal.
+    if let Some(ref client) = redis_client {
+        bootstrap::local_llm_fleet::install(client, &ollama_url).await;
+    }
 
     // B1: probe the local Ollama backend ONCE at boot for the autonomous memory
     // loops. Those loops route LOCAL-FIRST (external is a budget-gated fallback),
