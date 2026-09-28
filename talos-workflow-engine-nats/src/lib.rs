@@ -57,6 +57,7 @@
 //! [`EventSink`]: talos_workflow_engine_core::EventSink
 //! [`talos_workflow_job_protocol`]: ../talos_workflow_job_protocol/
 
+mod attempt_wait;
 mod dispatcher;
 mod run;
 mod transport;

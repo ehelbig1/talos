@@ -530,6 +530,13 @@ pub struct TalosContext {
     /// path that has a real execution id and therefore a working NATS route.
     pub host_diag_sink: Option<HostDiagSink>,
 
+    /// RFC 0014 P2: this job's waiting-for-the-local-inference-slot account.
+    /// The local-LLM gate records waits here; the job's wall-clock deadlines
+    /// (outer job timeout, inner `call_async` timeout, epoch wall-clock bound)
+    /// stand still while one is open. `None` (the default) for every caller
+    /// with no controller waiting on it, whose deadlines stay fixed.
+    pub inference_wait: Option<Arc<crate::inference_wait::InferenceWaitLedger>>,
+
     /// When true, non-GET HTTP requests, webhook sends, and messaging publishes
     /// are mocked with success responses instead of executing real network calls.
     /// GET requests still execute normally for data fetching.
@@ -1648,6 +1655,7 @@ impl TalosContext {
             // in-process (`run_sandbox` / `test_module`). Every NATS-backed
             // dispatch path leaves this None and is unchanged.
             host_diag_sink: None,
+            inference_wait: None,
             dry_run: false,
             actor_id: None,
             // Stamped from the constructor arg so the SSRF resolver's

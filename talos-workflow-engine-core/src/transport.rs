@@ -112,4 +112,28 @@ pub trait JobTransport: Send + Sync {
     ) -> Result<Vec<u8>, BoxError> {
         self.request(topic, payload).await
     }
+
+    /// RFC 0014 P2: [`request_with_reply_inbox`], also handing every message
+    /// that arrives on the job's PROGRESS subject to `on_progress` (raw bytes,
+    /// unverified — the dispatcher parses and verifies) while the reply is
+    /// awaited.
+    ///
+    /// The progress subject is derived from `reply_inbox` by the protocol crate
+    /// (`<reply_inbox>.progress`); the transport only has to listen on it from
+    /// before the publish until the reply arrives. The default delivers no
+    /// progress and delegates, so a transport that does not override it keeps
+    /// the pre-P2 behaviour exactly: the attempt window never pauses.
+    ///
+    /// [`request_with_reply_inbox`]: Self::request_with_reply_inbox
+    async fn request_with_reply_inbox_and_progress(
+        &self,
+        topic: &str,
+        reply_inbox: &str,
+        _progress_subject: &str,
+        payload: Vec<u8>,
+        _on_progress: &(dyn Fn(Vec<u8>) + Send + Sync),
+    ) -> Result<Vec<u8>, BoxError> {
+        self.request_with_reply_inbox(topic, reply_inbox, payload)
+            .await
+    }
 }

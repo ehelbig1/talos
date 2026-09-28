@@ -41,6 +41,7 @@ async fn test_runtime_no_nested_block_on() {
             None, // llm_usage_out — not collected
             None, // host_diag_out — not collected
             0,    // dispatch_attempt
+            None, // inference_wait (RFC 0014 P2): no controller is timing this call
         )
         .await;
 

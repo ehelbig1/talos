@@ -121,19 +121,69 @@ impl JobTransport for NatsTransport {
         // outbox while we wait for a reply. Errors here are not fatal
         // — `next()` will simply time out if the broker disconnects.
         let _ = self.client.flush().await;
-        match sub.next().await {
-            Some(msg) => {
-                // A NATS `503 No Responders` control message is a REPLY with
-                // an EMPTY body, not an error — see
-                // `no_responders_error_for` for why this check has to be
-                // here and what it cost to be missing.
-                if let Some(e) = no_responders_error_for(msg.status, topic) {
-                    return Err(e);
-                }
-                Ok(msg.payload.to_vec())
+        reply_from(sub.next().await, topic)
+    }
+
+    /// RFC 0014 P2: as [`Self::request_with_reply_inbox`], and ALSO listening on
+    /// the job's progress subject — subscribed before the publish, like the
+    /// inbox, so a report cannot race the subscription — forwarding every
+    /// progress message to `on_progress` until the reply arrives. Both
+    /// subscriptions are dropped (NATS unsubscribes) when this returns or is
+    /// cancelled by the caller's deadline.
+    async fn request_with_reply_inbox_and_progress(
+        &self,
+        topic: &str,
+        reply_inbox: &str,
+        progress_subject: &str,
+        payload: Vec<u8>,
+        on_progress: &(dyn Fn(Vec<u8>) + Send + Sync),
+    ) -> Result<Vec<u8>, BoxError> {
+        let mut sub = self
+            .client
+            .subscribe(reply_inbox.to_string())
+            .await
+            .map_err(|e| -> BoxError { format!("inbox subscribe: {e}").into() })?;
+        let mut progress = self
+            .client
+            .subscribe(progress_subject.to_string())
+            .await
+            .map_err(|e| -> BoxError { format!("progress subscribe: {e}").into() })?;
+        let mut headers = async_nats::HeaderMap::new();
+        talos_trace_nats::inject_trace_context(&mut headers);
+        self.client
+            .publish_with_reply_and_headers(
+                topic.to_string(),
+                reply_inbox.to_string(),
+                headers,
+                payload.into(),
+            )
+            .await
+            .map_err(|e| -> BoxError { format!("publish_with_reply: {e}").into() })?;
+        let _ = self.client.flush().await;
+        loop {
+            tokio::select! {
+                msg = sub.next() => return reply_from(msg, topic),
+                Some(p) = progress.next() => on_progress(p.payload.to_vec()),
             }
-            None => Err("inbox subscription closed before reply arrived".into()),
         }
+    }
+}
+
+/// The reply half shared by both inbox methods: the first message on the inbox
+/// is the reply, unless it is a NATS `503 No Responders` control message.
+fn reply_from(msg: Option<async_nats::Message>, topic: &str) -> Result<Vec<u8>, BoxError> {
+    match msg {
+        Some(msg) => {
+            // A NATS `503 No Responders` control message is a REPLY with
+            // an EMPTY body, not an error — see
+            // `no_responders_error_for` for why this check has to be
+            // here and what it cost to be missing.
+            if let Some(e) = no_responders_error_for(msg.status, topic) {
+                return Err(e);
+            }
+            Ok(msg.payload.to_vec())
+        }
+        None => Err("inbox subscription closed before reply arrived".into()),
     }
 }
 

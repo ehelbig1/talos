@@ -20,7 +20,8 @@ use talos_workflow_engine_core::{
     clamp_attempt_timeout, clamp_cause, dispatch_allowance_secs, AttemptWindow, BoxError,
     ChainDispatchRequest, ChainDispatchResult, ChainStepResult, ClampCause, DispatchJob,
     DispatchResult, EventSink, ExpressionEvaluator, JobTransport, NodeDispatcher, NodeEventWrite,
-    RetryClassifier, StepStatus, WorkerSharedKey, MIN_REMAINING_FOR_ATTEMPT_SECS,
+    RetryClassifier, StepStatus, WorkerSharedKey, BUDGET_RESERVE_SECS,
+    MIN_REMAINING_FOR_ATTEMPT_SECS,
 };
 use talos_workflow_job_protocol::{
     EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineJobResult,
@@ -769,14 +770,26 @@ pub(crate) async fn execute_job_with_retry(
         if let Some(rearm) = on_before_send {
             rearm();
         }
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(attempt_secs),
-            send_with_optional_inbox(
-                transport,
-                &topic,
-                reply_inbox.as_deref(),
-                current_payload.clone(),
-            ),
+        // RFC 0014 P2: the window stands still while the worker reports the job
+        // is queued for the local-inference slot — never past the run's own
+        // deadline less the reserve, which bounds the window exactly as the
+        // clamp above bounds it at the start. See `crate::attempt_wait`.
+        let run_limit = deadline.map(|d| {
+            d.checked_sub(std::time::Duration::from_secs(BUDGET_RESERVE_SECS))
+                .unwrap_or(d)
+        });
+        let result = crate::attempt_wait::await_attempt(
+            transport,
+            &topic,
+            reply_inbox.as_deref(),
+            current_payload.clone(),
+            attempt_secs,
+            run_limit,
+            crate::attempt_wait::ProgressCheck {
+                expected_job_id,
+                sent_payload: &current_payload,
+                verify_ring,
+            },
         )
         .await;
 
@@ -1236,7 +1249,18 @@ pub(crate) async fn execute_job_with_retry(
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
-            Err(_timeout) => {
+            Err(elapsed) => {
+                if !elapsed.excluded.is_zero() {
+                    // RFC 0014 P2: the window already stood still for this
+                    // long while the job queued for local inference; what ran
+                    // out was the job's own time (or the cap on queueing).
+                    tracing::warn!(
+                        job_id = %expected_job_id,
+                        attempt_timeout_secs = attempt_secs,
+                        excluded_ms = elapsed.excluded.as_millis() as u64,
+                        "attempt window elapsed after excluding local-inference queueing"
+                    );
+                }
                 // Distinguish "this node is too slow for its own
                 // allowance" from "this node ran out of the workflow's
                 // budget". They invite OPPOSITE operator responses, and

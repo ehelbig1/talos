@@ -3655,6 +3655,7 @@ impl TalosRuntime {
             None, // llm_usage_out — legacy helper doesn't collect usage
             None, // host_diag_out — legacy helper has a real execution id (NATS route)
             0,    // dispatch_attempt — legacy helper has no controller retry loop above it
+            None, // inference_wait (RFC 0014 P2): no controller is timing this call
         )
         .await
     }
@@ -3750,6 +3751,12 @@ impl TalosRuntime {
         // wants this; passing it explicitly makes every call site state its
         // answer.
         dispatch_attempt: u32,
+        // RFC 0014 P2: the job's waiting-for-the-local-inference-slot account.
+        // `Some` only on the worker's NATS path, where a controller is waiting on
+        // the job; the job's deadlines then stand still while it queues for the
+        // slot. `None` keeps every deadline fixed — the right answer for
+        // `run_sandbox`, `test_module` and replay, which nobody else is timing.
+        inference_wait: Option<Arc<crate::inference_wait::InferenceWaitLedger>>,
     ) -> Result<JsonValue> {
         // Per-job fuel override: use the controller-supplied value when non-zero,
         // otherwise fall back to the runtime's global fuel_limit.
@@ -3996,6 +4003,7 @@ impl TalosRuntime {
                         job_cancel_flag.clone(),
                         job_ledger.clone(),
                         anchor_eligible.clone(),
+                        inference_wait.clone(),
                     )
                     .await
                 {
@@ -4267,6 +4275,8 @@ impl TalosRuntime {
         // later attempt killed by the wall clock must not retract the fact that
         // the chain reached a terminal state.
         anchor_eligible: Arc<std::sync::atomic::AtomicBool>,
+        // RFC 0014 P2 (see `execute_job_with_full_features`).
+        inference_wait: Option<Arc<crate::inference_wait::InferenceWaitLedger>>,
     ) -> Result<JsonValue> {
         // DISTRIBUTED TRACING: Create execution span
         let execution_id = execution_context
@@ -4374,6 +4384,9 @@ impl TalosRuntime {
         if let Some(ref acc) = llm_usage_out {
             context.llm_usage = acc.clone();
         }
+        // RFC 0014 P2: set before the store is built, because the epoch
+        // callback armed below reads it out of the store's context.
+        context.inference_wait = inference_wait.clone();
         // In-process host-diagnostic mirror for callers with no execution row
         // (`run_sandbox` / `test_module`). Attached before the module runs so
         // diagnostics from the very first host call are collected.
@@ -4568,15 +4581,23 @@ impl TalosRuntime {
 
         let execution_start = std::time::Instant::now();
         let fuel_limit_for_calc = effective_fuel_limit;
-        let call_result = tokio::time::timeout(actual_timeout, async move {
-            let res = typed_run
-                .call_async(&mut store, (input_str,))
-                .await
-                .map(|(r,)| r);
-            let oom_msg = store.data().oom_error_message.clone();
-            let remaining_fuel = store.get_fuel().ok();
-            (res, oom_msg, remaining_fuel)
-        })
+        // RFC 0014 P2: time the guest spends queued for the local-inference
+        // slot does not count against this bound (identical to
+        // `tokio::time::timeout` when there is no ledger).
+        let wait_ledger = store.data().inference_wait.clone();
+        let call_result = crate::inference_wait::with_pausable_deadline(
+            actual_timeout,
+            wait_ledger.as_deref(),
+            async move {
+                let res = typed_run
+                    .call_async(&mut store, (input_str,))
+                    .await
+                    .map(|(r,)| r);
+                let oom_msg = store.data().oom_error_message.clone();
+                let remaining_fuel = store.get_fuel().ok();
+                (res, oom_msg, remaining_fuel)
+            },
+        )
         .await
         .map_err(|_| {
             anyhow::anyhow!(

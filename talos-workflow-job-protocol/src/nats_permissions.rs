@@ -325,6 +325,8 @@ mod tests {
             subjects::results_for("job-1"),
             subjects::pipeline_results_for("job-1"),
             format!("{CONTROLLER_INBOX_PREFIX}.abcdef.1"), // reply_topic + claim_inbox
+            // RFC 0014 P2: job progress rides the signed reply inbox.
+            subjects::job_progress_for(&format!("{CONTROLLER_INBOX_PREFIX}.abcdef.1")),
             subjects::AUDIT_LEDGER.to_string(),
             subjects::APPROVALS_PENDING.to_string(),
             subjects::worker_heartbeat_for("w-1"),

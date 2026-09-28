@@ -1,6 +1,6 @@
 # RFC 0014 — Local inference that does not depend on the schedule
 
-**Status:** In progress — P1 (progress-based deadlines) 2026-09-28
+**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28
 **Author:** Platform
 **Date:** 2026-09-28
 
@@ -16,7 +16,8 @@ Four phases:
 1. **P1:** a call is cut when it stops making **progress**, not when a clock runs
    out.
 2. **P2:** time spent **waiting** for the backend is not charged to a call's
-   deadlines, and waiting calls are admitted fairly and model-aware.
+   deadlines (P2a: the job's; P2b: the run's), and waiting calls are admitted
+   fairly and model-aware (P2c).
 3. **P3:** admission is **fleet-wide** and covers the controller's own Ollama
    client.
 4. **P4:** timeouts are **classified** for retry and made **visible**.
@@ -140,22 +141,62 @@ fail under it.
    process with different callers, and it belongs with P3, which has to touch it
    anyway.
 
-### P2 — waiting is not charged; admission is fair (proposed)
+### P2a — waiting is not charged to the job (2026-09-28)
 
-1. **The worker reports queueing.** While a call waits for a local slot, the
-   worker publishes a signed, rate-limited "waiting for local inference" progress
-   message on the job's reply channel.
-   - The dispatcher extends that attempt's deadline by the reported wait, bounded
-     by the workflow budget, which stays the one hard wall-clock limit.
-   - The worker's own job timeout excludes gate wait in the same way.
-   - Open question: a new signed message type needs `verify()` and
-     `verify_no_replay()` from day one (CLAUDE.md, verify-once rule), and the
-     platform-primitive checklist.
-2. **Fair order.** FIFO across *workflow runs*, not across calls, so one run's
+**Measured first.** Over 30 days of the gate's own histogram, 94 % of local calls
+waited under 10 ms at the gate, but about 56 waited over 30 s and 9 over 60 s,
+every long wait inside a scheduled herd (the 06:00, 07:00 and 08:00 starts). Each
+of those waits was charged to the job's deadlines.
+
+1. **The rule, one home.** `talos_workflow_engine_core::inference_wait` —
+   `WaitAccounting` and `LOCAL_INFERENCE_WAIT_CREDIT_CAP_SECS` (300 s), shared by
+   worker and controller so the two clocks apply one rule and one cap. Deadlines
+   measure work; waiting has its own bound.
+2. **Worker.** The gate records a wait on the job's `InferenceWaitLedger` only
+   when a call actually queues (a free slot is taken silently). All three
+   worker-side wall-clock bounds stand still while a wait is open: the outer job
+   timeout, the inner `call_async` timeout, and the epoch callback's wall-clock
+   bound. The epoch TICK budget is untouched — ticks only burn while the guest
+   runs.
+3. **Wire.** A new signed message, `JobProgress { job_id, dispatch_attempt,
+   state: waiting|admitted, worker_id, nonce }`, signed like `JobResult`
+   (worker Ed25519 or fleet HMAC), domain-tagged `progress:` so it can never be
+   confused with a result. It goes to `<reply_inbox>.progress`, derived from the
+   SIGNED reply topic.
+   - **No request field and no rollout order.** A controller that predates P2
+     does not subscribe there and the broker drops the messages. (A request flag
+     was considered and rejected: it would bind a new segment into every signed
+     dispatch, so a new controller would be refused by every old worker during a
+     rollout.)
+   - Verify-once: the dispatcher is the only consumer and calls `verify_dispatch`;
+     `verify_no_replay_dispatch` exists from day one.
+4. **Controller.** The dispatcher listens on the progress subject for the length
+   of the attempt and pauses the attempt window while a verified `waiting` is
+   open. A report is honoured only if it parses, names this job and this attempt,
+   verifies, and comes from the first worker that reported for the attempt; any
+   other report is ignored and the window runs as before. The window never passes
+   the run's deadline less `BUDGET_RESERVE_SECS`, and an unclosed wait is capped.
+5. **What a forger gets.** A holder of the fleet key who has seen a job's reply
+   inbox can make the controller wait longer for that attempt, by at most 300 s.
+   It cannot change a result, skip a gate or extend the worker's own deadlines.
+
+**Not in P2a, stated:** the workflow's own budget still counts queueing (P2b);
+pipeline jobs (dormant by config) report nothing; a job whose `waiting` message is
+lost is abandoned at its window exactly as before P2.
+
+### P2b — the run's budget pauses too (proposed)
+
+`ExecutionProgress` records the union of its jobs' reported waits on the
+controller's clock and the run-level timeout reads a live deadline; dispatches
+read the run deadline live instead of a snapshot taken at dispatch.
+
+### P2c — fair, model-aware admission (proposed)
+
+1. **Fair order.** FIFO across *workflow runs*, not across calls, so one run's
    fan-out cannot starve the others.
-3. **Model-aware order.** Among waiting calls, prefer those for the model already
-   loaded, with bounded unfairness (an aging limit). This measurably saves 3–8 s
-   per avoided swap and removes the retry-amplified thrash seen on 09-28.
+2. **Model-aware order.** Among waiting calls, prefer those for the model already
+   loaded, with bounded unfairness (an aging limit). This saves 3–8 s per avoided
+   swap and removes the retry-amplified thrash seen on 09-28.
 
 ### P3 — fleet-wide admission (proposed)
 
@@ -192,7 +233,8 @@ fail under it.
 - **P1** needs no migration and no wire change. Workers roll independently. The
   first-byte and idle deadlines are constants, deliberately not knobs, until P4's
   series give a basis for tuning them.
-- **P2** adds a signed message type. Deploy ordering will be stated with it
-  (workers first, as with every signed-field addition).
+- **P2a** adds a signed message type on a new subject and no request field, so
+  workers and controllers roll in any order: an old controller ignores the
+  reports, and a new controller hearing none behaves exactly as before.
 - **P3** adds a Redis dependency on the local-inference path. The fallback keeps
   a Redis outage from becoming an inference outage.

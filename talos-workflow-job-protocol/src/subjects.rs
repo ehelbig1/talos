@@ -75,6 +75,19 @@ pub fn results_for(job_id: impl std::fmt::Display) -> String {
     format!("talos.results.{job_id}")
 }
 
+/// RFC 0014 P2: where a worker reports a job's progress (`waiting` for the
+/// local-inference slot, then `admitted`) — `<reply_inbox>.progress`.
+///
+/// Derived from the job's SIGNED `reply_topic`, never from the unsigned wire
+/// reply header, so it names the same controller the result will reach. A
+/// controller that predates P2 subscribes to nothing here and the messages fall
+/// on the floor, which is the whole deploy-compatibility story: no request
+/// field, no ordering constraint between worker and controller rollouts.
+#[must_use]
+pub fn job_progress_for(reply_inbox: &str) -> String {
+    format!("{reply_inbox}.progress")
+}
+
 /// Per-job pipeline result subject: `talos.pipeline.results.<job_id>`.
 #[must_use]
 pub fn pipeline_results_for(job_id: impl std::fmt::Display) -> String {

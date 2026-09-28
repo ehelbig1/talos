@@ -18,6 +18,7 @@ pub mod error_sanitize;
 pub mod expose_fallback;
 pub mod host;
 pub mod host_impl;
+pub mod inference_wait;
 pub mod job_idempotency;
 pub mod job_span;
 pub mod metrics;

@@ -846,6 +846,7 @@ async fn cancellation_preempts_a_compute_bound_module() {
                 None, // llm_usage_out
                 None, // host_diag_out
                 0,    // dispatch_attempt
+                None, // inference_wait (RFC 0014 P2): no controller is timing this call
             )
             .await
         })
@@ -980,7 +981,8 @@ async fn an_uncancelled_compute_bound_job_still_traps_at_its_own_budget() {
             None,
             None,
             None,
-            0, // dispatch_attempt
+            0,    // dispatch_attempt
+            None, // inference_wait (RFC 0014 P2): no controller is timing this call
         )
         .await;
     let elapsed = start.elapsed();
