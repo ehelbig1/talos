@@ -2,7 +2,8 @@
 //!
 //! ## The defect this closes
 //!
-//! `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` (60 s) is documented on
+//! `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` (60 s; replaced by progress deadlines in
+//! RFC 0014 P1, see `host::llm_local_stream`) was documented on
 //! [`crate::host::limits`] as a bound on **one call**: *"a cold-start with a
 //! 7B+ model can take 20–40 s while the model loads into VRAM. 60 s gives
 //! headroom without masking an actually-stuck call."* That reasoning is

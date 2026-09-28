@@ -83,6 +83,8 @@ mod limits;
 mod line_reader;
 mod llm;
 pub(crate) mod llm_gate;
+/// RFC 0014 P1: progress-based deadlines for a local (Ollama) exchange.
+mod llm_local_stream;
 pub(crate) mod llm_providers;
 mod llm_streaming;
 mod llm_tools;

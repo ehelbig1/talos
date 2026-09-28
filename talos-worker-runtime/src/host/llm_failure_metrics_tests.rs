@@ -82,6 +82,26 @@ fn stall_signal() -> &'static tokio::sync::Semaphore {
 
 static REQUESTS_SERVED: AtomicU64 = AtomicU64::new(0);
 
+/// Requests the mock received with `"stream":true` in the body. RFC 0014 P1:
+/// every local call from both production call sites must ask for a stream.
+static STREAMED_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Permits added by the mock when it has read a full `mock-steady` request.
+fn steady_signal() -> &'static tokio::sync::Semaphore {
+    static S: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    S.get_or_init(|| tokio::sync::Semaphore::new(0))
+}
+
+/// One permit per `mock-steady` chunk; the test releases them as it advances
+/// the paused clock, so the answer's pace is set in VIRTUAL time.
+fn steady_release() -> &'static tokio::sync::Semaphore {
+    static S: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    S.get_or_init(|| tokio::sync::Semaphore::new(0))
+}
+
+/// Chunks `mock-steady` sends before its `done` line.
+const STEADY_CHUNKS: usize = 5;
+
 /// Requests the MOCK currently has in flight, and the high-water mark.
 ///
 /// Server-side, deliberately: the gate's claim is about how many exchanges
@@ -171,6 +191,9 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
         .and_then(|r| r.split('"').next())
         .unwrap_or("")
         .to_string();
+    if body.contains("\"stream\":true") {
+        STREAMED_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    }
 
     // Write failures are ignored throughout: several cases make the client
     // hang up mid-response on purpose.
@@ -191,12 +214,44 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
             note_mock_arrival();
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
             note_mock_departure();
-            write_simple(
+            write_ndjson(&mut stream, &[ok_line()]).await
+        }
+        // A steady answer paced by the test in virtual time (see
+        // `a_steady_local_answer_longer_than_the_old_total_completes`).
+        "mock-steady" => {
+            steady_signal().add_permits(1);
+            let _ = stream.write_all(NDJSON_HEAD.as_bytes()).await;
+            for i in 0..STEADY_CHUNKS {
+                steady_release()
+                    .acquire()
+                    .await
+                    .expect("semaphore")
+                    .forget();
+                let line = content_line(&i.to_string(), false);
+                if stream.write_all(line.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+            }
+            let _ = stream.write_all(done_line().as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+        // A tool call split across streamed lines, as Ollama sends it.
+        "mock-tool-stream" => {
+            let call = serde_json::json!({
+                "message": {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "noop", "arguments": {"a": 1}}}
+                ]},
+                "done": false
+            });
+            write_ndjson(
                 &mut stream,
-                200,
-                "OK",
-                r#"{"message":{"role":"assistant","content":"OK"},"done":true,
-                    "done_reason":"stop","prompt_eval_count":3,"eval_count":1}"#,
+                &[
+                    content_line("Calling ", false),
+                    content_line("noop.", false),
+                    format!("{call}\n"),
+                    done_line(),
+                ],
             )
             .await
         }
@@ -204,20 +259,55 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
         "mock-500" => {
             write_simple(&mut stream, 500, "Internal Server Error", "upstream boom").await
         }
-        "mock-badjson" => write_simple(&mut stream, 200, "OK", "this is not JSON at all").await,
+        "mock-badjson" => {
+            write_ndjson(&mut stream, &["this is not JSON at all\n".to_string()]).await
+        }
         "mock-huge" => write_oversized(&mut stream).await,
-        // Default: a valid native-Ollama completion.
-        _ => {
-            write_simple(
-                &mut stream,
-                200,
-                "OK",
-                r#"{"message":{"role":"assistant","content":"OK"},"done":true,
-                    "done_reason":"stop","prompt_eval_count":3,"eval_count":1}"#,
-            )
-            .await
+        // Default: a valid native-Ollama completion, streamed as one line.
+        _ => write_ndjson(&mut stream, &[ok_line()]).await,
+    }
+}
+
+const NDJSON_HEAD: &str =
+    "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n";
+
+fn content_line(content: &str, done: bool) -> String {
+    let v = serde_json::json!({
+        "message": {"role": "assistant", "content": content},
+        "done": done
+    });
+    format!("{v}\n")
+}
+
+fn done_line() -> String {
+    let v = serde_json::json!({
+        "message": {"role": "assistant", "content": ""},
+        "done": true, "done_reason": "stop",
+        "prompt_eval_count": 3, "eval_count": 1
+    });
+    format!("{v}\n")
+}
+
+/// The whole answer in one streamed line, as Ollama sends a short reply.
+fn ok_line() -> String {
+    let v = serde_json::json!({
+        "message": {"role": "assistant", "content": "OK"},
+        "done": true, "done_reason": "stop",
+        "prompt_eval_count": 3, "eval_count": 1
+    });
+    format!("{v}\n")
+}
+
+/// A streamed (close-delimited) body of JSON lines, as Ollama answers
+/// `stream: true`.
+async fn write_ndjson(stream: &mut tokio::net::TcpStream, lines: &[String]) {
+    let _ = stream.write_all(NDJSON_HEAD.as_bytes()).await;
+    for l in lines {
+        if stream.write_all(l.as_bytes()).await.is_err() {
+            return;
         }
     }
+    let _ = stream.flush().await;
 }
 
 async fn write_simple(stream: &mut tokio::net::TcpStream, code: u16, reason: &str, body: &str) {
@@ -523,7 +613,8 @@ fn a_stalled_exchange_is_counted_as_timeout() {
     // request, so by the time time is paused the TCP connection is established
     // and reqwest's 5 s connect timer is long gone. The 60 s exchange timeout
     // is then the only armed timer, so advancing past it can only fire the
-    // exit under test.
+    // exit under test. Since RFC 0014 P1 that timer is the FIRST-BYTE deadline:
+    // the mock never writes a byte of the answer.
     let _g = guard();
     let label = llm_provider_label(wit_llm::Provider::Ollama);
     rt().block_on(async {
@@ -544,7 +635,7 @@ fn a_stalled_exchange_is_counted_as_timeout() {
 
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(
-            super::LOCAL_LLM_EXCHANGE_TIMEOUT_SECS + 1,
+            super::LOCAL_LLM_FIRST_BYTE_TIMEOUT_SECS + 1,
         ))
         .await;
         let err = fut.await.expect_err("a stalled exchange must not complete");
@@ -797,5 +888,162 @@ fn the_tool_use_path_is_gated_too() {
             "the backend observed more than one simultaneous tool-use exchange; \
              the llm_tools call site is not holding the permit"
         );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0014 P1 — progress-based deadlines, driven through the PRODUCTION path
+// ---------------------------------------------------------------------------
+
+/// Both gated call sites must ask Ollama for a stream: a site that stayed
+/// non-streaming would still work against the mock (which answers either way)
+/// while quietly keeping the old total-deadline behaviour. One call per site.
+#[test]
+fn local_calls_are_streamed_at_both_call_sites() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+
+        let before = STREAMED_REQUESTS.load(Ordering::Relaxed);
+        let mut ctx = context_with_metrics(LlmTier::Tier1);
+        <TalosContext as wit_llm::Host>::complete(
+            &mut ctx,
+            request(wit_llm::Provider::Ollama, "mock-ok"),
+        )
+        .await
+        .expect("complete");
+        assert_eq!(
+            STREAMED_REQUESTS.load(Ordering::Relaxed),
+            before + 1,
+            "llm::complete sent a non-streaming local request"
+        );
+
+        let mut ctx = context_with_metrics_in_world(LlmTier::Tier1, CapabilityWorld::Secrets);
+        <TalosContext as wit_llm_tools::Host>::complete_with_tools(
+            &mut ctx,
+            tool_request("mock-ok"),
+        )
+        .await
+        .expect("complete_with_tools");
+        assert_eq!(
+            STREAMED_REQUESTS.load(Ordering::Relaxed),
+            before + 2,
+            "llm-tools::complete-with-tools sent a non-streaming local request"
+        );
+    });
+}
+
+fn tool_request(model: &str) -> wit_llm_tools::ToolCompletionRequest {
+    wit_llm_tools::ToolCompletionRequest {
+        provider: Some(wit_llm_tools::Provider::Ollama),
+        model: Some(model.to_string()),
+        messages: vec![wit_llm_tools::RichMessage {
+            role: wit_llm_tools::Role::User,
+            content: vec![wit_llm_tools::ContentBlock::Text("ping".to_string())],
+        }],
+        tools: vec![wit_llm_tools::ToolDefinition {
+            name: "noop".to_string(),
+            description: "does nothing".to_string(),
+            input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+        }],
+        max_tokens: Some(16),
+        temperature: None,
+        system_prompt: None,
+        force_tool: None,
+        response_schema: None,
+    }
+}
+
+/// THE regression, through the guest-facing entry point. The answer arrives
+/// one chunk every 20 s of VIRTUAL time, 100 s in all: every gap is inside the
+/// idle deadline, the total is well past the 60 s the old single deadline
+/// allowed. Before RFC 0014 P1 this call was cut at 60 s — the 2026-09-28
+/// failure of a healthy generation on an otherwise idle backend.
+///
+/// The clock is advanced by the test, never auto-advanced, so the pace is
+/// exact: the mock writes a chunk only when the test releases it.
+#[test]
+fn a_steady_local_answer_longer_than_the_old_total_completes() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        let mut ctx = context_with_metrics(LlmTier::Tier1);
+        let fut = <TalosContext as wit_llm::Host>::complete(
+            &mut ctx,
+            request(wit_llm::Provider::Ollama, "mock-steady"),
+        );
+        tokio::pin!(fut);
+
+        tokio::select! {
+            r = &mut fut => panic!("returned before the provider read the request: {r:?}"),
+            p = steady_signal().acquire() => { p.expect("semaphore").forget(); }
+        }
+
+        tokio::time::pause();
+        let gap = std::time::Duration::from_secs(20);
+        let mut elapsed = std::time::Duration::ZERO;
+        let driver = async {
+            for _ in 0..STEADY_CHUNKS {
+                tokio::time::advance(gap).await;
+                elapsed += gap;
+                steady_release().add_permits(1);
+                // Let the chunk cross the loopback and be read before the
+                // clock moves again. Real time, not virtual: the bytes travel
+                // through the kernel.
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(&mut fut, driver);
+        tokio::time::resume();
+
+        assert!(
+            elapsed.as_secs() > super::LOCAL_LLM_FIRST_BYTE_TIMEOUT_SECS,
+            "the test must outlast the old 60 s total to prove anything"
+        );
+        assert!(
+            gap.as_secs() < super::LOCAL_LLM_IDLE_TIMEOUT_SECS,
+            "each gap must be progress within the idle deadline"
+        );
+        let resp = result.expect("a steady answer must complete, however long it takes");
+        assert_eq!(resp.text, "01234");
+    });
+}
+
+/// Tool calls arrive in their own streamed line; the reassembled response
+/// must hand them to the guest exactly as the non-streaming API did.
+#[test]
+fn a_streamed_tool_call_reaches_the_guest() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        let mut ctx = context_with_metrics_in_world(LlmTier::Tier1, CapabilityWorld::Secrets);
+        let resp = <TalosContext as wit_llm_tools::Host>::complete_with_tools(
+            &mut ctx,
+            tool_request("mock-tool-stream"),
+        )
+        .await
+        .expect("streamed tool call");
+
+        let mut text = String::new();
+        let mut calls = Vec::new();
+        for block in &resp.content {
+            match block {
+                wit_llm_tools::ContentBlock::Text(t) => text.push_str(t),
+                wit_llm_tools::ContentBlock::ToolUse(c) => calls.push(c),
+                other => panic!("unexpected block {other:?}"),
+            }
+        }
+        assert_eq!(text, "Calling noop.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_name, "noop");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].arguments).unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        let usage = resp.usage.expect("usage from the done line");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (3, 1));
     });
 }

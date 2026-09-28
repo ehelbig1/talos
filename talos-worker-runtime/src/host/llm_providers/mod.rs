@@ -175,8 +175,8 @@ pub(crate) trait ProviderAdapter: Send + Sync {
     /// Canonical lowercase provider label (metrics, logs).
     fn name(&self) -> &'static str;
 
-    /// Local providers bypass the guest SSRF resolver and use the
-    /// shorter `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` (see `llm.rs`).
+    /// Local providers bypass the guest SSRF resolver and are streamed
+    /// under progress deadlines (RFC 0014 P1, `host::llm_local_stream`).
     fn is_local(&self) -> bool {
         false
     }

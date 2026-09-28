@@ -414,21 +414,25 @@ pub(crate) const EXECUTION_DURATION_BOUNDARIES_MS: &[f64] = &[
 ///   a p95 pinned at a bound; bracketing it in `(30000, 40000]` leaves it
 ///   interpolated. Recovered occupancy `(20,30]` = 19, `(30,40]` = 6,
 ///   `(40,60]` = 8.
-/// * **`60000`** — `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS`. A local call cannot
-///   exceed it, so `le="60000"` is the "every Ollama call that succeeded" mark
-///   and the bucket above it is structurally external-only.
+/// * **`60000`** — the old `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` total. Until
+///   RFC 0014 P1 (2026-09-28) a local call could not exceed it, so the bucket
+///   above was structurally external-only. **No longer**: a local exchange is
+///   now bounded by progress (first byte and idle, 60 s each, under a 600 s
+///   ceiling), so a long local answer lands above `le="60000"`. The boundary is
+///   kept — it now separates "would have been cut before P1" from the rest.
 /// * **`120000`** — `EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS`. **No boundary
-///   between 60 s and 120 s**: that entire region is reachable only by
-///   external-provider traffic, of which this deployment currently has none
-///   (see the provider note below). Splitting it would be imagination, not
-///   measurement.
+///   between 60 s and 120 s**: when these boundaries were measured that region
+///   was reachable only by external-provider traffic, of which this deployment
+///   has none. Since RFC 0014 P1 long local answers can land there too; a
+///   boundary waits for their distribution to be measured.
 ///
 /// ## Why `+Inf` is near-empty here, unlike the sibling
 ///
 /// `EXECUTION_DURATION_BOUNDARIES_MS`'s top bound is a per-node *default* that
 /// a node can legitimately run past. This one is closer to a clamp: the
-/// `tokio::time::timeout` around the HTTP exchange is unconditional at 60/120 s
-/// with no per-request override. **Not a hard guarantee, and the difference is
+/// `tokio::time::timeout` around an external HTTP exchange is unconditional at
+/// 120 s with no per-request override, and a local exchange is capped by
+/// `LOCAL_LLM_EXCHANGE_CEILING_SECS` (600 s). **Not a hard guarantee, and the difference is
 /// worth stating rather than rounding off:** `llm_start` is taken before key
 /// resolution (a vault RPC) and the duration is read after response parsing, so
 /// a recorded value CAN exceed the timeout — but only by time spent outside the

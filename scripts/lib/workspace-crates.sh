@@ -13,11 +13,21 @@
 # Paths are repository-relative and the caller's working directory must be
 # the repository root.
 
+# A directory is a workspace crate only if the root manifest lists it as a
+# member. A package outside the workspace — every catalog template under
+# `module-templates/` has its own `[package]` — is not something
+# `cargo check -p` can name, and passing it made the pre-commit hook refuse
+# every commit that touched a template.
+is_workspace_member() {
+    grep -qE "^[[:space:]]*\"$1\"[[:space:]]*,?[[:space:]]*(#.*)?$" Cargo.toml
+}
+
 crate_for() {
     local dir
     dir=$(dirname "$1")
     while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
         if [ -f "$dir/Cargo.toml" ] && grep -q '^\[package\]' "$dir/Cargo.toml" 2>/dev/null; then
+            is_workspace_member "$dir" || return 1
             grep -m1 '^name[[:space:]]*=' "$dir/Cargo.toml" \
                 | sed -E 's/^name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/'
             return 0

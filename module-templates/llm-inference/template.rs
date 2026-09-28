@@ -902,8 +902,11 @@ fn llm_error_message(err: talos::core::llm::Error, provider_str: &str, model: &s
             provider_str, detail
         ),
         Error::Timeout => format!(
-            "LLM provider '{}' timed out (host-side timeout, default 30s). Reduce MAX_TOKENS \
-             or split the request into smaller chunks.",
+            "LLM provider '{}' timed out: the host stopped waiting because the response made \
+             no progress in time. For a local model the host allows 60 s to the first byte \
+             and 60 s between chunks, however long the whole answer takes; the model may be \
+             loading, overloaded or stuck. External providers have a 120 s total deadline, \
+             where a smaller MAX_TOKENS helps.",
             provider_str
         ),
         Error::BudgetExhausted => {
