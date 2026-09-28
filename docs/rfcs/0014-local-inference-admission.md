@@ -1,6 +1,6 @@
 # RFC 0014 — Local inference that does not depend on the schedule
 
-**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28
+**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28; P2c measured and not built 2026-09-28
 **Author:** Platform
 **Date:** 2026-09-28
 
@@ -17,7 +17,7 @@ Four phases:
    out.
 2. **P2:** time spent **waiting** for the backend is not charged to a call's
    deadlines (P2a: the job's; P2b: the run's), and waiting calls are admitted
-   fairly and model-aware (P2c).
+   fairly and model-aware (P2c — measured, not built).
 3. **P3:** admission is **fleet-wide** and covers the controller's own Ollama
    client.
 4. **P4:** timeouts are **classified** for retry and made **visible**.
@@ -215,13 +215,36 @@ lost is abandoned at its window exactly as before P2.
   also holds it. That errs toward more time, and is bounded by the cap.
 - Pipeline jobs (dormant) carry no clock.
 
-### P2c — fair, model-aware admission (proposed)
+### P2c — fair, model-aware admission: measured, NOT built (2026-09-28)
 
-1. **Fair order.** FIFO across *workflow runs*, not across calls, so one run's
-   fan-out cannot starve the others.
-2. **Model-aware order.** Among waiting calls, prefer those for the model already
-   loaded, with bounded unfairness (an aging limit). This saves 3–8 s per avoided
-   swap and removes the retry-amplified thrash seen on 09-28.
+**Decided: not built.** It was measured first and would change almost nothing on
+this fleet. The numbers come from 30 days of `module_executions` for the 8
+modules whose source calls the local LLM (1,445 completed calls), with each
+call's model attributed from its workflow node's `MODEL`.
+
+1. **Fair order across runs: no effect.** 0 of 1,445 calls overlapped another
+   call from the SAME run; no run ever had two local LLM calls in flight. The
+   gate's per-call FIFO is therefore already per-run FIFO. 194 calls (13 %)
+   overlapped a call from a DIFFERENT run, and FIFO serves those in arrival
+   order as fairness requires.
+2. **Model-aware order: negligible effect.** Reordering saves a model swap only
+   when three or more calls are in flight with mixed models; with two, the
+   second model must load either way.
+   - 87 calls had two or more others in flight.
+   - 16 of those, on 5 days, involved a known different model.
+   - Those counts are an UPPER bound: a module execution's interval contains its
+     LLM call and other work.
+   - Each such event saves at most one load (3–8 s on this host), so a couple
+     of minutes a month. That does not justify an aging scheduler and its
+     starvation risk inside the gate.
+3. **Where the swaps actually come from:** models used one AFTER another over
+   time (`qwen2.5-coder:14b` between `qwen3.6` calls), which no queue order can
+   fix. Keeping both models resident does: the `OLLAMA_CONTEXT_LENGTH` operator
+   item below.
+
+**Revisit when** a workflow fans out parallel local LLM calls within one run,
+worker replicas grow past one (the gate is per process; P3), or overlapping
+mixed-model calls become common. Re-run the same measurement first.
 
 ### P3 — fleet-wide admission (proposed)
 
