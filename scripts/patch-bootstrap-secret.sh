@@ -83,8 +83,12 @@ if ! "${KUBECTL[@]}" -n "$NAMESPACE" get secret "$SECRET" >/dev/null 2>&1; then
 fi
 
 # ── Collect KEY=VALUE pairs from args + stdin ────────────────────────────────
-declare -A pairs=()
-declare -a key_order=()
+# Parallel indexed arrays instead of `declare -A` so this runs under the
+# bash 3.2 macOS ships: key_order[i] is the i-th distinct key in first-seen
+# order, key_vals[i] its value (a repeated key keeps its position and the
+# last value wins).
+key_order=()
+key_vals=()
 
 add_pair() {
     local kv="$1"
@@ -104,10 +108,15 @@ add_pair() {
             exit 1
         fi
     fi
-    if [ -z "${pairs[$key]+set}" ]; then
-        key_order+=("$key")
-    fi
-    pairs["$key"]="$val"
+    local i
+    for i in "${!key_order[@]}"; do
+        if [ "${key_order[$i]}" = "$key" ]; then
+            key_vals[$i]="$val"
+            return
+        fi
+    done
+    key_order+=("$key")
+    key_vals+=("$val")
 }
 
 if [ $# -gt 0 ]; then
@@ -130,7 +139,7 @@ EOF
     exit 1
 fi
 
-if [ ${#pairs[@]} -eq 0 ]; then
+if [ ${#key_order[@]} -eq 0 ]; then
     err "No KEY=VALUE pairs supplied."
     exit 1
 fi
@@ -156,17 +165,17 @@ jq_args=()
 jq_filter='{stringData: {}}'
 for i in "${!key_order[@]}"; do
     k="${key_order[$i]}"
-    (umask 077; printf '%s' "${pairs[$k]}" > "$STAGE_DIR/v$i")
+    (umask 077; printf '%s' "${key_vals[$i]}" > "$STAGE_DIR/v$i")
     jq_args+=(--arg "k$i" "$k" --rawfile "v$i" "$STAGE_DIR/v$i")
     jq_filter+=" | .stringData[\$k$i] = \$v$i"
 done
 (umask 077; jq -n "${jq_args[@]}" "$jq_filter" > "$STAGE_DIR/patch.json")
 
-say "Patching $NAMESPACE/$SECRET with ${#pairs[@]} key(s):"
-for k in "${key_order[@]}"; do
+say "Patching $NAMESPACE/$SECRET with ${#key_order[@]} key(s):"
+for i in "${!key_order[@]}"; do
     # Mask the value (show length only) so secrets don't end up in the
     # operator's terminal scrollback.
-    printf '  %s%s%s = <%d chars>\n' "$DIM" "$k" "$RESET" "${#pairs[$k]}"
+    printf '  %s%s%s = <%d chars>\n' "$DIM" "${key_order[$i]}" "$RESET" "${#key_vals[$i]}"
 done
 
 if ! "${KUBECTL[@]}" -n "$NAMESPACE" patch secret "$SECRET" --patch-file "$STAGE_DIR/patch.json"; then
