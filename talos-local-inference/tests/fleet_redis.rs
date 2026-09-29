@@ -472,7 +472,7 @@ async fn a_free_fleet_reports_nothing() {
     let url = url_or_skip!();
     let p = process(&url, &backend(), 1, TIMING).await;
     let seen = Counting::default();
-    let (slot, _) = admit(
+    let (slot, waited) = admit(
         Some(&p.gate),
         Some(&p.fleet),
         Duration::from_secs(5),
@@ -483,6 +483,10 @@ async fn a_free_fleet_reports_nothing() {
     assert!(matches!(slot, LocalLlmSlot::Held(_)));
     assert_eq!(seen.begun.load(Ordering::SeqCst), 0);
     assert_eq!(seen.ended.load(Ordering::SeqCst), 0);
+    // The measured wait is NOT zero even so: it counts the Redis round trip.
+    // So "the call queued" must be read from the observer, never from the
+    // duration (the controller's log line did the latter until 2026-09-29).
+    assert!(waited > Duration::ZERO);
 }
 
 /// RFC 0014 P4b: a switch is counted when a call is admitted for a different

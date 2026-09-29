@@ -485,6 +485,52 @@ fn build_chat_body(
     body
 }
 
+/// Whether a call actually WAITED in a queue — its process's gate or the
+/// fleet queue. The gate calls `begin_wait` only then, so this is the signal
+/// for the "queued" log line. The measured `waited` duration is not: since
+/// RFC 0014 P3b it also counts the fleet queue's Redis round trip, so it is
+/// non-zero on every call, and the line it gated claimed queueing on calls
+/// admitted at once (measured live 2026-09-29: 9 of 9 controller calls, each
+/// admitted with 0 ahead).
+#[derive(Default)]
+struct QueuedFlag(std::sync::atomic::AtomicBool);
+
+impl QueuedFlag {
+    fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl talos_local_inference::gate::QueueWaitObserver for QueuedFlag {
+    fn begin_wait(&self) -> impl std::future::Future<Output = ()> + Send {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::future::ready(())
+    }
+    fn end_wait(&self) -> impl std::future::Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+}
+
+/// What the gate's outcome warrants in the controller's log.
+#[derive(Debug, PartialEq, Eq)]
+enum GateLog {
+    /// The wait cap passed and the call proceeds ungated.
+    WaitExpired,
+    /// The call waited in a queue and was admitted.
+    Queued,
+    /// Admitted at once, or the gate is off.
+    Nothing,
+}
+
+fn gate_log(slot: &talos_local_inference::gate::LocalLlmSlot, queued: bool) -> GateLog {
+    use talos_local_inference::gate::{LocalLlmSlot, Ungated};
+    match slot {
+        LocalLlmSlot::Ungated(Ungated::WaitExpired) => GateLog::WaitExpired,
+        _ if queued => GateLog::Queued,
+        _ => GateLog::Nothing,
+    }
+}
+
 /// Map a failed local exchange to the controller's error. The HTTP-status
 /// wording is load-bearing (see [`OllamaClient::complete_structured`]); the
 /// provider's own text is never included — the exchange logs it DLP-redacted.
@@ -708,19 +754,20 @@ impl OllamaClient {
 
         // Bound, never `_`: the permit is released on drop, and it must be
         // held for the whole exchange.
-        let (_slot, waited) = gate::acquire_process_slot::<gate::NoWaitObserver>(None, model).await;
-        match &_slot {
-            gate::LocalLlmSlot::Ungated(gate::Ungated::WaitExpired) => warn!(
+        let queued = QueuedFlag::default();
+        let (_slot, waited) = gate::acquire_process_slot(Some(&queued), model).await;
+        match gate_log(&_slot, queued.get()) {
+            GateLog::WaitExpired => warn!(
                 model,
                 waited_ms = waited.as_millis() as u64,
                 "controller local LLM call waited out the gate; proceeding ungated"
             ),
-            _ if !waited.is_zero() => tracing::info!(
+            GateLog::Queued => tracing::info!(
                 model,
                 waited_ms = waited.as_millis() as u64,
                 "controller local LLM call queued for the gate"
             ),
-            _ => {}
+            GateLog::Nothing => {}
         }
 
         stream::request_streaming(&mut body);
