@@ -10,10 +10,10 @@ why, and when the operator should bump.
 
 | Crate                | Version  | Pinned in                          |
 |----------------------|----------|------------------------------------|
-| `wasmtime`           | 48.0.3   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime-wasi`      | 48.0.3   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime-wasi-http` | 48.0.3   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime`           | 48.0.3   | `worker/Cargo.toml` (dev-dep)      |
+| `wasmtime`           | 49.0.1   | `talos-worker-runtime/Cargo.toml`  |
+| `wasmtime-wasi`      | 49.0.1   | `talos-worker-runtime/Cargo.toml`  |
+| `wasmtime-wasi-http` | 49.0.1   | `talos-worker-runtime/Cargo.toml`  |
+| `wasmtime`           | 49.0.1   | `worker/Cargo.toml` (dev-dep)      |
 
 The runtime library (`TalosRuntime`, the engine config, the AOT cache) was
 extracted from `worker/` to `talos-worker-runtime/` in July 2026, so that
@@ -42,6 +42,7 @@ column is the version bumped *to*.
 
 | Version  | Identifier             | Class                                    |
 |----------|------------------------|------------------------------------------|
+| 49.0.1   | (support window)       | 48 stops receiving security backports once 50 ships; 49 also carries RUSTSEC-2026-0313…0316. Needs Rust 1.96 |
 | 48.0.3   | RUSTSEC-2026-0313      | `wasi:http` outgoing body write allows guest-driven host memory exhaustion |
 | 48.0.3   | RUSTSEC-2026-0314      | Guest can panic the host through a WASI filesystem datetime overflow |
 | 48.0.3   | RUSTSEC-2026-0315      | `call_ref` + exception `catch` can drop fuel accounting (exponential fuel amplification) |

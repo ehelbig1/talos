@@ -433,7 +433,13 @@ pub struct SecurityPolicy {
 ///             amplification, -0316 dynamic record lifting past the hostcall
 ///             fuel limit). Same reason again: V8 blobs are rejected by header
 ///             and recompile on next use.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV9";
+///   TALOSV10 — 2026-09-29: wasmtime 48→49 on Rust 1.96 (48 stops receiving
+///             security backports once 50 ships). The fingerprint also gained
+///             `wasm_wide_arithmetic=false` (49 enables the proposal by
+///             default; pinned off) and the explicit variable fuel costs
+///             (`memory.grow` now 1 fuel per page). V9 blobs are rejected by
+///             header and recompile on next use.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV10";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
@@ -531,7 +537,7 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
 /// moment it mattered.
 macro_rules! wasmtime_version {
     () => {
-        "48.0.3"
+        "49.0.1"
     };
 }
 
@@ -588,6 +594,8 @@ const ENGINE_CONFIG_FINGERPRINT: &[u8] = concat!(
     op_cost.table_grow=128\n\
     op_cost.memory_fill=5\n\
     op_cost.memory_copy=5\n\
+    op_cost.variable=wasmtime_default\n\
+    op_cost.variable.memory_grow_per_page=1\n\
     wasm_component_model=true\n\
     wasm_threads=false\n\
     wasm_simd=false\n\
@@ -598,6 +606,7 @@ const ENGINE_CONFIG_FINGERPRINT: &[u8] = concat!(
     wasm_function_references=false\n\
     wasm_tail_call=false\n\
     wasm_component_model_memory64=false\n\
+    wasm_wide_arithmetic=false\n\
     wasm_bulk_memory=true\n\
     wasm_reference_types=true\n\
     epoch_interruption=true\n\
@@ -940,7 +949,7 @@ mod aot_hmac_input_tests {
         // Pinned SHA-256 of the canonical fingerprint constant.
         // If this fails, ENGINE_CONFIG_FINGERPRINT was edited (config knob
         // or the wasmtime= line). See test doc for the update procedure.
-        const EXPECTED: &str = "e3ffc9bc9869d25e0eb914425d6e312f780961016c71b71351cf62e01e8e1ed5";
+        const EXPECTED: &str = "d14274e00c7dcf3638ff14585b073ee61c56b2866110cf025c7e7a6e37e6f60b";
         let actual = hex::encode(super::engine_config_fingerprint_hash());
         assert_eq!(
             actual, EXPECTED,
@@ -3260,6 +3269,16 @@ impl TalosRuntime {
             TableGrow: 128,  // funcref table growth
             MemoryFill: 5,   // bulk memory fill
             MemoryCopy: 5,   // bulk memory copy
+            // Work whose size is only known at runtime (Wasmtime 48+), pinned
+            // explicitly so a future default change shows up in the
+            // fingerprint. Wasmtime 49 began charging `memory.grow` 1 fuel per
+            // 64 KiB page on top of the fixed charge above (48 charged 0);
+            // kept, since growing a whole module memory costs at most a few
+            // thousand fuel against budgets in the millions.
+            variable: wasmtime::VariableOperatorCost {
+                memory_grow_per_page: 1,
+                ..wasmtime::VariableOperatorCost::new()
+            },
             ..wasmtime::OperatorCost::default()
         };
         config.operator_cost(op_cost);
@@ -3292,6 +3311,12 @@ impl TalosRuntime {
         // Wasmtime 48: new knob, off by default ("very incomplete" upstream).
         // Pinned off so a future default flip cannot widen the surface.
         config.wasm_component_model_memory64(false);
+        // Wasmtime 49 turned wide-arithmetic (`i64.add128`, `i64.mul_wide_*`)
+        // ON by default — exactly the silent codegen widening this list exists
+        // to stop. No module needs it: rustc's wasm32-wasip2 target does not
+        // enable the feature, and all 115 installed modules validate without
+        // it (measured 2026-09-29).
+        config.wasm_wide_arithmetic(false);
         config.wasm_bulk_memory(true);
         config.wasm_reference_types(true);
 
@@ -6841,6 +6866,71 @@ mod pipeline_step_retry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The proposal lockdown holds on the PRODUCTION engine, not only in the
+    /// config text: a module using a proposal Talos pins off does not compile.
+    /// Wide arithmetic is the case Wasmtime 49 turned ON by default.
+    /// Controls: an ordinary module compiles, and a SIMD module (locked down
+    /// since 2026-05) is refused, so the harness can see a refusal at all.
+    /// `memory.grow` is charged per page grown (Wasmtime 49's default, pinned
+    /// explicitly in the engine config). Measured as a difference, so the
+    /// fixed per-instruction charge cancels: growing 16 pages costs exactly
+    /// 16 fuel more than growing 0.
+    #[tokio::test]
+    async fn memory_grow_is_charged_per_page_on_the_production_engine() {
+        let engine = TalosRuntime::new().expect("runtime").engine_handle();
+        let module = wasmtime::Module::new(
+            &engine,
+            "(module (memory 1 64) \
+             (func (export \"grow\") (param i32) (result i32) \
+               local.get 0 memory.grow))",
+        )
+        .expect("module");
+        let fuel_for = |pages: i32| {
+            let engine = engine.clone();
+            let module = module.clone();
+            async move {
+                let mut store = wasmtime::Store::new(&engine, ());
+                store.set_fuel(1_000_000).unwrap();
+                // Production arms a deadline per execution; a fresh store's is
+                // 0, which interrupts at once under `epoch_interruption`.
+                store.set_epoch_deadline(1_000_000);
+                let instance = wasmtime::Instance::new_async(&mut store, &module, &[])
+                    .await
+                    .expect("instance");
+                let grow = instance
+                    .get_typed_func::<i32, i32>(&mut store, "grow")
+                    .expect("export");
+                let before = store.get_fuel().unwrap();
+                let old = grow.call_async(&mut store, pages).await.expect("grow");
+                assert_eq!(old, 1, "grew from the initial single page");
+                before - store.get_fuel().unwrap()
+            }
+        };
+        assert_eq!(fuel_for(16).await - fuel_for(0).await, 16);
+    }
+
+    #[test]
+    fn the_production_engine_refuses_locked_down_proposals() {
+        let engine = TalosRuntime::new().expect("runtime").engine_handle();
+        let compiles = |wat: &str| wasmtime::Module::new(&engine, wat).is_ok();
+
+        assert!(
+            compiles("(module (func (result i64) i64.const 1))"),
+            "control: an ordinary module compiles"
+        );
+        assert!(
+            !compiles("(module (func (result v128) v128.const i64x2 0 0))"),
+            "control: SIMD stays locked down"
+        );
+        assert!(
+            !compiles(
+                "(module (func (param i64 i64 i64 i64) (result i64 i64) \
+                 local.get 0 local.get 1 local.get 2 local.get 3 i64.add128))"
+            ),
+            "wide-arithmetic is on by default in Wasmtime 49 and must be pinned off"
+        );
+    }
 
     #[test]
     fn health_status_initial_values() {
