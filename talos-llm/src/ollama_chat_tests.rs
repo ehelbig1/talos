@@ -289,7 +289,55 @@ async fn control_the_mock_serves_two_ungated_requests_at_once() {
 fn chat_passes_its_model_to_the_gate() {
     let src: String = include_str!("lib.rs").split_whitespace().collect();
     assert!(
-        src.contains("gate::acquire_process_slot::<gate::NoWaitObserver>(None,model)"),
+        src.contains("gate::acquire_process_slot(Some(&queued),model)"),
         "OllamaClient::chat does not pass its model to the gate"
     );
+}
+
+/// The "queued" log line follows whether the call WAITED, not whether the
+/// measured wait was non-zero: a call admitted at once logs nothing, a call
+/// that queued logs, and an expired wait logs its own warning. Driven through
+/// the real gate with its own semaphore.
+#[tokio::test]
+async fn the_queued_line_follows_a_real_wait_not_a_nonzero_duration() {
+    use super::{gate_log, GateLog, QueuedFlag};
+    use talos_local_inference::gate::admit;
+    use tokio::sync::Semaphore;
+
+    let sem = Arc::new(Semaphore::new(1));
+
+    // Free slot: admitted at once, however long the admission took.
+    let free = QueuedFlag::default();
+    let (slot, _) = admit(Some(&sem), None, Duration::from_secs(5), Some(&free), "m").await;
+    assert_eq!(gate_log(&slot, free.get()), GateLog::Nothing);
+
+    // Held slot: the second call queues until the first is released.
+    let waiting = QueuedFlag::default();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(slot);
+    });
+    let (second, _) = admit(
+        Some(&sem),
+        None,
+        Duration::from_secs(5),
+        Some(&waiting),
+        "m",
+    )
+    .await;
+    release.await.unwrap();
+    assert_eq!(gate_log(&second, waiting.get()), GateLog::Queued);
+
+    // Held past the cap: the warning, not the info line.
+    let expired = QueuedFlag::default();
+    let (late, _) = admit(
+        Some(&sem),
+        None,
+        Duration::from_millis(50),
+        Some(&expired),
+        "m",
+    )
+    .await;
+    assert_eq!(gate_log(&late, expired.get()), GateLog::WaitExpired);
+    drop(second);
 }
