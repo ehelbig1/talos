@@ -36,7 +36,7 @@ env:
   CARGO_TERM_COLOR: always
   # Single source of truth for the toolchain — keep in lockstep with ci.yml
   # and rust-toolchain.toml.
-  RUST_TOOLCHAIN: "1.95"
+  RUST_TOOLCHAIN: "1.96"
 
 concurrency:
   # Only PR runs cancel each other (a newer push to the branch supersedes the
