@@ -70,6 +70,10 @@ mod crypto;
 mod data;
 mod database;
 mod egress;
+/// The operator-grant host matcher the egress gates use, exported so the
+/// controller can reason about an `allowed_hosts` list by the same rule the
+/// worker enforces (no second implementation to drift).
+pub use egress::host_allowlist_match;
 mod egress_admission;
 mod email;
 mod files;

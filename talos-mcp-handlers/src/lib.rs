@@ -161,6 +161,8 @@ pub mod executions;
 pub mod graph;
 #[cfg(test)]
 mod inherited_grants_pins;
+#[cfg(test)]
+mod install_grants_pin;
 pub mod knowledge_graph;
 pub mod ml;
 pub mod modules;

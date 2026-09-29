@@ -311,7 +311,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "install_module_from_catalog",
-            "description": "Compile and install a built-in module template from the catalog. Returns a module_id ready for use in add_node_to_workflow. Much faster than writing custom code for common patterns. Response always includes module_id, name, wasm_sha256 (hex SHA-256 of the compiled bytes), compiled_at (RFC3339 UTC of when the WASM was written), and bytes_changed (true on first install OR when the source produced different bytes than the prior install — false signals an idempotent no-op). Use bytes_changed/wasm_sha256 to verify a reinstall actually picked up new source after a platform deploy. Check for optional warning fields: grant_empty_warning (module has deny-all secret access — every vault:// config value will fail at runtime, reinstall with allowed_secrets) and wildcard_grant_warning (module has wildcard [\"*\"] secret access — consider scoping to explicit paths to limit blast radius).",
+            "description": "Compile and install a built-in module template from the catalog. Returns a module_id ready for use in add_node_to_workflow. Much faster than writing custom code for common patterns. Response always includes module_id, name, wasm_sha256 (hex SHA-256 of the compiled bytes), compiled_at (RFC3339 UTC of when the WASM was written), and bytes_changed (true on first install OR when the source produced different bytes than the prior install — false signals an idempotent no-op). Use bytes_changed/wasm_sha256 to verify a reinstall actually picked up new source after a platform deploy. Check for optional warning fields: grant_empty_warning (module has deny-all secret access — every vault:// config value will fail at runtime, reinstall with allowed_secrets) and wildcard_grant_warning (module has wildcard [\"*\"] secret access — consider scoping to explicit paths to limit blast radius). A REINSTALL keeps your installed copy's allowed_hosts / allowed_methods / allowed_secrets, bounded by the new template's grant, unless you pass them: grants_carried_from_installed_copy says whether a copy existed and grants_not_carried lists anything the template no longer grants.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -320,12 +320,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_secrets": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Vault key paths this module is permitted to read. Values are MERGED (union) with the catalog template's required minimums — you can add paths but cannot remove the template's required ones. Pass your actual vault paths (e.g. ['anthropic/api_key', 'openai/api_key']). Use ['*'] to allow all secrets. SECURITY NOTE: empty [] does not mean deny-all for catalog modules — the template's own required_secrets are always included. If a reinstall omits this parameter, the stored list is preserved (no accidental clearing)."
+                        "description": "Vault key paths this module may read. The template's own grant is the CEILING: your list can only NARROW it — an exact template path, a path under a template prefix or glob, or ['*'] meaning the template's whole list. Paths outside the template's grant are not installed and are listed in secrets_not_granted. An empty list [] installs a deny-all grant. Omitted on a FIRST install: the template's grant. Omitted on a REINSTALL: your installed copy's current grant is kept, bounded by the new template's grant (see grants_not_carried)."
                     },
                     "allowed_methods": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "HTTP method allowlist (e.g. ['GET', 'POST']). EMPTY DENIES EVERY VERB at all five egress gates (http fetch / fetch_all, graphql, webhook, SSE connect) — the same rule allowed_hosts and allowed_secrets have always had; before 2026-09-24 empty meant allow-all, which made this the one grant where declaring nothing granted everything. Empty also classifies the module UNKNOWN (not read-only) for the method-aware retry default, so nodes created from it get retry_count 0. There is no wildcard: the method set is closed at five, so 'every verb' is ['GET','POST','PUT','PATCH','DELETE'] written out. Declare ['GET'] on a read-only module to enforce read-only egress AND earn transient retries."
+                        "description": "HTTP method allowlist (e.g. ['GET', 'POST']). EMPTY DENIES EVERY VERB at all five egress gates (http fetch / fetch_all, graphql, webhook, SSE connect) — the same rule allowed_hosts and allowed_secrets have always had; before 2026-09-24 empty meant allow-all, which made this the one grant where declaring nothing granted everything. Empty also classifies the module UNKNOWN (not read-only) for the method-aware retry default, so nodes created from it get retry_count 0. There is no wildcard: the method set is closed at five, so 'every verb' is ['GET','POST','PUT','PATCH','DELETE'] written out. Declare ['GET'] on a read-only module to enforce read-only egress AND earn transient retries. Passed: ADDED to the template's verbs. Omitted on a REINSTALL: your installed copy's current verbs are kept, bounded by the template's."
                     },
                     "pin_module": { "type": "boolean", "description": "Mark module as pinned so restore_pinned_modules reinstalls it on session start. Useful for modules you always want available (e.g. llm-inference, http-request). Default: false." },
                     "fuel_budget": {
@@ -3174,6 +3174,110 @@ fn default_allowed_hosts_for_world(world: &str) -> Vec<String> {
     }
 }
 
+/// The three grants an install writes, and what a reinstall could not carry.
+pub(crate) struct InstallGrants {
+    pub(crate) hosts: Vec<String>,
+    pub(crate) methods: Vec<String>,
+    pub(crate) secrets: Vec<String>,
+    /// Per grant, the stored entries the new template no longer grants.
+    pub(crate) not_carried: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The ONE rule for which grants an install writes (2026-09-29).
+///
+/// `hosts` / `methods` / `secrets` are what a FIRST install would write: the
+/// template's grant, with the caller's explicit parameters already applied.
+/// On a first install (`installed` is `None`) they are written as-is. On a
+/// REINSTALL each grant the caller did NOT pass is the installed copy's
+/// stored grant, bounded by those template values; a grant the caller did
+/// pass keeps today's rule. Hosts have no caller parameter, so they are
+/// always carried.
+pub(crate) fn grants_for_install(
+    installed: Option<&talos_module_repository::StoredModuleGrants>,
+    hosts: Vec<String>,
+    methods: Vec<String>,
+    secrets: Vec<String>,
+    caller_passed_methods: bool,
+    caller_passed_secrets: bool,
+) -> InstallGrants {
+    let mut not_carried = serde_json::Map::new();
+    let Some(stored) = installed else {
+        return InstallGrants {
+            hosts,
+            methods,
+            secrets,
+            not_carried,
+        };
+    };
+    let (hosts, hosts_dropped) = carry_host_grant(&stored.hosts, &hosts);
+    let (methods, methods_dropped) = if caller_passed_methods {
+        (methods, Vec::new())
+    } else {
+        carry_method_grant(&stored.methods, &methods)
+    };
+    let (secrets, secrets_dropped) = if caller_passed_secrets {
+        (secrets, Vec::new())
+    } else {
+        narrow_secret_grant(&secrets, &stored.secrets)
+    };
+    for (key, dropped) in [
+        ("allowed_hosts", hosts_dropped),
+        ("allowed_methods", methods_dropped),
+        ("allowed_secrets", secrets_dropped),
+    ] {
+        if !dropped.is_empty() {
+            not_carried.insert(key.to_string(), serde_json::json!(dropped));
+        }
+    }
+    InstallGrants {
+        hosts,
+        methods,
+        secrets,
+        not_carried,
+    }
+}
+
+/// One grant list carried from an installed copy onto its reinstall:
+/// `(carried, not_carried)`.
+type CarriedList = (Vec<String>, Vec<String>);
+
+/// Carry an installed copy's stored HOST grant onto its reinstall, bounded
+/// by the new template's grant (2026-09-29).
+///
+/// A reinstall used to write the template's grant over whatever the copy
+/// held, so an operator's narrowing (`update_module_hosts`) was silently
+/// undone. Now each stored entry is kept only if the template still grants
+/// it, by the worker's own matcher: the template holds `"*"`, holds the same
+/// entry, or (for an exact host) admits it through a suffix pattern. The
+/// result is never wider than either list; dropped entries are returned so
+/// the response can name them.
+pub(crate) fn carry_host_grant(stored: &[String], template: &[String]) -> CarriedList {
+    let norm = |h: &str| h.trim_end_matches('.').to_ascii_lowercase();
+    let template_has_wildcard = template.iter().any(|t| t == "*");
+    let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+    for e in stored {
+        let is_exact_host = e != "*" && !e.starts_with('.');
+        let admitted = template_has_wildcard
+            || template.iter().any(|t| norm(t) == norm(e))
+            || (is_exact_host && talos_worker_runtime::host::host_allowlist_match(template, e));
+        if admitted {
+            kept.push(e.clone())
+        } else {
+            dropped.push(e.clone())
+        }
+    }
+    (kept, dropped)
+}
+
+/// Carry a stored METHOD grant onto a reinstall: a verb survives only if the
+/// new template still grants it. See [`carry_host_grant`].
+pub(crate) fn carry_method_grant(stored: &[String], template: &[String]) -> CarriedList {
+    stored
+        .iter()
+        .cloned()
+        .partition(|m| template.iter().any(|t| t.eq_ignore_ascii_case(m)))
+}
+
 /// Narrow a template's secret grant by a caller-supplied `allowed_secrets`
 /// list (2026-09-10). Returns `(granted, not_granted)`.
 ///
@@ -3223,6 +3327,154 @@ pub(crate) fn narrow_secret_grant(
         }
     }
     (granted, not_granted)
+}
+
+#[cfg(test)]
+mod carry_grant_tests {
+    use super::{carry_host_grant, carry_method_grant, narrow_secret_grant};
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The live case (2026-09-29): three installed Gmail copies are pinned to
+    /// one account's token while the template grants every Gmail path. A
+    /// reinstall must keep the pin, not widen it back to the template.
+    #[test]
+    fn a_narrowed_secret_grant_survives_a_reinstall() {
+        let pinned = v(&["oauth/gmail/u1/me@example.com/access_token"]);
+        let (kept, dropped) = narrow_secret_grant(&v(&["oauth/gmail/*"]), &pinned);
+        assert_eq!(kept, pinned);
+        assert!(dropped.is_empty());
+    }
+
+    /// The other direction: a path the new template no longer grants is not
+    /// carried, and is reported.
+    #[test]
+    fn a_secret_the_template_dropped_is_not_carried() {
+        let (kept, dropped) =
+            narrow_secret_grant(&v(&["slack/token"]), &v(&["slack/token", "github/token"]));
+        assert_eq!(kept, v(&["slack/token"]));
+        assert_eq!(dropped, v(&["github/token"]));
+    }
+
+    #[test]
+    fn a_narrowed_host_grant_survives_a_wildcard_template() {
+        let (kept, dropped) = carry_host_grant(&v(&["api.example.com"]), &v(&["*"]));
+        assert_eq!(kept, v(&["api.example.com"]));
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn a_host_is_carried_only_while_the_template_grants_it() {
+        let template = v(&["api.example.com", ".googleapis.com"]);
+        let (kept, dropped) = carry_host_grant(
+            &v(&[
+                "API.example.com.",
+                "gmail.googleapis.com",
+                "evil.example.net",
+                "*",
+                ".other.com",
+            ]),
+            &template,
+        );
+        assert_eq!(kept, v(&["API.example.com.", "gmail.googleapis.com"]));
+        assert_eq!(dropped, v(&["evil.example.net", "*", ".other.com"]));
+    }
+
+    /// Never wider than the stored grant: an empty stored grant stays empty
+    /// even under a wildcard template.
+    #[test]
+    fn an_empty_stored_grant_stays_empty() {
+        assert_eq!(carry_host_grant(&[], &v(&["*"])), (vec![], vec![]));
+        assert_eq!(
+            carry_method_grant(&[], &v(&["GET", "POST"])),
+            (vec![], vec![])
+        );
+    }
+
+    fn stored(h: &[&str], m: &[&str], s: &[&str]) -> talos_module_repository::StoredModuleGrants {
+        talos_module_repository::StoredModuleGrants {
+            hosts: v(h),
+            methods: v(m),
+            secrets: v(s),
+        }
+    }
+
+    /// A first install writes the template's grant exactly as before.
+    #[test]
+    fn a_first_install_is_unchanged() {
+        let g = super::grants_for_install(
+            None,
+            v(&["*"]),
+            v(&["GET"]),
+            v(&["oauth/gmail/*"]),
+            false,
+            false,
+        );
+        assert_eq!(
+            (g.hosts, g.methods, g.secrets),
+            (v(&["*"]), v(&["GET"]), v(&["oauth/gmail/*"]))
+        );
+        assert!(g.not_carried.is_empty());
+    }
+
+    /// THE defect: a plain reinstall of a copy an operator narrowed keeps
+    /// every narrowing instead of writing the template's grant back.
+    #[test]
+    fn a_plain_reinstall_keeps_every_narrowing() {
+        let copy = stored(
+            &["gmail.googleapis.com"],
+            &["GET"],
+            &["oauth/gmail/u1/me@example.com/access_token"],
+        );
+        let g = super::grants_for_install(
+            Some(&copy),
+            v(&["*"]),
+            v(&["GET", "POST"]),
+            v(&["oauth/gmail/*"]),
+            false,
+            false,
+        );
+        assert_eq!(g.hosts, copy.hosts);
+        assert_eq!(g.methods, copy.methods);
+        assert_eq!(g.secrets, copy.secrets);
+        assert!(g.not_carried.is_empty());
+    }
+
+    /// A parameter the caller passes explicitly still follows today's rule,
+    /// and whatever the new template no longer grants is dropped and named.
+    #[test]
+    fn an_explicit_parameter_wins_and_dropped_entries_are_reported() {
+        let copy = stored(&["old.example.com"], &["DELETE"], &["gone/key"]);
+        let g = super::grants_for_install(
+            Some(&copy),
+            v(&["api.example.com"]),
+            v(&["GET", "PUT"]),
+            v(&["slack/token"]),
+            true,
+            false,
+        );
+        assert_eq!(g.methods, v(&["GET", "PUT"]), "explicit methods win");
+        assert!(g.hosts.is_empty());
+        assert!(g.secrets.is_empty());
+        assert_eq!(
+            g.not_carried["allowed_hosts"],
+            serde_json::json!(["old.example.com"])
+        );
+        assert_eq!(
+            g.not_carried["allowed_secrets"],
+            serde_json::json!(["gone/key"])
+        );
+        assert!(!g.not_carried.contains_key("allowed_methods"));
+    }
+
+    #[test]
+    fn a_method_is_carried_only_while_the_template_grants_it() {
+        let (kept, dropped) = carry_method_grant(&v(&["GET", "delete"]), &v(&["get", "POST"]));
+        assert_eq!(kept, v(&["GET"]));
+        assert_eq!(dropped, v(&["delete"]));
+    }
 }
 
 #[cfg(test)]
@@ -3995,6 +4247,47 @@ async fn handle_install_module_from_catalog(
         .or_else(|| meta.get("display_name").and_then(|v| v.as_str()))
         .unwrap_or(name)
         .to_string();
+
+    // REINSTALL carries the installed copy's grants (2026-09-29). The write
+    // below lands on the existing `(user_id, name)` row and overwrites all
+    // three grant columns, so without this a plain reinstall silently put the
+    // template's full grant back over an operator's narrowing — measured
+    // live: three Gmail copies pinned to one account's token would have
+    // widened to `oauth/gmail/*`. A grant the caller passes explicitly still
+    // follows today's rule; an omitted one is carried, bounded by the NEW
+    // template's grant (never wider than either), and whatever the template
+    // no longer grants is dropped and reported. The stored grant being
+    // unreadable REFUSES the reinstall: proceeding is exactly the widening.
+    let caller_provided_allowed_methods = args.get("allowed_methods").is_some();
+    let installed_copy = match state
+        .module_repo
+        .get_user_module_grants(user_id, &display_name)
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!(error = %e, module = %display_name, "install_module_from_catalog: could not read the installed copy's grants");
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read the grants of your installed copy of this module, so the \
+                 reinstall was refused rather than risk widening them. Retry.",
+            );
+        }
+    };
+    let InstallGrants {
+        hosts: allowed_hosts,
+        methods: allowed_methods,
+        secrets: allowed_secrets,
+        not_carried: grants_not_carried,
+    } = grants_for_install(
+        installed_copy.as_ref(),
+        allowed_hosts,
+        allowed_methods,
+        allowed_secrets,
+        caller_provided_allowed_methods,
+        caller_provided_allowed_secrets,
+    );
     let description = meta
         .get("description")
         .and_then(|v| v.as_str())
@@ -4229,6 +4522,16 @@ async fn handle_install_module_from_catalog(
             }
             if let Some(w) = pin_warning {
                 resp["pin_warning"] = serde_json::json!(w);
+            }
+            resp["grants_carried_from_installed_copy"] =
+                serde_json::json!(installed_copy.is_some());
+            if !grants_not_carried.is_empty() {
+                resp["grants_not_carried"] = serde_json::Value::Object(grants_not_carried);
+                resp["grants_not_carried_note"] = serde_json::json!(
+                    "Your installed copy held these grants and the new template no longer \
+                     grants them, so they were not carried onto the reinstall. A reinstall keeps \
+                     your copy's grants only within the template's own grant."
+                );
             }
             if !secrets_not_granted.is_empty() {
                 resp["secrets_not_granted"] = serde_json::json!(secrets_not_granted);

@@ -320,7 +320,7 @@ mod tier1_egress_tests {
 /// Tier-1 LLM-host deny-list is downstream (see
 /// `is_external_llm_host`). This function is the operator-grant gate,
 /// not the platform deny-gate.
-pub(crate) fn host_allowlist_match(allowed: &[String], host: &str) -> bool {
+pub fn host_allowlist_match(allowed: &[String], host: &str) -> bool {
     host_allowlist_match_kind(allowed, host).is_some()
 }
 
