@@ -9074,6 +9074,7 @@ dependencies = [
  "talos-module-payload-encryption",
  "talos-push-channel-inventory",
  "talos-secrets-manager",
+ "talos-workflow-liveness",
  "tokio",
  "tracing",
  "uuid",

@@ -269,6 +269,87 @@ pub enum ModuleSource {
     Template,
 }
 
+/// One of a user's installed catalog copies, beside the system catalog row
+/// it was installed from. See [`ModuleRepository::list_catalog_copy_drift`].
+#[derive(Debug, Clone)]
+pub struct CatalogCopyRow {
+    pub module_id: Uuid,
+    pub name: String,
+    pub catalog_slug: Option<String>,
+    /// A system catalog row this copy maps to (by slug, else by name).
+    pub in_catalog: bool,
+    /// The catalog row carries no source — OCI mode, where the system row is
+    /// written with an empty `source_code` — so the copy cannot be compared.
+    pub catalog_source_absent: bool,
+    /// The copy's source is byte-identical to the catalog row's.
+    pub source_matches: bool,
+    /// The copy has been edited in place (`hot_update_module`), so a source
+    /// difference is the user's change, not staleness.
+    pub hot_updated: bool,
+    /// Workflows that are not retired and name this copy.
+    pub live_workflows: i64,
+    /// When the copy's WASM was compiled, and when the catalog row last changed.
+    pub compiled_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub catalog_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Where an installed catalog copy stands against the catalog (2026-09-29).
+///
+/// A user's installed copy is a frozen row: the seeder refreshes the SYSTEM
+/// catalog row, not the copies workflows actually run, so a catalog fix —
+/// including a security fix — is not live until the copy is reinstalled.
+/// Measured on the reference fleet: 5 of 8 copies had drifted, two of them
+/// live and missing the 2026-09-10 prompt-injection hardening. Source is the
+/// only reliable comparison: `content_hash` hashes the compiled WASM, which
+/// differs on every compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogCopyState {
+    /// Same source as the catalog.
+    Current,
+    /// The catalog has changed since the copy was installed; reinstall to
+    /// take the change.
+    Behind,
+    /// The copy was edited in place, so its source differing is deliberate.
+    Detached,
+    /// The catalog row carries no source (OCI mode): drift is not knowable
+    /// here. Never reported as current.
+    Unknown,
+    /// No catalog row maps to this copy any more.
+    NotInCatalog,
+}
+
+impl CatalogCopyState {
+    /// Classify one row. Order matters: an unknown comparison is never
+    /// promoted to a verdict, and a matching source is current even if the
+    /// copy was once hot-updated back to the catalog text.
+    #[must_use]
+    pub fn of(row: &CatalogCopyRow) -> Self {
+        if !row.in_catalog {
+            Self::NotInCatalog
+        } else if row.catalog_source_absent {
+            Self::Unknown
+        } else if row.source_matches {
+            Self::Current
+        } else if row.hot_updated {
+            Self::Detached
+        } else {
+            Self::Behind
+        }
+    }
+
+    /// The report spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Behind => "behind",
+            Self::Detached => "detached",
+            Self::Unknown => "unknown",
+            Self::NotInCatalog => "not_in_catalog",
+        }
+    }
+}
+
 /// The three egress grants stored on a user's module row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredModuleGrants {
@@ -3077,6 +3158,55 @@ impl ModuleRepository {
         Ok(())
     }
 
+    /// Every installed catalog copy the user owns, beside the system catalog
+    /// row it maps to (by `catalog_slug`, else by `name` for rows installed
+    /// before the slug existed). One statement; the workflow count reads only
+    /// the user's own workflows that are not retired.
+    pub async fn list_catalog_copy_drift(&self, user_id: Uuid) -> Result<Vec<CatalogCopyRow>> {
+        let sql = format!(
+            "SELECT u.id, u.name, u.catalog_slug, \
+                    s.id IS NOT NULL AS in_catalog, \
+                    COALESCE(s.source_code, '') = '' AS catalog_source_absent, \
+                    u.source_code IS NOT DISTINCT FROM s.source_code AS source_matches, \
+                    EXISTS (SELECT 1 FROM module_update_history h WHERE h.module_id = u.id) AS hot_updated, \
+                    (SELECT COUNT(*) FROM workflows w \
+                      WHERE w.user_id = u.user_id AND {not_retired} \
+                        AND w.graph_json::text LIKE '%' || u.id::text || '%') AS live_workflows, \
+                    u.compiled_at, s.updated_at \
+               FROM modules u \
+               LEFT JOIN LATERAL ( \
+                    SELECT c.id, c.source_code, c.updated_at FROM modules c \
+                     WHERE c.user_id IS NULL AND c.kind = 'catalog' \
+                       AND (c.catalog_slug = u.catalog_slug \
+                            OR (u.catalog_slug IS NULL AND c.name = u.name)) \
+                     ORDER BY (c.catalog_slug = u.catalog_slug) DESC NULLS LAST \
+                     LIMIT 1) s ON true \
+              WHERE u.user_id = $1 AND u.kind = 'catalog' \
+              ORDER BY u.name",
+            not_retired = talos_workflow_liveness::not_retired_sql(Some("w")),
+        );
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(CatalogCopyRow {
+                module_id: r.try_get(0)?,
+                name: r.try_get(1)?,
+                catalog_slug: r.try_get(2)?,
+                in_catalog: r.try_get(3)?,
+                catalog_source_absent: r.try_get(4)?,
+                source_matches: r.try_get(5)?,
+                hot_updated: r.try_get(6)?,
+                live_workflows: r.try_get(7)?,
+                compiled_at: r.try_get(8)?,
+                catalog_updated_at: r.try_get(9)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// The grants currently stored on the caller's installed copy named
     /// `name` — the row `install_catalog_module_to_modules` would overwrite.
     ///
@@ -4272,5 +4402,38 @@ mod dependent_workflow_scope_tests {
         let src = include_str!("lib.rs");
         assert!(src.contains("catalog_slug = CASE WHEN modules.user_id IS NOT NULL"));
         assert!(src.contains("modules.content_hash IS DISTINCT FROM EXCLUDED.content_hash"));
+    }
+}
+
+#[cfg(test)]
+mod catalog_copy_state_tests {
+    use super::{CatalogCopyRow, CatalogCopyState as S};
+
+    fn row(in_catalog: bool, absent: bool, matches: bool, hot: bool) -> CatalogCopyRow {
+        CatalogCopyRow {
+            module_id: uuid::Uuid::nil(),
+            name: "m".into(),
+            catalog_slug: Some("m".into()),
+            in_catalog,
+            catalog_source_absent: absent,
+            source_matches: matches,
+            hot_updated: hot,
+            live_workflows: 0,
+            compiled_at: None,
+            catalog_updated_at: None,
+        }
+    }
+
+    #[test]
+    fn each_state_and_its_precedence() {
+        assert_eq!(S::of(&row(true, false, true, false)), S::Current);
+        assert_eq!(S::of(&row(true, false, false, false)), S::Behind);
+        assert_eq!(S::of(&row(true, false, false, true)), S::Detached);
+        // Once hot-updated but back on the catalog text: current, not detached.
+        assert_eq!(S::of(&row(true, false, true, true)), S::Current);
+        // OCI mode: no source to compare is never promoted to "current",
+        // even though an empty copy source would compare equal.
+        assert_eq!(S::of(&row(true, true, true, false)), S::Unknown);
+        assert_eq!(S::of(&row(false, true, false, false)), S::NotInCatalog);
     }
 }

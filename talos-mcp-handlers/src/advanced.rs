@@ -3503,9 +3503,22 @@ async fn handle_agent_session_start(
         });
     }
 
+    // Catalog drift (2026-09-29): an installed catalog copy is never
+    // refreshed, so a catalog fix is not live in it until it is reinstalled.
+    // Surfaced here because nobody asks `get_catalog_status` a question they
+    // do not know to ask. `null` = the read failed, never "nothing behind".
+    let mut report = outcome.report;
+    report["catalog_drift"] = match state.module_repo.list_catalog_copy_drift(user_id).await {
+        Ok(rows) => crate::modules::catalog_drift_brief(&rows),
+        Err(e) => {
+            tracing::warn!(error = %e, "session_start: catalog drift read failed");
+            serde_json::Value::Null
+        }
+    };
+
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&outcome.report).unwrap_or_default(),
+        &serde_json::to_string_pretty(&report).unwrap_or_default(),
     )
 }
 

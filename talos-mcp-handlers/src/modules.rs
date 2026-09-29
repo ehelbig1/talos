@@ -3330,6 +3330,77 @@ pub(crate) fn narrow_secret_grant(
 }
 
 #[cfg(test)]
+mod catalog_drift_report_tests {
+    use super::{catalog_drift_tip, installed_copies_json};
+    use talos_module_repository::CatalogCopyRow;
+
+    fn copy(name: &str, matches: bool, hot: bool, live: i64) -> CatalogCopyRow {
+        CatalogCopyRow {
+            module_id: uuid::Uuid::nil(),
+            name: name.into(),
+            catalog_slug: Some(name.into()),
+            in_catalog: true,
+            catalog_source_absent: false,
+            source_matches: matches,
+            hot_updated: hot,
+            live_workflows: live,
+            compiled_at: None,
+            catalog_updated_at: None,
+        }
+    }
+
+    #[test]
+    fn counts_and_urgency_order() {
+        let rows = vec![
+            copy("current", true, false, 5),
+            copy("behind-unused", false, false, 0),
+            copy("edited", false, true, 1),
+            copy("behind-used", false, false, 3),
+        ];
+        let v = installed_copies_json(&rows);
+        assert_eq!(v["counts"]["behind"], 2);
+        assert_eq!(v["counts"]["current"], 1);
+        assert_eq!(v["counts"]["detached"], 1);
+        let order: Vec<&str> = v["copies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, ["behind-used", "behind-unused", "edited", "current"]);
+        assert_eq!(v["copies"][0]["state"], "behind");
+    }
+
+    #[test]
+    fn the_session_brief_counts_behind_and_names_the_used_ones() {
+        let v = super::catalog_drift_brief(&[
+            copy("llm", false, false, 14),
+            copy("gcp", false, false, 0),
+            copy("ok", true, false, 3),
+        ]);
+        assert_eq!(v["behind"], 2);
+        assert_eq!(v["behind_in_use"], serde_json::json!(["llm"]));
+        assert_eq!(v["unknown"], 0);
+    }
+
+    #[test]
+    fn the_tip_names_used_copies_first_and_only_fires_when_something_is_behind() {
+        assert_eq!(catalog_drift_tip(&[copy("a", true, false, 1)]), None);
+        assert_eq!(
+            catalog_drift_tip(&[copy("edited", false, true, 1)]),
+            None,
+            "a deliberately edited copy is not a finding"
+        );
+        let tip = catalog_drift_tip(&[copy("llm", false, false, 14), copy("gcp", false, false, 0)])
+            .expect("two behind");
+        assert!(tip.starts_with("2 of your installed"));
+        assert!(tip.contains("llm (14 live workflow(s))"));
+        assert!(tip.contains("Not used by any live workflow: gcp."));
+        assert!(tip.contains("keeps the same module id and your copy's allowed_hosts"));
+    }
+}
+
+#[cfg(test)]
 mod carry_grant_tests {
     use super::{carry_host_grant, carry_method_grant, narrow_secret_grant};
 
@@ -5110,6 +5181,119 @@ mod host_managed_access_tests {
 /// list_templates category-filtered view) and names what each MCP surface
 /// reads. Deliberately UNCACHED disk read — a diagnostic must report disk
 /// truth now, not the boot-time CATALOG_CACHE snapshot.
+/// The `installed_copies` block of `get_catalog_status`: a count per state
+/// and every copy, most urgent first (behind and used, then behind, then the
+/// rest). Pure, so the rendering is tested without a database.
+pub(crate) fn installed_copies_json(
+    rows: &[talos_module_repository::CatalogCopyRow],
+) -> serde_json::Value {
+    use talos_module_repository::CatalogCopyState as S;
+    let urgency = |r: &talos_module_repository::CatalogCopyRow| match S::of(r) {
+        S::Behind if r.live_workflows > 0 => 0,
+        S::Behind => 1,
+        S::Unknown | S::NotInCatalog => 2,
+        S::Detached => 3,
+        S::Current => 4,
+    };
+    let mut sorted: Vec<&talos_module_repository::CatalogCopyRow> = rows.iter().collect();
+    sorted.sort_by_key(|r| (urgency(r), r.name.clone()));
+    let mut counts = serde_json::Map::new();
+    for state in [
+        S::Current,
+        S::Behind,
+        S::Detached,
+        S::Unknown,
+        S::NotInCatalog,
+    ] {
+        let n = rows.iter().filter(|r| S::of(r) == state).count();
+        counts.insert(state.as_str().to_string(), serde_json::json!(n));
+    }
+    serde_json::json!({
+        "counts": counts,
+        "copies": sorted.iter().map(|r| serde_json::json!({
+            "module_id": r.module_id,
+            "name": r.name,
+            "catalog_slug": r.catalog_slug,
+            "state": S::of(r).as_str(),
+            "live_workflows": r.live_workflows,
+            "compiled_at": r.compiled_at.map(|t| t.to_rfc3339()),
+            "catalog_updated_at": r.catalog_updated_at.map(|t| t.to_rfc3339()),
+        })).collect::<Vec<_>>(),
+        "states": {
+            "current": "same source as the catalog",
+            "behind": "the catalog changed since this copy was installed; reinstall to take the change",
+            "detached": "edited in place (hot_update_module), so differing from the catalog is deliberate",
+            "unknown": "the catalog row carries no source (OCI mode), so drift cannot be determined here",
+            "not_in_catalog": "no catalog template maps to this copy any more",
+        },
+    })
+}
+
+/// The compact `catalog_drift` field of `session_start`: how many installed
+/// copies are behind the catalog, which of those live workflows use, and
+/// where the detail is.
+pub(crate) fn catalog_drift_brief(
+    rows: &[talos_module_repository::CatalogCopyRow],
+) -> serde_json::Value {
+    use talos_module_repository::CatalogCopyState as S;
+    let behind: Vec<&talos_module_repository::CatalogCopyRow> =
+        rows.iter().filter(|r| S::of(r) == S::Behind).collect();
+    serde_json::json!({
+        "behind": behind.len(),
+        "behind_in_use": behind
+            .iter()
+            .filter(|r| r.live_workflows > 0)
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        "unknown": rows.iter().filter(|r| S::of(r) == S::Unknown).count(),
+        "detail": "get_catalog_status → installed_copies",
+    })
+}
+
+/// The tip for copies that are BEHIND the catalog, or `None` when none are.
+/// Names the copies live workflows use first, and says what a reinstall does
+/// to their grants, because that is the question an operator must answer
+/// before running it.
+pub(crate) fn catalog_drift_tip(
+    rows: &[talos_module_repository::CatalogCopyRow],
+) -> Option<String> {
+    use talos_module_repository::CatalogCopyState as S;
+    let behind: Vec<&talos_module_repository::CatalogCopyRow> =
+        rows.iter().filter(|r| S::of(r) == S::Behind).collect();
+    if behind.is_empty() {
+        return None;
+    }
+    let used: Vec<String> = behind
+        .iter()
+        .filter(|r| r.live_workflows > 0)
+        .map(|r| format!("{} ({} live workflow(s))", r.name, r.live_workflows))
+        .collect();
+    let unused: Vec<&str> = behind
+        .iter()
+        .filter(|r| r.live_workflows == 0)
+        .map(|r| r.name.as_str())
+        .collect();
+    let mut tip = format!(
+        "{} of your installed catalog module(s) are BEHIND the catalog: the catalog \
+         changed after you installed them, and an installed copy is never refreshed, so \
+         catalog fixes (security fixes included) are not live in them until you reinstall \
+         with install_module_from_catalog. A reinstall keeps the same module id and your \
+         copy's allowed_hosts / allowed_methods / allowed_secrets, bounded by the \
+         template's grant.",
+        behind.len()
+    );
+    if !used.is_empty() {
+        tip.push_str(&format!(" Used by live workflows: {}.", used.join(", ")));
+    }
+    if !unused.is_empty() {
+        tip.push_str(&format!(
+            " Not used by any live workflow: {}.",
+            unused.join(", ")
+        ));
+    }
+    Some(tip)
+}
+
 async fn handle_get_catalog_status(
     req_id: Option<serde_json::Value>,
     state: &McpState,
@@ -5213,6 +5397,13 @@ async fn handle_get_catalog_status(
     let installed = readings.record(
         "installed_by_you",
         state.module_repo.list_user_template_names(user_id).await,
+    );
+    // Your installed copies against the catalog (2026-09-29). A copy is a
+    // frozen row that the seeder never refreshes, so a catalog fix is not
+    // live until it is reinstalled; nothing reported that before.
+    let copies_read = readings.record(
+        "installed_copies",
+        state.module_repo.list_catalog_copy_drift(user_id).await,
     );
 
     // Catalog rows that have NO compiled WASM. Until 2026-08-11 the only
@@ -5336,6 +5527,10 @@ async fn handle_get_catalog_status(
         ));
     }
 
+    if let Some(tip) = copies_read.as_deref().and_then(catalog_drift_tip) {
+        tips.push(tip);
+    }
+
     let report = serde_json::json!({
         "mode": mode,
         "registry_url_set": registry_url.is_some(),
@@ -5365,6 +5560,9 @@ async fn handle_get_catalog_status(
             "in_db_not_on_disk": in_db_not_on_disk,
         })),
         "installed_by_you": installed.as_ref().map(|i| i.len()),
+        // `null` when the read failed — never an empty list, which would
+        // read as "nothing is behind".
+        "installed_copies": copies_read.as_deref().map(installed_copies_json),
         "surfaces": {
             "list_templates": "DB modules table (kind='catalog'); default view filters to platform categories",
             "list_module_catalog": "baked disk dir /app/module-templates (cached per process)",
