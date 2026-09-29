@@ -82,9 +82,44 @@ impl FleetOutcome {
     }
 }
 
-/// Where each process records [`FleetOutcome`]s: the worker into its OTEL
-/// counter, the controller into its Prometheus registry.
-pub type FleetSink = dyn Fn(FleetOutcome) + Send + Sync;
+/// What the fleet queue reports to its process's series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetEvent {
+    /// How an admission attempt ended (RFC 0014 P3b).
+    Outcome(FleetOutcome),
+    /// A call joined the queue with `ahead` calls to be admitted before it: 0
+    /// when it was admitted at once (RFC 0014 P4b). Recorded once per call, at
+    /// arrival, so a herd shorter than any sampling interval is still seen.
+    Arrival { ahead: u64 },
+    /// The call was admitted for a different model than the previous call
+    /// admitted to the same backend, by ANY process (RFC 0014 P4b) — the proxy
+    /// for a model swap. Decided atomically with the admission.
+    ModelSwitch,
+}
+
+/// Histogram boundaries for [`FleetEvent::Arrival`]'s `ahead`, shared by both
+/// processes' series. The queue is one slot per backend on the reference
+/// deployment and its worst morning herd is a handful of calls; past 16 ahead
+/// the count matters less than that it happened.
+pub const QUEUE_AHEAD_BUCKETS: [f64; 9] = [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0];
+
+/// Where each process records [`FleetEvent`]s: the worker into its OTEL
+/// instruments, the controller into its Prometheus registry.
+pub type FleetSink = dyn Fn(FleetEvent) + Send + Sync;
+
+/// How long the last admitted model is remembered. Long enough that an idle
+/// night does not reset it, bounded so the key cannot outlive a retired
+/// backend forever.
+const LAST_MODEL_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// A model name is stored in Redis only up to this many bytes (cut on a char
+/// boundary). Two names sharing a longer prefix read as the same model.
+const MAX_MODEL_BYTES: usize = 128;
+
+/// The script's answer for an admission: admitted, and whether the model
+/// differs from the previous admission's. Positions are `>= 1`.
+const ADMITTED: i64 = -1;
+const ADMITTED_SWITCHED: i64 = -2;
 
 /// The timing of the fleet queue. [`FleetTiming::PRODUCTION`] in production; a
 /// value only so the tests can run it at millisecond scale.
@@ -116,11 +151,14 @@ impl FleetTiming {
     };
 }
 
-/// Every transition of the queue. `KEYS`: holders, waiters, alive, ticket.
-/// `ARGV`: op, token, cap, lease ms, alive ms, idle ms.
+/// Every transition of the queue. `KEYS`: holders, waiters, alive, ticket,
+/// last admitted model. `ARGV`: op, token, cap, lease ms, alive ms, idle ms,
+/// model (`''` = unknown), last-model ttl ms.
 ///
 /// `acquire` returns `-1` when the token holds a lease (newly or already),
-/// otherwise its position behind the free slots (`>= 1`). `renew` returns `1`
+/// `-2` when it was newly admitted for a different model than the previous
+/// admission (RFC 0014 P4b), otherwise its position behind the free slots
+/// (`>= 1`). `renew` returns `1`
 /// when the lease was extended and `0` when it no longer exists. `release`
 /// returns `0`.
 const SCRIPT: &str = r#"
@@ -139,6 +177,18 @@ local function keep()
   for i = 1, 4 do
     redis.call('PEXPIRE', KEYS[i], idle)
   end
+end
+local function admitted()
+  local model = ARGV[7]
+  if model == '' then
+    return -1
+  end
+  local prev = redis.call('GET', KEYS[5])
+  redis.call('SET', KEYS[5], model, 'PX', tonumber(ARGV[8]))
+  if prev and prev ~= model then
+    return -2
+  end
+  return -1
 end
 if op == 'release' then
   redis.call('ZREM', KEYS[1], token)
@@ -171,7 +221,7 @@ if rank < free then
   redis.call('ZREM', KEYS[3], token)
   redis.call('ZADD', KEYS[1], lease_until, token)
   keep()
-  return -1
+  return admitted()
 end
 keep()
 return rank - free + 1
@@ -180,7 +230,7 @@ return rank - free + 1
 /// The four keys of one backend's queue. A hash tag keeps them in one cluster
 /// slot, which a multi-key script requires.
 #[derive(Debug, Clone)]
-struct Keys([String; 4]);
+struct Keys([String; 5]);
 
 impl Keys {
     fn for_backend(backend_url: &str) -> Self {
@@ -191,6 +241,7 @@ impl Keys {
             format!("{base}:waiters"),
             format!("{base}:alive"),
             format!("{base}:ticket"),
+            format!("{base}:model"),
         ])
     }
 }
@@ -265,14 +316,17 @@ impl FleetAdmission {
         })
     }
 
-    /// Wait for a slot until `deadline`. `on_queue` runs once, the first time
-    /// the call has to wait (the process gate's observer uses it).
-    pub async fn acquire<F, Fut>(&self, deadline: Instant, on_queue: F) -> FleetAcquire
+    /// Wait for a slot for `model` until `deadline`. `on_queue` runs once, the
+    /// first time the call has to wait (the process gate's observer uses it).
+    /// An empty `model` is not compared for switches.
+    pub async fn acquire<F, Fut>(&self, deadline: Instant, model: &str, on_queue: F) -> FleetAcquire
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
         let token = uuid_like_token();
+        let model = bounded_model(model);
+        let mut arrived = false;
         // Leaves the queue however this future ends — admitted, expired, or
         // dropped by a caller that gave up.
         let mut waiting = WaiterGuard {
@@ -281,15 +335,20 @@ impl FleetAdmission {
         };
         let mut on_queue = Some(on_queue);
         loop {
-            match self.inner.call("acquire", &token).await {
+            let answer = self.inner.call("acquire", &token, model).await;
+            if let (false, Ok(a)) = (arrived, answer) {
+                arrived = true;
+                let ahead = if a < 0 { 0 } else { a as u64 };
+                self.record(FleetEvent::Arrival { ahead });
+            }
+            match answer {
                 Err(()) => {
-                    self.record(FleetOutcome::Unavailable);
+                    self.record(FleetEvent::Outcome(FleetOutcome::Unavailable));
                     return FleetAcquire::Unavailable;
                 }
-                Ok(-1) => {
+                Ok(a @ (ADMITTED | ADMITTED_SWITCHED)) => {
                     waiting.admission = None;
-                    self.record(FleetOutcome::Leased);
-                    return FleetAcquire::Leased(FleetLease::start(self.clone(), token));
+                    return self.admitted(token, a);
                 }
                 Ok(_position) => {
                     if let Some(f) = on_queue.take() {
@@ -301,21 +360,30 @@ impl FleetAdmission {
             if next >= deadline {
                 tokio::time::sleep_until(deadline).await;
                 // One last look: the slot may have freed during the sleep.
-                if let Ok(-1) = self.inner.call("acquire", &token).await {
+                if let Ok(a @ (ADMITTED | ADMITTED_SWITCHED)) =
+                    self.inner.call("acquire", &token, model).await
+                {
                     waiting.admission = None;
-                    self.record(FleetOutcome::Leased);
-                    return FleetAcquire::Leased(FleetLease::start(self.clone(), token));
+                    return self.admitted(token, a);
                 }
-                self.record(FleetOutcome::WaitExpired);
+                self.record(FleetEvent::Outcome(FleetOutcome::WaitExpired));
                 return FleetAcquire::WaitExpired;
             }
             tokio::time::sleep_until(next).await;
         }
     }
 
-    fn record(&self, outcome: FleetOutcome) {
+    fn admitted(&self, token: String, answer: i64) -> FleetAcquire {
+        self.record(FleetEvent::Outcome(FleetOutcome::Leased));
+        if answer == ADMITTED_SWITCHED {
+            self.record(FleetEvent::ModelSwitch);
+        }
+        FleetAcquire::Leased(FleetLease::start(self.clone(), token))
+    }
+
+    fn record(&self, event: FleetEvent) {
         if let Some(sink) = &self.inner.sink {
-            sink(outcome);
+            sink(event);
         }
     }
 }
@@ -323,7 +391,7 @@ impl FleetAdmission {
 impl Inner {
     /// One script call, bounded by `redis_call`. `Err(())` is Redis failing or
     /// too slow; the error is logged here, once per outage.
-    async fn call(&self, op: &str, token: &str) -> Result<i64, ()> {
+    async fn call(&self, op: &str, token: &str, model: &str) -> Result<i64, ()> {
         let mut conn = self.conn.clone();
         let mut inv = self.script.prepare_invoke();
         for k in &self.keys.0 {
@@ -334,7 +402,9 @@ impl Inner {
             .arg(self.cap)
             .arg(self.timing.lease.as_millis() as u64)
             .arg(self.timing.alive.as_millis() as u64)
-            .arg(self.idle_ms());
+            .arg(self.idle_ms())
+            .arg(model)
+            .arg(LAST_MODEL_TTL_MS);
         let result =
             tokio::time::timeout(self.timing.redis_call, inv.invoke_async::<i64>(&mut conn)).await;
         match result {
@@ -369,6 +439,18 @@ impl Inner {
     fn idle_ms(&self) -> u64 {
         (self.timing.lease.max(self.timing.alive) * 4).as_millis() as u64
     }
+}
+
+/// `model` cut to [`MAX_MODEL_BYTES`] on a char boundary.
+fn bounded_model(model: &str) -> &str {
+    if model.len() <= MAX_MODEL_BYTES {
+        return model;
+    }
+    let mut end = MAX_MODEL_BYTES;
+    while !model.is_char_boundary(end) {
+        end -= 1;
+    }
+    &model[..end]
 }
 
 /// A random token naming one admission attempt.
@@ -412,7 +494,7 @@ impl Drop for WaiterGuard {
 fn release_in_background(admission: FleetAdmission, token: String) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
-            let _ = admission.inner.call("release", &token).await;
+            let _ = admission.inner.call("release", &token, "").await;
         });
     }
     // With no runtime the entry expires on its own: a waiter within
@@ -433,14 +515,14 @@ impl FleetLease {
         let renew = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(a.inner.timing.renew_every).await;
-                match a.inner.call("renew", &t).await {
+                match a.inner.call("renew", &t, "").await {
                     Ok(1) => {}
                     Ok(_) => {
                         tracing::warn!(
                             "local LLM fleet admission: lease expired before it could be \
                              renewed; the call continues"
                         );
-                        a.record(FleetOutcome::LeaseLost);
+                        a.record(FleetEvent::Outcome(FleetOutcome::LeaseLost));
                         return;
                     }
                     // Logged by `call`; the next renewal may still be in time.
@@ -560,6 +642,15 @@ mod tests {
         assert!(t.renew_every * 2 < t.lease);
         assert!(t.poll < t.alive);
         assert!(t.redis_call < t.renew_every);
+    }
+
+    #[test]
+    fn a_long_model_name_is_cut_on_a_char_boundary() {
+        assert_eq!(bounded_model("qwen3.6"), "qwen3.6");
+        let long = "é".repeat(100);
+        let cut = bounded_model(&long);
+        assert!(cut.len() <= MAX_MODEL_BYTES);
+        assert!(long.starts_with(cut));
     }
 
     #[test]

@@ -281,3 +281,15 @@ async fn control_the_mock_serves_two_ungated_requests_at_once() {
     b.unwrap();
     assert_eq!(seen.peak.load(Ordering::SeqCst), 2);
 }
+
+/// RFC 0014 P4b: the controller's chat hands the gate its model, so the fleet
+/// queue can count model switches. A TEXTUAL pin: the fleet queue is not
+/// installed in this test binary.
+#[test]
+fn chat_passes_its_model_to_the_gate() {
+    let src: String = include_str!("lib.rs").split_whitespace().collect();
+    assert!(
+        src.contains("gate::acquire_process_slot::<gate::NoWaitObserver>(None,model)"),
+        "OllamaClient::chat does not pass its model to the gate"
+    );
+}
