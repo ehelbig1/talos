@@ -122,8 +122,8 @@ pub trait NodeLifecycleHook: Send + Sync {
     /// Use this for side effects that must happen per individual
     /// module invocation (e.g. persisting a `__memory_write__`
     /// envelope in the step's output). Do NOT use it for cost
-    /// attribution — pipeline fuel is aggregated at the chain level
-    /// and billing here would double-count.
+    /// attribution — the dispatcher's fuel sink already records each
+    /// step's fuel, so billing here would double-count.
     ///
     /// `max_write_ceiling` is the job's data-mutation ceiling. A step's
     /// `__memory_write__` is the same write by the same actor as a node's, so

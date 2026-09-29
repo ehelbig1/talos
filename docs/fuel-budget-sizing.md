@@ -128,12 +128,18 @@ dropped 2026-09-12 — it was never a backstop.)
 
 ## Where the real numbers live
 
-* **`execution_cost_rollup`** — authoritative per-node `fuel_consumed`,
-  `max_fuel` (the ceiling the worker actually enforced, from the
-  `__fuel_limit__` stamp), `wall_time_ms`. Written by
-  `ControllerNodeHook::on_node_completed`. **Only for completed runs.**
-* **`module_executions.fuel_consumed`** — populated from `__fuel_consumed__`
-  by `record_completed` as of 2026-08-17. Before that it was a dead column:
+* **`execution_cost_rollup`** — authoritative per-attempt `fuel_consumed`,
+  `max_fuel` (the ceiling the worker actually enforced), `wall_time_ms`, and
+  `outcome` (`completed | failed`). Since 2026-09-29 one row per VERIFIED
+  dispatch attempt — failed, retried, loop-body and module-bound attempts
+  included — written by `talos_cost_attribution` from the signed
+  `JobResult`. The hourly fuel budget sums every row; the fuel report and
+  adaptive ceilings read `completed` rows only. Before 2026-09-29 rows existed
+  only for completed nodes whose output was a JSON object.
+* **`module_executions.fuel_consumed`** — the SUM of the row's verified
+  attempts, written by the same recorder since 2026-09-29 (from
+  `__fuel_consumed__` in `record_completed` between 2026-08-17 and then,
+  which missed failures and non-object outputs). Before 2026-08-17 it was a dead column:
   0 of 25,213 rows written, because its only writer
   (`ModuleExecutionService::complete_execution`) is reachable only through
   `complete_execution_best_effort`, which has no callers. **The 25,213

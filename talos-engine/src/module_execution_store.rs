@@ -342,38 +342,14 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         } else {
             None
         };
-        // `module_executions.fuel_consumed` was a DEAD COLUMN until 2026-08:
-        // 0 of 25,213 rows populated. Its only writer
-        // (`ModuleExecutionService::complete_execution`) is reachable solely
-        // through `complete_execution_best_effort`, which has no callers
-        // workspace-wide, so the column — and the `fuelConsumed` field the
-        // GraphQL `ModuleExecution` type exposes from it — always read NULL.
-        // A column that always reads NULL is worse than an absent one: the
-        // next person doing fuel archaeology reads "no fuel was used" instead
-        // of "nobody ever wrote this".
-        //
-        // `record_completed` is the live terminal writer on the engine path,
-        // and the worker already stamps `__fuel_consumed__` into the node
-        // output — the same key `ControllerNodeHook::on_node_completed` reads
-        // for `execution_cost_rollup`. Reading it here costs one JSON lookup
-        // and makes the two ledgers agree by construction.
-        //
-        // Scope of what this does and does NOT fix, stated rather than
-        // implied: `execution_cost_rollup` remains the authoritative per-node
-        // fuel record and is the only one with the `max_fuel` ceiling
-        // alongside. This write makes the standalone-module row honest (those
-        // never get a rollup row at all — rollups are keyed by workflow node)
-        // and stops the GraphQL field lying. It does NOT retro-fill the 25,213
-        // historical rows, which stay NULL.
-        //
-        // Absent key ⇒ NULL, not 0: a pre-stamp worker, a system node, or a
-        // failure path that never ran the module has no measurement, and
-        // writing 0 would assert one. Same reason the message rewrite above
-        // refuses to print the limit where a measurement belongs.
-        let fuel_consumed: Option<i64> = output
-            .get(talos_workflow_engine_core::reserved_keys::FUEL_CONSUMED)
-            .and_then(JsonValue::as_i64)
-            .filter(|f| *f > 0);
+        // `module_executions.fuel_consumed` is NOT written here. Until
+        // 2026-09-29 this read `__fuel_consumed__` out of the output, which
+        // the worker stamps only into a JSON object and which a failed run
+        // does not have — so a non-object output or a failure left the column
+        // NULL. It is now written by the controller's fuel sink
+        // (`talos_cost_attribution::record_dispatch_fuel`), once per verified
+        // attempt from the signed `JobResult`, and SUMMED across retried
+        // attempts of this row. Writing it here too would double count.
 
         // Status guard — FIRST terminal writer wins.
         //
@@ -492,8 +468,8 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         // engine -> repository-layer edge (the classifier crate depends on
         // `talos-execution-repository`). That is the edge lint 51 forbids in
         // the sibling case. This crate already carries that layer, and already
-        // derives three other bound values from its inputs a few lines up
-        // (`fuel_consumed`, `format_arg`, `duration_source`).
+        // derives two other bound values from its inputs a few lines up
+        // (`format_arg`, `duration_source`).
         //
         // NULL on an unrecognised message, never a fall-through bucket — see
         // `module_error_type` for why, and for the under-reporting it costs.
@@ -509,8 +485,8 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
                                         THEN NULL ELSE 'monotonic' END, \
                  error_message = $7, \
                  error_type = $8, \
-                 fuel_consumed = COALESCE($9, fuel_consumed), completed_at = NOW() \
-             WHERE id = $10 AND status IN ('pending', 'running') \
+                 completed_at = NOW() \
+             WHERE id = $9 AND status IN ('pending', 'running') \
              RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
         )
         .bind(status)
@@ -521,7 +497,6 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         .bind(duration_ms)
         .bind(redacted_error.as_deref())
         .bind(error_type)
-        .bind(fuel_consumed)
         .bind(id)
         .fetch_optional(&self.pool)
         .await

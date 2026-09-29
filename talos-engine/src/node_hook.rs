@@ -3,10 +3,9 @@
 //! Handles every cross-cutting concern the Talos controller owns at
 //! per-node granularity:
 //!
-//! 1. **Fuel cost attribution** (on_node_completed). When a node's
-//!    output contains `__fuel_consumed__: i64 > 0`, the amount is
-//!    written to `execution_cost_rollup`. Fire-and-forget —
-//!    [`talos_cost_attribution::record_fuel`] spawns the INSERT.
+//! 1. **Fuel cost attribution** moved to the NATS dispatcher's fuel sink
+//!    (2026-09-29; see `talos_cost_attribution::record_dispatch_fuel`),
+//!    which sees every verified attempt rather than only completed nodes.
 //! 2. **`__memory_write__` protocol** (on_node_completed +
 //!    on_pipeline_step_completed). When the execution is owned by an
 //!    actor and the node output contains a `__memory_write__` JSON
@@ -362,33 +361,12 @@ impl ControllerNodeHook {
 
 impl NodeLifecycleHook for ControllerNodeHook {
     fn on_node_completed(&self, ctx: NodeCompletionContext<'_>, output: &JsonValue) {
-        // ── 1. Cost attribution: per-node fuel consumption ────────────
-        let fuel = output
-            .get("__fuel_consumed__")
-            .and_then(JsonValue::as_i64)
-            .unwrap_or(0);
-        if fuel > 0 {
-            let label = ctx
-                .node_label
-                .map(str::to_string)
-                .unwrap_or_else(|| ctx.node_id.to_string());
-            // `__fuel_limit__` is the limit the WORKER actually enforced
-            // (config override > module default, engine-clamped) — stamped
-            // next to `__fuel_consumed__`. None for outputs from pre-stamp
-            // workers; readers COALESCE back to modules.max_fuel.
-            let max_fuel = output.get("__fuel_limit__").and_then(JsonValue::as_i64);
-            talos_cost_attribution::record_fuel(
-                self.pool.clone(),
-                ctx.actor_id,
-                ctx.workflow_id,
-                ctx.execution_id,
-                label,
-                ctx.module_id,
-                fuel,
-                i64::try_from(ctx.wall_time_ms).unwrap_or(i64::MAX),
-                max_fuel,
-            );
-        }
+        // ── 1. Cost attribution is NOT done here. ─────────────────────
+        // Fuel is recorded by the NATS dispatcher's fuel sink, once per
+        // VERIFIED attempt, from the signed `JobResult` — so failed,
+        // retried, loop-body and non-object-output attempts count too. This
+        // hook sees only completed nodes and only their output, which is why
+        // reading `__fuel_consumed__` here missed all of those (2026-09-29).
 
         // ── 2. `__memory_write__` protocol: persist to actor_memory ──
         self.persist_memory_write_if_present(ctx.actor_id, output, ctx.max_write_ceiling);
@@ -440,9 +418,8 @@ impl NodeLifecycleHook for ControllerNodeHook {
         max_write_ceiling: WriteCeiling,
     ) {
         // Pipeline-step memory writes: same extraction, NO fuel
-        // attribution. Chain-level fuel is recorded once on the chain
-        // head via on_node_completed; double-billing per step would
-        // inflate rollups by the chain length.
+        // attribution — the dispatcher's fuel sink records each step's fuel
+        // from the signed result.
         self.persist_memory_write_if_present(actor_id, step_output, max_write_ceiling);
         talos_ml::spawn_distill_from_output(actor_id, step_output);
         self.persist_ops_alert_if_present(actor_id, step_output);

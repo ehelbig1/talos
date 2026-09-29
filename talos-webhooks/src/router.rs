@@ -1699,6 +1699,26 @@ impl WebhookRouter {
                         });
                     }
 
+                    // Fuel: this is a primary-verify site outside the engine
+                    // dispatcher, so it records the verified attempt's fuel
+                    // itself — success or failure, since a failed attempt
+                    // spent fuel too. Identity is read from the attempt's
+                    // own `module_executions` row, never from the result.
+                    if let Some(fuel) = result.spent_fuel() {
+                        talos_cost_attribution::spawn_record_module_bound_fuel(
+                            usage_pool.clone(),
+                            job_id,
+                            fuel.consumed,
+                            fuel.limit,
+                            result.execution_time_ms,
+                            if result.is_terminal_success() {
+                                talos_cost_attribution::AttemptOutcome::Completed
+                            } else {
+                                talos_cost_attribution::AttemptOutcome::Failed
+                            },
+                        );
+                    }
+
                     match result.status {
                         talos_workflow_job_protocol::JobStatus::Success => {
                             Ok(result.output_payload.value().to_string())

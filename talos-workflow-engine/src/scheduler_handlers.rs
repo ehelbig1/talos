@@ -2747,6 +2747,8 @@ impl ParallelWorkflowEngine {
                 // Each iteration mints its own `iter_exec_id`, so no iteration
                 // re-dispatches an id an earlier send used.
                 dispatch_attempt_base: 0,
+                workflow_id: Some(self.cost_attribution_workflow_id(execution_id)),
+                node_label: self.node_labels.get(&body_uuid).cloned(),
             };
 
             let dispatch_outcome = dispatcher.dispatch(body_job).await;

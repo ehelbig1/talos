@@ -479,6 +479,8 @@ impl ParallelWorkflowEngine {
                 // Chain-level, ignored per step (`PipelineJobRequest` carries no
                 // attempt; the chain path writes no audit chain to partition).
                 dispatch_attempt_base: 0,
+                workflow_id: Some(self.cost_attribution_workflow_id(execution_id)),
+                node_label: self.node_labels.get(&step_node_id).cloned(),
             });
         }
 

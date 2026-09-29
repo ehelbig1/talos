@@ -204,6 +204,12 @@ pub const TRIGGER: &str = "__trigger__";
 /// by the node.
 pub const FUEL_CONSUMED: &str = "__fuel_consumed__";
 
+/// Worker-written output marker beside [`FUEL_CONSUMED`]: the fuel limit the
+/// worker enforced for the node. Like [`FUEL_CONSUMED`] it is stamped only
+/// into an OBJECT output; the authoritative carrier is the signed
+/// `JobResult::fuel` field.
+pub const FUEL_LIMIT: &str = "__fuel_limit__";
+
 /// Written onto node input by the engine when an actor context is
 /// configured. Carries a per-actor memory view for modules that
 /// implement the agent-memory protocol.

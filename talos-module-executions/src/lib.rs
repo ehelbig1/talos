@@ -263,6 +263,9 @@ pub struct ModulePayloadReEncryptStats {
     pub failed: u64,
 }
 
+/// Re-exported so the module-bound fuel callers need no second dependency.
+pub use talos_cost_attribution::AttemptOutcome;
+
 /// Service for managing module executions
 pub struct ModuleExecutionService {
     db_pool: PgPool,
@@ -1499,6 +1502,31 @@ impl ModuleExecutionService {
                 e
             );
         }
+    }
+
+    /// Record a MODULE-BOUND attempt's fuel (webhook, push, DLQ replay) in
+    /// both fuel ledgers, fire-and-forget. The caller passes the figure from
+    /// the VERIFIED result (`JobResult::spent_fuel`); the actor, module and
+    /// execution are read from this row by
+    /// [`talos_cost_attribution::record_module_bound_fuel`], never taken from
+    /// the worker. Call it for every verified result, success or failure: a
+    /// failed attempt spent its fuel and the hourly budget must see it.
+    pub fn record_attempt_fuel(
+        &self,
+        module_execution_id: Uuid,
+        consumed: u64,
+        limit: Option<u64>,
+        wall_time_ms: u64,
+        outcome: talos_cost_attribution::AttemptOutcome,
+    ) {
+        talos_cost_attribution::spawn_record_module_bound_fuel(
+            self.db_pool.clone(),
+            module_execution_id,
+            consumed,
+            limit,
+            wall_time_ms,
+            outcome,
+        );
     }
 
     /// Complete an execution from a trusted worker result (no user_id ownership check).

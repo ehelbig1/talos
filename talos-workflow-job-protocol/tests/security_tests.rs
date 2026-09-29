@@ -525,6 +525,7 @@ fn tampered_job_result_status_fails() {
         signature: vec![],
         result_nonce: String::new(),
         worker_id: String::new(),
+        fuel: None,
     };
     result.sign(&key).unwrap();
 
@@ -551,6 +552,7 @@ fn tampered_job_result_execution_time_fails() {
         signature: vec![],
         result_nonce: String::new(),
         worker_id: String::new(),
+        fuel: None,
     };
     result.sign(&key).unwrap();
 
@@ -696,6 +698,7 @@ fn signed_job_result(key: &[u8]) -> JobResult {
         signature: vec![],
         result_nonce: String::new(),
         worker_id: String::new(),
+        fuel: None,
     };
     result.sign(key).unwrap();
     result
@@ -945,6 +948,7 @@ fn tampered_job_result_worker_id_fails() {
         signature: vec![],
         result_nonce: String::new(),
         worker_id: String::new(),
+        fuel: None,
     };
     result
         .sign_with_worker_id(&key, "worker-a")
@@ -1000,6 +1004,7 @@ fn worker_id_invalid_chars_rejected_at_sign_time() {
         signature: vec![],
         result_nonce: String::new(),
         worker_id: String::new(),
+        fuel: None,
     };
     // Embedded colon — would shift the signing-payload field
     // boundary if accepted.
@@ -1033,6 +1038,7 @@ fn worker_id_empty_passes_for_backcompat() {
         signature: vec![],
         result_nonce: String::new(),
         worker_id: String::new(),
+        fuel: None,
     };
     result.sign(&key).expect("bare sign must succeed");
     result

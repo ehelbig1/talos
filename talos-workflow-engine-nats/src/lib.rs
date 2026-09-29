@@ -62,6 +62,9 @@ mod dispatcher;
 mod run;
 mod transport;
 
-pub use dispatcher::{EnvelopeSealingHandle, LlmUsageReport, LlmUsageSink, NatsNodeDispatcher};
+pub use dispatcher::{
+    EnvelopeSealingHandle, FuelOutcome, FuelReport, FuelSink, LlmUsageReport, LlmUsageSink,
+    NatsNodeDispatcher,
+};
 pub use run::{run_with_nats, run_with_seed_via_nats};
 pub use transport::NatsTransport;

@@ -100,6 +100,66 @@ pub fn install_llm_usage_sink(sink: talos_workflow_engine_nats::LlmUsageSink) {
     let _ = LLM_USAGE_SINK.set(sink);
 }
 
+/// Process-wide fuel sink, installed once at controller boot and attached to
+/// every `NatsNodeDispatcher` built here — same memoization rationale as
+/// [`LLM_USAGE_SINK`]. This sink is the ONLY writer of the actor's fuel
+/// ledgers (`execution_cost_rollup`, `module_executions.fuel_consumed`) for
+/// engine dispatch, so a controller that did not install it would record no
+/// engine fuel at all; unset is correct only for tests and tools without a
+/// database.
+static FUEL_SINK: std::sync::OnceLock<talos_workflow_engine_nats::FuelSink> =
+    std::sync::OnceLock::new();
+
+/// Install the process-wide fuel sink. First caller wins (OnceLock); the sink
+/// MUST be non-blocking (spawn DB writes internally).
+pub fn install_fuel_sink(sink: talos_workflow_engine_nats::FuelSink) {
+    let _ = FUEL_SINK.set(sink);
+}
+
+/// The ledger row for one verified attempt's [`FuelReport`]. Pure, so the
+/// mapping from the dispatcher's report to the recorded row is tested
+/// without a database.
+///
+/// [`FuelReport`]: talos_workflow_engine_nats::FuelReport
+#[must_use]
+pub fn dispatch_fuel_row(
+    report: &talos_workflow_engine_nats::FuelReport,
+) -> talos_cost_attribution::DispatchFuel {
+    talos_cost_attribution::DispatchFuel {
+        module_execution_id: report.job_id,
+        execution_id: report.execution_id,
+        workflow_id: report.workflow_id,
+        node_label: report.node_label.clone(),
+        module_id: Some(report.module_id),
+        actor_id: report.actor_id,
+        consumed: report.fuel.consumed,
+        limit: report.fuel.limit,
+        wall_time_ms: report.execution_time_ms,
+        outcome: match report.outcome {
+            talos_workflow_engine_nats::FuelOutcome::Completed => {
+                talos_cost_attribution::AttemptOutcome::Completed
+            }
+            talos_workflow_engine_nats::FuelOutcome::Failed => {
+                talos_cost_attribution::AttemptOutcome::Failed
+            }
+        },
+    }
+}
+
+/// Install the production fuel recorder: every verified attempt's fuel is
+/// written to both ledgers through [`talos_cost_attribution`], spawned so it
+/// never blocks dispatch. Called once at controller boot.
+pub fn install_fuel_recorder(pool: sqlx::PgPool) {
+    install_fuel_sink(std::sync::Arc::new(
+        move |report: talos_workflow_engine_nats::FuelReport| {
+            talos_cost_attribution::spawn_record_dispatch_fuel(
+                pool.clone(),
+                dispatch_fuel_row(&report),
+            );
+        },
+    ));
+}
+
 /// Build the Talos default `NodeDispatcher` from a raw
 /// `async_nats::Client`. Used by `run_with_nats`, `run_with_seed_via_nats`,
 /// and `run_with_trigger_input_via_nats` so construction is in exactly
@@ -160,6 +220,10 @@ pub fn build_nats_dispatcher(
     // this dispatcher.
     let dispatcher = match LLM_USAGE_SINK.get() {
         Some(sink) => dispatcher.with_llm_usage_sink(sink.clone()),
+        None => dispatcher,
+    };
+    let dispatcher = match FUEL_SINK.get() {
+        Some(sink) => dispatcher.with_fuel_sink(sink.clone()),
         None => dispatcher,
     };
     // Inject the result verify-ring: the current signing key plus any
@@ -817,5 +881,80 @@ mod operator_cancel_tests {
             1,
             "only run_tracked may track a run — a bare track() skips the stop signal"
         );
+    }
+}
+
+/// Fuel attribution wiring (2026-09-29).
+#[cfg(test)]
+mod fuel_sink_wiring_tests {
+    use super::dispatch_fuel_row;
+    use talos_cost_attribution::AttemptOutcome;
+    use talos_workflow_engine_nats::{FuelOutcome, FuelReport};
+    use talos_workflow_job_protocol::{FuelSource, SpentFuel};
+    use uuid::Uuid;
+
+    fn report(outcome: FuelOutcome) -> FuelReport {
+        FuelReport {
+            job_id: Uuid::new_v4(),
+            execution_id: Uuid::new_v4(),
+            workflow_id: Some(Uuid::new_v4()),
+            node_label: Some("summarise".into()),
+            module_id: Uuid::new_v4(),
+            actor_id: Some(Uuid::new_v4()),
+            fuel: SpentFuel {
+                consumed: 1_234,
+                limit: Some(5_000),
+                source: FuelSource::OutOfBand,
+            },
+            outcome,
+            execution_time_ms: 42,
+        }
+    }
+
+    /// Every field of the recorded row comes from the report, and each
+    /// outcome maps to its own ledger outcome — a failed attempt must never
+    /// be recorded as completed (learners would train on it) or dropped.
+    #[test]
+    fn the_row_is_the_report() {
+        for (outcome, want) in [
+            (FuelOutcome::Completed, AttemptOutcome::Completed),
+            (FuelOutcome::Failed, AttemptOutcome::Failed),
+        ] {
+            let r = report(outcome);
+            let row = dispatch_fuel_row(&r);
+            assert_eq!(row.module_execution_id, r.job_id);
+            assert_eq!(row.execution_id, r.execution_id);
+            assert_eq!(row.workflow_id, r.workflow_id);
+            assert_eq!(row.node_label, r.node_label);
+            assert_eq!(row.module_id, Some(r.module_id));
+            assert_eq!(row.actor_id, r.actor_id);
+            assert_eq!(row.consumed, 1_234);
+            assert_eq!(row.limit, Some(5_000));
+            assert_eq!(row.wall_time_ms, 42);
+            assert_eq!(row.outcome, want);
+        }
+    }
+
+    /// Source pins (stated as textual). The fuel sink is the ONLY writer of
+    /// engine fuel into the hourly budget's table, so a dispatcher built
+    /// without it, or a controller that never installs it, records no engine
+    /// fuel at all — and every test in the workspace would stay green.
+    #[test]
+    fn the_production_dispatcher_attaches_the_fuel_sink() {
+        let src = include_str!("nats_run.rs");
+        let production = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let attach = ["dispatcher.with_fuel_sink", "(sink.clone())"].concat();
+        assert_eq!(production.matches(&attach).count(), 1);
+    }
+
+    #[test]
+    fn controller_boot_installs_the_fuel_recorder() {
+        let main = include_str!("../../controller/src/main.rs");
+        let call = [
+            "talos_engine::nats_run::install_fuel_recorder",
+            "(db_pool.clone())",
+        ]
+        .concat();
+        assert_eq!(main.matches(&call).count(), 1);
     }
 }

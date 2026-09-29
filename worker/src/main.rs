@@ -449,6 +449,7 @@ fn truncate_oversized_job_result(
         signature: vec![],
         result_nonce: String::new(),
         worker_id: String::new(),
+        fuel: None,
     }
 }
 
@@ -523,6 +524,7 @@ fn failed_result(job_id: uuid::Uuid, start: &std::time::Instant, msg: &str) -> J
         signature: vec![],
         result_nonce: String::new(),
         worker_id: String::new(),
+        fuel: None,
     }
 }
 
@@ -1391,6 +1393,7 @@ async fn execute_job(
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         };
     }
 
@@ -1758,6 +1761,7 @@ async fn execute_job(
                 signature: vec![],
                 result_nonce: String::new(),
                 worker_id: String::new(),
+                fuel: None,
             }
         }
         Ok(Err(e)) => {
@@ -1779,6 +1783,7 @@ async fn execute_job(
                 signature: vec![],
                 result_nonce: String::new(),
                 worker_id: String::new(),
+                fuel: None,
             }
         }
         Err(_) => {
@@ -1807,6 +1812,7 @@ async fn execute_job(
                 signature: vec![],
                 result_nonce: String::new(),
                 worker_id: String::new(),
+                fuel: None,
             }
         }
     }
@@ -2111,6 +2117,7 @@ async fn execute_pipeline_job(
                     output: output.clone().into(),
                     execution_time_ms: time_ms,
                     error: None,
+                    fuel: None,
                 })
                 .collect();
 
@@ -3645,6 +3652,7 @@ mod result_publish_tests {
             signature: vec![0; 32],
             result_nonce: "1700000000:abc".to_string(),
             worker_id: String::new(),
+            fuel: None,
         };
         let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
         // Identity bound: same job_id so the controller can correlate.
@@ -3681,6 +3689,7 @@ mod result_publish_tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         };
         let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
         let bytes = serde_json::to_vec(&replacement).unwrap();
