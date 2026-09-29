@@ -68,6 +68,7 @@ and hallucinations amplify on every run. Current labels in use:
   `SYNTHETIC_MEMORY_KINDS` 2026-09-10; that list also drives the
   graph-extraction skip, so consolidated rows no longer auto-extract —
   stated trade-off, since consolidation retires the source rows)
+- `essay_outline` — content-pipeline-weekly outlines (added 2026-09-29)
 
 **The `__memory_write__` protocol is OPT-IN per node.** A node persists to
 actor_memory ONLY when its output JSON contains a `__memory_write__` key
