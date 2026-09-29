@@ -17,6 +17,39 @@ use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 /// [`drain_llm_usage_entries`].
 pub type LlmUsageAcc = Arc<std::sync::Mutex<HashMap<(String, String), (u64, u64, u32)>>>;
 
+/// Per-job fuel accumulator: the fuel every in-worker attempt of a job
+/// consumed, drained into the signed `JobResult::fuel`.
+///
+/// It exists because the other carrier, `__fuel_consumed__` in the output,
+/// can be stamped only into a JSON object and a failed attempt has no output,
+/// so the controller's hourly fuel budget never saw a failed, fuel-exhausted
+/// or non-object attempt. The runtime adds to it at the one point every
+/// attempt's fuel is measured, BEFORE any error return, so a trap, an
+/// out-of-fuel kill or a module error is counted too. `None` = no attempt
+/// was measured (a result-cache hit, or an attempt that never reached the
+/// module).
+pub type FuelAcc = Arc<std::sync::Mutex<Option<talos_workflow_job_protocol::FuelMeasure>>>;
+
+/// Add one measured attempt to `acc`. Attempts sum; the limit is the latest
+/// attempt's (every attempt of one job runs under the same limit).
+pub fn add_attempt_fuel(acc: &FuelAcc, consumed: u64, limit: u64) {
+    let mut g = acc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total = g.map_or(0, |m| m.consumed).saturating_add(consumed);
+    *g = Some(talos_workflow_job_protocol::FuelMeasure {
+        consumed: total,
+        limit,
+    });
+}
+
+/// Take the accumulated measurement out of `acc`, leaving it empty.
+pub fn take_fuel(acc: &FuelAcc) -> Option<talos_workflow_job_protocol::FuelMeasure> {
+    acc.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
 /// In-process collector for the `[host:*]` diagnostic lines an execution
 /// emits — the SAME lines [`TalosContext::emit_host_diagnostic`] publishes to
 /// `wasm.log.{execution_id}`.
@@ -4177,6 +4210,38 @@ mod capability_denial_detail_tests {
         assert!(
             !line.contains(" — "),
             "no detail was passed, so none is rendered: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fuel_acc_tests {
+    use super::{add_attempt_fuel, take_fuel, FuelAcc};
+    use talos_workflow_job_protocol::FuelMeasure;
+
+    /// A job's attempts SUM: the budget is charged for every attempt the
+    /// worker ran, not only the last. `take` empties the accumulator, so a
+    /// result is never charged twice for the same spend.
+    #[test]
+    fn attempts_sum_and_take_empties() {
+        let acc: FuelAcc = std::sync::Arc::new(std::sync::Mutex::new(None));
+        assert_eq!(take_fuel(&acc), None, "nothing measured, nothing reported");
+        add_attempt_fuel(&acc, 700, 1_000);
+        add_attempt_fuel(&acc, 1_000, 1_000);
+        assert_eq!(
+            take_fuel(&acc),
+            Some(FuelMeasure {
+                consumed: 1_700,
+                limit: 1_000
+            })
+        );
+        assert_eq!(take_fuel(&acc), None);
+        add_attempt_fuel(&acc, u64::MAX, 1);
+        add_attempt_fuel(&acc, 5, 1);
+        assert_eq!(
+            take_fuel(&acc).map(|m| m.consumed),
+            Some(u64::MAX),
+            "saturates"
         );
     }
 }

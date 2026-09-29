@@ -1774,6 +1774,7 @@ async fn handle_run_scratch_session(
             None, // host_diag_out — no in-process diagnostic sink on this path
             0,    // dispatch_attempt — an operator-invoked run, no controller retry loop above it
             None, // inference_wait (RFC 0014 P2): no controller is timing this call
+            None, // fuel_out: this caller reports no fuel
         )
         .await;
 

@@ -34,6 +34,8 @@ use worker::{circuit_breaker, metrics, metrics_server, sql_validator};
 use worker::runtime::TalosRuntime;
 
 #[cfg(test)]
+mod fuel_emission_pin;
+#[cfg(test)]
 mod inference_wait_pin;
 mod rejected_jobs;
 #[cfg(test)]
@@ -449,7 +451,10 @@ fn truncate_oversized_job_result(
         signature: vec![],
         result_nonce: String::new(),
         worker_id: String::new(),
-        fuel: None,
+        // Preserve the fuel for the same reason as the token accounting: the
+        // module ran and spent it, and dropping it here would hide exactly
+        // the runs large enough to breach the cap from the fuel budget.
+        fuel: result.fuel,
     }
 }
 
@@ -1666,6 +1671,11 @@ async fn execute_job(
     // (success, failure, timeout) — tokens spent before a trap are spent.
     let llm_usage_acc: worker::context::LlmUsageAcc =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Out-of-band fuel: the runtime adds every attempt's measured fuel here,
+    // success or failure; drained into the signed JobResult below so the
+    // controller's hourly fuel budget sees failed, fuel-exhausted and
+    // non-object attempts too. A result-cache hit ran nothing and reports none.
+    let fuel_acc: worker::context::FuelAcc = std::sync::Arc::new(std::sync::Mutex::new(None));
     // RFC 0014 P2: this job's waiting-for-the-local-inference-slot account.
     // Every deadline below — this outer one, the runtime's inner one and the
     // epoch wall-clock bound — stands still while the job queues for the slot,
@@ -1739,6 +1749,7 @@ async fn execute_job(
             // rather than as a duplicated sequence in the first.
             req.dispatch_attempt,
             Some(inference_wait.clone()),
+            Some(fuel_acc.clone()),
         ),
     )
     .await
@@ -1761,7 +1772,7 @@ async fn execute_job(
                 signature: vec![],
                 result_nonce: String::new(),
                 worker_id: String::new(),
-                fuel: None,
+                fuel: worker::context::take_fuel(&fuel_acc),
             }
         }
         Ok(Err(e)) => {
@@ -1783,7 +1794,7 @@ async fn execute_job(
                 signature: vec![],
                 result_nonce: String::new(),
                 worker_id: String::new(),
-                fuel: None,
+                fuel: worker::context::take_fuel(&fuel_acc),
             }
         }
         Err(_) => {
@@ -1812,7 +1823,7 @@ async fn execute_job(
                 signature: vec![],
                 result_nonce: String::new(),
                 worker_id: String::new(),
-                fuel: None,
+                fuel: worker::context::take_fuel(&fuel_acc),
             }
         }
     }
@@ -2111,13 +2122,15 @@ async fn execute_pipeline_job(
                 .iter()
                 .zip(pipeline_result.step_outputs.iter())
                 .zip(pipeline_result.step_times_ms.iter())
-                .map(|((step, output), &time_ms)| PipelineStepResult {
+                .enumerate()
+                .map(|(i, ((step, output), &time_ms))| PipelineStepResult {
                     module_id: step.module_id,
                     status: JobStatus::Success,
                     output: output.clone().into(),
                     execution_time_ms: time_ms,
                     error: None,
-                    fuel: None,
+                    // Out-of-band per-step fuel (see `JobResult::fuel`).
+                    fuel: pipeline_result.step_fuel.get(i).copied().flatten(),
                 })
                 .collect();
 
@@ -3652,9 +3665,15 @@ mod result_publish_tests {
             signature: vec![0; 32],
             result_nonce: "1700000000:abc".to_string(),
             worker_id: String::new(),
-            fuel: None,
+            fuel: Some(talos_workflow_job_protocol::FuelMeasure {
+                consumed: 3_000_000,
+                limit: 4_000_000,
+            }),
         };
         let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
+        // The module ran and spent its fuel; dropping the output must not drop
+        // the spend from the actor's fuel budget.
+        assert_eq!(replacement.fuel, original.fuel);
         // Identity bound: same job_id so the controller can correlate.
         assert_eq!(replacement.job_id, original.job_id);
         // Status downgraded to Failed — the original Success is no

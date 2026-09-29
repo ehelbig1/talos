@@ -847,6 +847,7 @@ async fn cancellation_preempts_a_compute_bound_module() {
                 None, // host_diag_out
                 0,    // dispatch_attempt
                 None, // inference_wait (RFC 0014 P2): no controller is timing this call
+                None, // fuel_out: this caller reports no fuel
             )
             .await
         })
@@ -983,6 +984,7 @@ async fn an_uncancelled_compute_bound_job_still_traps_at_its_own_budget() {
             None,
             0,    // dispatch_attempt
             None, // inference_wait (RFC 0014 P2): no controller is timing this call
+            None, // fuel_out: this caller reports no fuel
         )
         .await;
     let elapsed = start.elapsed();
@@ -1003,5 +1005,106 @@ async fn an_uncancelled_compute_bound_job_still_traps_at_its_own_budget() {
         elapsed < Duration::from_secs(30),
         "the sliced budget must still sum to the original one, not extend it \
          (elapsed {elapsed:?}, budget {JOB_TIMEOUT:?})"
+    );
+}
+
+// ============================================================================
+// Out-of-band fuel (2026-09-29)
+// ============================================================================
+
+/// `run` returns `ok("[1]")` — a JSON ARRAY, the output shape the in-band
+/// `__fuel_consumed__` stamp cannot be written into.
+const ARRAY_CORE_WAT: &str = r#"
+(module
+  (import "talos:core/logging" "log" (func $log (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 200))
+  (func (export "run") (param i32 i32) (result i32)
+    (i32.store8 (i32.const 100) (i32.const 91))  ;; '['
+    (i32.store8 (i32.const 101) (i32.const 49))  ;; '1'
+    (i32.store8 (i32.const 102) (i32.const 93))  ;; ']'
+    (i32.store (i32.const 8) (i32.const 0))       ;; tag = ok
+    (i32.store (i32.const 12) (i32.const 100))    ;; str ptr
+    (i32.store (i32.const 16) (i32.const 3))      ;; str len
+    (i32.const 8)))
+"#;
+
+/// Run one job through the worker's production entry point with a fuel
+/// accumulator, returning the outcome and what the accumulator measured.
+async fn run_measuring_fuel(
+    core_wat: &str,
+    max_fuel: u64,
+) -> (
+    anyhow::Result<serde_json::Value>,
+    Option<talos_workflow_job_protocol::FuelMeasure>,
+) {
+    use talos_workflow_job_protocol::LlmTier;
+    let rt = TalosRuntime::new().expect("runtime");
+    let acc: worker::context::FuelAcc = Arc::new(std::sync::Mutex::new(None));
+    let out = rt
+        .execute_job_with_full_features(
+            &build_minimal_component(core_wat),
+            vec![],
+            vec![],
+            128,
+            serde_json::json!({}),
+            None,
+            None,
+            HashMap::new(),
+            None,
+            Duration::from_secs(30),
+            worker::runtime::RetryPolicy::none(),
+            None,
+            SecurityPolicy::default(),
+            None,
+            Some(max_fuel),
+            false,
+            None,
+            uuid::Uuid::nil(),
+            LlmTier::Tier2,
+            talos_workflow_job_protocol::WriteCeiling::Write,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            Some(acc.clone()),
+        )
+        .await;
+    (out, worker::context::take_fuel(&acc))
+}
+
+/// The shape the in-band stamp misses: an array output still reports its fuel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_array_output_reports_its_fuel_out_of_band() {
+    let (out, fuel) = run_measuring_fuel(ARRAY_CORE_WAT, 5_000_000).await;
+    assert_eq!(out.expect("module returns ok"), serde_json::json!([1]));
+    let fuel = fuel.expect("an array output must still be measured");
+    assert!(fuel.consumed > 0);
+    assert_eq!(fuel.limit, 5_000_000);
+}
+
+/// A module that SIGNALS failure returns no output at all, yet spent fuel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_attempt_reports_its_fuel_out_of_band() {
+    let (out, fuel) = run_measuring_fuel(ERR_CORE_WAT, 5_000_000).await;
+    assert!(out.is_err(), "the module returned err");
+    let fuel = fuel.expect("a failed attempt must still be measured");
+    assert!(fuel.consumed > 0);
+}
+
+/// A fuel-exhausted attempt spent its whole limit, and says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fuel_exhausted_attempt_reports_its_whole_limit() {
+    let (out, fuel) = run_measuring_fuel(LOOP_CORE_WAT, 1_000_000).await;
+    let err = format!("{:#}", out.expect_err("a runaway loop must not return Ok"));
+    assert!(err.contains("fuel"), "killed by fuel, got: {err}");
+    assert_eq!(
+        fuel,
+        Some(talos_workflow_job_protocol::FuelMeasure {
+            consumed: 1_000_000,
+            limit: 1_000_000,
+        })
     );
 }
