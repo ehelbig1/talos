@@ -2496,6 +2496,10 @@ pub struct PipelineResult {
     pub final_output: JsonValue,
     /// Elapsed time for each step in milliseconds.
     pub step_times_ms: Vec<u64>,
+    /// Fuel each step spent, carried out of band onto
+    /// `PipelineStepResult::fuel` (`None` when the step's fuel was not
+    /// measured).
+    pub step_fuel: Vec<Option<talos_workflow_job_protocol::FuelMeasure>>,
 }
 
 // ============================================================================
@@ -3696,6 +3700,7 @@ impl TalosRuntime {
             None, // host_diag_out — legacy helper has a real execution id (NATS route)
             0,    // dispatch_attempt — legacy helper has no controller retry loop above it
             None, // inference_wait (RFC 0014 P2): no controller is timing this call
+            None, // fuel_out: this caller reports no fuel
         )
         .await
     }
@@ -3797,6 +3802,11 @@ impl TalosRuntime {
         // slot. `None` keeps every deadline fixed — the right answer for
         // `run_sandbox`, `test_module` and replay, which nobody else is timing.
         inference_wait: Option<Arc<crate::inference_wait::InferenceWaitLedger>>,
+        // Fuel accumulator: every attempt's measured fuel is ADDED here, on
+        // success and on failure, so the caller can put it on the signed
+        // result (`JobResult::fuel`). `None` = the caller does not report
+        // fuel (in-process rehearsal surfaces).
+        fuel_out: Option<crate::context::FuelAcc>,
     ) -> Result<JsonValue> {
         // Per-job fuel override: use the controller-supplied value when non-zero,
         // otherwise fall back to the runtime's global fuel_limit.
@@ -4044,6 +4054,7 @@ impl TalosRuntime {
                         job_ledger.clone(),
                         anchor_eligible.clone(),
                         inference_wait.clone(),
+                        fuel_out.clone(),
                     )
                     .await
                 {
@@ -4317,6 +4328,8 @@ impl TalosRuntime {
         anchor_eligible: Arc<std::sync::atomic::AtomicBool>,
         // RFC 0014 P2 (see `execute_job_with_full_features`).
         inference_wait: Option<Arc<crate::inference_wait::InferenceWaitLedger>>,
+        // Fuel accumulator (see `execute_job_with_full_features`).
+        fuel_out: Option<crate::context::FuelAcc>,
     ) -> Result<JsonValue> {
         // DISTRIBUTED TRACING: Create execution span
         let execution_id = execution_context
@@ -4664,6 +4677,11 @@ impl TalosRuntime {
 
         let (call_result, oom_msg, remaining_fuel) = call_result;
         let fuel_consumed = remaining_fuel.map(|r| fuel_limit_for_calc.saturating_sub(r));
+        // Out-of-band fuel: recorded HERE, before any of the error returns
+        // below, so a trap, an out-of-fuel kill or a module error is counted.
+        if let (Some(acc), Some(consumed)) = (fuel_out.as_ref(), fuel_consumed) {
+            crate::context::add_attempt_fuel(acc, consumed, fuel_limit_for_calc);
+        }
 
         // Read any bytes written to WASI stderr during execution (e.g. panic messages).
         // The WASM runtime writes "thread '...' panicked at '...'" to WASI stderr on panic.
@@ -5240,6 +5258,8 @@ impl TalosRuntime {
         let mut previous_output: JsonValue = JsonValue::Null;
         let mut step_outputs: Vec<JsonValue> = Vec::with_capacity(steps.len());
         let mut step_times_ms: Vec<u64> = Vec::with_capacity(steps.len());
+        let mut step_fuel: Vec<Option<talos_workflow_job_protocol::FuelMeasure>> =
+            Vec::with_capacity(steps.len());
 
         for step in &steps {
             // Compute module SHA256 for cache lookup.
@@ -5404,6 +5424,12 @@ impl TalosRuntime {
 
             step_outputs.push(step_output.clone());
             step_times_ms.push(step_time_ms);
+            step_fuel.push(fuel_consumed.map(|consumed| {
+                talos_workflow_job_protocol::FuelMeasure {
+                    consumed,
+                    limit: step.max_fuel,
+                }
+            }));
             previous_output = step_output;
         }
 
@@ -5411,6 +5437,7 @@ impl TalosRuntime {
             step_outputs,
             final_output: previous_output,
             step_times_ms,
+            step_fuel,
         })
     }
 

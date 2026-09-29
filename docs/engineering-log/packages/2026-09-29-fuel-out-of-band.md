@@ -125,3 +125,44 @@ not driven (the router needs a broker and a verified reply); the observer
 test drives the same recorder through the other module-bound site. The
 controller's install call is a TEXTUAL pin, because `main.rs` is not reachable
 from a test.
+
+## PR B — the worker emits fuel out of band
+
+- `execute_job_with_full_features` takes a `fuel_out` accumulator
+  (`talos_worker_runtime::context::FuelAcc`), mirroring `llm_usage_out`. The
+  runtime ADDS each attempt's measured fuel at the one point it is computed,
+  BEFORE any error return, so a module error, a trap, an OOM, a cancellation
+  and a fuel-exhausted kill are all counted. Attempts sum (saturating).
+- The worker's NATS path passes one per job and drains it onto the signed
+  result on every branch that ran the module (success, failure, timeout); the
+  pre-execution rejection keeps `None`, since nothing ran. A result-cache hit
+  ran nothing and reports none. The oversize replacement keeps the fuel the
+  dropped output spent.
+- Pipeline steps report their fuel per step on `PipelineStepResult::fuel`.
+- The in-band stamp is KEPT: an older controller still reads it, and
+  operators read it in node outputs. The controller never counts both.
+- Every other caller (`run_sandbox`, `test_module`, scratch sessions, replay,
+  GraphQL `testModule`) passes `None`; those runs have no budget ledger.
+
+**Proof.** Runtime tests through the production entry point with real
+`minimal-node` components: an ARRAY output reports its fuel; a module that
+returns `err` reports its fuel; a fuel-exhausted loop reports exactly its
+limit (`1 000 000 / 1 000 000`). The accumulator sums attempts, saturates and
+empties on take. A textual pin (`worker/src/fuel_emission_pin.rs`) holds the
+worker's call site: the accumulator is passed once and drained on all three
+result branches, and the oversize replacement keeps it. The oversize unit
+test asserts the fuel survives. `nextest` over the touched runtime crates:
+1 024 passed. **Mutations: 5 applied, 5 caught** (recorded on success only;
+no accumulator passed; the failure branch drops it; the oversize replacement
+drops it; the accumulator overwrites instead of summing).
+
+**Stated limits.**
+- **A wall-clock-timed-out attempt reports no fuel.** The timeout drops the
+  future that owns the store, so its fuel cannot be read. That attempt is
+  bounded by its time budget.
+- **A failed pipeline reports no per-step fuel** (the runtime returns an error
+  with no per-step results), and the pipeline oversize replacement drops its
+  steps, as it already dropped their LLM usage. The chain path is dormant by
+  config.
+- The worker's `execute_job` is held by a textual pin, not driven: it needs a
+  broker.

@@ -842,6 +842,7 @@ async fn run_replays(
                 None, // host_diag_out — no in-process diagnostic sink on this path
                 0,    // dispatch_attempt — replay is its own dispatch, never a controller retry
                 None, // inference_wait (RFC 0014 P2): no controller is timing this call
+                None, // fuel_out: this caller reports no fuel
             )
             .await;
         let duration_ms = start.elapsed().as_millis() as i64;

@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
             None, // host_diag_out — not collected
             0,    // dispatch_attempt — a hand-run example, no controller retry loop
             None, // inference_wait (RFC 0014 P2): no controller is timing this call
+            None, // fuel_out: this caller reports no fuel
         )
         .await
     {
