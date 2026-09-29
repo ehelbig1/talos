@@ -423,7 +423,17 @@ pub struct SecurityPolicy {
 ///             reads 45.0.3, changing the HMAC for every blob; bumping the
 ///             header to V7 rejects V6 blobs cleanly on the fleet rather
 ///             than surfacing an HMAC failure on stale precompiled bytes.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV8";
+///   TALOSV8 — 2026-07-31 (#621): wasmtime 45→47 security bump
+///             (RUSTSEC-2026-0222: stores could mix up type indices between
+///             engines). Same reason as V7: the fingerprint's wasmtime line
+///             changed, so V7 blobs are rejected by header.
+///   TALOSV9 — 2026-09-29: wasmtime 47→48 security bump (RUSTSEC-2026-0313
+///             wasi-http outgoing-body memory exhaustion, -0314 WASI
+///             filesystem datetime panic, -0315 `call_ref`/exception fuel
+///             amplification, -0316 dynamic record lifting past the hostcall
+///             fuel limit). Same reason again: V8 blobs are rejected by header
+///             and recompile on next use.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV9";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
@@ -521,7 +531,7 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
 /// moment it mattered.
 macro_rules! wasmtime_version {
     () => {
-        "47.0.3"
+        "48.0.3"
     };
 }
 
@@ -587,6 +597,7 @@ const ENGINE_CONFIG_FINGERPRINT: &[u8] = concat!(
     wasm_gc=false\n\
     wasm_function_references=false\n\
     wasm_tail_call=false\n\
+    wasm_component_model_memory64=false\n\
     wasm_bulk_memory=true\n\
     wasm_reference_types=true\n\
     epoch_interruption=true\n\
@@ -929,7 +940,7 @@ mod aot_hmac_input_tests {
         // Pinned SHA-256 of the canonical fingerprint constant.
         // If this fails, ENGINE_CONFIG_FINGERPRINT was edited (config knob
         // or the wasmtime= line). See test doc for the update procedure.
-        const EXPECTED: &str = "06d85079d47486223ec41495d8ab6e992c20d30ddbcc11bb4f29519c1ba8c6dd";
+        const EXPECTED: &str = "e3ffc9bc9869d25e0eb914425d6e312f780961016c71b71351cf62e01e8e1ed5";
         let actual = hex::encode(super::engine_config_fingerprint_hash());
         assert_eq!(
             actual, EXPECTED,
@@ -2647,12 +2658,13 @@ pub struct TalosRuntime {
 /// "operator-authored, unrestricted by design" premise was false (any user
 /// with an `automation-node` grant compiles such a module).
 fn add_wasi_http_types_only(l: &mut Linker<TalosContext>) -> Result<()> {
-    use wasmtime_wasi_http::p2::{bindings, WasiHttp};
+    use wasmtime_wasi_http::p2::bindings;
+    use wasmtime_wasi_http::WasiHttp;
     let options = bindings::LinkOptions::default();
     bindings::http::types::add_to_linker::<_, WasiHttp>(
         l,
         &options.into(),
-        <TalosContext as wasmtime_wasi_http::p2::WasiHttpView>::http,
+        <TalosContext as wasmtime_wasi_http::WasiHttpView>::http,
     )?;
     Ok(())
 }
@@ -3277,6 +3289,9 @@ impl TalosRuntime {
         config.wasm_gc(false);
         config.wasm_function_references(false);
         config.wasm_tail_call(false);
+        // Wasmtime 48: new knob, off by default ("very incomplete" upstream).
+        // Pinned off so a future default flip cannot widen the surface.
+        config.wasm_component_model_memory64(false);
         config.wasm_bulk_memory(true);
         config.wasm_reference_types(true);
 
@@ -6849,7 +6864,8 @@ mod tests {
     /// fail to link, i.e. fail closed).
     #[test]
     fn wasi_http_outgoing_handler_only_in_trusted_linker() {
-        use wasmtime_wasi_http::p2::{bindings, WasiHttp};
+        use wasmtime_wasi_http::p2::bindings;
+        use wasmtime_wasi_http::WasiHttp;
 
         fn test_engine() -> Engine {
             let mut c = Config::new();
@@ -6862,7 +6878,7 @@ mod tests {
         fn has_outgoing_handler(mut l: Linker<TalosContext>) -> bool {
             bindings::http::outgoing_handler::add_to_linker::<_, WasiHttp>(
                 &mut l,
-                <TalosContext as wasmtime_wasi_http::p2::WasiHttpView>::http,
+                <TalosContext as wasmtime_wasi_http::WasiHttpView>::http,
             )
             .is_err()
         }

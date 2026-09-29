@@ -1794,6 +1794,8 @@ REQUIRED_PROPOSALS=(
     "wasm_gc(false)"
     "wasm_function_references(false)"
     "wasm_tail_call(false)"
+    # wasmtime 48 (2026-09-29): new knob, off by default; pinned off.
+    "wasm_component_model_memory64(false)"
 )
 
 PROPOSAL_VIOLATIONS=0

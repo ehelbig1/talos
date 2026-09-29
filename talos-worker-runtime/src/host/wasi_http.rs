@@ -52,18 +52,21 @@
 //!   `CONNECT`, `TRACE` and custom verbs can never be declared, so they are
 //!   always refused here.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
+use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use wasmtime::component::Resource;
 use wasmtime_wasi_http::p2::bindings::http::{outgoing_handler, types as wt};
-use wasmtime_wasi_http::p2::body::{HyperIncomingBody, HyperOutgoingBody};
-use wasmtime_wasi_http::p2::types::{
-    HostFutureIncomingResponse, HostOutgoingRequest, IncomingResponse, OutgoingRequestConfig,
-};
-use wasmtime_wasi_http::p2::{HttpResult, WasiHttpHooks, WasiHttpView};
+use wasmtime_wasi_http::p2::body::HyperIncomingBody;
+use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, HostOutgoingRequest};
+use wasmtime_wasi_http::p2::HttpResult;
+use wasmtime_wasi_http::{RequestOptions, WasiBody, WasiHttpHooks, WasiHttpView};
 
 use super::egress::insecure_http_opt_in;
 use super::limits::{MAX_HTTP_CALLS_PER_EXECUTION, MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION};
@@ -427,19 +430,30 @@ fn dry_run_response(method: &str, host: &str) -> HostFutureIncomingResponse {
         .header("x-talos-dry-run", "true")
         .header("content-type", "application/json")
         .body(body);
-    HostFutureIncomingResponse::ready(Ok(match resp {
-        Ok(resp) => Ok(IncomingResponse {
-            resp,
-            worker: None,
-            between_bytes_timeout: Duration::from_secs(600),
-        }),
-        Err(_) => Err(wt::ErrorCode::InternalError(None)),
-    }))
+    match resp {
+        // The response's "I/O driver" handle: a mock has no connection to
+        // drive, so it is a task that is already finished.
+        Ok(resp) => {
+            HostFutureIncomingResponse::Ready(Ok((resp, wasmtime_wasi::runtime::spawn(async {}))))
+        }
+        Err(_) => {
+            HostFutureIncomingResponse::Ready(Err(wasmtime_wasi_http::Error::InternalError(None)))
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The send path: the execution's hardened client, never a raw connect.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// A timeout the guest did not set in its `request-options`: upstream's own
+/// default (`wasmtime_wasi_http::default_send_request`), the value Wasmtime 47
+/// also filled in before calling the hook. The job's wall-clock bound still
+/// ends a call long before it.
+const DEFAULT_WASI_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The request/response I/O-completion future the hook API passes around.
+type IoFuture = Box<dyn Future<Output = wasmtime_wasi_http::Result<()>> + Send>;
 
 /// `WasiHttpHooks` whose `send_request` uses the execution's hardened
 /// `reqwest` client (SSRF-filtering resolver incl. local-only egress, no
@@ -458,62 +472,137 @@ impl HardenedWasiHttpHooks {
 impl WasiHttpHooks for HardenedWasiHttpHooks {
     fn send_request(
         &mut self,
-        request: http::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> HttpResult<HostFutureIncomingResponse> {
+        request: http::Request<WasiBody>,
+        options: Option<RequestOptions>,
+        // Upstream's default also ignores it: response-processing errors reach
+        // the guest through the body itself.
+        _response_done: IoFuture,
+    ) -> Box<
+        dyn Future<Output = wasmtime_wasi_http::Result<(http::Response<WasiBody>, IoFuture)>>
+            + Send,
+    > {
         let client = self.client.clone();
-        let handle = wasmtime_wasi::runtime::spawn(async move {
-            Ok(send_via_hardened_client(client, request, config).await)
-        });
-        Ok(HostFutureIncomingResponse::pending(handle))
+        Box::new(async move {
+            let response = send_via_hardened_client(client, request, options).await?;
+            // reqwest drives its own connection, so there is no separate I/O
+            // task for the caller to await.
+            Ok((response, Box::new(std::future::ready(Ok(()))) as IoFuture))
+        })
     }
 }
 
 async fn send_via_hardened_client(
     client: reqwest::Client,
-    request: http::Request<HyperOutgoingBody>,
-    config: OutgoingRequestConfig,
-) -> Result<IncomingResponse, wt::ErrorCode> {
+    request: http::Request<WasiBody>,
+    options: Option<RequestOptions>,
+) -> wasmtime_wasi_http::Result<http::Response<WasiBody>> {
+    use wasmtime_wasi_http::Error;
+
+    let first_byte_timeout = options
+        .and_then(|o| o.first_byte_timeout)
+        .unwrap_or(DEFAULT_WASI_HTTP_TIMEOUT);
+    let between_bytes_timeout = options
+        .and_then(|o| o.between_bytes_timeout)
+        .unwrap_or(DEFAULT_WASI_HTTP_TIMEOUT);
+
     let (parts, body) = request.into_parts();
     let stream = TryStreamExt::map_err(http_body_util::BodyStream::new(body), |e| {
         std::io::Error::other(format!("{e:?}"))
     })
     .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
     let request = http::Request::from_parts(parts, reqwest::Body::wrap_stream(stream));
-    let request =
-        reqwest::Request::try_from(request).map_err(|_| wt::ErrorCode::HttpRequestUriInvalid)?;
+    let request = reqwest::Request::try_from(request).map_err(|_| Error::HttpRequestUriInvalid)?;
 
-    let response = tokio::time::timeout(config.first_byte_timeout, client.execute(request))
+    let response = tokio::time::timeout(first_byte_timeout, client.execute(request))
         .await
-        .map_err(|_| wt::ErrorCode::ConnectionReadTimeout)?
+        .map_err(|_| Error::ConnectionReadTimeout)?
         .map_err(|e| {
             if e.is_timeout() {
-                wt::ErrorCode::ConnectionTimeout
+                Error::ConnectionTimeout
             } else if e.is_connect() {
                 // Includes the SSRF resolver refusing a private / public-under-
                 // local-only address — the connect is the gate.
-                wt::ErrorCode::ConnectionRefused
+                Error::ConnectionRefused
             } else {
-                wt::ErrorCode::HttpProtocolError
+                Error::HttpProtocolError
             }
         })?;
 
-    let max = max_response_bytes();
     let (parts, body) = http::Response::<reqwest::Body>::from(response).into_parts();
-    let body: HyperIncomingBody = http_body_util::Limited::new(body, max)
+    let body = harden_response_body(body, max_response_bytes(), between_bytes_timeout);
+    Ok(http::Response::from_parts(parts, body))
+}
+
+/// The response body the guest reads: capped at `max` bytes, and failed with
+/// `ConnectionReadTimeout` when no data arrives for `between_bytes`.
+///
+/// Wasmtime 47 applied `between_bytes_timeout` to every response itself; since
+/// 48 only upstream's own sender does, so a custom hook has to bound a stalled
+/// body or lose the bound entirely.
+fn harden_response_body(body: reqwest::Body, max: usize, between_bytes: Duration) -> WasiBody {
+    use wasmtime_wasi_http::Error;
+    let capped: WasiBody = http_body_util::Limited::new(body, max)
         .map_err(move |e| {
             if e.is::<http_body_util::LengthLimitError>() {
-                wt::ErrorCode::HttpResponseBodySize(u64::try_from(max).ok())
+                Error::HttpResponseBodySize(u64::try_from(max).ok())
             } else {
-                wt::ErrorCode::HttpProtocolError
+                Error::HttpProtocolError
             }
         })
         .boxed_unsync();
-    Ok(IncomingResponse {
-        resp: http::Response::from_parts(parts, body),
-        worker: None,
-        between_bytes_timeout: config.between_bytes_timeout,
-    })
+    BetweenBytesTimeout::new(capped, between_bytes).boxed_unsync()
+}
+
+/// A response body that fails with `ConnectionReadTimeout` when no frame
+/// arrives within `timeout` of the previous one (or of the headers). One timer
+/// per body, reset per frame — no allocation on the data path.
+struct BetweenBytesTimeout {
+    inner: WasiBody,
+    timeout: Duration,
+    idle: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl BetweenBytesTimeout {
+    fn new(inner: WasiBody, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            idle: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+}
+
+impl Body for BetweenBytesTimeout {
+    type Data = Bytes;
+    type Error = wasmtime_wasi_http::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                let next = tokio::time::Instant::now() + this.timeout;
+                this.idle.as_mut().reset(next);
+                Poll::Ready(frame)
+            }
+            Poll::Pending => match this.idle.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    Poll::Ready(Some(Err(wasmtime_wasi_http::Error::ConnectionReadTimeout)))
+                }
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 #[cfg(test)]
@@ -820,10 +909,11 @@ mod tests {
         let req = push_request(&mut ctx, wt::Method::Post, "api.example.com");
         let fut = gated_handle(&mut ctx, req, None).expect("mocked");
         let fut = ctx.table.delete(fut).unwrap();
-        assert!(fut.is_ready(), "answered in place, no task spawned");
-        let resp = fut.unwrap_ready().unwrap().expect("a mock response");
-        assert_eq!(resp.resp.status(), 200);
-        assert_eq!(resp.resp.headers()["x-talos-dry-run"], "true");
+        let HostFutureIncomingResponse::Ready(Ok((resp, _io))) = fut else {
+            panic!("answered in place with a mock, not sent");
+        };
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["x-talos-dry-run"], "true");
     }
 
     /// An admitted request reaches the SEND path (a pending future from the
@@ -838,7 +928,7 @@ mod tests {
         let fut = gated_handle(&mut ctx, req, None).expect("admitted");
         let fut = ctx.table.delete(fut).unwrap();
         assert!(
-            !fut.is_ready(),
+            matches!(fut, HostFutureIncomingResponse::Pending(_)),
             "handed to the send path, which runs in a task"
         );
         assert_eq!(
@@ -858,8 +948,8 @@ mod tests {
 
     // ── The send path: connect-time SSRF ──────────────────────────────────
 
-    fn get_localhost(port: u16) -> http::Request<HyperOutgoingBody> {
-        let body: HyperOutgoingBody = http_body_util::Empty::<Bytes>::new()
+    fn get_localhost(port: u16) -> http::Request<WasiBody> {
+        let body: WasiBody = http_body_util::Empty::<Bytes>::new()
             .map_err(|never: std::convert::Infallible| match never {})
             .boxed_unsync();
         http::Request::builder()
@@ -869,21 +959,12 @@ mod tests {
             .unwrap()
     }
 
-    fn config() -> OutgoingRequestConfig {
-        OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: Duration::from_secs(5),
-            first_byte_timeout: Duration::from_secs(5),
-            between_bytes_timeout: Duration::from_secs(5),
-        }
-    }
-
-    async fn resolve(fut: HostFutureIncomingResponse) -> Result<IncomingResponse, wt::ErrorCode> {
-        match fut {
-            HostFutureIncomingResponse::Pending(h) => h.await.expect("no trap"),
-            HostFutureIncomingResponse::Ready(r) => r.expect("no trap"),
-            HostFutureIncomingResponse::Consumed => panic!("consumed"),
-        }
+    fn options() -> Option<RequestOptions> {
+        Some(RequestOptions {
+            connect_timeout: Some(Duration::from_secs(5)),
+            first_byte_timeout: Some(Duration::from_secs(5)),
+            between_bytes_timeout: Some(Duration::from_secs(5)),
+        })
     }
 
     /// A HOSTNAME that resolves to loopback is refused at connect by the
@@ -906,21 +987,117 @@ mod tests {
         });
 
         // Control: the path this replaced connects to loopback.
-        let upstream = wasmtime_wasi_http::p2::default_send_request(get_localhost(port), config());
-        let reached = resolve(upstream).await;
-        assert!(
-            matches!(&reached, Ok(r) if r.resp.status() == 200),
-            "control: upstream's raw connect reaches the loopback listener"
-        );
+        let (reached, io) =
+            wasmtime_wasi_http::default_send_request(get_localhost(port), options())
+                .await
+                .expect("control: upstream's raw connect reaches the loopback listener");
+        let driver = tokio::spawn(io);
+        assert_eq!(reached.status(), 200);
+        driver.abort();
 
         let ctx = trusted_ctx(&["localhost"], &["GET"]);
         let mut hooks = HardenedWasiHttpHooks::new(ctx.http_client.clone());
-        let fut = hooks.send_request(get_localhost(port), config()).unwrap();
-        let refused = resolve(fut).await;
+        let refused = Pin::from(hooks.send_request(
+            get_localhost(port),
+            options(),
+            Box::new(std::future::ready(Ok(()))),
+        ))
+        .await;
         assert!(
-            matches!(refused, Err(wt::ErrorCode::ConnectionRefused)),
+            matches!(refused, Err(wasmtime_wasi_http::Error::ConnectionRefused)),
             "the hardened path refuses the resolved loopback address: {:?}",
-            refused.map(|r| r.resp.status())
+            refused.map(|(r, _)| r.status())
+        );
+    }
+
+    // ── The response body: size cap and between-bytes idle timeout ────────
+
+    /// A body that yields `chunks`, then waits forever.
+    fn stalling_body(chunks: &'static [&'static [u8]]) -> reqwest::Body {
+        let data = futures_util::stream::iter(
+            chunks
+                .iter()
+                .map(|c| Ok::<Bytes, std::io::Error>(Bytes::from_static(c))),
+        );
+        reqwest::Body::wrap_stream(data.chain(futures_util::stream::pending()))
+    }
+
+    use futures_util::StreamExt as _;
+
+    /// Wasmtime 48 stopped applying `between_bytes_timeout` to a custom hook's
+    /// response, so the hardened path applies it: a body that stops mid-way
+    /// fails with `ConnectionReadTimeout` after the idle bound, having
+    /// delivered what arrived first.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_response_body_fails_after_the_between_bytes_bound() {
+        let mut body =
+            harden_response_body(stalling_body(&[b"partial"]), 1024, Duration::from_secs(5));
+        let first = body.frame().await.expect("a frame").expect("data");
+        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"partial"));
+        let started = tokio::time::Instant::now();
+        // Bounded from outside, so a missing idle timeout FAILS here (after 60
+        // virtual seconds) instead of hanging the test.
+        let stalled = tokio::time::timeout(Duration::from_secs(60), body.frame())
+            .await
+            .expect("the stalled body was not cut: no between-bytes bound")
+            .expect("an error frame");
+        assert!(
+            matches!(
+                stalled,
+                Err(wasmtime_wasi_http::Error::ConnectionReadTimeout)
+            ),
+            "{stalled:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    /// The bound is BETWEEN frames, not a total: a slow body that keeps
+    /// delivering within the bound is read to the end.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_body_that_keeps_arriving_is_read_in_full() {
+        let paced = futures_util::stream::iter(0..4).then(|i| async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Ok::<Bytes, std::io::Error>(Bytes::from(format!("{i}")))
+        });
+        let body = harden_response_body(
+            reqwest::Body::wrap_stream(paced),
+            1024,
+            Duration::from_secs(5),
+        );
+        let all = body.collect().await.expect("16 s in total, never 5 s idle");
+        assert_eq!(all.to_bytes(), Bytes::from_static(b"0123"));
+    }
+
+    /// The size cap still applies.
+    #[tokio::test]
+    async fn an_oversized_response_body_is_refused() {
+        let body = harden_response_body(
+            reqwest::Body::from(vec![b'x'; 2048]),
+            1024,
+            Duration::from_secs(5),
+        );
+        let err = body.collect().await.expect_err("over the cap");
+        assert!(
+            matches!(
+                err,
+                wasmtime_wasi_http::Error::HttpResponseBodySize(Some(1024))
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The hardened path wraps every response through the hardening above.
+    /// TEXTUAL: the hardened client refuses loopback by design, so no local
+    /// test can carry a real response through `send_via_hardened_client`.
+    #[test]
+    fn the_send_path_hardens_every_response_body() {
+        let src = code_only(include_str!("wasi_http.rs"));
+        let body = fn_body(&src, "async fn send_via_hardened_client(");
+        assert!(
+            body.contains(
+                "harden_response_body(body, max_response_bytes(), between_bytes_timeout)"
+            ),
+            "{body}"
         );
     }
 
@@ -966,7 +1143,7 @@ mod tests {
         let ctx_src = code_only(include_str!("../context.rs"));
         let body = fn_body(
             &ctx_src,
-            "impl wasmtime_wasi_http::p2::WasiHttpView for TalosContext {",
+            "impl wasmtime_wasi_http::WasiHttpView for TalosContext {",
         );
         assert!(body.contains("hooks: &mut self.wasi_http_hooks"), "{body}");
         assert!(!body.contains(&format!("default_{}()", "hooks")), "{body}");
