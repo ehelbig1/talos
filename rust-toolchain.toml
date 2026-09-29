@@ -10,5 +10,5 @@
 # locally, run `cargo clippy --workspace -- -D warnings`, fix anything
 # that breaks, then bump this pin in the same PR. Always pin to a
 # specific minor version; never use `stable`.
-channel = "1.95"
+channel = "1.96"
 components = ["rustfmt", "clippy"]

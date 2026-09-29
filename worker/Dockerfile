@@ -4,7 +4,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # Base image digest matches controller/Dockerfile so both binaries link
 # against the same glibc/OpenSSL versions. Bump together when rotating.
-FROM rust:1.95@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS builder
+FROM rust:1.96@sha256:1f0dbad1df66647807e6952d1db85d0b2bda7606cb2139d82517e4f009967376 AS builder
 
 # All Talos crates — including the engine + protocol crates folded
 # back from the sibling repo in May-2026 — live in this single
@@ -67,7 +67,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # Stage 2: Minimal runtime image
 # ══════════════════════════════════════════════════════════════════════════════
 # IMPORTANT: The runtime base MUST match the builder's Debian version.
-# rust:1.95 is based on Debian trixie (glibc 2.41, OpenSSL 3.5).
+# rust:1.96 is based on Debian trixie (glibc 2.41, OpenSSL 3.5).
 # Using bookworm-slim (glibc 2.36, OpenSSL 3.0) causes "GLIBC_2.38 not found"
 # and "OPENSSL_3.3.0 not found" crashes at startup.
 FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
