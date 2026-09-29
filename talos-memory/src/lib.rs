@@ -1708,6 +1708,14 @@ pub const SYNTHETIC_MEMORY_KINDS: &[&str] = &[
     // sources were RETIRED when the summary was written, so grounding no
     // longer sees that content at all until it is re-learned.
     "consolidated",
+    // Essay outlines (`content-pipeline-weekly`): the model invents a topic
+    // and outlines it, then persists it to the actor it runs as. Measured
+    // 2026-09-29: every run was handed the PREVIOUS week's outline as
+    // grounding (rank 0 or 1 in `execution_memory_context`), and the topic
+    // settled into a two-week cycle — the 09-21 title and thesis were
+    // verbatim copies of 09-07's. Excluded from grounding recall and from
+    // graph auto-extraction; still readable through `actor_recall*`.
+    "essay_outline",
 ];
 
 /// [`SYNTHETIC_MEMORY_KINDS`] as an owned `Vec<String>` for the
@@ -4415,6 +4423,19 @@ mod spawn_graph_extraction_synthetic_kind_tests {
             is_synthetic_memory_kind("consolidated"),
             "consolidated summaries are LLM-laundered and must not re-enter grounding or the graph"
         );
+    }
+
+    #[test]
+    fn essay_outline_is_synthetic() {
+        // An essay outline is the model's own invention. Grounding the next
+        // run on it turned "a fresh topic every week" into a two-week cycle.
+        assert!(
+            is_synthetic_memory_kind("essay_outline"),
+            "essay outlines are LLM self-outputs and must not ground the next outline"
+        );
+        assert!(synthetic_memory_kinds()
+            .iter()
+            .any(|k| k == "essay_outline"));
     }
 
     #[test]

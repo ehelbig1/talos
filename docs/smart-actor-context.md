@@ -136,7 +136,7 @@ default (destructive-zero guard).
 `talos_memory::SYNTHETIC_MEMORY_KINDS` (+ `synthetic_memory_kinds()` owned
 `Vec<String>`): `recall, meeting_prep, daily_brief, ask_thread, synthesize,
 judge, inline_judge, ensemble, llm_dispatch, capability_dispatch, ml_digest,
-commitment_check`. One list, used by every reader; conservative by design —
+commitment_check, reflection, consolidated, essay_outline`. One list, used by every reader; conservative by design —
 only SELF-OUTPUT kinds, never human-sourced memories (a human note wrongly
 excluded is worse than a synthetic note wrongly included).
 
