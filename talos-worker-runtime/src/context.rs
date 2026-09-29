@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use wasmtime::component::ResourceTable;
 use wasmtime::ResourceLimiter;
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 /// R2 token ledger: shared per-job LLM usage accumulator.
 ///
@@ -1414,7 +1414,9 @@ impl TalosContext {
         // raw-WASI-syscall surface to match.
         // Single, named, exhaustive policy (see `capability_world_has_fs_preopen`).
         if capability_world_has_fs_preopen(&capability_world) {
-            builder.preopened_dir(ephemeral_dir.path(), "/", DirPerms::all(), FilePerms::all())?;
+            // Wasmtime 48 folded `DirPerms::all()` + `FilePerms::all()` into
+            // `FsPerms::ReadWrite` — the same grant.
+            builder.preopened_dir(ephemeral_dir.path(), "/", FsPerms::ReadWrite)?;
         }
 
         // Network access for wasi:sockets (WASIP2) — only granted when the
@@ -1895,9 +1897,9 @@ impl wasmtime::component::HasData for TalosContext {
     type Data<'a> = TalosContext;
 }
 
-impl wasmtime_wasi_http::p2::WasiHttpView for TalosContext {
-    fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
-        wasmtime_wasi_http::p2::WasiHttpCtxView {
+impl wasmtime_wasi_http::WasiHttpView for TalosContext {
+    fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::WasiHttpCtxView {
             ctx: &mut self.http_ctx,
             table: &mut self.table,
             // SECURITY: never `default_hooks()`. Upstream's default

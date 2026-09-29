@@ -10,10 +10,10 @@ why, and when the operator should bump.
 
 | Crate                | Version  | Pinned in                          |
 |----------------------|----------|------------------------------------|
-| `wasmtime`           | 47.0.3   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime-wasi`      | 47.0.3   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime-wasi-http` | 47.0.3   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime`           | 47.0.3   | `worker/Cargo.toml` (dev-dep)      |
+| `wasmtime`           | 48.0.3   | `talos-worker-runtime/Cargo.toml`  |
+| `wasmtime-wasi`      | 48.0.3   | `talos-worker-runtime/Cargo.toml`  |
+| `wasmtime-wasi-http` | 48.0.3   | `talos-worker-runtime/Cargo.toml`  |
+| `wasmtime`           | 48.0.3   | `worker/Cargo.toml` (dev-dep)      |
 
 The runtime library (`TalosRuntime`, the engine config, the AOT cache) was
 extracted from `worker/` to `talos-worker-runtime/` in July 2026, so that
@@ -42,6 +42,10 @@ column is the version bumped *to*.
 
 | Version  | Identifier             | Class                                    |
 |----------|------------------------|------------------------------------------|
+| 48.0.3   | RUSTSEC-2026-0313      | `wasi:http` outgoing body write allows guest-driven host memory exhaustion |
+| 48.0.3   | RUSTSEC-2026-0314      | Guest can panic the host through a WASI filesystem datetime overflow |
+| 48.0.3   | RUSTSEC-2026-0315      | `call_ref` + exception `catch` can drop fuel accounting (exponential fuel amplification) |
+| 48.0.3   | RUSTSEC-2026-0316      | Dynamic record lifting can allocate beyond the hostcall fuel limit |
 | 47.0.3   | RUSTSEC-2026-0222      | Stores mix up type indices between engines (GHSA-hgjw-h833-99q9) |
 | 45.0.3   | RUSTSEC-2026-0188      | WASI hard-link/rename `FilePerms` bypass |
 | 44.0.3   | RUSTSEC-2026-0182      | WASIp1 `fd_renumber` memory leak (lockfile-only bump — the manifests stayed `44.0.2`) |
