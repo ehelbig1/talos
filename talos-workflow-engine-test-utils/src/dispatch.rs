@@ -174,6 +174,8 @@ mod tests {
             retry_delay_expr: None,
             emit_retry_events: false,
             dispatch_attempt_base: 0,
+            workflow_id: None,
+            node_label: None,
         }
     }
 

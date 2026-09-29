@@ -204,6 +204,23 @@ pub async fn handle_result_message(
         result.execution_time_ms
     );
 
+    // Fuel: every verified attempt's spend reaches the actor's hourly fuel
+    // budget, success or failure. The figure comes from the signed result;
+    // the identity from this row (see `record_attempt_fuel`).
+    if let Some(fuel) = result.spent_fuel() {
+        service.record_attempt_fuel(
+            job_id,
+            fuel.consumed,
+            fuel.limit,
+            result.execution_time_ms,
+            if result.is_terminal_success() {
+                talos_module_executions::AttemptOutcome::Completed
+            } else {
+                talos_module_executions::AttemptOutcome::Failed
+            },
+        );
+    }
+
     let terminal = if matches!(
         result.status,
         talos_workflow_job_protocol::JobStatus::Success

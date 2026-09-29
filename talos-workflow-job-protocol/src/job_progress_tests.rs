@@ -125,6 +125,7 @@ fn a_report_is_never_a_valid_result_and_a_result_never_a_report() {
         worker_id: p.worker_id.clone(),
         crypto_scheme: CRYPTO_SCHEME_HMAC,
         llm_usage: vec![],
+        fuel: None,
     };
     assert_ne!(r.signing_payload(), p.signing_payload());
     assert!(r

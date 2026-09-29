@@ -611,6 +611,11 @@ async fn main() -> anyhow::Result<()> {
             },
         ));
     }
+    // Fuel ledger: every verified dispatch attempt's fuel — success or
+    // failure, first attempt or retry — is recorded from the signed
+    // JobResult. This is the ONLY writer of engine fuel into the hourly
+    // budget's table; without it no engine fuel is counted.
+    talos_engine::nats_run::install_fuel_recorder(db_pool.clone());
     // 2. Controller-side client sink — talos-llm's generate_code /
     //    generate_text / scaffold_workflow / OllamaClient::complete record
     //    here. user_id arrives via the `talos_llm::usage::scoped_user`

@@ -1697,9 +1697,9 @@ impl ExecutionRepository {
     }
 
     /// Fuel history for one node of one workflow over the trailing
-    /// `days`: `(successful_runs, p50_fuel, max_fuel_observed)`. Rows in
-    /// `execution_cost_rollup` are written at node COMPLETION, so this
-    /// is effectively successful-run history — exactly the signal a
+    /// `days`: `(successful_runs, p50_fuel, max_fuel_observed)`. Only
+    /// `outcome = 'completed'` rows are read (failed attempts have rows too
+    /// since 2026-09-29), so this is successful-run history — exactly the signal a
     /// fuel-exhaustion remediation needs ("what does this node actually
     /// consume when it works?"). Tenancy via the workflows join;
     /// `days` is caller-clamped AND bound `::int` (make_interval is
@@ -1724,7 +1724,8 @@ impl ExecutionRepository {
              FROM execution_cost_rollup r \
              JOIN workflows w ON w.id = r.workflow_id \
              WHERE r.workflow_id = $1 AND w.user_id = $2 AND r.node_id = $3 \
-               AND r.recorded_at > NOW() - make_interval(days => $4::int)",
+               AND r.recorded_at > NOW() - make_interval(days => $4::int) \
+               AND r.outcome = 'completed'",
         )
         .bind(workflow_id)
         .bind(user_id)

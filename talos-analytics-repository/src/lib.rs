@@ -6385,6 +6385,7 @@ impl AnalyticsRepository {
              WHERE w.user_id = $1 \
                AND r.recorded_at > NOW() - make_interval(days => $2::int) \
                AND r.module_id IS NOT NULL \
+               AND r.outcome = 'completed' \
              GROUP BY m.id, m.name, m.kind, m.max_fuel \
              HAVING COUNT(*) >= $3 \
              ORDER BY PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY r.fuel_consumed) DESC NULLS LAST \
@@ -6553,6 +6554,7 @@ impl AnalyticsRepository {
                 WHERE r.recorded_at > NOW() - make_interval(days => $1::int) \
                   AND r.max_fuel > 0 \
                   AND r.fuel_consumed > 0 \
+                  AND r.outcome = 'completed' \
                   AND NOT COALESCE(we.is_test_execution, false) \
                   AND ($2::uuid IS NULL OR wf.user_id = $2) \
                 GROUP BY r.workflow_id, r.node_id \
@@ -6589,13 +6591,14 @@ impl AnalyticsRepository {
     ///
     /// # Why this is a second source and not another rollup query
     ///
-    /// `execution_cost_rollup` is written from `on_node_completed` only, and
-    /// only when the node's output carries `__fuel_consumed__ > 0`. A node
-    /// killed by the fuel meter never completes and never produces that output,
-    /// so **the exact event a fuel report exists to warn about is structurally
-    /// absent from the table every other section of that report reads.** Adding
-    /// a sample floor, a percentile, or a threshold to a rollup query cannot
-    /// reach it; only a different source can.
+    /// Until 2026-09-29 `execution_cost_rollup` was written from
+    /// `on_node_completed` only, so a node killed by the fuel meter was
+    /// structurally absent from it. Rows now exist for every verified attempt,
+    /// but a failed attempt is marked `outcome = 'failed'` and every other
+    /// section of the fuel report reads `completed` rows only (a learned
+    /// ceiling must not be fed its own exhaustions), and a failed attempt has a
+    /// row only when the worker reports its fuel out of band. So the rollup is
+    /// still not the source for "which nodes died"; a different source is.
     ///
     /// `dead_letter_queue` is that source. The engine's `on_node_failed` hook
     /// writes one row per terminal node failure carrying `(workflow_id,
@@ -6837,6 +6840,7 @@ impl AnalyticsRepository {
              WHERE r.workflow_id = $1 \
                AND r.recorded_at > NOW() - make_interval(days => $2::int) \
                AND r.fuel_consumed > 0 \
+               AND r.outcome = 'completed' \
              GROUP BY r.node_id \
              HAVING COUNT(*) >= $3",
         )
@@ -6926,6 +6930,7 @@ impl AnalyticsRepository {
              JOIN workflows w ON w.id = r.workflow_id \
              WHERE r.workflow_id = $1 AND w.user_id = $2 \
                AND r.recorded_at > NOW() - make_interval(days => $3::int) \
+               AND r.outcome = 'completed' \
              GROUP BY r.node_id \
              ORDER BY AVG(r.wall_time_ms) DESC NULLS LAST",
         )

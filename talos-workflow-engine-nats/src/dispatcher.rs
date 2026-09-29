@@ -657,11 +657,12 @@ pub(crate) async fn execute_job_with_retry(
     // `dispatch_with_retry` for the rationale — the worker's claim
     // single-takes the seal per attempt, so a retry must re-register it.
     on_before_send: Option<&(dyn Fn() + Send + Sync)>,
-    // R2 token ledger: usage hook, invoked once per VERIFIED JobResult
-    // (per attempt — failed attempts spent tokens too) carrying non-empty
-    // `llm_usage`. The hook owner attaches identity from the
-    // controller-side dispatch context.
-    on_llm_usage: Option<&(dyn Fn(Vec<talos_workflow_job_protocol::LlmUsageEntry>) + Send + Sync)>,
+    // Per-attempt accounting hook, invoked once per VERIFIED JobResult —
+    // failed attempts included, since a failed attempt spent tokens and fuel
+    // too. The hook owner (`dispatch`) records LLM usage and fuel with
+    // identity from the controller-side dispatch context; the worker's
+    // result contributes only the measured figures.
+    on_verified_result: Option<&(dyn Fn(&talos_workflow_job_protocol::JobResult) + Send + Sync)>,
     // Absolute instant the WORKFLOW's wall-clock budget expires, from
     // `DispatchJob::deadline`. `None` disables the clamp entirely and
     // reproduces the pre-clamp behaviour exactly. See
@@ -900,10 +901,8 @@ pub(crate) async fn execute_job_with_retry(
                 // another actor's ledger. (When `verify_ring` is None — test
                 // harnesses only — the hook still fires; production always
                 // verifies.)
-                if let Some(hook) = on_llm_usage {
-                    if !job_result.llm_usage.is_empty() {
-                        hook(job_result.llm_usage.clone());
-                    }
+                if let Some(hook) = on_verified_result {
+                    hook(&job_result);
                 }
 
                 // Check both job-level status AND payload-level success field.
@@ -1598,6 +1597,7 @@ pub struct NatsNodeDispatcher {
     /// carries non-empty `llm_usage`. `None` (default) drops usage — test
     /// harnesses and consumers that don't account.
     llm_usage_sink: Option<LlmUsageSink>,
+    fuel_sink: Option<FuelSink>,
 }
 
 /// The controller-provided pieces the dispatcher needs to route a claim-based
@@ -1630,6 +1630,48 @@ pub struct LlmUsageReport {
 /// dispatch hot path right after result verification.
 pub type LlmUsageSink = Arc<dyn Fn(LlmUsageReport) + Send + Sync>;
 
+/// Whether a verified dispatch attempt succeeded, for fuel attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuelOutcome {
+    /// `JobResult::is_terminal_success` (or a `Success` pipeline step).
+    Completed,
+    /// Anything else: a failed, timed-out or fuel-exhausted attempt.
+    Failed,
+}
+
+/// One verified attempt's fuel, attributed with the CONTROLLER's own dispatch
+/// identity (the `DispatchJob` the engine stamped). The worker's result
+/// contributes only the measured figure, read through
+/// [`talos_workflow_job_protocol::spent_fuel`].
+#[derive(Debug, Clone)]
+pub struct FuelReport {
+    /// The verified wire `job_id` — the attempt's `module_executions` row.
+    pub job_id: Uuid,
+    /// Workflow execution that owned the dispatch.
+    pub execution_id: Uuid,
+    /// Workflow the engine ran (see `DispatchJob::workflow_id`).
+    pub workflow_id: Option<Uuid>,
+    /// The node's graph label.
+    pub node_label: Option<String>,
+    /// The module that ran.
+    pub module_id: Uuid,
+    /// The actor the fuel is charged to.
+    pub actor_id: Option<Uuid>,
+    /// The fuel the verified result reports as spent.
+    pub fuel: talos_workflow_job_protocol::SpentFuel,
+    /// Whether the attempt succeeded.
+    pub outcome: FuelOutcome,
+    /// Worker-measured execution time of the attempt.
+    pub execution_time_ms: u64,
+}
+
+/// Controller-installed recorder for [`FuelReport`]s. Called once per
+/// verified attempt that reports fuel — success or failure, first attempt or
+/// retry — so the actor's hourly fuel budget sees every attempt. MUST be
+/// non-blocking (spawn DB writes internally): it runs inline on the dispatch
+/// hot path right after result verification.
+pub type FuelSink = Arc<dyn Fn(FuelReport) + Send + Sync>;
+
 impl NatsNodeDispatcher {
     /// Build a dispatcher. `event_sink` may be `None` when there's no
     /// execution-event persistence configured; `worker_shared_key` may
@@ -1659,6 +1701,7 @@ impl NatsNodeDispatcher {
             expression_evaluator,
             envelope: None,
             llm_usage_sink: None,
+            fuel_sink: None,
         }
     }
 
@@ -1669,6 +1712,16 @@ impl NatsNodeDispatcher {
     #[must_use]
     pub fn with_llm_usage_sink(mut self, sink: LlmUsageSink) -> Self {
         self.llm_usage_sink = Some(sink);
+        self
+    }
+
+    /// Install the fuel recorder. The dispatcher calls it once per verified
+    /// attempt (single node, loop body, pipeline step) that reports fuel,
+    /// with the identity taken from the CONTROLLER-side dispatch context.
+    /// Omit it to drop fuel (default; test harnesses).
+    #[must_use]
+    pub fn with_fuel_sink(mut self, sink: FuelSink) -> Self {
+        self.fuel_sink = Some(sink);
         self
     }
 
@@ -1944,26 +1997,57 @@ impl NodeDispatcher for NatsNodeDispatcher {
         } else {
             None
         };
-        // R2 token ledger: per-attempt usage hook. Identity comes from the
-        // CONTROLLER-side DispatchJob (stamped by the engine from its own
-        // execution records), never from the worker's result.
-        let usage_hook: Option<
-            Box<dyn Fn(Vec<talos_workflow_job_protocol::LlmUsageEntry>) + Send + Sync>,
-        > = self.llm_usage_sink.as_ref().map(|sink| {
-            let sink = sink.clone();
-            let (execution_id, actor_id, user_id) = (job.execution_id, job.actor_id, job.user_id);
-            Box::new(
-                move |entries: Vec<talos_workflow_job_protocol::LlmUsageEntry>| {
-                    sink(LlmUsageReport {
-                        execution_id,
-                        actor_id,
-                        user_id,
-                        entries,
-                    });
+        // Per-attempt accounting: LLM usage (R2 token ledger) and fuel, for
+        // EVERY verified attempt — failures and retries included. Identity
+        // comes from the CONTROLLER-side DispatchJob (stamped by the engine
+        // from its own execution records), never from the worker's result.
+        let verified_hook: Option<
+            Box<dyn Fn(&talos_workflow_job_protocol::JobResult) + Send + Sync>,
+        > = if self.llm_usage_sink.is_none() && self.fuel_sink.is_none() {
+            None
+        } else {
+            let usage_sink = self.llm_usage_sink.clone();
+            let fuel_sink = self.fuel_sink.clone();
+            let (execution_id, actor_id, user_id, module_id, workflow_id) = (
+                job.execution_id,
+                job.actor_id,
+                job.user_id,
+                job.module_id,
+                job.workflow_id,
+            );
+            let node_label = job.node_label.clone();
+            Some(Box::new(
+                move |result: &talos_workflow_job_protocol::JobResult| {
+                    if let Some(sink) = usage_sink.as_ref() {
+                        if !result.llm_usage.is_empty() {
+                            sink(LlmUsageReport {
+                                execution_id,
+                                actor_id,
+                                user_id,
+                                entries: result.llm_usage.clone(),
+                            });
+                        }
+                    }
+                    if let (Some(sink), Some(fuel)) = (fuel_sink.as_ref(), result.spent_fuel()) {
+                        sink(FuelReport {
+                            job_id: result.job_id,
+                            execution_id,
+                            workflow_id,
+                            node_label: node_label.clone(),
+                            module_id,
+                            actor_id,
+                            fuel,
+                            outcome: if result.is_terminal_success() {
+                                FuelOutcome::Completed
+                            } else {
+                                FuelOutcome::Failed
+                            },
+                            execution_time_ms: result.execution_time_ms,
+                        });
+                    }
                 },
-            )
-                as Box<dyn Fn(Vec<talos_workflow_job_protocol::LlmUsageEntry>) + Send + Sync>
-        });
+            ))
+        };
         let result = execute_job_with_retry(
             self.transport.as_ref(),
             topic,
@@ -1992,7 +2076,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // RFC 0010 P3 (M3): re-arm the seal before each attempt.
             seal_rearm.as_deref(),
             // R2 token ledger: record verified per-attempt usage.
-            usage_hook.as_deref(),
+            verified_hook.as_deref(),
             // Workflow wall-clock deadline (engine-stamped; `None` when
             // the run has no cap). Clamps each attempt's outer wait —
             // NOT the wire `timeout_ms` above, which the worker still
@@ -2299,6 +2383,34 @@ impl NodeDispatcher for NatsNodeDispatcher {
             }
         }
 
+        // Per-step fuel, attributed to each step's own controller-side
+        // `DispatchJob` (position i in the request is position i in the
+        // signed result; the step fuel digest binds that order).
+        if let Some(sink) = self.fuel_sink.as_ref() {
+            for (step_job, sr) in request.steps.iter().zip(result.step_results.iter()) {
+                if let Some(fuel) = sr.spent_fuel() {
+                    sink(FuelReport {
+                        job_id: step_job.job_id.unwrap_or(result.job_id),
+                        execution_id: request.workflow_execution_id,
+                        workflow_id: step_job.workflow_id,
+                        node_label: step_job.node_label.clone(),
+                        module_id: step_job.module_id,
+                        actor_id: step_job.actor_id,
+                        fuel,
+                        outcome: if matches!(
+                            sr.status,
+                            talos_workflow_job_protocol::JobStatus::Success
+                        ) {
+                            FuelOutcome::Completed
+                        } else {
+                            FuelOutcome::Failed
+                        },
+                        execution_time_ms: sr.execution_time_ms,
+                    });
+                }
+            }
+        }
+
         // 8. Map per-step results back into the abstract shape.
         let steps: Vec<ChainStepResult> = result
             .step_results
@@ -2546,6 +2658,7 @@ mod p3_full_loop_tests {
                     result_nonce: String::new(),
                     worker_id: String::new(),
                     crypto_scheme: 0,
+                    fuel: None,
                 };
                 jr.sign_with_worker_id(shared.as_bytes(), worker_id)
                     .unwrap();
@@ -3209,6 +3322,7 @@ mod budget_clamp_loop_tests {
                 result_nonce: String::new(),
                 worker_id: String::new(),
                 crypto_scheme: 0,
+                fuel: None,
             };
             Ok(serde_json::to_vec(&jr).unwrap())
         }
@@ -3488,6 +3602,7 @@ mod budget_clamp_loop_tests {
                 result_nonce: String::new(),
                 worker_id: String::new(),
                 crypto_scheme: 0,
+                fuel: None,
             };
             Ok(serde_json::to_vec(&jr).unwrap())
         }
@@ -3514,6 +3629,7 @@ mod budget_clamp_loop_tests {
                 result_nonce: String::new(),
                 worker_id: String::new(),
                 crypto_scheme: 0,
+                fuel: None,
             };
             Ok(serde_json::to_vec(&jr).unwrap())
         }
@@ -3658,6 +3774,7 @@ mod budget_clamp_loop_tests {
                 result_nonce: String::new(),
                 worker_id: String::new(),
                 crypto_scheme: 0,
+                fuel: None,
             };
             jr.sign_with_worker_id(&self.key, "w-test")
                 .expect("sign result");
@@ -4020,6 +4137,7 @@ mod liveness_redispatch_tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         }
     }
 
@@ -4035,6 +4153,7 @@ mod liveness_redispatch_tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         }
     }
 
@@ -4050,6 +4169,7 @@ mod liveness_redispatch_tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         }
     }
 
@@ -4438,5 +4558,245 @@ mod liveness_redispatch_tests {
         );
         assert_eq!(LivenessCause::StaleDispatch.as_str(), "stale_dispatch");
         assert_eq!(LivenessCause::NoResponders.as_str(), "no_responders");
+    }
+}
+
+#[cfg(test)]
+mod fuel_sink_tests {
+    //! The fuel sink drives the actor's hourly fuel budget, so these tests
+    //! drive the PRODUCTION `NatsNodeDispatcher::dispatch` — with a real key,
+    //! so every result passes the real verifier before the sink sees it —
+    //! and assert what the sink receives, attempt by attempt.
+
+    use super::{FuelOutcome, FuelReport, NatsNodeDispatcher};
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use talos_workflow_engine_core::{
+        BoxError, DispatchJob, ExpressionEvaluator, JobTransport, NodeDispatcher, RetryClassifier,
+        WorkerSharedKey,
+    };
+    use talos_workflow_job_protocol::{FuelMeasure, FuelSource, JobResult, JobStatus};
+
+    struct AlwaysTransient;
+    impl RetryClassifier for AlwaysTransient {
+        fn classify(&self, _e: &str) -> String {
+            "transient".to_string()
+        }
+        fn is_transient(&self, _c: &str) -> bool {
+            true
+        }
+    }
+
+    struct NoExpr;
+    impl ExpressionEvaluator for NoExpr {
+        fn eval_bool(&self, _e: &str, _c: &serde_json::Value) -> bool {
+            true
+        }
+        fn try_eval_bool(&self, _e: &str, _c: &serde_json::Value) -> Result<bool, BoxError> {
+            Ok(true)
+        }
+        fn eval_i64(&self, _e: &str, _c: &serde_json::Value) -> Option<i64> {
+            None
+        }
+        fn eval_json(
+            &self,
+            _e: &str,
+            _c: &serde_json::Value,
+        ) -> Result<serde_json::Value, BoxError> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    /// One scripted worker reply: status, output, out-of-band fuel.
+    type Reply = (JobStatus, serde_json::Value, Option<FuelMeasure>);
+
+    /// Answers each send with the next scripted reply, HMAC-signed under the
+    /// dispatcher's own key, echoing the request's `job_id`.
+    struct SignedScript {
+        script: Vec<Reply>,
+        sent: Mutex<usize>,
+        key: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl JobTransport for SignedScript {
+        async fn request(&self, _topic: &str, payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+            let job_id =
+                serde_json::from_slice::<talos_workflow_job_protocol::JobRequest>(&payload)
+                    .expect("payload is a JobRequest")
+                    .job_id;
+            let n = {
+                let mut g = self.sent.lock().expect("lock");
+                *g += 1;
+                *g - 1
+            };
+            let (status, output, fuel) = self.script[n.min(self.script.len() - 1)].clone();
+            let mut jr = JobResult {
+                llm_usage: vec![],
+                job_id,
+                status,
+                output_payload: output.into(),
+                logs: vec![],
+                execution_time_ms: 11,
+                signature: vec![],
+                result_nonce: String::new(),
+                worker_id: String::new(),
+                crypto_scheme: 0,
+                fuel,
+            };
+            jr.sign_with_worker_id(&self.key, "w-fuel")
+                .expect("sign result");
+            Ok(serde_json::to_vec(&jr).unwrap())
+        }
+    }
+
+    fn fuel(consumed: u64, limit: u64) -> Option<FuelMeasure> {
+        Some(FuelMeasure { consumed, limit })
+    }
+
+    /// Dispatch one job through the production path; return what the sink
+    /// received and the dispatch outcome.
+    // disallowed-method: talos_workflow_engine_nats::NatsNodeDispatcher::new — test in the type's own crate
+    #[allow(clippy::disallowed_methods)]
+    async fn dispatch_with(
+        script: Vec<Reply>,
+        job: DispatchJob,
+    ) -> (Vec<FuelReport>, Result<serde_json::Value, String>) {
+        let key = vec![7u8; 32];
+        let reports: Arc<Mutex<Vec<FuelReport>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_reports = reports.clone();
+        let dispatcher = NatsNodeDispatcher::new(
+            Arc::new(SignedScript {
+                script,
+                sent: Mutex::new(0),
+                key: key.clone(),
+            }),
+            None,
+            Some(WorkerSharedKey::new(key)),
+            Arc::new(AlwaysTransient),
+            Arc::new(NoExpr),
+        )
+        .with_fuel_sink(Arc::new(move |r: FuelReport| {
+            sink_reports.lock().expect("lock").push(r);
+        }));
+        let out = dispatcher
+            .dispatch(job)
+            .await
+            .map(|r| r.output)
+            .map_err(|e| e.to_string());
+        let got = reports.lock().expect("lock").clone();
+        (got, out)
+    }
+
+    fn job(max_retries: u32) -> DispatchJob {
+        DispatchJob {
+            execution_id: uuid::Uuid::new_v4(),
+            node_id: uuid::Uuid::new_v4(),
+            module_id: uuid::Uuid::new_v4(),
+            job_id: Some(uuid::Uuid::new_v4()),
+            user_id: Some(uuid::Uuid::new_v4()),
+            actor_id: Some(uuid::Uuid::new_v4()),
+            workflow_id: Some(uuid::Uuid::new_v4()),
+            node_label: Some("summarise".into()),
+            input_payload: serde_json::json!({"seed": 1}),
+            timeout: Duration::from_secs(5),
+            max_retries,
+            backoff_ms: 1,
+            ..Default::default()
+        }
+    }
+
+    /// THE budget property: a failed attempt, a fuel-exhausted attempt and a
+    /// successful attempt with an ARRAY output each reach the sink — the
+    /// three kinds of spend the in-band reading could not see — in order,
+    /// each attributed with the controller's identity for the job.
+    #[tokio::test]
+    async fn every_verified_attempt_reports_its_fuel_with_controller_identity() {
+        let j = job(2);
+        let (reports, out) = dispatch_with(
+            vec![
+                (
+                    JobStatus::Failed,
+                    serde_json::json!({"error": "connection reset"}),
+                    fuel(700, 1_000),
+                ),
+                (
+                    JobStatus::Failed,
+                    serde_json::json!({"error": "fuel exhausted"}),
+                    fuel(1_000, 1_000),
+                ),
+                (
+                    JobStatus::Success,
+                    serde_json::json!([1, 2, 3]),
+                    fuel(300, 1_000),
+                ),
+            ],
+            j.clone(),
+        )
+        .await;
+        assert_eq!(
+            out.expect("third attempt succeeds"),
+            serde_json::json!([1, 2, 3])
+        );
+        let seen: Vec<(u64, FuelOutcome)> = reports
+            .iter()
+            .map(|r| (r.fuel.consumed, r.outcome))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (700, FuelOutcome::Failed),
+                (1_000, FuelOutcome::Failed),
+                (300, FuelOutcome::Completed),
+            ]
+        );
+        for r in &reports {
+            assert_eq!(r.job_id, j.job_id.unwrap());
+            assert_eq!(r.execution_id, j.execution_id);
+            assert_eq!(r.workflow_id, j.workflow_id);
+            assert_eq!(r.node_label, j.node_label);
+            assert_eq!(r.module_id, j.module_id);
+            assert_eq!(r.actor_id, j.actor_id);
+            assert_eq!(r.fuel.limit, Some(1_000));
+            assert_eq!(r.fuel.source, FuelSource::OutOfBand);
+            assert_eq!(r.execution_time_ms, 11);
+        }
+    }
+
+    /// A worker that predates the out-of-band field is still counted, from
+    /// the in-band figure, exactly once.
+    #[tokio::test]
+    async fn a_pre_field_worker_is_counted_from_the_in_band_figure_once() {
+        let (reports, out) = dispatch_with(
+            vec![(
+                JobStatus::Success,
+                serde_json::json!({"ok": true, "__fuel_consumed__": 500, "__fuel_limit__": 2_000}),
+                None,
+            )],
+            job(0),
+        )
+        .await;
+        assert!(out.is_ok());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].fuel.consumed, 500);
+        assert_eq!(reports[0].fuel.source, FuelSource::InBand);
+        assert_eq!(reports[0].outcome, FuelOutcome::Completed);
+    }
+
+    /// NEGATIVE CONTROL: results that report no fuel record nothing, so the
+    /// sink is not simply called once per send.
+    #[tokio::test]
+    async fn results_without_fuel_record_nothing() {
+        let (reports, out) = dispatch_with(
+            vec![
+                (JobStatus::Failed, serde_json::json!({"error": "x"}), None),
+                (JobStatus::Success, serde_json::json!([1]), None),
+            ],
+            job(1),
+        )
+        .await;
+        assert!(out.is_ok());
+        assert!(reports.is_empty(), "{reports:?}");
     }
 }

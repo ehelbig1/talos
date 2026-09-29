@@ -336,6 +336,7 @@ mod tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         }
     }
 

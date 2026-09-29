@@ -401,9 +401,9 @@ impl ParallelWorkflowEngine {
             }
         }
 
-        // Post-completion hook: drives fuel attribution,
-        // `__memory_write__` persistence, and any future cross-cutting
-        // per-node observers. Fire-and-forget — the hook returns
+        // Post-completion hook: drives `__memory_write__` persistence and
+        // any future cross-cutting per-node observers (fuel is recorded by
+        // the dispatcher's fuel sink, per verified attempt). Fire-and-forget — the hook returns
         // quickly; impls spawn internally. `wall_time_ms` is the
         // monotonic reading from `node_start_times` on BOTH entry points
         // (see the note on `handle_completed_future`); `0` means the
@@ -413,7 +413,7 @@ impl ParallelWorkflowEngine {
             let module_id = self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
             hook.on_node_completed(
                 talos_workflow_engine_core::NodeCompletionContext {
-                    workflow_id: self.workflow_id.unwrap_or(execution_id),
+                    workflow_id: self.cost_attribution_workflow_id(execution_id),
                     execution_id,
                     node_id: finished_id,
                     node_label,
@@ -607,7 +607,7 @@ impl ParallelWorkflowEngine {
             let module_id = self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
             hook.on_node_failed(
                 talos_workflow_engine_core::NodeCompletionContext {
-                    workflow_id: self.workflow_id.unwrap_or(execution_id),
+                    workflow_id: self.cost_attribution_workflow_id(execution_id),
                     execution_id,
                     node_id: finished_id,
                     node_label,

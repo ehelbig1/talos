@@ -5187,6 +5187,110 @@ fn check_result_worker_id_shape(worker_id: &str) -> Result<(), VerifyError> {
     })
 }
 
+/// WASM fuel one job spent, measured by the worker and carried OUT OF BAND
+/// on [`JobResult::fuel`] / [`PipelineStepResult::fuel`].
+///
+/// The worker also stamps `__fuel_consumed__` / `__fuel_limit__` into the
+/// module's OUTPUT, but only when that output is a JSON object — an array,
+/// string or number output has nowhere to put them, and a failed run returns
+/// no output at all. Fuel read from the output therefore missed every
+/// non-object result and every failure, and the actor's hourly fuel budget
+/// (`max_fuel_per_hour`) never counted them. This field is the carrier that
+/// does not depend on the output's shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuelMeasure {
+    /// Fuel the job's WASM consumed, summed over every in-worker attempt.
+    pub consumed: u64,
+    /// The fuel limit the worker enforced.
+    pub limit: u64,
+}
+
+impl FuelMeasure {
+    /// The fixed-shape text bound into a signing payload.
+    fn canonical_segment(&self) -> String {
+        format!("{}/{}", self.consumed, self.limit)
+    }
+}
+
+/// Where a result's fuel figure came from. See [`spent_fuel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuelSource {
+    /// The signed out-of-band [`FuelMeasure`] field.
+    OutOfBand,
+    /// The `__fuel_consumed__` key in the output (a worker that predates the
+    /// out-of-band field).
+    InBand,
+}
+
+/// Fuel a verified result reports as spent, ready to record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpentFuel {
+    /// Fuel consumed; always `> 0`.
+    pub consumed: u64,
+    /// The enforced limit, when the result carried one.
+    pub limit: Option<u64>,
+    /// Which carrier supplied it.
+    pub source: FuelSource,
+}
+
+/// The ONE rule for reading a result's spent fuel. Every recorder (the NATS
+/// dispatcher's fuel sink, the webhook router, the result observer) calls
+/// this, so no two ledgers can disagree about a result.
+///
+/// - The signed out-of-band [`FuelMeasure`] wins whenever it is present,
+///   whatever the output's shape or the job's status.
+/// - Otherwise the in-band `__fuel_consumed__` key is read, so a result from
+///   a worker that predates the field is still counted exactly as before.
+///   Never both: a result is recorded from one carrier, so nothing is
+///   counted twice.
+/// - A zero or absent measurement yields `None` — there is nothing to record,
+///   and writing `0` would assert a measurement.
+#[must_use]
+pub fn spent_fuel(
+    out_of_band: Option<FuelMeasure>,
+    output: &serde_json::Value,
+) -> Option<SpentFuel> {
+    use talos_workflow_engine_core::reserved_keys::{FUEL_CONSUMED, FUEL_LIMIT};
+    if let Some(m) = out_of_band {
+        return (m.consumed > 0).then_some(SpentFuel {
+            consumed: m.consumed,
+            limit: (m.limit > 0).then_some(m.limit),
+            source: FuelSource::OutOfBand,
+        });
+    }
+    let consumed = output
+        .get(FUEL_CONSUMED)
+        .and_then(serde_json::Value::as_u64)
+        .filter(|f| *f > 0)?;
+    Some(SpentFuel {
+        consumed,
+        limit: output
+            .get(FUEL_LIMIT)
+            .and_then(serde_json::Value::as_u64)
+            .filter(|l| *l > 0),
+        source: FuelSource::InBand,
+    })
+}
+
+/// Bind per-step fuel into a pipeline signing payload: `Some(hex_sha256)` when
+/// ANY step carries a measurement, `None` otherwise (so a pipeline with no
+/// out-of-band fuel signs byte-identically to the pre-field format).
+fn step_fuel_signing_hash(steps: &[PipelineStepResult]) -> Option<String> {
+    use sha2::Digest;
+    if steps.iter().all(|s| s.fuel.is_none()) {
+        return None;
+    }
+    let lines: Vec<String> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| match s.fuel {
+            Some(f) => format!("{i}|{}", f.canonical_segment()),
+            None => format!("{i}|none"),
+        })
+        .collect();
+    Some(hex::encode(Sha256::digest(lines.join("\n").as_bytes())))
+}
+
 /// Result returned by a Worker to the Controller via NATS.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JobResult {
@@ -5240,9 +5344,24 @@ pub struct JobResult {
     /// Capped at [`MAX_LLM_USAGE_ENTRIES`] by the worker.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub llm_usage: Vec<LlmUsageEntry>,
+
+    /// WASM fuel this job spent — see [`FuelMeasure`]. `None` from a worker
+    /// that predates the field, and for a job that never ran a module (a
+    /// pre-execution rejection). Bound into [`Self::signing_payload`] ONLY
+    /// when present (append-at-end), so a result without it signs
+    /// byte-identically to the pre-field format. Read it through
+    /// [`JobResult::spent_fuel`], never directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<FuelMeasure>,
 }
 
 impl JobResult {
+    /// The fuel this verified result reports as spent. See [`spent_fuel`].
+    #[must_use]
+    pub fn spent_fuel(&self) -> Option<SpentFuel> {
+        spent_fuel(self.fuel, self.output_payload.value())
+    }
+
     /// Does the output payload carry an application-level `success: false`?
     ///
     /// WASM modules like `database-query` return [`JobStatus::Success`] but
@@ -5374,6 +5493,13 @@ impl JobResult {
         if let Some(usage_hash) = llm_usage_signing_hash(&self.llm_usage) {
             use std::fmt::Write as _;
             let _ = write!(payload, ":llm_usage:{usage_hash}");
+        }
+        // Out-of-band fuel (2026-09-29): conditional append-at-end, after
+        // `:llm_usage:`. Absent = pre-field bytes. Present = the actor's
+        // budget figure is bound, so an on-wire tamperer cannot deflate it.
+        if let Some(fuel) = self.fuel {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":fuel={}", fuel.canonical_segment());
         }
         payload.into_bytes()
     }
@@ -6492,6 +6618,19 @@ pub struct PipelineStepResult {
     pub output: SignedJson,
     pub execution_time_ms: u64,
     pub error: Option<String>,
+    /// WASM fuel this step spent — see [`FuelMeasure`]. Bound into
+    /// [`PipelineJobResult`]'s signing payload only when some step carries
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<FuelMeasure>,
+}
+
+impl PipelineStepResult {
+    /// The fuel this verified step reports as spent. See [`spent_fuel`].
+    #[must_use]
+    pub fn spent_fuel(&self) -> Option<SpentFuel> {
+        spent_fuel(self.fuel, self.output.value())
+    }
 }
 
 /// Result of a pipeline job returned by the Worker via NATS.
@@ -6614,6 +6753,11 @@ impl PipelineJobResult {
         if let Some(usage_hash) = llm_usage_signing_hash(&self.llm_usage) {
             use std::fmt::Write as _;
             let _ = write!(payload, ":llm_usage:{usage_hash}");
+        }
+        // Out-of-band per-step fuel: conditional append-at-end, as above.
+        if let Some(fuel_hash) = step_fuel_signing_hash(&self.step_results) {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":step_fuel:{fuel_hash}");
         }
         payload.into_bytes()
     }
@@ -7131,6 +7275,7 @@ mod worker_heartbeat_domain_separation_tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: "dev-worker-fleet".to_string(),
+            fuel: None,
         };
         r.sign(&KEY).unwrap();
         r
@@ -8168,6 +8313,7 @@ mod tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         };
 
         result.sign(&key).unwrap();
@@ -8191,6 +8337,7 @@ mod tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         };
         result.sign(&key).unwrap();
         result.output_payload = serde_json::json!({"answer": 99}).into(); // tamper
@@ -8223,6 +8370,7 @@ mod tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         };
         a.sign(&key).unwrap();
 
@@ -8262,6 +8410,7 @@ mod tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         };
         a.sign(&key).unwrap();
         a.verify_as(&key, 300, Verifier::Observer).unwrap();
@@ -8283,6 +8432,7 @@ mod tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         };
         a.sign(&key).unwrap();
         a.output_payload = serde_json::json!({"answer": 99}).into();
@@ -8400,6 +8550,7 @@ mod tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         };
         assert!(result.verify(&key, 300).is_err());
     }
@@ -8807,6 +8958,7 @@ mod tests {
                 worker_id: "worker-1".to_string(),
                 crypto_scheme: 0,
                 llm_usage: Vec::new(),
+                fuel: None,
             };
             res.sign_ed25519_with_worker_id(&sk, "worker-1").unwrap();
             let wire = serde_json::to_vec(&res).expect("serialise");
@@ -9002,6 +9154,7 @@ mod tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         }
     }
 
@@ -9893,6 +10046,7 @@ mod tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         };
         result.sign(&key).unwrap();
 
@@ -10003,6 +10157,7 @@ mod tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         };
         result.sign(&key).unwrap();
         result
@@ -10804,6 +10959,185 @@ mod tests {
         assert!(tampered.verify_no_replay(&key, 300).is_err());
     }
 
+    // ------------------------------------------------------------------
+    // Out-of-band fuel (2026-09-29): wire compatibility, binding, and the
+    // one resolution rule every fuel recorder uses.
+    // ------------------------------------------------------------------
+
+    /// A result without `fuel` signs exactly as before the field existed:
+    /// nothing is appended, and the key is omitted from the wire.
+    #[test]
+    fn fuel_absent_signs_byte_identical_to_pre_field() {
+        let key = test_key();
+        let mut result = make_test_result();
+        assert!(result.fuel.is_none());
+        let payload = String::from_utf8(result.signing_payload()).unwrap();
+        assert!(!payload.contains(":fuel="), "{payload}");
+        result.sign(&key).unwrap();
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(
+            !wire.contains("\"fuel\""),
+            "absent fuel must be omitted: {wire}"
+        );
+        let back: JobResult = serde_json::from_str(&wire).unwrap();
+        back.verify_no_replay(&key, 300).unwrap();
+    }
+
+    /// Present fuel is bound: a tamperer cannot lower it (the budget
+    /// figure), raise it, or strip it without invalidating the signature.
+    #[test]
+    fn fuel_round_trip_and_tamper_detection() {
+        let key = test_key();
+        let mut result = make_test_result();
+        result.fuel = Some(FuelMeasure {
+            consumed: 1_234_567,
+            limit: 5_000_000,
+        });
+        result.sign(&key).unwrap();
+        let wire = serde_json::to_string(&result).unwrap();
+        let back: JobResult = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.fuel, result.fuel);
+        back.verify_no_replay(&key, 300).unwrap();
+
+        for tamper in [
+            |r: &mut JobResult| r.fuel.as_mut().unwrap().consumed -= 1,
+            |r: &mut JobResult| r.fuel.as_mut().unwrap().consumed += 1,
+            |r: &mut JobResult| r.fuel.as_mut().unwrap().limit = 1,
+            |r: &mut JobResult| r.fuel = None,
+        ] {
+            let mut t = back.clone();
+            tamper(&mut t);
+            assert!(
+                t.verify_no_replay(&key, 300).is_err(),
+                "a changed or stripped fuel figure must fail verification"
+            );
+        }
+    }
+
+    /// The exact bytes the field adds: the pre-field payload, then
+    /// `:fuel=<consumed>/<limit>` and nothing else. Append-only at the end is
+    /// what lets a result without the field keep verifying on either side of
+    /// a rolling deploy. `worker_id` cannot contain `:` (`validate_worker_id`,
+    /// re-checked at verify), so the segment cannot be forged from it.
+    #[test]
+    fn fuel_signing_segment_is_appended_verbatim_at_the_end() {
+        let mut result = make_test_result();
+        result.llm_usage = usage_entries();
+        let without = String::from_utf8(result.signing_payload()).unwrap();
+        result.fuel = Some(FuelMeasure {
+            consumed: 1_234_567,
+            limit: 5_000_000,
+        });
+        let with = String::from_utf8(result.signing_payload()).unwrap();
+        assert_eq!(with, format!("{without}:fuel=1234567/5000000"));
+        assert!(
+            without.contains(":llm_usage:"),
+            "fuel is appended AFTER llm_usage"
+        );
+    }
+
+    /// The resolution rule, case by case.
+    #[test]
+    fn spent_fuel_prefers_out_of_band_and_falls_back_to_in_band() {
+        let oob = Some(FuelMeasure {
+            consumed: 900,
+            limit: 1_000,
+        });
+        let in_band = serde_json::json!({"x": 1, "__fuel_consumed__": 500, "__fuel_limit__": 800});
+
+        // Out-of-band wins, even over an in-band figure: one carrier, never both.
+        assert_eq!(
+            spent_fuel(oob, &in_band),
+            Some(SpentFuel {
+                consumed: 900,
+                limit: Some(1_000),
+                source: FuelSource::OutOfBand
+            })
+        );
+        // An array output has no in-band figure; out-of-band still counts it.
+        assert_eq!(
+            spent_fuel(oob, &serde_json::json!([1, 2, 3])).map(|f| f.consumed),
+            Some(900)
+        );
+        // A pre-field worker: the in-band figure is read, as before.
+        assert_eq!(
+            spent_fuel(None, &in_band),
+            Some(SpentFuel {
+                consumed: 500,
+                limit: Some(800),
+                source: FuelSource::InBand
+            })
+        );
+        // A pre-field worker's array output: nothing to read.
+        assert_eq!(spent_fuel(None, &serde_json::json!([1, 2, 3])), None);
+        // Zero is not a measurement worth recording, from either carrier.
+        assert_eq!(
+            spent_fuel(
+                Some(FuelMeasure {
+                    consumed: 0,
+                    limit: 1
+                }),
+                &in_band
+            ),
+            None
+        );
+        assert_eq!(
+            spent_fuel(None, &serde_json::json!({"__fuel_consumed__": 0})),
+            None
+        );
+    }
+
+    /// Per-step pipeline fuel mirrors the single-result contract.
+    #[test]
+    fn pipeline_step_fuel_is_bound_only_when_present() {
+        let key = test_key();
+        let step = |fuel| PipelineStepResult {
+            module_id: Uuid::nil(),
+            status: JobStatus::Success,
+            output: serde_json::json!([1]).into(),
+            execution_time_ms: 3,
+            error: None,
+            fuel,
+        };
+        let mut result = PipelineJobResult {
+            llm_usage: vec![],
+            crypto_scheme: 0,
+            job_id: Uuid::new_v4(),
+            overall_status: JobStatus::Success,
+            step_results: vec![step(None), step(None)],
+            final_output: serde_json::json!([1]).into(),
+            total_time_ms: 5,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+        };
+        let payload = String::from_utf8(result.signing_payload()).unwrap();
+        assert!(!payload.contains(":step_fuel:"), "{payload}");
+
+        result.step_results[1].fuel = Some(FuelMeasure {
+            consumed: 42,
+            limit: 100,
+        });
+        result.sign(&key).unwrap();
+        let back: PipelineJobResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        back.verify_no_replay(&key, 300).unwrap();
+        assert_eq!(
+            back.step_results[1].spent_fuel().map(|f| f.consumed),
+            Some(42)
+        );
+
+        let mut moved = back.clone();
+        moved.step_results.swap(0, 1);
+        assert!(
+            moved.verify_no_replay(&key, 300).is_err(),
+            "fuel is bound to its step"
+        );
+        let mut stripped = back;
+        stripped.step_results[1].fuel = None;
+        assert!(stripped.verify_no_replay(&key, 300).is_err());
+    }
+
     /// aggregate_llm_usage folds per-call observations per (provider, model),
     /// counts calls, saturates, and caps the output length.
     #[test]
@@ -11278,6 +11612,7 @@ mod protocol_review_2026_09_tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         }
     }
 
@@ -11648,6 +11983,7 @@ mod pre_execution_rejection_tests {
             signature: vec![],
             result_nonce: String::new(),
             worker_id: String::new(),
+            fuel: None,
         }
     }
 

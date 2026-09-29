@@ -65,6 +65,7 @@ fn job_result_roundtrip() {
         signature: vec![],
         result_nonce: String::new(),
         worker_id: String::new(),
+        fuel: None,
     };
     let ser = serde_json::to_string(&res).expect("serialize result");
     let de: JobResult = serde_json::from_str(&ser).expect("deserialize result");
@@ -217,6 +218,7 @@ fn pipeline_job_result_roundtrip() {
             output: json!({"value": 42}).into(),
             execution_time_ms: 50,
             error: None,
+            fuel: None,
         }],
         final_output: json!({"value": 42}).into(),
         total_time_ms: 100,

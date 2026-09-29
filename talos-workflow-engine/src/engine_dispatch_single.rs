@@ -667,6 +667,8 @@ impl ParallelWorkflowEngine {
             // one site that dispatches it again, and it moves the base past
             // every attempt this dispatch can send.
             dispatch_attempt_base: 0,
+            workflow_id: Some(self.cost_attribution_workflow_id(execution_id)),
+            node_label: self.node_labels.get(&node_id).cloned(),
         };
 
         // ── One-shot reactive OAuth credential repair ────────────────────

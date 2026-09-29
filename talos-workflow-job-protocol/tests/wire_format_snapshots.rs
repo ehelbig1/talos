@@ -317,6 +317,7 @@ fn job_result_json_snapshot() {
         // round-trips identically to pre-L-11 results across the
         // controller's `#[serde(default)]` deserializer.
         worker_id: "snapshot-worker-01".into(),
+        fuel: None,
     };
     let actual = serde_json::to_string(&result).expect("serialize");
     let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","status":"Success","output_payload":{"out":42},"logs":["info: ok"],"execution_time_ms":7,"signature":[222,173,190,239],"result_nonce":"0:00000000000000000000000000000000","worker_id":"snapshot-worker-01","crypto_scheme":0}"#;
@@ -324,6 +325,32 @@ fn job_result_json_snapshot() {
         actual, expected,
         "JobResult wire format drifted — see test docstring for resolution"
     );
+}
+
+/// Non-default `fuel` (2026-09-29): the field's own wire shape. The
+/// all-default snapshot above proves the field ships inert; this one pins the
+/// bytes it adds when present.
+#[test]
+fn job_result_non_default_fuel_json_snapshot() {
+    let result = JobResult {
+        llm_usage: vec![],
+        crypto_scheme: 0,
+        job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
+        status: JobStatus::Failed,
+        output_payload: json!({"error": "fuel exhausted"}).into(),
+        logs: vec![],
+        execution_time_ms: 7,
+        signature: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        result_nonce: "0:00000000000000000000000000000000".into(),
+        worker_id: "snapshot-worker-01".into(),
+        fuel: Some(talos_workflow_job_protocol::FuelMeasure {
+            consumed: 5_000_000,
+            limit: 5_000_000,
+        }),
+    };
+    let actual = serde_json::to_string(&result).expect("serialize");
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","status":"Failed","output_payload":{"error":"fuel exhausted"},"logs":[],"execution_time_ms":7,"signature":[222,173,190,239],"result_nonce":"0:00000000000000000000000000000000","worker_id":"snapshot-worker-01","crypto_scheme":0,"fuel":{"consumed":5000000,"limit":5000000}}"#;
+    assert_eq!(actual, expected, "JobResult fuel wire format drifted");
 }
 
 #[test]
@@ -391,6 +418,7 @@ fn pipeline_job_result_json_snapshot() {
             output: json!({"step": "ok"}).into(),
             error: None,
             execution_time_ms: 12,
+            fuel: None,
         }],
         final_output: json!({"step": "ok"}).into(),
         overall_status: JobStatus::Success,

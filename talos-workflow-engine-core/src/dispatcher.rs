@@ -123,6 +123,16 @@ pub struct DispatchJob {
     /// Actor id that owns the execution (if actor-owned), so the
     /// worker can route agent-memory WIT calls to the right rows.
     pub actor_id: Option<Uuid>,
+    /// Workflow the dispatching engine runs — a sub-workflow's OWN id when
+    /// dispatched from a sub-engine. **Controller-side attribution only,
+    /// never on the wire.** The fuel sink writes it into
+    /// `execution_cost_rollup.workflow_id`, whose `JOIN workflows` is the
+    /// tenancy predicate of every fuel report, so it must be the same value
+    /// `NodeCompletionContext::workflow_id` carries. `None` = not known.
+    pub workflow_id: Option<Uuid>,
+    /// The node's graph label (`execution_cost_rollup.node_id`).
+    /// Controller-side attribution only, never on the wire.
+    pub node_label: Option<String>,
 
     // ── Module artifact ──────────────────────────────────────────────
     /// URI the worker can resolve the wasm binary from if
@@ -387,6 +397,8 @@ impl Default for DispatchJob {
             job_id: None,
             user_id: None,
             actor_id: None,
+            workflow_id: None,
+            node_label: None,
             module_uri: String::new(),
             wasm_bytes: None,
             expected_wasm_hash: None,
@@ -790,6 +802,8 @@ impl fmt::Debug for DispatchJob {
             .field("job_id", &self.job_id)
             .field("user_id", &self.user_id)
             .field("actor_id", &self.actor_id)
+            .field("workflow_id", &self.workflow_id)
+            .field("node_label", &self.node_label)
             .field("module_uri", &self.module_uri)
             .field(
                 "wasm_bytes",

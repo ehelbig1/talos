@@ -41,6 +41,7 @@ fn signed(job_id: Uuid, status: JobStatus, key: &[u8]) -> Vec<u8> {
         worker_id: String::new(),
         crypto_scheme: 0,
         llm_usage: vec![],
+        fuel: None,
     };
     r.sign_with_worker_id(key, "worker-test").expect("sign");
     serde_json::to_vec(&r).expect("serialize")

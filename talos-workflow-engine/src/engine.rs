@@ -1131,6 +1131,17 @@ impl AdapterSet {
 }
 
 impl ParallelWorkflowEngine {
+    /// The workflow id cost attribution records for a node of this run —
+    /// `NodeCompletionContext::workflow_id` and `DispatchJob::workflow_id`
+    /// both read it, so the fuel sink and the completion hook can never
+    /// attribute one node to two workflows. A sub-engine carries its OWN
+    /// workflow id; `execution_id` is the fallback for engines built without
+    /// one (tests, diagnostics), whose rows the reports' `JOIN workflows`
+    /// then excludes.
+    pub(crate) fn cost_attribution_workflow_id(&self, execution_id: Uuid) -> Uuid {
+        self.workflow_id.unwrap_or(execution_id)
+    }
+
     /// Construct a bare engine with no adapters wired and the
     /// documented defaults for every limit / timeout / sandbox /
     /// agent-loop history setting.
