@@ -177,6 +177,36 @@ for dir in "$ROOT"/module-templates/*/; do
     total=$((total + 1))
 done
 
+# Extra crates declared in talos.json `dependencies`, rendered as Cargo.toml
+# lines. The heredoc lives in this function rather than inline in the
+# caller's `$( … )` because bash 3.2 (the macOS /bin/bash) scans command-
+# substitution text for quote balance without understanding heredocs, so a
+# single apostrophe in the Python below broke the whole script's parse.
+render_extra_deps() {
+    PRE_BUNDLED="$PRE_BUNDLED" python3 - "$1" <<'PY'
+import json, os, sys
+meta = json.load(open(sys.argv[1]))
+# Mirror create_workspace's PRE_BUNDLED skip. Without it a talos.json that
+# legitimately declares `serde` (allowlisted, and production silently drops
+# it as already-bundled) emits a second `serde = ...` line into a manifest
+# that already has one, and cargo fails with `duplicate key` — this gate
+# would report a template as broken that production builds fine.
+pre_bundled = {c.lower() for c in os.environ.get("PRE_BUNDLED", "").split()}
+for name, ver in (meta.get("dependencies") or {}).items():
+    if name.lower() in pre_bundled:
+        continue
+    # Mirror the two feature-flag special cases in
+    # talos_compilation::create_workspace — without them a template
+    # declaring uuid/tokio compiles here and fails in production.
+    if name == "uuid":
+        print(f'uuid = {{ version = "{ver}", features = ["v4", "v7"] }}')
+    elif name == "tokio":
+        print(f'tokio = {{ version = "{ver}", features = ["rt", "macros", "time", "sync", "io-util"] }}')
+    else:
+        print(f'{name} = "{ver}"')
+PY
+}
+
 # Build one template exactly the way `talos_compilation::create_workspace`
 # does: fixed base manifest + the `dependencies` block from talos.json, and
 # nothing from the template's own Cargo.toml. World comes from talos.json
@@ -200,29 +230,7 @@ scaffold_and_check() {
     # Extra crates declared in talos.json `dependencies` — the ONLY
     # dependency source the runtime reads.
     local extra_deps
-    extra_deps="$(PRE_BUNDLED="$PRE_BUNDLED" python3 - "$dir/talos.json" <<'PY'
-import json, os, sys
-meta = json.load(open(sys.argv[1]))
-# Mirror create_workspace's PRE_BUNDLED skip. Without it a talos.json that
-# legitimately declares `serde` (allowlisted, and production silently drops
-# it as already-bundled) emits a second `serde = ...` line into a manifest
-# that already has one, and cargo fails with `duplicate key` — this gate
-# would report a template as broken that production builds fine.
-pre_bundled = {c.lower() for c in os.environ.get("PRE_BUNDLED", "").split()}
-for name, ver in (meta.get("dependencies") or {}).items():
-    if name.lower() in pre_bundled:
-        continue
-    # Mirror the two feature-flag special cases in
-    # talos_compilation::create_workspace — without them a template
-    # declaring uuid/tokio compiles here and fails in production.
-    if name == "uuid":
-        print(f'uuid = {{ version = "{ver}", features = ["v4", "v7"] }}')
-    elif name == "tokio":
-        print(f'tokio = {{ version = "{ver}", features = ["rt", "macros", "time", "sync", "io-util"] }}')
-    else:
-        print(f'{name} = "{ver}"')
-PY
-)"
+    extra_deps="$(render_extra_deps "$dir/talos.json")"
     local tmp
     tmp="$(mktemp -d)"
     cp "$src" "$tmp/template.rs"
