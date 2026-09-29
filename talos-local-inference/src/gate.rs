@@ -273,14 +273,19 @@ impl QueueWaitObserver for NoWaitObserver {
 ///
 /// When the call has to QUEUE at either stage, the wait is reported to `wait`
 /// once. A slot that is free is taken without reporting.
+///
+/// `model` is the model the call will ask for; the fleet queue compares it with
+/// the previous admission's to count model switches (RFC 0014 P4b).
 pub async fn acquire_process_slot<W: QueueWaitObserver>(
     wait: Option<&W>,
+    model: &str,
 ) -> (LocalLlmSlot, Duration) {
     admit(
         process_gate(),
         crate::fleet::installed(),
         Duration::from_secs(LOCAL_LLM_QUEUE_WAIT_SECS),
         wait,
+        model,
     )
     .await
 }
@@ -302,6 +307,7 @@ pub async fn admit<W: QueueWaitObserver>(
     fleet: Option<&FleetAdmission>,
     wait_cap: Duration,
     wait: Option<&W>,
+    model: &str,
 ) -> (LocalLlmSlot, Duration) {
     let Some(sem) = permits else {
         return (LocalLlmSlot::Ungated(Ungated::Disabled), Duration::ZERO);
@@ -348,7 +354,7 @@ pub async fn admit<W: QueueWaitObserver>(
 
     let lease = match fleet {
         None => None,
-        Some(f) => match f.acquire(deadline, report).await {
+        Some(f) => match f.acquire(deadline, model, report).await {
             FleetAcquire::Leased(lease) => Some(lease),
             FleetAcquire::Unavailable => None,
             FleetAcquire::WaitExpired => {
@@ -370,7 +376,7 @@ pub async fn acquire_reporting_from<W: QueueWaitObserver>(
     wait_cap: Duration,
     wait: Option<&W>,
 ) -> (LocalLlmSlot, Duration) {
-    admit(permits, None, wait_cap, wait).await
+    admit(permits, None, wait_cap, wait, "").await
 }
 
 /// [`admit`] on the process gate alone, reporting nothing.
@@ -384,7 +390,7 @@ pub async fn acquire_from(
     permits: Option<&Arc<Semaphore>>,
     wait_cap: Duration,
 ) -> (LocalLlmSlot, Duration) {
-    admit::<NoWaitObserver>(permits, None, wait_cap, None).await
+    admit::<NoWaitObserver>(permits, None, wait_cap, None, "").await
 }
 
 #[cfg(test)]

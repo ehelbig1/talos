@@ -94,3 +94,24 @@ async fn an_expired_queue_wait_is_excluded_and_closed() {
     assert!(!ledger.is_waiting());
     assert_eq!(heard.admitted.load(Ordering::SeqCst), 1);
 }
+
+/// RFC 0014 P4b: both local call sites hand the gate the model they will ask
+/// for, so the fleet queue can count model switches. A TEXTUAL pin: the fleet
+/// queue is not installed in this test binary, so no behavioural test here can
+/// see the argument.
+#[test]
+fn both_local_call_sites_pass_the_model_to_the_gate() {
+    for (file, src) in [
+        ("llm.rs", include_str!("llm.rs")),
+        ("llm_tools.rs", include_str!("llm_tools.rs")),
+    ] {
+        let at = src
+            .find("acquire_local_llm_slot(")
+            .unwrap_or_else(|| panic!("{file}: no gate call"));
+        let args: String = src[at..at + 200].split_whitespace().collect();
+        assert!(
+            args.starts_with("acquire_local_llm_slot(self.inference_wait.as_deref(),&model,)"),
+            "{file}: the gate call does not pass the model: {args}"
+        );
+    }
+}

@@ -736,15 +736,8 @@ pub fn record_google_push_accepted_on(metrics: &TalosMetrics, integration: PushI
         .inc();
 }
 
-/// Count one fleet-queue outcome for a local LLM call (RFC 0014 P3b). Inert
-/// without [`set_global`].
-pub fn record_local_llm_fleet_admission(outcome: LocalLlmFleetOutcome) {
-    if let Some(m) = global() {
-        record_local_llm_fleet_admission_on(m, outcome);
-    }
-}
-
-/// The recording itself, against an EXPLICIT registry.
+/// Count one controller-side local LLM fleet-queue outcome (RFC 0014 P3b),
+/// against an EXPLICIT registry.
 pub fn record_local_llm_fleet_admission_on(metrics: &TalosMetrics, outcome: LocalLlmFleetOutcome) {
     metrics
         .local_llm_fleet_admission_total
@@ -752,15 +745,28 @@ pub fn record_local_llm_fleet_admission_on(metrics: &TalosMetrics, outcome: Loca
         .inc();
 }
 
-/// Count one controller-side local LLM exchange cut by a progress deadline
-/// (RFC 0014 P4a). Inert without [`set_global`].
-pub fn record_local_llm_timeout(kind: LocalLlmTimeoutKind) {
-    if let Some(m) = global() {
-        record_local_llm_timeout_on(m, kind);
-    }
+/// Boundaries of `talos_local_llm_fleet_queue_ahead`, equal to the worker's
+/// (pinned by the controller against `talos_local_inference`).
+pub const LOCAL_LLM_QUEUE_AHEAD_BUCKETS: [f64; 9] = [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0];
+
+fn talos_local_llm_queue_ahead_buckets() -> Vec<f64> {
+    LOCAL_LLM_QUEUE_AHEAD_BUCKETS.to_vec()
 }
 
-/// The recording itself, against an EXPLICIT registry.
+/// Record how many calls were ahead of a controller-side local LLM call when
+/// it joined the fleet queue (RFC 0014 P4b), against an EXPLICIT registry.
+pub fn record_local_llm_fleet_arrival_on(metrics: &TalosMetrics, ahead: u64) {
+    metrics.local_llm_fleet_queue_ahead.observe(ahead as f64);
+}
+
+/// Count one controller-side admission that switched model (RFC 0014 P4b),
+/// against an EXPLICIT registry.
+pub fn record_local_llm_fleet_model_switch_on(metrics: &TalosMetrics) {
+    metrics.local_llm_fleet_model_switches_total.inc();
+}
+
+/// Count one controller-side local LLM exchange cut by a progress deadline
+/// (RFC 0014 P4a), against an EXPLICIT registry.
 pub fn record_local_llm_timeout_on(metrics: &TalosMetrics, kind: LocalLlmTimeoutKind) {
     metrics
         .local_llm_timeouts_total
@@ -1954,6 +1960,12 @@ pub struct TalosMetrics {
     /// exchanges cut by a progress deadline (RFC 0014 P4a).
     /// `LocalLlmTimeoutKind::ALL`, seeded at 0.
     pub local_llm_timeouts_total: CounterVec,
+    /// `talos_local_llm_fleet_queue_ahead` — calls ahead of each controller
+    /// local LLM call when it joined the fleet queue (RFC 0014 P4b).
+    pub local_llm_fleet_queue_ahead: prometheus::Histogram,
+    /// `talos_local_llm_fleet_model_switches_total` — controller admissions
+    /// for a different model than the previous admission (RFC 0014 P4b).
+    pub local_llm_fleet_model_switches_total: Counter,
     /// `talos_google_push_deferred_total{integration,reason}` — pushes handed
     /// back to the transport for redelivery because Talos could not answer.
     /// `PushIntegration::ALL` x `PushDeferReason::ALL`, seeded at 0. Package ES.
@@ -3625,6 +3637,29 @@ impl TalosMetrics {
                 .with_label_values(&[kind.as_str()])
                 .inc_by(0.0);
         }
+        let local_llm_fleet_queue_ahead = prometheus::Histogram::with_opts(
+            prometheus::HistogramOpts::new(
+                "talos_local_llm_fleet_queue_ahead",
+                "Calls ahead of each of the controller's local LLM calls when it joined the \
+                 fleet-wide admission queue, 0 when admitted at once (RFC 0014 P4b). \
+                 Recorded per ARRIVAL rather than sampled, so a herd shorter than any \
+                 scrape interval is still seen. Absent when the queue is not installed. \
+                 NOT pre-seeded (a histogram needs no first observation). The worker's \
+                 series is wasm_llm_fleet_queue_ahead.",
+            )
+            .buckets(talos_local_llm_queue_ahead_buckets()),
+        )?;
+        registry.register(Box::new(local_llm_fleet_queue_ahead.clone()))?;
+        let local_llm_fleet_model_switches_total = Counter::new(
+            "talos_local_llm_fleet_model_switches_total",
+            "The controller's local LLM admissions for a different model than the previous \
+             admission to the same backend, by ANY process (RFC 0014 P4b) — the proxy for a \
+             model swap on a backend that cannot hold both. Decided atomically with the \
+             admission in Redis. No model label: model names are not a closed set. Sum \
+             with the worker's wasm_llm_fleet_model_switches_total for the fleet. Not \
+             alerted: no baseline yet.",
+        )?;
+        registry.register(Box::new(local_llm_fleet_model_switches_total.clone()))?;
         let google_push_deferred_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_google_push_deferred_total",
@@ -4256,6 +4291,8 @@ impl TalosMetrics {
             google_push_accepted_total,
             local_llm_fleet_admission_total,
             local_llm_timeouts_total,
+            local_llm_fleet_queue_ahead,
+            local_llm_fleet_model_switches_total,
             google_push_deferred_total,
             execution_pause_refusals_total,
             webhook_duplicate_suppressed_total,
@@ -4843,6 +4880,21 @@ mod tests {
         let warm = m.render_prometheus().expect("render");
         assert!(warm.contains("talos_local_llm_fleet_admission_total{outcome=\"unavailable\"} 1"));
         assert!(warm.contains("talos_local_llm_fleet_admission_total{outcome=\"leased\"} 0"));
+    }
+
+    /// RFC 0014 P4b: the switch counter exports 0 before any switch, and the
+    /// arrival histogram records its observation.
+    #[test]
+    fn local_llm_fleet_depth_and_switches_render() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        assert!(cold.contains("talos_local_llm_fleet_model_switches_total 0"));
+        m.local_llm_fleet_model_switches_total.inc();
+        m.local_llm_fleet_queue_ahead.observe(2.0);
+        let warm = m.render_prometheus().expect("render");
+        assert!(warm.contains("talos_local_llm_fleet_model_switches_total 1"));
+        assert!(warm.contains("talos_local_llm_fleet_queue_ahead_bucket{le=\"2\"} 1"));
+        assert!(warm.contains("talos_local_llm_fleet_queue_ahead_bucket{le=\"1\"} 0"));
     }
 
     /// The local-LLM timeout counter (RFC 0014 P4a) is seeded for every kind

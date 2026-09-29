@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use talos_local_inference::fleet::{FleetAcquire, FleetAdmission, FleetOutcome, FleetTiming};
+use talos_local_inference::fleet::{
+    FleetAcquire, FleetAdmission, FleetEvent, FleetOutcome, FleetTiming,
+};
 use talos_local_inference::gate::{
     admit, LocalLlmSlot, NoWaitObserver, QueueWaitObserver, Ungated,
 };
@@ -54,23 +56,32 @@ fn backend() -> String {
 }
 
 type Seen = Arc<Mutex<Vec<FleetOutcome>>>;
+type Events = Arc<Mutex<Vec<FleetEvent>>>;
 
-/// One "process": its own connection, its own gate, a sink recording outcomes.
+/// One "process": its own connection, its own gate, a sink recording outcomes
+/// (`seen`) and every event (`events`).
 struct Process {
     fleet: FleetAdmission,
     gate: Arc<Semaphore>,
     seen: Seen,
+    events: Events,
 }
 
 async fn process(url: &str, backend: &str, cap: usize, timing: FleetTiming) -> Process {
     let seen: Seen = Arc::default();
-    let s = seen.clone();
+    let events: Events = Arc::default();
+    let (s, e) = (seen.clone(), events.clone());
     let fleet = FleetAdmission::connect(
         redis::Client::open(url).unwrap(),
         backend,
         cap,
         timing,
-        Some(Arc::new(move |o| s.lock().unwrap().push(o))),
+        Some(Arc::new(move |ev| {
+            if let FleetEvent::Outcome(o) = ev {
+                s.lock().unwrap().push(o);
+            }
+            e.lock().unwrap().push(ev);
+        })),
     )
     .await
     .expect("connect to the test Redis");
@@ -78,12 +89,38 @@ async fn process(url: &str, backend: &str, cap: usize, timing: FleetTiming) -> P
         fleet,
         gate: Arc::new(Semaphore::new(cap)),
         seen,
+        events,
     }
 }
 
 impl Process {
     async fn admit(&self, wait_cap: Duration) -> (LocalLlmSlot, Duration) {
-        admit::<NoWaitObserver>(Some(&self.gate), Some(&self.fleet), wait_cap, None).await
+        self.admit_for(wait_cap, "model-a").await
+    }
+
+    async fn admit_for(&self, wait_cap: Duration, model: &str) -> (LocalLlmSlot, Duration) {
+        admit::<NoWaitObserver>(Some(&self.gate), Some(&self.fleet), wait_cap, None, model).await
+    }
+
+    fn switches(&self) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| **e == FleetEvent::ModelSwitch)
+            .count()
+    }
+
+    fn arrivals(&self) -> Vec<u64> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                FleetEvent::Arrival { ahead } => Some(*ahead),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -152,7 +189,7 @@ async fn control_two_process_gates_alone_overlap() {
         let (in_flight, peak) = (in_flight.clone(), peak.clone());
         tasks.push(tokio::spawn(async move {
             let (slot, _) =
-                admit::<NoWaitObserver>(Some(&gate), None, Duration::from_secs(5), None).await;
+                admit::<NoWaitObserver>(Some(&gate), None, Duration::from_secs(5), None, "m").await;
             let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -232,7 +269,11 @@ async fn a_dead_holders_slot_frees_after_its_lease() {
     let dead = process(&url, &b, 1, TIMING).await;
     let FleetAcquire::Leased(lease) = dead
         .fleet
-        .acquire(Instant::now() + Duration::from_secs(2), || async {})
+        .acquire(
+            Instant::now() + Duration::from_secs(2),
+            "model-a",
+            || async {},
+        )
         .await
     else {
         panic!("the first caller is admitted");
@@ -415,6 +456,7 @@ async fn a_fleet_wait_is_reported_once() {
         Some(&p.fleet),
         Duration::from_secs(5),
         Some(&seen),
+        "model-a",
     )
     .await;
     release.await.unwrap();
@@ -435,9 +477,68 @@ async fn a_free_fleet_reports_nothing() {
         Some(&p.fleet),
         Duration::from_secs(5),
         Some(&seen),
+        "model-a",
     )
     .await;
     assert!(matches!(slot, LocalLlmSlot::Held(_)));
     assert_eq!(seen.begun.load(Ordering::SeqCst), 0);
     assert_eq!(seen.ended.load(Ordering::SeqCst), 0);
+}
+
+/// RFC 0014 P4b: a switch is counted when a call is admitted for a different
+/// model than the PREVIOUS admission to the backend — by any process — and
+/// only then. The first admission has nothing to switch from.
+#[tokio::test]
+async fn model_switches_are_counted_across_processes() {
+    let url = url_or_skip!();
+    let b = backend();
+    let a = process(&url, &b, 1, TIMING).await;
+    let c = process(&url, &b, 1, TIMING).await;
+    for (p, model) in [
+        (&a, "qwen3.6"),       // first: nothing to switch from
+        (&a, "qwen3.6"),       // same model
+        (&c, "qwen2.5-coder"), // a switch, by the other process
+        (&c, "qwen2.5-coder"), // same
+        (&a, "qwen3.6"),       // a switch back
+        (&c, ""),              // unknown model: not compared
+    ] {
+        let (slot, _) = p.admit_for(Duration::from_secs(5), model).await;
+        assert!(matches!(slot, LocalLlmSlot::Held(_)));
+        drop(slot);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(a.switches(), 1, "a's switch back");
+    assert_eq!(c.switches(), 1, "c's switch");
+}
+
+/// RFC 0014 P4b: every call reports, once, how many calls were ahead of it
+/// when it joined — 0 when admitted at once — so a herd is visible however
+/// briefly it lasts.
+#[tokio::test]
+async fn each_call_reports_how_many_were_ahead_on_arrival() {
+    let url = url_or_skip!();
+    let b = backend();
+    let holder = process(&url, &b, 1, TIMING).await;
+    let (slot, _) = holder.admit(Duration::from_secs(2)).await;
+    assert_eq!(holder.arrivals(), vec![0]);
+
+    let second = process(&url, &b, 1, TIMING).await;
+    let third = process(&url, &b, 1, TIMING).await;
+    let t2 = tokio::spawn(async move {
+        let (s, _) = second.admit(Duration::from_secs(5)).await;
+        drop(s);
+        second
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t3 = tokio::spawn(async move {
+        let (s, _) = third.admit(Duration::from_secs(5)).await;
+        drop(s);
+        third
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(slot);
+    let second = t2.await.unwrap();
+    let third = t3.await.unwrap();
+    assert_eq!(second.arrivals(), vec![1], "one holder ahead");
+    assert_eq!(third.arrivals(), vec![2], "a holder and a waiter ahead");
 }

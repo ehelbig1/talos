@@ -708,7 +708,7 @@ impl OllamaClient {
 
         // Bound, never `_`: the permit is released on drop, and it must be
         // held for the whole exchange.
-        let (_slot, waited) = gate::acquire_process_slot::<gate::NoWaitObserver>(None).await;
+        let (_slot, waited) = gate::acquire_process_slot::<gate::NoWaitObserver>(None, model).await;
         match &_slot {
             gate::LocalLlmSlot::Ungated(gate::Ungated::WaitExpired) => warn!(
                 model,

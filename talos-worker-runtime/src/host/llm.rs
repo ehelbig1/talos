@@ -682,8 +682,11 @@ impl TalosContext {
         // drop, so `let _ = …` would hold the slot for zero time and gate
         // nothing.
         let _llm_slot = if is_local {
-            let (slot, waited) =
-                crate::host::llm_gate::acquire_local_llm_slot(self.inference_wait.as_deref()).await;
+            let (slot, waited) = crate::host::llm_gate::acquire_local_llm_slot(
+                self.inference_wait.as_deref(),
+                &model,
+            )
+            .await;
             if let Some(ref m) = self.metrics {
                 m.record_llm_gate(slot.outcome_label(), waited.as_secs_f64() * 1000.0);
             }

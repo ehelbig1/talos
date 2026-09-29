@@ -1,6 +1,6 @@
 # RFC 0014 — Local inference that does not depend on the schedule
 
-**Status:** In progress — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28; P2c measured and not built 2026-09-28; P3a (the controller gated and on progress deadlines) 2026-09-28; P3b (one queue across processes) 2026-09-28; P4a (timeouts classified and counted by kind) 2026-09-28
+**Status:** Shipped (P1, P2a, P2b, P3a, P3b, P4a, P4b; P2c measured and not built) — P1 (progress-based deadlines) 2026-09-28; P2a (waiting not charged to the job) 2026-09-28; P2b (nor to the run) 2026-09-28; P2c measured and not built 2026-09-28; P3a (the controller gated and on progress deadlines) 2026-09-28; P3b (one queue across processes) 2026-09-28; P4a (timeouts classified and counted by kind) 2026-09-28; P4b (queue depth at arrival, model switches) 2026-09-28
 **Author:** Platform
 **Date:** 2026-09-28
 
@@ -405,11 +405,47 @@ will show whether it ever acts.
 - **Pipeline steps** (dormant by config) read the worker's own check, which
   treats only the ceiling differently.
 
-### P4b — queue depth and model switches (proposed)
+### P4b — queue depth at arrival, and model switches (2026-09-28)
 
-1. Fleet queue depth, sampled from the Redis queue.
-2. A model-switch count kept in Redis: consecutive admitted calls to different
-   models, the proxy for the swaps P2c measured.
+**Decided.**
+
+1. **Queue depth is recorded per ARRIVAL, not sampled.** The fleet queue's first
+   answer to a call says how many calls must be admitted before it (0 when it is
+   admitted at once). That number is recorded once per call, as a histogram:
+   - worker `wasm_llm_fleet_queue_ahead`;
+   - controller `talos_local_llm_fleet_queue_ahead`;
+   - one set of buckets (`0, 1, 2, 3, 4, 6, 8, 12, 16`), pinned equal across the
+     two processes.
+
+   A gauge sampled every 15 s was rejected: the 08:00 herd lasts tens of
+   seconds, so a sample would read 0 almost always and could miss it outright.
+   A per-arrival reading cannot. Not seeded, as the house rule for histograms
+   says.
+2. **Per-model depth deliberately NOT built.** A model label is not a closed
+   set: model names come from workflow configuration, and this repo does not
+   let caller-influenced values become label cardinality.
+3. **A model switch is counted inside the admission.** The queue's script keeps
+   the last admitted model per backend (a fifth key, 24 h TTL). An admission for
+   a different model returns a distinct answer (`-2`), so the comparison is
+   atomic with the admission and ordered across processes. It is counted by the
+   process that made the call; sum the two series for the fleet:
+   - worker `wasm_llm_fleet_model_switches_total`;
+   - controller `talos_local_llm_fleet_model_switches_total`;
+   - seeded at 0, no model label.
+   - A model name is stored cut to 128 bytes; an unknown (empty) model is not
+     compared.
+4. **One sink for the queue's events.** `FleetSink` now takes a `FleetEvent`:
+   an admission outcome (P3b), an arrival, or a model switch. The controller
+   records into an explicit registry, so its mapping is testable.
+
+**Not done, stated.**
+
+- **Only calls that reach the fleet queue are measured.** No Redis, the queue
+  switched off, or Redis failing: no arrival and no switch is recorded.
+- **A switch is a proxy for a swap.** It counts consecutive admissions to
+  different models. Whether Ollama actually evicted one depends on memory,
+  which Talos cannot see; P2c measured the real swaps from Ollama's log.
+- **No alert** on either series: no baseline yet.
 
 ## Operator items (not code)
 

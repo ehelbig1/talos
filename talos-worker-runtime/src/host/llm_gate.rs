@@ -29,10 +29,13 @@ impl QueueWaitObserver for InferenceWaitLedger {
 /// Take a local-LLM slot on this worker's gate, recording a queued wait on
 /// `wait` — the job's ledger. **Call this BEFORE starting the exchange's
 /// deadlines**: queue time is not the call's own service time.
+///
+/// `model` is counted for model switches by the fleet queue (RFC 0014 P4b).
 pub(crate) async fn acquire_local_llm_slot(
     wait: Option<&InferenceWaitLedger>,
+    model: &str,
 ) -> (LocalLlmSlot, Duration) {
-    talos_local_inference::gate::acquire_process_slot(wait).await
+    talos_local_inference::gate::acquire_process_slot(wait, model).await
 }
 
 #[cfg(test)]
