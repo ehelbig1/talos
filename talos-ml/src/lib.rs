@@ -77,7 +77,8 @@ pub use serve::{
     ServedPrediction, ServingMode,
 };
 pub use teacher_audit::{
-    start_teacher_audit, stored_teacher_audit, TeacherAuditError, TeacherAuditStart, TeacherRequest,
+    start_teacher_audit, stored_teacher_audit, TeacherAuditError, TeacherAuditStart,
+    TeacherBackend, TeacherRequest,
 };
 pub use teacher_audit_job::{run_teacher_audit_tick, spawn_teacher_audit_scheduler};
 pub use teacher_ceilings::teacher_ceilings;

@@ -87,12 +87,52 @@ const STRICT_RETRY_LINE: &str = "Respond with ONLY the JSON object, no other tex
 /// One teacher call, provider-agnostic: the caller (MCP handler /
 /// future GraphQL) supplies the transport; this crate owns the prompt.
 pub struct TeacherRequest {
-    /// The teacher model name (from the model config's fallback leg).
+    /// The teacher model name (the model config's fallback leg, or the
+    /// System One model the audit was asked to run).
     pub llm_model: String,
     pub system_prompt: String,
     pub user_content: String,
     pub max_tokens: u32,
+    /// The label set the answer must come from. A chat transport finds it in
+    /// `system_prompt`; a System One transport passes it as the options.
+    pub labels: Vec<String>,
 }
+
+/// Which transport answers the audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeacherBackend {
+    /// The model's chat teacher (`fallback.model`) — the production LLM leg.
+    /// Its report is `ml_models.teacher_audit` itself.
+    Chat,
+    /// A local Ollama System One model scoring the labels
+    /// (`/v1/systemone`, v0.35.0+). Its report is stored under
+    /// `teacher_audit.systemone`, beside the chat teacher's, so a comparison
+    /// never replaces the production teacher's figure.
+    SystemOne { model: String },
+}
+
+impl TeacherBackend {
+    /// The sub-key a report is stored under; `None` = the top level.
+    fn storage_key(&self) -> Option<&'static str> {
+        match self {
+            Self::Chat => None,
+            Self::SystemOne { .. } => Some(SYSTEM_ONE_KEY),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::SystemOne { .. } => "systemone",
+        }
+    }
+}
+
+/// Where a System One audit's report lives inside `teacher_audit`.
+pub const SYSTEM_ONE_KEY: &str = "systemone";
+
+/// Longest System One model name accepted.
+const MAX_SYSTEM_ONE_MODEL_CHARS: usize = 128;
 
 #[derive(Debug)]
 pub enum TeacherAuditError {
@@ -494,6 +534,7 @@ pub async fn start_teacher_audit<F, Fut>(
     model_id: Uuid,
     limit: i64,
     system_prompt: Option<String>,
+    backend: TeacherBackend,
     classify: F,
 ) -> Result<TeacherAuditStart, TeacherAuditError>
 where
@@ -509,7 +550,14 @@ where
         return Err(TeacherAuditError::AlreadyRunning);
     };
 
-    let loaded = load_audit_inputs(pool, dataset, user_id, model_id, limit).await?;
+    if let TeacherBackend::SystemOne { model } = &backend {
+        if model.trim().is_empty() || model.chars().count() > MAX_SYSTEM_ONE_MODEL_CHARS {
+            return Err(TeacherAuditError::InvalidConfig(format!(
+                "the System One model name must be 1–{MAX_SYSTEM_ONE_MODEL_CHARS} characters"
+            )));
+        }
+    }
+    let loaded = load_audit_inputs(pool, dataset, user_id, model_id, limit, &backend).await?;
     if loaded.gold.is_empty() {
         return Err(TeacherAuditError::InvalidConfig(
             "no gold slice: the dataset has no source='correction' rows yet — resolve some \
@@ -525,6 +573,7 @@ where
         pool,
         model_id,
         user_id,
+        backend.storage_key(),
         &serde_json::json!({
             "status": "running",
             "started_at": chrono::Utc::now(),
@@ -558,6 +607,7 @@ where
             few_shot,
             gold,
             base,
+            backend,
             classify,
         )
         .await;
@@ -574,6 +624,7 @@ async fn load_audit_inputs(
     user_id: Uuid,
     model_id: Uuid,
     limit: i64,
+    backend: &TeacherBackend,
 ) -> Result<LoadedAudit, TeacherAuditError> {
     let mut tx = open_tx(pool, user_id).await?;
     let model = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id)
@@ -606,10 +657,19 @@ async fn load_audit_inputs(
              local providers ({LOCAL_LLM_PROVIDERS:?}); external teachers run node-side"
         )));
     }
-    let teacher_model = model.config_json["fallback"]["model"]
-        .as_str()
-        .unwrap_or("qwen3.6:latest")
-        .to_string();
+    let teacher_model = match backend {
+        TeacherBackend::Chat => model.config_json["fallback"]["model"]
+            .as_str()
+            .unwrap_or("qwen3.6:latest")
+            .to_string(),
+        // Ollama only: System One is a local endpoint, and the transport
+        // refuses a model that is not proven local before sending.
+        TeacherBackend::SystemOne { model } => model.trim().to_string(),
+    };
+    let provider = match backend {
+        TeacherBackend::Chat => provider,
+        TeacherBackend::SystemOne { .. } => "ollama".to_string(),
+    };
     // Label set: the provisioned config records it; legacy models fall
     // back to the dataset's observed classes.
     let mut labels: Vec<String> = model.config_json["labels"]
@@ -677,6 +737,7 @@ async fn run_audit_task<F, Fut>(
     few_shot: Vec<(String, String)>,
     gold: Vec<GoldExample>,
     base: String,
+    backend: TeacherBackend,
     classify: F,
 ) where
     F: Fn(TeacherRequest) -> Fut,
@@ -716,6 +777,7 @@ async fn run_audit_task<F, Fut>(
             system_prompt: sys.clone(),
             user_content: user.clone(),
             max_tokens: TEACHER_MAX_TOKENS,
+            labels: labels.clone(),
         })
         .await;
         let text = match reply {
@@ -741,6 +803,7 @@ async fn run_audit_task<F, Fut>(
                 system_prompt: strict_sys,
                 user_content: user.clone(),
                 max_tokens: TEACHER_MAX_TOKENS,
+                labels: labels.clone(),
             })
             .await
             {
@@ -765,7 +828,10 @@ async fn run_audit_task<F, Fut>(
                 "gold_rows": gold_rows,
                 "skipped_few_shot_anchors": skipped_anchors,
             });
-            if let Err(e) = stamp_teacher_audit(&pool, model_id, user_id, &progress).await {
+            if let Err(e) =
+                stamp_teacher_audit(&pool, model_id, user_id, backend.storage_key(), &progress)
+                    .await
+            {
                 tracing::warn!(target: "talos_ml", %model_id, error = ?e, "teacher audit progress stamp failed");
             }
         }
@@ -778,7 +844,9 @@ async fn run_audit_task<F, Fut>(
             "error": "teacher unavailable (repeated call failures)",
             "failed_at": chrono::Utc::now(),
         });
-        if let Err(e) = stamp_teacher_audit(&pool, model_id, user_id, &failed).await {
+        if let Err(e) =
+            stamp_teacher_audit(&pool, model_id, user_id, backend.storage_key(), &failed).await
+        {
             tracing::warn!(target: "talos_ml", %model_id, error = ?e, "teacher audit failure stamp failed");
         }
         return;
@@ -807,6 +875,7 @@ async fn run_audit_task<F, Fut>(
             .collect::<serde_json::Map<_, _>>(),
         "mismatches": totals.mismatches,
         "teacher": {
+            "backend": backend.label(),
             "provider": teacher_provider,
             "model": teacher_model,
             "few_shot_used": few_shot.len(),
@@ -816,7 +885,9 @@ async fn run_audit_task<F, Fut>(
         "retries": retries,
         "gold_limit": limit,
     });
-    if let Err(e) = stamp_teacher_audit(&pool, model_id, user_id, &report).await {
+    if let Err(e) =
+        stamp_teacher_audit(&pool, model_id, user_id, backend.storage_key(), &report).await
+    {
         tracing::warn!(target: "talos_ml", %model_id, error = ?e, "teacher audit final store failed");
     }
 }
@@ -828,20 +899,42 @@ async fn stamp_teacher_audit(
     pool: &PgPool,
     model_id: Uuid,
     user_id: Uuid,
+    key: Option<&'static str>,
     value: &serde_json::Value,
 ) -> Result<(), TeacherAuditError> {
     let mut tx = open_tx(pool, user_id).await?;
-    sqlx::query(
-        "UPDATE ml_models SET teacher_audit = $1, updated_at = NOW() \
-         WHERE id = $2 AND user_id = $3",
-    )
-    .bind(value)
-    .bind(model_id)
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await
-    .context("store teacher_audit")
-    .map_err(TeacherAuditError::Internal)?;
+    // Top level (the chat teacher): replace the report but CARRY a stored
+    // System One report across, so a routine re-audit never erases the
+    // comparison. Under a key (System One): set only that key.
+    let sql = match key {
+        None => {
+            "UPDATE ml_models SET teacher_audit = $1 || CASE \
+               WHEN jsonb_typeof(teacher_audit) = 'object' AND teacher_audit ? $4::text \
+               THEN jsonb_build_object($4::text, teacher_audit -> $4::text) \
+               ELSE '{}'::jsonb END, \
+             updated_at = NOW() \
+             WHERE id = $2 AND user_id = $3"
+        }
+        Some(_) => {
+            "UPDATE ml_models SET teacher_audit = jsonb_set( \
+               CASE WHEN jsonb_typeof(teacher_audit) = 'object' THEN teacher_audit \
+                    ELSE '{}'::jsonb END, \
+               ARRAY[$4::text], $1, true), \
+             updated_at = NOW() \
+             WHERE id = $2 AND user_id = $3"
+        }
+    };
+    // $4 is the sub-key: the one being written, or (top level) the one
+    // carried across.
+    sqlx::query(sql)
+        .bind(value)
+        .bind(model_id)
+        .bind(user_id)
+        .bind(key.unwrap_or(SYSTEM_ONE_KEY))
+        .execute(&mut *tx)
+        .await
+        .context("store teacher_audit")
+        .map_err(TeacherAuditError::Internal)?;
     tx.commit()
         .await
         .map_err(|e| TeacherAuditError::Internal(e.into()))?;

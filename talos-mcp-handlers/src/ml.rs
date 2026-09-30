@@ -177,7 +177,9 @@ pub fn tool_schemas() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {
                 "model_id": { "type": "string" },
                 "limit": { "type": "integer", "description": "Gold rows to audit, 1-100 (default 100); each row is one local LLM call" },
-                "system_prompt": { "type": "string", "description": "The classifier node's SYSTEM_PROMPT, for exact prompt parity; omit to audit with the bare label instruction" }
+                "system_prompt": { "type": "string", "description": "The classifier node's SYSTEM_PROMPT, for exact prompt parity; omit to audit with the bare label instruction" },
+                "backend": { "type": "string", "enum": ["chat", "systemone"], "description": "Who answers: 'chat' (default) = the model's chat teacher (fallback.model), the production LLM leg, stored as teacher_audit. 'systemone' = a local Ollama System One model (/v1/systemone, Ollama ≥ 0.35) scoring the labels, stored as teacher_audit.systemone BESIDE the chat teacher's report — a comparison, never a replacement" },
+                "systemone_model": { "type": "string", "description": "Required when backend='systemone': the pulled System One model, e.g. 'nimble:9b'. Must be local (a cloud model is refused before anything is sent)" }
             }, "required": ["model_id"] }
         }),
         serde_json::json!({
@@ -1665,6 +1667,22 @@ async fn handle_teacher_audit(
         .get("system_prompt")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let backend = match args.get("backend").and_then(|v| v.as_str()).unwrap_or("chat") {
+        "chat" => talos_ml::TeacherBackend::Chat,
+        "systemone" => match args.get("systemone_model").and_then(|v| v.as_str()) {
+            Some(m) if !m.trim().is_empty() => talos_ml::TeacherBackend::SystemOne {
+                model: m.trim().to_string(),
+            },
+            _ => {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    "backend 'systemone' needs systemone_model (the pulled System One model, e.g. 'nimble:9b')",
+                )
+            }
+        },
+        _ => return mcp_error(req_id, -32602, "backend must be 'chat' or 'systemone'"),
+    };
     let Some(ollama) = state.ollama_client.clone() else {
         return mcp_error(
             req_id,
@@ -1680,17 +1698,31 @@ async fn handle_teacher_audit(
     // otherwise burn the whole response budget thinking without emitting
     // the {"label": ...} object — measured 23/100 unparseable replies on
     // the 2026-07-21 audit; reasoning-off also ~3x'd the inbox A/B.
+    //
+    // System One: the same prompt (instructions = the teacher system prompt,
+    // which carries the labels and the few-shot anchors; state = the
+    // spotlit example) scored over the label set. The answer is rendered as
+    // the `{"label": …}` object the audit already parses, so scoring,
+    // aggregation and storage are the chat teacher's, unchanged.
+    let use_system_one = matches!(backend, talos_ml::TeacherBackend::SystemOne { .. });
     let classify = move |r: talos_ml::TeacherRequest| {
         let ollama = ollama.clone();
         async move {
-            ollama
-                .complete_structured(
-                    &r.llm_model,
-                    &r.system_prompt,
-                    &r.user_content,
-                    r.max_tokens,
-                )
-                .await
+            if use_system_one {
+                let answer = ollama
+                    .system_one_choice(&r.llm_model, &r.user_content, &r.system_prompt, &r.labels)
+                    .await?;
+                Ok(serde_json::json!({ "label": answer.choice }).to_string())
+            } else {
+                ollama
+                    .complete_structured(
+                        &r.llm_model,
+                        &r.system_prompt,
+                        &r.user_content,
+                        r.max_tokens,
+                    )
+                    .await
+            }
         }
     };
     match talos_ml::start_teacher_audit(
@@ -1700,6 +1732,7 @@ async fn handle_teacher_audit(
         model_id,
         limit,
         system_prompt,
+        backend,
         classify,
     )
     .await

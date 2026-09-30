@@ -48,7 +48,7 @@ use uuid::Uuid;
 
 use crate::dataset::DatasetService;
 use crate::teacher_audit::{
-    start_teacher_audit, TeacherAuditError, TeacherRequest, MAX_AUDIT_ROWS,
+    start_teacher_audit, TeacherAuditError, TeacherBackend, TeacherRequest, MAX_AUDIT_ROWS,
 };
 use talos_llm::OllamaClient;
 
@@ -254,6 +254,7 @@ pub async fn run_teacher_audit_tick(
             c.model_id,
             MAX_AUDIT_ROWS,
             None,
+            TeacherBackend::Chat,
             classify,
         )
         .await
