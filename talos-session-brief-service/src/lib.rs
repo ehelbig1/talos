@@ -21,10 +21,11 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Service-level errors. In practice every repository read in the brief is
-/// best-effort (`unwrap_or_default`, matching the historical handler), so
-/// `build` only fails on future required-path additions — the enum exists
-/// for the stable protocol mapping.
+/// Service-level errors. Every repository read in the brief is best-effort:
+/// a read that fails renders its field as `null` and names it under
+/// `measurement.not_measured` (`talos_measurement::Readings`), so `build`
+/// only fails on future required-path additions — the enum exists for the
+/// stable protocol mapping.
 #[derive(Debug, Error)]
 pub enum SessionBriefError {
     /// Required-path repository call returned an error. Maps to `-32000`.
@@ -72,14 +73,35 @@ pub struct SessionBriefInput {
 /// stay caller-side because capability auto-tagging lives in the handler
 /// crate (`analytics::auto_suggest_capabilities`).
 pub struct SessionBriefOutcome {
-    /// The full session brief JSON.
+    /// The full session brief JSON, with the `measurement` disclosure
+    /// attached when a read failed.
     pub report: serde_json::Value,
+    /// The brief's one ledger. A caller that adds a section records its read
+    /// through [`SessionBriefOutcome::record`], so the disclosure covers it.
+    readings: talos_measurement::Readings,
     /// True when unembedded workflows exist AND the embedding provider is
     /// available — the caller should spawn the background embed loop.
     pub spawn_embedding_heal: bool,
     /// True when uncapabilized workflows exist — the caller should spawn
     /// the background capability-tagging loop.
     pub spawn_capability_heal: bool,
+}
+
+impl SessionBriefOutcome {
+    /// Record a read the CALLER adds to the brief (the handler's catalog-drift
+    /// section, say): `None` on failure, and the field is named in
+    /// `measurement.not_measured` alongside the service's own reads. One
+    /// ledger per report — a second one would publish "complete" over this
+    /// failure.
+    pub fn record<T, E: std::fmt::Display>(
+        &mut self,
+        field: &'static str,
+        result: Result<T, E>,
+    ) -> Option<T> {
+        let value = self.readings.record(field, result);
+        self.readings.attach(&mut self.report);
+        value
+    }
 }
 
 /// Cross-protocol session-brief service. One Arc is shared by the MCP
@@ -102,20 +124,29 @@ impl SessionBriefService {
         let user_id = input.user_id;
         let auto_archive_days = input.auto_archive_days;
 
-        // 1. Embedding coverage
-        let (total_wf, embedded_wf) = self
-            .advanced_repo
-            .get_embedding_coverage(user_id)
-            .await
-            .unwrap_or((0, 0));
+        // ONE ledger for the whole brief. A read that fails yields `None`, its
+        // field renders `null` and is named under `measurement.not_measured`,
+        // and `priority_action` may not call the platform healthy. Until
+        // 2026-09-30 twelve of these reads defaulted to `0` / `[]` on error,
+        // so a database fault read as "nothing stuck, nothing to restore,
+        // platform healthy". Check 74b now scans this function because it
+        // constructs a `Readings`: a new awaited read that is defaulted here
+        // fails the lint.
+        let mut readings = talos_measurement::Readings::new();
 
-        let unembedded = total_wf - embedded_wf;
+        // 1. Embedding coverage
+        let coverage = readings.record(
+            "embedding_coverage",
+            self.advanced_repo.get_embedding_coverage(user_id).await,
+        );
+        let total_wf: Option<i64> = coverage.map(|(total, _)| total);
+        let embedded_wf: Option<i64> = coverage.map(|(_, embedded)| embedded);
+        let unembedded: Option<i64> = coverage.map(|(total, embedded)| total - embedded);
         // When total_wf == 0 there are no workflows to embed — return null rather than
         // the misleading "100%" that a zero-division guard would produce.
-        let embedding_pct: Option<i64> = if total_wf > 0 {
-            Some(embedded_wf * 100 / total_wf)
-        } else {
-            None
+        let embedding_pct: Option<i64> = match coverage {
+            Some((total, embedded)) if total > 0 => Some(embedded * 100 / total),
+            _ => None,
         };
 
         // Auto-heal: the caller spawns background embedding for any unembedded
@@ -129,7 +160,8 @@ impl SessionBriefService {
         // the response so the agent reports the misconfiguration instead of
         // promising "fully operational within seconds".
         let embedding_provider_available = talos_search_service::embedding_provider_available();
-        let auto_healing_embeddings = unembedded > 0 && embedding_provider_available;
+        let auto_healing_embeddings =
+            unembedded.is_some_and(|n| n > 0) && embedding_provider_available;
 
         // 2. Auto-archive stale drafts if requested — BEFORE the draft display
         // read, deliberately.
@@ -174,17 +206,23 @@ impl SessionBriefService {
                         "session_start auto-archive failed; no draft was archived"
                     );
                     auto_archive_failed = true;
+                    readings.mark_derived("auto_archived_stale_drafts");
                 }
             }
         }
 
         // 2b. Draft workflows (unpublished, no executions) — recent first.
         // Post-sweep by construction (see above).
-        let draft_rows = self
-            .advanced_repo
-            .get_draft_workflows(user_id)
-            .await
-            .unwrap_or_default();
+        let draft_read = readings.record(
+            "in_progress_drafts",
+            self.advanced_repo.get_draft_workflows(user_id).await,
+        );
+        let drafts_measured = draft_read.is_some();
+        if !drafts_measured {
+            // Both lists come from the one read.
+            readings.mark_derived("unpublished_substantive_drafts");
+        }
+        let draft_rows = draft_read.unwrap_or_default();
 
         // Drafts split by substantive-ness (pain point #1, addressed r234):
         //   * `unpublished_substantive_drafts` — workflows that are well-configured
@@ -364,13 +402,13 @@ impl SessionBriefService {
         // id/name/created_at for every row in duplicate groups via a subquery —
         // stays O(duplicate_rows), which is tiny by definition (we only surface up
         // to 10 *groups*, each typically 2-3 rows).
-        let duplicate_name_groups: Vec<serde_json::Value> = {
-            let rows = self
-                .advanced_repo
+        let duplicate_rows = readings.record(
+            "duplicate_name_groups",
+            self.advanced_repo
                 .find_workflow_duplicate_name_groups(user_id)
-                .await
-                .unwrap_or_default();
-
+                .await,
+        );
+        let duplicate_name_groups: Option<Vec<serde_json::Value>> = duplicate_rows.map(|rows| {
             // Group rows by name. BTreeMap preserves alphabetical order for stable output.
             let mut groups: std::collections::BTreeMap<
                 String,
@@ -412,19 +450,18 @@ impl SessionBriefService {
                     })
                 })
                 .collect()
-        };
+        });
 
         // 3. Uncapabilized workflows
-        let uncap_count: i64 = self
-            .advanced_repo
-            .get_uncapabilized_count(user_id)
-            .await
-            .unwrap_or(0);
+        let uncap_count: Option<i64> = readings.record(
+            "uncapabilized_count",
+            self.advanced_repo.get_uncapabilized_count(user_id).await,
+        );
 
         // Auto-heal: the caller spawns background capability tagging for any
         // uncapabilized workflows. Idempotent — auto_suggest_capabilities only
         // applies when capabilities IS NULL or empty.
-        let auto_healing_caps = uncap_count > 0;
+        let auto_healing_caps = uncap_count.is_some_and(|n| n > 0);
 
         // 4. Next scheduled run.
         //
@@ -434,11 +471,11 @@ impl SessionBriefService {
         // table since 20260309000200) and includes `next_trigger_at` so callers
         // can distinguish "no schedule" from "next firing is far out" without
         // a follow-up list_schedules call.
-        let next_schedule = self
-            .advanced_repo
-            .get_next_scheduled_run(user_id)
-            .await
-            .ok()
+        let next_schedule = readings
+            .record(
+                "next_scheduled_run",
+                self.advanced_repo.get_next_scheduled_run(user_id).await,
+            )
             .flatten()
             .map(|s| {
                 serde_json::json!({
@@ -450,29 +487,32 @@ impl SessionBriefService {
             });
 
         // 4b. No-schedule health check: active workflows with no schedule
-        let active_wf_count: i64 = self
-            .advanced_repo
-            .get_active_workflow_count(user_id)
-            .await
-            .unwrap_or(0);
+        let active_wf_count: Option<i64> = readings.record(
+            "schedule_health.active_workflows",
+            self.advanced_repo.get_active_workflow_count(user_id).await,
+        );
 
-        let active_schedule_count: i64 = self
-            .advanced_repo
-            .get_active_schedule_count(user_id)
-            .await
-            .unwrap_or(0);
+        let active_schedule_count: Option<i64> = readings.record(
+            "schedule_health.active_schedules",
+            self.advanced_repo.get_active_schedule_count(user_id).await,
+        );
 
         // Count of active workflows that ACTUALLY have ≥1 enabled schedule attached
         // — distinct from `active_wf_count` (every status='active' workflow) and
         // `active_schedule_count` (schedule-row count; a workflow can have several).
         // This is the field most callers think `active_workflows` means.
-        let active_workflows_with_schedule: i64 = self
-            .advanced_repo
-            .get_active_workflows_with_schedule_count(user_id)
-            .await
-            .unwrap_or(0);
+        let active_workflows_with_schedule: Option<i64> = readings.record(
+            "schedule_health.workflows_with_active_schedules",
+            self.advanced_repo
+                .get_active_workflows_with_schedule_count(user_id)
+                .await,
+        );
 
-        let no_schedule_warning = active_wf_count > 0 && active_schedule_count == 0;
+        // Unknown unless both counts were read.
+        let no_schedule_warning: Option<bool> = match (active_wf_count, active_schedule_count) {
+            (Some(workflows), Some(schedules)) => Some(workflows > 0 && schedules == 0),
+            _ => None,
+        };
 
         // 5. Detect frequently-executed workflows without a schedule.
         // Condition: ≥3 executions in the last 60 days AND no active schedule
@@ -483,26 +523,20 @@ impl SessionBriefService {
         // "may have lost their trigger" framing produced false positives for
         // pure manual-trigger utilities. The two new filters + the softer
         // framing below cut the false-positive rate sharply.
-        // r243: surface query failures via tracing::warn so future schema/SQL
-        // regressions are visible — pre-r243 the bare `.unwrap_or_default()`
-        // swallowed the SQL error from r242's wrong JSONB path silently, and
-        // session_start reported "clean" coverage while the query was broken.
-        let prev_scheduled_rows = self
-            .advanced_repo
-            .get_frequently_executed_unscheduled(user_id)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "session_start: get_frequently_executed_unscheduled failed; \
-                     frequently_executed_unscheduled will be reported as empty"
-                );
-                Vec::new()
-            });
+        // r243 logged a failure of this read; since 2026-09-30 it is also
+        // `null` in the response rather than an empty list, because pre-r243
+        // the swallowed SQL error from r242's wrong JSONB path read as
+        // "clean" coverage while the query was broken.
+        let prev_scheduled_rows = readings.record(
+            "frequently_executed_unscheduled",
+            self.advanced_repo
+                .get_frequently_executed_unscheduled(user_id)
+                .await,
+        );
 
-        let frequently_executed_unscheduled: Vec<serde_json::Value> = prev_scheduled_rows
-            .iter()
-            .map(|r| {
+        let frequently_executed_unscheduled: Option<Vec<serde_json::Value>> =
+            prev_scheduled_rows.as_deref().map(|rows| {
+                rows.iter().map(|r| {
                 let id = r.id.to_string();
                 serde_json::json!({
                     "workflow_id": id,
@@ -515,37 +549,46 @@ impl SessionBriefService {
                         id, id
                     ),
                 })
-            })
-            .collect();
+            }).collect()
+            });
 
         // 6. Pinned modules: check which are present vs need restore.
         // IMPORTANT: check the user's actual wasm_modules row (installed copy), not just whether
         // the system node_templates row has WASM. A deleted wasm_modules row must show as
         // needs_restore even if the catalog template still has precompiled_wasm.
-        let pinned_rows = self
-            .advanced_repo
-            .list_pinned_modules_with_user_install_status(user_id, 200)
-            .await
+        let pinned_rows = readings.record(
+            "pinned_modules",
+            self.advanced_repo
+                .list_pinned_modules_with_user_install_status(user_id, 200)
+                .await,
+        );
+
+        // `None` = the pins could not be read. That is NOT "nothing needs
+        // restoring": the three lists below render null, never empty.
+        let pinned_split: Option<(Vec<String>, Vec<String>)> = pinned_rows.map(|rows| {
+            let mut present: Vec<String> = Vec::new();
+            let mut needs_restore: Vec<String> = Vec::new();
+            for r in rows {
+                if r.has_wasm {
+                    present.push(r.module_name);
+                } else {
+                    needs_restore.push(r.module_name);
+                }
+            }
+            (present, needs_restore)
+        });
+        let pinned_needs_restore: Vec<String> = pinned_split
+            .as_ref()
+            .map(|(_, needs)| needs.clone())
             .unwrap_or_default();
 
-        let mut pinned_present: Vec<String> = Vec::new();
-        let mut pinned_needs_restore: Vec<String> = Vec::new();
-        for r in pinned_rows {
-            if r.has_wasm {
-                pinned_present.push(r.module_name);
-            } else {
-                pinned_needs_restore.push(r.module_name);
-            }
-        }
-
-        let needs_restore_count = pinned_needs_restore.len();
         let pinned_modules_field = serde_json::json!({
-            "present": pinned_present,
-            "needs_restore": pinned_needs_restore,
+            "present": pinned_split.as_ref().map(|(present, _)| present),
+            "needs_restore": pinned_split.as_ref().map(|(_, needs)| needs),
             // Always surface the tool name so agents don't have to discover it.
             // needs_restore being empty means nothing currently requires action.
             "restore_tool": "restore_pinned_modules",
-            "restore_needed": needs_restore_count > 0,
+            "restore_needed": pinned_split.as_ref().map(|(_, needs)| !needs.is_empty()),
         });
 
         // 7. Actors — surface identity/persona context at session start so agents
@@ -554,40 +597,35 @@ impl SessionBriefService {
         //    2026-09-30 it held every non-archived one, terminated included);
         //    the rest are counted in `inactive_actors`. A read that fails is
         //    `null` — unknown — never `[]`, which would read as "no actors".
-        let active_actors = match self
-            .advanced_repo
-            .list_active_actors_with_memory_count(user_id, 20)
-            .await
-        {
-            Ok(rows) => serde_json::Value::Array(render_active_actors(&rows)),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "session_start: active actors read failed; active_actors reported as null (unknown)"
-                );
-                serde_json::Value::Null
-            }
-        };
-        let inactive_actors = match self.advanced_repo.count_actors_by_status(user_id).await {
-            Ok(counts) => inactive_actor_summary(&counts),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "session_start: actor status counts read failed; inactive_actors reported as null (unknown)"
-                );
-                serde_json::Value::Null
-            }
-        };
+        let active_actors = readings
+            .record(
+                "active_actors",
+                self.advanced_repo
+                    .list_active_actors_with_memory_count(user_id, 20)
+                    .await,
+            )
+            .map_or(serde_json::Value::Null, |rows| {
+                serde_json::Value::Array(render_active_actors(&rows))
+            });
+        let inactive_actors = readings
+            .record(
+                "inactive_actors",
+                self.advanced_repo.count_actors_by_status(user_id).await,
+            )
+            .map_or(serde_json::Value::Null, |counts| {
+                inactive_actor_summary(&counts)
+            });
 
         // 8. Stuck executions: running > 1 hour
-        let stuck_rows = self
-            .advanced_repo
-            .list_stuck_executions(user_id, 1, 10)
-            .await
-            .unwrap_or_default();
+        let stuck_rows = readings.record(
+            "stuck_executions",
+            self.advanced_repo
+                .list_stuck_executions(user_id, 1, 10)
+                .await,
+        );
 
-        let stuck_executions: Vec<serde_json::Value> = stuck_rows
-            .iter()
+        let stuck_executions: Option<Vec<serde_json::Value>> = stuck_rows.as_deref().map(|rows| {
+            rows.iter()
             .map(|r| {
                 serde_json::json!({
                     "execution_id": r.execution_id.to_string(),
@@ -596,7 +634,8 @@ impl SessionBriefService {
                     "tip": "cancel_execution or investigate with get_execution_status(detail: true)",
                 })
             })
-            .collect();
+            .collect()
+        });
 
         // 8b. Recent execution activity for MCP-transport-drop awareness.
         //
@@ -613,14 +652,15 @@ impl SessionBriefService {
         // workflow that the agent kicked off and immediately lost. Limit
         // of 25 caps the response size at the noisiest extreme.
         const RECENT_EXEC_WINDOW_MIN: i32 = 5;
-        let recent_exec_rows = self
-            .advanced_repo
-            .list_recent_executions_for_session_awareness(user_id, RECENT_EXEC_WINDOW_MIN, 25)
-            .await
-            .unwrap_or_default();
+        let recent_exec_rows = readings.record(
+            "recent_executions",
+            self.advanced_repo
+                .list_recent_executions_for_session_awareness(user_id, RECENT_EXEC_WINDOW_MIN, 25)
+                .await,
+        );
 
-        let recent_executions: Vec<serde_json::Value> = recent_exec_rows
-            .iter()
+        let recent_executions: Option<Vec<serde_json::Value>> = recent_exec_rows.as_deref().map(|rows| {
+            rows.iter()
             .map(|r| {
                 let tip = match r.status.as_str() {
                     "running" => "Still in flight. get_execution_status(execution_id: ...) for live state, \
@@ -643,12 +683,12 @@ impl SessionBriefService {
                     "tip": tip,
                 })
             })
-            .collect();
-        let recent_executions_count = recent_executions.len();
-        let recent_running_count = recent_exec_rows
-            .iter()
-            .filter(|r| r.status == "running")
-            .count();
+            .collect()
+        });
+        let recent_executions_count: Option<usize> = recent_executions.as_ref().map(Vec::len);
+        let recent_running_count: Option<usize> = recent_exec_rows
+            .as_deref()
+            .map(|rows| rows.iter().filter(|r| r.status == "running").count());
 
         // 8. Determine single most impactful action
         //
@@ -656,7 +696,8 @@ impl SessionBriefService {
         // misconfigured (whole feature silently broken — surface ABOVE the
         // auto-healing branches because we WON'T be auto-healing in that case)
         // → auto-healing in progress → drafts → schedules.
-        let embedding_provider_misconfigured = unembedded > 0 && !embedding_provider_available;
+        let embedding_provider_misconfigured =
+            unembedded.is_some_and(|n| n > 0) && !embedding_provider_available;
         // Drafts the publish nudge may count: substantive AND known not to be
         // a child. An UNKNOWN child status counts (the nudge stays, and the
         // entry's next_step says the scan failed) — the failure mode of a
@@ -667,84 +708,23 @@ impl SessionBriefService {
             .count();
         let publishable_substantive_count =
             unpublished_substantive_drafts.len() - child_substantive_count;
-        let priority_action = if !pinned_needs_restore.is_empty() {
-            format!(
-                "{} pinned module(s) need WASM restore: {}. Call restore_pinned_modules.",
-                pinned_needs_restore.len(),
-                pinned_needs_restore.join(", ")
-            )
-        } else if embedding_provider_misconfigured {
-            format!(
-                "Embedding provider not configured — {} workflow(s) are unembedded and \
-                 semantic search is degraded. Set EMBEDDING_API_KEY (or OPENAI_API_KEY) \
-                 on the controller, or set EMBEDDING_API_URL to a keyless local \
-                 endpoint (e.g. http://ollama:11434/v1/embeddings). Coverage will \
-                 auto-heal on the next session_start once configured.",
-                unembedded
-            )
-        } else if auto_healing_embeddings && auto_healing_caps {
-            format!(
-                "{} workflow(s) had no embedding and {} had no capability tags — \
-                 both auto-healing in background. Platform will be fully indexed within seconds.",
-                unembedded, uncap_count
-            )
-        } else if auto_healing_embeddings {
-            format!(
-                "{} workflow(s) had no embedding — auto-embedding triggered in background. \
-                 Semantic search will be fully operational within seconds.",
-                unembedded
-            )
-        } else if auto_healing_caps {
-            format!(
-                "{} workflow(s) have no capability tags — auto-tagging triggered in background. \
-                 Capability-based discovery will be available within seconds.",
-                uncap_count
-            )
-        } else if publishable_substantive_count > 0 {
-            // Substantive drafts dominate priority over stub-class drafts —
-            // the user has already done the work, just needs publish_version.
-            // A CHILD draft is not "ready for publish_version": its parent
-            // runs the draft graph directly and publishing changes nothing, so
-            // it is counted separately and never makes this the priority.
-            if child_substantive_count > 0 {
-                format!(
-                    "You have {} substantive draft workflow(s) ready for publish_version \
-                     ({} more are sub-workflow children whose parent runs the draft graph \
-                     directly — nothing to publish; see runs_as_child_of). \
-                     See unpublished_substantive_drafts for the list.",
-                    publishable_substantive_count, child_substantive_count
-                )
-            } else {
-                format!(
-                    "You have {} substantive draft workflow(s) ready for publish_version. \
-                     See unpublished_substantive_drafts for the list.",
-                    publishable_substantive_count
-                )
-            }
-        } else if !in_progress_drafts.is_empty() {
-            format!(
-                "You have {} stub draft workflow(s) (mostly unconfigured nodes). \
-                 Call get_workflow_quickstart on the first one to see what's needed.",
-                in_progress_drafts.len()
-            )
-        } else if !frequently_executed_unscheduled.is_empty() {
-            format!(
-                "{} active workflow(s) ran recently without a schedule — schedule with \
-                 create_schedule if recurring is intended, or tag 'interactive' to suppress \
-                 this signal for on-demand utilities. See frequently_executed_unscheduled \
-                 for per-workflow tips.",
-                frequently_executed_unscheduled.len()
-            )
-        } else if no_schedule_warning {
-            format!(
-                "{} active workflow(s) have no scheduled trigger. \
-                 Call deploy_workflow with a cron_expression to automate execution.",
-                active_wf_count
-            )
-        } else {
-            "Platform looks healthy. All workflows are embedded, capabilized, and scheduled."
-                .to_string()
-        };
+        let priority_action = priority_action(&PriorityInputs {
+            pinned_needs_restore: &pinned_needs_restore,
+            embedding_provider_misconfigured,
+            unembedded: unembedded.unwrap_or(0),
+            auto_healing_embeddings,
+            auto_healing_caps,
+            uncap_count: uncap_count.unwrap_or(0),
+            publishable_substantive_count,
+            child_substantive_count,
+            in_progress_count: in_progress_drafts.len(),
+            frequently_executed_unscheduled_count: frequently_executed_unscheduled
+                .as_ref()
+                .map_or(0, Vec::len),
+            no_schedule_warning: no_schedule_warning.unwrap_or(false),
+            active_wf_count: active_wf_count.unwrap_or(0),
+            not_measured: readings.not_measured(),
+        });
 
         let mut report = serde_json::json!({
             "embedding_coverage": {
@@ -770,7 +750,7 @@ impl SessionBriefService {
                 } else {
                     None
                 },
-                "note": if total_wf == 0 {
+                "note": if total_wf == Some(0) {
                     Some("No workflows created yet — create your first workflow to start tracking coverage.")
                 } else {
                     None
@@ -790,12 +770,13 @@ impl SessionBriefService {
             "capabilities_coverage": {
                 "uncapabilized_count": uncap_count,
                 "auto_healing": auto_healing_caps,
-                "tip": if uncap_count > 0 {
-                    "Capability tags are being auto-applied in the background. \
+                "tip": match uncap_count {
+                    None => "The capability-tag count could not be read, so this brief does not \
+                             say whether any workflow lacks tags (see measurement.not_measured).",
+                    Some(n) if n > 0 => "Capability tags are being auto-applied in the background. \
                      Call get_platform_hygiene_report to see which workflows still lack tags, \
-                     or suggest_capabilities(workflow_id) to apply them manually."
-                } else {
-                    "All workflows have capability tags."
+                     or suggest_capabilities(workflow_id) to apply them manually.",
+                    Some(_) => "All workflows have capability tags.",
                 },
                 // MCP-113 (2026-05-08): mirror field_meanings on the
                 // capabilities_coverage block.
@@ -804,15 +785,16 @@ impl SessionBriefService {
                     "uncapabilized_count": "Number of workflows with no capability tags. Workflows without tags are invisible to capability-based search and dispatch routing.",
                 },
             },
-            "in_progress_drafts": in_progress_drafts,
-            "unpublished_substantive_drafts": unpublished_substantive_drafts,
+            // `null`, not `[]`, when the draft read failed.
+            "in_progress_drafts": drafts_measured.then_some(&in_progress_drafts),
+            "unpublished_substantive_drafts": drafts_measured.then_some(&unpublished_substantive_drafts),
             // The two numbers the publish nudge is built from, rendered so a
             // reader (and a test) can see them whatever else outranks drafts
             // in `priority_action` this session. A child is substantive AND
             // not publishable; it is in the list above and in the second
             // count only.
-            "publishable_substantive_draft_count": publishable_substantive_count,
-            "child_substantive_draft_count": child_substantive_count,
+            "publishable_substantive_draft_count": drafts_measured.then_some(publishable_substantive_count),
+            "child_substantive_draft_count": drafts_measured.then_some(child_substantive_count),
             "duplicate_name_groups": duplicate_name_groups,
             "uncapabilized_count": uncap_count,
             "next_scheduled_run": next_schedule,
@@ -853,22 +835,25 @@ impl SessionBriefService {
                 "running_count": recent_running_count,
                 "window_minutes": RECENT_EXEC_WINDOW_MIN,
                 "items": recent_executions,
-                "tip": if recent_executions_count == 0 {
-                    None
-                } else if recent_running_count > 0 {
-                    Some(format!(
+                "tip": match (recent_executions_count, recent_running_count) {
+                    (None, _) | (_, None) => Some(
+                        "Recent executions could not be read. If you kicked one off and lost the \
+                         response, check list_recent_executions before retrying."
+                            .to_string(),
+                    ),
+                    (Some(0), _) => None,
+                    (Some(_), Some(running)) if running > 0 => Some(format!(
                         "{} execution(s) still running. If you kicked one off and lost the response, \
                          do NOT retry — get_execution_status / watch_execution / get_execution_output \
                          with the execution_id from the items array.",
-                        recent_running_count
-                    ))
-                } else {
-                    Some(format!(
+                        running
+                    )),
+                    (Some(count), Some(_)) => Some(format!(
                         "{} execution(s) completed in the last {} minute(s). \
                          If your client lost the response from a recent test_workflow / call_workflow / trigger_workflow, \
                          pull get_execution_output(execution_id: ...) from the items array instead of retrying.",
-                        recent_executions_count, RECENT_EXEC_WINDOW_MIN
-                    ))
+                        count, RECENT_EXEC_WINDOW_MIN
+                    )),
                 },
             },
             "active_actors": active_actors,
@@ -1005,11 +990,130 @@ impl SessionBriefService {
             );
         }
 
+        // `measurement` appears only when a read failed, so a healthy brief is
+        // byte-identical to the pre-ledger one.
+        readings.attach(&mut report);
+
         Ok(SessionBriefOutcome {
             report,
+            readings,
             spawn_embedding_heal: auto_healing_embeddings,
             spawn_capability_heal: auto_healing_caps,
         })
+    }
+}
+
+/// What `priority_action` is decided from. Unknown counts arrive as `0` /
+/// `false`, so an unread section never RAISES an action; `not_measured` is
+/// what stops the brief from calling an unread platform healthy.
+struct PriorityInputs<'a> {
+    pinned_needs_restore: &'a [String],
+    embedding_provider_misconfigured: bool,
+    unembedded: i64,
+    auto_healing_embeddings: bool,
+    auto_healing_caps: bool,
+    uncap_count: i64,
+    publishable_substantive_count: usize,
+    child_substantive_count: usize,
+    in_progress_count: usize,
+    frequently_executed_unscheduled_count: usize,
+    no_schedule_warning: bool,
+    active_wf_count: i64,
+    not_measured: &'a [&'static str],
+}
+
+/// The single most impactful action. Priority order: pinned-restore (data
+/// loss risk) → embedding provider misconfigured (whole feature silently
+/// broken — surfaced ABOVE the auto-healing branches because we WON'T be
+/// auto-healing in that case) → auto-healing in progress → drafts →
+/// schedules → an incomplete read → healthy. Pure, so it is tested without a
+/// database.
+fn priority_action(i: &PriorityInputs<'_>) -> String {
+    if !i.pinned_needs_restore.is_empty() {
+        format!(
+            "{} pinned module(s) need WASM restore: {}. Call restore_pinned_modules.",
+            i.pinned_needs_restore.len(),
+            i.pinned_needs_restore.join(", ")
+        )
+    } else if i.embedding_provider_misconfigured {
+        format!(
+            "Embedding provider not configured — {} workflow(s) are unembedded and \
+             semantic search is degraded. Set EMBEDDING_API_KEY (or OPENAI_API_KEY) \
+             on the controller, or set EMBEDDING_API_URL to a keyless local \
+             endpoint (e.g. http://ollama:11434/v1/embeddings). Coverage will \
+             auto-heal on the next session_start once configured.",
+            i.unembedded
+        )
+    } else if i.auto_healing_embeddings && i.auto_healing_caps {
+        format!(
+            "{} workflow(s) had no embedding and {} had no capability tags — \
+             both auto-healing in background. Platform will be fully indexed within seconds.",
+            i.unembedded, i.uncap_count
+        )
+    } else if i.auto_healing_embeddings {
+        format!(
+            "{} workflow(s) had no embedding — auto-embedding triggered in background. \
+             Semantic search will be fully operational within seconds.",
+            i.unembedded
+        )
+    } else if i.auto_healing_caps {
+        format!(
+            "{} workflow(s) have no capability tags — auto-tagging triggered in background. \
+             Capability-based discovery will be available within seconds.",
+            i.uncap_count
+        )
+    } else if i.publishable_substantive_count > 0 {
+        // Substantive drafts dominate priority over stub-class drafts —
+        // the user has already done the work, just needs publish_version.
+        // A CHILD draft is not "ready for publish_version": its parent
+        // runs the draft graph directly and publishing changes nothing, so
+        // it is counted separately and never makes this the priority.
+        if i.child_substantive_count > 0 {
+            format!(
+                "You have {} substantive draft workflow(s) ready for publish_version \
+                 ({} more are sub-workflow children whose parent runs the draft graph \
+                 directly — nothing to publish; see runs_as_child_of). \
+                 See unpublished_substantive_drafts for the list.",
+                i.publishable_substantive_count, i.child_substantive_count
+            )
+        } else {
+            format!(
+                "You have {} substantive draft workflow(s) ready for publish_version. \
+                 See unpublished_substantive_drafts for the list.",
+                i.publishable_substantive_count
+            )
+        }
+    } else if i.in_progress_count > 0 {
+        format!(
+            "You have {} stub draft workflow(s) (mostly unconfigured nodes). \
+             Call get_workflow_quickstart on the first one to see what's needed.",
+            i.in_progress_count
+        )
+    } else if i.frequently_executed_unscheduled_count > 0 {
+        format!(
+            "{} active workflow(s) ran recently without a schedule — schedule with \
+             create_schedule if recurring is intended, or tag 'interactive' to suppress \
+             this signal for on-demand utilities. See frequently_executed_unscheduled \
+             for per-workflow tips.",
+            i.frequently_executed_unscheduled_count
+        )
+    } else if i.no_schedule_warning {
+        format!(
+            "{} active workflow(s) have no scheduled trigger. \
+             Call deploy_workflow with a cron_expression to automate execution.",
+            i.active_wf_count
+        )
+    } else if !i.not_measured.is_empty() {
+        format!(
+            "Part of the platform state could not be read ({}). Those fields are null in \
+             this brief, so it cannot say the platform is healthy. See \
+             measurement.not_measured; the error is in the server log under \
+             event_kind=report_field_not_measured.",
+            i.not_measured.join(", ")
+        )
+    } else {
+        "Platform looks healthy. All workflows are embedded, capabilized, and scheduled."
+            .to_string()
     }
 }
 
@@ -1117,5 +1221,182 @@ mod actor_section_tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0]["status"], "active");
         assert!(v[0]["tip"].as_str().unwrap().contains("actor_remember"));
+    }
+}
+
+#[cfg(test)]
+mod priority_action_tests {
+    use super::{priority_action, PriorityInputs};
+
+    fn quiet<'a>(not_measured: &'a [&'static str], pinned: &'a [String]) -> PriorityInputs<'a> {
+        PriorityInputs {
+            pinned_needs_restore: pinned,
+            embedding_provider_misconfigured: false,
+            unembedded: 0,
+            auto_healing_embeddings: false,
+            auto_healing_caps: false,
+            uncap_count: 0,
+            publishable_substantive_count: 0,
+            child_substantive_count: 0,
+            in_progress_count: 0,
+            frequently_executed_unscheduled_count: 0,
+            no_schedule_warning: false,
+            active_wf_count: 0,
+            not_measured,
+        }
+    }
+
+    #[test]
+    fn an_unread_platform_is_never_called_healthy() {
+        let action = priority_action(&quiet(&["pinned_modules", "stuck_executions"], &[]));
+        assert!(!action.starts_with("Platform looks healthy"), "{action}");
+        assert!(
+            action.contains("pinned_modules, stuck_executions"),
+            "{action}"
+        );
+        assert!(action.contains("measurement.not_measured"), "{action}");
+    }
+
+    #[test]
+    fn a_fully_read_quiet_platform_is_healthy() {
+        assert!(priority_action(&quiet(&[], &[])).starts_with("Platform looks healthy."));
+    }
+
+    #[test]
+    fn a_known_action_still_outranks_an_incomplete_read() {
+        let pinned = vec!["LLM Inference".to_string()];
+        let action = priority_action(&quiet(&["stuck_executions"], &pinned));
+        assert!(
+            action.contains("need WASM restore: LLM Inference"),
+            "{action}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unreadable_platform_tests {
+    use super::{SessionBriefInput, SessionBriefService};
+    use std::sync::Arc;
+
+    /// Every read fails (nothing listens on port 1), so every section must
+    /// render `null`, be named in `measurement.not_measured`, and start no
+    /// auto-heal. Before 2026-09-30 this brief rendered zeros and empty lists
+    /// here and could end in "Platform looks healthy."
+    #[tokio::test]
+    async fn every_unreadable_section_is_null_and_named() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let service = SessionBriefService::new(Arc::new(
+            talos_advanced_repository::AdvancedRepository::new(pool),
+        ));
+        let outcome = service
+            .build(SessionBriefInput {
+                user_id: uuid::Uuid::new_v4(),
+                auto_archive_days: None,
+                server_version: "test".into(),
+                build_time: "not-a-timestamp".into(),
+                static_tool_count: 0,
+            })
+            .await
+            .expect("a failed read is disclosed, not an error");
+        let r = &outcome.report;
+
+        for pointer in [
+            "/embedding_coverage/total_workflows",
+            "/embedding_coverage/unembedded",
+            "/capabilities_coverage/uncapabilized_count",
+            "/uncapabilized_count",
+            "/in_progress_drafts",
+            "/unpublished_substantive_drafts",
+            "/publishable_substantive_draft_count",
+            "/duplicate_name_groups",
+            "/next_scheduled_run",
+            "/frequently_executed_unscheduled",
+            "/schedule_health/active_workflows",
+            "/schedule_health/active_schedules",
+            "/schedule_health/workflows_with_active_schedules",
+            "/schedule_health/no_schedule_warning",
+            "/pinned_modules/present",
+            "/pinned_modules/needs_restore",
+            "/pinned_modules/restore_needed",
+            "/stuck_executions",
+            "/recent_executions/count",
+            "/recent_executions/items",
+            "/active_actors",
+            "/inactive_actors",
+        ] {
+            assert_eq!(
+                r.pointer(pointer),
+                Some(&serde_json::Value::Null),
+                "{pointer} must be null when its read failed"
+            );
+        }
+
+        let not_measured: Vec<&str> = r["measurement"]["not_measured"]
+            .as_array()
+            .expect("the failures are disclosed")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for field in [
+            "embedding_coverage",
+            "in_progress_drafts",
+            "unpublished_substantive_drafts",
+            "duplicate_name_groups",
+            "uncapabilized_count",
+            "next_scheduled_run",
+            "schedule_health.active_workflows",
+            "schedule_health.active_schedules",
+            "schedule_health.workflows_with_active_schedules",
+            "frequently_executed_unscheduled",
+            "pinned_modules",
+            "active_actors",
+            "inactive_actors",
+            "stuck_executions",
+            "recent_executions",
+        ] {
+            assert!(
+                not_measured.contains(&field),
+                "{field} not disclosed: {not_measured:?}"
+            );
+        }
+
+        let action = r["priority_action"].as_str().unwrap_or_default();
+        assert!(!action.starts_with("Platform looks healthy"), "{action}");
+        assert!(!outcome.spawn_embedding_heal && !outcome.spawn_capability_heal);
+    }
+}
+
+#[cfg(test)]
+mod caller_read_tests {
+    use super::SessionBriefOutcome;
+
+    fn outcome() -> SessionBriefOutcome {
+        SessionBriefOutcome {
+            report: serde_json::json!({"priority_action": "x"}),
+            readings: talos_measurement::Readings::new(),
+            spawn_embedding_heal: false,
+            spawn_capability_heal: false,
+        }
+    }
+
+    #[test]
+    fn a_failed_caller_read_joins_the_disclosure() {
+        let mut o = outcome();
+        let v: Option<u8> = o.record("catalog_drift", Err::<u8, _>("db down"));
+        assert_eq!(v, None);
+        assert_eq!(
+            o.report["measurement"]["not_measured"],
+            serde_json::json!(["catalog_drift"])
+        );
+    }
+
+    #[test]
+    fn a_successful_caller_read_adds_no_disclosure() {
+        let mut o = outcome();
+        assert_eq!(o.record("catalog_drift", Ok::<u8, String>(3)), Some(3));
+        assert!(o.report.get("measurement").is_none());
     }
 }
