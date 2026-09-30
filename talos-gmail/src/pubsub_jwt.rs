@@ -36,7 +36,10 @@ pub use talos_integration_helpers::google_jwt::{
 /// the pre-lift implementation so `controller/src/main.rs` needs no
 /// changes.
 pub struct PubsubJwtVerifier {
-    inner: GoogleOidcVerifier,
+    /// Shared with every other Google push receiver in the process: the
+    /// cache holds Google's public keys, which do not depend on the
+    /// integration, so one cache means one fetch and one boot warm-up.
+    inner: std::sync::Arc<GoogleOidcVerifier>,
     /// Audience value configured on the operator's Pub/Sub
     /// subscription (`--push-auth-token-audience=...`). Typically the
     /// webhook URL itself.
@@ -52,8 +55,22 @@ impl PubsubJwtVerifier {
     /// use triggers a refresh, so startup isn't blocked on Google's
     /// CDN.
     pub fn new(expected_audience: String, expected_email: String) -> Self {
+        Self::with_shared_verifier(
+            std::sync::Arc::new(GoogleOidcVerifier::new()),
+            expected_audience,
+            expected_email,
+        )
+    }
+
+    /// Build on a key cache shared with the process's other Google push
+    /// receivers — the controller passes the one it warms at boot.
+    pub fn with_shared_verifier(
+        inner: std::sync::Arc<GoogleOidcVerifier>,
+        expected_audience: String,
+        expected_email: String,
+    ) -> Self {
         Self {
-            inner: GoogleOidcVerifier::new(),
+            inner,
             expected_audience,
             expected_email,
         }
@@ -69,7 +86,7 @@ impl PubsubJwtVerifier {
         keys: std::collections::HashMap<String, jsonwebtoken::DecodingKey>,
     ) -> Self {
         Self {
-            inner: GoogleOidcVerifier::with_keys_for_test(keys),
+            inner: std::sync::Arc::new(GoogleOidcVerifier::with_keys_for_test(keys)),
             expected_audience,
             expected_email,
         }
