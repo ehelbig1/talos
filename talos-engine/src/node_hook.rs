@@ -216,10 +216,10 @@ impl ControllerNodeHook {
             .and_then(JsonValue::as_str)
             .unwrap_or("episodic")
             .to_string();
-        let ttl_hours = mw
-            .get("ttl_hours")
-            .and_then(JsonValue::as_f64)
-            .unwrap_or(168.0);
+        let ttl_hours = envelope_ttl_hours(
+            &memory_type,
+            mw.get("ttl_hours").and_then(JsonValue::as_f64),
+        );
         // Metadata is optional. When present and an object, it is stored in the
         // dedicated actor_memory.metadata JSONB column (not merged into value).
         // Non-object metadata is ignored — the DB column is typed JSONB object.
@@ -234,7 +234,7 @@ impl ControllerNodeHook {
                 &value,
                 metadata.as_ref(),
                 &memory_type,
-                Some(ttl_hours),
+                ttl_hours,
             )
             .await
             {
@@ -530,5 +530,58 @@ impl NodeLifecycleHook for ControllerNodeHook {
                 );
             }
         });
+    }
+}
+
+/// The envelope's documented default when it carries no `ttl_hours`.
+const ENVELOPE_DEFAULT_TTL_HOURS: f64 = 168.0;
+
+/// The TTL a `__memory_write__` envelope is persisted with.
+///
+/// An explicit `ttl_hours` always wins. Without one, a `semantic` memory has
+/// NO expiry and every other type takes the envelope's 168-hour default.
+/// Until 2026-09-30 the 168 was applied to `semantic` too, so every durable
+/// memory written through this protocol (the Actor Memory Writer template's
+/// default type, among others) quietly expired a week after its last write,
+/// contrary to the envelope's documented "semantic memories ignore TTL".
+/// `None` here reaches `talos_memory::default_expires_at`, whose `semantic`
+/// arm is exactly "no expiry".
+fn envelope_ttl_hours(memory_type: &str, explicit: Option<f64>) -> Option<f64> {
+    match explicit {
+        Some(hours) => Some(hours),
+        None if memory_type == "semantic" => None,
+        None => Some(ENVELOPE_DEFAULT_TTL_HOURS),
+    }
+}
+
+#[cfg(test)]
+mod envelope_ttl_tests {
+    use super::envelope_ttl_hours;
+
+    #[test]
+    fn a_semantic_write_without_a_ttl_never_expires() {
+        assert_eq!(envelope_ttl_hours("semantic", None), None);
+    }
+
+    #[test]
+    fn other_types_without_a_ttl_keep_the_envelope_default() {
+        for memory_type in ["episodic", "working", "scratchpad"] {
+            assert_eq!(
+                envelope_ttl_hours(memory_type, None),
+                Some(168.0),
+                "{memory_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_ttl_wins_for_every_type() {
+        for memory_type in ["semantic", "episodic", "working", "scratchpad"] {
+            assert_eq!(
+                envelope_ttl_hours(memory_type, Some(2.0)),
+                Some(2.0),
+                "{memory_type}"
+            );
+        }
     }
 }

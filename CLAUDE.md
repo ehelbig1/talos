@@ -89,7 +89,9 @@ Accepted `__memory_write__` fields:
   synthetic LLM outputs with `metadata.kind` so they don't poison
   same-actor recalls. Non-object metadata is ignored. Available without
   the `agent-node` capability ceiling — the http-node ceiling is enough.
-* `ttl_hours` (number, default 168) — TTL from now; semantic memories ignore TTL
+* `ttl_hours` (number) — TTL from now. An explicit value always applies.
+  Omitted, a `semantic` write never expires and every other type gets 168
+  (until 2026-09-30 omitted meant 168 for `semantic` too)
 
 **The envelope obeys the actor's WRITE CEILING (#750).** `actors.max_write_ceiling`
 is ONE control with TWO enforcement surfaces, and until #750 only the worker's
