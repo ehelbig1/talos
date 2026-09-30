@@ -825,6 +825,35 @@ impl OllamaClient {
         let body: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow!("Failed to parse Ollama response: {e}"))?;
         usage::record_ollama(model, &body);
+        // A prompt Ollama silently truncated to fit the loaded context: the
+        // answer was written without its start (the system prompt). The
+        // tokens were spent (recorded above); the answer is refused.
+        if let talos_local_inference::context::PromptFit::Truncated {
+            evaluated,
+            context_length,
+        } = talos_local_inference::context::check_prompt_fit(
+            &self.client,
+            &self.base_url,
+            model,
+            body.get("prompt_eval_count").and_then(|v| v.as_u64()),
+        )
+        .await
+        {
+            warn!(
+                model,
+                evaluated,
+                context_length,
+                "controller local LLM prompt truncated by Ollama; answer refused"
+            );
+            return Err(anyhow!(
+                "{}",
+                talos_local_inference::context::truncation_message(
+                    model,
+                    evaluated,
+                    context_length
+                )
+            ));
+        }
         let text = body
             .get("message")
             .and_then(|m| m.get("content"))

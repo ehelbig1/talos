@@ -100,6 +100,21 @@ async fn serve_with_tags(handler: Arc<Handler>, tags: Option<Value>) -> (String,
             let tags = tags.clone();
             tokio::spawn(async move {
                 let (head, body) = read_request(&mut sock).await;
+                // `/api/ps`: the loaded context the truncation check reads.
+                // `m` is loaded with a 4 096-token context.
+                if head.starts_with("get /api/ps") {
+                    let payload = json!({"models": [
+                        {"name": "m:latest", "model": "m:latest", "context_length": 4096}
+                    ]})
+                    .to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
                 if head.starts_with("get /api/tags") {
                     let (status, payload) = match tags {
                         Some(t) => (200, t.to_string()),
@@ -268,6 +283,46 @@ async fn an_http_400_still_triggers_the_think_retry() {
     assert_eq!(bodies[0]["think"], false);
     assert!(bodies[1].get("think").is_none());
     assert_eq!(bodies[1]["format"], "json");
+}
+
+fn done_with_prompt_count(n: u64) -> String {
+    format!(
+        "{}\n",
+        json!({"model": "m", "message": {"role": "assistant", "content": ""},
+               "done": true, "done_reason": "stop", "prompt_eval_count": n, "eval_count": 3})
+    )
+}
+
+/// Ollama truncated the prompt (evaluated count = context/2 + 2, the measured
+/// signature): the answer is refused, not returned. The control — a count
+/// that is not the signature — is returned normally.
+#[tokio::test]
+async fn an_answer_to_a_truncated_prompt_is_refused() {
+    for (count, truncated) in [(2_050u64, true), (3_000, false)] {
+        let (base, _) = serve(Arc::new(move |_, _| Reply {
+            status: 200,
+            chunks: vec![
+                (Duration::ZERO, chunk("answer")),
+                (Duration::ZERO, done_with_prompt_count(count)),
+            ],
+        }))
+        .await;
+        let c = client(base, Duration::from_secs(10), MS_DEADLINES);
+        let got = c.complete("m", "sys", "user", 16).await;
+        if truncated {
+            let err = got.unwrap_err().to_string();
+            assert!(
+                err.contains("truncated the prompt") && err.contains("4096"),
+                "{err}"
+            );
+            assert!(
+                !err.contains("HTTP 400"),
+                "must not trigger the think retry: {err}"
+            );
+        } else {
+            assert_eq!(got.unwrap(), "answer");
+        }
+    }
 }
 
 /// The gate: two calls on one client reach the backend one at a time.

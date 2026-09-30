@@ -171,6 +171,7 @@ mod tests {
         let unreachable = |provider: &str, outcome: LlmFailure| {
             (provider == "ollama" && outcome == LlmFailure::NotConfigured)
                 || outcome == LlmFailure::InvalidRequest
+                || (outcome == LlmFailure::PromptTruncated && provider != "ollama")
         };
 
         let expected = LLM_PROVIDER_LABELS
@@ -182,7 +183,8 @@ mod tests {
             seeded.len(),
             expected,
             "seed set must be exactly the reachable pairs: 1 ollama/not_configured \
-             carve-out + 4 invalid_request carve-outs removed from the 36-pair product"
+             carve-out + 4 invalid_request + 3 external prompt_truncated carve-outs \
+             removed from the 40-pair product"
         );
         assert!(
             !seeded.contains(&("ollama", LlmFailure::NotConfigured)),
@@ -196,6 +198,14 @@ mod tests {
              serde_json::to_vec over a Value the adapter just built, which cannot \
              fail for any input. That is a STRONGER unreachability argument than \
              the ollama branch, so seeding it while excluding ollama was backwards"
+        );
+        assert!(
+            seeded.contains(&("ollama", LlmFailure::PromptTruncated))
+                && !seeded
+                    .iter()
+                    .any(|(p, o)| *o == LlmFailure::PromptTruncated && *p != "ollama"),
+            "only a LOCAL exchange is checked for a truncated prompt, so \
+             prompt_truncated is reachable for ollama alone"
         );
         assert!(
             !seeded.iter().any(|(p, _)| *p == "other"),
@@ -461,8 +471,10 @@ mod tests {
             }
             seeded_count += 1;
         }
-        // 31 = 4 providers × 9 outcomes, minus (ollama, not_configured) and
-        // minus all four (*, invalid_request). Was 35 until 2026-08-14, when
+        // 32 = 4 providers × 10 outcomes, minus (ollama, not_configured),
+        // minus all four (*, invalid_request), and minus the three external
+        // (*, prompt_truncated) — only a local exchange is checked for a
+        // truncated prompt (2026-09-30). Was 31 with 9 outcomes, and 35 until 2026-08-14, when
         // review found the invalid_request pairs seeded despite the enum's own
         // doc calling them a permanent 0 — see `seeded_llm_failure_series`.
         //
@@ -474,7 +486,7 @@ mod tests {
         // would have made the correct fix look like the regression. A tripwire
         // states what changed; a booby trap states that the bug is correct.
         assert_eq!(
-            seeded_count, 31,
+            seeded_count, 32,
             "the reachable (provider, outcome) set changed size; \
              seeded_llm_failure_series' carve-outs need re-reading"
         );

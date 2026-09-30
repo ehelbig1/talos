@@ -1006,6 +1006,41 @@ impl TalosContext {
             parsed.output_tokens.unwrap_or(0),
         );
 
+        // A local prompt Ollama silently truncated to fit the loaded context:
+        // the answer was written without the prompt's start (the system
+        // prompt). Checked AFTER the usage fold — those tokens were spent.
+        if is_local {
+            if let talos_local_inference::context::PromptFit::Truncated {
+                evaluated,
+                context_length,
+            } = talos_local_inference::context::check_prompt_fit(
+                local_llm_http_client(),
+                ollama_base_url(),
+                &model,
+                parsed.input_tokens,
+            )
+            .await
+            {
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    model = %model,
+                    evaluated,
+                    context_length,
+                    "local LLM prompt truncated by Ollama; answer refused"
+                );
+                return Err(LlmCallFailure::new(
+                    crate::metrics::LlmFailure::PromptTruncated,
+                    wit_llm::Error::InvalidRequest(
+                        talos_local_inference::context::truncation_message(
+                            &model,
+                            evaluated,
+                            context_length,
+                        ),
+                    ),
+                ));
+            }
+        }
+
         let text = parsed.text;
         let stop_reason = parsed.stop_reason;
         // MCP-1008: saturate-on-overflow to surface malicious / corrupted

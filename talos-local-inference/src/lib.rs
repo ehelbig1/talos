@@ -7,6 +7,8 @@
 //!   non-streaming response body.
 //! * [`fleet`]: the queue shared by every process calling one backend (P3b).
 //! * [`line_reader`]: the byte-level line reader the stream is built on.
+//! * [`context`]: whether Ollama silently truncated a prompt that did not fit
+//!   the model's loaded context.
 //! * [`locality`]: whether a model the local Ollama serves actually runs on
 //!   this host (an Ollama cloud model does not).
 //!
@@ -15,6 +17,7 @@
 //! processes, so each has its own gate; since P3b a [`fleet`] queue in Redis,
 //! taken after the process gate, bounds them together.
 
+pub mod context;
 pub mod deadlines;
 pub mod fleet;
 pub mod gate;
