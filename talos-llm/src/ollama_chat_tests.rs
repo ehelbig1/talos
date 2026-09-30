@@ -415,3 +415,88 @@ async fn the_queued_line_follows_a_real_wait_not_a_nonzero_duration() {
     assert_eq!(gate_log(&late, expired.get()), GateLog::WaitExpired);
     drop(second);
 }
+
+// ── System One (`/v1/systemone`) ────────────────────────────────────────
+
+fn system_one_reply(choice: &str) -> Reply {
+    let body = json!({
+        "model": "m",
+        "answers": {"label": {"type": "choice", "choice": choice,
+            "probabilities": {"archive": 0.1, "follow_up": 0.9, "unasked": 0.5},
+            "confidence": 0.8}},
+        "usage": {"input_tokens": 12, "output_tokens": 1}
+    });
+    Reply {
+        status: 200,
+        chunks: vec![(Duration::ZERO, body.to_string())],
+    }
+}
+
+fn opts() -> Vec<String> {
+    vec!["archive".to_string(), "follow_up".to_string()]
+}
+
+/// The request is a `choice` question over exactly the options asked, each
+/// with a null description; the answer comes back as the choice plus the
+/// probabilities of the options that were asked (an unasked key is dropped).
+#[tokio::test]
+async fn system_one_asks_a_choice_question_and_returns_the_choice() {
+    let (base, seen) = serve(Arc::new(|_, _| system_one_reply("follow_up"))).await;
+    let c = client(base, Duration::from_secs(10), MS_DEADLINES);
+    let got = c
+        .system_one_choice(
+            "m",
+            "Subject: can you review this?",
+            "Pick a label.",
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.choice, "follow_up");
+    assert_eq!(got.probabilities.len(), 2, "{:?}", got.probabilities);
+    assert_eq!(got.confidence, Some(0.8));
+    let bodies = seen.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let q = &bodies[0]["questions"]["label"];
+    assert_eq!(bodies[0]["model"], "m");
+    assert_eq!(bodies[0]["state"], "Subject: can you review this?");
+    assert_eq!(q["type"], "choice");
+    assert_eq!(q["instructions"], "Pick a label.");
+    assert_eq!(q["criteria"], json!({"archive": null, "follow_up": null}));
+}
+
+/// A choice that was not offered is an error, never a label.
+#[tokio::test]
+async fn system_one_rejects_a_choice_that_was_not_offered() {
+    let (base, _) = serve(Arc::new(|_, _| system_one_reply("delete_everything"))).await;
+    let c = client(base, Duration::from_secs(10), MS_DEADLINES);
+    let err = c
+        .system_one_choice("m", "x", "", &opts())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not offered"), "{err}");
+}
+
+/// A cloud model is refused before anything is sent (the #999 check), and
+/// malformed options are refused before any request at all.
+#[tokio::test]
+async fn system_one_refuses_a_cloud_model_and_bad_options_before_sending() {
+    let (base, seen) = serve(Arc::new(|_, _| system_one_reply("archive"))).await;
+    let c = client(base, Duration::from_secs(10), MS_DEADLINES);
+    assert!(c
+        .system_one_choice("glm-5.3-flash:cloud", "x", "", &opts())
+        .await
+        .is_err());
+    assert!(c
+        .system_one_choice("m", "x", "", &["only".to_string()])
+        .await
+        .is_err());
+    assert!(c
+        .system_one_choice("m", "x", "", &["a".to_string(), " ".to_string()])
+        .await
+        .is_err());
+    assert!(c.system_one_choice("m", "  ", "", &opts()).await.is_err());
+    let too_many: Vec<String> = (0..27).map(|i| format!("o{i}")).collect();
+    assert!(c.system_one_choice("m", "x", "", &too_many).await.is_err());
+    assert_eq!(seen.requests.load(Ordering::SeqCst), 0);
+}

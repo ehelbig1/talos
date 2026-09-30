@@ -282,9 +282,18 @@ async fn an_unreadable_dataset_does_not_report_a_missing_model_to_the_teacher_au
     };
 
     rename(&pool, "ml_datasets", "ml_datasets_away").await;
-    let err = talos_ml::start_teacher_audit(&pool, &dsvc, user, model, 1, None, never)
-        .await
-        .expect_err("an unreadable dataset must refuse");
+    let err = talos_ml::start_teacher_audit(
+        &pool,
+        &dsvc,
+        user,
+        model,
+        1,
+        None,
+        talos_ml::TeacherBackend::Chat,
+        never,
+    )
+    .await
+    .expect_err("an unreadable dataset must refuse");
     assert!(
         matches!(err, talos_ml::TeacherAuditError::Internal(_)),
         "an unreadable dataset must be Internal, not NotFound: {err:?}"
@@ -301,9 +310,18 @@ async fn an_unreadable_dataset_does_not_report_a_missing_model_to_the_teacher_au
         .await
         .expect("repoint model at a foreign dataset");
     let never2 = |_req: talos_ml::TeacherRequest| async move { panic!("LLM must not be reached") };
-    let err = talos_ml::start_teacher_audit(&pool, &dsvc, user, model, 1, None, never2)
-        .await
-        .expect_err("a foreign dataset must refuse");
+    let err = talos_ml::start_teacher_audit(
+        &pool,
+        &dsvc,
+        user,
+        model,
+        1,
+        None,
+        talos_ml::TeacherBackend::Chat,
+        never2,
+    )
+    .await
+    .expect_err("a foreign dataset must refuse");
     assert!(
         matches!(err, talos_ml::TeacherAuditError::NotFound),
         "a foreign dataset must stay NotFound: {err:?}"

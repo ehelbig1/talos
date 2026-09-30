@@ -531,6 +531,59 @@ fn gate_log(slot: &talos_local_inference::gate::LocalLlmSlot, queued: bool) -> G
     }
 }
 
+/// Fewest options a System One `choice` question accepts.
+pub const SYSTEM_ONE_MIN_OPTIONS: usize = 2;
+/// Most options a System One `choice` question accepts.
+pub const SYSTEM_ONE_MAX_OPTIONS: usize = 26;
+/// Whole-exchange deadline for one System One request: the answer is one
+/// token, so the time is model load plus prompt evaluation.
+const SYSTEM_ONE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One System One `choice` answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemOneChoice {
+    /// The chosen option — always one of the options asked.
+    pub choice: String,
+    /// The model's probability for each option, as returned.
+    pub probabilities: std::collections::BTreeMap<String, f64>,
+    /// How strongly the model favours one option over the others (0–1);
+    /// `None` when the response omits it.
+    pub confidence: Option<f64>,
+}
+
+/// Parse a `/v1/systemone` response's `label` answer. A choice outside
+/// `options`, or no choice, is an error.
+fn parse_system_one_choice(v: &serde_json::Value, options: &[String]) -> Result<SystemOneChoice> {
+    let answer = v
+        .get("answers")
+        .and_then(|a| a.get("label"))
+        .ok_or_else(|| anyhow!("Ollama System One response has no `label` answer"))?;
+    let choice = answer
+        .get("choice")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| anyhow!("Ollama System One answer has no choice"))?;
+    if !options.iter().any(|o| o == choice) {
+        return Err(anyhow!(
+            "Ollama System One chose an option that was not offered"
+        ));
+    }
+    let probabilities = answer
+        .get("probabilities")
+        .and_then(|p| p.as_object())
+        .map(|m| {
+            m.iter()
+                .filter(|(k, _)| options.iter().any(|o| o == *k))
+                .filter_map(|(k, p)| p.as_f64().map(|p| (k.clone(), p)))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(SystemOneChoice {
+        choice: choice.to_string(),
+        probabilities,
+        confidence: answer.get("confidence").and_then(|c| c.as_f64()),
+    })
+}
+
 /// Refuse a controller call whose model does not provably run on this host.
 ///
 /// See [`talos_local_inference::locality`]: a cloud-served model, a model the
@@ -887,6 +940,90 @@ impl OllamaClient {
         // torn down mid-body.
         let _ = talos_http_body::read_json_capped::<serde_json::Value>(resp).await;
         Ok(())
+    }
+
+    /// Ask a local System One model (Ollama `/v1/systemone`, v0.35.0+) to
+    /// choose ONE of `options` for `state`.
+    ///
+    /// System One scores each option instead of generating text: the answer
+    /// is a choice, a probability per option and a confidence, from one
+    /// generated token. It is the natural backend for a classifier, and this
+    /// is how the teacher audit compares it against the chat teacher on the
+    /// human-corrected slice.
+    ///
+    /// Same guards as [`Self::chat`]: the model must be proven local (a cloud
+    /// model is refused before anything is sent), the call takes this
+    /// process's local-inference gate, the response body is read capped.
+    /// `options` must be 2–26 non-blank names (the API's bounds); each is
+    /// sent with a null description, which System One reads as the name
+    /// itself. A returned choice outside `options` is an error, never a
+    /// label.
+    pub async fn system_one_choice(
+        &self,
+        model: &str,
+        state: &str,
+        instructions: &str,
+        options: &[String],
+    ) -> Result<SystemOneChoice> {
+        use talos_local_inference::gate;
+
+        if !(SYSTEM_ONE_MIN_OPTIONS..=SYSTEM_ONE_MAX_OPTIONS).contains(&options.len()) {
+            return Err(anyhow!(
+                "System One needs {SYSTEM_ONE_MIN_OPTIONS}–{SYSTEM_ONE_MAX_OPTIONS} options, got {}",
+                options.len()
+            ));
+        }
+        if options.iter().any(|o| o.trim().is_empty()) {
+            return Err(anyhow!("System One options must not be blank"));
+        }
+        if state.trim().is_empty() {
+            return Err(anyhow!("System One needs a non-empty input"));
+        }
+        refuse_unless_local(&self.client, &self.base_url, model).await?;
+
+        let queued = QueuedFlag::default();
+        let (_slot, _waited) = gate::acquire_process_slot(Some(&queued), model).await;
+
+        let criteria: serde_json::Map<String, serde_json::Value> = options
+            .iter()
+            .map(|o| (o.clone(), serde_json::Value::Null))
+            .collect();
+        let instructions = if instructions.trim().is_empty() {
+            "Choose the option that fits the input."
+        } else {
+            instructions
+        };
+        let body = json!({
+            "model": model,
+            "state": state,
+            "questions": {
+                "label": {
+                    "type": "choice",
+                    "instructions": instructions,
+                    "criteria": criteria,
+                }
+            },
+        });
+        let resp = self
+            .client
+            .post(format!("{}/v1/systemone", self.base_url))
+            .json(&body)
+            .timeout(SYSTEM_ONE_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Ollama System One request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Body not echoed: it can quote the input.
+            return Err(anyhow!(
+                "Ollama System One returned status {}",
+                status.as_u16()
+            ));
+        }
+        let v: serde_json::Value = talos_http_body::read_json_capped(resp)
+            .await
+            .map_err(|e| anyhow!("Failed to read Ollama System One response: {e}"))?;
+        parse_system_one_choice(&v, options)
     }
 
     /// List locally available models via Ollama API.
