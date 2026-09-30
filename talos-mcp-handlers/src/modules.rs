@@ -3330,6 +3330,87 @@ pub(crate) fn narrow_secret_grant(
 }
 
 #[cfg(test)]
+mod catalog_template_resolver_tests {
+    use super::resolve_catalog_template_dir;
+    use std::fs;
+
+    /// A throwaway catalog: `<root>/catalog/llm-inference/talos.json`, plus a
+    /// directory OUTSIDE the catalog that also has a manifest, so a key that
+    /// escaped the catalog would have something to find.
+    fn fixture() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("talos-resolver-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("catalog").join("llm-inference");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("talos.json"),
+            r#"{"display_name": "LLM Inference"}"#,
+        )
+        .unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("talos.json"), r#"{"display_name": "Outside"}"#).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_slug_and_a_display_name_resolve_to_the_same_template() {
+        let root = fixture();
+        let catalog = root.join("catalog");
+        let want = catalog.join("llm-inference");
+        assert_eq!(
+            resolve_catalog_template_dir(&catalog, "llm-inference"),
+            Some(want.clone())
+        );
+        // The pin stores the DISPLAY name — the case restore used to get wrong.
+        assert_eq!(
+            resolve_catalog_template_dir(&catalog, "LLM Inference"),
+            Some(want)
+        );
+        assert_eq!(
+            resolve_catalog_template_dir(&catalog, "no-such-template"),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Restore rebuilds only an UNCHANGED copy: the template comes back only
+    /// when its source is byte-identical to the copy's.
+    #[test]
+    fn only_an_unchanged_copy_is_rebuildable() {
+        let root = fixture();
+        let dir = root.join("catalog").join("llm-inference");
+        fs::write(dir.join("template.rs"), "fn catalog_v2() {}").unwrap();
+        let load = || talos_compilation::CatalogTemplate::load(&dir).unwrap();
+        assert!(super::rebuildable_template("fn catalog_v2() {}", load()).is_ok());
+        assert!(
+            super::rebuildable_template("fn catalog_v1() {}", load()).is_err(),
+            "behind"
+        );
+        assert!(
+            super::rebuildable_template("fn mine() {}", load()).is_err(),
+            "edited"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A key is never joined onto the path unless it is one safe component,
+    /// so nothing outside the catalog can be reached, whatever the key.
+    #[test]
+    fn no_key_escapes_the_catalog() {
+        let root = fixture();
+        let catalog = root.join("catalog");
+        for key in ["../outside", "..", "a/b", "/etc", "Outside", "outside", ""] {
+            assert_eq!(
+                resolve_catalog_template_dir(&catalog, key),
+                None,
+                "key {key:?}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod catalog_drift_report_tests {
     use super::{catalog_drift_tip, installed_copies_json};
     use talos_module_repository::CatalogCopyRow;
@@ -4061,6 +4142,99 @@ async fn handle_list_module_catalog(
 
 // ── install_module_from_catalog ──────────────────────────────────────────────
 
+/// The catalog template, returned ONLY when it would rebuild exactly the
+/// source the installed copy holds (2026-09-30). Taking the template by value
+/// means the restore can compile nothing but what this returns: a copy that
+/// is behind the catalog, or was edited in place, would otherwise be replaced
+/// by different code under the same module id.
+pub(crate) fn rebuildable_template(
+    stored_source: &str,
+    template: talos_compilation::CatalogTemplate,
+) -> Result<talos_compilation::CatalogTemplate, &'static str> {
+    if stored_source == template.source() {
+        Ok(template)
+    } else {
+        Err(
+            "your copy's source differs from the catalog template (it is behind the catalog, \
+             or was edited in place), so restore will not rebuild it from the template. \
+             Reinstall with install_module_from_catalog to take the catalog version (your \
+             grants are kept), or recompile your own source with hot_update_module(module_id).",
+        )
+    }
+}
+
+/// The `content_hash` an installed catalog module stores: SHA-256 of the
+/// compiled WASM, lowercase hex. ONE home for install and restore, so the
+/// two cannot describe the same bytes differently.
+pub(crate) fn catalog_wasm_content_hash(wasm: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(wasm))
+}
+
+/// Normalise a template name or display name to its slug form
+/// (lowercase, non-alphanumerics folded to single hyphens).
+fn catalog_slug_of(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// A key that is safe to join onto the catalog directory as ONE path
+/// component: non-empty ASCII alphanumerics and hyphens, not starting with a
+/// hyphen. Anything else (a display name with spaces, `..`, `/`) is never
+/// joined; it can only be matched against the directories that exist.
+fn is_safe_template_dir_name(key: &str) -> bool {
+    !key.is_empty()
+        && !key.starts_with('-')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// The ONE resolver from a template key — a catalog directory name (slug) or
+/// a template's `display_name` — to its directory under `catalog_dir`.
+/// Shared by `install_module_from_catalog` and `restore_pinned_modules`
+/// (2026-09-30): restore used to join the pin's DISPLAY name straight onto
+/// the path (`module-templates/LLM Inference`), which exists for no
+/// template, and would have joined a caller-supplied name unchecked.
+///
+/// An exact directory is tried only for a safe single-component key; then
+/// the direct children are scanned for a `talos.json` whose `display_name`
+/// has the same slug. The key is never used to build any other path.
+pub(crate) fn resolve_catalog_template_dir(
+    catalog_dir: &std::path::Path,
+    key: &str,
+) -> Option<std::path::PathBuf> {
+    if is_safe_template_dir_name(key) {
+        let exact = catalog_dir.join(key);
+        if exact.join("talos.json").exists() {
+            return Some(exact);
+        }
+    }
+    let target = catalog_slug_of(key);
+    if target.is_empty() {
+        return None;
+    }
+    std::fs::read_dir(catalog_dir)
+        .ok()?
+        .flatten()
+        .find(|entry| {
+            std::fs::read(entry.path().join("talos.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|m| {
+                    m.get("display_name")
+                        .and_then(|v| v.as_str())
+                        .map(catalog_slug_of)
+                })
+                .is_some_and(|slug| slug == target)
+        })
+        .map(|e| e.path())
+}
+
 async fn handle_install_module_from_catalog(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -4128,56 +4302,17 @@ async fn handle_install_module_from_catalog(
     // Resolve module directory: exact slug match first, then fuzzy display_name match.
     // This handles cases where the tool name ("http-request-with-retry") differs from
     // the directory name ("http-retry") but matches the talos.json display_name.
-    let module_dir = {
-        fn to_slug(s: &str) -> String {
-            let lowered = s.to_lowercase();
-            let hyphenated: String = lowered
-                .chars()
-                .map(|c| if c.is_alphanumeric() { c } else { '-' })
-                .collect();
-            hyphenated
-                .split('-')
-                .filter(|p| !p.is_empty())
-                .collect::<Vec<_>>()
-                .join("-")
-        }
-
-        let exact = catalog_dir.join(name);
-        if exact.join("talos.json").exists() {
-            exact
-        } else {
-            let target = to_slug(name);
-            let found = std::fs::read_dir(catalog_dir)
-                .ok()
-                .and_then(|entries| {
-                    entries.flatten().find(|entry| {
-                        let meta_path = entry.path().join("talos.json");
-                        if let Ok(bytes) = std::fs::read(&meta_path) {
-                            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                                if let Some(display) =
-                                    meta.get("display_name").and_then(|v| v.as_str())
-                                {
-                                    return to_slug(display) == target;
-                                }
-                            }
-                        }
-                        false
-                    })
-                })
-                .map(|e| e.path());
-            match found {
-                Some(dir) => dir,
-                None => {
-                    return mcp_error(
-                        req_id,
-                        -32000,
-                        &format!(
-                            "Module '{}' not found in catalog. Use list_module_catalog to see available modules.",
-                            name
-                        ),
-                    )
-                }
-            }
+    let module_dir = match resolve_catalog_template_dir(catalog_dir, name) {
+        Some(dir) => dir,
+        None => {
+            return mcp_error(
+                req_id,
+                -32000,
+                &format!(
+                    "Module '{}' not found in catalog. Use list_module_catalog to see available modules.",
+                    name
+                ),
+            )
         }
     };
 
@@ -4418,8 +4553,7 @@ async fn handle_install_module_from_catalog(
             let _ = caller_provided_allowed_secrets;
             let _ = (&category, &description); // metadata embedded in modules row directly
 
-            use sha2::{Digest, Sha256};
-            let content_hash = format!("{:x}", Sha256::digest(&wasm_bytes));
+            let content_hash = catalog_wasm_content_hash(&wasm_bytes);
             let cw_short = if capability_world == "automation-node" {
                 "trusted"
             } else {
@@ -4683,68 +4817,110 @@ async fn handle_restore_pinned_modules(
             continue;
         }
 
-        // Need to reinstall — look up the catalog template through the ONE
-        // catalog reader, so the rebuild gets the same declared dependencies
-        // the original install did. This site used to pass `None`, which meant
-        // restoring a pinned module that needs e.g. chrono silently rebuilt it
-        // without chrono and failed.
-        let module_dir = catalog_dir.join(&module_name);
-        let template = match talos_compilation::CatalogTemplate::load(&module_dir) {
-            Ok(t) => t,
-            Err(_) => {
+        // Rebuild THIS copy (2026-09-30). The pin stores the display name, so
+        // the copy is found by (user, name), and its template by the copy's
+        // catalog slug through the ONE resolver — never by joining the name
+        // onto a path (`module-templates/LLM Inference` exists for no
+        // template, and a pinned name is caller-supplied).
+        let target = match state
+            .module_repo
+            .get_pinned_restore_target(user_id, &module_name)
+            .await
+        {
+            Ok(Some(t)) => t,
+            Ok(None) => {
                 failed.push(serde_json::json!({
                     "module": module_name,
-                    "reason": "template.rs not found in catalog — module may have been removed"
+                    "reason": "no module is installed under this name for your account — \
+                               run install_module_from_catalog first, then re-run restore_pinned_modules"
+                }));
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(module = %module_name, "restore_pinned_modules: target read failed: {:#}", e);
+                failed.push(serde_json::json!({
+                    "module": module_name,
+                    "reason": "could not read your installed copy; nothing was changed — retry"
+                }));
+                continue;
+            }
+        };
+        let key = target.catalog_slug.as_deref().unwrap_or(&module_name);
+        let Some(module_dir) = resolve_catalog_template_dir(catalog_dir, key) else {
+            failed.push(serde_json::json!({
+                "module": module_name,
+                "reason": format!("no catalog template matches '{key}' — it may have been removed from the catalog")
+            }));
+            continue;
+        };
+        // The ONE catalog reader, so the rebuild gets the template's declared
+        // dependencies exactly as an install does.
+        let template = match talos_compilation::CatalogTemplate::load(&module_dir) {
+            Ok(t) => t,
+            Err(e) => {
+                failed.push(serde_json::json!({
+                    "module": module_name,
+                    "reason": format!("catalog template could not be read: {e}")
+                }));
+                continue;
+            }
+        };
+        // A restore rebuilds the SAME source the copy holds; the template is
+        // only usable past this point if the sources match.
+        let template = match rebuildable_template(&target.source_code, template) {
+            Ok(t) => t,
+            Err(reason) => {
+                failed.push(serde_json::json!({
+                    "module": module_name,
+                    "module_id": target.module_id,
+                    "reason": reason,
                 }));
                 continue;
             }
         };
 
+        let compile_name = module_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(key)
+            .to_string();
         let job_id = uuid::Uuid::new_v4();
         let compilation = state
             .compiler
-            .compile_catalog_template(user_id, job_id, &module_name, &template)
+            .compile_catalog_template(user_id, job_id, &compile_name, &template)
             .await;
 
         match compilation {
             Ok(res) if res.success => {
-                if let Some(wasm_bytes) = res.wasm_bytes {
-                    // The write is scoped to THIS user's install row. It used to
-                    // be `WHERE name = $2` with no owner predicate, which
-                    // overwrote every tenant's module of that name plus the
-                    // shared catalog row — a user-scoped read reporting a
-                    // cross-tenant write. See
-                    // `ModuleRepository::update_template_precompiled_wasm`.
-                    match state
-                        .module_repo
-                        .update_template_precompiled_wasm(&module_name, &wasm_bytes, user_id)
-                        .await
-                    {
-                        // `rows_affected == 0` means the compile succeeded but
-                        // landed on no row: this user has a pin but no install
-                        // row under that name. Reporting it as `restored` would
-                        // tell the operator a module is usable when the write
-                        // went nowhere — the same class this whole path is being
-                        // audited for, one level down.
-                        Ok(0) => failed.push(serde_json::json!({
-                            "module": module_name,
-                            "reason": "compiled, but no module row is installed under this name for your account — \
-                                       run install_module_from_catalog first, then re-run restore_pinned_modules"
-                        })),
-                        Ok(_) => restored.push(module_name.clone()),
-                        Err(e) => {
-                            tracing::error!(module = %module_name, "restore_pinned_modules upsert failed: {:#}", e);
-                            failed.push(serde_json::json!({
-                                "module": module_name,
-                                "reason": "compilation succeeded but failed to save"
-                            }));
-                        }
-                    }
-                } else {
+                let Some(wasm_bytes) = res.wasm_bytes else {
                     failed.push(serde_json::json!({
                         "module": module_name,
                         "reason": "compilation produced no WASM output"
                     }));
+                    continue;
+                };
+                // The hash that describes the bytes written, as an install
+                // computes it; the old writer left the previous hash in place.
+                let content_hash = catalog_wasm_content_hash(&wasm_bytes);
+                match state
+                    .module_repo
+                    .restore_missing_module_wasm(
+                        target.module_id,
+                        user_id,
+                        &wasm_bytes,
+                        &content_hash,
+                    )
+                    .await
+                {
+                    Ok(0) => already_present.push(module_name.clone()),
+                    Ok(_) => restored.push(module_name.clone()),
+                    Err(e) => {
+                        tracing::error!(module = %module_name, "restore_pinned_modules write failed: {:#}", e);
+                        failed.push(serde_json::json!({
+                            "module": module_name,
+                            "reason": "compilation succeeded but failed to save"
+                        }));
+                    }
                 }
             }
             Ok(_) => {
