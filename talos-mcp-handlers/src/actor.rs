@@ -687,7 +687,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "description": "PERMANENTLY delete one of your actors. Only an actor that has already ENDED \
                 (status terminated or archived) can be deleted, and never your Default actor. Refused \
                 while any workflow or any execution history (live, archived, or sub-workflow runs) still \
-                references the actor, since deleting it would falsify that history. The delete also \
+                references the actor, since deleting it would falsify that history — and history only \
+                leaves by retention: module executions are purged only while \
+                MODULE_EXECUTION_RETENTION_ENABLED is on (default off), so with it off an actor that \
+                ever ran a module is kept permanently. The delete also \
                 removes the actor's memory, approval and budget policies and its action log; the action \
                 log and those counts are copied into one admin_event_log record first, in the same \
                 transaction, so the audit trail outlives the actor. Frees the actor's name for reuse. \

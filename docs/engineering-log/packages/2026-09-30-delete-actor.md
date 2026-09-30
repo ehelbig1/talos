@@ -57,6 +57,27 @@ Unit tests map every outcome to its reply and error kind.
 
 **Stated limits.**
 - MCP only; GraphQL has no actor-delete mutation.
-- A deleted actor's executions cannot exist by construction (they refuse the
-  delete), so an actor with any history is kept until retention removes it.
-  The archive tier is retained 30 days past the 30-day live window.
+- An actor with any execution history is refused, and it stays refused until
+  retention removes that history. Each table ages out differently, and one
+  does not age out at all on the reference fleet (corrected 2026-09-30, below):
+  - `workflow_executions`: the 30-day live window, then 30 days in
+    `workflow_executions_archive`, then gone;
+  - `sub_workflow_runs`: the child-run ledger purge;
+  - `module_executions`: ONLY while `MODULE_EXECUTION_RETENTION_ENABLED` is
+    on, and then only terminal rows whose parent workflow execution no longer
+    exists. It is off by deliberate decision (package AT: the off-host backup
+    chain must be proven first), so an actor that ever ran a module is kept
+    PERMANENTLY there.
+
+**Correction (2026-09-30, first live use).** The record above said an actor
+with history "is kept until retention removes it". On the reference fleet
+that is false for module history. The first real `delete_actor` (a dry run on
+the terminated `probe-750-readonly`) was refused for 2 `module_executions`
+rows: the two Actor Memory Writer runs that were the live verification of the
+#750 write-ceiling gate. Both rows are orphans (their parent workflow
+executions were purged), so an enabled module-retention sweep would remove
+them. With it off they stay, and so does the actor. The refusal is correct:
+those rows are audit evidence, and `module_executions.actor_id` is
+`ON DELETE RESTRICT` to stop exactly that history being deleted or
+re-attributed. The pre-check made by hand before the dry run had looked at
+`workflow_executions` only and missed them; the tool did not.
