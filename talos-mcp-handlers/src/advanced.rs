@@ -3464,7 +3464,7 @@ async fn handle_agent_session_start(
         static_tool_count: crate::static_tool_count(),
     };
 
-    let outcome = match state.session_brief_service.build(input).await {
+    let mut outcome = match state.session_brief_service.build(input).await {
         Ok(o) => o,
         Err(e) => return mcp_error(req_id, e.jsonrpc_code(), &e.user_facing_message()),
     };
@@ -3507,18 +3507,19 @@ async fn handle_agent_session_start(
     // refreshed, so a catalog fix is not live in it until it is reinstalled.
     // Surfaced here because nobody asks `get_catalog_status` a question they
     // do not know to ask. `null` = the read failed, never "nothing behind".
-    let mut report = outcome.report;
-    report["catalog_drift"] = match state.module_repo.list_catalog_copy_drift(user_id).await {
-        Ok(rows) => crate::modules::catalog_drift_brief(&rows),
-        Err(e) => {
-            tracing::warn!(error = %e, "session_start: catalog drift read failed");
-            serde_json::Value::Null
-        }
-    };
+    // The read joins the brief's own ledger, so a failure is named in
+    // `measurement.not_measured` like every other section's.
+    let drift = outcome.record(
+        "catalog_drift",
+        state.module_repo.list_catalog_copy_drift(user_id).await,
+    );
+    outcome.report["catalog_drift"] = drift.map_or(serde_json::Value::Null, |rows| {
+        crate::modules::catalog_drift_brief(&rows)
+    });
 
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&report).unwrap_or_default(),
+        &serde_json::to_string_pretty(&outcome.report).unwrap_or_default(),
     )
 }
 
