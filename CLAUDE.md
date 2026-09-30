@@ -2206,6 +2206,16 @@ the override). Core type `talos_workflow_engine_core::EgressScope` (fail-closed
 4. `wit_graphql::execute` — same host deny-list.
 5. `wit_webhook::send` + `wit_http_stream` — same host deny-list.
 
+**An Ollama CLOUD model is not local (2026-09-30).** Ollama serves a
+`:cloud` / `-cloud` model, or any model its `/api/tags` lists with a
+`remote_host`, by forwarding the prompt to `ollama.com`. The one home is
+`talos_local_inference::locality::model_locality`: every worker path to the
+local Ollama (`complete*`, `complete-with-tools`, `start-stream`,
+`start-tool-stream`) calls `TalosContext::admit_local_model` for a tier-1
+actor, and `talos_llm::OllamaClient::chat` refuses such a model for every
+caller. A model the listing does not contain, or an unreadable listing, is
+refused too. A new local-inference call site must go through one of the two.
+
 **Defense in depth on the controller side:** `build_encrypted_secrets_for` takes `max_llm_tier` and SKIPS the `resolve_llm_keys` prefetch entirely when `Tier1`. Tier-1 jobs never have an Anthropic/OpenAI/Gemini key on the wire (encrypted or otherwise) — bounds blast radius if a future bypass slips.
 
 **Stamping the tier on a workflow execution:** ALWAYS use `talos_engine::actor_binding::apply_actor_to_engine(&actor_repo, &mut engine, actor_id)` (moved from `ActorRepository` in 2026-07 — lint check 51 forbids the repo→engine dep edge) — it sets `actor_id` AND `max_llm_tier` together and fail-closes to Tier-1 on DB error. Never call bare `engine.set_actor_id(aid)` — lint check 29 catches it (the setter is confined to `talos-workflow-engine/` and `talos-engine/src/actor_binding.rs`).

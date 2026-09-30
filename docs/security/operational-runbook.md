@@ -84,7 +84,16 @@ providers a job dispatched on their behalf may reach:
   the worker's `llm::complete` / `llm-tools` / `llm-streaming` host
   functions: a tier-1 job's attempt to resolve an Anthropic / OpenAI /
   Gemini key returns `None` with a logged warning, and the LLM call
-  fails closed with "missing provider key".
+  fails closed with "missing provider key". "Local Ollama" means a model
+  whose weights are on this host: an Ollama **cloud** model (a `:cloud` /
+  `-cloud` tag, or any model `/api/tags` lists with a `remote_host`) forwards
+  the prompt to `ollama.com`, so a tier-1 job's call to one — or to a model
+  the local Ollama does not list, or while that list cannot be read — is
+  refused before it is sent (capability denial, policy `tier1-llm-egress` or
+  `tier1-llm-locality-unverified`). The controller's own local-inference
+  client (consolidation, reflection, graph-RAG extraction, evaluation, the
+  teacher audit, `local_llm_complete`) applies the same check to every call,
+  whatever the tier (`talos_audit` event `local_llm_model_refused`).
 - **`tier2`** (default) — external providers allowed (Anthropic,
   OpenAI, Gemini). DLP scrubbing still runs pre-send as defense in
   depth, but "anything here is potentially seen by the provider".

@@ -105,6 +105,13 @@ impl wit_llm_tools::Host for TalosContext {
             wit_llm_tools::Provider::Ollama => "mistral".to_string(),
         });
 
+        // A tier-1 actor's local call must reach a model that runs HERE.
+        if is_local_tools {
+            self.admit_local_model("llm-tools-local-model", &model)
+                .await
+                .map_err(wit_llm_tools::Error::NotConfigured)?;
+        }
+
         // 4. Convert the WIT rich messages + tool defs into canonical form
         //    and let the provider adapter build its own wire body.
         //    Pre-trait, every provider received the ANTHROPIC tools shape
