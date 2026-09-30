@@ -617,11 +617,14 @@ pub enum LlmFailure {
     /// `record_llm_failure` about the overlap with
     /// `wasm_executions_cancelled_total`.
     Cancelled,
-    /// No API key could be resolved for an external provider. Covers BOTH a
-    /// genuinely absent key AND a Tier-1 ceiling refusing external egress:
-    /// `get_llm_api_key` returns `None` for both, and `complete_inner` cannot
-    /// tell them apart. The tier refusal is separately visible as a
-    /// capability-denied event; do not read this label as "misconfigured".
+    /// The call could not be made as configured. Covers a genuinely absent
+    /// key, a Tier-1 ceiling refusing an external provider, and (since
+    /// 2026-09-30) a Tier-1 local call to a model not proven local. The
+    /// guest-facing MESSAGE tells these apart (`LlmKeyUnavailable`,
+    /// `LocalModelRefusal`); the label deliberately does not — a fourth label
+    /// would split a closed, pre-seeded set for a distinction the ceiling
+    /// refusals already carry as capability-denied events. Do not read this
+    /// label as "misconfigured".
     NotConfigured,
     /// The outbound request body could not be serialized.
     ///

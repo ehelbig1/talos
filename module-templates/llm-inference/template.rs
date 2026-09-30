@@ -907,9 +907,13 @@ fn truncate_with_marker(s: &str, max_chars: usize) -> String {
 fn llm_error_message(err: talos::core::llm::Error, provider_str: &str, model: &str) -> String {
     use talos::core::llm::Error;
     match err {
+        // The host's detail already names the cause AND its remedy — a
+        // missing key (the vault path and env var to set), a tier-1 ceiling
+        // refusing an external provider, a tier-1 call to a model not proven
+        // local. Until 2026-09-30 this arm appended "Operator must set the
+        // provider's vault key", which is the wrong remedy for the last two.
         Error::NotConfigured(detail) => format!(
-            "LLM provider '{}' is not configured ({}). Operator must set the provider's vault \
-             key (e.g. anthropic/api_key for anthropic). Verify with `list_secrets`.",
+            "LLM provider '{}' refused the call: {}",
             provider_str, detail
         ),
         Error::RateLimited => format!(
