@@ -90,6 +90,26 @@ const JWK_REFRESH_BACKOFF_SECS: i64 = 60;
 /// occasional slow CDN hop.
 const JWK_FETCH_TIMEOUT_SECS: u64 = 5;
 
+/// Delays between the boot warm-up's attempts ([`GoogleOidcVerifier::warm`]):
+/// attempts at 0 s, 2 s and 10 s, then the on-demand path takes over.
+///
+/// Why a warm-up at all, measured over 30 days on the reference host: of 95
+/// controller lifetimes that fetched Google's keys, **25 (26%) failed their
+/// FIRST fetch**, and in 25 of the 26 lifetimes with any failure the first
+/// fetch was the one that failed. That fetch was lazy — made by the first push
+/// after a restart, which arrives as the head of the redelivery backlog — so
+/// each failure refused that backlog for the 60 s backoff (94 pushes on
+/// 2026-09-30 18:36). Fetching at boot moves the attempt to before the backlog
+/// arrives, and a second attempt a few seconds later is what recovered the
+/// on-demand path every time.
+///
+/// Why only three, and this spacing: every attempt counts on
+/// `talos_google_jwk_refresh_total{outcome}`, and `TalosGoogleJwkRefreshFailing`
+/// (`>= 5` failed in 15 m) was derived from the on-demand path's cap of one
+/// failure per minute. Three quick attempts plus that cap still need two
+/// minutes of continuous failure to reach five.
+const WARMUP_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(8)];
+
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
     #[error("malformed JWT header")]
@@ -251,6 +271,28 @@ pub struct GoogleOidcVerifier {
     /// time, even under a flood of concurrent pushes with unknown kids.
     refresh_lock: Mutex<()>,
     http: reqwest::Client,
+    /// Where the JWK set is fetched from: [`GOOGLE_JWK_URL`] in production.
+    jwk_url: String,
+}
+
+/// Why a JWK fetch was made, which decides how loudly its failure is logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchCause {
+    /// A push needed a key the cache does not hold.
+    OnDemand,
+    /// The boot warm-up; `retrying` = another warm-up attempt follows.
+    Warmup { attempt: usize, retrying: bool },
+}
+
+/// How [`GoogleOidcVerifier::warm`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JwkWarmup {
+    /// Keys were fetched; `attempts` counts the one that succeeded.
+    Warmed { attempts: usize },
+    /// Keys were already cached and fresh (a push fetched them first).
+    AlreadyWarm,
+    /// Every attempt failed; the on-demand path fetches on the next push.
+    GaveUp { attempts: usize },
 }
 
 impl Default for GoogleOidcVerifier {
@@ -282,6 +324,17 @@ impl GoogleOidcVerifier {
             .connect_timeout(Duration::from_secs(2))
             .build()
             .expect("GoogleOidcVerifier: failed to build hardened reqwest client"),
+            jwk_url: GOOGLE_JWK_URL.to_string(),
+        }
+    }
+
+    /// A verifier that fetches its JWK set from `url` instead of Google.
+    /// Tests only: production always uses [`GOOGLE_JWK_URL`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_jwk_url_for_test(url: &str) -> Self {
+        Self {
+            jwk_url: url.to_string(),
+            ..Self::new()
         }
     }
 
@@ -299,6 +352,7 @@ impl GoogleOidcVerifier {
             backoff_refusals: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: reqwest::Client::new(),
+            jwk_url: GOOGLE_JWK_URL.to_string(),
         }
     }
 
@@ -433,7 +487,59 @@ impl GoogleOidcVerifier {
             return Ok(());
         }
 
-        self.fetch_jwks().await
+        self.fetch_jwks(FetchCause::OnDemand).await
+    }
+
+    /// Fetch Google's keys ahead of the first push: up to three attempts, at
+    /// 0 s, 2 s and 10 s ([`WARMUP_RETRY_DELAYS`]). Spawned once at controller
+    /// boot, fire-and-forget; nothing waits on it.
+    ///
+    /// Each attempt takes the same single-flight lock as the on-demand path,
+    /// so a push that arrives mid-warm-up waits for this fetch instead of
+    /// starting another. The warm-up does not wait out a backoff window —
+    /// it is capped at three attempts, so it cannot hammer Google the way an
+    /// unbounded caller could. A failure is logged at INFO while another
+    /// attempt follows and at WARN on the last one, where the on-demand path
+    /// (and its 60 s backoff) takes over.
+    pub async fn warm(&self) -> JwkWarmup {
+        self.warm_with(&WARMUP_RETRY_DELAYS).await
+    }
+
+    async fn warm_with(&self, delays: &[Duration]) -> JwkWarmup {
+        let attempts_allowed = delays.len() + 1;
+        for attempt in 1..=attempts_allowed {
+            {
+                let _guard = self.refresh_lock.lock().await;
+                let fresh = !self.keys.load().is_empty()
+                    && chrono::Utc::now()
+                        .timestamp()
+                        .saturating_sub(self.last_refreshed.load(Ordering::Relaxed))
+                        < JWK_REFRESH_INTERVAL_SECS;
+                if fresh {
+                    return if attempt == 1 {
+                        JwkWarmup::AlreadyWarm
+                    } else {
+                        JwkWarmup::Warmed {
+                            attempts: attempt - 1,
+                        }
+                    };
+                }
+                let retrying = attempt < attempts_allowed;
+                if self
+                    .fetch_jwks(FetchCause::Warmup { attempt, retrying })
+                    .await
+                    .is_ok()
+                {
+                    return JwkWarmup::Warmed { attempts: attempt };
+                }
+            }
+            if let Some(delay) = delays.get(attempt - 1) {
+                tokio::time::sleep(*delay).await;
+            }
+        }
+        JwkWarmup::GaveUp {
+            attempts: attempts_allowed,
+        }
     }
 
     /// Fetch JWKs from Google, parse, hot-swap. On failure we keep
@@ -441,14 +547,21 @@ impl GoogleOidcVerifier {
     /// so the next push doesn't immediately re-fetch. Without the
     /// backoff, a sustained Google outage would turn every push
     /// into a 5-second timeout + JwkFetchFailed response.
-    async fn fetch_jwks(&self) -> Result<(), VerifyError> {
+    async fn fetch_jwks(&self, cause: FetchCause) -> Result<(), VerifyError> {
+        let started = std::time::Instant::now();
         let result = async {
             let resp = self
                 .http
-                .get(GOOGLE_JWK_URL)
+                .get(&self.jwk_url)
                 .send()
                 .await
-                .map_err(|e| VerifyError::JwkFetchFailed(e.to_string()))?;
+                // The full source chain, not reqwest's outermost layer:
+                // "error sending request for url" alone cannot tell a DNS
+                // failure from a connect timeout from a TLS error, and every
+                // first-fetch failure logged before 2026-09-30 said only that.
+                .map_err(|e| {
+                    VerifyError::JwkFetchFailed(talos_http_utils::trusted_client::error_chain(&e))
+                })?;
             if !resp.status().is_success() {
                 return Err(VerifyError::JwkFetchFailed(format!(
                     "unexpected status {}",
@@ -491,6 +604,11 @@ impl GoogleOidcVerifier {
                 // Any earlier backoff is implicitly cleared — a
                 // time in the past is !< now.
                 talos_metrics::record_google_jwk_refresh(JwkRefreshOutcome::Ok);
+                if let FetchCause::Warmup { attempt, .. } = cause {
+                    if attempt > 1 {
+                        tracing::info!(attempt, "JWK boot warm-up succeeded after a retry");
+                    }
+                }
                 if refused_in_previous_window > 0 {
                     tracing::warn!(
                         refused_in_previous_window,
@@ -508,13 +626,27 @@ impl GoogleOidcVerifier {
                 self.backoff_until
                     .store(now + JWK_REFRESH_BACKOFF_SECS, Ordering::Relaxed);
                 talos_metrics::record_google_jwk_refresh(JwkRefreshOutcome::Failed);
-                tracing::warn!(
-                    error = %e,
-                    backoff_secs = JWK_REFRESH_BACKOFF_SECS,
-                    refused_in_previous_window,
-                    "JWK refresh failed; backing off — unknown-key pushes are refused (401) \
-                     until the window closes and are summarised then"
-                );
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                match cause {
+                    FetchCause::Warmup {
+                        attempt,
+                        retrying: true,
+                    } => tracing::info!(
+                        error = %e,
+                        elapsed_ms,
+                        attempt,
+                        "JWK boot warm-up attempt failed; retrying"
+                    ),
+                    FetchCause::OnDemand | FetchCause::Warmup { .. } => tracing::warn!(
+                        error = %e,
+                        elapsed_ms,
+                        backoff_secs = JWK_REFRESH_BACKOFF_SECS,
+                        refused_in_previous_window,
+                        warmup = matches!(cause, FetchCause::Warmup { .. }),
+                        "JWK refresh failed; backing off — unknown-key pushes are refused (401) \
+                         until the window closes and are summarised then"
+                    ),
+                }
             }
         }
         result
@@ -1081,5 +1213,167 @@ mod tests {
                 .expect_err("must reject"),
             VerifyError::EmailNotVerified
         ));
+    }
+
+    /// The controller builds ONE key cache, hands it to BOTH Google push
+    /// receivers, and warms it at boot. A second `GoogleOidcVerifier::new()`
+    /// there, or Gmail's receiver built with its own (`PubsubJwtVerifier::new`),
+    /// would bring back a cache the warm-up never fills. A TEXTUAL pin: the
+    /// bootstrap cannot be driven from a test.
+    #[test]
+    fn the_controller_shares_and_warms_one_key_cache() {
+        let src = include_str!("../../controller/src/bootstrap/services.rs");
+        assert_eq!(src.matches("GoogleOidcVerifier::new()").count(), 1);
+        assert_eq!(src.matches("PubsubJwtVerifier::new(").count(), 0);
+        assert_eq!(
+            src.matches("PubsubJwtVerifier::with_shared_verifier(")
+                .count(),
+            1
+        );
+        assert_eq!(src.matches("Some(google_oidc_verifier.clone())").count(), 1);
+        assert_eq!(src.matches("verifier.warm().await").count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Boot warm-up (`warm`) against a loopback JWK endpoint
+    // -----------------------------------------------------------------------
+
+    /// A JWK set document for `pub_key`, the shape Google's endpoint returns.
+    fn jwk_set_json(pub_key: &RsaPublicKey, kid: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use rsa::traits::PublicKeyParts;
+        json!({"keys": [{
+            "kid": kid, "kty": "RSA", "alg": "RS256", "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(pub_key.e().to_bytes_be()),
+        }]})
+        .to_string()
+    }
+
+    /// Serves `body` on every request after the first `drop_first` requests,
+    /// which are accepted and closed with nothing written — the failure a
+    /// fresh controller's first fetch showed. Returns the URL and a count of
+    /// requests received.
+    async fn jwk_server(
+        body: String,
+        drop_first: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = s.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                if n < drop_first {
+                    continue; // dropped: connection closed, no response
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}/oauth2/v3/certs"), seen)
+    }
+
+    fn keypair_with_public() -> (EncodingKey, RsaPublicKey) {
+        let priv_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let pub_key = RsaPublicKey::from(&priv_key);
+        let pem = priv_key.to_pkcs1_pem(Default::default()).unwrap();
+        (EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(), pub_key)
+    }
+
+    fn fresh_claims() -> serde_json::Value {
+        json!({
+            "iss": GOOGLE_ISSUER, "aud": TEST_AUDIENCE, "email": TEST_SA,
+            "email_verified": true, "iat": now(), "exp": now() + 300,
+        })
+    }
+
+    const FAST: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(10)];
+
+    /// The observed defect: the first fetch fails. The warm-up's second
+    /// attempt succeeds, and a push signed with Google's (here: the loopback
+    /// server's) key then verifies with NO further fetch — the backlog that
+    /// follows a restart finds the keys already cached.
+    #[tokio::test]
+    async fn warm_retries_a_failed_first_fetch_and_the_keys_verify_a_push() {
+        let (enc, pub_key) = keypair_with_public();
+        let (url, seen) = jwk_server(jwk_set_json(&pub_key, "kid-warm"), 1).await;
+        let v = GoogleOidcVerifier::with_jwk_url_for_test(&url);
+
+        assert_eq!(v.warm_with(&FAST).await, JwkWarmup::Warmed { attempts: 2 });
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+
+        let token = sign(&enc, "kid-warm", fresh_claims());
+        v.verify_signed(&token, TEST_AUDIENCE)
+            .await
+            .expect("warm keys verify");
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "the push fetched again");
+    }
+
+    /// Bounded: three attempts, then the on-demand path owns it — and that
+    /// path's backoff is open, so a push arriving next does not add a fourth
+    /// request inside the window.
+    #[tokio::test]
+    async fn warm_gives_up_after_three_attempts_and_leaves_the_backoff_open() {
+        let (_, pub_key) = keypair_with_public();
+        let (url, seen) = jwk_server(jwk_set_json(&pub_key, "k"), usize::MAX).await;
+        let v = GoogleOidcVerifier::with_jwk_url_for_test(&url);
+
+        assert_eq!(v.warm_with(&FAST).await, JwkWarmup::GaveUp { attempts: 3 });
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+        assert!(v.in_backoff());
+        let (enc, _) = keypair_with_public();
+        let err = v
+            .verify_signed(&sign(&enc, "k", fresh_claims()), TEST_AUDIENCE)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VerifyError::UnknownKey), "{err:?}");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            3,
+            "a push fetched inside the backoff"
+        );
+    }
+
+    /// Keys a push already fetched are not fetched again.
+    #[tokio::test]
+    async fn warm_is_a_no_op_when_the_keys_are_fresh() {
+        let (_, dec, kid) = keypair();
+        let v = make_verifier(dec, &kid);
+        assert_eq!(v.warm_with(&FAST).await, JwkWarmup::AlreadyWarm);
+    }
+
+    /// A failed fetch names its cause, not only reqwest's outermost layer.
+    #[tokio::test]
+    async fn a_failed_fetch_reports_the_cause_below_the_request_error() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let v = GoogleOidcVerifier::with_jwk_url_for_test(&format!("http://127.0.0.1:{port}/"));
+        let (enc, _) = keypair_with_public();
+        let err = v
+            .verify_signed(&sign(&enc, "k", fresh_claims()), TEST_AUDIENCE)
+            .await
+            .unwrap_err();
+        let VerifyError::JwkFetchFailed(msg) = err else {
+            panic!("expected a fetch failure, got {err:?}");
+        };
+        let top_end = msg.find(')').expect("reqwest names the URL") + 1;
+        assert!(
+            msg.len() > top_end + 2,
+            "only the outermost layer was reported: {msg}"
+        );
     }
 }

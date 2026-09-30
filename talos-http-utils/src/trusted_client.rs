@@ -53,9 +53,102 @@ pub fn build_integration_client(timeout: Duration) -> reqwest::Client {
         .expect("failed to build hardened integration HTTP client")
 }
 
+/// Longest rendering [`error_chain`] returns, in characters.
+const MAX_ERROR_CHAIN_CHARS: usize = 512;
+
+/// An error and every `source()` beneath it, joined with `": "`, bounded to
+/// [`MAX_ERROR_CHAIN_CHARS`].
+///
+/// reqwest's own `Display` stops at the outermost layer — `error sending
+/// request for url (...)` — which says a request failed and not why. The
+/// sources name the layer: `dns error`, `tcp connect error`, `operation timed
+/// out`, a TLS failure. A layer whose text the rendering already contains is
+/// skipped, since hyper and reqwest often repeat their child's message.
+///
+/// For a log field about a request to a FIXED, trusted host: the URL in the
+/// outermost message is that host's, and no layer carries a request header or
+/// body. Do not use it on an error from a caller-supplied URL without first
+/// deciding that URL may be logged.
+#[must_use]
+pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(layer) = source {
+        let text = layer.to_string();
+        if !text.is_empty() && !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = layer.source();
+    }
+    if out.chars().count() > MAX_ERROR_CHAIN_CHARS {
+        out = out.chars().take(MAX_ERROR_CHAIN_CHARS).collect();
+        out.push('…');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1
+                .as_deref()
+                .map(|l| l as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn error_chain_names_every_layer_once() {
+        let e = Layer(
+            "error sending request for url (https://example.test/)",
+            Some(Box::new(Layer(
+                "client error (Connect)",
+                Some(Box::new(Layer(
+                    "dns error",
+                    Some(Box::new(Layer("dns error", None))),
+                ))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&e),
+            "error sending request for url (https://example.test/): client error (Connect): dns error"
+        );
+        let long = Layer(Box::leak("x".repeat(2_000).into_boxed_str()), None);
+        assert_eq!(
+            error_chain(&long).chars().count(),
+            MAX_ERROR_CHAIN_CHARS + 1
+        );
+    }
+
+    /// A real reqwest failure carries its cause below the top layer.
+    #[tokio::test]
+    async fn error_chain_shows_the_cause_of_a_reqwest_failure() {
+        // A bound-then-dropped port on loopback: nothing listens there.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let err = build_integration_client(Duration::from_secs(5))
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        let top = err.to_string();
+        let chain = error_chain(&err);
+        assert!(chain.starts_with(&top));
+        assert!(chain.len() > top.len(), "no cause below `{top}`: {chain}");
+    }
 
     #[test]
     fn hardened_client_builds() {
