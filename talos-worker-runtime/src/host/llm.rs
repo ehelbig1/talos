@@ -360,6 +360,83 @@ pub(crate) fn decide_llm_tier_access(
     }
 }
 
+/// Why an external provider's key was not handed back.
+///
+/// `get_llm_api_key*` answers `None` both when the actor's ceiling refused the
+/// provider and when no key exists, and every caller used to render the second
+/// meaning ("set vault path …") for both — so a tier-1 actor calling Anthropic
+/// was told to add a key, the one remedy that must not be taken. The ceiling
+/// decision is the pure [`decide_llm_tier_access`], so the caller can recover
+/// the reason exactly, without a second lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LlmKeyUnavailable {
+    /// The actor's `max_llm_tier` forbids this external provider.
+    CeilingRefused { provider: String },
+    /// No key is configured for the provider.
+    Missing {
+        vault_path: &'static str,
+        env_name: &'static str,
+    },
+}
+
+impl LlmKeyUnavailable {
+    /// Classify a `None` from `get_llm_api_key*` for `provider` under `ceiling`.
+    pub(crate) fn classify(provider: &str, ceiling: talos_workflow_job_protocol::LlmTier) -> Self {
+        let lower = provider.to_ascii_lowercase();
+        if decide_llm_tier_access(&lower, ceiling) == LlmTierDecision::Refused {
+            return Self::CeilingRefused { provider: lower };
+        }
+        let (vault_path, env_name) =
+            llm_key_lookup_paths(&lower).unwrap_or(("<unknown>", "<unknown>"));
+        Self::Missing {
+            vault_path,
+            env_name,
+        }
+    }
+
+    /// The sentence handed to the guest. Each names the remedy that applies.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::CeilingRefused { provider } => format!(
+                "LLM provider `{provider}` is external, and this actor's max_llm_tier is tier1 \
+                 (data must not leave the host), so no key was resolved. Use provider `ollama` \
+                 with a locally pulled model, or raise the actor's ceiling with \
+                 set_actor_llm_tier_ceiling."
+            ),
+            Self::Missing {
+                vault_path,
+                env_name,
+            } => format!(
+                "LLM API key not configured. Set vault path `{vault_path}` in the dashboard \
+                 (Settings → Secrets), or export {env_name} in the worker environment as a \
+                 fallback."
+            ),
+        }
+    }
+}
+
+impl TalosContext {
+    /// The guest-facing sentence for a `None` from `get_llm_api_key*`, logging
+    /// a missing key. A ceiling refusal is NOT logged again here: the key
+    /// lookup already recorded it (capability denial + WARN) where it refused.
+    pub(crate) fn llm_key_unavailable_message(&self, provider: &str) -> String {
+        let why = LlmKeyUnavailable::classify(provider, self.max_llm_tier);
+        if let LlmKeyUnavailable::Missing {
+            vault_path,
+            env_name,
+        } = &why
+        {
+            tracing::warn!(
+                vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
+                env_name,
+                module_id = ?self.module_id,
+                "LLM API key not configured"
+            );
+        }
+        why.message()
+    }
+}
+
 /// The provider name a cloud-served Ollama model is judged as by
 /// [`decide_llm_tier_access`]: an EXTERNAL provider, so a tier-1 ceiling
 /// refuses it and a tier-2 one allows it — the same answer, from the same
@@ -672,27 +749,11 @@ impl TalosContext {
             match self.get_llm_api_key(provider).await {
                 Some(k) => k,
                 None => {
-                    let (vault_path, env_name) = match provider {
-                        wit_llm::Provider::Anthropic => ("anthropic/api_key", "ANTHROPIC_API_KEY"),
-                        wit_llm::Provider::Openai => ("openai/api_key", "OPENAI_API_KEY"),
-                        wit_llm::Provider::Gemini => ("gemini/api_key", "GEMINI_API_KEY"),
-                        wit_llm::Provider::Ollama => unreachable!(),
-                    };
-                    let msg = format!(
-                        "LLM API key not configured. Set vault path `{}` in the dashboard (Settings → Secrets), \
-                         or export {} in the worker environment as a fallback.",
-                        vault_path, env_name
-                    );
-                    tracing::warn!(
-                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
-                        env_name,
-                        module_id = ?self.module_id,
-                        "{}",
-                        msg
-                    );
                     // Also the Tier-1-refusal exit: `get_llm_api_key` returns
-                    // `None` for a ceiling denial too, and cannot be told apart
-                    // from a genuinely missing key here. See `LlmFailure::NotConfigured`.
+                    // `None` for a ceiling denial too. The MESSAGE tells the
+                    // two apart (`LlmKeyUnavailable`); the metric label
+                    // deliberately does not — see `LlmFailure::NotConfigured`.
+                    let msg = self.llm_key_unavailable_message(provider_label);
                     return Err(LlmCallFailure::new(
                         crate::metrics::LlmFailure::NotConfigured,
                         wit_llm::Error::NotConfigured(msg),
@@ -1172,10 +1233,7 @@ impl wit_embedding::Host for TalosContext {
             Some(k) => k,
             None => {
                 return Err(wit_embedding::Error::NotConfigured(
-                    "OpenAI API key not configured. Set vault path `openai/api_key` in \
-                     the dashboard (Settings → Secrets), or export OPENAI_API_KEY in the \
-                     worker environment as a fallback."
-                        .into(),
+                    self.llm_key_unavailable_message("openai"),
                 ));
             }
         };
