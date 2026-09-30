@@ -39,7 +39,15 @@
       "MAX_TOKENS": {
         "type": "number",
         "default": 1024,
-        "description": "Maximum number of tokens the model may generate in the response. Capped at u32::MAX."
+        "description": "Maximum number of tokens the model may generate in the response. Capped at u32::MAX. An answer the provider cuts off at this budget fails the node unless ALLOW_TRUNCATED_OUTPUT is true."
+      },
+      "ALLOW_TRUNCATED_OUTPUT": {
+        "type": [
+          "boolean",
+          "string"
+        ],
+        "default": false,
+        "description": "Accept an answer the provider cut off at MAX_TOKENS (stop reason length / max_tokens). Default false: a cut-off answer fails the node, because a truncated answer — half a JSON object, half a briefing — would otherwise be used as if complete. Set true only where a partial answer is acceptable."
       },
       "TEMPERATURE": {
         "type": "number",
