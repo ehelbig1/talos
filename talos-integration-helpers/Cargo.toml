@@ -52,7 +52,8 @@ uuid.workspace = true
 [dev-dependencies]
 # `start_paused = true` in the renewal-scheduler test needs tokio's
 # test-util clock control.
-tokio = { version = "1", features = ["sync", "rt", "macros", "time", "test-util"] }
+# `net` + `io-util`: google_jwt::tests serve a JWK set from a loopback socket.
+tokio = { version = "1", features = ["sync", "rt", "macros", "time", "test-util", "net", "io-util"] }
 # google_jwt::tests mint RSA keypairs to back locally-signed test JWTs
 # and hand-assemble an `alg: none` token via base64. Production verifies
 # Google's JWKs and never calls rsa::* / base64 directly.

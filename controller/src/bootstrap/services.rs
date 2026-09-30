@@ -648,6 +648,13 @@ pub(crate) async fn build_platform_services(
         talos_github_connect::GithubConnectService::new(db_pool.clone(), github_app_config),
     );
 
+    // ONE Google push-JWT key cache for the process. Gmail and Google Cloud
+    // push both verify Google-signed OIDC tokens against the same public key
+    // set, so they share it: one fetch, one boot warm-up. Construction does
+    // no I/O; the warm-up is spawned below only if a receiver is enabled.
+    let google_oidc_verifier =
+        std::sync::Arc::new(talos_integration_helpers::google_jwt::GoogleOidcVerifier::new());
+
     // ---------- Gmail push-notification (watch) service ----------
     // Optional. Requires an operator-created Pub/Sub topic + push
     // subscription. If GMAIL_PUBSUB_TOPIC is unset, push receiving
@@ -701,7 +708,8 @@ pub(crate) async fn build_platform_services(
     let gmail_pubsub_verifier: Option<std::sync::Arc<gmail::pubsub_jwt::PubsubJwtVerifier>> =
         match (&gmail_watch_service, &gmail_pubsub_audience) {
             (Some(_), Some(aud)) => Some(std::sync::Arc::new(
-                gmail::pubsub_jwt::PubsubJwtVerifier::new(
+                gmail::pubsub_jwt::PubsubJwtVerifier::with_shared_verifier(
+                    google_oidc_verifier.clone(),
                     aud.clone(),
                     gmail_pubsub_service_account.clone(),
                 ),
@@ -741,11 +749,9 @@ pub(crate) async fn build_platform_services(
             ));
             // The shared verifier holds only the JWK cache; the audience
             // is passed per-call and the service-account email is
-            // per-watch, so one verifier serves every GCP watch channel.
-            let verifier = std::sync::Arc::new(
-                talos_integration_helpers::google_jwt::GoogleOidcVerifier::new(),
-            );
-            (Some(watch), Some(verifier))
+            // per-watch, so one verifier serves every GCP watch channel —
+            // and Gmail's receiver (above) as well.
+            (Some(watch), Some(google_oidc_verifier.clone()))
         }
         None => {
             tracing::info!(
@@ -754,6 +760,33 @@ pub(crate) async fn build_platform_services(
             (None, None)
         }
     };
+
+    // Fetch Google's push-JWT keys before the first push. Measured over 30
+    // days, 26% of controller lifetimes failed the lazy first fetch — made
+    // by the first push after a restart, i.e. the head of the redelivery
+    // backlog — and refused that backlog for the 60 s backoff. Fire and
+    // forget: boot neither waits for nor fails on it; see
+    // `GoogleOidcVerifier::warm` for the bounded schedule.
+    if gmail_pubsub_verifier.is_some() || gcp_pubsub_verifier.is_some() {
+        let verifier = google_oidc_verifier.clone();
+        tokio::spawn(async move {
+            match verifier.warm().await {
+                talos_integration_helpers::google_jwt::JwkWarmup::Warmed { attempts } => {
+                    tracing::info!(attempts, "Google push-JWT keys fetched at boot");
+                }
+                talos_integration_helpers::google_jwt::JwkWarmup::AlreadyWarm => {}
+                talos_integration_helpers::google_jwt::JwkWarmup::GaveUp { attempts } => {
+                    // INFO, not WARN: the last attempt already logged the
+                    // WARN carrying the cause; one incident, one WARN.
+                    tracing::info!(
+                        attempts,
+                        "Google push-JWT keys could not be fetched at boot; the first push \
+                         will retry (the JWK refresh WARN above names the cause)"
+                    );
+                }
+            }
+        });
+    }
 
     // ---------- Push-channel inventories (operator surfaces) ----------
     //
