@@ -172,6 +172,8 @@ pub mod platform;
 #[cfg(test)]
 mod push_channel_wiring_tests;
 pub mod resources;
+#[cfg(test)]
+mod restore_pinned_pin;
 pub mod sandbox;
 pub mod schedules;
 pub mod schemas;

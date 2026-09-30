@@ -120,16 +120,25 @@ async fn drop_users(pool: &Pool<Postgres>, users: &[Uuid]) {
         .await;
 }
 
-// ── M1: restore_pinned_modules — the cross-tenant write ─────────────────────
+// ── M1: restore_pinned_modules — the restore write ──────────────────────────
+//
+// The restore writer is keyed by module id AND owner since 2026-09-30
+// (`restore_missing_module_wasm`). The name-keyed writer it replaced once wrote
+// `WHERE name = $2` and clobbered every tenant's module of that name plus the
+// shared catalog row; these tests keep that guarantee on the new shape, and
+// add the two it gained: the hash is written with the bytes, and present bytes
+// are never overwritten.
 
-/// **The defect, verbatim.** `update_template_precompiled_wasm` wrote
-/// `WHERE name = $2`. Two tenants each holding a module called
-/// `pa-scope-shared-<uuid>` is the ordinary case — every user who installs the
-/// same catalog template has one — and user A restoring their pin overwrote
-/// user B's compiled bytes. A tenant who had `hot_update_module`'d their copy
-/// silently lost it, with no history row and no audit event.
-///
-/// On the pre-fix tree B's bytes become A's and this assertion fails.
+async fn hash_of(pool: &Pool<Postgres>, module_id: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT content_hash FROM modules WHERE id = $1")
+        .bind(module_id)
+        .fetch_one(pool)
+        .await
+        .expect("hash")
+}
+
+/// Another tenant's module id writes nothing, even though the caller holds a
+/// module of the same name.
 #[tokio::test]
 async fn restore_wasm_write_does_not_reach_another_tenants_module() {
     let Some(pool) = pool_or_skip().await else {
@@ -138,39 +147,21 @@ async fn restore_wasm_write_does_not_reach_another_tenants_module() {
     let user_a = seed_user(&pool, "a").await;
     let user_b = seed_user(&pool, "b").await;
     let shared_name = format!("pa-scope-shared-{}", Uuid::new_v4());
-
-    let a_mod = seed_module(&pool, user_a, &shared_name, Some(b"A-ORIGINAL"), 1).await;
-    let b_mod = seed_module(&pool, user_b, &shared_name, Some(b"B-CUSTOMISED"), 1).await;
+    seed_module(&pool, user_a, &shared_name, None, 1).await;
+    let b_mod = seed_module(&pool, user_b, &shared_name, None, 1).await;
 
     let repo = ModuleRepository::new(pool.clone());
     let affected = repo
-        .update_template_precompiled_wasm(&shared_name, b"A-REBUILT", user_a)
+        .restore_missing_module_wasm(b_mod, user_a, b"A-REBUILT", "hash-a")
         .await
-        .expect("update wasm");
-
-    assert_eq!(
-        affected, 1,
-        "the write must land on exactly ONE row — this user's install. \
-         2 means it reached another tenant; 0 means it reached nobody"
-    );
-    assert_eq!(
-        wasm_of(&pool, a_mod).await.as_deref(),
-        Some(&b"A-REBUILT"[..]),
-        "the requesting user's own module must be the one restored"
-    );
-    assert_eq!(
-        wasm_of(&pool, b_mod).await.as_deref(),
-        Some(&b"B-CUSTOMISED"[..]),
-        "another tenant's module of the same name must be untouched — this is the \
-         cross-tenant clobber the unscoped `WHERE name = $2` performed"
-    );
+        .expect("restore");
+    assert_eq!(affected, 0, "A may not write B's module by id");
+    assert_eq!(wasm_of(&pool, b_mod).await, None, "B's module is untouched");
 
     drop_users(&pool, &[user_a, user_b]).await;
 }
 
-/// The shared CATALOG row (`user_id IS NULL`) is the other victim of the
-/// unscoped write, and it is a distinct case from a peer tenant: it is global by
-/// construction, so nothing about per-user uniqueness protects it.
+/// The shared CATALOG row (`user_id IS NULL`) is never a restore target.
 #[tokio::test]
 async fn restore_wasm_write_does_not_reach_the_shared_catalog_row() {
     let Some(pool) = pool_or_skip().await else {
@@ -178,40 +169,27 @@ async fn restore_wasm_write_does_not_reach_the_shared_catalog_row() {
     };
     let user_a = seed_user(&pool, "cat").await;
     let shared_name = format!("pa-scope-catalog-{}", Uuid::new_v4());
-
     let catalog_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO modules (id, user_id, name, kind, wasm_bytes, compiled_at) \
-         VALUES ($1, NULL, $2, 'catalog', $3, NOW())",
+         VALUES ($1, NULL, $2, 'catalog', NULL, NOW())",
     )
     .bind(catalog_id)
     .bind(&shared_name)
-    .bind(&b"CATALOG-BYTES"[..])
     .execute(&pool)
     .await
     .expect("seed catalog row");
 
-    let a_mod = seed_module(&pool, user_a, &shared_name, Some(b"A-ORIGINAL"), 1).await;
-
     let repo = ModuleRepository::new(pool.clone());
     let affected = repo
-        .update_template_precompiled_wasm(&shared_name, b"A-REBUILT", user_a)
+        .restore_missing_module_wasm(catalog_id, user_a, b"A-REBUILT", "hash-a")
         .await
-        .expect("update wasm");
-
+        .expect("restore");
     assert_eq!(
-        affected, 1,
-        "only the user's own install row may be written"
+        affected, 0,
+        "the shared catalog row is no user's restore target"
     );
-    assert_eq!(
-        wasm_of(&pool, catalog_id).await.as_deref(),
-        Some(&b"CATALOG-BYTES"[..]),
-        "the shared catalog row must be untouched by one user's restore"
-    );
-    assert_eq!(
-        wasm_of(&pool, a_mod).await.as_deref(),
-        Some(&b"A-REBUILT"[..])
-    );
+    assert_eq!(wasm_of(&pool, catalog_id).await, None);
 
     let _ = sqlx::query("DELETE FROM modules WHERE id = $1")
         .bind(catalog_id)
@@ -220,40 +198,68 @@ async fn restore_wasm_write_does_not_reach_the_shared_catalog_row() {
     drop_users(&pool, &[user_a]).await;
 }
 
-/// A pin with no install row for this user must report zero rows written, not
-/// silent success. The handler turns `Ok(0)` into an explicit `failed` entry —
-/// reporting it as `restored` would tell the operator a module is usable when
-/// the write went nowhere, which is this same class one level down.
+/// The owner's evicted module is restored WITH the hash of the bytes written
+/// (the old writer left the previous hash), and a module whose bytes are
+/// present is never overwritten.
 #[tokio::test]
-async fn restore_wasm_write_reports_zero_when_this_user_has_no_install_row() {
+async fn restore_writes_the_hash_and_never_overwrites_present_bytes() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let user_a = seed_user(&pool, "noinstall").await;
-    let user_b = seed_user(&pool, "hasinstall").await;
-    let name = format!("pa-scope-absent-{}", Uuid::new_v4());
+    let user_a = seed_user(&pool, "own").await;
+    let evicted = seed_module(
+        &pool,
+        user_a,
+        &format!("pa-evicted-{}", Uuid::new_v4()),
+        None,
+        1,
+    )
+    .await;
+    let present = seed_module(
+        &pool,
+        user_a,
+        &format!("pa-present-{}", Uuid::new_v4()),
+        Some(b"FRESH"),
+        1,
+    )
+    .await;
 
-    // Only B has a row under this name. A has none.
-    let b_mod = seed_module(&pool, user_b, &name, Some(b"B-BYTES"), 1).await;
-
-    let repo = ModuleRepository::new(pool.clone());
-    let affected = repo
-        .update_template_precompiled_wasm(&name, b"A-REBUILT", user_a)
+    // The evicted row still carries the hash of the bytes it USED to hold —
+    // the eviction sweep keeps `content_hash`.
+    sqlx::query("UPDATE modules SET content_hash = 'hash-before-eviction' WHERE id = $1")
+        .bind(evicted)
+        .execute(&pool)
         .await
-        .expect("update wasm");
-
+        .expect("seed old hash");
+    let repo = ModuleRepository::new(pool.clone());
     assert_eq!(
-        affected, 0,
-        "A owns no row under this name, so the write must land nowhere and say so. \
-         Pre-fix this returned 1 — having written B's module."
+        repo.restore_missing_module_wasm(evicted, user_a, b"REBUILT", "hash-rebuilt")
+            .await
+            .expect("restore"),
+        1
     );
     assert_eq!(
-        wasm_of(&pool, b_mod).await.as_deref(),
-        Some(&b"B-BYTES"[..]),
-        "B's module must be untouched by a restore A had no row for"
+        wasm_of(&pool, evicted).await.as_deref(),
+        Some(&b"REBUILT"[..])
+    );
+    assert_eq!(
+        hash_of(&pool, evicted).await.as_deref(),
+        Some("hash-rebuilt")
     );
 
-    drop_users(&pool, &[user_a, user_b]).await;
+    assert_eq!(
+        repo.restore_missing_module_wasm(present, user_a, b"STALE", "hash-stale")
+            .await
+            .expect("restore"),
+        0,
+        "present bytes are never replaced by a restore"
+    );
+    assert_eq!(
+        wasm_of(&pool, present).await.as_deref(),
+        Some(&b"FRESH"[..])
+    );
+
+    drop_users(&pool, &[user_a]).await;
 }
 
 /// The READ leg of the same defect. `list_user_pinned_modules` joined

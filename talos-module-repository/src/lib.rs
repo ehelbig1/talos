@@ -495,6 +495,14 @@ pub struct PinnedModuleStatus {
     pub has_wasm: bool,
 }
 
+/// A pinned module to rebuild. See [`ModuleRepository::get_pinned_restore_target`].
+#[derive(Debug, Clone)]
+pub struct PinnedRestoreTarget {
+    pub module_id: Uuid,
+    pub catalog_slug: Option<String>,
+    pub source_code: String,
+}
+
 /// Row returned by find_module_alternatives queries — covers both the
 /// "target lookup" projection and the trigram/category/ilike result projection
 /// (the latter add `score` and `same_category` as optional fields).
@@ -2002,50 +2010,67 @@ impl ModuleRepository {
             .collect::<Result<Vec<_>>>()
     }
 
-    /// Phase 5: update a module's precompiled wasm bytes by name (modules
-    /// table; `wasm_bytes` replaces the legacy `precompiled_wasm` column).
-    ///
-    /// **Scoped to `owner_user_id`.** This write used to be `WHERE name = $2`
-    /// with no owner predicate, which is safe only if `modules.name` is
-    /// globally unique. It is not:
-    /// `migrations/20260423000000_modules_table_phase1.sql:74-81` declares TWO
-    /// uniqueness scopes —
-    /// `modules_user_name_uniq (user_id, name) WHERE user_id IS NOT NULL` and
-    /// `modules_catalog_name_uniq (name) WHERE user_id IS NULL`. One
-    /// catalog-template name therefore names one row PER TENANT plus the shared
-    /// catalog row, and the unscoped UPDATE overwrote all of them:
-    /// `restore_pinned_modules` reported "N of YOUR pinned modules restored"
-    /// while writing N x (tenants holding those names). A tenant who had
-    /// `hot_update_module`'d their copy lost it to a stock catalog rebuild with
-    /// no history row and no audit event, and `compiled_at = NOW()` stamped on
-    /// every tenant's row corrupts the `ORDER BY compiled_at DESC` keeper
-    /// choice that `cleanup_module_versions` depends on.
-    ///
-    /// The correctly-scoped shape already existed one crate over:
-    /// `talos_advanced_repository::list_pinned_modules_with_user_install_status`
-    /// resolves a pin with `EXISTS(… WHERE m.user_id = $1 AND m.name = …)` and
-    /// documents `modules.user_id + name` as "the new per-user install signal".
-    /// This is that predicate applied to the write side.
-    ///
-    /// Returns `rows_affected` so the caller can distinguish a real restore (1)
-    /// from "this user has no install row under that name" (0), instead of
-    /// reporting success for a write that landed nowhere.
-    pub async fn update_template_precompiled_wasm(
+    /// The pinned copy `restore_pinned_modules` would rebuild: the caller's
+    /// own row named `name` (the pin stores the display name), with its id,
+    /// catalog slug and stored source. `None` when this user has no such row.
+    /// User-scoped by predicate; `modules.name` is unique only per user.
+    pub async fn get_pinned_restore_target(
         &self,
-        module_name: &str,
-        wasm_bytes: &[u8],
+        user_id: Uuid,
+        name: &str,
+    ) -> Result<Option<PinnedRestoreTarget>> {
+        let row: Option<(Uuid, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, catalog_slug, source_code FROM modules WHERE user_id = $1 AND name = $2",
+        )
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(row.map(
+            |(module_id, catalog_slug, source_code)| PinnedRestoreTarget {
+                module_id,
+                catalog_slug,
+                source_code: source_code.unwrap_or_default(),
+            },
+        ))
+    }
+
+    /// Put rebuilt bytes back on ONE of the caller's modules whose bytes are
+    /// missing (evicted or never written), with the hash that describes them
+    /// (2026-09-30).
+    ///
+    /// Replaces a name-keyed writer that set `wasm_bytes` and `size_bytes`
+    /// but not `content_hash`, leaving the row's hash describing bytes it no
+    /// longer held; an oversized module dispatched by reference is verified
+    /// against that hash by the worker. This one is keyed by `id` AND
+    /// `owner_user_id` (the tenancy predicate that name-keyed writer had to
+    /// learn, see `restore_wasm_write_does_not_reach_another_tenants_module`),
+    /// and fills ONLY missing bytes, so a restore racing a reinstall can never
+    /// overwrite fresher bytes. The `modules_clear_wasm_evicted_at` trigger
+    /// clears the eviction marker when the bytes land.
+    ///
+    /// Returns `rows_affected`: 0 means not this user's module, or its bytes
+    /// were already present.
+    pub async fn restore_missing_module_wasm(
+        &self,
+        module_id: Uuid,
         owner_user_id: Uuid,
+        wasm_bytes: &[u8],
+        content_hash: &str,
     ) -> Result<u64> {
         let result = sqlx::query(
             "UPDATE modules \
-             SET wasm_bytes = $1, \
-                 size_bytes = length($1)::INTEGER, \
+             SET wasm_bytes = $3, \
+                 content_hash = $4, \
+                 size_bytes = length($3)::INTEGER, \
                  compiled_at = NOW() \
-             WHERE name = $2 AND user_id = $3",
+             WHERE id = $1 AND user_id = $2 \
+               AND (wasm_bytes IS NULL OR octet_length(wasm_bytes) = 0)",
         )
-        .bind(wasm_bytes)
-        .bind(module_name)
+        .bind(module_id)
         .bind(owner_user_id)
+        .bind(wasm_bytes)
+        .bind(content_hash)
         .execute(&self.db_pool)
         .await?;
         Ok(result.rows_affected())
@@ -4271,10 +4296,9 @@ mod preview_action_scope_pins {
     #[test]
     fn pinned_wasm_write_is_scoped_to_one_owner() {
         assert!(
-            src().contains(concat!("WHERE name = $2 AND ", "user_id = $3")),
-            "update_template_precompiled_wasm lost its owner predicate; without it \
-             restore_pinned_modules reports a user-scoped restore while overwriting \
-             every tenant's module of that name and the shared catalog row"
+            src().contains(concat!("WHERE id = $1 AND ", "user_id = $2")),
+            "restore_missing_module_wasm lost its owner predicate; without it \
+             restore_pinned_modules could write another tenant's module by id"
         );
         // There is deliberately NO paired negative assertion ("the unscoped form
         // is not back"). The doc comments in this crate quote `WHERE name = $2`
