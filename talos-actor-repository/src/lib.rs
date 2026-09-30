@@ -372,6 +372,57 @@ pub struct ActorBasicInfo {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+/// The statuses from which an actor may be deleted: both are final (neither
+/// can be reactivated), so deleting one ends nothing that was still running.
+pub const ACTOR_FINAL_STATUSES: [&str; 2] = ["terminated", "archived"];
+
+/// How many action-log entries a deletion copies into its audit record. The
+/// true count is recorded beside it.
+pub const DELETION_ACTION_LOG_SNAPSHOT_MAX: i64 = 100;
+
+/// What still references an actor that is asked to be deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorReferences {
+    pub workflows: i64,
+    /// Live, archived and sub-workflow execution rows combined.
+    pub executions: i64,
+}
+
+/// What an actor deletion removes along with the actor (its cascades).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorDeletionRemoves {
+    pub action_log_entries: i64,
+    pub memories: i64,
+    pub approval_policies: i64,
+    pub budget_policies: i64,
+}
+
+/// The outcome of [`ActorRepository::delete_actor_recorded`].
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActorDeletion {
+    Deleted {
+        name: String,
+        status: String,
+        removed: ActorDeletionRemoves,
+    },
+    /// `dry_run`: every check passed; nothing was written.
+    WouldDelete {
+        name: String,
+        status: String,
+        removed: ActorDeletionRemoves,
+    },
+    /// Not the caller's actor, or no such actor — one answer for both.
+    NotFound,
+    DefaultActor,
+    /// A real delete whose `confirmed_name` did not match the actor's name.
+    NameMismatch,
+    NotFinal {
+        status: String,
+    },
+    StillReferenced(ActorReferences),
+}
+
 /// Compact actor row returned by `list_active_actors_basic` — fields needed
 /// by `suggest_actor_for_task` for keyword fallback scoring.
 #[derive(Debug)]
@@ -1144,6 +1195,161 @@ impl ActorRepository {
         .execute(&self.db_pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Permanently delete one of the caller's actors, RECORDED (2026-09-30).
+    ///
+    /// Until this method no path deleted an actor; `archive_actor` deferred to
+    /// "an admin-level tool" that did not exist, and the only way was a
+    /// hand-written `DELETE` that records nothing and silently cascades the
+    /// actor's own audit trail (`actor_action_log`) away.
+    ///
+    /// Everything happens in ONE transaction under a row lock on the actor:
+    ///
+    /// 1. REFUSE, writing nothing, when the actor is not the caller's
+    ///    ([`ActorDeletion::NotFound`] — one answer for absent and foreign,
+    ///    so it is not an existence oracle), is the user's Default actor
+    ///    (every execution without an actor falls back to it), is not in a
+    ///    FINAL state (`terminated` / `archived` — end an actor before deleting
+    ///    it), or is still referenced by any workflow or any execution
+    ///    history (live, archived, or a sub-workflow run), which the delete
+    ///    would falsify.
+    /// 2. Snapshot what the cascade removes — the action log (the first
+    ///    [`DELETION_ACTION_LOG_SNAPSHOT_MAX`] entries plus the true count),
+    ///    and the memory / approval-policy / budget-policy counts — into ONE
+    ///    `admin_event_log` row, so the audit trail outlives the actor.
+    /// 3. Delete. A deletion that cannot be recorded does not happen.
+    ///
+    /// `dry_run` evaluates the same checks and snapshot and rolls back.
+    /// Ledgers that carry the actor id without a foreign key
+    /// (`execution_cost_rollup`, `llm_usage`, `execution_memory_context`,
+    /// `secret_audit_log`) keep it: they are history, not the actor.
+    pub async fn delete_actor_recorded(
+        &self,
+        actor_id: Uuid,
+        user_id: Uuid,
+        dry_run: bool,
+        // The name the caller confirmed. Checked HERE, under the row lock,
+        // against the name this delete would remove, so a rename landing
+        // between a preview and the delete cannot slip through. `None` only
+        // for `dry_run`.
+        confirmed_name: Option<&str>,
+    ) -> Result<ActorDeletion> {
+        let mut tx = self.db_pool.begin().await?;
+        let row: Option<(String, String, bool)> = sqlx::query_as(
+            "SELECT name, status, is_default FROM actors \
+             WHERE id = $1 AND user_id = $2 FOR UPDATE",
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((name, status, is_default)) = row else {
+            return Ok(ActorDeletion::NotFound);
+        };
+        if is_default {
+            return Ok(ActorDeletion::DefaultActor);
+        }
+        if !dry_run && confirmed_name != Some(name.as_str()) {
+            return Ok(ActorDeletion::NameMismatch);
+        }
+        if !ACTOR_FINAL_STATUSES.contains(&status.as_str()) {
+            return Ok(ActorDeletion::NotFinal { status });
+        }
+        let references: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM workflows WHERE actor_id = $1), \
+                    (SELECT COUNT(*) FROM workflow_executions WHERE actor_id = $1), \
+                    (SELECT COUNT(*) FROM workflow_executions_archive WHERE actor_id = $1), \
+                    (SELECT COUNT(*) FROM module_executions WHERE actor_id = $1), \
+                    (SELECT COUNT(*) FROM sub_workflow_runs WHERE actor_id = $1)",
+        )
+        .bind(actor_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let referenced = ActorReferences {
+            workflows: references.0,
+            executions: references.1 + references.2 + references.3 + references.4,
+        };
+        if referenced.workflows > 0 || referenced.executions > 0 {
+            return Ok(ActorDeletion::StillReferenced(referenced));
+        }
+        let counts: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM actor_action_log WHERE actor_id = $1), \
+                    (SELECT COUNT(*) FROM actor_memory WHERE actor_id = $1), \
+                    (SELECT COUNT(*) FROM actor_approval_policies WHERE actor_id = $1), \
+                    (SELECT COUNT(*) FROM actor_budget_policies WHERE actor_id = $1)",
+        )
+        .bind(actor_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let action_log: Vec<(DateTime<Utc>, String, Option<String>)> = sqlx::query_as(
+            "SELECT timestamp, action_type, summary FROM actor_action_log \
+             WHERE actor_id = $1 ORDER BY timestamp, id LIMIT $2",
+        )
+        .bind(actor_id)
+        .bind(DELETION_ACTION_LOG_SNAPSHOT_MAX)
+        .fetch_all(&mut *tx)
+        .await?;
+        let removed = ActorDeletionRemoves {
+            action_log_entries: counts.0,
+            memories: counts.1,
+            approval_policies: counts.2,
+            budget_policies: counts.3,
+        };
+        if dry_run {
+            tx.rollback().await?;
+            return Ok(ActorDeletion::WouldDelete {
+                name,
+                status,
+                removed,
+            });
+        }
+        let details = serde_json::json!({
+            "actor_name": name,
+            "final_status": status,
+            "removed": {
+                "action_log_entries": removed.action_log_entries,
+                "memories": removed.memories,
+                "approval_policies": removed.approval_policies,
+                "budget_policies": removed.budget_policies,
+            },
+            // The actor's own audit trail, preserved here because the cascade
+            // deletes it. Capped; the true count is above.
+            "action_log": action_log
+                .iter()
+                .map(|(at, kind, summary)| serde_json::json!({
+                    "timestamp": at.to_rfc3339(),
+                    "action_type": kind,
+                    "summary": summary,
+                }))
+                .collect::<Vec<_>>(),
+            "action_log_truncated": removed.action_log_entries > DELETION_ACTION_LOG_SNAPSHOT_MAX,
+        });
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(user_id),
+            "actor_deleted",
+            "actor",
+            Some(actor_id),
+            &format!("Actor '{name}' ({actor_id}) deleted via MCP delete_actor"),
+            Some(&details),
+        )
+        .await?;
+        let deleted = sqlx::query("DELETE FROM actors WHERE id = $1 AND user_id = $2")
+            .bind(actor_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        anyhow::ensure!(
+            deleted.rows_affected() == 1,
+            "actor row vanished under its own lock"
+        );
+        tx.commit().await?;
+        Ok(ActorDeletion::Deleted {
+            name,
+            status,
+            removed,
+        })
     }
 
     /// Set an actor's status to 'terminated', scoped to the requesting user.
