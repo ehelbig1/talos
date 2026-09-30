@@ -383,6 +383,48 @@ pub(crate) fn record_rpc_metric(
     }
 }
 
+/// The DETAIL line for an op that returned an error: the error's own `Debug`
+/// (the `InvalidInput` reason, the `Internal` cause), which the `talos_rpc`
+/// completion line above does not carry.
+///
+/// Its level rests on the same `RpcOutcome::class()`. A `Finding` stays at
+/// `warn!`. A `Declined` outcome is `debug!`, because `record_rpc_metric`
+/// already writes that call's `info!` "rpc declined" line and counts it —
+/// until 2026-09-30 this line was an unconditional `warn!`, so the first
+/// `agent_memory::get` of a never-written key (the documented "no memory
+/// yet" path) wrote a WARN and an INFO for one designed outcome. Check 69's
+/// harm: a level that fires on a healthy fleet trains operators to ignore it.
+///
+/// The target and the rendered message are unchanged (`"<label>: op failed"`
+/// on this crate's default target), so an existing log filter still matches.
+pub(crate) fn log_op_error(
+    label: &'static str,
+    actor_id: uuid::Uuid,
+    integration: Option<&str>,
+    outcome: RpcOutcome,
+    error: &dyn std::fmt::Debug,
+) {
+    let loud = matches!(outcome.class(), OutcomeClass::Finding);
+    match (loud, integration) {
+        (true, None) => tracing::warn!(
+            actor_id = %actor_id, outcome = outcome.as_str(), error = ?error,
+            "{label}: op failed"
+        ),
+        (false, None) => tracing::debug!(
+            actor_id = %actor_id, outcome = outcome.as_str(), error = ?error,
+            "{label}: op failed"
+        ),
+        (true, Some(integration)) => tracing::warn!(
+            actor_id = %actor_id, integration, outcome = outcome.as_str(), error = ?error,
+            "{label}: op failed"
+        ),
+        (false, Some(integration)) => tracing::debug!(
+            actor_id = %actor_id, integration, outcome = outcome.as_str(), error = ?error,
+            "{label}: op failed"
+        ),
+    }
+}
+
 /// Live-broker behaviour of TWO subscriber kernels on one subject — the
 /// shape of two controller replicas (chart default `replicaCount: 2`).
 /// Gated on `TALOS_TEST_NATS_URL` / `TALOS_TEST_NATS_PERM_URL`; named
@@ -807,6 +849,93 @@ mod kernel_tests {
             let got = cap.0.lock().expect("capture lock")[0].0;
             assert_eq!(got, expected, "wrong level for `{}`", outcome.as_str());
         }
+    }
+
+    /// Every event, whatever its target: the op-error line is on this
+    /// crate's default target, not `talos_rpc`.
+    #[derive(Clone, Default)]
+    struct AnyCapture(Arc<Mutex<Vec<tracing::Level>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for AnyCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .push(*event.metadata().level());
+        }
+    }
+
+    fn op_error_level(outcome: RpcOutcome, integration: Option<&str>) -> tracing::Level {
+        let cap = AnyCapture::default();
+        let subscriber = Registry::default()
+            .with(LevelFilter::TRACE)
+            .with(cap.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            log_op_error(
+                "memory RPC",
+                uuid::Uuid::nil(),
+                integration,
+                outcome,
+                &"err",
+            );
+        });
+        let seen = cap.0.lock().expect("capture lock").clone();
+        assert_eq!(seen.len(), 1, "exactly one detail line per failed op");
+        seen[0]
+    }
+
+    /// A never-written key is the documented "no memory yet" path: its detail
+    /// line must not be a WARN (it was, unconditionally, until 2026-09-30),
+    /// and a platform failure's must stay one.
+    #[test]
+    fn the_op_error_line_is_loud_only_for_a_finding() {
+        assert_eq!(
+            op_error_level(RpcOutcome::NotFound, None),
+            tracing::Level::DEBUG
+        );
+        assert_eq!(
+            op_error_level(RpcOutcome::NotFound, Some("gmail")),
+            tracing::Level::DEBUG
+        );
+        assert_eq!(
+            op_error_level(RpcOutcome::Internal, None),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            op_error_level(RpcOutcome::Internal, Some("gmail")),
+            tracing::Level::WARN
+        );
+        for outcome in RpcOutcome::ALL {
+            let expected = match outcome.class() {
+                OutcomeClass::Finding => tracing::Level::WARN,
+                OutcomeClass::Served | OutcomeClass::Declined => tracing::Level::DEBUG,
+            };
+            assert_eq!(
+                op_error_level(*outcome, None),
+                expected,
+                "wrong level for `{}`",
+                outcome.as_str()
+            );
+        }
+    }
+
+    /// Both handlers must route their error detail through `log_op_error`; a
+    /// hand-written `warn!` at either site restores the defect and the test
+    /// above cannot see a call site.
+    #[test]
+    fn both_op_error_sites_route_through_the_helper() {
+        let lib = include_str!("lib.rs");
+        let needle = concat!("RPC: op failed", "\"");
+        assert_eq!(
+            lib.matches(needle).count(),
+            0,
+            "an `op failed` line is hand-written in lib.rs again; use kernel::log_op_error"
+        );
+        assert_eq!(
+            lib.matches("kernel::log_op_error(").count(),
+            2,
+            "memory and integration-state handlers each call log_op_error once"
+        );
     }
 
     #[test]

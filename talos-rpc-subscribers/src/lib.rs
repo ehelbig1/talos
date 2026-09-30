@@ -1948,11 +1948,7 @@ pub fn spawn_memory_rpc_subscriber(
             let reply = match op_result {
                 Ok(r) => MemoryRpcReply { result: Ok(r) },
                 Err(e) => {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        error = ?e,
-                        "memory RPC: op failed"
-                    );
+                    kernel::log_op_error("memory RPC", req.actor_id, None, outcome_tag, &e);
                     MemoryRpcReply { result: Err(e) }
                 }
             };
@@ -3216,11 +3212,12 @@ pub fn spawn_integration_state_subscriber(
             let reply = match op_result {
                 Ok(r) => IntegrationStateReply { result: Ok(r) },
                 Err(e) => {
-                    tracing::warn!(
-                        actor_id = %req.actor_id,
-                        integration = %req.integration_name,
-                        error = ?e,
-                        "integration-state RPC: op failed"
+                    kernel::log_op_error(
+                        "integration-state RPC",
+                        req.actor_id,
+                        Some(req.integration_name.as_str()),
+                        outcome_tag,
+                        &e,
                     );
                     IntegrationStateReply { result: Err(e) }
                 }
