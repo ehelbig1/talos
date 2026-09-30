@@ -327,6 +327,8 @@ async fn an_answer_to_a_truncated_prompt_is_refused() {
             assert_eq!(got.unwrap(), "answer");
         }
     }
+}
+
 /// Plain `complete` turns thinking off too (it was the one path that sent no
 /// `think`, so a thinking-by-default model spent the budget reasoning), and
 /// shares the retry-without-`think` on a 400 — with the prompt unchanged.
