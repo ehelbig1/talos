@@ -134,6 +134,23 @@ async fn wait_complete(
     );
 }
 
+/// Corrections seeded for the round-trip test: more than the audit's 8
+/// few-shot anchors, so some rows are actually compared.
+const GOLD_ROWS: usize = 12;
+
+/// Rows the audit compared, asserting the rest were skipped as few-shot
+/// anchors — every seeded correction is accounted for, and at least one was
+/// compared (a report over zero rows would prove nothing).
+fn compared_rows(report: &serde_json::Value) -> u64 {
+    let compared = report["compared"].as_u64().expect("compared");
+    let skipped = report["skipped_few_shot_anchors"]
+        .as_u64()
+        .expect("skipped");
+    assert!(compared > 0, "the audit compared no rows: {report}");
+    assert_eq!(compared + skipped, GOLD_ROWS as u64, "{report}");
+    compared
+}
+
 fn answer(
     label: &'static str,
 ) -> impl Fn(TeacherRequest) -> std::future::Ready<anyhow::Result<String>> + Send + 'static {
@@ -145,7 +162,10 @@ async fn a_system_one_audit_is_stored_beside_the_chat_teacher_and_survives_a_re_
     let (pool, _db) = common::isolated_db_pool().await;
     let (user, model) = seed(&pool).await;
     let (ls, dsvc) = services(&pool).await;
-    add_corrections(&pool, &ls, &dsvc, model, user, 3).await;
+    // More corrections than the few-shot budget (8): a gold row that is also
+    // an anchor is skipped by the audit's self-leakage guard, so with fewer
+    // rows than anchors nothing would be compared at all.
+    add_corrections(&pool, &ls, &dsvc, model, user, GOLD_ROWS).await;
 
     // Chat teacher: agrees with every correction ("archive").
     start_teacher_audit(
@@ -163,7 +183,11 @@ async fn a_system_one_audit_is_stored_beside_the_chat_teacher_and_survives_a_re_
     let v = wait_complete(&pool, model, "/status").await;
     assert_eq!(v["teacher"]["backend"], "chat");
     assert_eq!(v["teacher"]["model"], "chat-teacher");
-    assert_eq!(v["agree"], 3);
+    let compared = compared_rows(&v);
+    assert_eq!(
+        v["agree"], compared,
+        "the chat stub agrees with every correction"
+    );
 
     // System One: sees the label set, disagrees with every correction.
     let saw_labels = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -181,6 +205,7 @@ async fn a_system_one_audit_is_stored_beside_the_chat_teacher_and_survives_a_re_
     let v = wait_complete(&pool, model, "/systemone/status").await;
     assert_eq!(v["systemone"]["teacher"]["backend"], "systemone");
     assert_eq!(v["systemone"]["teacher"]["model"], "nimble:9b");
+    assert_eq!(compared_rows(&v["systemone"]), compared);
     assert_eq!(v["systemone"]["agree"], 0);
     assert_eq!(
         *saw_labels.lock().unwrap(),
@@ -188,7 +213,7 @@ async fn a_system_one_audit_is_stored_beside_the_chat_teacher_and_survives_a_re_
     );
     // The chat teacher's report is untouched.
     assert_eq!(v["teacher"]["backend"], "chat");
-    assert_eq!(v["agree"], 3);
+    assert_eq!(v["agree"], compared);
 
     // A routine chat re-audit carries the System One comparison across.
     start_teacher_audit(
@@ -203,12 +228,8 @@ async fn a_system_one_audit_is_stored_beside_the_chat_teacher_and_survives_a_re_
     )
     .await
     .expect("chat re-audit starts");
-    for _ in 0..100 {
-        if teacher_audit(&pool, model).await["agree"] == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // `start_teacher_audit` stamps `running` before it returns, so the
+    // `complete` awaited here is the re-audit's own.
     let v = wait_complete(&pool, model, "/status").await;
     assert_eq!(v["agree"], 0, "the re-audit's own figure");
     assert_eq!(v["systemone"]["teacher"]["model"], "nimble:9b");
