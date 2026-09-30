@@ -568,10 +568,11 @@ fn a_cancelled_execution_is_counted_before_any_request() {
 #[test]
 fn a_tier1_ceiling_refusing_an_external_provider_is_counted() {
     // Reaches `NotConfigured` without touching process env: `get_llm_api_key`
-    // returns `None` for a tier refusal exactly as it does for a missing key,
-    // and `complete_inner` cannot tell them apart. Asserting through the tier
-    // gate keeps the case deterministic regardless of whether the developer
-    // running it has ANTHROPIC_API_KEY exported.
+    // returns `None` for a tier refusal exactly as it does for a missing key.
+    // The metric label is shared; the MESSAGE names the ceiling (see
+    // `a_tier1_refusal_names_the_ceiling_not_a_missing_key_on_every_path`).
+    // Asserting through the tier gate keeps the case deterministic regardless
+    // of whether the developer running it has ANTHROPIC_API_KEY exported.
     let err = assert_complete_fails_with(
         LlmTier::Tier1,
         wit_llm::Provider::Anthropic,
@@ -1519,4 +1520,94 @@ fn the_local_model_decision_admits_only_proven_local() {
     // A guest-supplied model name is bounded in what reaches the ledger/log.
     let long = "m".repeat(10_000);
     assert!(LocalModelRefusal::Unlisted.message(&long).len() < 1_000);
+}
+
+// ---------------------------------------------------------------------------
+// A refused external provider names the ceiling, not a missing key
+// ---------------------------------------------------------------------------
+
+/// A tier-1 actor calling Anthropic is refused by its ceiling. Every path must
+/// SAY so: until 2026-09-30 each one answered "LLM API key not configured. Set
+/// vault path `anthropic/api_key`", the one remedy that must not be taken.
+/// Driven through all four WIT entry points (each renders the message at its
+/// own call site). Deterministic: a ceiling refusal resolves no key, so an
+/// exported ANTHROPIC_API_KEY cannot change the answer.
+#[test]
+fn a_tier1_refusal_names_the_ceiling_not_a_missing_key_on_every_path() {
+    let _g = guard();
+    rt().block_on(async {
+        let mut msgs: Vec<(&str, String)> = Vec::new();
+
+        let mut ctx = context_with_metrics(LlmTier::Tier1);
+        match <TalosContext as wit_llm::Host>::complete(
+            &mut ctx,
+            request(wit_llm::Provider::Anthropic, "claude-sonnet-4-20250514"),
+        )
+        .await
+        {
+            Err(wit_llm::Error::NotConfigured(m)) => msgs.push(("complete", m)),
+            other => panic!("complete: {other:?}"),
+        }
+
+        let mut ctx = context_with_metrics_in_world(LlmTier::Tier1, CapabilityWorld::Agent);
+        let mut req = tool_request("claude-sonnet-4-20250514");
+        req.provider = Some(wit_llm_tools::Provider::Anthropic);
+        match <TalosContext as wit_llm_tools::Host>::complete_with_tools(&mut ctx, req).await {
+            Err(wit_llm_tools::Error::NotConfigured(m)) => msgs.push(("complete-with-tools", m)),
+            other => panic!("complete-with-tools: {other:?}"),
+        }
+
+        let mut ctx = context_with_metrics_in_world(LlmTier::Tier1, CapabilityWorld::Agent);
+        let mut req = stream_request("claude-sonnet-4-20250514");
+        req.provider = Some("anthropic".to_string());
+        match <TalosContext as wit_llm_streaming::Host>::start_stream(&mut ctx, req).await {
+            Err(wit_llm_streaming::Error::NotConfigured(m)) => msgs.push(("start-stream", m)),
+            other => panic!("start-stream: {other:?}"),
+        }
+
+        let mut ctx = context_with_metrics_in_world(LlmTier::Tier1, CapabilityWorld::Agent);
+        let mut req = stream_tool_request("claude-sonnet-4-20250514");
+        req.provider = Some("anthropic".to_string());
+        match <TalosContext as wit_llm_streaming::Host>::start_tool_stream(&mut ctx, req).await {
+            Err(wit_llm_streaming::Error::NotConfigured(m)) => msgs.push(("start-tool-stream", m)),
+            other => panic!("start-tool-stream: {other:?}"),
+        }
+
+        for (surface, m) in msgs {
+            assert!(m.contains("max_llm_tier is tier1"), "{surface}: {m}");
+            assert!(m.contains("set_actor_llm_tier_ceiling"), "{surface}: {m}");
+            assert!(
+                !m.contains("Set vault path"),
+                "{surface} advises a key: {m}"
+            );
+        }
+    });
+}
+
+/// The two reasons, decided by the same pure ceiling rule the key lookup
+/// uses. The tier-2 case is the missing-key sentence, naming the provider's
+/// vault path and env var.
+#[test]
+fn a_missing_key_and_a_ceiling_refusal_are_told_apart() {
+    use super::LlmKeyUnavailable;
+    assert_eq!(
+        LlmKeyUnavailable::classify("Anthropic", LlmTier::Tier1),
+        LlmKeyUnavailable::CeilingRefused {
+            provider: "anthropic".into()
+        }
+    );
+    let missing = LlmKeyUnavailable::classify("openai", LlmTier::Tier2);
+    assert_eq!(
+        missing,
+        LlmKeyUnavailable::Missing {
+            vault_path: "openai/api_key",
+            env_name: "OPENAI_API_KEY",
+        }
+    );
+    let m = missing.message();
+    assert!(
+        m.contains("Set vault path `openai/api_key`") && m.contains("OPENAI_API_KEY"),
+        "{m}"
+    );
+    assert!(!m.contains("tier1"), "{m}");
 }

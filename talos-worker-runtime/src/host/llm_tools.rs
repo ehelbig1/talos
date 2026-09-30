@@ -78,21 +78,9 @@ impl wit_llm_tools::Host for TalosContext {
             match self.get_llm_api_key_by_name(provider_name).await {
                 Some(k) => k,
                 None => {
-                    let (vault_path, env_name) =
-                        llm_key_lookup_paths(provider_name).unwrap_or(("<unknown>", "<unknown>"));
-                    let msg = format!(
-                        "LLM API key not configured. Set vault path `{}` in the dashboard (Settings → Secrets), \
-                         or export {} in the worker environment as a fallback.",
-                        vault_path, env_name
-                    );
-                    tracing::warn!(
-                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
-                        env_name,
-                        module_id = ?self.module_id,
-                        "{}",
-                        msg
-                    );
-                    return Err(wit_llm_tools::Error::NotConfigured(msg));
+                    return Err(wit_llm_tools::Error::NotConfigured(
+                        self.llm_key_unavailable_message(provider_name),
+                    ));
                 }
             }
         };
