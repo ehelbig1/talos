@@ -548,35 +548,36 @@ impl SessionBriefService {
             "restore_needed": needs_restore_count > 0,
         });
 
-        // 7. Active actors — surface identity/persona context at session start so agents
+        // 7. Actors — surface identity/persona context at session start so agents
         //    know what actors exist without a separate list_actors call.
-        let actor_rows = self
+        //    `active_actors` holds ONLY `status = 'active'` actors (until
+        //    2026-09-30 it held every non-archived one, terminated included);
+        //    the rest are counted in `inactive_actors`. A read that fails is
+        //    `null` — unknown — never `[]`, which would read as "no actors".
+        let active_actors = match self
             .advanced_repo
             .list_active_actors_with_memory_count(user_id, 20)
             .await
-            .unwrap_or_default();
-
-        let active_actors: Vec<serde_json::Value> = actor_rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "actor_id": r.id.to_string(),
-                    "name": r.name,
-                    "description": r.description,
-                    "status": r.status,
-                    "max_capability_world": r.max_capability_world,
-                    "memory_count": r.memory_count,
-                    "tip": if r.memory_count == 0 {
-                        Some(format!(
-                            "No memories set — define a persona with actor_remember(actor_id: '{}', key: 'persona', value: {{...}}, memory_type: 'semantic')",
-                            r.id
-                        ))
-                    } else {
-                        None
-                    },
-                })
-            })
-            .collect();
+        {
+            Ok(rows) => serde_json::Value::Array(render_active_actors(&rows)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "session_start: active actors read failed; active_actors reported as null (unknown)"
+                );
+                serde_json::Value::Null
+            }
+        };
+        let inactive_actors = match self.advanced_repo.count_actors_by_status(user_id).await {
+            Ok(counts) => inactive_actor_summary(&counts),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "session_start: actor status counts read failed; inactive_actors reported as null (unknown)"
+                );
+                serde_json::Value::Null
+            }
+        };
 
         // 8. Stuck executions: running > 1 hour
         let stuck_rows = self
@@ -871,6 +872,7 @@ impl SessionBriefService {
                 },
             },
             "active_actors": active_actors,
+            "inactive_actors": inactive_actors,
             "priority_action": priority_action,
             // Schema staleness detection: compare this against your cached tools/list version.
             // If the version differs from what you connected with, reconnect to re-fetch the schema.
@@ -1030,5 +1032,90 @@ mod error_mapping_tests {
         ));
         assert_eq!(e.user_facing_message(), "Failed to build session brief");
         assert!(!e.user_facing_message().contains("relation"));
+    }
+}
+
+/// The `active_actors` entries of the session brief. Pure, so the rendering
+/// is tested without a database.
+fn render_active_actors(
+    rows: &[talos_advanced_repository::ActiveActorWithMemoryRow],
+) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|r| {
+            serde_json::json!({
+                "actor_id": r.id.to_string(),
+                "name": r.name,
+                "description": r.description,
+                "status": r.status,
+                "max_capability_world": r.max_capability_world,
+                "memory_count": r.memory_count,
+                "tip": if r.memory_count == 0 {
+                    Some(format!(
+                        "No memories set — define a persona with actor_remember(actor_id: '{}', key: 'persona', value: {{...}}, memory_type: 'semantic')",
+                        r.id
+                    ))
+                } else {
+                    None
+                },
+            })
+        })
+        .collect()
+}
+
+/// The `inactive_actors` field of the session brief: how many actors are in
+/// each non-active status. Every status in the `actors.status` CHECK set is
+/// rendered, as 0 when absent, so an absent key cannot be mistaken for an
+/// unread one. `suspended` is reversible; `terminated` and `archived` are
+/// final.
+fn inactive_actor_summary(counts: &[(String, i64)]) -> serde_json::Value {
+    let count = |status: &str| {
+        counts
+            .iter()
+            .filter(|(s, _)| s == status)
+            .map(|(_, n)| *n)
+            .sum::<i64>()
+    };
+    serde_json::json!({
+        "suspended": count("suspended"),
+        "terminated": count("terminated"),
+        "archived": count("archived"),
+        "detail": "list_actors(status: 'suspended' | 'terminated' | 'archived')",
+    })
+}
+
+#[cfg(test)]
+mod actor_section_tests {
+    use super::{inactive_actor_summary, render_active_actors};
+
+    #[test]
+    fn inactive_statuses_are_counted_and_absent_ones_are_zero() {
+        let v = inactive_actor_summary(&[
+            ("active".to_string(), 6),
+            ("terminated".to_string(), 1),
+            ("archived".to_string(), 4),
+        ]);
+        assert_eq!(v["suspended"], 0);
+        assert_eq!(v["terminated"], 1);
+        assert_eq!(v["archived"], 4);
+        assert!(
+            v.get("active").is_none(),
+            "active actors are listed, not counted here"
+        );
+    }
+
+    #[test]
+    fn an_active_actor_renders_with_its_persona_tip() {
+        let rows = vec![talos_advanced_repository::ActiveActorWithMemoryRow {
+            id: uuid::Uuid::nil(),
+            name: "a".into(),
+            description: None,
+            status: "active".into(),
+            max_capability_world: "minimal-node".into(),
+            memory_count: 0,
+        }];
+        let v = render_active_actors(&rows);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["status"], "active");
+        assert!(v[0]["tip"].as_str().unwrap().contains("actor_remember"));
     }
 }

@@ -4365,8 +4365,28 @@ impl AdvancedRepository {
             .collect::<Result<Vec<_>>>()
     }
 
-    /// Active actors with active-memory count subquery. Used by
-    /// `agent_session_start` to surface persona context.
+    /// How many of the user's actors are in each status. One aggregate
+    /// statement over the `(user_id)` rows; a status with no actors is absent
+    /// from the result, and the caller renders it as 0.
+    pub async fn count_actors_by_status(&self, user_id: Uuid) -> Result<Vec<(String, i64)>> {
+        Ok(
+            sqlx::query_as(
+                "SELECT status, COUNT(*) FROM actors WHERE user_id = $1 GROUP BY status",
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await?,
+        )
+    }
+
+    /// ACTIVE actors (`status = 'active'`) with an active-memory count.
+    /// Used by `agent_session_start` to surface persona context.
+    ///
+    /// Until 2026-09-30 this read `status != 'archived'`, so suspended and
+    /// terminated actors were reported under `active_actors`, and — worse —
+    /// consumed the `LIMIT`: enough inactive actors would push real active
+    /// ones out of the list. Inactive actors are counted by
+    /// [`Self::count_actors_by_status`] instead.
     pub async fn list_active_actors_with_memory_count(
         &self,
         user_id: Uuid,
@@ -4378,7 +4398,7 @@ impl AdvancedRepository {
                      WHERE am.actor_id = a.id \
                        AND (am.expires_at IS NULL OR am.expires_at > NOW())) AS memory_count \
              FROM actors a \
-             WHERE a.user_id = $1 AND a.status != 'archived' \
+             WHERE a.user_id = $1 AND a.status = 'active' \
              ORDER BY a.created_at DESC \
              LIMIT $2",
         )
