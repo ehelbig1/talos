@@ -269,6 +269,14 @@ pub enum ModuleSource {
     Template,
 }
 
+/// The three egress grants stored on a user's module row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredModuleGrants {
+    pub hosts: Vec<String>,
+    pub methods: Vec<String>,
+    pub secrets: Vec<String>,
+}
+
 /// Row from the `user_modules` view (union of wasm_modules + node_templates).
 #[derive(Debug)]
 pub struct UserModuleViewRow {
@@ -3067,6 +3075,33 @@ impl ModuleRepository {
             ));
         }
         Ok(())
+    }
+
+    /// The grants currently stored on the caller's installed copy named
+    /// `name` — the row `install_catalog_module_to_modules` would overwrite.
+    ///
+    /// THREE-VALUED on purpose: `Ok(None)` is a first install, `Ok(Some)` a
+    /// reinstall whose stored grants must be carried, and `Err` means the
+    /// stored grants are UNKNOWN. A caller must refuse on `Err`: proceeding
+    /// would install the template's full grant over an operator's narrowing.
+    pub async fn get_user_module_grants(
+        &self,
+        user_id: Uuid,
+        name: &str,
+    ) -> Result<Option<StoredModuleGrants>> {
+        let row: Option<(Vec<String>, Vec<String>, Vec<String>)> = sqlx::query_as(
+            "SELECT allowed_hosts, allowed_methods, allowed_secrets \
+             FROM modules WHERE user_id = $1 AND name = $2",
+        )
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(row.map(|(hosts, methods, secrets)| StoredModuleGrants {
+            hosts,
+            methods,
+            secrets,
+        }))
     }
 
     /// Phase 3.2 install path: write a catalog-installed module to the
