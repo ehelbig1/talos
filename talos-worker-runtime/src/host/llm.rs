@@ -360,6 +360,129 @@ pub(crate) fn decide_llm_tier_access(
     }
 }
 
+/// The provider name a cloud-served Ollama model is judged as by
+/// [`decide_llm_tier_access`]: an EXTERNAL provider, so a tier-1 ceiling
+/// refuses it and a tier-2 one allows it — the same answer, from the same
+/// function, as Anthropic or OpenAI.
+pub(crate) const OLLAMA_CLOUD_PROVIDER: &str = "ollama-cloud";
+
+/// Longest model name recorded in a denial target. The name is guest-supplied.
+const MAX_MODEL_TARGET_CHARS: usize = 128;
+
+/// Why a local-Ollama call was refused before it was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalModelRefusal {
+    /// The model is served off the host (an Ollama cloud model).
+    Remote { host: String },
+    /// Ollama's listing does not contain the model, so the gate cannot vouch
+    /// for where it runs.
+    Unlisted,
+    /// The listing could not be read.
+    Unreadable(String),
+}
+
+impl LocalModelRefusal {
+    /// The `policy` field of the capability denial.
+    pub(crate) fn policy(&self) -> &'static str {
+        match self {
+            Self::Remote { .. } => "tier1-llm-egress",
+            Self::Unlisted | Self::Unreadable(_) => "tier1-llm-locality-unverified",
+        }
+    }
+
+    /// The guest-visible sentence. Names the model and the rule; never a URL
+    /// or response body.
+    pub(crate) fn message(&self, model: &str) -> String {
+        let model = bounded_model_target(model);
+        match self {
+            Self::Remote { host } => format!(
+                "Ollama model `{model}` is served by {host}, not on this host, and this actor's \
+                 max_llm_tier is tier1 (data must not leave the host). Use a model whose weights \
+                 are pulled locally, or raise the actor's ceiling with set_actor_llm_tier_ceiling."
+            ),
+            Self::Unlisted => format!(
+                "Ollama model `{model}` is not in the local Ollama's model list, so a tier1 actor \
+                 cannot be shown to keep its data on this host. Pull the model locally, or check \
+                 the model name."
+            ),
+            Self::Unreadable(reason) => format!(
+                "Refusing Ollama model `{model}` for a tier1 actor: {reason}, so the model cannot \
+                 be shown to run on this host. Retry once Ollama is reachable."
+            ),
+        }
+    }
+}
+
+fn bounded_model_target(model: &str) -> String {
+    model.trim().chars().take(MAX_MODEL_TARGET_CHARS).collect()
+}
+
+/// Whether `ceiling` requires a local-Ollama call's model to be proven local.
+///
+/// False exactly when [`decide_llm_tier_access`] would allow an EXTERNAL
+/// provider (tier-2): a cloud model there is an external provider the actor
+/// may already use. Any other ceiling, including a future unclassified one,
+/// requires proof — the same fail-closed direction as that function.
+pub(crate) fn ceiling_requires_local_model(ceiling: talos_workflow_job_protocol::LlmTier) -> bool {
+    decide_llm_tier_access(OLLAMA_CLOUD_PROVIDER, ceiling) != LlmTierDecision::Allowed
+}
+
+/// What a locality answer means for a call that must stay local: `None` = send.
+pub(crate) fn local_model_refusal(
+    locality: Result<
+        talos_local_inference::locality::ModelLocality,
+        talos_local_inference::locality::LocalityUnreadable,
+    >,
+) -> Option<LocalModelRefusal> {
+    use talos_local_inference::locality::ModelLocality;
+    match locality {
+        Ok(ModelLocality::Local) => None,
+        Ok(ModelLocality::Remote { host }) => Some(LocalModelRefusal::Remote { host }),
+        Ok(ModelLocality::Unlisted) => Some(LocalModelRefusal::Unlisted),
+        Err(e) => Some(LocalModelRefusal::Unreadable(e.0)),
+    }
+}
+
+impl TalosContext {
+    /// Admission for every worker call to the LOCAL Ollama: a tier-1 actor's
+    /// call is sent only when the model provably runs on this host.
+    ///
+    /// Called by all four local paths — `complete*` (via `complete_inner`),
+    /// `complete-with-tools`, `start-stream` and `start-tool-stream` — before
+    /// the local-inference gate is taken, so a refused call never queues.
+    /// On refusal it records a capability denial (`capability` names the
+    /// surface, `target` the bounded model name) and returns the sentence the
+    /// caller hands the guest.
+    pub(crate) async fn admit_local_model(
+        &mut self,
+        capability: &'static str,
+        model: &str,
+    ) -> Result<(), String> {
+        if !ceiling_requires_local_model(self.max_llm_tier) {
+            return Ok(());
+        }
+        let locality = talos_local_inference::locality::model_locality(
+            local_llm_http_client(),
+            ollama_base_url(),
+            model,
+        )
+        .await;
+        let Some(refusal) = local_model_refusal(locality) else {
+            return Ok(());
+        };
+        let target = bounded_model_target(model);
+        self.record_capability_denied(capability, refusal.policy(), &target)
+            .await;
+        tracing::warn!(
+            module_id = ?self.module_id,
+            model = %target,
+            policy = refusal.policy(),
+            "tier-1 actor's local LLM call refused: model not proven local"
+        );
+        Err(refusal.message(model))
+    }
+}
+
 // ============================================================================
 // LLM
 // ============================================================================
@@ -586,6 +709,17 @@ impl TalosContext {
             wit_llm::Provider::Gemini => "gemini-1.5-pro".to_string(),
             wit_llm::Provider::Ollama => "mistral".to_string(),
         });
+
+        // A tier-1 actor's local call must reach a model that runs HERE: an
+        // Ollama cloud model forwards the prompt off the host.
+        if is_local {
+            if let Err(msg) = self.admit_local_model("llm-local-model", &model).await {
+                return Err(LlmCallFailure::new(
+                    crate::metrics::LlmFailure::NotConfigured,
+                    wit_llm::Error::NotConfigured(msg),
+                ));
+            }
+        }
 
         // Canonical messages — each adapter owns its wire role mapping
         // (e.g. Anthropic folds System into `user` + a top-level `system`

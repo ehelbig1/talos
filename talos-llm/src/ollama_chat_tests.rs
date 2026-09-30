@@ -9,7 +9,10 @@
 //! * an answer that stops making progress is cut at the idle deadline;
 //! * an HTTP 400 still reads as `HTTP 400`, so the `think` retry still works;
 //! * two calls on one client reach the backend one at a time (the gate), with
-//!   a control proving the mock can serve two at once.
+//!   a control proving the mock can serve two at once;
+//! * a model that does not provably run on this host — a cloud tag, an alias
+//!   the model list marks remote, a name the list does not contain, or any
+//!   model when the list cannot be read — is refused and never sent.
 //!
 //! The deadlines run at millisecond scale through `OllamaClient::for_tests`;
 //! production uses `ProgressDeadlines::LOCAL`.
@@ -41,7 +44,7 @@ struct Seen {
 
 type Handler = dyn Fn(usize, &Value) -> Reply + Send + Sync;
 
-async fn read_request(sock: &mut TcpStream) -> Value {
+async fn read_request(sock: &mut TcpStream) -> (String, Value) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
@@ -63,10 +66,28 @@ async fn read_request(sock: &mut TcpStream) -> Value {
         assert!(n > 0);
         buf.extend_from_slice(&tmp[..n]);
     }
-    serde_json::from_slice(&buf[header_end..header_end + len]).unwrap_or(Value::Null)
+    let body = serde_json::from_slice(&buf[header_end..header_end + len]).unwrap_or(Value::Null);
+    (head, body)
+}
+
+/// The model list the mock serves on `GET /api/tags`: `m` runs locally,
+/// `cloud-alias` is an alias of a cloud model (Ollama marks it with
+/// `remote_host`, and its name does not say "cloud").
+fn tags() -> Value {
+    json!({"models": [
+        {"name": "m:latest", "model": "m:latest"},
+        {"name": "cloud-alias:latest", "model": "cloud-alias:latest",
+         "remote_host": "https://ollama.com"},
+    ]})
 }
 
 async fn serve(handler: Arc<Handler>) -> (String, Arc<Seen>) {
+    serve_with_tags(handler, Some(tags())).await
+}
+
+/// `tags: None` answers `GET /api/tags` with HTTP 500. The listing request is
+/// answered here and is NOT counted in [`Seen`], which counts chat requests.
+async fn serve_with_tags(handler: Arc<Handler>, tags: Option<Value>) -> (String, Arc<Seen>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let seen = Arc::new(Seen::default());
@@ -76,8 +97,22 @@ async fn serve(handler: Arc<Handler>) -> (String, Arc<Seen>) {
             let (mut sock, _) = listener.accept().await.unwrap();
             let handler = handler.clone();
             let seen = s.clone();
+            let tags = tags.clone();
             tokio::spawn(async move {
-                let body = read_request(&mut sock).await;
+                let (head, body) = read_request(&mut sock).await;
+                if head.starts_with("get /api/tags") {
+                    let (status, payload) = match tags {
+                        Some(t) => (200, t.to_string()),
+                        None => (500, "{}".to_string()),
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
                 let idx = seen.requests.fetch_add(1, Ordering::SeqCst);
                 let now = seen.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 seen.peak.fetch_max(now, Ordering::SeqCst);
@@ -252,6 +287,45 @@ async fn two_calls_reach_the_backend_one_at_a_time() {
         1,
         "the gate admitted two at once"
     );
+}
+
+/// A model that does not provably run on this host is refused BEFORE the
+/// chat is sent, for every controller caller. Each case asserts the backend
+/// received no chat request; `m` succeeding elsewhere in this file is the
+/// control that the listing itself does not refuse everything.
+#[tokio::test]
+async fn a_model_not_proven_local_is_never_sent() {
+    for (model, expect) in [
+        ("glm-5.3-flash:cloud", "not on this host"),
+        ("gpt-oss:120b-cloud", "not on this host"),
+        ("cloud-alias", "https://ollama.com"),
+        ("absent-model", "not in the local Ollama's model list"),
+    ] {
+        let (base, seen) = serve(Arc::new(|_, _| streamed(&["leaked"], Duration::ZERO))).await;
+        let c = client(base, Duration::from_secs(10), MS_DEADLINES);
+        let err = c
+            .complete(model, "", "private memory", 16)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(expect), "{model}: {err}");
+        assert!(
+            !err.to_string().contains("HTTP 400"),
+            "a refusal must not trigger the think retry: {err}"
+        );
+        assert_eq!(seen.requests.load(Ordering::SeqCst), 0, "{model} was sent");
+    }
+}
+
+/// A listing that cannot be read refuses (a gate that cannot read its rule
+/// must not grant), and nothing is sent.
+#[tokio::test]
+async fn an_unreadable_model_list_refuses() {
+    let (base, seen) =
+        serve_with_tags(Arc::new(|_, _| streamed(&["leaked"], Duration::ZERO)), None).await;
+    let c = client(base, Duration::from_secs(10), MS_DEADLINES);
+    let err = c.complete("m", "", "user", 16).await.unwrap_err();
+    assert!(err.to_string().contains("could not be checked"), "{err}");
+    assert_eq!(seen.requests.load(Ordering::SeqCst), 0);
 }
 
 /// Control for the case above: without the gate the same mock serves two

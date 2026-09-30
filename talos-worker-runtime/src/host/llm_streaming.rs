@@ -374,6 +374,13 @@ impl wit_llm_streaming::Host for TalosContext {
             }
         });
 
+        // A tier-1 actor's local call must reach a model that runs HERE.
+        if is_local_stream {
+            self.admit_local_model("llm-stream-local-model", &model)
+                .await
+                .map_err(wit_llm_streaming::Error::NotConfigured)?;
+        }
+
         // Parse messages from JSON.
         let messages: serde_json::Value =
             serde_json::from_str(&req.messages_json).map_err(|e| {
@@ -462,6 +469,13 @@ impl wit_llm_streaming::Host for TalosContext {
                 "claude-sonnet-4-20250514".to_string()
             }
         });
+
+        // A tier-1 actor's local call must reach a model that runs HERE.
+        if is_local_tool_stream {
+            self.admit_local_model("llm-tool-stream-local-model", &model)
+                .await
+                .map_err(wit_llm_streaming::Error::NotConfigured)?;
+        }
 
         let messages: serde_json::Value =
             serde_json::from_str(&req.messages_json).map_err(|e| {

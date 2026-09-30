@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use talos_workflow_job_protocol::LlmTier;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{llm_provider_label, wit_llm, wit_llm_tools, TalosContext};
+use super::{llm_provider_label, wit_llm, wit_llm_streaming, wit_llm_tools, TalosContext};
 use crate::metrics::{
     get_prometheus_metrics, init_telemetry_for_tests, LlmFailure, RuntimeMetrics,
     LLM_PROVIDER_LABELS,
@@ -187,6 +187,38 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(_) => return,
         }
+    }
+    // A tier-1 call first asks the backend which models run locally
+    // (`talos_local_inference::locality`). Answer as Ollama would, listing
+    // every mock model as local, and do not count it as a chat request.
+    if headers.starts_with("get /api/tags") {
+        let names = [
+            "mock-429",
+            "mock-500",
+            "mock-abort",
+            "mock-badjson",
+            "mock-huge",
+            "mock-idle",
+            "mock-ok",
+            "mock-slow",
+            "mock-stall",
+            "mock-steady",
+            "mock-tool-stream",
+        ];
+        let models: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| serde_json::json!({"name": format!("{n}:latest"), "model": format!("{n}:latest")}))
+            // An alias of an Ollama cloud model: its name does not say
+            // "cloud", Ollama's `remote_host` does.
+            .chain(std::iter::once(serde_json::json!({
+                "name": "mock-cloud-alias:latest",
+                "model": "mock-cloud-alias:latest",
+                "remote_host": "https://ollama.com",
+            })))
+            .collect();
+        let payload = serde_json::json!({ "models": models }).to_string();
+        write_simple(&mut stream, 200, "OK", &payload).await;
+        return;
     }
     REQUESTS_SERVED.fetch_add(1, Ordering::Relaxed);
 
@@ -1295,4 +1327,196 @@ fn a_queued_tool_completion_records_its_wait_on_the_jobs_ledger() {
         );
         assert_eq!(heard.admitted.load(Ordering::SeqCst), 1);
     });
+}
+
+// ---------------------------------------------------------------------------
+// Tier-1 local calls must reach a model that runs on this host
+// ---------------------------------------------------------------------------
+
+fn stream_request(model: &str) -> wit_llm_streaming::StreamRequest {
+    wit_llm_streaming::StreamRequest {
+        provider: Some("ollama".to_string()),
+        model: Some(model.to_string()),
+        messages_json: r#"[{"role":"user","content":[{"type":"text","text":"ping"}]}]"#.to_string(),
+        max_tokens: Some(16),
+        temperature: None,
+        system_prompt: None,
+    }
+}
+
+fn stream_tool_request(model: &str) -> wit_llm_streaming::StreamToolRequest {
+    wit_llm_streaming::StreamToolRequest {
+        provider: Some("ollama".to_string()),
+        model: Some(model.to_string()),
+        messages_json: r#"[{"role":"user","content":[{"type":"text","text":"ping"}]}]"#
+            .to_string(),
+        tools_json: r#"[{"name":"noop","description":"does nothing","input_schema":{"type":"object","properties":{}}}]"#
+            .to_string(),
+        max_tokens: Some(16),
+        temperature: None,
+        system_prompt: None,
+    }
+}
+
+/// Drive every worker path to the local Ollama for `model` under `tier` and
+/// return, per surface, `None` when the call was admitted or the refusal text.
+/// Each surface is a separate call site; a guard at the shared helper cannot
+/// see whether one of them stopped calling it.
+async fn local_call_outcomes(tier: LlmTier, model: &str) -> Vec<(&'static str, Option<String>)> {
+    let refused = |e: String| -> Option<String> { Some(e) };
+    let mut out = Vec::new();
+
+    let mut ctx = context_with_metrics(tier);
+    out.push((
+        "complete",
+        match <TalosContext as wit_llm::Host>::complete(
+            &mut ctx,
+            request(wit_llm::Provider::Ollama, model),
+        )
+        .await
+        {
+            Err(wit_llm::Error::NotConfigured(m)) => refused(m),
+            _ => None,
+        },
+    ));
+
+    let mut ctx = context_with_metrics_in_world(tier, CapabilityWorld::Agent);
+    out.push((
+        "complete-with-tools",
+        match <TalosContext as wit_llm_tools::Host>::complete_with_tools(
+            &mut ctx,
+            tool_request(model),
+        )
+        .await
+        {
+            Err(wit_llm_tools::Error::NotConfigured(m)) => refused(m),
+            _ => None,
+        },
+    ));
+
+    let mut ctx = context_with_metrics_in_world(tier, CapabilityWorld::Agent);
+    out.push((
+        "start-stream",
+        match <TalosContext as wit_llm_streaming::Host>::start_stream(
+            &mut ctx,
+            stream_request(model),
+        )
+        .await
+        {
+            Err(wit_llm_streaming::Error::NotConfigured(m)) => refused(m),
+            _ => None,
+        },
+    ));
+
+    let mut ctx = context_with_metrics_in_world(tier, CapabilityWorld::Agent);
+    out.push((
+        "start-tool-stream",
+        match <TalosContext as wit_llm_streaming::Host>::start_tool_stream(
+            &mut ctx,
+            stream_tool_request(model),
+        )
+        .await
+        {
+            Err(wit_llm_streaming::Error::NotConfigured(m)) => refused(m),
+            _ => None,
+        },
+    ));
+    out
+}
+
+/// An Ollama cloud model forwards the prompt off the host. A tier-1 actor must
+/// never reach one — by its cloud tag, by an alias Ollama marks remote, or by
+/// a name the local listing does not contain — on ANY of the four paths, and
+/// nothing may be sent to the backend.
+#[test]
+fn a_tier1_call_to_a_model_not_proven_local_is_refused_on_every_path() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        for (model, expect) in [
+            ("glm-5.3-flash:cloud", "not on this host"),
+            ("mock-cloud-alias", "https://ollama.com"),
+            ("never-pulled", "not in the local Ollama's model list"),
+        ] {
+            let served_before = REQUESTS_SERVED.load(Ordering::Relaxed);
+            for (surface, outcome) in local_call_outcomes(LlmTier::Tier1, model).await {
+                let msg = outcome.unwrap_or_else(|| panic!("{surface}: {model} was admitted"));
+                assert!(msg.contains(expect), "{surface}/{model}: {msg}");
+                assert!(msg.contains("tier1"), "{surface}/{model}: {msg}");
+            }
+            assert_eq!(
+                REQUESTS_SERVED.load(Ordering::Relaxed),
+                served_before,
+                "{model} reached the backend"
+            );
+        }
+    });
+}
+
+/// Controls. A model the listing marks local is admitted on every path under
+/// tier-1, and a cloud model is admitted under tier-2 (it is an external
+/// provider there, which that ceiling allows) — so the refusals above are the
+/// ceiling and the listing talking, not a blanket refusal.
+#[test]
+fn a_local_model_under_tier1_and_a_cloud_model_under_tier2_are_admitted() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        for (tier, model) in [
+            (LlmTier::Tier1, "mock-ok"),
+            (LlmTier::Tier2, "glm-5.3-flash:cloud"),
+            (LlmTier::Tier2, "mock-cloud-alias"),
+        ] {
+            for (surface, outcome) in local_call_outcomes(tier, model).await {
+                assert!(
+                    outcome.is_none(),
+                    "{surface}: {model} under {tier:?} was refused: {outcome:?}"
+                );
+            }
+        }
+    });
+}
+
+/// The pure halves of `admit_local_model`: which ceilings need proof, and what
+/// each locality answer means. An unreadable listing is a refusal (a gate that
+/// cannot read its rule must not grant) and only `Local` is admitted.
+#[test]
+fn the_local_model_decision_admits_only_proven_local() {
+    use super::{ceiling_requires_local_model, local_model_refusal, LocalModelRefusal};
+    use talos_local_inference::locality::{LocalityUnreadable, ModelLocality};
+
+    assert!(ceiling_requires_local_model(LlmTier::Tier1));
+    assert!(!ceiling_requires_local_model(LlmTier::Tier2));
+
+    assert_eq!(local_model_refusal(Ok(ModelLocality::Local)), None);
+    assert_eq!(
+        local_model_refusal(Ok(ModelLocality::Remote {
+            host: "https://ollama.com".into()
+        })),
+        Some(LocalModelRefusal::Remote {
+            host: "https://ollama.com".into()
+        })
+    );
+    assert_eq!(
+        local_model_refusal(Ok(ModelLocality::Unlisted)),
+        Some(LocalModelRefusal::Unlisted)
+    );
+    let unreadable = local_model_refusal(Err(LocalityUnreadable("status 500".into())));
+    assert_eq!(
+        unreadable,
+        Some(LocalModelRefusal::Unreadable("status 500".into()))
+    );
+
+    // Policy vocabulary operators filter on.
+    assert_eq!(
+        LocalModelRefusal::Remote { host: "h".into() }.policy(),
+        "tier1-llm-egress"
+    );
+    assert_eq!(
+        LocalModelRefusal::Unlisted.policy(),
+        "tier1-llm-locality-unverified"
+    );
+    // A guest-supplied model name is bounded in what reaches the ledger/log.
+    let long = "m".repeat(10_000);
+    assert!(LocalModelRefusal::Unlisted.message(&long).len() < 1_000);
 }

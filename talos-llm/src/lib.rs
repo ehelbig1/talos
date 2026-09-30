@@ -531,6 +531,36 @@ fn gate_log(slot: &talos_local_inference::gate::LocalLlmSlot, queued: bool) -> G
     }
 }
 
+/// Refuse a controller call whose model does not provably run on this host.
+///
+/// See [`talos_local_inference::locality`]: a cloud-served model, a model the
+/// local Ollama does not list, and an unreadable listing are all refused. The
+/// error never carries a URL or a response body.
+async fn refuse_unless_local(client: &reqwest::Client, base_url: &str, model: &str) -> Result<()> {
+    use talos_local_inference::locality::{model_locality, ModelLocality};
+    let bounded: String = model.trim().chars().take(128).collect();
+    let refusal = match model_locality(client, base_url, model).await {
+        Ok(ModelLocality::Local) => return Ok(()),
+        Ok(ModelLocality::Remote { host }) => {
+            format!("Ollama model `{bounded}` is served by {host}, not on this host")
+        }
+        Ok(ModelLocality::Unlisted) => {
+            format!("Ollama model `{bounded}` is not in the local Ollama's model list")
+        }
+        Err(e) => format!("Ollama model `{bounded}` could not be checked: {e}"),
+    };
+    warn!(
+        target: "talos_audit",
+        event_kind = "local_llm_model_refused",
+        model = %bounded,
+        reason = %refusal,
+        "controller local LLM call refused: model not proven local"
+    );
+    Err(anyhow!(
+        "{refusal}; this client runs local inference only, so the call was not sent"
+    ))
+}
+
 /// Map a failed local exchange to the controller's error. The HTTP-status
 /// wording is load-bearing (see [`OllamaClient::complete_structured`]); the
 /// provider's own text is never included — the exchange logs it DLP-redacted.
@@ -751,6 +781,14 @@ impl OllamaClient {
     /// `complete_with_schema` match on for their `think` retry.
     async fn chat(&self, model: &str, mut body: serde_json::Value) -> Result<String> {
         use talos_local_inference::{gate, stream};
+
+        // Every caller of this client treats its answer as LOCAL inference —
+        // consolidation and reflection over actor memory, graph-RAG extraction
+        // (the tier-1 path `TALOS_GRAPH_RAG_TIER1_LOCAL_OK` admits),
+        // evaluation, the teacher audit, `local_llm_complete`. An Ollama cloud
+        // model forwards the prompt to its remote host, so it is refused here
+        // for every caller, before the gate: a refused call never queues.
+        refuse_unless_local(&self.client, &self.base_url, model).await?;
 
         // Bound, never `_`: the permit is released on drop, and it must be
         // held for the whole exchange.

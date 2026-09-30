@@ -7,6 +7,8 @@
 //!   non-streaming response body.
 //! * [`fleet`]: the queue shared by every process calling one backend (P3b).
 //! * [`line_reader`]: the byte-level line reader the stream is built on.
+//! * [`locality`]: whether a model the local Ollama serves actually runs on
+//!   this host (an Ollama cloud model does not).
 //!
 //! Two callers: the worker's `llm::complete*` host functions (since P1/P2) and
 //! the controller's `talos_llm::OllamaClient` (since P3a). They are different
@@ -17,4 +19,5 @@ pub mod deadlines;
 pub mod fleet;
 pub mod gate;
 pub mod line_reader;
+pub mod locality;
 pub mod stream;
