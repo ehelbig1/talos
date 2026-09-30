@@ -80,6 +80,11 @@ fn run(input: String) -> Result<String, String> {
         .map(|n| n.min(u32::MAX as u64) as u32)
         .unwrap_or(1024);
     let temperature = config.temperature.map(|n| n as f32);
+    let allow_truncated_output = config
+        .allow_truncated_output
+        .as_ref()
+        .map(BoolOrString::as_bool)
+        .unwrap_or(false);
 
     // ── Config knobs ─────────────────────────────────────────────────────
     let inject_context = config
@@ -423,6 +428,22 @@ fn run(input: String) -> Result<String, String> {
         llm::complete(&req)
     }
     .map_err(|e| llm_error_message(e, &provider_key, model))?;
+
+    // ── Cut-off answers ──────────────────────────────────────────────────
+    // A provider that stops because MAX_TOKENS ran out still answers 200 with
+    // whatever it had generated. Until 2026-09-30 that partial answer was used
+    // as if complete — a truncated JSON object, half a briefing — and nothing
+    // said so. Fail loudly unless the node opts in to partial answers.
+    if answer_was_cut_off(resp.stop_reason.as_deref()) && !allow_truncated_output {
+        return Err(format!(
+            "LLM answer was cut off at MAX_TOKENS={} (provider '{}' stop reason `{}`), so the \
+             output is incomplete and was not used. Raise MAX_TOKENS, ask for a shorter \
+             answer, or set ALLOW_TRUNCATED_OUTPUT: true if a partial answer is acceptable.",
+            max_tokens,
+            provider_key,
+            resp.stop_reason.as_deref().unwrap_or("")
+        ));
+    }
     let raw_text = resp.text;
 
     // ── Fence stripping ──────────────────────────────────────────────────
@@ -625,6 +646,10 @@ struct Config {
     /// be absent on first run).
     #[serde(rename = "ALLOW_EMPTY_TEMPLATE_VARS")]
     allow_empty_template_vars: Option<BoolOrString>,
+    /// Accept an answer the provider cut off at MAX_TOKENS. Defaults to false:
+    /// a cut-off answer fails the node.
+    #[serde(rename = "ALLOW_TRUNCATED_OUTPUT")]
+    allow_truncated_output: Option<BoolOrString>,
     #[serde(rename = "BLOCKED_PATTERNS_INPUT")]
     blocked_patterns_input: Option<StringOrList>,
     #[serde(rename = "BLOCKED_PATTERNS")]
@@ -919,9 +944,30 @@ fn llm_error_message(err: talos::core::llm::Error, provider_str: &str, model: &s
     }
 }
 
+/// Whether the provider stopped because the output budget ran out. Each
+/// provider spells it its own way and the host passes the spelling through:
+/// Ollama and OpenAI `length`, Anthropic `max_tokens`, Gemini `MAX_TOKENS`.
+fn answer_was_cut_off(stop_reason: Option<&str>) -> bool {
+    matches!(
+        stop_reason.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("length") | Some("max_tokens")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_providers_budget_stop_is_a_cut_off() {
+        for r in ["length", "max_tokens", "MAX_TOKENS", " Length "] {
+            assert!(answer_was_cut_off(Some(r)), "{r}");
+        }
+        for r in ["stop", "end_turn", "STOP", "tool_use", "tool_calls", ""] {
+            assert!(!answer_was_cut_off(Some(r)), "{r}");
+        }
+        assert!(!answer_was_cut_off(None));
+    }
     use serde_json::json;
 
     #[test]

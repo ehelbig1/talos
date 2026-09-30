@@ -319,6 +319,36 @@ impl wit_llm_tools::Host for TalosContext {
             parsed.output_tokens.unwrap_or(0),
         );
 
+        // A local prompt Ollama silently truncated (see `complete_inner`).
+        if is_local_tools {
+            if let talos_local_inference::context::PromptFit::Truncated {
+                evaluated,
+                context_length,
+            } = talos_local_inference::context::check_prompt_fit(
+                local_llm_http_client(),
+                ollama_base_url(),
+                &model,
+                parsed.input_tokens,
+            )
+            .await
+            {
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    model = %model,
+                    evaluated,
+                    context_length,
+                    "local LLM tool-call prompt truncated by Ollama; answer refused"
+                );
+                return Err(wit_llm_tools::Error::InvalidRequest(
+                    talos_local_inference::context::truncation_message(
+                        &model,
+                        evaluated,
+                        context_length,
+                    ),
+                ));
+            }
+        }
+
         let content_blocks: Vec<wit_llm_tools::ContentBlock> = parsed
             .blocks
             .into_iter()

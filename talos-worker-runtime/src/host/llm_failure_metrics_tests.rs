@@ -191,6 +191,17 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
     // A tier-1 call first asks the backend which models run locally
     // (`talos_local_inference::locality`). Answer as Ollama would, listing
     // every mock model as local, and do not count it as a chat request.
+    // The loaded context the truncation check reads (`/api/ps`): every mock
+    // model is "loaded" with a 4 096-token context.
+    if headers.starts_with("get /api/ps") {
+        let payload = serde_json::json!({"models": [
+            {"name": "mock-truncated:latest", "model": "mock-truncated:latest", "context_length": 4096},
+            {"name": "mock-ok:latest", "model": "mock-ok:latest", "context_length": 4096},
+        ]})
+        .to_string();
+        write_simple(&mut stream, 200, "OK", &payload).await;
+        return;
+    }
     if headers.starts_with("get /api/tags") {
         let names = [
             "mock-429",
@@ -204,6 +215,7 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
             "mock-stall",
             "mock-steady",
             "mock-tool-stream",
+            "mock-truncated",
         ];
         let models: Vec<serde_json::Value> = names
             .iter()
@@ -313,6 +325,16 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
         }
         "mock-huge" => write_oversized(&mut stream).await,
         // Default: a valid native-Ollama completion, streamed as one line.
+        // Ollama truncated the prompt to fit a 4 096-token context: the
+        // evaluated count is the measured signature, context/2 + 2.
+        "mock-truncated" => {
+            let v = serde_json::json!({
+                "message": {"role": "assistant", "content": "an answer without its system prompt"},
+                "done": true, "done_reason": "stop",
+                "prompt_eval_count": 2050, "eval_count": 8
+            });
+            write_ndjson(&mut stream, &[format!("{v}\n")]).await
+        }
         _ => write_ndjson(&mut stream, &[ok_line()]).await,
     }
 }
@@ -806,6 +828,7 @@ fn every_outcome_has_a_distinct_stable_label() {
             "network",
             "not_configured",
             "oversized_response",
+            "prompt_truncated",
             "rate_limited",
             "timeout",
         ]
@@ -1610,4 +1633,48 @@ fn a_missing_key_and_a_ceiling_refusal_are_told_apart() {
         "{m}"
     );
     assert!(!m.contains("tier1"), "{m}");
+}
+
+/// Ollama truncated the prompt to fit the loaded context (the measured
+/// signature, context/2 + 2 evaluated tokens): the answer is refused, the
+/// guest gets `invalid-request` naming the counts, and
+/// `wasm_llm_failures_total{outcome="prompt_truncated"}` moves exactly once.
+#[test]
+fn an_answer_to_a_truncated_prompt_is_refused_and_counted() {
+    let err = assert_complete_fails_with(
+        LlmTier::Tier1,
+        wit_llm::Provider::Ollama,
+        "mock-truncated",
+        LlmFailure::PromptTruncated,
+    );
+    match err {
+        wit_llm::Error::InvalidRequest(m) => {
+            assert!(
+                m.contains("truncated the prompt") && m.contains("4096"),
+                "{m}"
+            )
+        }
+        other => panic!("expected invalid-request, got {other:?}"),
+    }
+}
+
+/// The tools path has its own call site; it refuses a truncated prompt too.
+#[test]
+fn a_tool_call_answer_to_a_truncated_prompt_is_refused() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        let mut ctx = context_with_metrics_in_world(LlmTier::Tier1, CapabilityWorld::Agent);
+        match <TalosContext as wit_llm_tools::Host>::complete_with_tools(
+            &mut ctx,
+            tool_request("mock-truncated"),
+        )
+        .await
+        {
+            Err(wit_llm_tools::Error::InvalidRequest(m)) => {
+                assert!(m.contains("truncated the prompt"), "{m}")
+            }
+            other => panic!("expected invalid-request, got {other:?}"),
+        }
+    });
 }

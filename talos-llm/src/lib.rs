@@ -704,10 +704,16 @@ impl OllamaClient {
     /// OpenAI-compat shim 2026-07-09, in lockstep with the worker's
     /// `llm_providers::ollama` adapter): `max_tokens` maps to the native
     /// `options.num_predict`, and the response is `message.content`
-    /// rather than `choices[0]`. Native also keeps the door open for
-    /// `think` / `format` / `options.num_ctx` without another endpoint
-    /// change. `stream:false` is explicit — the native default is
-    /// streaming.
+    /// rather than `choices[0]`. `stream:false` is explicit — the native
+    /// default is streaming.
+    ///
+    /// Thinking is OFF (since 2026-09-30), as on every other path here.
+    /// Before, this was the one controller call that sent no `think`, so a
+    /// thinking-by-default model (qwen3.6: `thinking.default = true` per
+    /// `/api/show`) spent the `num_predict` budget reasoning before it wrote
+    /// the answer — the failure the teacher audit measured on 23 of 100
+    /// replies. Its callers (graph-RAG extraction, `local_llm_complete`)
+    /// want the answer, not the trace.
     pub async fn complete(
         &self,
         model: &str,
@@ -715,8 +721,10 @@ impl OllamaClient {
         user_prompt: &str,
         max_tokens: u32,
     ) -> Result<String> {
-        let body = build_chat_body(model, system_prompt, user_prompt, max_tokens, None, None);
-        self.chat(model, body).await
+        self.chat_thinking_off(model, |think| {
+            build_chat_body(model, system_prompt, user_prompt, max_tokens, think, None)
+        })
+        .await
     }
 
     /// Classification-shaped completion mirroring the Smart Classifier
@@ -725,11 +733,6 @@ impl OllamaClient {
     /// Reasoning models (qwen3.6 et al.) otherwise burn the whole
     /// `num_predict` budget thinking without ever emitting the JSON (the
     /// teacher audit measured 23/100 such replies on 2026-07-21).
-    ///
-    /// Some models reject the `think` field outright (HTTP 400 on models
-    /// without a reasoning mode, Ollama version dependent) — on a 4xx the
-    /// call retries ONCE without `think`, keeping `format`/temperature, so
-    /// a non-reasoning teacher still gets structured output.
     pub async fn complete_structured(
         &self,
         model: &str,
@@ -737,32 +740,17 @@ impl OllamaClient {
         user_prompt: &str,
         max_tokens: u32,
     ) -> Result<String> {
-        let body = build_chat_body(
-            model,
-            system_prompt,
-            user_prompt,
-            max_tokens,
-            Some(false),
-            Some(json!("json")),
-        );
-        match self.chat(model, body).await {
-            Ok(text) => Ok(text),
-            // Retry WITHOUT `think` only on a 400 — the model rejected the
-            // `think` field (not all Ollama models support it). Narrow to 400
-            // so a 401/404/429 fails fast instead of a wasted second call.
-            Err(e) if e.to_string().contains("HTTP 400") => {
-                let body = build_chat_body(
-                    model,
-                    system_prompt,
-                    user_prompt,
-                    max_tokens,
-                    None,
-                    Some(json!("json")),
-                );
-                self.chat(model, body).await
-            }
-            Err(e) => Err(e),
-        }
+        self.chat_thinking_off(model, |think| {
+            build_chat_body(
+                model,
+                system_prompt,
+                user_prompt,
+                max_tokens,
+                think,
+                Some(json!("json")),
+            )
+        })
+        .await
     }
 
     /// STRUCTURED-OUTPUT completion — the reliable path. Unlike
@@ -771,8 +759,7 @@ impl OllamaClient {
     /// SHAPE, e.g. nesting the whole payload in one field), this passes a JSON
     /// SCHEMA to Ollama's `format` field (Ollama Structured Outputs), so the
     /// model is CONSTRAINED to the schema. The returned text is schema-conformant
-    /// JSON. Same `think:false` + 4xx-retry-without-think resilience as
-    /// `complete_structured` (the schema is preserved across the retry).
+    /// JSON. The schema is preserved across the no-`think` retry.
     pub async fn complete_with_schema(
         &self,
         model: &str,
@@ -781,30 +768,34 @@ impl OllamaClient {
         max_tokens: u32,
         schema: &serde_json::Value,
     ) -> Result<String> {
-        let body = build_chat_body(
-            model,
-            system_prompt,
-            user_prompt,
-            max_tokens,
-            Some(false),
-            Some(schema.clone()),
-        );
-        match self.chat(model, body).await {
+        self.chat_thinking_off(model, |think| {
+            build_chat_body(
+                model,
+                system_prompt,
+                user_prompt,
+                max_tokens,
+                think,
+                Some(schema.clone()),
+            )
+        })
+        .await
+    }
+
+    /// The one home for "thinking off, and cope with a server that rejects
+    /// the field": send `think:false`; on an HTTP 400 retry ONCE without
+    /// `think`, everything else unchanged. Narrowed to 400 so a 401/404/429
+    /// fails fast instead of spending a second call. Measured on Ollama
+    /// 0.35.0: `think:false` is ACCEPTED by models without a thinking mode
+    /// (only `think:true` is rejected), so the retry costs nothing there; it
+    /// stays for servers that reject the field outright.
+    async fn chat_thinking_off(
+        &self,
+        model: &str,
+        body: impl Fn(Option<bool>) -> serde_json::Value,
+    ) -> Result<String> {
+        match self.chat(model, body(Some(false))).await {
             Ok(text) => Ok(text),
-            // Retry WITHOUT `think` only on a 400 — the model rejected the
-            // `think` field (not all Ollama models support it). Narrow to 400
-            // so a 401/404/429 fails fast instead of a wasted second call.
-            Err(e) if e.to_string().contains("HTTP 400") => {
-                let body = build_chat_body(
-                    model,
-                    system_prompt,
-                    user_prompt,
-                    max_tokens,
-                    None,
-                    Some(schema.clone()),
-                );
-                self.chat(model, body).await
-            }
+            Err(e) if e.to_string().contains("HTTP 400") => self.chat(model, body(None)).await,
             Err(e) => Err(e),
         }
     }
@@ -878,6 +869,35 @@ impl OllamaClient {
         let body: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow!("Failed to parse Ollama response: {e}"))?;
         usage::record_ollama(model, &body);
+        // A prompt Ollama silently truncated to fit the loaded context: the
+        // answer was written without its start (the system prompt). The
+        // tokens were spent (recorded above); the answer is refused.
+        if let talos_local_inference::context::PromptFit::Truncated {
+            evaluated,
+            context_length,
+        } = talos_local_inference::context::check_prompt_fit(
+            &self.client,
+            &self.base_url,
+            model,
+            body.get("prompt_eval_count").and_then(|v| v.as_u64()),
+        )
+        .await
+        {
+            warn!(
+                model,
+                evaluated,
+                context_length,
+                "controller local LLM prompt truncated by Ollama; answer refused"
+            );
+            return Err(anyhow!(
+                "{}",
+                talos_local_inference::context::truncation_message(
+                    model,
+                    evaluated,
+                    context_length
+                )
+            ));
+        }
         let text = body
             .get("message")
             .and_then(|m| m.get("content"))

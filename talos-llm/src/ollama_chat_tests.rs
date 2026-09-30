@@ -100,6 +100,21 @@ async fn serve_with_tags(handler: Arc<Handler>, tags: Option<Value>) -> (String,
             let tags = tags.clone();
             tokio::spawn(async move {
                 let (head, body) = read_request(&mut sock).await;
+                // `/api/ps`: the loaded context the truncation check reads.
+                // `m` is loaded with a 4 096-token context.
+                if head.starts_with("get /api/ps") {
+                    let payload = json!({"models": [
+                        {"name": "m:latest", "model": "m:latest", "context_length": 4096}
+                    ]})
+                    .to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
                 if head.starts_with("get /api/tags") {
                     let (status, payload) = match tags {
                         Some(t) => (200, t.to_string()),
@@ -203,6 +218,10 @@ async fn a_chat_streams_and_is_reassembled() {
         "the transport must ask to stream"
     );
     assert_eq!(bodies[0]["options"]["num_predict"], 64);
+    assert_eq!(
+        bodies[0]["think"], false,
+        "plain complete must turn thinking off"
+    );
 }
 
 /// The client-wide timeout stands in for the production 60 s. An answer that
@@ -268,6 +287,90 @@ async fn an_http_400_still_triggers_the_think_retry() {
     assert_eq!(bodies[0]["think"], false);
     assert!(bodies[1].get("think").is_none());
     assert_eq!(bodies[1]["format"], "json");
+}
+
+fn done_with_prompt_count(n: u64) -> String {
+    format!(
+        "{}\n",
+        json!({"model": "m", "message": {"role": "assistant", "content": ""},
+               "done": true, "done_reason": "stop", "prompt_eval_count": n, "eval_count": 3})
+    )
+}
+
+/// Ollama truncated the prompt (evaluated count = context/2 + 2, the measured
+/// signature): the answer is refused, not returned. The control — a count
+/// that is not the signature — is returned normally.
+#[tokio::test]
+async fn an_answer_to_a_truncated_prompt_is_refused() {
+    for (count, truncated) in [(2_050u64, true), (3_000, false)] {
+        let (base, _) = serve(Arc::new(move |_, _| Reply {
+            status: 200,
+            chunks: vec![
+                (Duration::ZERO, chunk("answer")),
+                (Duration::ZERO, done_with_prompt_count(count)),
+            ],
+        }))
+        .await;
+        let c = client(base, Duration::from_secs(10), MS_DEADLINES);
+        let got = c.complete("m", "sys", "user", 16).await;
+        if truncated {
+            let err = got.unwrap_err().to_string();
+            assert!(
+                err.contains("truncated the prompt") && err.contains("4096"),
+                "{err}"
+            );
+            assert!(
+                !err.contains("HTTP 400"),
+                "must not trigger the think retry: {err}"
+            );
+        } else {
+            assert_eq!(got.unwrap(), "answer");
+        }
+    }
+}
+
+/// Plain `complete` turns thinking off too (it was the one path that sent no
+/// `think`, so a thinking-by-default model spent the budget reasoning), and
+/// shares the retry-without-`think` on a 400 — with the prompt unchanged.
+#[tokio::test]
+async fn plain_complete_turns_thinking_off_and_retries_without_it_on_400() {
+    let (base, seen) = serve(Arc::new(|idx, _| {
+        if idx == 0 {
+            Reply {
+                status: 400,
+                chunks: vec![(Duration::ZERO, "{\"error\":\"think not supported\"}".into())],
+            }
+        } else {
+            streamed(&["answer"], Duration::ZERO)
+        }
+    }))
+    .await;
+    let c = client(base, Duration::from_secs(10), MS_DEADLINES);
+    let text = c.complete("m", "sys", "user", 64).await.unwrap();
+    assert_eq!(text, "answer");
+    let bodies = seen.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0]["think"], false);
+    assert!(bodies[1].get("think").is_none());
+    assert_eq!(bodies[0]["messages"], bodies[1]["messages"]);
+    assert!(
+        bodies[1].get("format").is_none(),
+        "plain complete has no format"
+    );
+}
+
+/// A non-400 failure is NOT retried: one request, and the error surfaces.
+#[tokio::test]
+async fn a_non_400_failure_is_not_retried_without_think() {
+    let (base, seen) = serve(Arc::new(|_, _| Reply {
+        status: 500,
+        chunks: vec![(Duration::ZERO, "{\"error\":\"boom\"}".into())],
+    }))
+    .await;
+    let c = client(base, Duration::from_secs(10), MS_DEADLINES);
+    let err = c.complete("m", "", "user", 16).await.unwrap_err();
+    assert!(err.to_string().contains("HTTP 500"), "{err}");
+    assert_eq!(seen.requests.load(Ordering::SeqCst), 1);
 }
 
 /// The gate: two calls on one client reach the backend one at a time.
