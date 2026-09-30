@@ -37,5 +37,10 @@ tokio = { version = "1", features = ["macros", "rt"] }
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# `fuel_headroom` is an async integration binary against a migrated Postgres:
+# which rollup rows the detector counts is a property of its SQL.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true
