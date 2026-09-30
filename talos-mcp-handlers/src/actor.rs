@@ -671,12 +671,34 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 all owned workflows, executions, memory, and audit trail are preserved (nothing is deleted). \
                 NAME RESERVATION: the archived actor's name remains reserved per-user — attempting to \
                 create_actor with the same name returns an 'already exists' error. Pick a new name for \
-                the replacement, or delete the archived row via an admin-level tool if name reuse is \
-                required. Use suspend_actor for temporary, reversible pauses.",
+                the replacement, or delete the archived actor with delete_actor (which frees the name) \
+                if name reuse is required. Use suspend_actor for temporary, reversible pauses.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "actor_id": { "type": "string", "description": "UUID of the actor to archive" }
+                },
+                "required": ["actor_id"]
+            }
+        }),
+        // ── 2026-09-30: recorded actor deletion ─────────────────────────
+        serde_json::json!({
+            "name": "delete_actor",
+            "description": "PERMANENTLY delete one of your actors. Only an actor that has already ENDED \
+                (status terminated or archived) can be deleted, and never your Default actor. Refused \
+                while any workflow or any execution history (live, archived, or sub-workflow runs) still \
+                references the actor, since deleting it would falsify that history. The delete also \
+                removes the actor's memory, approval and budget policies and its action log; the action \
+                log and those counts are copied into one admin_event_log record first, in the same \
+                transaction, so the audit trail outlives the actor. Frees the actor's name for reuse. \
+                Run with dry_run: true to see the checks and what would be removed; a real delete \
+                requires confirm_name equal to the actor's exact name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "actor_id": { "type": "string", "description": "UUID of the actor to delete" },
+                    "dry_run": { "type": "boolean", "description": "Evaluate every check and report what would be removed, writing nothing. Default: false." },
+                    "confirm_name": { "type": "string", "description": "Required unless dry_run: the actor's exact name." }
                 },
                 "required": ["actor_id"]
             }
@@ -1020,6 +1042,7 @@ pub async fn dispatch(
         "preview_actor_context" => handle_preview_actor_context(req_id, args, state, user_id).await,
         "handoff_to_actor" => handle_handoff_to_actor(req_id, args, state, user_id).await,
         "archive_actor" => handle_archive_actor(req_id, args, state, user_id).await,
+        "delete_actor" => handle_delete_actor(req_id, args, state, user_id).await,
         "refresh_memory_ttl" => handle_refresh_memory_ttl(req_id, args, state, user_id).await,
         "clone_actor" => handle_clone_actor(req_id, args, state, user_id).await,
         "update_actor" => handle_update_actor(req_id, args, state, user_id).await,
@@ -2235,6 +2258,122 @@ async fn handle_terminate_actor(
         }))
         .unwrap_or_default(),
     )
+}
+
+async fn handle_delete_actor(
+    req_id: Option<serde_json::Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let actor_id = match resolve_actor_via_repo(&req_id, args, &state.actor_repo, user_id).await {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    let dry_run = match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let confirm_name = args.get("confirm_name").and_then(|v| v.as_str());
+    if !dry_run && confirm_name.is_none() {
+        return mcp_error(
+            req_id,
+            -32602,
+            "delete_actor is permanent: pass confirm_name with the actor's exact name \
+             (run with dry_run: true first to see it and what would be removed)",
+        );
+    }
+    let outcome = match state
+        .actor_repo
+        .delete_actor_recorded(actor_id, user_id, dry_run, confirm_name)
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(error = %e, %actor_id, "delete_actor failed");
+            return mcp_failed(
+                req_id,
+                -32000,
+                "Failed to delete actor; nothing was changed",
+            );
+        }
+    };
+    delete_actor_response(req_id, actor_id, outcome)
+}
+
+/// Map a deletion outcome to the reply. Pure, so every arm is tested.
+fn delete_actor_response(
+    req_id: Option<serde_json::Value>,
+    actor_id: Uuid,
+    outcome: talos_actor_repository::ActorDeletion,
+) -> JsonRpcResponse {
+    use talos_actor_repository::ActorDeletion as D;
+    let removed_json = |r: &talos_actor_repository::ActorDeletionRemoves| {
+        serde_json::json!({
+            "action_log_entries": r.action_log_entries,
+            "memories": r.memories,
+            "approval_policies": r.approval_policies,
+            "budget_policies": r.budget_policies,
+        })
+    };
+    match outcome {
+        D::Deleted { name, status, removed } => mcp_text(
+            req_id,
+            &serde_json::json!({
+                "deleted": true,
+                "actor_id": actor_id.to_string(),
+                "name": name,
+                "final_status": status,
+                "removed": removed_json(&removed),
+                "audit": "Recorded in admin_event_log (event_type actor_deleted), including the \
+                          actor's action log, in the same transaction as the delete.",
+            })
+            .to_string(),
+        ),
+        D::WouldDelete { name, status, removed } => mcp_text(
+            req_id,
+            &serde_json::json!({
+                "dry_run": true,
+                "would_delete": true,
+                "actor_id": actor_id.to_string(),
+                "name": name,
+                "final_status": status,
+                "would_remove": removed_json(&removed),
+                "next_step": format!("delete_actor(actor_id: '{actor_id}', confirm_name: '{name}')"),
+            })
+            .to_string(),
+        ),
+        // Absent and foreign collapse to one answer, which the instrument
+        // labels `Denied` (McpErrorKind's rule for the collapsed sentence).
+        D::NotFound => mcp_denied(req_id, -32000, "Actor not found or access denied"),
+        D::DefaultActor => mcp_denied(
+            req_id,
+            -32000,
+            "Refused: this is your Default actor, which every execution without an actor falls back to",
+        ),
+        D::NameMismatch => mcp_denied(
+            req_id,
+            -32602,
+            "Refused: confirm_name does not match the actor's name; nothing was deleted",
+        ),
+        D::NotFinal { status } => mcp_denied(
+            req_id,
+            -32000,
+            &format!(
+                "Refused: the actor is '{status}'. Only a terminated or archived actor can be \
+                 deleted; end it first with terminate_actor or archive_actor"
+            ),
+        ),
+        D::StillReferenced(r) => mcp_denied(
+            req_id,
+            -32000,
+            &format!(
+                "Refused: {} workflow(s) and {} execution row(s) (live, archived or sub-workflow \
+                 runs) still reference this actor; deleting it would falsify that history",
+                r.workflows, r.executions
+            ),
+        ),
+    }
 }
 
 async fn handle_archive_actor(
@@ -7093,5 +7232,71 @@ mod write_ceiling_description_tests {
                 "{name}: {d}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod delete_actor_response_tests {
+    use super::delete_actor_response;
+    use talos_actor_repository::{ActorDeletion as D, ActorDeletionRemoves, ActorReferences};
+    use talos_mcp::McpErrorKind;
+
+    fn removed() -> ActorDeletionRemoves {
+        ActorDeletionRemoves {
+            action_log_entries: 2,
+            memories: 0,
+            approval_policies: 0,
+            budget_policies: 1,
+        }
+    }
+
+    #[test]
+    fn a_delete_and_a_preview_succeed_and_every_refusal_is_denied() {
+        let id = uuid::Uuid::nil();
+        for ok in [
+            D::Deleted {
+                name: "p".into(),
+                status: "terminated".into(),
+                removed: removed(),
+            },
+            D::WouldDelete {
+                name: "p".into(),
+                status: "terminated".into(),
+                removed: removed(),
+            },
+        ] {
+            let r = delete_actor_response(None, id, ok);
+            assert_eq!(r.error_kind, None, "a delete or preview is not an error");
+        }
+        for refused in [
+            D::NotFound,
+            D::DefaultActor,
+            D::NameMismatch,
+            D::NotFinal {
+                status: "active".into(),
+            },
+            D::StillReferenced(ActorReferences {
+                workflows: 1,
+                executions: 0,
+            }),
+        ] {
+            let r = delete_actor_response(None, id, refused);
+            assert_eq!(r.error_kind, Some(McpErrorKind::Denied));
+        }
+    }
+
+    #[test]
+    fn a_preview_names_the_exact_call_that_deletes() {
+        let r = delete_actor_response(
+            None,
+            uuid::Uuid::nil(),
+            D::WouldDelete {
+                name: "probe".into(),
+                status: "terminated".into(),
+                removed: removed(),
+            },
+        );
+        let text = serde_json::to_string(&r.result).unwrap();
+        assert!(text.contains("confirm_name: 'probe'"), "{text}");
     }
 }
