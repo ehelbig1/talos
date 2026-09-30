@@ -6488,22 +6488,42 @@ impl AnalyticsRepository {
     /// a node that has ONLY ever run under test (1 pair of the 77) is invisible
     /// here — acceptable, because it has no production traffic to protect.
     ///
-    /// The `workflow_executions` join is a LEFT join and the test predicate is
-    /// `NOT COALESCE(we.is_test_execution, false)`, deliberately. A SUB-workflow
-    /// run has no `workflow_executions` row at all (`execute_subworkflow_graph`
-    /// seeds a synthetic execution id and detaches the event sink for exactly
-    /// that reason), so an inner join silently deleted every sub-workflow node
-    /// from the DETECTOR — 86 rollup rows over the last 30 days when this was
-    /// measured, topped by a node sitting at 99.2% of its ceiling the day before
-    /// it died of fuel exhaustion. A missing row now reads as "not a test",
-    /// which is the correct reading for a sub-workflow and is the LOUD
-    /// direction: the only way it can be wrong is by counting a sub-workflow
+    /// The test predicate is `execution_id NOT IN (the test executions)`,
+    /// deliberately NOT a join that requires a `workflow_executions` row. A
+    /// SUB-workflow run has no `workflow_executions` row at all
+    /// (`execute_subworkflow_graph` seeds a synthetic execution id and detaches
+    /// the event sink for exactly that reason), so an inner join silently
+    /// deleted every sub-workflow node from the DETECTOR — 86 rollup rows over
+    /// the last 30 days when this was measured, topped by a node sitting at
+    /// 99.2% of its ceiling the day before it died of fuel exhaustion. A row
+    /// with no execution row reads as "not a test", which is the correct
+    /// reading for a sub-workflow and is the LOUD direction: the only way it can be wrong is by counting a sub-workflow
     /// dispatched from a `test_workflow` run as production traffic, which adds a
     /// warning rather than hiding one. (`is_test_execution` is not propagated
     /// into sub-engines; propagating it would be the way to close that, and is
     /// not worth a wire change to suppress a louder warning.)
     ///
     /// ## Bounds
+    ///
+    /// ## Plan shape (2026-09-30)
+    ///
+    /// The test check is a HASHED subplan over the test executions (10 on the
+    /// dev database, served by the partial index `idx_workflow_executions_test`
+    /// and bounded by the live table's 30-day retention), and the owner filter
+    /// is a hashed subplan over the user's workflows. Both are computed once
+    /// per call, so neither depends on the planner's estimate for the rollup
+    /// scan. The previous shape joined `workflow_executions` per rollup row and
+    /// `workflows` for the owner: when the rollup's statistics went stale (the
+    /// `outcome` column added on 2026-09-29 had none, so the scan was estimated
+    /// at 175 rows and returned 36 279) that became 36 258 index probes of
+    /// `workflow_executions`, 108 699 buffer hits. Measured on the dev database
+    /// with the same stale statistics, 70 identical rows in both forms:
+    /// fleet-wide 53.9 ms → 25.1 ms, owner-scoped 51.6 ms → 23.9 ms.
+    /// `NOT IN` is exact here because both `execution_cost_rollup.execution_id`
+    /// and `workflow_executions.id` are NOT NULL. A row with no `workflow_id`
+    /// (a module-bound dispatch, since the 2026-09-29 fuel migration) has no
+    /// workflow node to report and is excluded before the aggregate; the outer
+    /// join to `workflows` still drops a pair whose workflow was deleted.
     ///
     /// `LIMIT $N` on the aggregate (one row per pair). It runs once per sweep
     /// interval (300 s) and is deliberately NOT given its own index: measured
@@ -6536,9 +6556,11 @@ impl AnalyticsRepository {
         // the microsecond, so element 1 orders by `recorded_at` and element 2
         // breaks ties by `max_fuel` — and being unordered it lets the planner
         // hash-aggregate instead of sorting. `workflows` is joined for
-        // `user_id` inside the scan (`$2`) and for `name` only AFTER the
-        // aggregate (one row per pair). Measured on the dev database, 33 553
-        // window rows / 57 pairs: 74.9 ms → 24.1 ms, same 57 rows.
+        // `name` only AFTER the aggregate (one row per pair). Measured on the
+        // dev database, 33 553 window rows / 57 pairs: 74.9 ms → 24.1 ms,
+        // same 57 rows. The owner filter and the test-execution exclusion are
+        // hashed subplans computed once per call (2026-09-30, see the doc
+        // comment), so no per-row join depends on the rollup's statistics.
         let rows = sqlx::query_as::<_, (Uuid, String, String, i64, i64, i64)>(
             "SELECT agg.workflow_id, w.name, agg.node_id, \
                     agg.samples, agg.peak_fuel, agg.current_ceiling \
@@ -6549,14 +6571,16 @@ impl AnalyticsRepository {
                        (MAX(ARRAY[EXTRACT(EPOCH FROM r.recorded_at)::numeric, \
                                   r.max_fuel::numeric]))[2]::bigint AS current_ceiling \
                 FROM execution_cost_rollup r \
-                LEFT JOIN workflow_executions we ON we.id = r.execution_id \
-                JOIN workflows wf ON wf.id = r.workflow_id \
                 WHERE r.recorded_at > NOW() - make_interval(days => $1::int) \
                   AND r.max_fuel > 0 \
                   AND r.fuel_consumed > 0 \
                   AND r.outcome = 'completed' \
-                  AND NOT COALESCE(we.is_test_execution, false) \
-                  AND ($2::uuid IS NULL OR wf.user_id = $2) \
+                  AND r.workflow_id IS NOT NULL \
+                  AND r.execution_id NOT IN ( \
+                        SELECT te.id FROM workflow_executions te \
+                         WHERE te.is_test_execution) \
+                  AND ($2::uuid IS NULL OR r.workflow_id IN ( \
+                        SELECT o.id FROM workflows o WHERE o.user_id = $2)) \
                 GROUP BY r.workflow_id, r.node_id \
              ) agg \
              JOIN workflows w ON w.id = agg.workflow_id \
@@ -7711,8 +7735,9 @@ mod fuel_blindspot_tests {
     /// synthetic execution id — so an inner join deletes every sub-workflow
     /// node from the detector. Measured on the live database before the fix: 86
     /// rollup rows over 30 days were dropped this way, topped by a node at
-    /// 99.2% of its ceiling the day before it died. This needs Postgres to
-    /// exercise behaviourally, so the shape is pinned in the text instead.
+    /// 99.2% of its ceiling the day before it died. The behaviour is driven
+    /// against Postgres by `tests/fuel_headroom.rs`; this pin keeps the shape
+    /// visible in a build without a database.
     #[test]
     fn the_headroom_detector_does_not_require_a_workflow_execution_row() {
         let src = include_str!("lib.rs");
@@ -7725,12 +7750,12 @@ mod fuel_blindspot_tests {
             .map_or(body.len(), |i| i + 1);
         let body = &body[..end];
         assert!(
-            body.contains("LEFT JOIN workflow_executions we"),
-            "the workflow_executions join must be a LEFT join"
+            !body.contains("JOIN workflow_executions"),
+            "the test exclusion must not join workflow_executions per rollup row"
         );
         assert!(
-            body.contains("NOT COALESCE(we.is_test_execution, false)"),
-            "a missing workflow_executions row must read as NOT a test execution"
+            body.contains("r.execution_id NOT IN"),
+            "a rollup row with no workflow_executions row must read as NOT a test execution"
         );
         // The exact pre-fix text, which would silently restore the blindness.
         assert!(
