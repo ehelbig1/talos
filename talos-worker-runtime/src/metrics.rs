@@ -654,6 +654,11 @@ pub enum LlmFailure {
     OversizedResponse,
     /// A 2xx response arrived but the adapter could not parse it.
     Decode,
+    /// A LOCAL (Ollama) call whose prompt Ollama truncated to fit the model's
+    /// loaded context — detected from the response's own `prompt_eval_count`
+    /// (`talos_local_inference::context`). The answer was produced without
+    /// the prompt's start (the system prompt), so it is refused.
+    PromptTruncated,
 }
 
 impl LlmFailure {
@@ -670,11 +675,12 @@ impl LlmFailure {
             LlmFailure::HttpStatus => "http_status",
             LlmFailure::OversizedResponse => "oversized_response",
             LlmFailure::Decode => "decode",
+            LlmFailure::PromptTruncated => "prompt_truncated",
         }
     }
 
     /// Every variant, for exhaustiveness tests and seeding.
-    pub(crate) const ALL: [LlmFailure; 9] = [
+    pub(crate) const ALL: [LlmFailure; 10] = [
         LlmFailure::Cancelled,
         LlmFailure::NotConfigured,
         LlmFailure::InvalidRequest,
@@ -684,6 +690,7 @@ impl LlmFailure {
         LlmFailure::HttpStatus,
         LlmFailure::OversizedResponse,
         LlmFailure::Decode,
+        LlmFailure::PromptTruncated,
     ];
 }
 
@@ -796,6 +803,9 @@ pub(crate) fn seeded_llm_failure_series() -> impl Iterator<Item = (&'static str,
             .into_iter()
             .filter(move |outcome| !(provider == "ollama" && *outcome == LlmFailure::NotConfigured))
             .filter(|outcome| *outcome != LlmFailure::InvalidRequest)
+            // Only a LOCAL exchange is checked for a truncated prompt, so
+            // `prompt_truncated` is reachable for `ollama` alone.
+            .filter(move |outcome| *outcome != LlmFailure::PromptTruncated || provider == "ollama")
             .map(move |outcome| (provider, outcome))
     })
 }
