@@ -349,41 +349,168 @@ pub struct FreshnessPolicy {
     pub on_stale: OnStale,
 }
 
+/// A usable max-age bound: a finite number of hours above zero. A `0` or a
+/// non-numeric bound would make every read permanently stale — a footgun, not
+/// a contract — so the parser skips it, and [`freshness_contract_problems`]
+/// reports it with this same rule.
+fn usable_max_age(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().filter(|h| h.is_finite() && *h > 0.0)
+}
+
+/// The [`ON_STALE`] value as written: `Ok(None)` when absent, `Err` with the
+/// text when it is not one of the two words the engine knows.
+fn on_stale_as_written(config: Option<&serde_json::Value>) -> Result<Option<OnStale>, String> {
+    match config.and_then(|c| c.get(ON_STALE)) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) if s.trim().eq_ignore_ascii_case("fail") => {
+            Ok(Some(OnStale::Fail))
+        }
+        Some(serde_json::Value::String(s)) if s.trim().eq_ignore_ascii_case("annotate") => {
+            Ok(Some(OnStale::Annotate))
+        }
+        Some(other) => Err(match other {
+            serde_json::Value::String(s) => format!("\"{s}\""),
+            v => v.to_string(),
+        }),
+    }
+}
+
 /// Parse a node's freshness contract from its merged config/`data`.
 ///
 /// Returns `None` when [`REQUIRES_FRESH`] is absent, empty, or not an object
 /// — i.e. "no contract", the backward-compatible default. Non-positive and
 /// non-numeric max-ages are skipped (a `0`/garbage bound would make every
-/// read permanently stale, which is a footgun, not a contract).
+/// read permanently stale, which is a footgun, not a contract). An
+/// [`ON_STALE`] the engine does not recognise reads as `annotate`.
+///
+/// Everything this drops, it drops silently — the engine must not fail a run
+/// over an authoring slip. [`freshness_contract_problems`] is where the same
+/// slips are SAID, for the surfaces an author reads before the run.
 #[must_use]
 pub fn resolve_freshness_policy(config: Option<&serde_json::Value>) -> Option<FreshnessPolicy> {
     let obj = config.and_then(|c| c.get(REQUIRES_FRESH))?.as_object()?;
     let requirements: Vec<(String, f64)> = obj
         .iter()
-        .filter_map(|(k, v)| {
-            let hours = v.as_f64()?;
-            if hours.is_finite() && hours > 0.0 {
-                Some((k.clone(), hours))
-            } else {
-                None
-            }
-        })
+        .filter_map(|(k, v)| usable_max_age(v).map(|hours| (k.clone(), hours)))
         .collect();
     if requirements.is_empty() {
         return None;
     }
-    let on_stale = match config
-        .and_then(|c| c.get(ON_STALE))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-    {
-        Some(s) if s.eq_ignore_ascii_case("fail") => OnStale::Fail,
-        _ => OnStale::Annotate,
-    };
+    let on_stale = on_stale_as_written(config)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     Some(FreshnessPolicy {
         requirements,
         on_stale,
     })
+}
+
+/// A part of a node's freshness contract, as written, that the engine will
+/// not act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreshnessContractProblem {
+    /// [`REQUIRES_FRESH`] is present but is not an object of key → hours.
+    NotAnObject {
+        /// What it is instead ("an array", "a string", …).
+        found: &'static str,
+    },
+    /// [`REQUIRES_FRESH`] is an object with no entries.
+    NoKeys,
+    /// One key's bound is not a positive number of hours; that key is not checked.
+    UnusableBound {
+        /// The memory key whose bound is unusable.
+        key: String,
+        /// The bound as written (JSON text).
+        value: String,
+    },
+    /// [`ON_STALE`] is neither `annotate` nor `fail`; `annotate` is used.
+    UnknownOnStale {
+        /// The value as written (JSON text).
+        value: String,
+    },
+    /// [`ON_STALE`] is set but there is no usable [`REQUIRES_FRESH`] for it to apply to.
+    OnStaleWithoutRequirements,
+}
+
+impl std::fmt::Display for FreshnessContractProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnObject { found } => write!(
+                f,
+                "`{REQUIRES_FRESH}` is {found}, not an object of memory key to max age in hours \
+                 (e.g. {{\"daily_brief/latest\": 6}}), so the node has NO freshness contract"
+            ),
+            Self::NoKeys => write!(f, "`{REQUIRES_FRESH}` lists no memory key, so the node has NO freshness contract"),
+            Self::UnusableBound { key, value } => write!(
+                f,
+                "`{REQUIRES_FRESH}.{key}` is {value}, not a number of hours above zero, so that key is NOT checked"
+            ),
+            Self::UnknownOnStale { value } => write!(
+                f,
+                "`{ON_STALE}` is {value}; the engine knows \"annotate\" and \"fail\" and treats anything \
+                 else as \"annotate\", so a stale input will NOT stop this node"
+            ),
+            Self::OnStaleWithoutRequirements => write!(
+                f,
+                "`{ON_STALE}` is set but `{REQUIRES_FRESH}` gives it nothing to apply to"
+            ),
+        }
+    }
+}
+
+/// Everything in a node's freshness contract, as written in its config, that
+/// [`resolve_freshness_policy`] drops — by the parser's own rules, so the two
+/// cannot disagree about what counts. Empty when the contract is absent or
+/// fully usable.
+///
+/// The slip that matters most is [`FreshnessContractProblem::UnknownOnStale`]:
+/// an author who wrote `"on_stale": "error"` asked for a stale input to stop
+/// the node and got one that is annotated and sent on.
+#[must_use]
+pub fn freshness_contract_problems(
+    config: Option<&serde_json::Value>,
+) -> Vec<FreshnessContractProblem> {
+    let mut problems = Vec::new();
+    let declared = config
+        .and_then(|c| c.get(REQUIRES_FRESH))
+        .filter(|v| !v.is_null());
+    let mut usable = 0usize;
+    match declared {
+        None => {}
+        Some(serde_json::Value::Object(obj)) if obj.is_empty() => {
+            problems.push(FreshnessContractProblem::NoKeys);
+        }
+        Some(serde_json::Value::Object(obj)) => {
+            for (key, value) in obj {
+                if usable_max_age(value).is_some() {
+                    usable += 1;
+                } else {
+                    problems.push(FreshnessContractProblem::UnusableBound {
+                        key: key.clone(),
+                        value: value.to_string(),
+                    });
+                }
+            }
+        }
+        Some(other) => problems.push(FreshnessContractProblem::NotAnObject {
+            found: match other {
+                serde_json::Value::Array(_) => "an array",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::Bool(_) => "a boolean",
+                _ => "not an object",
+            },
+        }),
+    }
+    match on_stale_as_written(config) {
+        Err(value) => problems.push(FreshnessContractProblem::UnknownOnStale { value }),
+        Ok(Some(_)) if usable == 0 && declared.is_none() => {
+            problems.push(FreshnessContractProblem::OnStaleWithoutRequirements);
+        }
+        Ok(_) => {}
+    }
+    problems
 }
 
 /// Build the [`STALENESS`] payload for a policy given each key's resolved
@@ -1069,6 +1196,124 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn a_usable_or_absent_contract_has_no_problems() {
+        for config in [
+            json!({}),
+            json!({"requires_fresh": null}),
+            json!({"requires_fresh": {"daily_brief/latest": 6}}),
+            json!({"requires_fresh": {"a": 0.5, "b": 96}, "on_stale": "annotate"}),
+            json!({"requires_fresh": {"a": 6}, "on_stale": " FAIL "}),
+            json!({"requires_fresh": {"a": 6}, "on_stale": null}),
+        ] {
+            assert_eq!(
+                freshness_contract_problems(Some(&config)),
+                vec![],
+                "{config}"
+            );
+        }
+        assert_eq!(freshness_contract_problems(None), vec![]);
+    }
+
+    #[test]
+    fn every_part_the_parser_drops_is_reported() {
+        use FreshnessContractProblem as P;
+        let one = |config: serde_json::Value| freshness_contract_problems(Some(&config));
+        assert_eq!(
+            one(json!({"requires_fresh": "6h"})),
+            vec![P::NotAnObject { found: "a string" }]
+        );
+        assert_eq!(
+            one(json!({"requires_fresh": ["a"]})),
+            vec![P::NotAnObject { found: "an array" }]
+        );
+        assert_eq!(
+            one(json!({"requires_fresh": 6})),
+            vec![P::NotAnObject { found: "a number" }]
+        );
+        assert_eq!(one(json!({"requires_fresh": {}})), vec![P::NoKeys]);
+        assert_eq!(
+            one(json!({"requires_fresh": {"a": "6", "b": 0, "c": -1, "d": 6}})),
+            vec![
+                P::UnusableBound {
+                    key: "a".into(),
+                    value: "\"6\"".into()
+                },
+                P::UnusableBound {
+                    key: "b".into(),
+                    value: "0".into()
+                },
+                P::UnusableBound {
+                    key: "c".into(),
+                    value: "-1".into()
+                },
+            ]
+        );
+        // The slip that changes behaviour: a stop was asked for and will not happen.
+        for bad in [
+            json!("error"),
+            json!("failed"),
+            json!("abort"),
+            json!(true),
+            json!(""),
+        ] {
+            let problems = one(json!({"requires_fresh": {"a": 6}, "on_stale": bad}));
+            assert!(
+                matches!(problems.as_slice(), [P::UnknownOnStale { .. }]),
+                "{bad}: {problems:?}"
+            );
+            assert!(problems[0].to_string().contains("will NOT stop this node"));
+        }
+        assert_eq!(
+            one(json!({"on_stale": "fail"})),
+            vec![P::OnStaleWithoutRequirements]
+        );
+        // The sentences name the field an author would search for.
+        assert!(P::NoKeys.to_string().contains("`requires_fresh`"));
+        assert!(P::UnusableBound {
+            key: "k".into(),
+            value: "0".into()
+        }
+        .to_string()
+        .contains("`requires_fresh.k` is 0"));
+    }
+
+    /// The report and the parser must agree on what counts: no problem ⇔ the
+    /// parser kept every declared key and the stop the author asked for.
+    #[test]
+    fn the_problem_report_and_the_parser_agree() {
+        let configs = [
+            json!({}),
+            json!({"requires_fresh": {"a": 6}}),
+            json!({"requires_fresh": {"a": 6, "b": "x"}}),
+            json!({"requires_fresh": {"a": 0}}),
+            json!({"requires_fresh": {}}),
+            json!({"requires_fresh": []}),
+            json!({"requires_fresh": {"a": 6}, "on_stale": "fail"}),
+            json!({"requires_fresh": {"a": 6}, "on_stale": "stop"}),
+        ];
+        for config in configs {
+            let declared = config
+                .get("requires_fresh")
+                .and_then(|v| v.as_object())
+                .map_or(0, serde_json::Map::len);
+            let policy = resolve_freshness_policy(Some(&config));
+            let kept = policy.as_ref().map_or(0, |p| p.requirements.len());
+            let asked_to_fail = config.get("on_stale").is_some();
+            let will_fail = policy.as_ref().is_some_and(|p| p.on_stale == OnStale::Fail);
+            let lossless = kept == declared
+                && config
+                    .get("requires_fresh")
+                    .is_none_or(|v| v.is_object() && declared > 0)
+                && (!asked_to_fail || will_fail);
+            assert_eq!(
+                freshness_contract_problems(Some(&config)).is_empty(),
+                lossless,
+                "{config}"
+            );
+        }
     }
 
     #[test]

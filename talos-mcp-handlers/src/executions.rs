@@ -422,7 +422,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_node_io",
-            "description": "Get the stored input snapshot and the output of one node in a workflow execution — for debugging data flow between nodes. `input_status` says what `input` is: `complete`; `shortened` (the input was over 4096 bytes, so long strings, long arrays, wide objects and deep nesting are abbreviated with a '…' marker — keys and nesting are kept); `unparseable` (the stored text is not JSON — an older row cut mid-structure — and is returned raw as `truncated_preview`); `not_recorded` (system nodes such as collect/judge/sub_workflow and nodes that never ran store none); `node_id` may be the node's id or its display label; a label shared by several nodes is refused. A name the graph does not carry, with nothing recorded for it, is an error that lists the graph's nodes; `node_in_current_graph` is false for a node the run recorded but the graph has since dropped. or `unreadable` (the read failed). Engine-supplied keys (__accumulated__, __actor_context__, __trigger_input__, __staleness__, __degraded_inputs__) are never in the snapshot although the node received them.",
+            "description": "Get the stored input snapshot and the output of one node in a workflow execution — for debugging data flow between nodes. `input_status` says what `input` is: `complete`; `shortened` (the input was over 4096 bytes, so long strings, long arrays, wide objects and deep nesting are abbreviated with a '…' marker — keys and nesting are kept); `unparseable` (the stored text is not JSON — an older row cut mid-structure — and is returned raw as `truncated_preview`); `not_recorded` (system nodes such as collect/judge/sub_workflow and nodes that never ran store none); `node_id` may be the node's id or its display label; a label shared by several nodes is refused. A name the graph does not carry, with nothing recorded for it, is an error that lists the graph's nodes; `node_in_current_graph` is false for a node the run recorded but the graph has since dropped. or `unreadable` (the read failed). Engine-supplied keys (__accumulated__, __actor_context__, __trigger_input__, __staleness__, __degraded_inputs__) are never in the snapshot although the node received them. `freshness_contract` (present when the node declares `requires_fresh` in the current graph) shows the contract the engine enforces for it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7328,8 +7328,12 @@ async fn handle_get_node_io(
     // (`data.label`, the name the timeline and waterfall show) — to the
     // engine's node uuid. A label naming more than one node is refused: any
     // pick would answer about a node the caller may not have meant.
+    let mut freshness_contract: Option<serde_json::Value> = None;
     let (node_uuid, graph_node_id) = match resolve_graph_node(&graph_nodes, node_id_str) {
-        NodeResolution::Resolved(node) => (node.uuid, Some(node.id.clone())),
+        NodeResolution::Resolved(node) => {
+            freshness_contract.clone_from(&node.freshness_contract);
+            (node.uuid, Some(node.id.clone()))
+        }
         NodeResolution::AmbiguousLabel(ids) => {
             return mcp_error(
                 req_id,
@@ -7412,20 +7416,37 @@ async fn handle_get_node_io(
         );
     }
 
+    let mut reply = serde_json::json!({
+        "node_id": node_id_str,
+        "graph_node_id": graph_node_id,
+        "node_in_current_graph": presence.in_current_graph(),
+        "input": input_report.value,
+        "input_status": input_report.status,
+        "input_note": input_report.note,
+        "output": output_value,
+    });
+    attach_freshness_contract(&mut reply, freshness_contract);
     respond_maybe_archived(
         req_id,
         archived_at,
-        serde_json::to_string_pretty(&serde_json::json!({
-            "node_id": node_id_str,
-            "graph_node_id": graph_node_id,
-            "node_in_current_graph": presence.in_current_graph(),
-            "input": input_report.value,
-            "input_status": input_report.status,
-            "input_note": input_report.note,
-            "output": output_value,
-        }))
-        .unwrap_or_default(),
+        serde_json::to_string_pretty(&reply).unwrap_or_default(),
     )
+}
+
+/// The engine-supplied `__staleness__` report is never in a stored snapshot,
+/// so the snapshot cannot show whether a freshness contract reached the node.
+/// When the node carries one in the CURRENT graph, say so and say what it is.
+/// No contract ⇒ no key.
+fn attach_freshness_contract(reply: &mut serde_json::Value, contract: Option<serde_json::Value>) {
+    let Some(mut contract) = contract else {
+        return;
+    };
+    contract["note"] = serde_json::json!(
+        "From the workflow's CURRENT graph (it may differ from the graph this run used). With this \
+         contract the engine checks each key's age against the node's bound actor and gives the node a \
+         `__staleness__` report, which is engine-supplied and therefore not in the stored `input`."
+    );
+    reply["freshness_contract"] = contract;
 }
 
 /// One node of a workflow graph, as `get_node_io` resolves names against it.
@@ -7437,6 +7458,9 @@ struct GraphNode {
     id: String,
     /// `data.label`, when the node has one.
     label: Option<String>,
+    /// The node's freshness contract in the CURRENT graph, as the engine
+    /// parses it (see `render_freshness_contract`).
+    freshness_contract: Option<serde_json::Value>,
 }
 
 /// The nodes of `graph_json`, parsed once. An absent or unparseable graph is
@@ -7463,6 +7487,9 @@ fn graph_nodes(graph_json: Option<&str>) -> Vec<GraphNode> {
                             .and_then(|d| d.get("label"))
                             .and_then(|l| l.as_str())
                             .map(str::to_string),
+                        freshness_contract: crate::utils::render_freshness_contract(
+                            node.get("data"),
+                        ),
                     })
                 })
                 .collect()
@@ -8683,5 +8710,44 @@ mod waterfall_bar_geometry_tests {
                 "bar must fit: {s},{d},{t},{w} -> {g:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod node_io_freshness_contract_tests {
+    use super::{attach_freshness_contract, graph_nodes};
+    use serde_json::json;
+
+    #[test]
+    fn the_nodes_contract_is_read_from_the_graph_and_attached_only_when_present() {
+        let graph = json!({"nodes": [
+            {"id": "plan", "data": {"label": "Plan", "requires_fresh": {"commitments/mine": 96}}},
+            {"id": "send", "data": {"TO": "x"}}
+        ]})
+        .to_string();
+        let nodes = graph_nodes(Some(&graph));
+        let plan = nodes.iter().find(|n| n.id == "plan").unwrap();
+        let send = nodes.iter().find(|n| n.id == "send").unwrap();
+        assert_eq!(
+            plan.freshness_contract,
+            Some(json!({"requires_fresh": {"commitments/mine": 96.0}, "on_stale": "annotate"}))
+        );
+        assert_eq!(send.freshness_contract, None);
+
+        let mut with = json!({"node_id": "plan"});
+        attach_freshness_contract(&mut with, plan.freshness_contract.clone());
+        assert_eq!(with["freshness_contract"]["on_stale"], "annotate");
+        assert!(with["freshness_contract"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("`__staleness__`"));
+
+        let mut without = json!({"node_id": "send"});
+        attach_freshness_contract(&mut without, None);
+        assert_eq!(
+            without,
+            json!({"node_id": "send"}),
+            "no contract adds no key"
+        );
     }
 }
