@@ -429,6 +429,103 @@ pub fn apply_retry_policy(
     }
 }
 
+/// The per-node controls `create_workflow` accepts on a MODULE node, beside
+/// the retry fields: the same three `add_node_to_workflow` takes as named
+/// parameters.
+pub const NODE_CONTROL_KEYS: [&str; 3] = ["skip_condition", "continue_on_error", "timeout_secs"];
+
+/// Why a `create_workflow` node's controls cannot be accepted as written, or
+/// `None` when they can. Shape only: the Rhai check of `skip_condition` and
+/// the numeric caps belong to the handler and the canonical graph validator.
+///
+/// Until 2026-10-01 these keys were not read at all on a `create_workflow`
+/// node. A caller who set `continue_on_error: true` there got a workflow
+/// without it and no word that it was dropped; the working route was a second
+/// call per node, or the undocumented `config.continue_on_error`.
+///
+/// Refused rather than ignored:
+/// * a wrong type (a string `"true"`, a fractional or non-positive timeout);
+/// * `skip_condition` / `continue_on_error` on a structural node, where this
+///   builder does not write them (their own tools do), so accepting the key
+///   would drop it silently — `timeout_secs` is exempt there because it is a
+///   structural parameter of `sub_workflow` / `capability_dispatch`;
+/// * the same control given both on the node and inside `config` with
+///   different values: the engine reads `config` first, so the node-level
+///   value would lose without notice.
+pub fn node_controls_shape_error(input_node: &Value) -> Option<String> {
+    let label = input_node
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unnamed node>");
+    let present = |key: &str| input_node.get(key).filter(|v| !v.is_null());
+    let structural = input_node
+        .get("node_type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| STRUCTURAL_NODE_TYPES.contains(&t));
+
+    if let Some(v) = present("skip_condition") {
+        if !v.is_string() {
+            return Some(format!(
+                "node '{label}': skip_condition must be a string (a Rhai expression)"
+            ));
+        }
+    }
+    if let Some(v) = present("continue_on_error") {
+        if !v.is_boolean() {
+            return Some(format!(
+                "node '{label}': continue_on_error must be true or false, got {v}"
+            ));
+        }
+    }
+    if structural {
+        for key in ["skip_condition", "continue_on_error"] {
+            if present(key).is_some() {
+                return Some(format!(
+                    "node '{label}': {key} is not set on a structural node by create_workflow — \
+                     create the workflow, then use {} for this node",
+                    if key == "skip_condition" {
+                        "add_skip_condition"
+                    } else {
+                        "set_continue_on_error"
+                    }
+                ));
+            }
+        }
+        return None;
+    }
+    if let Some(v) = present("timeout_secs") {
+        if v.as_u64().is_none_or(|n| n == 0) {
+            return Some(format!("node '{label}': timeout_secs must be a whole number of seconds, 1 or more, got {v}"));
+        }
+    }
+    for key in NODE_CONTROL_KEYS {
+        let in_config = input_node
+            .get("config")
+            .and_then(|c| c.get(key))
+            .filter(|v| !v.is_null());
+        if let (Some(a), Some(b)) = (present(key), in_config) {
+            if a != b {
+                return Some(format!(
+                    "node '{label}': {key} is given both on the node ({a}) and inside config ({b}); set it once"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Copy a module node's controls from the `create_workflow` input onto the
+/// graph node, at the top level — where `add_node_to_workflow` writes them and
+/// the engine's graph loader reads them. Assumes
+/// [`node_controls_shape_error`] returned `None`.
+pub fn apply_node_controls(node_obj: &mut Map<String, Value>, input_node: &Value) {
+    for key in NODE_CONTROL_KEYS {
+        if let Some(v) = input_node.get(key).filter(|v| !v.is_null()) {
+            node_obj.insert(key.to_string(), v.clone());
+        }
+    }
+}
+
 /// Extract `connect_from` / `connect_to` shorthand on a single input
 /// node into explicit `(source, target)` edges. Returns the edges in
 /// declaration order: `connect_from` first (those edges have the
@@ -521,6 +618,7 @@ pub fn build_graph_node(
                 .and_then(|s| s.parse::<Uuid>().ok())
                 .and_then(|uid| template_max_retries_map.get(&uid).copied());
             apply_retry_policy(obj, input_node, default_retry, template_max_retries);
+            apply_node_controls(obj, input_node);
         }
         node_json
     };
@@ -2107,6 +2205,128 @@ mod tests {
         let mut y = 100.0;
         let (node, _) = build_graph_node(&n, &json!({}), &tmap, &mut y);
         assert_eq!(node["retry_count"], 0);
+    }
+
+    #[test]
+    fn build_graph_node_carries_a_module_nodes_controls_at_the_top_level() {
+        let n = json!({
+            "id": "fetch", "module_id": "00000000-0000-0000-0000-000000000001", "config": {"URL": "x"},
+            "skip_condition": "count == 0", "continue_on_error": true, "timeout_secs": 45
+        });
+        let mut y = 0.0;
+        let (node, _) = build_graph_node(&n, &json!({}), &HashMap::new(), &mut y);
+        assert_eq!(node["skip_condition"], "count == 0");
+        assert_eq!(node["continue_on_error"], true);
+        assert_eq!(node["timeout_secs"], 45);
+        assert_eq!(
+            node["data"],
+            json!({"URL": "x"}),
+            "the module's config is not touched"
+        );
+        // Absent or null controls add no key (the engine's defaults apply).
+        let bare = json!({"id": "a", "module_id": "00000000-0000-0000-0000-000000000001", "continue_on_error": null});
+        let (node, _) = build_graph_node(&bare, &json!({}), &HashMap::new(), &mut y);
+        for key in NODE_CONTROL_KEYS {
+            assert!(node.get(key).is_none(), "{key}");
+        }
+        // A structural node's `timeout_secs` stays its own parameter, in `data`.
+        let sub = json!({"id": "s", "node_type": "sub_workflow", "sub_workflow_id": "00000000-0000-0000-0000-000000000002", "timeout_secs": 90});
+        let (node, _) = build_graph_node(&sub, &json!({}), &HashMap::new(), &mut y);
+        assert!(node.get("timeout_secs").is_none());
+        assert_eq!(node["data"]["timeout_secs"], 90);
+    }
+
+    #[test]
+    fn node_controls_are_refused_when_they_would_be_dropped_or_misread() {
+        let module = |extra: Value| {
+            let mut n = json!({"id": "n1", "module_id": "00000000-0000-0000-0000-000000000001"});
+            for (k, v) in extra.as_object().unwrap() {
+                n[k] = v.clone();
+            }
+            n
+        };
+        // Accepted as written.
+        for ok in [
+            json!({}),
+            json!({"skip_condition": "count == 0", "continue_on_error": false, "timeout_secs": 1}),
+            json!({"continue_on_error": null, "timeout_secs": null}),
+            json!({"continue_on_error": true, "config": {"continue_on_error": true}}),
+        ] {
+            assert_eq!(node_controls_shape_error(&module(ok.clone())), None, "{ok}");
+        }
+        // Wrong types are named, with the node.
+        let cases = [
+            (
+                json!({"continue_on_error": "true"}),
+                "continue_on_error must be true or false",
+            ),
+            (
+                json!({"continue_on_error": 1}),
+                "continue_on_error must be true or false",
+            ),
+            (
+                json!({"skip_condition": true}),
+                "skip_condition must be a string",
+            ),
+            (
+                json!({"timeout_secs": 0}),
+                "timeout_secs must be a whole number",
+            ),
+            (
+                json!({"timeout_secs": 1.5}),
+                "timeout_secs must be a whole number",
+            ),
+            (
+                json!({"timeout_secs": "45"}),
+                "timeout_secs must be a whole number",
+            ),
+            (
+                json!({"timeout_secs": -3}),
+                "timeout_secs must be a whole number",
+            ),
+        ];
+        for (extra, want) in cases {
+            let err = node_controls_shape_error(&module(extra.clone()))
+                .unwrap_or_else(|| panic!("{extra} accepted"));
+            assert!(
+                err.starts_with("node 'n1': ") && err.contains(want),
+                "{extra}: {err}"
+            );
+        }
+        // Given twice with different values: the config copy would win silently.
+        let twice =
+            module(json!({"continue_on_error": true, "config": {"continue_on_error": false}}));
+        assert!(node_controls_shape_error(&twice)
+            .unwrap()
+            .contains("set it once"));
+        let twice = module(json!({"skip_condition": "a", "config": {"skip_condition": "b"}}));
+        assert!(node_controls_shape_error(&twice)
+            .unwrap()
+            .contains("set it once"));
+        // On a structural node the builder writes neither; say where to set them.
+        let collect = |extra: Value| {
+            let mut n = json!({"id": "c", "node_type": "collect"});
+            for (k, v) in extra.as_object().unwrap() {
+                n[k] = v.clone();
+            }
+            n
+        };
+        assert!(
+            node_controls_shape_error(&collect(json!({"continue_on_error": true})))
+                .unwrap()
+                .contains("set_continue_on_error")
+        );
+        assert!(
+            node_controls_shape_error(&collect(json!({"skip_condition": "x"})))
+                .unwrap()
+                .contains("add_skip_condition")
+        );
+        assert_eq!(
+            node_controls_shape_error(&collect(json!({"timeout_secs": 90}))),
+            None,
+            "a structural parameter"
+        );
+        assert_eq!(node_controls_shape_error(&collect(json!({}))), None);
     }
 
     #[test]

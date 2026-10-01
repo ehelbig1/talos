@@ -9,6 +9,12 @@
   "allowed_methods": ["GET"],
   "requires_secrets": ["oauth/gmail/*"],
   "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 25,
+    "bytes_per_item": 8000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 3.0
+  },
   "config_schema": {
     "type": "object",
     "required": ["AUTH_HEADER"],

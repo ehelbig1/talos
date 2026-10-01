@@ -111,7 +111,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "create_workflow",
-            "description": "Create a new blank workflow (also called: make workflow, build workflow, start workflow, new workflow). Provide a name and an optional array of nodes (each with a module_id from compile_template or list_modules). Edges connect nodes. Returns the new workflow ID. For AI-assisted creation use create_workflow_from_description instead. For common workflow shapes (webhooks, data pipelines, LLM inference) check list_workflow_patterns first — instantiate_workflow_pattern creates a pre-wired workflow in one call.\n\nEmpty workflow is allowed (omit nodes or pass []). Use this when all nodes need continue_on_error, skip_condition, or retry_count — set those via add_node_to_workflow which supports them as first-class params.\n\nTwo paths for structural nodes (collect, loop, sub_workflow, capability_dispatch):\n  PREFERRED (inline): set node_type instead of module_id on any node; use connect_from/connect_to to wire edges in the same call. Edges between structural and regular nodes work in create_workflow — no multi-step required.\n  FALLBACK (post-creation): create_workflow with empty nodes, then add_node_to_workflow with connect_from/connect_to to build the full graph incrementally.",
+            "description": "Create a new blank workflow (also called: make workflow, build workflow, start workflow, new workflow). Provide a name and an optional array of nodes (each with a module_id from compile_template or list_modules). Edges connect nodes. Returns the new workflow ID. For AI-assisted creation use create_workflow_from_description instead. For common workflow shapes (webhooks, data pipelines, LLM inference) check list_workflow_patterns first — instantiate_workflow_pattern creates a pre-wired workflow in one call.\n\nEmpty workflow is allowed (omit nodes or pass []). A module node may carry skip_condition, continue_on_error, timeout_secs and the retry fields right here, as named fields beside config — the same controls add_node_to_workflow takes — so a fan-in whose branches may fail needs no second call per node. On a structural node set skip_condition / continue_on_error afterwards with add_skip_condition / set_continue_on_error.\n\nTwo paths for structural nodes (collect, loop, sub_workflow, capability_dispatch):\n  PREFERRED (inline): set node_type instead of module_id on any node; use connect_from/connect_to to wire edges in the same call. Edges between structural and regular nodes work in create_workflow — no multi-step required.\n  FALLBACK (post-creation): create_workflow with empty nodes, then add_node_to_workflow with connect_from/connect_to to build the full graph incrementally.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -141,7 +141,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                                 "retry_count": { "type": "number", "description": "Max retries on failure. Omit to take the method-aware default: read-only / pure-compute modules (minimal/secrets worlds, or http/agent with a DECLARED GET/HEAD-only allowed_methods) get transient retries; governance / messaging / database / unknown worlds and state-changing HTTP fail closed to 0. Setting retry_backoff_ms or retry_condition alone does NOT imply a count — they answer how far apart and when, never how many. An explicit value here always wins, including 0." },
                                 "retry_backoff_ms": { "type": "number", "description": "Base backoff in ms, doubles each retry (default: 500)" },
                                 "retry_condition": { "type": "string", "description": "Rhai expression evaluated against the module's error output JSON. Return false to skip retries (fail immediately); return true to allow the retry. Variables in scope: all fields from the output JSON (e.g. status, error, error_message, is_error). Defaults to retry on evaluation error (safe default). Example: 'status != 429' (retry for everything except rate limits)" },
-                                "retry_delay_expression": { "type": "string", "description": "Rhai expression that returns a delay in ms computed from the error output. Variables in scope: same as retry_condition. Overrides exponential backoff when set. Capped at 60000ms. Example: 'if status == 429 { retry_after * 1000 } else { 1000 }'" }
+                                "retry_delay_expression": { "type": "string", "description": "Rhai expression that returns a delay in ms computed from the error output. Variables in scope: same as retry_condition. Overrides exponential backoff when set. Capped at 60000ms. Example: 'if status == 429 { retry_after * 1000 } else { 1000 }'" },
+                                "skip_condition": { "type": "string", "description": "Module nodes only. Rhai expression evaluated before the node runs; true skips it and execution continues. Fields of the node's input bind as BARE variables (\"count == 0\"). FAIL-OPEN: an expression that cannot be evaluated does NOT skip. Same rules as add_node_to_workflow's skip_condition. Max 2000 chars." },
+                                "continue_on_error": { "type": "boolean", "description": "Module nodes only. If true, this node's failure does not fail the workflow: downstream nodes run and receive its error output (a collect node receives it as one of its items). Default false." },
+                                "timeout_secs": { "type": "number", "description": "Per-node execution timeout in whole seconds (default 60). On a sub_workflow / capability_dispatch node this is that node's own child timeout parameter." }
                             },
                             "required": ["id"]
                         }
@@ -234,7 +237,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "type": "object",
                         "description": "Optional map of crate name → version string for the inline compile (e.g. {\"chrono\": \"0.4\", \"url\": \"2\"}). serde and serde_json are pre-bundled. Only allowlisted crates are accepted — see compile_custom_sandbox.dependencies for the full list. Mirrors compile_custom_sandbox semantics so inline-compiled nodes don't have to be compiled separately just to pull a dependency."
                     },
-                    "config": { "type": "object", "description": "Per-node module config key/value pairs merged with the module's default config. Also carries per-node ENGINE HINTS, chiefly `max_fuel` (integer): a node-level fuel budget that OVERRIDES the module row's default at dispatch. Set it when this node sees a bigger payload than the module's typical one (e.g. a fan-in collect payload). The response echoes it back as `node_max_fuel_override`, and `configured_max_fuel` reports the budget as authored — note `applied_max_fuel` is the MODULE row and is expected to differ. `configured_max_fuel` is NOT a prediction of the enforced ceiling: at dispatch the engine takes max(configured, adaptive-fuel learned floor) clamped to max_fuel_per_node, so what a worker enforces can be higher or lower. Read the enforced value from get_fuel_usage_report / get_execution_trace after the node has run." },
+                    "config": { "type": "object", "description": "Per-node module config key/value pairs merged with the module's default config. Also carries per-node ENGINE HINTS, chiefly `max_fuel` (integer): a node-level fuel budget that OVERRIDES the module row's default at dispatch. Set it when this node sees a bigger payload than the module's typical one (e.g. a fan-in collect payload). The response echoes it back as `node_max_fuel_override`, and `configured_max_fuel` reports the budget as authored — note `applied_max_fuel` is the MODULE row and is expected to differ. `configured_max_fuel` is NOT a prediction of the enforced ceiling: at dispatch the engine takes max(configured, adaptive-fuel learned floor) clamped to max_fuel_per_node, so what a worker enforces can be higher or lower. Read the enforced value from get_fuel_usage_report / get_execution_trace after the node has run. Also carries the node's FRESHNESS CONTRACT: `requires_fresh` — an object of actor-memory key to maximum age in hours, e.g. {\"daily_brief/latest\": 6} — makes the engine check each key's age against the node's bound actor and hand the node a `__staleness__` report ({any_stale, entries:[{key, age_hours, max_age_hours, present, stale}]}; an absent key counts as stale); `on_stale` is \"annotate\" (default: report and continue) or \"fail\" (the node fails on a stale input). validate_workflow lists the contracts it understood under `freshness_contracts`." },
                     "skip_condition": { "type": "string", "description": "Rhai expression evaluated before the node runs — if it returns true the node is skipped and execution continues with the next node. Fields bind as BARE variables: \"dry_run == true\", NOT \"input.dry_run == true\" (there is no `input` wrapper unless an upstream output has an `input` key); use `ctx.a.b` for nested access. `is_error` / `error_message` are always in scope. FAIL-OPEN: an expression that cannot be evaluated defaults to false, i.e. the node is NOT skipped and RUNS — syntax is rejected at save time, but verify names with test_condition against a representative payload. Max 2000 chars." },
                     "continue_on_error": { "type": "boolean", "description": "If true, a node failure does not halt the workflow — execution continues with downstream nodes. Use with care: downstream nodes receive error output. Default: false." },
                     "timeout_secs": { "type": "number", "description": "Per-node execution timeout in seconds (default: 60). Nodes that exceed this limit are treated as timed-out failures. Set higher when a node calls an LLM (Ollama synthesis typically 20-45s), performs large HTTP fetches, or runs expensive SQL. Use the global set_wasm_config `execution_timeout_secs` to change the default for nodes that don't specify one." },
@@ -315,7 +318,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_workflow_draft",
-            "description": "Trigger the current draft graph_json directly, bypassing the published version. Useful for testing unpublished changes without publishing first. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound drafts run with the same __actor_context__ payload they would receive in production.",
+            "description": "Trigger the current draft graph_json directly, bypassing the published version. Useful for testing unpublished changes without publishing first. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound drafts run with the same __actor_context__ payload they would receive in production. BUDGET: a rehearsal is a real execution and counts toward the actor's budget; the reply's `actor_budget` block shows each cap the actor's policy sets (limit, used, remaining) and carries a `warning` once any cap is 80% spent — in `suspend` mode a start refused on the hourly cap suspends the actor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -377,7 +380,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "validate_workflow",
-            "description": "Validate a workflow's structure: check that all referenced modules exist and the graph has no cycles. `issues` are errors; `warnings` are full sentences; `warning_summary` (present when there are warnings) indexes them by category ({category, count, nodes}) so a new kind of warning stands out among several long ones about the same thing.",
+            "description": "Validate a workflow's structure: check that all referenced modules exist and the graph has no cycles. `issues` are errors; `warnings` are full sentences; `warning_summary` (present when there are warnings) indexes them by category ({category, count, nodes}) so a new kind of warning stands out among several long ones about the same thing. `freshness_contracts` (present when any node declares one) lists each node's `requires_fresh` / `on_stale` exactly as the engine will enforce it; a part of a contract the engine cannot use is a `freshness-contract` warning.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -479,7 +482,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_workflow",
-            "description": "Execute a workflow synchronously and run assertions against the result. Returns pass/fail with detailed assertion results. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound workflows run with the same __actor_context__ payload they would receive in production.",
+            "description": "Execute a workflow synchronously and run assertions against the result. Returns pass/fail with detailed assertion results. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound workflows run with the same __actor_context__ payload they would receive in production. BUDGET: a rehearsal is a real execution and counts toward the actor's budget; the reply's `actor_budget` block shows each cap the actor's policy sets (limit, used, remaining) and carries a `warning` once any cap is 80% spent — in `suspend` mode a start refused on the hourly cap suspends the actor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1637,12 +1640,22 @@ async fn handle_create_workflow(
     // live in an export would make an existing workflow unrestorable — a
     // worse failure than the one being prevented. The runtime counter and
     // the WARN cover conditions that arrive that way.
+    //
+    // Since 2026-10-01 a node may also carry `skip_condition`,
+    // `continue_on_error` and `timeout_secs` as named fields, as
+    // `add_node_to_workflow` always could. Their shape is checked first
+    // (wrong type, a structural node, a value given twice), then the
+    // expression itself wherever it was written.
     for node in &input_nodes {
-        let Some(expr) = node
+        if let Some(msg) = talos_workflow_creation_helpers::node_controls_shape_error(node) {
+            return mcp_error(req_id, -32602, &msg);
+        }
+        let named = node.get("skip_condition").and_then(|v| v.as_str());
+        let in_config = node
             .get("config")
             .and_then(|c| c.get("skip_condition"))
-            .and_then(|v| v.as_str())
-        else {
+            .and_then(|v| v.as_str());
+        let Some(expr) = named.or(in_config) else {
             continue;
         };
         if let Err(msg) = crate::graph::validate_skip_condition(expr) {
@@ -1782,6 +1795,16 @@ async fn handle_create_workflow(
         }
     }
     let graph_json = graph_json_value.to_string();
+
+    // The canonical per-node caps (node timeout, retry count, retry backoff).
+    // Every graph MUTATION runs them inside `save_graph_json` (MCP-1226), but
+    // this tool built its graph and inserted it without: measured 2026-10-01,
+    // a node with `timeout_secs: 86400` or `retry_count: 9000` was accepted
+    // here and refused by every other tool. Found while adding `timeout_secs`
+    // as a named node field.
+    if let Err(resp) = crate::utils::ensure_graph_within_caps(&graph_json, &req_id) {
+        return resp;
+    }
 
     // MCP-320 (2026-05-11): strict-parse capabilities. Pre-fix used
     // `json_string_array_field` which silently dropped non-string
@@ -1984,6 +2007,33 @@ async fn handle_create_workflow(
             tracing::error!(err = ?e, "create_workflow failed");
             mcp_error(req_id, -32000, "Failed to create workflow")
         }
+    }
+}
+
+#[cfg(test)]
+mod create_workflow_node_controls_tests {
+    /// The node schema must declare the three controls the handler now reads:
+    /// an accepted-but-undeclared field is undiscoverable.
+    #[test]
+    fn the_node_schema_declares_the_controls_the_builder_reads() {
+        let tools = super::tool_schemas();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "create_workflow")
+            .expect("create_workflow is declared");
+        let node_props = &tool["inputSchema"]["properties"]["nodes"]["items"]["properties"];
+        for key in talos_workflow_creation_helpers::NODE_CONTROL_KEYS {
+            assert!(
+                node_props.get(key).is_some(),
+                "create_workflow nodes must declare `{key}`"
+            );
+        }
+        assert_eq!(node_props["continue_on_error"]["type"], "boolean");
+        let description = tool["description"].as_str().unwrap();
+        assert!(
+            description.contains("continue_on_error")
+                && !description.contains("set those via add_node_to_workflow")
+        );
     }
 }
 
@@ -3536,19 +3586,22 @@ async fn handle_test_workflow_draft(
     // Return a structured envelope so downstream scripts/agents don't
     // have to string-strip a prose header. `message` preserves the old
     // human-facing summary for operators reading raw MCP output.
+    let mut reply = serde_json::json!({
+        "execution_id": exec_id.to_string(),
+        "status": "running",
+        "is_draft": true,
+        "next_step": "get_execution_status",
+        "message": format!(
+            "Draft workflow triggered. Execution ID: {}. Running the DRAFT graph, not the published version — use get_execution_status to check results.",
+            exec_id
+        ),
+    });
+    if let Some(budget) = actor_budget_block(&state.db_pool, draft_row_actor).await {
+        reply["actor_budget"] = budget;
+    }
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "execution_id": exec_id.to_string(),
-            "status": "running",
-            "is_draft": true,
-            "next_step": "get_execution_status",
-            "message": format!(
-                "Draft workflow triggered. Execution ID: {}. Running the DRAFT graph, not the published version — use get_execution_status to check results.",
-                exec_id
-            ),
-        }))
-        .unwrap_or_default(),
+        &serde_json::to_string_pretty(&reply).unwrap_or_default(),
     )
 }
 
@@ -4855,6 +4908,12 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
     if warning_summary.as_array().is_some_and(|a| !a.is_empty()) {
         result["warning_summary"] = warning_summary;
     }
+    // The freshness contracts the engine will enforce, per node. Nothing
+    // declared (or the graph unread) ⇒ no key.
+    let freshness = declared_freshness_contracts(&graph);
+    if graph_measured && !freshness.is_empty() {
+        result["freshness_contracts"] = serde_json::Value::Array(freshness);
+    }
     // #661: say which happened. Absent this field the caller cannot tell a
     // genuinely low score from a score computed on inputs that failed to load.
     // The graph is disclosed on its own field as well as in the shared list:
@@ -5891,6 +5950,167 @@ fn annotate_unpersisted_status(body: &mut serde_json::Value, status_persisted: b
     body["warning"] = serde_json::json!(
         "The run finished but its terminal status could NOT be written to the database. get_execution_status may report this execution as still running until the stale-execution sweeper finalizes it. The result reported here is the real one."
     );
+}
+
+/// Every node of `graph` that carries a usable freshness contract, as
+/// `{node, requires_fresh, on_stale}` — what `validate_workflow` echoes back so
+/// an author can see the contract was understood.
+pub(crate) fn declared_freshness_contracts(graph: &serde_json::Value) -> Vec<serde_json::Value> {
+    graph
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| {
+                    let mut contract = crate::utils::render_freshness_contract(node.get("data"))?;
+                    contract["node"] = node.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                    Some(contract)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod freshness_contract_listing_tests {
+    use super::declared_freshness_contracts;
+    use serde_json::json;
+
+    #[test]
+    fn only_nodes_with_a_usable_contract_are_listed() {
+        let graph = json!({"nodes": [
+            {"id": "plan", "data": {"requires_fresh": {"commitments/mine": 96}, "on_stale": "annotate"}},
+            {"id": "send", "data": {"TO": "x"}},
+            {"id": "strict", "data": {"requires_fresh": {"a": 6}, "on_stale": "fail"}},
+            {"id": "broken", "data": {"requires_fresh": "6h"}},
+            {"id": "bare"}
+        ]});
+        assert_eq!(
+            declared_freshness_contracts(&graph),
+            vec![
+                json!({"node": "plan", "requires_fresh": {"commitments/mine": 96.0}, "on_stale": "annotate"}),
+                json!({"node": "strict", "requires_fresh": {"a": 6.0}, "on_stale": "fail"}),
+            ]
+        );
+        assert!(declared_freshness_contracts(&json!({"nodes": []})).is_empty());
+        assert!(declared_freshness_contracts(&json!({})).is_empty());
+    }
+
+    /// The contract is authored through node config; the tools that write node
+    /// config must say it exists, and the validator must say where it echoes it.
+    #[test]
+    fn the_tools_that_write_and_check_node_config_document_the_contract() {
+        let tools = super::tool_schemas();
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is declared"))
+                .clone()
+        };
+        let add = find("add_node_to_workflow");
+        let config = add["inputSchema"]["properties"]["config"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            config.contains("`requires_fresh`")
+                && config.contains("`on_stale`")
+                && config.contains("`__staleness__`")
+        );
+        assert!(find("validate_workflow")["description"]
+            .as_str()
+            .unwrap()
+            .contains("`freshness_contracts`"));
+    }
+}
+
+/// A cap spent to this share or beyond is called out in a rehearsal's reply.
+const BUDGET_WARN_PERCENT: i64 = 80;
+
+/// The `actor_budget` block of a rehearsal reply (`test_workflow`,
+/// `test_workflow_draft`).
+///
+/// A rehearsal is a real execution: it counts toward the actor's hourly cap
+/// and its model calls toward the daily token cap, and under `suspend` a
+/// refused start suspends the actor — taking its scheduled workflows with it.
+/// Nothing said so. On 2026-10-01 an afternoon of rehearsals took a live
+/// actor to 30 of 40 executions an hour and 341 K of 500 K tokens a day, seen
+/// only because someone went looking.
+///
+/// Three answers, kept apart: a budget with its caps; `policy: "none"` for an
+/// actor with no policy; `unreadable: true` when the read failed — which says
+/// nothing about how much is left and must not render as "no caps".
+pub(crate) fn render_actor_budget<E>(
+    read: Result<Option<talos_actor_budget_refusal::BudgetHeadroom>, E>,
+) -> serde_json::Value {
+    let headroom = match read {
+        Err(_) => {
+            return serde_json::json!({
+                "unreadable": true,
+                "note": "the actor's budget could not be read; this says nothing about how much is left",
+            })
+        }
+        Ok(None) => return serde_json::json!({ "policy": "none" }),
+        Ok(Some(h)) => h,
+    };
+    let caps: Vec<serde_json::Value> = headroom
+        .caps
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "cap": c.cap.as_str(),
+                "limit": c.limit,
+                "used": c.used,
+                "remaining": c.remaining(),
+                "percent_used": c.percent_used(),
+            })
+        })
+        .collect();
+    let near: Vec<String> = headroom
+        .caps
+        .iter()
+        .filter(|c| c.percent_used() >= BUDGET_WARN_PERCENT)
+        .map(|c| {
+            format!(
+                "{}: {} of {} used ({}%)",
+                c.cap.as_str(),
+                c.used,
+                c.limit,
+                c.percent_used()
+            )
+        })
+        .collect();
+    let mut block = serde_json::json!({ "mode": headroom.mode, "caps": caps });
+    if !near.is_empty() {
+        let consequence = if headroom.mode == "suspend" {
+            "Once a cap is reached further starts are refused, and in `suspend` mode a refusal on the hourly cap SUSPENDS the actor, which stops its scheduled workflows too."
+        } else {
+            "Once a cap is reached further starts by this actor are refused, scheduled ones included."
+        };
+        block["warning"] = format!(
+            "{}. {consequence} Rehearsals count like any other run.",
+            near.join("; ")
+        )
+        .into();
+    }
+    block
+}
+
+/// Read the budget of the actor a rehearsal ran as and render it. `None` when
+/// the run had no actor (nothing to report). Runs AFTER the row is admitted,
+/// so the counts include this run.
+async fn actor_budget_block(
+    pool: &sqlx::PgPool,
+    actor_id: Option<uuid::Uuid>,
+) -> Option<serde_json::Value> {
+    let actor_id = actor_id?;
+    let read = talos_actor_budget_refusal::actor_budget_headroom(pool, actor_id).await;
+    if let Err(e) = &read {
+        tracing::warn!(actor_id = %actor_id, error = %e, "actor budget could not be read for a rehearsal reply");
+    }
+    Some(render_actor_budget(read))
 }
 
 /// Shared by the two sync-wait handlers (`call_workflow`, `test_workflow`):
@@ -8158,7 +8378,6 @@ async fn handle_test_workflow(
         .with_actor_context(lifted_actor_context)
         .with_dry_run(dry_run)
         .with_timeout_override(600);
-    let _ = effective_test_actor; // kept for clarity; with_effective_actor encodes the same.
     let repo_for_test = state.workflow_repo.clone();
     let mut engine = match talos_engine::builder::for_workflow(
         registry,
@@ -8309,7 +8528,7 @@ async fn handle_test_workflow(
             // `running` response so the caller can poll via
             // `get_execution_status` rather than interpreting this as
             // a failure. Assertions are skipped (no output yet).
-            let running_result = serde_json::json!({
+            let mut running_result = serde_json::json!({
                 "passed": false,
                 "status": "running",
                 "execution_id": exec_id.to_string(),
@@ -8321,6 +8540,9 @@ async fn handle_test_workflow(
                     timeout_secs
                 ),
             });
+            if let Some(budget) = actor_budget_block(&state.db_pool, effective_test_actor).await {
+                running_result["actor_budget"] = budget;
+            }
             return Some(mcp_text(
                 req_id.clone(),
                 &serde_json::to_string_pretty(&running_result).unwrap_or_default(),
@@ -8353,6 +8575,9 @@ async fn handle_test_workflow(
     // Same pure helper as call_workflow so the two sync-wait handlers cannot
     // drift, and so one unit test covers both.
     annotate_unpersisted_status(&mut test_result, status_persisted);
+    if let Some(budget) = actor_budget_block(&state.db_pool, effective_test_actor).await {
+        test_result["actor_budget"] = budget;
+    }
 
     Some(mcp_text(
         req_id.clone(),
@@ -14007,6 +14232,116 @@ mod trigger_as_actors_context_pin {
             );
             let copy = format!("get(\"__actor_{}__\").cloned()", "context");
             assert!(!body.contains(&copy), "{handler} copies the context");
+        }
+    }
+}
+
+#[cfg(test)]
+mod actor_budget_block_tests {
+    use super::render_actor_budget;
+    use talos_actor_budget_refusal::{BudgetCap, BudgetHeadroom, CapUse};
+
+    fn headroom(mode: &str, caps: &[(BudgetCap, i64, i64)]) -> BudgetHeadroom {
+        BudgetHeadroom {
+            mode: mode.to_string(),
+            caps: caps
+                .iter()
+                .map(|&(cap, limit, used)| CapUse { cap, limit, used })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn caps_are_listed_with_what_is_left_and_no_warning_below_the_threshold() {
+        let block = render_actor_budget::<()>(Ok(Some(headroom(
+            "suspend",
+            &[
+                (BudgetCap::PerHour, 40, 30),
+                (BudgetCap::LlmTokensPerDay, 500_000, 340_704),
+            ],
+        ))));
+        assert_eq!(block["mode"], "suspend");
+        assert_eq!(
+            block["caps"],
+            serde_json::json!([
+                {"cap": "per_hour", "limit": 40, "used": 30, "remaining": 10, "percent_used": 75},
+                {"cap": "llm_tokens_per_day", "limit": 500_000, "used": 340_704, "remaining": 159_296, "percent_used": 68},
+            ])
+        );
+        assert!(
+            block.get("warning").is_none(),
+            "75% and 68% are below the 80% threshold"
+        );
+    }
+
+    #[test]
+    fn a_cap_at_eighty_percent_is_called_out_with_what_suspend_does() {
+        let block = render_actor_budget::<()>(Ok(Some(headroom(
+            "suspend",
+            &[
+                (BudgetCap::PerHour, 40, 32),
+                (BudgetCap::LlmTokensPerDay, 500_000, 100),
+            ],
+        ))));
+        let warning = block["warning"].as_str().expect("32 of 40 is 80%");
+        assert!(
+            warning.starts_with("per_hour: 32 of 40 used (80%)."),
+            "{warning}"
+        );
+        assert!(warning.contains("SUSPENDS the actor") && !warning.contains("llm_tokens_per_day"));
+        // One under the threshold: quiet.
+        let quiet = render_actor_budget::<()>(Ok(Some(headroom(
+            "suspend",
+            &[(BudgetCap::PerHour, 40, 31)],
+        ))));
+        assert!(quiet.get("warning").is_none());
+        // Other modes refuse without suspending, and the warning does not claim otherwise.
+        for mode in ["block", "alert"] {
+            let b = render_actor_budget::<()>(Ok(Some(headroom(
+                mode,
+                &[
+                    (BudgetCap::PerHour, 40, 40),
+                    (BudgetCap::FuelPerHour, 100, 95),
+                ],
+            ))));
+            let w = b["warning"].as_str().unwrap();
+            assert!(
+                w.contains("per_hour: 40 of 40 used (100%); fuel_per_hour: 95 of 100 used (95%)")
+                    && !w.contains("SUSPENDS"),
+                "{mode}: {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_policy_and_an_unreadable_budget_are_different_answers() {
+        assert_eq!(
+            render_actor_budget::<()>(Ok(None)),
+            serde_json::json!({"policy": "none"})
+        );
+        let unreadable = render_actor_budget(Err("db down"));
+        assert_eq!(unreadable["unreadable"], true);
+        assert!(unreadable.get("caps").is_none() && unreadable.get("policy").is_none());
+        // A policy that sets no cap is a policy, with nothing to count.
+        let empty = render_actor_budget::<()>(Ok(Some(headroom("block", &[]))));
+        assert_eq!(empty, serde_json::json!({"mode": "block", "caps": []}));
+    }
+
+    #[test]
+    fn both_rehearsal_tools_document_the_block() {
+        let tools = super::tool_schemas();
+        for name in ["test_workflow", "test_workflow_draft"] {
+            let tool = tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is declared"));
+            assert!(
+                tool["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("`actor_budget`"),
+                "{name}"
+            );
         }
     }
 }

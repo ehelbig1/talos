@@ -206,3 +206,71 @@ async fn an_install_that_cannot_be_recorded_changes_nothing() {
         .unwrap();
     assert_eq!(rows, 0);
 }
+
+/// A reinstall keeps the copy's own fuel limit unless the caller passes one,
+/// and the install reports the limit the row actually carries (2026-10-01).
+/// The value offered is not always the value stored, so the report is read
+/// back from the write; `get_user_module_grants` shows the same limit to the
+/// dry run.
+#[tokio::test]
+async fn a_reinstall_keeps_the_copys_fuel_limit_and_reports_what_is_stored() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool).await;
+    let repo = ModuleRepository::new(pool.clone());
+    let install_with = |fuel: i64, explicit: bool, hash: &'static str| {
+        let repo = &repo;
+        async move {
+            repo.install_catalog_module_to_modules(
+                Some(user),
+                "Gmail: List Messages",
+                "http",
+                b"\0asm",
+                hash,
+                "fn run() {}",
+                fuel,
+                &["gmail.googleapis.com".to_string()],
+                &["GET".to_string()],
+                &[],
+                &[],
+                &json!({}),
+                Some("gmail-list-messages"),
+                explicit,
+            )
+            .await
+            .expect("install")
+        }
+    };
+    let stored_limit = || async {
+        repo.get_user_module_grants(user, "Gmail: List Messages")
+            .await
+            .expect("read")
+            .expect("installed")
+            .max_fuel
+    };
+
+    // First install: the offered limit is written.
+    let first = install_with(2_000_000, false, "h1").await;
+    assert_eq!(first.max_fuel, 2_000_000);
+    assert_eq!(stored_limit().await, 2_000_000);
+
+    // Reinstall offering the template's larger recommendation, not explicit:
+    // the copy's own limit stays, and the result says so rather than echoing
+    // the offer.
+    let kept = install_with(5_850_000, false, "h2").await;
+    assert_eq!(
+        kept.max_fuel, 2_000_000,
+        "a reinstall never changes the limit on its own"
+    );
+    assert_eq!(stored_limit().await, 2_000_000);
+
+    // The caller passes a budget: it is applied, up...
+    let raised = install_with(5_850_000, true, "h3").await;
+    assert_eq!(raised.max_fuel, 5_850_000);
+    assert_eq!(stored_limit().await, 5_850_000);
+    // ...or down.
+    let lowered = install_with(1_000_000, true, "h4").await;
+    assert_eq!(
+        (lowered.max_fuel, stored_limit().await),
+        (1_000_000, 1_000_000)
+    );
+}

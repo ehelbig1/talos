@@ -3499,6 +3499,28 @@ pub fn validate_prepared_with_children(
             }
         }
 
+        // ── Freshness contracts (Warning) ────────────────────────────────
+        // `requires_fresh` / `on_stale` are read by the engine from a node's
+        // flat `data`, and whatever it cannot use it drops without a word (a
+        // run must not fail over an authoring slip). This is where the slip
+        // is said. Same rules as the parser, from the same module.
+        for node in &nodes {
+            let node_label = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+            for problem in talos_workflow_engine_core::reserved_keys::freshness_contract_problems(
+                node.get("data"),
+            ) {
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Warning,
+                    message: format!(
+                        "Node '{node_label}': {problem}. Correct it with update_node_config \
+                         (action merge_config)."
+                    ),
+                    node_id: Some(node_label.to_string()),
+                    category: "freshness-contract".into(),
+                });
+            }
+        }
+
         // ── Reachability analysis (Warning) ──────────────────────────────
         let has_cycle = issues.iter().any(|i| i.category == "cycle");
         if !has_cycle && nodes.len() > 1 {
@@ -6968,6 +6990,61 @@ mod fleet_convergence_tests {
             .iter()
             .filter(|i| i.category == "reachability")
             .all(|i| i.severity == ValidationSeverity::Warning));
+    }
+
+    /// A freshness contract the engine cannot use is said at validation time.
+    /// The engine drops such a part silently (a run must not fail over an
+    /// authoring slip), and until 2026-10-01 nothing else mentioned it.
+    #[test]
+    fn a_freshness_contract_the_engine_cannot_use_is_a_warning() {
+        let graph = |data: serde_json::Value| {
+            serde_json::json!({
+                "nodes": [{"id": "plan", "type": module_id().to_string(), "data": data}],
+                "edges": []
+            })
+        };
+        let freshness = |data: serde_json::Value| -> Vec<String> {
+            let result = validate_prepared(prepared(
+                graph(data),
+                vec![http_get_template(vec!["*".into()])],
+            ));
+            assert!(result.valid, "a contract slip is never an error");
+            result
+                .issues
+                .iter()
+                .filter(|i| i.category == "freshness-contract")
+                .map(|i| {
+                    assert_eq!(i.severity, ValidationSeverity::Warning);
+                    assert_eq!(i.node_id.as_deref(), Some("plan"));
+                    i.message.clone()
+                })
+                .collect()
+        };
+        // Control: a usable contract, and no contract, say nothing.
+        assert!(freshness(
+            serde_json::json!({"requires_fresh": {"daily_brief/latest": 6}, "on_stale": "fail"})
+        )
+        .is_empty());
+        assert!(freshness(serde_json::json!({"URL": "https://example.com"})).is_empty());
+
+        let stop = freshness(serde_json::json!({"requires_fresh": {"a": 6}, "on_stale": "error"}));
+        assert_eq!(stop.len(), 1);
+        assert!(
+            stop[0].starts_with("Node 'plan': `on_stale` is \"error\"")
+                && stop[0].contains("will NOT stop this node"),
+            "{}",
+            stop[0]
+        );
+
+        let bounds = freshness(serde_json::json!({"requires_fresh": {"a": "6", "b": 0, "c": 12}}));
+        assert_eq!(bounds.len(), 2, "{bounds:?}");
+        assert!(bounds.iter().all(|m| m.contains("is NOT checked")));
+
+        let shape = freshness(serde_json::json!({"requires_fresh": ["daily_brief/latest"]}));
+        assert!(
+            shape.len() == 1 && shape[0].contains("NO freshness contract"),
+            "{shape:?}"
+        );
     }
 
     /// The checks the fleet sweep gained wholesale. Each of these categories
