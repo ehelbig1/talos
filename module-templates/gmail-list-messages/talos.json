@@ -2,7 +2,7 @@
   "name": "gmail-list-messages",
   "version": "v1.0.0",
   "display_name": "Gmail: List Messages",
-  "description": "List messages from the authenticated Gmail account. Filter by Gmail search query (e.g. 'is:unread newer_than:24h'), cap results, and receive structured metadata (id, subject, from, date, snippet). Canonical building block for morning-brief / inbox-triage / follow-up-detector workflows.\n\nRequires a vault:// reference to an Atlassian-style Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time — you only need to pass the vault path.",
+  "description": "List messages from the authenticated Gmail account. Filter by Gmail search query (e.g. 'is:unread newer_than:24h'), cap results, and receive structured metadata (id, subject, from, date, snippet, plus any EXTRA_HEADERS you ask for, e.g. To). Canonical building block for morning-brief / inbox-triage / follow-up-detector workflows.\n\nRequires a vault:// reference to an Atlassian-style Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time — you only need to pass the vault path.",
   "category": "Communication",
   "capability_world": "http-node",
   "allowed_hosts": ["gmail.googleapis.com"],
@@ -26,6 +26,11 @@
         "type": "integer",
         "default": 10,
         "description": "Maximum messages to fetch metadata for (1–25). Each message requires one extra HTTP call for headers — keep tight to stay within fuel budget."
+      },
+      "EXTRA_HEADERS": {
+        "type": ["array", "string"],
+        "items": { "type": "string" },
+        "description": "Extra message headers to return, beyond From / Subject / Date — an array of names (e.g. [\"To\", \"Cc\"]) or one comma-separated string. Each is returned on every message under its lower-case name with '-' as '_' (To → to, Reply-To → reply_to), empty when the message does not carry it. At most 6; a name is letters, digits and '-' only. Use [\"To\"] for sent mail (QUERY 'in:sent ...'), where From is always you. For a message's body use the 'Gmail: Get Message' template."
       }
     }
   },

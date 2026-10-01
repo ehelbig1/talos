@@ -372,6 +372,70 @@ mod catalog_template_tests {
         assert!(t.validate_dependencies().is_err());
     }
 
+    /// A config key a template deserializes by name is in its `config_schema`.
+    ///
+    /// The schema is what `get_module_info` and the node editor show, so a key
+    /// read by the code and absent from it can only be found by reading the
+    /// template source. Measured 2026-10-01: 52 such keys in 6 templates, 3
+    /// undocumented — LLM Inference's `USER_PROMPT` (the only way to stop the
+    /// node sending its whole input to the model) and
+    /// `ALLOW_EMPTY_TEMPLATE_VARS`, and HTTP Request's `MAX_RESPONSE_BYTES`.
+    ///
+    /// Scope, stated: only keys read through `#[serde(rename = "KEY")]`. A
+    /// template that reads `config.get("KEY")` is not covered — seven older
+    /// templates disagree with their schema that way and are recorded in
+    /// `docs/engineering-log/packages/2026-10-01-template-config-docs.md`.
+    #[test]
+    fn a_config_key_a_template_deserializes_by_name_is_in_its_config_schema() {
+        let rename = regex::Regex::new(r#"#\[serde\([^)]*\brename\s*=\s*"([A-Z][A-Z0-9_]+)""#)
+            .expect("regex");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../module-templates");
+        assert!(
+            root.is_dir(),
+            "module-templates not found at {} — update this test",
+            root.display()
+        );
+        let mut offenders: Vec<String> = Vec::new();
+        let (mut templates, mut keys) = (0usize, 0usize);
+        for entry in std::fs::read_dir(&root).unwrap().flatten() {
+            let dir = entry.path();
+            let (manifest, source) = (dir.join("talos.json"), dir.join("template.rs"));
+            if !manifest.exists() || !source.exists() {
+                continue;
+            }
+            let manifest: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap())
+                    .unwrap_or_else(|e| panic!("{}: talos.json: {e}", dir.display()));
+            let documented = manifest
+                .pointer("/config_schema/properties")
+                .and_then(|p| p.as_object());
+            let source = std::fs::read_to_string(&source).unwrap();
+            let mut read_any = false;
+            for cap in rename.captures_iter(&source) {
+                read_any = true;
+                keys += 1;
+                let key = &cap[1];
+                if !documented.is_some_and(|d| d.contains_key(key)) {
+                    offenders.push(format!(
+                        "{}: {key}",
+                        dir.file_name().unwrap().to_string_lossy()
+                    ));
+                }
+            }
+            templates += usize::from(read_any);
+        }
+        // A scan that stops matching must fail, not pass over nothing.
+        assert!(
+            templates >= 6 && keys >= 50,
+            "scanned {templates} templates / {keys} keys — the pattern no longer matches"
+        );
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "config keys read by a template but missing from its talos.json config_schema: {offenders:?}"
+        );
+    }
+
     /// Every shipped catalog template must declare, in `talos.json`, every
     /// extra crate its own `Cargo.toml` declares. `talos.json` is the ONLY
     /// declaration production reads; a `Cargo.toml`-only dep compiles green

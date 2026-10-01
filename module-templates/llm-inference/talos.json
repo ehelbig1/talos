@@ -36,6 +36,18 @@
         "default": "You are a helpful assistant.",
         "description": "System prompt sent before the user message. Supports {{key}} and {{key.subkey}} template interpolation — placeholders are replaced with values from upstream node output at runtime. Strings are inlined; objects/arrays are JSON-serialized. Interpolated values are wrapped in <untrusted_data> tags so the spotlighting directive treats them as data, not instructions. Unresolved placeholders are left as-is so misconfiguration surfaces visibly. Appended with actor context when INJECT_CONTEXT is true."
       },
+      "USER_PROMPT": {
+        "type": "string",
+        "description": "The user message, as a template. Same {{key}} and {{key.subkey}} interpolation as SYSTEM_PROMPT, resolved against this node's input (the upstream node's output keys). When set, ONLY the rendered text is sent as the user message. When unset, the node's whole input JSON is sent instead — including every earlier node's output under __accumulated__ — which is larger, slower and gives the model data it was not meant to weigh; set USER_PROMPT whenever the model should see specific fields. A placeholder that resolves to empty, null or missing fails the node unless ALLOW_EMPTY_TEMPLATE_VARS is true."
+      },
+      "ALLOW_EMPTY_TEMPLATE_VARS": {
+        "type": [
+          "boolean",
+          "string"
+        ],
+        "default": false,
+        "description": "Let a {{placeholder}} in SYSTEM_PROMPT or USER_PROMPT resolve to empty, null or missing. Default false: the node fails before calling the model and names the placeholders, because a prompt built on an empty upstream value gets a confident answer about nothing. Set true only where an empty value is part of the contract (an optional field, a list that may legitimately be empty)."
+      },
       "MAX_TOKENS": {
         "type": "number",
         "default": 1024,
