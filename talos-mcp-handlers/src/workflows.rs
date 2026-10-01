@@ -111,7 +111,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "create_workflow",
-            "description": "Create a new blank workflow (also called: make workflow, build workflow, start workflow, new workflow). Provide a name and an optional array of nodes (each with a module_id from compile_template or list_modules). Edges connect nodes. Returns the new workflow ID. For AI-assisted creation use create_workflow_from_description instead. For common workflow shapes (webhooks, data pipelines, LLM inference) check list_workflow_patterns first — instantiate_workflow_pattern creates a pre-wired workflow in one call.\n\nEmpty workflow is allowed (omit nodes or pass []). Use this when all nodes need continue_on_error, skip_condition, or retry_count — set those via add_node_to_workflow which supports them as first-class params.\n\nTwo paths for structural nodes (collect, loop, sub_workflow, capability_dispatch):\n  PREFERRED (inline): set node_type instead of module_id on any node; use connect_from/connect_to to wire edges in the same call. Edges between structural and regular nodes work in create_workflow — no multi-step required.\n  FALLBACK (post-creation): create_workflow with empty nodes, then add_node_to_workflow with connect_from/connect_to to build the full graph incrementally.",
+            "description": "Create a new blank workflow (also called: make workflow, build workflow, start workflow, new workflow). Provide a name and an optional array of nodes (each with a module_id from compile_template or list_modules). Edges connect nodes. Returns the new workflow ID. For AI-assisted creation use create_workflow_from_description instead. For common workflow shapes (webhooks, data pipelines, LLM inference) check list_workflow_patterns first — instantiate_workflow_pattern creates a pre-wired workflow in one call.\n\nEmpty workflow is allowed (omit nodes or pass []). A module node may carry skip_condition, continue_on_error, timeout_secs and the retry fields right here, as named fields beside config — the same controls add_node_to_workflow takes — so a fan-in whose branches may fail needs no second call per node. On a structural node set skip_condition / continue_on_error afterwards with add_skip_condition / set_continue_on_error.\n\nTwo paths for structural nodes (collect, loop, sub_workflow, capability_dispatch):\n  PREFERRED (inline): set node_type instead of module_id on any node; use connect_from/connect_to to wire edges in the same call. Edges between structural and regular nodes work in create_workflow — no multi-step required.\n  FALLBACK (post-creation): create_workflow with empty nodes, then add_node_to_workflow with connect_from/connect_to to build the full graph incrementally.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -141,7 +141,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                                 "retry_count": { "type": "number", "description": "Max retries on failure. Omit to take the method-aware default: read-only / pure-compute modules (minimal/secrets worlds, or http/agent with a DECLARED GET/HEAD-only allowed_methods) get transient retries; governance / messaging / database / unknown worlds and state-changing HTTP fail closed to 0. Setting retry_backoff_ms or retry_condition alone does NOT imply a count — they answer how far apart and when, never how many. An explicit value here always wins, including 0." },
                                 "retry_backoff_ms": { "type": "number", "description": "Base backoff in ms, doubles each retry (default: 500)" },
                                 "retry_condition": { "type": "string", "description": "Rhai expression evaluated against the module's error output JSON. Return false to skip retries (fail immediately); return true to allow the retry. Variables in scope: all fields from the output JSON (e.g. status, error, error_message, is_error). Defaults to retry on evaluation error (safe default). Example: 'status != 429' (retry for everything except rate limits)" },
-                                "retry_delay_expression": { "type": "string", "description": "Rhai expression that returns a delay in ms computed from the error output. Variables in scope: same as retry_condition. Overrides exponential backoff when set. Capped at 60000ms. Example: 'if status == 429 { retry_after * 1000 } else { 1000 }'" }
+                                "retry_delay_expression": { "type": "string", "description": "Rhai expression that returns a delay in ms computed from the error output. Variables in scope: same as retry_condition. Overrides exponential backoff when set. Capped at 60000ms. Example: 'if status == 429 { retry_after * 1000 } else { 1000 }'" },
+                                "skip_condition": { "type": "string", "description": "Module nodes only. Rhai expression evaluated before the node runs; true skips it and execution continues. Fields of the node's input bind as BARE variables (\"count == 0\"). FAIL-OPEN: an expression that cannot be evaluated does NOT skip. Same rules as add_node_to_workflow's skip_condition. Max 2000 chars." },
+                                "continue_on_error": { "type": "boolean", "description": "Module nodes only. If true, this node's failure does not fail the workflow: downstream nodes run and receive its error output (a collect node receives it as one of its items). Default false." },
+                                "timeout_secs": { "type": "number", "description": "Per-node execution timeout in whole seconds (default 60). On a sub_workflow / capability_dispatch node this is that node's own child timeout parameter." }
                             },
                             "required": ["id"]
                         }
@@ -1637,12 +1640,22 @@ async fn handle_create_workflow(
     // live in an export would make an existing workflow unrestorable — a
     // worse failure than the one being prevented. The runtime counter and
     // the WARN cover conditions that arrive that way.
+    //
+    // Since 2026-10-01 a node may also carry `skip_condition`,
+    // `continue_on_error` and `timeout_secs` as named fields, as
+    // `add_node_to_workflow` always could. Their shape is checked first
+    // (wrong type, a structural node, a value given twice), then the
+    // expression itself wherever it was written.
     for node in &input_nodes {
-        let Some(expr) = node
+        if let Some(msg) = talos_workflow_creation_helpers::node_controls_shape_error(node) {
+            return mcp_error(req_id, -32602, &msg);
+        }
+        let named = node.get("skip_condition").and_then(|v| v.as_str());
+        let in_config = node
             .get("config")
             .and_then(|c| c.get("skip_condition"))
-            .and_then(|v| v.as_str())
-        else {
+            .and_then(|v| v.as_str());
+        let Some(expr) = named.or(in_config) else {
             continue;
         };
         if let Err(msg) = crate::graph::validate_skip_condition(expr) {
@@ -1782,6 +1795,16 @@ async fn handle_create_workflow(
         }
     }
     let graph_json = graph_json_value.to_string();
+
+    // The canonical per-node caps (node timeout, retry count, retry backoff).
+    // Every graph MUTATION runs them inside `save_graph_json` (MCP-1226), but
+    // this tool built its graph and inserted it without: measured 2026-10-01,
+    // a node with `timeout_secs: 86400` or `retry_count: 9000` was accepted
+    // here and refused by every other tool. Found while adding `timeout_secs`
+    // as a named node field.
+    if let Err(resp) = crate::utils::ensure_graph_within_caps(&graph_json, &req_id) {
+        return resp;
+    }
 
     // MCP-320 (2026-05-11): strict-parse capabilities. Pre-fix used
     // `json_string_array_field` which silently dropped non-string
@@ -1984,6 +2007,33 @@ async fn handle_create_workflow(
             tracing::error!(err = ?e, "create_workflow failed");
             mcp_error(req_id, -32000, "Failed to create workflow")
         }
+    }
+}
+
+#[cfg(test)]
+mod create_workflow_node_controls_tests {
+    /// The node schema must declare the three controls the handler now reads:
+    /// an accepted-but-undeclared field is undiscoverable.
+    #[test]
+    fn the_node_schema_declares_the_controls_the_builder_reads() {
+        let tools = super::tool_schemas();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "create_workflow")
+            .expect("create_workflow is declared");
+        let node_props = &tool["inputSchema"]["properties"]["nodes"]["items"]["properties"];
+        for key in talos_workflow_creation_helpers::NODE_CONTROL_KEYS {
+            assert!(
+                node_props.get(key).is_some(),
+                "create_workflow nodes must declare `{key}`"
+            );
+        }
+        assert_eq!(node_props["continue_on_error"]["type"], "boolean");
+        let description = tool["description"].as_str().unwrap();
+        assert!(
+            description.contains("continue_on_error")
+                && !description.contains("set those via add_node_to_workflow")
+        );
     }
 }
 
