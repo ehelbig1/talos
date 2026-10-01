@@ -657,6 +657,28 @@ pub fn validate_workflow_description(input: Option<&str>) -> Result<ValidatedDes
     }
 }
 
+/// The declared secret grants no stored secret satisfies, sorted.
+///
+/// A grant entry is an exact path, a prefix (`oauth/gmail`) or a glob
+/// (`oauth/gmail/*`); it is satisfied when at least one of the caller's stored
+/// key paths is permitted by it, judged by the one grant matcher
+/// (`vault_path_permitted`). `*` (everything) is never "missing".
+pub fn missing_secret_grants(required: &HashSet<String>, stored_paths: &[String]) -> Vec<String> {
+    let mut missing: Vec<String> = required
+        .iter()
+        .filter(|grant| grant.as_str() != "*")
+        .filter(|grant| {
+            let one = [(*grant).clone()];
+            !stored_paths
+                .iter()
+                .any(|path| talos_workflow_job_protocol::vault_path_permitted(&one, path))
+        })
+        .cloned()
+        .collect();
+    missing.sort();
+    missing
+}
+
 /// Inputs to [`build_create_workflow_response`]. Bundled in a single
 /// struct so the function signature stays scannable and so future
 /// fields land in one place rather than as positional arguments.
@@ -675,6 +697,10 @@ pub struct CreateResponseInputs {
     pub graph_is_empty: bool,
     pub missing_config: Vec<Value>,
     pub required_secrets: HashSet<String>,
+    /// Which of `required_secrets` the caller has NOT stored, from
+    /// [`missing_secret_grants`]. `None` = the caller's secrets could not be
+    /// read, so nothing is claimed about which exist.
+    pub missing_secrets: Option<Vec<String>>,
     pub vault_warnings: Vec<String>,
     /// Set when the workflow has no description — semantic search
     /// will return poor results without one.
@@ -721,20 +747,36 @@ pub fn build_create_workflow_response(inputs: CreateResponseInputs) -> Value {
             "nodes_needing_config": &inputs.missing_config,
         }));
     }
-    if !inputs.required_secrets.is_empty() {
+    // The secrets step names only what is actually missing. Until 2026-10-01
+    // it listed every grant the modules declare, so a workflow whose secrets
+    // were all stored was still told to "provision" them.
+    let secrets_to_provision: Vec<&String> = match &inputs.missing_secrets {
+        Some(missing) => missing.iter().collect(),
+        // Could not check: fall back to every declared grant, and say so.
+        None => {
+            let mut all: Vec<&String> = inputs.required_secrets.iter().collect();
+            all.sort();
+            all
+        }
+    };
+    if !secrets_to_provision.is_empty() {
         // MCP-1201 (2026-05-17): secret writes moved exclusively to the
         // GraphQL surface (require_2fa + SecretsWrite). Provisioning
         // happens in the dashboard (Settings → Secrets); the next-step
         // entry no longer references the deleted `set_secret` MCP tool.
-        next_steps.push(
-            "Provision required secrets in the dashboard (Settings → Secrets), then reference them in node config — secret writes require 2FA and aren't available through MCP."
-                .to_string(),
-        );
+        let unverified = inputs.missing_secrets.is_none();
+        next_steps.push(if unverified {
+            "The modules declare secret grants, and which of them you have stored could not be checked. Provision any that are missing in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP."
+                .to_string()
+        } else {
+            "Provision the missing secrets in the dashboard (Settings → Secrets), then reference them in node config — secret writes require 2FA and aren't available through MCP."
+                .to_string()
+        });
         next_steps_checklist.push(serde_json::json!({
             "step": next_steps_checklist.len() + 1,
-            "action": "Provision secrets",
+            "action": if unverified { "Check and provision secrets" } else { "Provision secrets" },
             "tool": null,
-            "required_secrets": inputs.required_secrets.iter().collect::<Vec<_>>(),
+            "required_secrets": secrets_to_provision,
         }));
     }
     next_steps_checklist.push(serde_json::json!({
@@ -799,6 +841,8 @@ pub fn build_create_workflow_response(inputs: CreateResponseInputs) -> Value {
         "ready_to_run": inputs.ready_to_run,
         "missing_config": inputs.missing_config,
         "required_secrets": inputs.required_secrets.into_iter().collect::<Vec<_>>(),
+        // The subset not stored for the caller; `null` = could not be checked.
+        "missing_secrets": inputs.missing_secrets,
         "next_steps": next_steps,
         "next_steps_checklist": next_steps_checklist,
     });
@@ -2376,10 +2420,91 @@ mod tests {
             graph_is_empty: false,
             missing_config: vec![],
             required_secrets: HashSet::new(),
+            missing_secrets: Some(vec![]),
             vault_warnings: vec![],
             description_warning: None,
             name_collision_warning: None,
         }
+    }
+
+    #[test]
+    fn a_grant_is_missing_only_when_no_stored_secret_satisfies_it() {
+        let required: HashSet<String> = [
+            "oauth/gmail/u/a@example.com/access_token", // exact, stored
+            "oauth/gmail",                              // prefix, satisfied
+            "oauth/slack/*",                            // glob, nothing stored
+            "plaid/secret",                             // exact, not stored
+            "*",                                        // everything: never missing
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let stored = vec![
+            "oauth/gmail/u/a@example.com/access_token".to_string(),
+            "plaid/client_id".to_string(),
+        ];
+        assert_eq!(
+            missing_secret_grants(&required, &stored),
+            vec!["oauth/slack/*".to_string(), "plaid/secret".to_string()]
+        );
+        // Nothing stored: every non-wildcard grant is missing.
+        assert_eq!(missing_secret_grants(&required, &[]).len(), 4);
+    }
+
+    #[test]
+    fn the_secrets_step_names_only_what_is_missing() {
+        let declared: HashSet<String> = ["a/one".to_string(), "b/two".to_string()]
+            .into_iter()
+            .collect();
+
+        // All stored: no secrets step at all, and the answer says so.
+        let mut inputs = baseline_inputs();
+        inputs.required_secrets = declared.clone();
+        inputs.missing_secrets = Some(vec![]);
+        let resp = build_create_workflow_response(inputs);
+        assert!(
+            !checklist_actions(&resp)
+                .iter()
+                .any(|a| a.contains("secrets")),
+            "{resp}"
+        );
+        assert_eq!(resp["missing_secrets"], serde_json::json!([]));
+        assert_eq!(resp["required_secrets"].as_array().unwrap().len(), 2);
+
+        // One missing: the step lists that one only.
+        let mut inputs = baseline_inputs();
+        inputs.required_secrets = declared.clone();
+        inputs.missing_secrets = Some(vec!["b/two".to_string()]);
+        let resp = build_create_workflow_response(inputs);
+        let step = resp["next_steps_checklist"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["action"] == "Provision secrets")
+            .expect("a provision step");
+        assert_eq!(step["required_secrets"], serde_json::json!(["b/two"]));
+
+        // Could not check: every declared grant is listed, under a different
+        // action, and `missing_secrets` is null rather than a guess.
+        let mut inputs = baseline_inputs();
+        inputs.required_secrets = declared;
+        inputs.missing_secrets = None;
+        let resp = build_create_workflow_response(inputs);
+        assert!(resp["missing_secrets"].is_null());
+        let step = resp["next_steps_checklist"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["action"] == "Check and provision secrets")
+            .expect("an unverified step");
+        assert_eq!(
+            step["required_secrets"],
+            serde_json::json!(["a/one", "b/two"])
+        );
+        assert!(resp["next_steps"][0]
+            .as_str()
+            .unwrap()
+            .contains("could not be checked"));
     }
 
     fn checklist_actions(resp: &Value) -> Vec<&str> {
@@ -2432,6 +2557,7 @@ mod tests {
         let mut secrets = HashSet::new();
         secrets.insert("slack/bot_token".into());
         inputs.required_secrets = secrets;
+        inputs.missing_secrets = Some(vec!["slack/bot_token".into()]);
         inputs.ready_to_run = false;
         let resp = build_create_workflow_response(inputs);
         let actions = checklist_actions(&resp);
@@ -2446,6 +2572,7 @@ mod tests {
         let mut secrets = HashSet::new();
         secrets.insert("slack/bot_token".into());
         inputs.required_secrets = secrets;
+        inputs.missing_secrets = Some(vec!["slack/bot_token".into()]);
         inputs.ready_to_run = false;
         let resp = build_create_workflow_response(inputs);
         let actions = checklist_actions(&resp);

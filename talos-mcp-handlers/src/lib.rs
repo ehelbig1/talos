@@ -1499,9 +1499,24 @@ async fn handle_tools_call_inner(
             "tools/call received argument names not in the tool's inputSchema"
         );
     }
+    // The sibling check: a declared argument passed as the wrong JSON type is
+    // read as absent by the handler (see utils::mistyped_argument_warning).
+    let type_warning = crate::utils::mistyped_argument_warning(name, &args);
+    if let Some(w) = type_warning.as_deref() {
+        tracing::warn!(
+            target: "talos_mcp",
+            event_kind = "mistyped_tool_arguments",
+            tool = name,
+            warning = w,
+            "tools/call received an argument whose JSON type is not the declared one"
+        );
+    }
     // Decorator applied to whichever domain dispatch claims the tool.
     let decorate = |mut r: JsonRpcResponse| -> JsonRpcResponse {
         if let Some(w) = arg_warning.as_deref() {
+            crate::utils::append_warning_block(&mut r, w);
+        }
+        if let Some(w) = type_warning.as_deref() {
             crate::utils::append_warning_block(&mut r, w);
         }
         r
