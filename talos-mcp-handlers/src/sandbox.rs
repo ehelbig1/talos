@@ -335,12 +335,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_module",
-            "description": "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call), so you can see how close a run came to its fuel and token limits. NOTE: the run also INHERITS the actor's LLM/egress tier — and WITHOUT an actor_id it defaults to Tier-1 (local-egress-only). So a module that calls an EXTERNAL API (any non-loopback host — Google, Slack, etc.) will fail with a network error unless the actor permits public egress. That is the EGRESS axis, not the LLM tier: since `egress_scope` was split out, `max_llm_tier=tier1` + `egress_scope=public` reaches an external API while still refusing every external LLM provider — the house pattern for a privacy-sensitive reader, and the correct posture here. (This note used to say \"a Tier-2 actor\", which has been wrong since the split.) `vault://` references in config are delivered to the module AS THE LITERAL, exactly as the engine delivers them, and the host resolves them at the outbound call; the block is the egress ceiling, not the secret.\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
+            "description": "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call), so you can see how close a run came to its fuel and token limits. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. NOTE: the run also INHERITS the actor's LLM/egress tier — and WITHOUT an actor_id it defaults to Tier-1 (local-egress-only). So a module that calls an EXTERNAL API (any non-loopback host — Google, Slack, etc.) will fail with a network error unless the actor permits public egress. That is the EGRESS axis, not the LLM tier: since `egress_scope` was split out, `max_llm_tier=tier1` + `egress_scope=public` reaches an external API while still refusing every external LLM provider — the house pattern for a privacy-sensitive reader, and the correct posture here. (This note used to say \"a Tier-2 actor\", which has been wrong since the split.) `vault://` references in config are delivered to the module AS THE LITERAL, exactly as the engine delivers them, and the host resolves them at the outbound call; the block is the egress ceiling, not the secret.\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "module_id": { "type": "string", "description": "UUID of the module to test" },
-                    "config": { "type": "object", "description": "Node config values — delivered to the module under `data[\"config\"]`, matching add_node_to_workflow's `config` semantics. Preferred param for config-taking modules." },
+                    "config": { "type": "object", "description": "Node config values — delivered to the module under `data[\"config\"]`, matching add_node_to_workflow's `config` semantics. Preferred param for config-taking modules. `max_fuel` here sets this run's fuel limit, as it does on a node." },
                     "input": { "type": "object", "description": "Simulated upstream node output — delivered to the module under `data[\"input\"]`, matching workflow-dispatch shape. When passed WITHOUT an explicit `config`, it is treated as config for backwards compatibility." },
                     "actor_id": { "type": "string", "description": "Optional UUID of an actor whose memories the module should see. Modules calling agent_memory::search / get / list-keys etc. will scope to this actor (mirrors workflow dispatch when the workflow is bound to an actor). The actor must be owned by you; cross-tenant actor_ids are rejected. Without this, memory calls run anonymously and return 0 hits." },
                     "accumulated": { "type": "object", "description": "Optional. Outputs of EARLIER workflow nodes, keyed by node id, delivered to the module as `data[\"__accumulated__\"]` exactly as the engine does in a workflow. Use it to rehearse a module that reads a non-parent node's output (e.g. {\"prepare\": {\"refs\": {...}}}). Max 1 MB." },
@@ -2844,6 +2844,100 @@ pub(crate) fn rendered_fuel(acc: &talos_worker_runtime::context::FuelAcc) -> ser
     }
 }
 
+/// The fuel limit one `test_module` run is held to, and where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TestFuelLimit {
+    /// `None` only for a module row with no usable limit (the runtime default
+    /// then applies); every other case names a number.
+    pub(crate) limit: Option<u64>,
+    /// `node_config` when the run's `config.max_fuel` set it, else `module`.
+    pub(crate) source: &'static str,
+    /// The configured value was above the engine's per-node ceiling.
+    pub(crate) clamped: bool,
+}
+
+/// Resolve a `test_module` run's fuel limit the way a workflow node's is:
+/// `max_fuel` in the node config overrides the module row, and the result is
+/// capped at the engine's per-node ceiling
+/// ([`talos_workflow_engine::DEFAULT_MAX_FUEL_PER_NODE`]).
+///
+/// Until 2026-10-01 the run was always held to the module row, so a module
+/// whose stored limit was lower than the one every workflow node sets could
+/// not be rehearsed with a realistic input at all — and the exhaustion error
+/// said the limit was "configurable via per-node max_fuel config", which this
+/// tool ignored.
+///
+/// What it does NOT model: the adaptive-fuel learned floor, which can raise a
+/// node's enforced limit at dispatch (it depends on that node's history).
+///
+/// A `max_fuel` that is present but not a positive integer is an error, not a
+/// silent fall back to the module row: the caller asked for a limit and would
+/// otherwise read a result measured against a different one.
+pub(crate) fn resolve_test_fuel_limit(
+    config: &serde_json::Value,
+    module_max_fuel: i64,
+) -> Result<TestFuelLimit, String> {
+    let ceiling = talos_workflow_engine::DEFAULT_MAX_FUEL_PER_NODE;
+    match config.get("max_fuel") {
+        None | Some(serde_json::Value::Null) => Ok(TestFuelLimit {
+            limit: u64::try_from(module_max_fuel).ok().filter(|f| *f > 0),
+            source: "module",
+            clamped: false,
+        }),
+        Some(v) => match v.as_u64().filter(|f| *f > 0) {
+            Some(requested) => Ok(TestFuelLimit {
+                limit: Some(requested.min(ceiling)),
+                source: "node_config",
+                clamped: requested > ceiling,
+            }),
+            None => Err(format!(
+                "config.max_fuel must be a positive whole number of fuel units (got {v}); \
+                 the engine's per-node ceiling is {ceiling}"
+            )),
+        },
+    }
+}
+
+/// `rendered_fuel` plus where the limit came from, for `test_module`.
+pub(crate) fn rendered_test_fuel(
+    acc: &talos_worker_runtime::context::FuelAcc,
+    limit: TestFuelLimit,
+) -> serde_json::Value {
+    let mut fuel = rendered_fuel(acc);
+    if let Some(obj) = fuel.as_object_mut() {
+        obj.insert("limit_source".to_string(), limit.source.into());
+        // Out of fuel under the module's own limit: say how to rehearse with
+        // the limit a node would set, rather than leave the caller to
+        // recompile the module to find out.
+        let exhausted = match (
+            obj.get("consumed").and_then(|v| v.as_u64()),
+            obj.get("limit").and_then(|v| v.as_u64()),
+        ) {
+            (Some(consumed), Some(cap)) => consumed >= cap,
+            _ => false,
+        };
+        if exhausted && limit.source == "module" {
+            obj.insert(
+                "limit_hint".to_string(),
+                "the module's own fuel limit was reached; set `max_fuel` in `config` to rehearse \
+                 with the limit a workflow node would set"
+                    .into(),
+            );
+        }
+        if limit.clamped {
+            obj.insert(
+                "limit_note".to_string(),
+                format!(
+                    "config.max_fuel was above the engine's per-node ceiling and was capped at {}",
+                    talos_workflow_engine::DEFAULT_MAX_FUEL_PER_NODE
+                )
+                .into(),
+            );
+        }
+    }
+    fuel
+}
+
 /// What `hot_update_module` did with the source, as a pure decision.
 ///
 /// `rust_code` is OPTIONAL: omitting it recompiles the STORED source, which
@@ -3696,6 +3790,14 @@ async fn handle_test_module(
         None => (input.clone(), serde_json::json!({})),
     };
 
+    // The limit a node with this config would be configured with (the module
+    // row unless `config.max_fuel` says otherwise), capped at the engine's
+    // per-node ceiling. Resolved before anything is fetched or run.
+    let fuel_limit = match resolve_test_fuel_limit(&config_val, module.max_fuel) {
+        Ok(l) => l,
+        Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
+    };
+
     let payload = test_module_payload(&config_val, &input_val, accumulated.as_ref());
 
     // Auto-detect vault:// refs on the FULL payload (config + input) and
@@ -3904,7 +4006,9 @@ async fn handle_test_module(
             // the baseline both paths now share. Non-positive rows (never
             // written by the registry, which clamps ≥1M) fall back to the
             // runtime default rather than a zero-fuel insta-kill.
-            u64::try_from(module.max_fuel).ok().filter(|f| *f > 0),
+            // `config.max_fuel` now raises (or lowers) it here exactly as a
+            // node's config does at dispatch — see `resolve_test_fuel_limit`.
+            fuel_limit.limit,
             false, // dry_run
             Some(effective_actor_id),
             user_id,
@@ -3992,7 +4096,7 @@ async fn handle_test_module(
                     "success": true,
                     "output": output,
                     "duration_ms": duration_ms,
-                    "fuel": rendered_fuel(&fuel),
+                    "fuel": rendered_test_fuel(&fuel, fuel_limit),
                     "llm_usage": rendered_llm_usage(&llm_usage),
                     "memory_write": memory_write_note,
                     // Denied/failed host calls this run. Present on the
@@ -4009,7 +4113,7 @@ async fn handle_test_module(
                 "success": false,
                 "error": format!("{}", e),
                 "duration_ms": duration_ms,
-                "fuel": rendered_fuel(&fuel),
+                "fuel": rendered_test_fuel(&fuel, fuel_limit),
                 "llm_usage": rendered_llm_usage(&llm_usage),
                 // The whole point: an opaque `networkerror` here is now
                 // accompanied by the host's reason for it.
@@ -5502,5 +5606,145 @@ mod rehearsal_tool_tests {
             rendered_fuel(&acc),
             json!({"consumed": 1500, "limit": 4000})
         );
+    }
+}
+
+#[cfg(test)]
+mod test_module_fuel_limit_tests {
+    use super::{rendered_test_fuel, resolve_test_fuel_limit, TestFuelLimit};
+    use serde_json::json;
+
+    const CEILING: u64 = talos_workflow_engine::DEFAULT_MAX_FUEL_PER_NODE;
+
+    #[test]
+    fn without_a_config_limit_the_module_row_applies() {
+        for config in [
+            json!({}),
+            json!({"max_fuel": null}),
+            json!({"MODEL": "x"}),
+            json!(null),
+        ] {
+            assert_eq!(
+                resolve_test_fuel_limit(&config, 1_404_000),
+                Ok(TestFuelLimit {
+                    limit: Some(1_404_000),
+                    source: "module",
+                    clamped: false
+                }),
+                "{config}"
+            );
+        }
+        // A row with no usable limit leaves the runtime default in force.
+        assert_eq!(resolve_test_fuel_limit(&json!({}), 0).unwrap().limit, None);
+        assert_eq!(resolve_test_fuel_limit(&json!({}), -5).unwrap().limit, None);
+    }
+
+    #[test]
+    fn a_config_limit_overrides_the_module_row_in_both_directions() {
+        let raised = resolve_test_fuel_limit(&json!({"max_fuel": 10_000_000}), 1_404_000).unwrap();
+        assert_eq!(
+            raised,
+            TestFuelLimit {
+                limit: Some(10_000_000),
+                source: "node_config",
+                clamped: false
+            }
+        );
+        // A node may also set a LOWER limit than the module's; the rehearsal follows it.
+        let lowered = resolve_test_fuel_limit(&json!({"max_fuel": 500_000}), 1_404_000).unwrap();
+        assert_eq!(lowered.limit, Some(500_000));
+    }
+
+    #[test]
+    fn a_config_limit_is_capped_at_the_engine_ceiling() {
+        let at = resolve_test_fuel_limit(&json!({"max_fuel": CEILING}), 1_000_000).unwrap();
+        assert_eq!((at.limit, at.clamped), (Some(CEILING), false));
+        for over in [CEILING + 1, u64::MAX] {
+            let capped = resolve_test_fuel_limit(&json!({"max_fuel": over}), 1_000_000).unwrap();
+            assert_eq!(
+                (capped.limit, capped.clamped, capped.source),
+                (Some(CEILING), true, "node_config"),
+                "{over}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_limit_that_is_not_a_positive_whole_number_is_refused_not_ignored() {
+        for bad in [
+            json!("10000000"),
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!(true),
+            json!([1]),
+            json!({"n": 1}),
+        ] {
+            let err = resolve_test_fuel_limit(&json!({"max_fuel": bad}), 1_404_000).unwrap_err();
+            assert!(
+                err.contains("config.max_fuel must be a positive whole number"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reply_says_which_limit_applied_and_how_to_raise_the_modules_own() {
+        let acc = |consumed: u64, limit: u64| -> talos_worker_runtime::context::FuelAcc {
+            let acc: talos_worker_runtime::context::FuelAcc =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            talos_worker_runtime::context::add_attempt_fuel(&acc, consumed, limit);
+            acc
+        };
+        let module = TestFuelLimit {
+            limit: Some(1_404_000),
+            source: "module",
+            clamped: false,
+        };
+        let exhausted = rendered_test_fuel(&acc(1_404_000, 1_404_000), module);
+        assert_eq!(exhausted["limit_source"], "module");
+        assert!(exhausted["limit_hint"]
+            .as_str()
+            .unwrap()
+            .contains("set `max_fuel` in `config`"));
+        // Within the limit: no hint.
+        assert!(rendered_test_fuel(&acc(900_000, 1_404_000), module)
+            .get("limit_hint")
+            .is_none());
+        // Out of fuel under a limit the caller set: the hint would be advice already taken.
+        let node = TestFuelLimit {
+            limit: Some(CEILING),
+            source: "node_config",
+            clamped: true,
+        };
+        let over = rendered_test_fuel(&acc(CEILING, CEILING), node);
+        assert_eq!(over["limit_source"], "node_config");
+        assert!(over.get("limit_hint").is_none());
+        assert!(over["limit_note"]
+            .as_str()
+            .unwrap()
+            .contains("capped at 50000000"));
+        // A run that never reported fuel renders null, not an object of guesses.
+        let none: talos_worker_runtime::context::FuelAcc =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        assert!(rendered_test_fuel(&none, module).is_null());
+    }
+
+    /// The tool's own description must tell a caller the limit can be set.
+    #[test]
+    fn the_tool_description_documents_the_config_limit() {
+        let tools = super::tool_schemas();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "test_module")
+            .expect("test_module is declared");
+        assert!(tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("`config.max_fuel`"));
+        assert!(tool["inputSchema"]["properties"]["config"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("`max_fuel`"));
     }
 }
