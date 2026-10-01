@@ -1584,9 +1584,18 @@ impl ActorRepository {
     /// from the worker's result (it contributes only provider/model/counts).
     /// With no `execution_id` (controller-side scaffolding calls) the row
     /// records the caller-resolved `user_id` and NULL workflow/org.
+    ///
+    /// `dispatch_workflow_id` is the workflow the dispatching ENGINE ran
+    /// (`DispatchJob::workflow_id`). It is used only when `execution_id` has
+    /// no `workflow_executions` row — a sub-workflow child, which runs under
+    /// an execution id of its own and writes no row there — and only when it
+    /// names a workflow owned by `user_id`. Until 2026-10-01 such rows had a
+    /// NULL workflow (measured: 14 rows in 7 days, every one a child run), so
+    /// a per-workflow usage query missed every child.
     pub async fn record_llm_usage(
         &self,
         execution_id: Option<Uuid>,
+        dispatch_workflow_id: Option<Uuid>,
         actor_id: Option<Uuid>,
         user_id: Option<Uuid>,
         entries: &[LlmUsageInsert],
@@ -1604,12 +1613,14 @@ impl ActorRepository {
             "INSERT INTO llm_usage \
              (execution_id, workflow_id, actor_id, user_id, org_id, \
               provider, model, prompt_tokens, completion_tokens, calls) \
-             SELECT $1, we.workflow_id, COALESCE(we.actor_id, $2), \
-                    COALESCE(we.user_id, $3), we.org_id, \
+             SELECT $1, COALESCE(we.workflow_id, cw.id), COALESCE(we.actor_id, $2), \
+                    COALESCE(we.user_id, $3), COALESCE(we.org_id, cw.org_id), \
                     u.provider, u.model, u.prompt_tokens, u.completion_tokens, u.calls \
              FROM UNNEST($4::text[], $5::text[], $6::bigint[], $7::bigint[], $8::int[]) \
                   AS u(provider, model, prompt_tokens, completion_tokens, calls) \
-             LEFT JOIN workflow_executions we ON we.id = $1",
+             LEFT JOIN workflow_executions we ON we.id = $1 \
+             LEFT JOIN workflows cw \
+                    ON we.id IS NULL AND cw.id = $9::uuid AND cw.user_id = $3::uuid",
         )
         .bind(execution_id)
         .bind(actor_id)
@@ -1619,6 +1630,7 @@ impl ActorRepository {
         .bind(&prompts)
         .bind(&completions)
         .bind(&calls)
+        .bind(dispatch_workflow_id)
         .execute(&self.db_pool)
         .await?;
         Ok(result.rows_affected())

@@ -322,6 +322,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "items": { "type": "string" },
                         "description": "Vault key paths this module may read. The template's own grant is the CEILING: your list can only NARROW it — an exact template path, a path under a template prefix or glob, or ['*'] meaning the template's whole list. Paths outside the template's grant are not installed and are listed in secrets_not_granted. An empty list [] installs a deny-all grant. Omitted on a FIRST install: the template's grant. Omitted on a REINSTALL: your installed copy's current grant is kept, bounded by the new template's grant (see grants_not_carried)."
                     },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "When true, nothing is compiled, written or recorded: the reply says which allowed_hosts / allowed_methods / allowed_secrets the install WOULD store, your copy's current ones, whether they differ, and anything that would not be carried (grants_not_carried, secrets_not_granted). Use it before reinstalling a module that live workflows use. Default false."
+                    },
                     "allowed_methods": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -3183,6 +3187,52 @@ pub(crate) struct InstallGrants {
     pub(crate) not_carried: serde_json::Map<String, serde_json::Value>,
 }
 
+/// What `install_module_from_catalog` would store, for `dry_run: true`.
+///
+/// `grants` is the outcome of [`grants_for_install`] — the same value the real
+/// install writes — so the preview cannot disagree with the install. `current`
+/// is `null` on a first install. `grants_changed` compares the three lists as
+/// sets, since order carries no meaning in a grant.
+pub(crate) fn install_dry_run_report(
+    name: &str,
+    capability_world: &str,
+    installed: Option<&talos_module_repository::StoredModuleGrants>,
+    grants: &InstallGrants,
+    secrets_not_granted: &[String],
+) -> serde_json::Value {
+    fn as_set(v: &[String]) -> std::collections::BTreeSet<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+    let grants_changed = installed.map(|cur| {
+        as_set(&cur.hosts) != as_set(&grants.hosts)
+            || as_set(&cur.methods) != as_set(&grants.methods)
+            || as_set(&cur.secrets) != as_set(&grants.secrets)
+    });
+    serde_json::json!({
+        "dry_run": true,
+        "name": name,
+        "capability_world": capability_world,
+        "first_install": installed.is_none(),
+        "would_install": {
+            "allowed_hosts": grants.hosts,
+            "allowed_methods": grants.methods,
+            "allowed_secrets": grants.secrets,
+        },
+        "current": installed.map(|cur| serde_json::json!({
+            "allowed_hosts": cur.hosts,
+            "allowed_methods": cur.methods,
+            "allowed_secrets": cur.secrets,
+        })),
+        // `null` on a first install: there is nothing to compare with.
+        "grants_changed": grants_changed,
+        "grants_not_carried": grants.not_carried,
+        "secrets_not_granted": secrets_not_granted,
+        "note": "Nothing was compiled, written or recorded. Run again without dry_run to install. \
+                 The code itself is not compared here: get_catalog_status → installed_copies says \
+                 whether your copy is behind the catalog.",
+    })
+}
+
 /// The ONE rule for which grants an install writes (2026-09-29).
 ///
 /// `hosts` / `methods` / `secrets` are what a FIRST install would write: the
@@ -4494,6 +4544,32 @@ async fn handle_install_module_from_catalog(
         caller_provided_allowed_methods,
         caller_provided_allowed_secrets,
     );
+    // DRY RUN: every grant decision is made above this line, before the
+    // compile and the write. Answer what the install WOULD store and stop —
+    // nothing is compiled, written or recorded. Until 2026-10-01 the only way
+    // to learn that a reinstall would drop a grant was to run it.
+    match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {
+        Ok(false) => {}
+        Ok(true) => {
+            let report = install_dry_run_report(
+                &display_name,
+                capability_world,
+                installed_copy.as_ref(),
+                &InstallGrants {
+                    hosts: allowed_hosts,
+                    methods: allowed_methods,
+                    secrets: allowed_secrets,
+                    not_carried: grants_not_carried,
+                },
+                &secrets_not_granted,
+            );
+            return mcp_text(
+                req_id,
+                &serde_json::to_string_pretty(&report).unwrap_or_default(),
+            );
+        }
+        Err(resp) => return resp,
+    }
     let description = meta
         .get("description")
         .and_then(|v| v.as_str())
@@ -5826,5 +5902,95 @@ mod config_schema_projection_tests {
         })));
         assert_eq!(p["config_schema_status"], "declared");
         assert_eq!(p["required_config_keys"], serde_json::json!([]));
+    }
+}
+
+#[cfg(test)]
+mod install_dry_run_tests {
+    use super::{grants_for_install, install_dry_run_report};
+    use talos_module_repository::StoredModuleGrants;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A reinstall that would drop a stored secret the new template no longer
+    /// grants says so BEFORE anything is installed, and the preview is built
+    /// from the same `grants_for_install` value the real install writes.
+    #[test]
+    fn a_reinstall_preview_names_what_would_change_and_what_is_not_carried() {
+        let stored = StoredModuleGrants {
+            hosts: v(&["gmail.googleapis.com"]),
+            methods: v(&["GET"]),
+            secrets: v(&["oauth/gmail/u/a@example.com/access_token", "legacy/key"]),
+        };
+        let grants = grants_for_install(
+            Some(&stored),
+            v(&["gmail.googleapis.com"]),
+            v(&["GET"]),
+            v(&["oauth/gmail/*"]),
+            false,
+            false,
+        );
+        let r = install_dry_run_report(
+            "Gmail: List Messages",
+            "http-node",
+            Some(&stored),
+            &grants,
+            &[],
+        );
+        assert_eq!(r["dry_run"], true);
+        assert_eq!(r["first_install"], false);
+        assert_eq!(
+            r["would_install"]["allowed_secrets"],
+            serde_json::json!(["oauth/gmail/u/a@example.com/access_token"])
+        );
+        assert_eq!(r["current"]["allowed_secrets"].as_array().unwrap().len(), 2);
+        assert_eq!(r["grants_changed"], true);
+        assert_eq!(
+            r["grants_not_carried"]["allowed_secrets"],
+            serde_json::json!(["legacy/key"])
+        );
+        assert!(r["note"].as_str().unwrap().contains("Nothing was compiled"));
+    }
+
+    /// CONTROL: a reinstall that changes no grant says `false`, comparing the
+    /// lists as sets; a first install has nothing to compare and says `null`.
+    #[test]
+    fn an_unchanged_reinstall_and_a_first_install_are_told_apart() {
+        let stored = StoredModuleGrants {
+            hosts: v(&["b.example.com", "a.example.com"]),
+            methods: v(&["GET"]),
+            secrets: vec![],
+        };
+        let grants = grants_for_install(
+            Some(&stored),
+            v(&["a.example.com", "b.example.com"]),
+            v(&["GET"]),
+            vec![],
+            false,
+            false,
+        );
+        let r = install_dry_run_report("m", "http-node", Some(&stored), &grants, &[]);
+        assert_eq!(r["grants_changed"], false, "{r}");
+        assert!(r["grants_not_carried"].as_object().unwrap().is_empty());
+
+        let first = grants_for_install(
+            None,
+            v(&["a.example.com"]),
+            v(&["GET"]),
+            v(&["x/y"]),
+            false,
+            false,
+        );
+        let r = install_dry_run_report("m", "http-node", None, &first, &v(&["z/denied"]));
+        assert_eq!(r["first_install"], true);
+        assert!(r["current"].is_null());
+        assert!(r["grants_changed"].is_null());
+        assert_eq!(
+            r["would_install"]["allowed_secrets"],
+            serde_json::json!(["x/y"])
+        );
+        assert_eq!(r["secrets_not_granted"], serde_json::json!(["z/denied"]));
     }
 }
