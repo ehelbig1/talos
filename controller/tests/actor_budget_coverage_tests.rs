@@ -644,3 +644,126 @@ async fn an_execution_older_than_an_hour_does_not_count_toward_the_hourly_cap() 
     tx.rollback().await.unwrap();
     assert!(matches!(admission, BudgetAdmission::Admitted));
 }
+
+/// The headroom report (2026-10-01) reads the same caps the admission check
+/// enforces, so a rehearsal reply can say how much is left. Read back from a
+/// real clone: the policy's caps only, in admission order, with the counts the
+/// admission statements produce — and "no policy" as its own answer.
+#[tokio::test]
+async fn the_headroom_report_reads_the_caps_the_admission_check_enforces() {
+    use talos_actor_budget_refusal::{actor_budget_headroom, BudgetCap, CapUse};
+    let (pool, _db) = common::isolated_db_pool().await;
+    let f = fixture(&pool).await;
+
+    assert_eq!(
+        actor_budget_headroom(&pool, f.actor).await.expect("read"),
+        None,
+        "an actor with no policy has no headroom to report"
+    );
+
+    // One execution, 5 fuel and 5 tokens; a policy that sets one cap at 1.
+    hold_at_cap(&pool, &f, "max_llm_tokens_per_day").await;
+    let one = actor_budget_headroom(&pool, f.actor)
+        .await
+        .expect("read")
+        .expect("policy");
+    assert_eq!(one.mode, "block");
+    // `max_workflows_per_minute` has a column default (10), so a policy row
+    // always carries that cap; the caps left NULL are not reported.
+    assert_eq!(
+        one.caps,
+        vec![
+            CapUse {
+                cap: BudgetCap::PerMinute,
+                limit: 10,
+                used: 1
+            },
+            CapUse {
+                cap: BudgetCap::LlmTokensPerDay,
+                limit: 1,
+                used: 5
+            },
+        ],
+        "only the caps the policy carries are reported"
+    );
+
+    // Every cap set: each is counted, in the order admission checks them.
+    sqlx::query(
+        "UPDATE actor_budget_policies SET max_workflows_per_minute = 10, max_executions_per_hour = 40, \
+         max_executions_total = 1000, max_fuel_per_hour = 100, max_llm_tokens_per_day = 500, \
+         on_budget_exceeded = 'suspend' WHERE actor_id = $1",
+    )
+    .bind(f.actor)
+    .execute(&pool)
+    .await
+    .expect("widen policy");
+    // An archived run counts toward the lifetime cap only.
+    sqlx::query(
+        "INSERT INTO workflow_executions_archive (id, workflow_id, user_id, status, started_at, actor_id) \
+         VALUES ($1, $2, $3, 'completed', NOW() - INTERVAL '40 days', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(f.wf)
+    .bind(f.user)
+    .bind(f.actor)
+    .execute(&pool)
+    .await
+    .expect("seed archived execution");
+    let all = actor_budget_headroom(&pool, f.actor)
+        .await
+        .expect("read")
+        .expect("policy");
+    assert_eq!(all.mode, "suspend");
+    assert_eq!(
+        all.caps,
+        vec![
+            CapUse {
+                cap: BudgetCap::PerMinute,
+                limit: 10,
+                used: 1
+            },
+            CapUse {
+                cap: BudgetCap::PerHour,
+                limit: 40,
+                used: 1
+            },
+            CapUse {
+                cap: BudgetCap::Total,
+                limit: 1000,
+                used: 2
+            },
+            CapUse {
+                cap: BudgetCap::FuelPerHour,
+                limit: 100,
+                used: 5
+            },
+            CapUse {
+                cap: BudgetCap::LlmTokensPerDay,
+                limit: 500,
+                used: 5
+            },
+        ]
+    );
+
+    // Another actor's spend is not this actor's.
+    let other = seed_actor(&pool, f.user, false).await;
+    sqlx::query("INSERT INTO actor_budget_policies (actor_id, max_executions_per_hour, on_budget_exceeded) VALUES ($1, 40, 'block')")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .expect("seed other policy");
+    let theirs = actor_budget_headroom(&pool, other)
+        .await
+        .expect("read")
+        .expect("policy");
+    assert!(
+        theirs.caps.iter().all(|c| c.used == 0),
+        "the first actor's runs, fuel and tokens are not counted: {:?}",
+        theirs.caps
+    );
+    assert!(theirs.caps.contains(&CapUse {
+        cap: BudgetCap::PerHour,
+        limit: 40,
+        used: 0
+    }));
+}

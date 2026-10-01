@@ -342,6 +342,34 @@ pub use talos_mcp::{mcp_denied, mcp_error, mcp_failed, mcp_not_found, mcp_text};
 /// validator a single import-everywhere call, mirroring the `push
 /// validator into the canonical helper` pattern (MCP-1224 for
 /// memory_key, MCP-1225 for memory_type enum).
+/// A node's freshness contract as the ENGINE will read it, or `None` when the
+/// node has no usable one. Rendered from the engine's own parser
+/// (`resolve_freshness_policy`), so what this shows is what dispatch enforces
+/// — a bound the parser drops is absent here and reported by
+/// `validate_workflow` as a `freshness-contract` warning.
+///
+/// Exists because the contract lives in a node's config and nothing echoed it
+/// back: `__staleness__` is engine-supplied and never stored, so an author had
+/// no way to see that a `requires_fresh` they wrote had been understood.
+pub fn render_freshness_contract(
+    node_data: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    use talos_workflow_engine_core::reserved_keys::{resolve_freshness_policy, OnStale};
+    let policy = resolve_freshness_policy(node_data)?;
+    let requires: serde_json::Map<String, serde_json::Value> = policy
+        .requirements
+        .iter()
+        .map(|(key, hours)| (key.clone(), serde_json::json!(hours)))
+        .collect();
+    Some(serde_json::json!({
+        "requires_fresh": requires,
+        "on_stale": match policy.on_stale {
+            OnStale::Annotate => "annotate",
+            OnStale::Fail => "fail",
+        },
+    }))
+}
+
 pub fn ensure_graph_within_caps(
     graph_json: &str,
     req_id: &Option<serde_json::Value>,
@@ -4251,5 +4279,42 @@ mod mistyped_argument_tests {
             tool_arg_types().len()
         );
         assert!(typed > 400, "typed arguments: {typed}");
+    }
+}
+
+#[cfg(test)]
+mod freshness_contract_render_tests {
+    use super::render_freshness_contract;
+    use serde_json::json;
+
+    #[test]
+    fn the_rendered_contract_is_what_the_engine_parses() {
+        assert_eq!(render_freshness_contract(None), None);
+        assert_eq!(
+            render_freshness_contract(Some(&json!({"MODEL": "x"}))),
+            None
+        );
+        assert_eq!(
+            render_freshness_contract(Some(&json!({"requires_fresh": {"commitments/mine": 96}}))),
+            Some(json!({"requires_fresh": {"commitments/mine": 96.0}, "on_stale": "annotate"}))
+        );
+        // A bound the engine drops is not shown as part of the contract, and an
+        // unrecognised mode is shown as what it will actually be.
+        assert_eq!(
+            render_freshness_contract(Some(
+                &json!({"requires_fresh": {"a": 6, "b": "12"}, "on_stale": "error"})
+            )),
+            Some(json!({"requires_fresh": {"a": 6.0}, "on_stale": "annotate"}))
+        );
+        assert_eq!(
+            render_freshness_contract(Some(
+                &json!({"requires_fresh": {"a": 0.5}, "on_stale": "fail"})
+            )),
+            Some(json!({"requires_fresh": {"a": 0.5}, "on_stale": "fail"}))
+        );
+        assert_eq!(
+            render_freshness_contract(Some(&json!({"requires_fresh": {"a": 0}}))),
+            None
+        );
     }
 }
