@@ -123,16 +123,59 @@ pub fn compute_max_fuel_with_llm_output(
     llm_output_bytes: u64,
     safety_multiplier: f64,
 ) -> u64 {
+    compute_max_fuel_with_rates(
+        item_count,
+        bytes_per_item,
+        llm_output_bytes,
+        FUEL_PER_BYTE,
+        safety_multiplier,
+    )
+}
+
+/// [`compute_max_fuel_with_llm_output`] with the per-byte cost stated by the
+/// caller instead of taken as [`FUEL_PER_BYTE`].
+///
+/// The default of 2 fuel per byte describes a module that deserializes small
+/// items into typed structs, where the fixed 60 K per item carries most of the
+/// cost. It is far too low for a module that WORKS on its bytes. Measured
+/// 2026-10-01 with a staged probe build over 684 KB of Gmail responses:
+///
+/// | work done on each byte                         | fuel per byte |
+/// |------------------------------------------------|---------------|
+/// | receiving the HTTP body                        | ~1.2          |
+/// | UTF-8 validation                               | ~2.5          |
+/// | typed JSON parse                               | ~7            |
+/// | base64 decode (per input character)            | ~30           |
+/// | scanning text or HTML byte by byte             | ~36           |
+///
+/// So a module that only fetches and typed-parses costs about 11 per byte, and
+/// one that decodes or scans what it fetched costs 30–40 per byte it touches.
+/// With the default, 20 messages of 60 KB were budgeted 7.3 M; reading them
+/// took about 50 M. Loop style did not matter (iterator and indexed loops, and
+/// a table decoder in place of the `base64` crate, all measured the same);
+/// only touching fewer bytes did.
+///
+/// `fuel_per_byte` is clamped to `[1, FUEL_PER_BYTE_MAX]`; the result is
+/// clamped to `[FUEL_MIN, FUEL_MAX]` as before.
+pub fn compute_max_fuel_with_rates(
+    item_count: u64,
+    bytes_per_item: u64,
+    llm_output_bytes: u64,
+    fuel_per_byte: u64,
+    safety_multiplier: f64,
+) -> u64 {
+    let fuel_per_byte = fuel_per_byte.clamp(1, FUEL_PER_BYTE_MAX);
     // Coefficients hoisted to module scope (see the "Fuel-budget coefficients"
     // section below) so the human-translation helpers invert the SAME formula —
     // the forward estimate and the tier/capacity labels shown back to operators
     // can never drift apart.
     let per_item_bytes = item_count
         .saturating_mul(bytes_per_item)
-        .saturating_mul(FUEL_PER_BYTE);
+        .saturating_mul(fuel_per_byte);
     let per_item_parse = item_count.saturating_mul(FUEL_PER_ITEM_TYPED_PARSE);
     // LLM output is parsed once per execution (not per item) so it enters the
     // total directly, not multiplied by item_count.
+    // The model's reply is small and typed-parsed once: the default rate.
     let llm_output_fuel = llm_output_bytes.saturating_mul(FUEL_PER_BYTE);
     let subtotal = FUEL_BASELINE
         .saturating_add(per_item_parse)
@@ -164,8 +207,15 @@ pub fn compute_max_fuel_with_llm_output(
 pub(crate) const FUEL_BASELINE: u64 = 50_000;
 /// Typed-struct parse cost per input item (fuel).
 pub(crate) const FUEL_PER_ITEM_TYPED_PARSE: u64 = 60_000;
-/// Wasmtime fuel charged per raw input byte.
-pub(crate) const FUEL_PER_BYTE: u64 = 2;
+/// Fuel per raw input byte when the caller states no rate of its own — right
+/// for small typed items, far too low for byte-heavy work (see
+/// [`compute_max_fuel_with_rates`]).
+pub const FUEL_PER_BYTE: u64 = 2;
+/// Largest per-byte rate a budget may state.
+pub const FUEL_PER_BYTE_MAX: u64 = 100;
+/// The sentence every `fuel_budget` schema carries about the per-byte rate, so
+/// the four tools that take a budget cannot describe it four ways.
+pub const FUEL_PER_BYTE_GUIDANCE: &str = "`fuel_per_byte` (integer 1–100, default 2) is the cost of each input byte. The default suits small typed items; measured costs are about 11 per byte for a response that is only fetched and typed-parsed, and 30–40 per byte the module decodes or scans (base64, HTML, text). Set it for byte-heavy modules: at the default, 20 items of 60 KB are budgeted 7.3M where reading them took about 50M.";
 /// Dispatcher clamp floor — the smallest max_fuel any module is given.
 pub const FUEL_MIN: u64 = 1_000_000;
 /// Dispatcher clamp ceiling — the largest max_fuel any module is given.
@@ -822,6 +872,65 @@ mod tests {
         let f = compute_max_fuel(10, 1000, 0.0);
         let expected_floor = 50_000 + 10 * 60_000 + 10 * 1000 * 2;
         assert!(f >= expected_floor.max(1_000_000), "got {}", f);
+    }
+
+    #[test]
+    fn the_default_rate_leaves_every_existing_budget_unchanged() {
+        for (items, bytes, llm, mult) in [
+            (10, 2000, 0, 2.0),
+            (50, 2000, 24_000, 3.0),
+            (20, 60_000, 0, 2.0),
+            (0, 0, 0, 2.0),
+        ] {
+            assert_eq!(
+                compute_max_fuel_with_rates(items, bytes, llm, FUEL_PER_BYTE, mult),
+                compute_max_fuel_with_llm_output(items, bytes, llm, mult),
+                "{items} x {bytes}"
+            );
+        }
+        // The shape that undersized a byte-heavy module: 20 items of 60 KB.
+        assert_eq!(
+            compute_max_fuel_with_llm_output(20, 60_000, 0, 2.0),
+            7_300_000
+        );
+    }
+
+    #[test]
+    fn a_stated_per_byte_rate_scales_the_byte_term_only() {
+        // 20 x 60 KB at 40 per byte: (50K + 1.2M + 48M) x 2 → the ceiling.
+        assert_eq!(
+            compute_max_fuel_with_rates(20, 60_000, 0, 40, 2.0),
+            FUEL_MAX
+        );
+        // 5 x 60 KB at 40: (50K + 300K + 12M) x 2 = 24.7M.
+        assert_eq!(
+            compute_max_fuel_with_rates(5, 60_000, 0, 40, 2.0),
+            24_700_000
+        );
+        // Fetch-and-parse at 11: (50K + 300K + 3.3M) x 2 = 7.3M.
+        assert_eq!(
+            compute_max_fuel_with_rates(5, 60_000, 0, 11, 2.0),
+            7_300_000
+        );
+        // The model's reply is not multiplied by the stated rate.
+        assert_eq!(
+            compute_max_fuel_with_rates(10, 2000, 3000, 40, 1.0)
+                - compute_max_fuel_with_rates(10, 2000, 0, 40, 1.0),
+            3000 * FUEL_PER_BYTE
+        );
+        // Out-of-range rates are clamped, not trusted.
+        assert_eq!(
+            compute_max_fuel_with_rates(10, 2000, 0, 0, 2.0),
+            compute_max_fuel_with_rates(10, 2000, 0, 1, 2.0)
+        );
+        assert_eq!(
+            compute_max_fuel_with_rates(5, 10_000, 0, u64::MAX, 1.0),
+            compute_max_fuel_with_rates(5, 10_000, 0, FUEL_PER_BYTE_MAX, 1.0)
+        );
+        assert_eq!(
+            compute_max_fuel_with_rates(u64::MAX, u64::MAX, u64::MAX, u64::MAX, 5.0),
+            FUEL_MAX
+        );
     }
 
     #[test]

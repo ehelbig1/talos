@@ -177,12 +177,13 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "fuel_budget": {
                         "type": "object",
-                        "description": "Declare the expected payload shape so the dispatcher computes an honest per-execution fuel limit at compile time. Replaces the old pattern of 'bump max_fuel until green'. Formula baseline + 60K per item + 2 fuel per input byte + 2 fuel per llm_output_bytes, then × safety_multiplier (default 2.0), clamped to [1M, 50M]. Fields: expected_items (u64, default 10), bytes_per_item (u64, default 2000), llm_output_bytes (u64, default 0 — set to ~3000 for LLM-backed modules), safety_multiplier (float 1.0–5.0, default 2.0). Omit to accept the conservative default (10 items × 2KB × 2.0 = ~2.2M fuel).\n\nHTTP-FETCHING MODULES: `bytes_per_item` should be the size of ONE response-body item (e.g. ~2–8KB for a GitHub PR object, a Jira issue, or a Gmail message). Total fuel ≈ 60K × items + 2 × items × bytes_per_item — so for 20 PRs @ 8KB each you need ~2.5M base, × 3 safety = 7.5M.\n\nVALUE-PARSING MODULES: modules that use `serde_json::Value` access patterns (caught by the value-parser lint) cost 3–10× more fuel per byte than typed #[derive(Deserialize)] structs. For Value-heavy modules set `safety_multiplier: 3–5` or switch to typed parsing.",
+                        "description": "Declare the expected payload shape so the dispatcher computes an honest per-execution fuel limit at compile time. Replaces the old pattern of 'bump max_fuel until green'. Formula baseline + 60K per item + 2 fuel per input byte + 2 fuel per llm_output_bytes, then × safety_multiplier (default 2.0), clamped to [1M, 50M]. Fields: expected_items (u64, default 10), bytes_per_item (u64, default 2000), llm_output_bytes (u64, default 0 — set to ~3000 for LLM-backed modules), safety_multiplier (float 1.0–5.0, default 2.0). Omit to accept the conservative default (10 items × 2KB × 2.0 = ~2.2M fuel).\n\nHTTP-FETCHING MODULES: `bytes_per_item` should be the size of ONE response-body item (e.g. ~2–8KB for a GitHub PR object, a Jira issue, or a Gmail message). Total fuel ≈ 60K × items + fuel_per_byte × items × bytes_per_item — so for 20 PRs @ 8KB each at the default rate you need ~1.6M base, × 3 safety = 4.7M. For LARGE items the per-byte rate is what matters and the default of 2 is too low: see `fuel_per_byte`.\n\nVALUE-PARSING MODULES: modules that use `serde_json::Value` access patterns (caught by the value-parser lint) cost 3–10× more fuel per byte than typed #[derive(Deserialize)] structs. For Value-heavy modules set `safety_multiplier: 3–5` or switch to typed parsing.",
                         "properties": {
                             "expected_items": { "type": "integer", "minimum": 0 },
                             "bytes_per_item": { "type": "integer", "minimum": 0 },
                             "llm_output_bytes": { "type": "integer", "minimum": 0 },
-                            "safety_multiplier": { "type": "number", "minimum": 1.0, "maximum": 5.0 }
+                            "safety_multiplier": { "type": "number", "minimum": 1.0, "maximum": 5.0 },
+                            "fuel_per_byte": { "type": "integer", "minimum": 1, "maximum": 100, "description": talos_compilation::scaffold::FUEL_PER_BYTE_GUIDANCE }
                         }
                     },
                     "integration_name": {
@@ -306,7 +307,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             "expected_items": { "type": "integer", "minimum": 0 },
                             "bytes_per_item": { "type": "integer", "minimum": 0 },
                             "llm_output_bytes": { "type": "integer", "minimum": 0 },
-                            "safety_multiplier": { "type": "number", "minimum": 1.0, "maximum": 5.0 }
+                            "safety_multiplier": { "type": "number", "minimum": 1.0, "maximum": 5.0 },
+                            "fuel_per_byte": { "type": "integer", "minimum": 1, "maximum": 100, "description": talos_compilation::scaffold::FUEL_PER_BYTE_GUIDANCE }
                         }
                     }
                 },
@@ -548,10 +550,17 @@ pub(crate) fn compute_fuel_from_budget_value(budget: &Value) -> u64 {
         .get("safety_multiplier")
         .and_then(|v| v.as_f64())
         .unwrap_or(2.0);
-    talos_compilation::scaffold::compute_max_fuel_with_llm_output(
+    // Absent (or not a whole number) → the default rate, so every budget
+    // written before the field existed computes exactly what it did.
+    let fuel_per_byte = budget
+        .get("fuel_per_byte")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(talos_compilation::scaffold::FUEL_PER_BYTE);
+    talos_compilation::scaffold::compute_max_fuel_with_rates(
         items,
         bytes,
         llm_output_bytes,
+        fuel_per_byte,
         mult,
     )
 }
@@ -5746,5 +5755,84 @@ mod test_module_fuel_limit_tests {
             .as_str()
             .unwrap()
             .contains("`max_fuel`"));
+    }
+}
+
+#[cfg(test)]
+mod fuel_per_byte_tests {
+    use super::compute_fuel_from_budget_value;
+    use serde_json::json;
+
+    #[test]
+    fn a_budget_without_the_field_computes_what_it_always_did() {
+        assert_eq!(
+            compute_fuel_from_budget_value(
+                &json!({"expected_items": 20, "bytes_per_item": 60000, "safety_multiplier": 2.0})
+            ),
+            7_300_000
+        );
+        assert_eq!(
+            compute_fuel_from_budget_value(&json!({})),
+            talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0)
+        );
+        // A value that is not a whole number is not a rate: the default applies.
+        for bad in [json!("40"), json!(40.5), json!(null), json!(-3)] {
+            assert_eq!(
+                compute_fuel_from_budget_value(
+                    &json!({"expected_items": 20, "bytes_per_item": 60000, "fuel_per_byte": bad})
+                ),
+                7_300_000
+            );
+        }
+    }
+
+    #[test]
+    fn a_stated_rate_sizes_a_byte_heavy_module() {
+        let at = |rate: u64| {
+            compute_fuel_from_budget_value(
+                &json!({"expected_items": 5, "bytes_per_item": 60000, "fuel_per_byte": rate, "safety_multiplier": 2.0}),
+            )
+        };
+        assert_eq!(at(2), 1_900_000);
+        assert_eq!(at(11), 7_300_000);
+        assert_eq!(at(40), 24_700_000);
+        assert_eq!(at(100_000), at(100), "clamped at the maximum rate");
+    }
+
+    /// Four tools take a `fuel_budget`; each must declare the field, with the
+    /// one shared sentence.
+    #[test]
+    fn every_tool_that_takes_a_budget_declares_the_rate() {
+        let guidance = talos_compilation::scaffold::FUEL_PER_BYTE_GUIDANCE;
+        let mut seen = Vec::new();
+        for tools in [
+            super::tool_schemas(),
+            crate::modules::tool_schemas(),
+            crate::workflows::tool_schemas(),
+        ] {
+            for tool in &tools {
+                let Some(budget) = tool["inputSchema"]["properties"].get("fuel_budget") else {
+                    continue;
+                };
+                let name = tool["name"].as_str().unwrap_or("?").to_string();
+                assert_eq!(
+                    budget["properties"]["fuel_per_byte"]["description"].as_str(),
+                    Some(guidance),
+                    "{name} takes a fuel_budget but does not declare fuel_per_byte"
+                );
+                seen.push(name);
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                "add_node_to_workflow",
+                "compile_custom_sandbox",
+                "hot_update_module",
+                "install_module_from_catalog"
+            ],
+            "the set of tools that take a fuel_budget changed; check the new one declares the rate"
+        );
     }
 }
