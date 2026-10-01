@@ -1684,6 +1684,8 @@ impl WebhookRouter {
                             if let Err(e) = repo
                                 .record_llm_usage(
                                     Some(job_id),
+                                    // Module-bound dispatch: no workflow.
+                                    None,
                                     resolved_actor,
                                     Some(user_id),
                                     &entries,
