@@ -1501,6 +1501,8 @@ async fn handle_tools_call_inner(
     }
     // Decorator applied to whichever domain dispatch claims the tool.
     let decorate = |mut r: JsonRpcResponse| -> JsonRpcResponse {
+        // Says what a `[REDACTED:…]` marker in the result does and does not mean.
+        crate::utils::append_redaction_notice(&mut r);
         if let Some(w) = arg_warning.as_deref() {
             crate::utils::append_warning_block(&mut r, w);
         }

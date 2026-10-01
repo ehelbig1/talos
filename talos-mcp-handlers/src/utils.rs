@@ -2031,6 +2031,42 @@ pub(crate) fn append_warning_block(resp: &mut talos_mcp::JsonRpcResponse, warnin
     }
 }
 
+/// The opening of every marker data-loss prevention writes in place of a
+/// value (`[REDACTED:EMAIL]`, `[REDACTED:SECRET]`, …). The bare `[REDACTED]`
+/// used for actor-memory values is a different mechanism and is not matched.
+const DLP_MARKER_OPENING: &str = "[REDACTED:";
+
+/// Appended to a tool result that shows a DLP marker.
+///
+/// A marker in a displayed node output reads as if the value had been lost
+/// between two nodes. It was not: redaction is applied where a value is
+/// stored or displayed, never to what a running workflow hands the next node.
+pub(crate) const REDACTION_NOTICE: &str = "ℹ Values shown as [REDACTED:…] were replaced by \
+data-loss prevention where the value was stored or displayed. A running workflow passes the \
+original values from node to node, so a marker here does not mean a node received redacted \
+data. Anything that starts from the stored copy instead (a module replay, for example) \
+starts from the redacted values.";
+
+/// Append [`REDACTION_NOTICE`] when any text block of the result shows a DLP
+/// marker. One substring scan per text block; no-op on non-standard shapes.
+pub(crate) fn append_redaction_notice(resp: &mut talos_mcp::JsonRpcResponse) {
+    let shows_marker = resp
+        .result
+        .as_ref()
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.as_array())
+        .is_some_and(|blocks| {
+            blocks.iter().any(|b| {
+                b.get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.contains(DLP_MARKER_OPENING))
+            })
+        });
+    if shows_marker {
+        append_warning_block(resp, REDACTION_NOTICE);
+    }
+}
+
 /// What a `workflows.graph_json` read actually established.
 ///
 /// The read returns `Result<Option<String>>` and the three outcomes mean
@@ -2221,6 +2257,37 @@ mod unknown_arg_tests {
             unknown_argument_warning("Redis_Cache-v1", &serde_json::json!({"anything": 1}))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_result_showing_a_dlp_marker_gets_the_redaction_notice_once() {
+        let blocks = |r: &talos_mcp::JsonRpcResponse| {
+            r.result.as_ref().unwrap()["content"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let mut shown = mcp_text(None, r#"{"to":"[REDACTED:EMAIL]","n":1}"#);
+        append_redaction_notice(&mut shown);
+        let b = blocks(&shown);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[1]["text"], REDACTION_NOTICE);
+        // The first block is untouched, so a caller parsing it as JSON still can.
+        assert_eq!(b[0]["text"], r#"{"to":"[REDACTED:EMAIL]","n":1}"#);
+
+        // Control: no marker, no notice — including the actor-memory
+        // `[REDACTED]`, which is a different mechanism.
+        for text in [r#"{"n":1}"#, r#"{"value":"[REDACTED]"}"#] {
+            let mut plain = mcp_text(None, text);
+            append_redaction_notice(&mut plain);
+            assert_eq!(blocks(&plain).len(), 1, "{text}");
+        }
+
+        // A protocol error has no content blocks and is left alone.
+        let mut err = mcp_error(None, -32602, "bad [REDACTED:EMAIL]");
+        let before = serde_json::to_string(&err.error).unwrap();
+        append_redaction_notice(&mut err);
+        assert_eq!(serde_json::to_string(&err.error).unwrap(), before);
     }
 
     #[test]
