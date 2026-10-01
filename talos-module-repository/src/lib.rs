@@ -373,6 +373,13 @@ pub struct CatalogCopyRow {
     pub catalog_source_absent: bool,
     /// The copy's source is byte-identical to the catalog row's.
     pub source_matches: bool,
+    /// The rest of what a reinstall copies from the catalog row matches it:
+    /// the config schema (what `get_module_info` and the node editor show),
+    /// the capability world and the approval list. Grants and `max_fuel` are
+    /// not compared — a reinstall carries the copy's own.
+    pub schema_matches: bool,
+    pub world_matches: bool,
+    pub approvals_match: bool,
     /// The copy has been edited in place (`hot_update_module`), so a source
     /// difference is the user's change, not staleness.
     pub hot_updated: bool,
@@ -383,18 +390,51 @@ pub struct CatalogCopyRow {
     pub catalog_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl CatalogCopyRow {
+    /// Config schema, capability world and approval list all match.
+    #[must_use]
+    pub fn manifest_matches(&self) -> bool {
+        self.schema_matches && self.world_matches && self.approvals_match
+    }
+
+    /// What a reinstall would change, by column. Empty when nothing would,
+    /// and when there is no catalog row to compare with.
+    #[must_use]
+    pub fn differs_in(&self) -> Vec<&'static str> {
+        if !self.in_catalog || self.catalog_source_absent {
+            return Vec::new();
+        }
+        [
+            (self.source_matches, "source"),
+            (self.schema_matches, "config_schema"),
+            (self.world_matches, "capability_world"),
+            (self.approvals_match, "requires_approval_for"),
+        ]
+        .into_iter()
+        .filter(|(matches, _)| !matches)
+        .map(|(_, column)| column)
+        .collect()
+    }
+}
+
 /// Where an installed catalog copy stands against the catalog (2026-09-29).
 ///
 /// A user's installed copy is a frozen row: the seeder refreshes the SYSTEM
 /// catalog row, not the copies workflows actually run, so a catalog fix —
 /// including a security fix — is not live until the copy is reinstalled.
 /// Measured on the reference fleet: 5 of 8 copies had drifted, two of them
-/// live and missing the 2026-09-10 prompt-injection hardening. Source is the
-/// only reliable comparison: `content_hash` hashes the compiled WASM, which
-/// differs on every compile.
+/// live and missing the 2026-09-10 prompt-injection hardening. The CODE is
+/// compared by source: `content_hash` hashes the compiled WASM, which differs
+/// on every compile.
+///
+/// Since 2026-10-01 the comparison covers everything a reinstall copies from
+/// the catalog row, not the source alone: a template change that touched only
+/// its `config_schema` left the copy reading "current" while its stored
+/// schema lacked the new keys (see [`CatalogCopyRow::differs_in`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogCopyState {
-    /// Same source as the catalog.
+    /// Same source, config schema, capability world and approval list as
+    /// the catalog.
     Current,
     /// The catalog has changed since the copy was installed; reinstall to
     /// take the change.
@@ -410,17 +450,19 @@ pub enum CatalogCopyState {
 
 impl CatalogCopyState {
     /// Classify one row. Order matters: an unknown comparison is never
-    /// promoted to a verdict, and a matching source is current even if the
-    /// copy was once hot-updated back to the catalog text.
+    /// promoted to a verdict, and a copy that matches the catalog is current
+    /// even if it was once hot-updated back to the catalog text. Detached is
+    /// about the SOURCE: an edited copy whose source differs is the user's
+    /// change; one whose source matches but whose schema is stale is behind.
     #[must_use]
     pub fn of(row: &CatalogCopyRow) -> Self {
         if !row.in_catalog {
             Self::NotInCatalog
         } else if row.catalog_source_absent {
             Self::Unknown
-        } else if row.source_matches {
+        } else if row.source_matches && row.manifest_matches() {
             Self::Current
-        } else if row.hot_updated {
+        } else if !row.source_matches && row.hot_updated {
             Self::Detached
         } else {
             Self::Behind
@@ -3283,14 +3325,18 @@ impl ModuleRepository {
                     s.id IS NOT NULL AS in_catalog, \
                     COALESCE(s.source_code, '') = '' AS catalog_source_absent, \
                     u.source_code IS NOT DISTINCT FROM s.source_code AS source_matches, \
+                    u.config_schema IS NOT DISTINCT FROM s.config_schema AS schema_matches, \
+                    u.capability_world IS NOT DISTINCT FROM s.capability_world AS world_matches, \
+                    u.requires_approval_for IS NOT DISTINCT FROM s.requires_approval_for AS approvals_match, \
                     EXISTS (SELECT 1 FROM module_update_history h WHERE h.module_id = u.id) AS hot_updated, \
                     (SELECT COUNT(*) FROM workflows w \
                       WHERE w.user_id = u.user_id AND {not_retired} \
                         AND w.graph_json::text LIKE '%' || u.id::text || '%') AS live_workflows, \
-                    u.compiled_at, s.updated_at \
+                    u.compiled_at, s.updated_at AS catalog_updated_at \
                FROM modules u \
                LEFT JOIN LATERAL ( \
-                    SELECT c.id, c.source_code, c.updated_at FROM modules c \
+                    SELECT c.id, c.source_code, c.updated_at, c.config_schema, \
+                           c.capability_world, c.requires_approval_for FROM modules c \
                      WHERE c.user_id IS NULL AND c.kind = 'catalog' \
                        AND (c.catalog_slug = u.catalog_slug \
                             OR (u.catalog_slug IS NULL AND c.name = u.name)) \
@@ -3312,11 +3358,14 @@ impl ModuleRepository {
                 catalog_slug: r.try_get(2)?,
                 in_catalog: r.try_get(3)?,
                 catalog_source_absent: r.try_get(4)?,
-                source_matches: r.try_get(5)?,
-                hot_updated: r.try_get(6)?,
-                live_workflows: r.try_get(7)?,
-                compiled_at: r.try_get(8)?,
-                catalog_updated_at: r.try_get(9)?,
+                source_matches: r.try_get("source_matches")?,
+                schema_matches: r.try_get("schema_matches")?,
+                world_matches: r.try_get("world_matches")?,
+                approvals_match: r.try_get("approvals_match")?,
+                hot_updated: r.try_get("hot_updated")?,
+                live_workflows: r.try_get("live_workflows")?,
+                compiled_at: r.try_get("compiled_at")?,
+                catalog_updated_at: r.try_get("catalog_updated_at")?,
             });
         }
         Ok(out)
@@ -4650,11 +4699,55 @@ mod catalog_copy_state_tests {
             in_catalog,
             catalog_source_absent: absent,
             source_matches: matches,
+            schema_matches: true,
+            world_matches: true,
+            approvals_match: true,
             hot_updated: hot,
             live_workflows: 0,
             compiled_at: None,
             catalog_updated_at: None,
         }
+    }
+
+    #[test]
+    fn a_copy_whose_schema_is_stale_is_behind_even_when_its_source_matches() {
+        // The 2026-10-01 case: a template change that touched only its
+        // config schema left the copy reading "current".
+        let mut stale = row(true, false, true, false);
+        stale.schema_matches = false;
+        assert_eq!(S::of(&stale), S::Behind);
+        assert_eq!(stale.differs_in(), vec!["config_schema"]);
+        // Each compared column is enough on its own.
+        for set in [
+            (|r: &mut CatalogCopyRow| r.world_matches = false) as fn(&mut CatalogCopyRow),
+            |r| r.approvals_match = false,
+        ] {
+            let mut r = row(true, false, true, false);
+            set(&mut r);
+            assert_eq!(S::of(&r), S::Behind);
+            assert_eq!(r.differs_in().len(), 1);
+        }
+        // Hot-updated back to the catalog text, schema stale: behind, because
+        // a reinstall is what refreshes the schema.
+        let mut hot = row(true, false, true, true);
+        hot.schema_matches = false;
+        assert_eq!(S::of(&hot), S::Behind);
+        // An edited copy stays detached whatever its schema says.
+        let mut edited = row(true, false, false, true);
+        edited.schema_matches = false;
+        assert_eq!(S::of(&edited), S::Detached);
+        assert_eq!(edited.differs_in(), vec!["source", "config_schema"]);
+    }
+
+    #[test]
+    fn nothing_is_claimed_to_differ_when_there_is_nothing_to_compare_with() {
+        let mut oci = row(true, true, false, false);
+        oci.schema_matches = false;
+        assert_eq!(S::of(&oci), S::Unknown);
+        assert!(oci.differs_in().is_empty());
+        let orphan = row(false, false, false, false);
+        assert!(orphan.differs_in().is_empty());
+        assert!(row(true, false, true, false).differs_in().is_empty());
     }
 
     #[test]

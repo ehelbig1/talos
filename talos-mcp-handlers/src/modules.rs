@@ -3539,6 +3539,9 @@ mod catalog_drift_report_tests {
             in_catalog: true,
             catalog_source_absent: false,
             source_matches: matches,
+            schema_matches: true,
+            world_matches: true,
+            approvals_match: true,
             hot_updated: hot,
             live_workflows: live,
             compiled_at: None,
@@ -3566,6 +3569,24 @@ mod catalog_drift_report_tests {
             .collect();
         assert_eq!(order, ["behind-used", "behind-unused", "edited", "current"]);
         assert_eq!(v["copies"][0]["state"], "behind");
+    }
+
+    #[test]
+    fn a_schema_only_difference_is_reported_as_behind_and_named() {
+        let mut schema_only = copy("llm", true, false, 16);
+        schema_only.schema_matches = false;
+        let rows = vec![schema_only, copy("ok", true, false, 1)];
+        let v = installed_copies_json(&rows);
+        assert_eq!(v["counts"]["behind"], 1);
+        assert_eq!(v["copies"][0]["name"], "llm");
+        assert_eq!(v["copies"][0]["state"], "behind");
+        assert_eq!(
+            v["copies"][0]["differs_in"],
+            serde_json::json!(["config_schema"])
+        );
+        assert_eq!(v["copies"][1]["differs_in"], serde_json::json!([]));
+        assert_eq!(super::catalog_drift_brief(&rows)["behind"], 1);
+        assert!(catalog_drift_tip(&rows).is_some());
     }
 
     #[test]
@@ -5555,13 +5576,14 @@ pub(crate) fn installed_copies_json(
             "name": r.name,
             "catalog_slug": r.catalog_slug,
             "state": S::of(r).as_str(),
+            "differs_in": r.differs_in(),
             "live_workflows": r.live_workflows,
             "compiled_at": r.compiled_at.map(|t| t.to_rfc3339()),
             "catalog_updated_at": r.catalog_updated_at.map(|t| t.to_rfc3339()),
         })).collect::<Vec<_>>(),
         "states": {
-            "current": "same source as the catalog",
-            "behind": "the catalog changed since this copy was installed; reinstall to take the change",
+            "current": "same source, config schema, capability world and approval list as the catalog",
+            "behind": "the catalog changed since this copy was installed (differs_in says what: source, config_schema, capability_world, requires_approval_for); reinstall to take the change",
             "detached": "edited in place (hot_update_module), so differing from the catalog is deliberate",
             "unknown": "the catalog row carries no source (OCI mode), so drift cannot be determined here",
             "not_in_catalog": "no catalog template maps to this copy any more",
