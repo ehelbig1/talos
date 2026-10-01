@@ -125,7 +125,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "nodes": {
                         "type": "array",
-                        "description": "Array of node objects. Each needs: id (any unique string), module_id (UUID from list_modules or list_module_catalog), position (optional {x,y}), config (optional object). Post-Phase-5.1, modules table is unified — module_id is a single canonical UUID, no more wasm_modules vs node_templates distinction.\n\nIMPORTANT: rust_code is NOT supported in this nodes array. To compile inline Rust code, first call create_workflow (with no nodes or just structural nodes), then call add_node_to_workflow (which supports rust_code compilation). Passing rust_code here causes an 'Invalid module_id' error.",
+                        "description": "Array of node objects. Each needs: id (any unique string) and EITHER module_id (UUID from list_modules or list_module_catalog) OR node_type for a built-in structural node (collect, loop, sub_workflow, capability_dispatch — see the node_type property); plus position (optional {x,y}) and config (optional object). Post-Phase-5.1, modules table is unified — module_id is a single canonical UUID, no more wasm_modules vs node_templates distinction.\n\nIMPORTANT: rust_code is NOT supported in this nodes array. To compile inline Rust code, first call create_workflow (with no nodes or just structural nodes), then call add_node_to_workflow (which supports rust_code compilation). Passing rust_code here causes an 'Invalid module_id' error.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1912,9 +1912,31 @@ async fn handle_create_workflow(
             // A workflow with zero nodes fails at dispatch with "graph load failed:
             // Workflow has no nodes" — reflect that in the ready_to_run flag so the
             // response is self-consistent.
+            // Which declared grants have no stored secret behind them. The
+            // read is names only (key paths, never values); a failed read is
+            // `None`, so the response says "could not check" instead of
+            // calling stored secrets missing.
+            let missing_secrets: Option<Vec<String>> = if required_secrets_set.is_empty() {
+                Some(Vec::new())
+            } else {
+                match state
+                    .secrets_manager
+                    .list_user_secret_key_paths(user_id)
+                    .await
+                {
+                    Ok(stored) => Some(talos_workflow_creation_helpers::missing_secret_grants(
+                        &required_secrets_set,
+                        &stored,
+                    )),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "create_workflow: could not list the caller's secret key paths; required secrets reported unverified");
+                        None
+                    }
+                }
+            };
             let ready_to_run = !graph_nodes.is_empty()
                 && missing_config.is_empty()
-                && required_secrets_set.is_empty();
+                && missing_secrets.as_ref().is_some_and(Vec::is_empty);
 
             // Opt-in inline config suggestions: if include_config_suggestions=true and LLM is
             // available, request suggested values for each node's missing required fields.
@@ -1947,6 +1969,7 @@ async fn handle_create_workflow(
                     graph_is_empty: graph_nodes.is_empty(),
                     missing_config,
                     required_secrets: required_secrets_set,
+                    missing_secrets,
                     vault_warnings,
                     description_warning: description_warning.map(String::from),
                     name_collision_warning,
