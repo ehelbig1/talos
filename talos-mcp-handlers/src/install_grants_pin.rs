@@ -75,3 +75,36 @@ fn the_install_handler_reads_carries_and_writes_the_carried_grants() {
         assert!(write.contains(g), "writer takes {g}");
     }
 }
+
+/// A dry run answers and returns after the grant decision and BEFORE the
+/// compile and the write. Textual, for the reason in this file's header: a
+/// dry run that fell through to the installer would install.
+#[test]
+fn a_dry_run_returns_before_the_compile_and_the_write() {
+    let body = install_handler_body();
+    let decide = body
+        .find(&["grants_for_install", "("].concat())
+        .expect("grant decision");
+    let dry = body
+        .find(&["\"dry", "_run\", false"].concat())
+        .expect("the dry_run argument is read");
+    let report = body
+        .find(&["install_dry_run", "_report("].concat())
+        .expect("the dry-run report is built");
+    let compile = body
+        .find(&[".compile_catalog", "_template("].concat())
+        .expect("compile");
+    let write = body
+        .find(&[".install_catalog_module", "_to_modules("].concat())
+        .expect("write");
+    assert!(decide < dry && dry < report, "decided, then previewed");
+    assert!(
+        report < compile && compile < write,
+        "preview precedes compile and write"
+    );
+    let branch = &body[report..compile];
+    assert!(
+        branch.contains(&["return mcp", "_text("].concat()),
+        "the dry-run branch returns its report"
+    );
+}
