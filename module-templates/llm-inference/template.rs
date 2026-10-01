@@ -421,6 +421,7 @@ fn run(input: String) -> Result<String, String> {
             serde_json::json!({ "type": "json_object" }),
         );
     }
+    apply_local_thinking_default(matches!(provider, Provider::Ollama), &mut options_obj);
     let resp = if !options_obj.is_empty() {
         let opts_str = serde_json::Value::Object(options_obj).to_string();
         llm::complete_with_options(&req, Some(opts_str.as_str()))
@@ -944,6 +945,33 @@ fn llm_error_message(err: talos::core::llm::Error, provider_str: &str, model: &s
     }
 }
 
+/// A local (Ollama) call runs with thinking OFF unless the node says otherwise.
+///
+/// A thinking model spends its `MAX_TOKENS` budget on reasoning before it
+/// answers. Measured on `qwen3.6` (thinking on by default), asked for one word
+/// with `MAX_TOKENS: 200`: all 200 tokens went to reasoning and the answer was
+/// empty; since the cut-off check above that is a failed node rather than an
+/// empty success. Every production node already set `think: false` by hand, so
+/// the default now says it for them.
+///
+/// The node's own choice always wins: a `think` key (`true`, a level such as
+/// `"low"`, `false`, or `null` for the model's own default) or a
+/// `reasoning_effort` key in `PROVIDER_OPTIONS` is left exactly as written.
+/// Ollama accepts `think: false` for a model with no thinking mode (measured
+/// on 0.31.2 and 0.35.0), so the default is safe for every local model. Other
+/// providers are untouched.
+fn apply_local_thinking_default(
+    provider_is_ollama: bool,
+    options: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if provider_is_ollama
+        && !options.contains_key("think")
+        && !options.contains_key("reasoning_effort")
+    {
+        options.insert("think".to_string(), serde_json::Value::Bool(false));
+    }
+}
+
 /// Whether the provider stopped because the output budget ran out. Each
 /// provider spells it its own way and the host passes the spelling through:
 /// Ollama and OpenAI `length`, Anthropic `max_tokens`, Gemini `MAX_TOKENS`.
@@ -967,6 +995,43 @@ mod tests {
             assert!(!answer_was_cut_off(Some(r)), "{r}");
         }
         assert!(!answer_was_cut_off(None));
+    }
+
+    #[test]
+    fn a_local_call_defaults_thinking_off_and_the_nodes_choice_wins() {
+        // Nothing said: off.
+        let mut o = serde_json::Map::new();
+        apply_local_thinking_default(true, &mut o);
+        assert_eq!(o.get("think"), Some(&serde_json::Value::Bool(false)));
+
+        // Other options do not count as a choice about thinking.
+        let mut o = serde_json::json!({"keep_alive": "3h", "seed": 7})
+            .as_object()
+            .cloned()
+            .unwrap();
+        apply_local_thinking_default(true, &mut o);
+        assert_eq!(o.get("think"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(o.len(), 3);
+
+        // Every explicit choice is left exactly as written — including `null`
+        // (the model's own default) and the `reasoning_effort` spelling.
+        for chosen in [
+            serde_json::json!({"think": true}),
+            serde_json::json!({"think": "low"}),
+            serde_json::json!({"think": false}),
+            serde_json::json!({"think": null}),
+            serde_json::json!({"reasoning_effort": "high"}),
+            serde_json::json!({"reasoning_effort": "none"}),
+        ] {
+            let mut o = chosen.as_object().cloned().unwrap();
+            apply_local_thinking_default(true, &mut o);
+            assert_eq!(serde_json::Value::Object(o), chosen);
+        }
+
+        // Not a local call: untouched, so the plain `complete` path is kept.
+        let mut o = serde_json::Map::new();
+        apply_local_thinking_default(false, &mut o);
+        assert!(o.is_empty());
     }
     use serde_json::json;
 
