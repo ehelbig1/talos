@@ -146,3 +146,59 @@ async fn every_copy_is_classified_and_counted_against_the_catalog() {
     );
     assert_eq!(state(orphan).0, CatalogCopyState::NotInCatalog);
 }
+
+/// A template change that touches only what the catalog row carries BESIDE
+/// its source — here the config schema — leaves the copy behind (2026-10-01:
+/// such a copy read "current" while its stored schema lacked the new keys).
+#[tokio::test]
+async fn a_copy_with_the_same_source_and_a_stale_schema_is_behind() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let me = user(&pool).await;
+    let source = "fn same() {}";
+    let catalog = module(&pool, None, "Tmpl S", Some("tmpl-s"), source).await;
+    let stale = module(&pool, Some(me), "Tmpl S", Some("tmpl-s"), source).await;
+    module(&pool, None, "Tmpl T", Some("tmpl-t"), source).await;
+    let same = module(&pool, Some(me), "Tmpl T", Some("tmpl-t"), source).await;
+
+    let new_schema =
+        serde_json::json!({"type": "object", "properties": {"NEW_KEY": {"type": "string"}}});
+    let old_schema = serde_json::json!({"type": "object", "properties": {}});
+    for (id, schema) in [(catalog, &new_schema), (stale, &old_schema)] {
+        sqlx::query("UPDATE modules SET config_schema = $2 WHERE id = $1")
+            .bind(id)
+            .bind(schema)
+            .execute(&pool)
+            .await
+            .expect("set schema");
+    }
+    // Control: the same schema on both sides, written with its keys in a
+    // different order, is not a difference.
+    sqlx::query(
+        "UPDATE modules SET config_schema = $1::jsonb WHERE name = 'Tmpl T' AND user_id IS NULL",
+    )
+    .bind(r#"{"type":"object","properties":{"A":{"type":"string"}}}"#)
+    .execute(&pool)
+    .await
+    .expect("set schema");
+    sqlx::query("UPDATE modules SET config_schema = $2::jsonb WHERE id = $1")
+        .bind(same)
+        .bind(r#"{"properties":{"A":{"type":"string"}},"type":"object"}"#)
+        .execute(&pool)
+        .await
+        .expect("set schema");
+
+    let rows = ModuleRepository::new(pool.clone())
+        .list_catalog_copy_drift(me)
+        .await
+        .expect("read drift");
+    let find = |id: Uuid| {
+        rows.iter()
+            .find(|r| r.module_id == id)
+            .expect("copy listed")
+    };
+    assert_eq!(CatalogCopyState::of(find(stale)), CatalogCopyState::Behind);
+    assert_eq!(find(stale).differs_in(), vec!["config_schema"]);
+    assert!(find(stale).source_matches);
+    assert_eq!(CatalogCopyState::of(find(same)), CatalogCopyState::Current);
+    assert!(find(same).differs_in().is_empty());
+}
