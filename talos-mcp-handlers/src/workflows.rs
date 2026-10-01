@@ -377,7 +377,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "validate_workflow",
-            "description": "Validate a workflow's structure: check that all referenced modules exist and the graph has no cycles.",
+            "description": "Validate a workflow's structure: check that all referenced modules exist and the graph has no cycles. `issues` are errors; `warnings` are full sentences; `warning_summary` (present when there are warnings) indexes them by category ({category, count, nodes}) so a new kind of warning stands out among several long ones about the same thing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4280,6 +4280,46 @@ pub(crate) enum ValidateWorkflowOutcome {
     Report(serde_json::Value),
 }
 
+/// The warnings of a validation, one entry per category: how many, and which
+/// nodes they name. Ordered by category so the output is stable.
+///
+/// `validate_workflow`'s `warnings` are full sentences — a retry note runs to
+/// ~900 characters and a workflow with three such nodes carries three of them
+/// (measured 2026-10-01), which buried the one warning of a different kind.
+/// The sentences are unchanged; this is the index to them. Errors are not
+/// summarised: they are few and each must be read.
+pub(crate) fn summarize_warnings(
+    issues: &[talos_workflow_validation::ValidationIssue],
+) -> serde_json::Value {
+    use talos_workflow_validation::ValidationSeverity;
+    let mut by_category: std::collections::BTreeMap<
+        &str,
+        (usize, std::collections::BTreeSet<&str>),
+    > = std::collections::BTreeMap::new();
+    for i in issues
+        .iter()
+        .filter(|i| i.severity == ValidationSeverity::Warning)
+    {
+        let entry = by_category.entry(i.category.as_str()).or_default();
+        entry.0 += 1;
+        if let Some(node) = i.node_id.as_deref() {
+            entry.1.insert(node);
+        }
+    }
+    serde_json::Value::Array(
+        by_category
+            .into_iter()
+            .map(|(category, (count, nodes))| {
+                serde_json::json!({
+                    "category": category,
+                    "count": count,
+                    "nodes": nodes.into_iter().collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Build the `validate_workflow` response body.
 ///
 /// PURE: no `async`, no repository, no `McpState`, no clock. Everything that
@@ -4323,6 +4363,7 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
         .filter(|i| i.severity == ValidationSeverity::Warning)
         .map(|i| i.message.clone())
         .collect();
+    let warning_summary = summarize_warnings(&validation.issues);
     let valid = validation.valid;
     // History coverage travels with the verdict. `valid: true, issues: []` is
     // ambiguous on its own — it reads as "this workflow is fine" whether
@@ -4807,6 +4848,13 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
             "note": history_note,
         },
     });
+    // One line per warning CATEGORY (count + the nodes it names), beside the
+    // full sentences in `warnings`, so a new kind of warning is visible among
+    // several long ones about the same thing. Present only when there ARE
+    // warnings: a clean workflow's response keeps its pinned shape.
+    if warning_summary.as_array().is_some_and(|a| !a.is_empty()) {
+        result["warning_summary"] = warning_summary;
+    }
     // #661: say which happened. Absent this field the caller cannot tell a
     // genuinely low score from a score computed on inputs that failed to load.
     // The graph is disclosed on its own field as well as in the shared list:
@@ -5050,6 +5098,81 @@ mod validate_workflow_render_tests {
             .iter()
             .map(|a| a["action"].as_str().unwrap_or_default().to_string())
             .collect()
+    }
+
+    /// The summary is the index to the warning sentences: one entry per
+    /// category with its count and nodes, errors left out, and the sentences
+    /// themselves unchanged beside it.
+    #[test]
+    fn warnings_are_summarised_by_category_beside_the_full_sentences() {
+        use talos_workflow_validation::{ValidationIssue, ValidationSeverity};
+        let issue = |sev, cat: &str, node: Option<&str>, msg: &str| ValidationIssue {
+            severity: sev,
+            message: msg.to_string(),
+            node_id: node.map(str::to_string),
+            category: cat.to_string(),
+        };
+        let validation = ValidationResult {
+            valid: false,
+            issues: vec![
+                issue(
+                    ValidationSeverity::Warning,
+                    "retry-explicit-zero",
+                    Some("fetch_b"),
+                    "long b",
+                ),
+                issue(
+                    ValidationSeverity::Warning,
+                    "retry-explicit-zero",
+                    Some("fetch_a"),
+                    "long a",
+                ),
+                issue(
+                    ValidationSeverity::Warning,
+                    "at-least-once",
+                    None,
+                    "one of a kind",
+                ),
+                issue(
+                    ValidationSeverity::Error,
+                    "missing-module",
+                    Some("x"),
+                    "an error",
+                ),
+            ],
+            history: HistoryCoverage::Empty { window_days: 30 },
+        };
+        assert_eq!(
+            super::summarize_warnings(&validation.issues),
+            serde_json::json!([
+                {"category": "at-least-once", "count": 1, "nodes": []},
+                {"category": "retry-explicit-zero", "count": 2, "nodes": ["fetch_a", "fetch_b"]},
+            ])
+        );
+        let (reads, _) = healthy_reads();
+        let body = report(render_validate_workflow(
+            wf(),
+            GraphRead::Present(a_graph_with_everything()),
+            validation,
+            reads,
+        ));
+        assert_eq!(body["warning_summary"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            body["warnings"],
+            serde_json::json!(["long b", "long a", "one of a kind"])
+        );
+        assert_eq!(body["issues"], serde_json::json!(["an error"]));
+
+        // CONTROL: with no warnings the field is absent, so a clean
+        // workflow's response keeps the shape its consumers know.
+        let (reads, _) = healthy_reads();
+        let body = report(render_validate_workflow(
+            wf(),
+            GraphRead::Present(a_graph_with_everything()),
+            clean_validation(),
+            reads,
+        ));
+        assert!(body.get("warning_summary").is_none(), "{body}");
     }
 
     /// BASELINE. With the graph measured, the report is a plain verdict: real

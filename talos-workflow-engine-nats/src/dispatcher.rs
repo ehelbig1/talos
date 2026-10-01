@@ -1617,6 +1617,10 @@ pub use talos_envelope_seal::EnvelopeSealingHandle;
 pub struct LlmUsageReport {
     /// Workflow execution that owned the dispatch (controller-side).
     pub execution_id: Uuid,
+    /// Workflow the dispatching engine ran (see `DispatchJob::workflow_id`)
+    /// — a sub-workflow's OWN id when dispatched from a sub-engine, whose
+    /// `execution_id` has no `workflow_executions` row to resolve it from.
+    pub workflow_id: Option<Uuid>,
     /// Actor bound to the dispatch, when actor-owned (controller-side).
     pub actor_id: Option<Uuid>,
     /// Owning user of the dispatch (controller-side).
@@ -2022,6 +2026,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
                         if !result.llm_usage.is_empty() {
                             sink(LlmUsageReport {
                                 execution_id,
+                                workflow_id,
                                 actor_id,
                                 user_id,
                                 entries: result.llm_usage.clone(),
@@ -2376,6 +2381,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             if !result.llm_usage.is_empty() {
                 sink(LlmUsageReport {
                     execution_id: request.workflow_execution_id,
+                    workflow_id: request.steps.iter().find_map(|s| s.workflow_id),
                     actor_id: request.steps.iter().find_map(|s| s.actor_id),
                     user_id: request.user_id,
                     entries: result.llm_usage.clone(),
@@ -4617,6 +4623,8 @@ mod fuel_sink_tests {
         script: Vec<Reply>,
         sent: Mutex<usize>,
         key: Vec<u8>,
+        /// LLM usage every reply reports (signed with the result).
+        usage: Vec<talos_workflow_job_protocol::LlmUsageEntry>,
     }
 
     #[async_trait]
@@ -4633,7 +4641,7 @@ mod fuel_sink_tests {
             };
             let (status, output, fuel) = self.script[n.min(self.script.len() - 1)].clone();
             let mut jr = JobResult {
-                llm_usage: vec![],
+                llm_usage: self.usage.clone(),
                 job_id,
                 status,
                 output_payload: output.into(),
@@ -4671,6 +4679,7 @@ mod fuel_sink_tests {
                 script,
                 sent: Mutex::new(0),
                 key: key.clone(),
+                usage: vec![],
             }),
             None,
             Some(WorkerSharedKey::new(key)),
@@ -4762,6 +4771,50 @@ mod fuel_sink_tests {
             assert_eq!(r.fuel.source, FuelSource::OutOfBand);
             assert_eq!(r.execution_time_ms, 11);
         }
+    }
+
+    /// The LLM usage report names the workflow the dispatching engine ran.
+    /// A sub-workflow child's `execution_id` has no `workflow_executions`
+    /// row, so this is the only thing that can attribute its usage.
+    // disallowed-method: talos_workflow_engine_nats::NatsNodeDispatcher::new — test in the type's own crate
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test]
+    async fn the_usage_report_carries_the_engines_workflow_and_controller_identity() {
+        let key = vec![7u8; 32];
+        let j = job(0);
+        let reports: Arc<Mutex<Vec<super::LlmUsageReport>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_reports = reports.clone();
+        let dispatcher = NatsNodeDispatcher::new(
+            Arc::new(SignedScript {
+                script: vec![(JobStatus::Success, serde_json::json!({"ok": true}), None)],
+                sent: Mutex::new(0),
+                key: key.clone(),
+                usage: vec![talos_workflow_job_protocol::LlmUsageEntry {
+                    provider: "ollama".into(),
+                    model: "m".into(),
+                    prompt_tokens: 40,
+                    completion_tokens: 2,
+                    calls: 1,
+                }],
+            }),
+            None,
+            Some(WorkerSharedKey::new(key)),
+            Arc::new(AlwaysTransient),
+            Arc::new(NoExpr),
+        )
+        .with_llm_usage_sink(Arc::new(move |r: super::LlmUsageReport| {
+            sink_reports.lock().expect("lock").push(r);
+        }));
+        dispatcher.dispatch(j.clone()).await.expect("dispatch");
+        let got = reports.lock().expect("lock").clone();
+        assert_eq!(got.len(), 1);
+        assert!(j.workflow_id.is_some(), "the fixture must name a workflow");
+        assert_eq!(got[0].workflow_id, j.workflow_id);
+        assert_eq!(got[0].execution_id, j.execution_id);
+        assert_eq!(got[0].actor_id, j.actor_id);
+        assert_eq!(got[0].user_id, j.user_id);
+        assert_eq!(got[0].entries.len(), 1);
+        assert_eq!(got[0].entries[0].prompt_tokens, 40);
     }
 
     /// A worker that predates the out-of-band field is still counted, from

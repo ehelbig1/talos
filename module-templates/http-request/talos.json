@@ -69,6 +69,10 @@
         "type": "number",
         "default": 8192,
         "description": "Maximum byte length of the response body when SANITIZE_FOR_LLM is true. Content beyond this limit is truncated with a [TRUNCATED] marker before being passed to downstream nodes. Default: 8192 bytes."
+      },
+      "MAX_RESPONSE_BYTES": {
+        "type": "number",
+        "description": "Maximum bytes of the raw response body to return, applied whether or not SANITIZE_FOR_LLM is set. Use it when the next node is an extractor that needs the raw body but the body may exceed the platform's node-input limit (about 1 MB). The cut is walked back to a character boundary. Unset: the body is not truncated."
       }
     },
     "required": [
