@@ -871,7 +871,11 @@ services:
       TALOS_REPLAY_FAIL_CLOSED: ${TALOS_REPLAY_FAIL_CLOSED:-false}
       TALOS_SIGNATURE_DIAG: ${TALOS_SIGNATURE_DIAG:-}
     ports:
+      # Both loopback families. `localhost` resolves to ::1 first on macOS, so
+      # a client that does not fall back to IPv4 (an MCP client did, 2026-10-01)
+      # is refused on an IPv4-only publish while curl and browsers work.
       - "127.0.0.1:8000:8000"
+      - "[::1]:8000:8000"
     volumes:
       # DEV template live-editing: bind-mount the repo's module-templates
       # over the image-baked copy so install_module_from_catalog picks up
