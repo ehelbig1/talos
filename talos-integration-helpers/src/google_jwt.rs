@@ -85,10 +85,30 @@ const JWK_REFRESH_INTERVAL_SECS: i64 = 3600;
 /// wait one minute without the whole flow breaking.
 const JWK_REFRESH_BACKOFF_SECS: i64 = 60;
 
-/// HTTP timeout for the JWK fetch. Short enough that a stuck call
-/// doesn't pile up under push load; long enough to clear the
-/// occasional slow CDN hop.
+/// HTTP timeout for the whole JWK fetch (name lookup, connect, TLS, response).
+/// Short enough that a stuck call doesn't pile up under push load; long enough
+/// to clear the occasional slow CDN hop.
+///
+/// It is the ONLY deadline on this client's request besides the shared
+/// builder's 5 s connect timeout. Until 2026-09-30 the connect phase carried
+/// its own 2 s limit, and reqwest's connect phase includes the name lookup.
+/// Measured on the reference host from inside the controller container: a
+/// lookup of a name the resolver has not seen recently takes 2.01-2.13 s (7 of
+/// 10 Google hostnames; every repeat lookup 2 ms), so a cold lookup ALWAYS
+/// exceeded that limit and the fetch failed at 2 001 ms, while the same fetch
+/// with the name cached completes in about 60 ms. A cold lookup plus the
+/// fetch is about 2.2 s, inside this budget.
 const JWK_FETCH_TIMEOUT_SECS: u64 = 5;
+
+/// The client builder every [`GoogleOidcVerifier`] fetches with: the shared
+/// hardened builder (no redirects, the house connect timeout) under
+/// [`JWK_FETCH_TIMEOUT_SECS`]. Do not add a shorter connect timeout here; see
+/// that constant for what one cost.
+fn jwk_http_client_builder() -> reqwest::ClientBuilder {
+    talos_http_utils::trusted_client::hardened_client_builder(Duration::from_secs(
+        JWK_FETCH_TIMEOUT_SECS,
+    ))
+}
 
 /// Delays between the boot warm-up's attempts ([`GoogleOidcVerifier::warm`]):
 /// attempts at 0 s, 2 s and 10 s, then the on-demand path takes over.
@@ -102,6 +122,12 @@ const JWK_FETCH_TIMEOUT_SECS: u64 = 5;
 /// 2026-09-30 18:36). Fetching at boot moves the attempt to before the backlog
 /// arrives, and a second attempt a few seconds later is what recovered the
 /// on-demand path every time.
+///
+/// The cause, found once failures reported their source chain (2026-09-30):
+/// a connect-phase timeout at 2 001 ms, i.e. a cold name lookup against a 2 s
+/// connect limit that no longer exists (see [`JWK_FETCH_TIMEOUT_SECS`]). The
+/// warm-up stays: it still moves the first fetch ahead of the backlog, and a
+/// network that is genuinely not up at boot still needs a second attempt.
 ///
 /// Why only three, and this spacing: every attempt counts on
 /// `talos_google_jwk_refresh_total{outcome}`, and `TalosGoogleJwkRefreshFailing`
@@ -318,12 +344,9 @@ impl GoogleOidcVerifier {
             // auth header here doesn't reopen the credential-leak
             // surface; replace the `unwrap_or_else(Client::new)`
             // anti-pattern with a loud `.expect()` per the convention.
-            http: talos_http_utils::trusted_client::hardened_client_builder(Duration::from_secs(
-                JWK_FETCH_TIMEOUT_SECS,
-            ))
-            .connect_timeout(Duration::from_secs(2))
-            .build()
-            .expect("GoogleOidcVerifier: failed to build hardened reqwest client"),
+            http: jwk_http_client_builder()
+                .build()
+                .expect("GoogleOidcVerifier: failed to build hardened reqwest client"),
             jwk_url: GOOGLE_JWK_URL.to_string(),
         }
     }
@@ -1375,5 +1398,60 @@ mod tests {
             msg.len() > top_end + 2,
             "only the outermost layer was reported: {msg}"
         );
+    }
+
+    /// Resolves every name to `addr` after `delay` — a resolver that has not
+    /// seen the name recently.
+    struct SlowResolver {
+        addr: std::net::SocketAddr,
+        delay: Duration,
+    }
+
+    impl reqwest::dns::Resolve for SlowResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let (addr, delay) = (self.addr, self.delay);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(addr));
+                Ok(addrs)
+            })
+        }
+    }
+
+    /// The measured defect: a cold name lookup takes a little over 2 s, and
+    /// the fetch must survive it. The client is the production builder plus
+    /// the slow resolver, so a connect-phase limit at or under the lookup time
+    /// fails this test the way it failed the controller's first fetch.
+    #[tokio::test]
+    async fn a_fetch_survives_a_cold_name_lookup() {
+        let (enc, pub_key) = keypair_with_public();
+        let (url, seen) = jwk_server(jwk_set_json(&pub_key, "kid-cold"), 0).await;
+        let addr: std::net::SocketAddr = url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let v = GoogleOidcVerifier {
+            http: jwk_http_client_builder()
+                .dns_resolver(Arc::new(SlowResolver {
+                    addr,
+                    // The slowest cold lookup measured was 2.13 s.
+                    delay: Duration::from_millis(2_200),
+                }))
+                .build()
+                .unwrap(),
+            ..GoogleOidcVerifier::with_jwk_url_for_test(&format!(
+                "http://jwk.cold-lookup.test:{}/oauth2/v3/certs",
+                addr.port()
+            ))
+        };
+        let claims = v
+            .verify_signed(&sign(&enc, "kid-cold", fresh_claims()), TEST_AUDIENCE)
+            .await
+            .expect("a cold lookup must not fail the fetch");
+        assert_eq!(claims.email, TEST_SA);
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
     }
 }
