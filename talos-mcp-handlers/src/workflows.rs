@@ -5919,6 +5919,60 @@ pub(crate) fn declared_freshness_contracts(graph: &serde_json::Value) -> Vec<ser
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+mod freshness_contract_listing_tests {
+    use super::declared_freshness_contracts;
+    use serde_json::json;
+
+    #[test]
+    fn only_nodes_with_a_usable_contract_are_listed() {
+        let graph = json!({"nodes": [
+            {"id": "plan", "data": {"requires_fresh": {"commitments/mine": 96}, "on_stale": "annotate"}},
+            {"id": "send", "data": {"TO": "x"}},
+            {"id": "strict", "data": {"requires_fresh": {"a": 6}, "on_stale": "fail"}},
+            {"id": "broken", "data": {"requires_fresh": "6h"}},
+            {"id": "bare"}
+        ]});
+        assert_eq!(
+            declared_freshness_contracts(&graph),
+            vec![
+                json!({"node": "plan", "requires_fresh": {"commitments/mine": 96.0}, "on_stale": "annotate"}),
+                json!({"node": "strict", "requires_fresh": {"a": 6.0}, "on_stale": "fail"}),
+            ]
+        );
+        assert!(declared_freshness_contracts(&json!({"nodes": []})).is_empty());
+        assert!(declared_freshness_contracts(&json!({})).is_empty());
+    }
+
+    /// The contract is authored through node config; the tools that write node
+    /// config must say it exists, and the validator must say where it echoes it.
+    #[test]
+    fn the_tools_that_write_and_check_node_config_document_the_contract() {
+        let tools = super::tool_schemas();
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is declared"))
+                .clone()
+        };
+        let add = find("add_node_to_workflow");
+        let config = add["inputSchema"]["properties"]["config"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            config.contains("`requires_fresh`")
+                && config.contains("`on_stale`")
+                && config.contains("`__staleness__`")
+        );
+        assert!(find("validate_workflow")["description"]
+            .as_str()
+            .unwrap()
+            .contains("`freshness_contracts`"));
+    }
+}
+
 /// Shared by the two sync-wait handlers (`call_workflow`, `test_workflow`):
 /// collapse a terminal-status write into a bool and WARN on failure, so the
 /// response builder can be honest about a status the platform did not record.
@@ -14034,59 +14088,5 @@ mod trigger_as_actors_context_pin {
             let copy = format!("get(\"__actor_{}__\").cloned()", "context");
             assert!(!body.contains(&copy), "{handler} copies the context");
         }
-    }
-}
-
-#[cfg(test)]
-mod freshness_contract_listing_tests {
-    use super::declared_freshness_contracts;
-    use serde_json::json;
-
-    #[test]
-    fn only_nodes_with_a_usable_contract_are_listed() {
-        let graph = json!({"nodes": [
-            {"id": "plan", "data": {"requires_fresh": {"commitments/mine": 96}, "on_stale": "annotate"}},
-            {"id": "send", "data": {"TO": "x"}},
-            {"id": "strict", "data": {"requires_fresh": {"a": 6}, "on_stale": "fail"}},
-            {"id": "broken", "data": {"requires_fresh": "6h"}},
-            {"id": "bare"}
-        ]});
-        assert_eq!(
-            declared_freshness_contracts(&graph),
-            vec![
-                json!({"node": "plan", "requires_fresh": {"commitments/mine": 96.0}, "on_stale": "annotate"}),
-                json!({"node": "strict", "requires_fresh": {"a": 6.0}, "on_stale": "fail"}),
-            ]
-        );
-        assert!(declared_freshness_contracts(&json!({"nodes": []})).is_empty());
-        assert!(declared_freshness_contracts(&json!({})).is_empty());
-    }
-
-    /// The contract is authored through node config; the tools that write node
-    /// config must say it exists, and the validator must say where it echoes it.
-    #[test]
-    fn the_tools_that_write_and_check_node_config_document_the_contract() {
-        let tools = super::tool_schemas();
-        let find = |name: &str| {
-            tools
-                .iter()
-                .find(|t| t["name"] == name)
-                .unwrap_or_else(|| panic!("{name} is declared"))
-                .clone()
-        };
-        let add = find("add_node_to_workflow");
-        let config = add["inputSchema"]["properties"]["config"]["description"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(
-            config.contains("`requires_fresh`")
-                && config.contains("`on_stale`")
-                && config.contains("`__staleness__`")
-        );
-        assert!(find("validate_workflow")["description"]
-            .as_str()
-            .unwrap()
-            .contains("`freshness_contracts`"));
     }
 }
