@@ -377,7 +377,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "validate_workflow",
-            "description": "Validate a workflow's structure: check that all referenced modules exist and the graph has no cycles. `issues` are errors; `warnings` are full sentences; `warning_summary` indexes the warnings by category ({category, count, nodes}) so a new kind of warning stands out among several long ones about the same thing.",
+            "description": "Validate a workflow's structure: check that all referenced modules exist and the graph has no cycles. `issues` are errors; `warnings` are full sentences; `warning_summary` (present when there are warnings) indexes them by category ({category, count, nodes}) so a new kind of warning stands out among several long ones about the same thing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4816,10 +4816,6 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
         "node_count": if graph_measured { serde_json::json!(nodes.len()) } else { serde_json::Value::Null },
         "edge_count": if graph_measured { serde_json::json!(edges.len()) } else { serde_json::Value::Null },
         "issues": issues,
-        // One line per warning CATEGORY (count + the nodes it names), ahead
-        // of the full sentences in `warnings`, so a new kind of warning is
-        // visible among several long ones about the same thing.
-        "warning_summary": warning_summary,
         "warnings": warnings,
         "top_improvements": improvement_actions,
         "history_coverage": {
@@ -4829,6 +4825,13 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
             "note": history_note,
         },
     });
+    // One line per warning CATEGORY (count + the nodes it names), beside the
+    // full sentences in `warnings`, so a new kind of warning is visible among
+    // several long ones about the same thing. Present only when there ARE
+    // warnings: a clean workflow's response keeps its pinned shape.
+    if warning_summary.as_array().is_some_and(|a| !a.is_empty()) {
+        result["warning_summary"] = warning_summary;
+    }
     // #661: say which happened. Absent this field the caller cannot tell a
     // genuinely low score from a score computed on inputs that failed to load.
     // The graph is disclosed on its own field as well as in the shared list:
@@ -5137,7 +5140,8 @@ mod validate_workflow_render_tests {
         );
         assert_eq!(body["issues"], serde_json::json!(["an error"]));
 
-        // CONTROL: no warnings is an empty summary, not a missing field.
+        // CONTROL: with no warnings the field is absent, so a clean
+        // workflow's response keeps the shape its consumers know.
         let (reads, _) = healthy_reads();
         let body = report(render_validate_workflow(
             wf(),
@@ -5145,7 +5149,7 @@ mod validate_workflow_render_tests {
             clean_validation(),
             reads,
         ));
-        assert_eq!(body["warning_summary"], serde_json::json!([]));
+        assert!(body.get("warning_summary").is_none(), "{body}");
     }
 
     /// BASELINE. With the graph measured, the report is a plain verdict: real

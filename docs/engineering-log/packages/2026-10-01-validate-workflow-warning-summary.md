@@ -7,9 +7,11 @@ record and a remedy checked against the budget). Measured on
 `retry_count: 0`, plus one short warning of a different kind. After changing
 one node, finding what was new meant reading all of them again.
 
-**Change.** The reply gains `warning_summary`: one entry per warning category
-with its count and the node ids it names, sorted by category. `warnings` and
-`issues` are unchanged. The pure `summarize_warnings` reads the
+**Change.** When there are warnings, the reply carries `warning_summary`: one
+entry per warning category with its count and the node ids it names, sorted by
+category. `warnings` and `issues` are unchanged, and a workflow with no
+warnings gets no new key (its response shape is pinned by
+`the_measured_report_shape_is_unchanged`). The pure `summarize_warnings` reads the
 `ValidationIssue` category and node id the validator already attaches.
 
 **Decisions.**
@@ -31,5 +33,5 @@ The note is accurate; the summary makes it one line.
 
 **Guard.** `warnings_are_summarised_by_category_beside_the_full_sentences`
 drives the real renderer: two categories, node ids sorted, an error left out,
-the sentence list unchanged, and an empty summary (not a missing field) when
-there are no warnings.
+the sentence list unchanged, and no `warning_summary` key at all when there
+are no warnings.
