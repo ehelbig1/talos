@@ -422,12 +422,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_node_io",
-            "description": "Get the stored input snapshot and the output of one node in a workflow execution — for debugging data flow between nodes. `input_status` says what `input` is: `complete`; `shortened` (the input was over 4096 bytes, so long strings, long arrays, wide objects and deep nesting are abbreviated with a '…' marker — keys and nesting are kept); `unparseable` (the stored text is not JSON — an older row cut mid-structure — and is returned raw as `truncated_preview`); `not_recorded` (system nodes such as collect/judge/sub_workflow and nodes that never ran store none); or `unreadable` (the read failed). Engine-supplied keys (__accumulated__, __actor_context__, __trigger_input__, __staleness__, __degraded_inputs__) are never in the snapshot although the node received them.",
+            "description": "Get the stored input snapshot and the output of one node in a workflow execution — for debugging data flow between nodes. `input_status` says what `input` is: `complete`; `shortened` (the input was over 4096 bytes, so long strings, long arrays, wide objects and deep nesting are abbreviated with a '…' marker — keys and nesting are kept); `unparseable` (the stored text is not JSON — an older row cut mid-structure — and is returned raw as `truncated_preview`); `not_recorded` (system nodes such as collect/judge/sub_workflow and nodes that never ran store none); `node_id` may be the node's id or its display label; a label shared by several nodes is refused. A name the graph does not carry, with nothing recorded for it, is an error that lists the graph's nodes; `node_in_current_graph` is false for a node the run recorded but the graph has since dropped. or `unreadable` (the read failed). Engine-supplied keys (__accumulated__, __actor_context__, __trigger_input__, __staleness__, __degraded_inputs__) are never in the snapshot although the node received them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "execution_id": { "type": "string", "description": "UUID of the execution" },
-                    "node_id": { "type": "string", "description": "Node label (e.g. 'fetch-jira', 'summarize')" }
+                    "node_id": { "type": "string", "description": "The node's id in the graph (e.g. 'fetch-jira'), or its display label" }
                 },
                 "required": ["execution_id", "node_id"]
             }
@@ -7322,16 +7322,37 @@ async fn handle_get_node_io(
             return crate::utils::database_error(req_id);
         }
     };
-    let node_label_map = build_node_label_map(graph_json_opt);
+    let graph_nodes = graph_nodes(graph_json_opt.as_deref());
 
-    // Resolve the user-provided label to a node UUID
-    let node_uuid = node_label_map
-        .iter()
-        .find(|(_, label)| label.as_str() == node_id_str)
-        .map(|(uuid, _)| *uuid)
-        // Fall back to the engine's own graph-id → node_id mapping, so a
-        // caller passing the rf_id (rather than a label) still resolves.
-        .unwrap_or_else(|| talos_workflow_engine_core::engine_node_uuid(node_id_str));
+    // Resolve what the caller passed — a node id, or a node's display label
+    // (`data.label`, the name the timeline and waterfall show) — to the
+    // engine's node uuid. A label naming more than one node is refused: any
+    // pick would answer about a node the caller may not have meant.
+    let (node_uuid, graph_node_id) = match resolve_graph_node(&graph_nodes, node_id_str) {
+        NodeResolution::Resolved(node) => (node.uuid, Some(node.id.clone())),
+        NodeResolution::AmbiguousLabel(ids) => {
+            return mcp_error(
+                req_id,
+                -32602,
+                &format!(
+                    "The label '{}' names {} nodes in this workflow's graph (ids: {}). Pass the node id.",
+                    clip_node_id(node_id_str),
+                    ids.len(),
+                    ids.iter()
+                        .take(UNKNOWN_NODE_LISTED)
+                        .map(|id| clip_node_id(id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        }
+        // Not in the current graph: the engine's own id → uuid mapping still
+        // finds what a since-removed node recorded.
+        NodeResolution::NotInGraph => (
+            talos_workflow_engine_core::engine_node_uuid(node_id_str),
+            None,
+        ),
+    };
 
     // The stored input snapshot. A failed read is REPORTED as unreadable: a
     // bare `"input": null` would read as "this node recorded no input".
@@ -7373,11 +7394,31 @@ async fn handle_get_node_io(
         })
         .unwrap_or(serde_json::Value::Null);
 
+    // A name the graph does not carry, with nothing recorded for it, is a
+    // mistyped id — say so instead of answering "no input recorded", which is
+    // also what a real system node answers. A failed input read is not
+    // "nothing recorded".
+    let recorded_anything = !matches!(input_read, Ok(None)) || !output_value.is_null();
+    let presence = node_presence(
+        !graph_nodes.is_empty(),
+        graph_node_id.is_some(),
+        recorded_anything,
+    );
+    if presence == NodePresence::Unknown {
+        return mcp_error(
+            req_id,
+            -32602,
+            &unknown_node_message(node_id_str, &graph_nodes),
+        );
+    }
+
     respond_maybe_archived(
         req_id,
         archived_at,
         serde_json::to_string_pretty(&serde_json::json!({
             "node_id": node_id_str,
+            "graph_node_id": graph_node_id,
+            "node_in_current_graph": presence.in_current_graph(),
             "input": input_report.value,
             "input_status": input_report.status,
             "input_note": input_report.note,
@@ -7385,6 +7426,244 @@ async fn handle_get_node_io(
         }))
         .unwrap_or_default(),
     )
+}
+
+/// One node of a workflow graph, as `get_node_io` resolves names against it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphNode {
+    /// The engine's uuid for the node (what `execution_events.node_id` holds).
+    uuid: uuid::Uuid,
+    /// The graph's own node id.
+    id: String,
+    /// `data.label`, when the node has one.
+    label: Option<String>,
+}
+
+/// The nodes of `graph_json`, parsed once. An absent or unparseable graph is
+/// an empty list, which every reader below treats as "no graph to compare
+/// with", never as "the node is not there".
+fn graph_nodes(graph_json: Option<&str>) -> Vec<GraphNode> {
+    let Some(graph) = graph_json.and_then(|g| serde_json::from_str::<serde_json::Value>(g).ok())
+    else {
+        return Vec::new();
+    };
+    graph
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| {
+                    let id = node.get("id")?.as_str()?;
+                    Some(GraphNode {
+                        uuid: talos_workflow_engine_core::engine_node_uuid(id),
+                        id: id.to_string(),
+                        label: node
+                            .get("data")
+                            .and_then(|d| d.get("label"))
+                            .and_then(|l| l.as_str())
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What a caller-supplied node name resolves to in the current graph.
+#[derive(Debug, PartialEq, Eq)]
+enum NodeResolution<'a> {
+    Resolved(&'a GraphNode),
+    /// A display label carried by more than one node: their ids, sorted.
+    AmbiguousLabel(Vec<&'a str>),
+    NotInGraph,
+}
+
+/// A node id wins over a display label, so a label that happens to equal
+/// another node's id cannot redirect a lookup by id.
+fn resolve_graph_node<'a>(nodes: &'a [GraphNode], asked: &str) -> NodeResolution<'a> {
+    if let Some(node) = nodes.iter().find(|n| n.id == asked) {
+        return NodeResolution::Resolved(node);
+    }
+    let labelled: Vec<&GraphNode> = nodes
+        .iter()
+        .filter(|n| n.label.as_deref() == Some(asked))
+        .collect();
+    match labelled.as_slice() {
+        [] => NodeResolution::NotInGraph,
+        [one] => NodeResolution::Resolved(one),
+        many => {
+            let mut ids: Vec<&str> = many.iter().map(|n| n.id.as_str()).collect();
+            ids.sort_unstable();
+            NodeResolution::AmbiguousLabel(ids)
+        }
+    }
+}
+
+/// Where the name a caller passed stands against the workflow's graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodePresence {
+    /// The workflow's current graph names it.
+    InGraph,
+    /// The current graph does not name it, but this execution recorded
+    /// something for it: the graph was edited after the run.
+    RemovedSinceRun,
+    /// The graph does not name it and the execution recorded nothing for it.
+    Unknown,
+    /// There is no graph to compare with (the workflow row is gone, or its
+    /// graph has no nodes), so nothing is claimed either way.
+    GraphUnavailable,
+}
+
+impl NodePresence {
+    /// `true` / `false`, or `None` when there is no graph to compare with.
+    fn in_current_graph(self) -> Option<bool> {
+        match self {
+            Self::InGraph => Some(true),
+            Self::RemovedSinceRun | Self::Unknown => Some(false),
+            Self::GraphUnavailable => None,
+        }
+    }
+}
+
+fn node_presence(graph_has_nodes: bool, in_graph: bool, recorded_anything: bool) -> NodePresence {
+    if !graph_has_nodes {
+        NodePresence::GraphUnavailable
+    } else if in_graph {
+        NodePresence::InGraph
+    } else if recorded_anything {
+        NodePresence::RemovedSinceRun
+    } else {
+        NodePresence::Unknown
+    }
+}
+
+/// Most nodes listed in an error, and the longest name shown.
+const UNKNOWN_NODE_LISTED: usize = 40;
+const UNKNOWN_NODE_ID_CHARS: usize = 64;
+
+fn clip_node_id(id: &str) -> String {
+    id.chars().take(UNKNOWN_NODE_ID_CHARS).collect()
+}
+
+/// The error for a name the graph does not carry: what was asked for and the
+/// nodes that exist — id, and display label where it differs — sorted and
+/// bounded.
+fn unknown_node_message(asked: &str, nodes: &[GraphNode]) -> String {
+    let mut names: Vec<String> = nodes
+        .iter()
+        .map(|n| match n.label.as_deref() {
+            Some(label) if label != n.id => {
+                format!("{} (label '{}')", clip_node_id(&n.id), clip_node_id(label))
+            }
+            _ => clip_node_id(&n.id),
+        })
+        .collect();
+    names.sort_unstable();
+    let more = names.len().saturating_sub(UNKNOWN_NODE_LISTED);
+    names.truncate(UNKNOWN_NODE_LISTED);
+    format!(
+        "No node '{}' in this workflow's graph, and this execution recorded no input or output \
+         for it. Nodes in the graph: {}{}.",
+        clip_node_id(asked),
+        names.join(", "),
+        if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        }
+    )
+}
+
+#[cfg(test)]
+mod node_presence_tests {
+    use super::{
+        graph_nodes, node_presence, resolve_graph_node, unknown_node_message, NodePresence,
+        NodeResolution,
+    };
+    use serde_json::json;
+
+    fn nodes(graph: serde_json::Value) -> Vec<super::GraphNode> {
+        graph_nodes(Some(&graph.to_string()))
+    }
+
+    fn ids(list: &[&str]) -> Vec<super::GraphNode> {
+        nodes(json!({"nodes": list.iter().map(|id| json!({"id": id})).collect::<Vec<_>>() }))
+    }
+
+    #[test]
+    fn a_node_resolves_by_id_or_by_its_display_label() {
+        let g = nodes(json!({"nodes": [
+            {"id": "n1", "data": {"label": "first"}},
+            {"id": "fetch"},
+        ]}));
+        let by_id = resolve_graph_node(&g, "n1");
+        let by_label = resolve_graph_node(&g, "first");
+        assert!(matches!(by_id, NodeResolution::Resolved(n) if n.id == "n1"));
+        // The label resolves to the SAME node, not to the uuid of the string "first".
+        assert_eq!(by_id, by_label);
+        assert!(
+            matches!(resolve_graph_node(&g, "fetch"), NodeResolution::Resolved(n) if n.id == "fetch")
+        );
+        assert_eq!(resolve_graph_node(&g, "frist"), NodeResolution::NotInGraph);
+    }
+
+    #[test]
+    fn an_id_wins_over_a_label_and_a_shared_label_is_refused() {
+        let g = nodes(json!({"nodes": [
+            {"id": "a", "data": {"label": "b"}},
+            {"id": "b", "data": {"label": "dup"}},
+            {"id": "c", "data": {"label": "dup"}},
+        ]}));
+        assert!(matches!(resolve_graph_node(&g, "b"), NodeResolution::Resolved(n) if n.id == "b"));
+        assert_eq!(
+            resolve_graph_node(&g, "dup"),
+            NodeResolution::AmbiguousLabel(vec!["b", "c"])
+        );
+    }
+
+    #[test]
+    fn a_mistyped_name_is_unknown_and_a_real_system_node_is_not() {
+        // A system node records no input snapshot and may have no output;
+        // it is still a node of the graph.
+        assert_eq!(node_presence(true, true, false), NodePresence::InGraph);
+        assert_eq!(node_presence(true, false, false), NodePresence::Unknown);
+    }
+
+    #[test]
+    fn a_node_removed_after_the_run_still_shows_what_it_recorded() {
+        let p = node_presence(true, false, true);
+        assert_eq!(p, NodePresence::RemovedSinceRun);
+        assert_eq!(p.in_current_graph(), Some(false));
+    }
+
+    #[test]
+    fn nothing_is_claimed_without_a_graph() {
+        assert!(graph_nodes(None).is_empty());
+        assert!(graph_nodes(Some("not json")).is_empty());
+        let p = node_presence(false, false, false);
+        assert_eq!(p, NodePresence::GraphUnavailable);
+        assert_eq!(p.in_current_graph(), None);
+    }
+
+    #[test]
+    fn the_error_names_the_graphs_nodes_sorted_and_bounded() {
+        let g = nodes(json!({"nodes": [
+            {"id": "send"},
+            {"id": "n1", "data": {"label": "first"}},
+            {"id": "collect", "data": {"label": "collect"}},
+        ]}));
+        let msg = unknown_node_message("colect", &g);
+        assert!(msg.contains("No node 'colect'"), "{msg}");
+        assert!(msg.contains("collect, n1 (label 'first'), send."), "{msg}");
+
+        let many: Vec<String> = (0..60).map(|i| format!("n{i:02}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let msg = unknown_node_message(&"x".repeat(500), &ids(&refs));
+        assert!(msg.contains("(+20 more)"), "{msg}");
+        assert!(msg.contains("n39") && !msg.contains("n40"), "{msg}");
+        assert!(msg.len() < 700, "{} bytes", msg.len());
+    }
 }
 
 /// What `get_node_io` says about a node's stored input snapshot.

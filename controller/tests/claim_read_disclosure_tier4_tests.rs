@@ -479,6 +479,20 @@ async fn an_unreadable_graph_does_not_answer_about_a_different_node() {
         Some("first"),
         "control: the tool must answer while the graph is readable: {healthy}"
     );
+    // "first" is the node's DISPLAY LABEL; its id is "n1". The label must
+    // resolve to that node, not to the uuid of the string "first".
+    assert_eq!(
+        healthy.get("graph_node_id").and_then(Value::as_str),
+        Some("n1"),
+        "{healthy}"
+    );
+    assert_eq!(
+        healthy
+            .get("node_in_current_graph")
+            .and_then(Value::as_bool),
+        Some(true),
+        "{healthy}"
+    );
 
     // NOT `DROP TABLE workflows` — measured: that also breaks the EXECUTION
     // lookup above this read, so the handler refuses with
@@ -513,6 +527,68 @@ async fn an_unreadable_graph_does_not_answer_about_a_different_node() {
         text_json(&degraded).get("node_id").is_none(),
         "and it must not render a body at all: {}",
         serde_json::to_string(&degraded).unwrap_or_default()
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 5b. `get_node_io` — a display label reads the node's own snapshot; a name
+//     the graph does not carry is an error, not "no input recorded".
+// ───────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_label_reads_its_own_node_and_a_mistyped_name_is_an_error() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user_id = seed_user(&pool).await;
+    let actor_id = seed_actor(&pool, user_id).await;
+    let wf_id = seed_workflow(&pool, user_id, Some(actor_id)).await;
+    let exec_id = seed_execution(&pool, wf_id, user_id, actor_id).await;
+    // The engine keys a node's events by the uuid derived from its graph id.
+    sqlx::query(
+        "INSERT INTO execution_events (execution_id, event_type, node_id, status, log_message) \
+         VALUES ($1, 'node_input', $2, 'Input', $3)",
+    )
+    .bind(exec_id)
+    .bind(talos_workflow_engine_core::engine_node_uuid("n1"))
+    .bind(r#"{"config":{"K":"snapshot-of-n1"}}"#)
+    .execute(&pool)
+    .await
+    .expect("seed node_input");
+    let state = mcp_state(pool.clone()).await;
+    let call = |node: &'static str, id: i64| {
+        let state = &state;
+        async move {
+            controller::mcp::executions::dispatch(
+                "get_node_io",
+                Some(serde_json::json!(id)),
+                &serde_json::json!({"execution_id": exec_id.to_string(), "node_id": node}),
+                state,
+                agent(user_id),
+            )
+            .await
+            .expect("get_node_io is dispatched")
+        }
+    };
+
+    // By id and by display label: the same node, the same snapshot.
+    for (node, id) in [("n1", 1), ("first", 2)] {
+        let body = text_json(&call(node, id).await);
+        assert_eq!(body["graph_node_id"], "n1", "{node}: {body}");
+        assert_eq!(body["input_status"], "complete", "{node}: {body}");
+        assert_eq!(
+            body["input"]["config"]["K"], "snapshot-of-n1",
+            "{node}: {body}"
+        );
+    }
+
+    // A name the graph does not carry: an error that lists the real nodes.
+    let unknown = call("frist", 3).await;
+    let msg = error_message(&unknown);
+    assert!(msg.contains("No node 'frist'"), "{msg}");
+    assert!(msg.contains("n1 (label 'first')"), "{msg}");
+    assert!(
+        text_json(&unknown).get("input_status").is_none(),
+        "no body for an unknown node: {}",
+        serde_json::to_string(&unknown).unwrap_or_default()
     );
 }
 
