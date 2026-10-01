@@ -815,6 +815,7 @@ mod tests {
             "MEMORY_REFLECTION_MIN_MEMORIES",
             "MEMORY_REFLECTION_MAX_ACTORS_PER_TICK",
             "MEMORY_REFLECTION_MODEL",
+            "MEMORY_CONSOLIDATION_MODEL",
         ] {
             env::remove_var(v);
         }
@@ -851,11 +852,21 @@ mod tests {
         // Actors-per-tick clamps to [1, 500].
         env::set_var("MEMORY_REFLECTION_MAX_ACTORS_PER_TICK", "99999");
         assert_eq!(crate::memory_reflection_max_actors_per_tick(), 500);
-        // Blank model falls back to the default.
+        // Blank model falls back to consolidation's model, which is its own
+        // default while that is unset.
         env::set_var("MEMORY_REFLECTION_MODEL", "   ");
         assert_eq!(crate::memory_reflection_model(), "qwen2.5:7b");
+        // Unset or blank, reflection follows the model the operator configured
+        // for consolidation — one knob sets both loops.
+        env::set_var("MEMORY_CONSOLIDATION_MODEL", "qwen3.6");
+        assert_eq!(crate::memory_reflection_model(), "qwen3.6");
+        env::remove_var("MEMORY_REFLECTION_MODEL");
+        assert_eq!(crate::memory_reflection_model(), "qwen3.6");
+        // Its own value still wins, and does not move consolidation.
         env::set_var("MEMORY_REFLECTION_MODEL", "llama3.1:8b");
         assert_eq!(crate::memory_reflection_model(), "llama3.1:8b");
+        assert_eq!(crate::memory_consolidation_model(), "qwen3.6");
+        env::remove_var("MEMORY_CONSOLIDATION_MODEL");
 
         for v in [
             "ENABLE_MEMORY_REFLECTION",

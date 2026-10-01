@@ -223,4 +223,4 @@ whole fleet fairly rather than starving higher-id actors past the per-tick cap.
 | `MEMORY_REFLECTION_INPUT_CAP` | `40` | Max memories fed to the LLM; clamp `[5, 200]` |
 | `MEMORY_REFLECTION_MIN_MEMORIES` | `8` | Floor to reflect at all; clamp `[3, 100]` |
 | `MEMORY_REFLECTION_MAX_ACTORS_PER_TICK` | `25` | Fleet fan-out per tick; clamp `[1, 500]` |
-| `MEMORY_REFLECTION_MODEL` | `qwen2.5:7b` | Ollama model for the tier-1 local path |
+| `MEMORY_REFLECTION_MODEL` | the value of `MEMORY_CONSOLIDATION_MODEL` (itself `qwen2.5:7b` when unset) | Ollama model for the local path. A model the local Ollama does not have fails the local attempt, and for a tier-2 actor that falls back to the external provider |

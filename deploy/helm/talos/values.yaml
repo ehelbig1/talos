@@ -298,6 +298,8 @@ controller:
     # ── Optional memory-loop tuning (code defaults shown; uncomment to override) ─
     # LOCAL summarisation model for the two LLM loops (must be pulled in Ollama):
     #   MEMORY_CONSOLIDATION_MODEL: "qwen2.5:7b"
+    # Reflection follows MEMORY_CONSOLIDATION_MODEL when unset; set it only to
+    # make the two loops use different models:
     #   MEMORY_REFLECTION_MODEL: "qwen2.5:7b"
     # Loop cadence (seconds; default 86400 = daily; clamped in code):
     #   MEMORY_CONSOLIDATION_INTERVAL_SECS: "86400"

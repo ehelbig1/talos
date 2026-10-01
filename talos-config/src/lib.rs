@@ -664,12 +664,22 @@ pub fn memory_reflection_max_actors_per_tick() -> i64 {
     positive_env_or_default::<i64>("MEMORY_REFLECTION_MAX_ACTORS_PER_TICK", 25).clamp(1, 500)
 }
 
-/// Ollama model used to generate the reflection on the tier-1 LOCAL-only path
-/// (`MEMORY_REFLECTION_MODEL`). Default matches consolidation's default model.
+/// Ollama model used to generate the reflection on the local path
+/// (`MEMORY_REFLECTION_MODEL`). Unset or blank, it is whatever
+/// [`memory_consolidation_model`] resolves to — the operator's
+/// `MEMORY_CONSOLIDATION_MODEL` if set, else that function's default.
+///
+/// Until 2026-10-01 an unset value was the literal `qwen2.5:7b`, independent
+/// of consolidation. A deployment that pointed consolidation at a model it had
+/// pulled and left this unset then asked the local Ollama for a model it did
+/// not have, and for a tier-2 actor a failed local reflection falls back to
+/// the EXTERNAL provider — so a default nobody chose decided where an actor's
+/// memories were sent. One knob now sets both loops; set this one only to make
+/// them differ.
 pub fn memory_reflection_model() -> String {
-    let v = get_env("MEMORY_REFLECTION_MODEL", "qwen2.5:7b");
+    let v = get_env("MEMORY_REFLECTION_MODEL", "");
     if v.trim().is_empty() {
-        "qwen2.5:7b".to_string()
+        memory_consolidation_model()
     } else {
         v
     }
