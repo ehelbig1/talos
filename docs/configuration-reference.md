@@ -266,7 +266,8 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `EMBEDDING_API_KEY` | none (optional) | controller | Embedding API key | 🔒 |
 | `EMBEDDING_MODEL` | built-in default | controller | Embedding model name | |
 | `EMBEDDING_DIMENSIONS` | `768` | controller | Embedding vector dimension | |
-| `EMBEDDING_TIMEOUT_SECS` | `8` (clamped 1–60) | controller | Embedding request timeout | |
+| `EMBEDDING_TIMEOUT_SECS` | `8` (clamped 1–60) | controller | Per-attempt timeout of one embedding request (one retry). For a local provider it starts once the call holds an in-flight slot (`TALOS_EMBEDDING_MAX_IN_FLIGHT`), so it bounds the call's own service time, not time queued behind other calls; a call queues for a slot for at most twice this value, then goes ahead without one | |
+| `TALOS_EMBEDDING_MAX_IN_FLIGHT` | `1` (0–64) | controller | Simultaneous calls to a LOCAL embedding provider per controller process. `1` matches the bundled Ollama embedder, which serves one request at a time (Ollama loads every embedding model with one slot); raise it only for a local embedder that really serves several at once. `0` disables the gate (every call is sent at once, the pre-2026-10-01 behaviour). An empty, unparseable or out-of-range value means the default, never `0`. Not applied to an external provider. Observed on `talos_embedding_gate_total` / `talos_embedding_queue_wait_seconds` | |
 | `TALOS_GRAPH_RAG_MODEL` | `qwen2.5:7b` | controller | Graph-RAG entity-extraction model | |
 | `TALOS_GRAPH_RAG_TIER1_LOCAL_OK` | `false` | controller | Attestation that Ollama is on-host so Tier-1 graph extraction may run locally | 🔒 (privacy) |
 | `SEMANTIC_SEARCH_MIN_SCORE` | `0.40` (clamped 0–1) | controller | Default cosine floor for semantic search | |

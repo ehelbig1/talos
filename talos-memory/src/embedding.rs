@@ -168,7 +168,10 @@ impl EmbeddingConfig {
 /// ## Latency budget
 ///
 /// A single embedding call gets at most the configured timeout per
-/// attempt and we retry exactly once on connect / request errors.
+/// attempt and we retry exactly once on connect / request errors. For a
+/// local provider the timeout starts once the call holds an in-flight slot
+/// (see the gate below), so it bounds the call's own service time and not
+/// the time it spent queued behind other calls.
 /// This prevents slow-provider pathology from burning WASM fuel inside
 /// sandbox `agent_memory::search` calls — the previous 15 s timeout
 /// let a single stuck Ollama call chew through the default 1 M fuel
@@ -395,7 +398,7 @@ pub async fn generate_embedding(text: &str, local_only: bool) -> Option<Vec<f32>
     });
 
     let result = cell
-        .get_or_init(|| do_embedding_request(&config, truncated))
+        .get_or_init(|| gated_embedding_request(&config, truncated))
         .await
         .clone();
 
@@ -403,6 +406,221 @@ pub async fn generate_embedding(text: &str, local_only: bool) -> Option<Vec<f32>
         cache_insert(key, v.clone());
     }
     result
+}
+
+// ── In-flight gate (2026-10-01) ─────────────────────────────────────────────
+//
+// The per-attempt timeout above is documented as a bound on ONE call. Nothing
+// made that true: every caller sent its request at once, and a local embedder
+// serves them one at a time, so the timeout was shared by every request in
+// flight and a call could spend all of it queued behind somebody else's.
+//
+// Measured on the reference deployment (a CPU-only Ollama container, runner
+// started with `--parallel 1` — Ollama loads every embedding model that way):
+//
+// * 3.5 days, 2,975 requests: 164 (5.5 %) were cut at the 8 s client timeout,
+//   always inside a burst; a lone request took 0.44 s at the median.
+// * Six concurrent 1,500-character requests completed at 1.6, 3.2, 5.5, 7.1,
+//   8.6 and 10.1 s — strictly one after another. One batch of the same six
+//   took 9.1 s: batching buys nothing either.
+//
+// So a call takes a slot BEFORE its timeout starts. The gate queues; it never
+// refuses. When no slot comes free within the wait bound the call goes ahead
+// without one, which is exactly the behaviour that shipped before the gate —
+// there is no input for which the gate turns a call that would have succeeded
+// into one that is not made. Same shape, and the same reasons, as the local
+// LLM gate (`talos_local_inference::gate`).
+//
+// What it is NOT: a bound across processes (one semaphore per controller
+// replica); applied to an EXTERNAL provider (those serve in parallel — a gate
+// there is a latency regression); or a way to make the embedder faster.
+
+/// Simultaneous calls to a LOCAL embedding provider per process.
+///
+/// **1**, measured: the bundled Ollama embedder serves one request at a time
+/// whatever `OLLAMA_NUM_PARALLEL` says. A deployment whose local embedder
+/// really serves several at once should raise it via [`MAX_IN_FLIGHT_ENV`].
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 1;
+
+/// Largest accepted [`MAX_IN_FLIGHT_ENV`] value.
+pub const MAX_IN_FLIGHT_CEILING: usize = 64;
+
+/// Override for [`DEFAULT_MAX_IN_FLIGHT`]. `0` disables the gate. An empty,
+/// unparseable or out-of-range value falls back to the DEFAULT, never to 0:
+/// a typo must not switch the control off.
+pub const MAX_IN_FLIGHT_ENV: &str = "TALOS_EMBEDDING_MAX_IN_FLIGHT";
+
+fn parse_max_in_flight(raw: Option<&str>) -> usize {
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n <= MAX_IN_FLIGHT_CEILING)
+        .unwrap_or(DEFAULT_MAX_IN_FLIGHT)
+}
+
+/// The process gate; `None` when disabled.
+fn process_gate() -> Option<&'static std::sync::Arc<tokio::sync::Semaphore>> {
+    static GATE: std::sync::OnceLock<Option<std::sync::Arc<tokio::sync::Semaphore>>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        match parse_max_in_flight(std::env::var(MAX_IN_FLIGHT_ENV).ok().as_deref()) {
+            0 => None,
+            n => Some(std::sync::Arc::new(tokio::sync::Semaphore::new(n))),
+        }
+    })
+    .as_ref()
+}
+
+/// How long a call may queue for a slot before it goes ahead without one:
+/// twice the per-attempt timeout — the time a call could already spend on its
+/// two attempts, so the wait is on the scale callers are sized for and moves
+/// with `EMBEDDING_TIMEOUT_SECS`. At the measured ~1.7 s per request the
+/// default 16 s drains about nine queued calls.
+fn queue_wait_bound() -> std::time::Duration {
+    std::time::Duration::from_secs(request_timeout_secs().saturating_mul(2))
+}
+
+/// How a provider call passed the gate. Spellings are the metric's label
+/// values (`talos_embedding_gate_total`), pinned against `talos-metrics` by a
+/// test below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// Held a slot for the whole call.
+    Acquired,
+    /// No slot within the wait bound; went ahead without one.
+    WaitExpired,
+    /// The gate does not apply: disabled, or the provider is external.
+    Ungated,
+}
+
+impl GateOutcome {
+    /// Every value.
+    pub const ALL: &'static [Self] = &[Self::Acquired, Self::WaitExpired, Self::Ungated];
+
+    /// The metric label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Acquired => "acquired",
+            Self::WaitExpired => "wait_expired",
+            Self::Ungated => "ungated",
+        }
+    }
+}
+
+/// What one provider call came to (`talos_embedding_requests_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOutcome {
+    /// A vector of the configured dimensions.
+    Ok,
+    /// A 4xx or a wrong-dimension vector; not retried.
+    Rejected,
+    /// No usable answer after the retry.
+    Unavailable,
+}
+
+impl CallOutcome {
+    /// Every value.
+    pub const ALL: &'static [Self] = &[Self::Ok, Self::Rejected, Self::Unavailable];
+
+    /// The metric label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Rejected => "rejected",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// One call that reached the provider. A cache hit, or a caller that shared
+/// another caller's in-flight request, produces no report.
+#[derive(Debug, Clone, Copy)]
+pub struct CallReport {
+    pub gate: GateOutcome,
+    /// Time spent queued for a slot (zero when ungated).
+    pub queue_wait: std::time::Duration,
+    pub outcome: CallOutcome,
+    /// The provider's own time, both attempts when one was retried.
+    pub service: std::time::Duration,
+}
+
+/// Receives every [`CallReport`]. Must not block: it runs inline on the
+/// embedding path.
+pub type CallObserver = std::sync::Arc<dyn Fn(CallReport) + Send + Sync>;
+
+static CALL_OBSERVER: std::sync::OnceLock<CallObserver> = std::sync::OnceLock::new();
+
+/// Install the process-wide observer (the controller wires it to its
+/// metrics; this crate cannot depend on them). First caller wins. Unset —
+/// tests, the worker, tools without metrics — reports are dropped.
+pub fn set_call_observer(observer: CallObserver) {
+    let _ = CALL_OBSERVER.set(observer);
+}
+
+/// A held slot, or the reason there is none. Dropping it frees the slot.
+enum Slot {
+    Held(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit),
+    None(GateOutcome),
+}
+
+impl Slot {
+    fn outcome(&self) -> GateOutcome {
+        match self {
+            Self::Held(_) => GateOutcome::Acquired,
+            Self::None(why) => *why,
+        }
+    }
+}
+
+/// Take a slot on `gate` for a call to a provider that is `local` or not,
+/// waiting at most `wait`. Returns the slot and how long the call queued.
+async fn acquire_slot(
+    gate: Option<&std::sync::Arc<tokio::sync::Semaphore>>,
+    local: bool,
+    wait: std::time::Duration,
+) -> (Slot, std::time::Duration) {
+    let Some(gate) = gate.filter(|_| local) else {
+        return (Slot::None(GateOutcome::Ungated), std::time::Duration::ZERO);
+    };
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(wait, gate.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => (Slot::Held(permit), started.elapsed()),
+        // The wait ran out, or the semaphore was closed (it never is): go
+        // ahead ungated rather than not at all.
+        Ok(Err(_)) | Err(_) => (Slot::None(GateOutcome::WaitExpired), started.elapsed()),
+    }
+}
+
+/// One provider call: take a slot, THEN start the call's own timeout.
+async fn gated_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Option<Vec<f32>> {
+    let (slot, queue_wait) = acquire_slot(
+        process_gate(),
+        config.is_local_provider(),
+        queue_wait_bound(),
+    )
+    .await;
+    let gate = slot.outcome();
+    if gate == GateOutcome::WaitExpired {
+        tracing::debug!(
+            queue_wait_ms = queue_wait.as_millis() as u64,
+            "embedding gate: no slot within the wait bound — calling the provider ungated"
+        );
+    }
+    let started = std::time::Instant::now();
+    let (vector, outcome) = do_embedding_request(config, truncated).await;
+    let service = started.elapsed();
+    drop(slot);
+    if let Some(observer) = CALL_OBSERVER.get() {
+        observer(CallReport {
+            gate,
+            queue_wait,
+            outcome,
+            service,
+        });
+    }
+    vector
 }
 
 /// MCP-1111 (2026-05-16): cache the hardened embedding HTTP client at
@@ -440,7 +658,10 @@ static EMBED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::Lazy
         .expect("talos-memory: failed to build embedding HTTP client (TLS init)")
 });
 
-async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Option<Vec<f32>> {
+async fn do_embedding_request(
+    config: &EmbeddingConfig,
+    truncated: &str,
+) -> (Option<Vec<f32>>, CallOutcome) {
     // MCP-520: same Mode-B credential-leak class as the sibling
     // `talos-search-service` embedding client. Operator-configured
     // `EMBEDDING_API_URL` + `bearer_auth(key)` means a same-origin
@@ -512,7 +733,7 @@ async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Opti
                     // Cache insertion is done by the caller
                     // (`generate_embedding`) so the dedupe path can
                     // populate cache AND the OnceCell atomically.
-                    return Some(embedding);
+                    return (Some(embedding), CallOutcome::Ok);
                 }
                 tracing::warn!(
                     got = embedding.len(),
@@ -520,7 +741,7 @@ async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Opti
                     model = %config.model,
                     "Embedding provider returned unexpected dimension count — no retry"
                 );
-                return None;
+                return (None, CallOutcome::Rejected);
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -530,7 +751,7 @@ async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Opti
                         url = %config.api_url,
                         "Embedding API 4xx — no retry"
                     );
-                    return None;
+                    return (None, CallOutcome::Rejected);
                 }
                 last_err = Some(format!("http {status}"));
             }
@@ -559,7 +780,16 @@ async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Opti
         error = ?last_err,
         "Embedding API unavailable after retry — falling back to keyword search"
     );
-    None
+    (None, CallOutcome::Unavailable)
+}
+
+/// The identity of the embedding model every NEW vector is produced
+/// by — the value stamped into `embedding_model` columns and required
+/// by semantic reads (strict equality; see the provenance migration
+/// 20260720190000). `None` when embeddings are disabled entirely.
+#[must_use]
+pub fn active_embedding_model() -> Option<String> {
+    EmbeddingConfig::cached().map(|c| c.model)
 }
 
 /// Fire-and-forget embedding warmup. Call once at controller startup to
@@ -575,15 +805,6 @@ async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Opti
 /// No-op if the embedding provider isn't configured (the inner
 /// `generate_embedding` returns None). Spawned as a background task by
 /// the caller so controller startup isn't delayed by a slow provider.
-/// The identity of the embedding model every NEW vector is produced
-/// by — the value stamped into `embedding_model` columns and required
-/// by semantic reads (strict equality; see the provenance migration
-/// 20260720190000). `None` when embeddings are disabled entirely.
-#[must_use]
-pub fn active_embedding_model() -> Option<String> {
-    EmbeddingConfig::cached().map(|c| c.model)
-}
-
 pub async fn warmup() {
     let started = std::time::Instant::now();
     // Warmup ping carries no actor data — never tier-restricted.
@@ -645,5 +866,117 @@ mod tier_egress_tests {
         ] {
             assert!(!cfg(url).is_local_provider(), "should be EXTERNAL: {url}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn the_cap_parses_and_a_bad_value_is_the_default_never_zero() {
+        assert_eq!(parse_max_in_flight(None), DEFAULT_MAX_IN_FLIGHT);
+        assert_eq!(parse_max_in_flight(Some("4")), 4);
+        assert_eq!(parse_max_in_flight(Some(" 2 ")), 2);
+        // Explicit zero is the off switch.
+        assert_eq!(parse_max_in_flight(Some("0")), 0);
+        for bad in ["", "  ", "one", "-1", "1.5", "65", "999999999999999999999"] {
+            assert_eq!(
+                parse_max_in_flight(Some(bad)),
+                DEFAULT_MAX_IN_FLIGHT,
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_call_waits_for_the_first_and_its_wait_is_reported() {
+        let gate = Arc::new(Semaphore::new(1));
+        let (first, waited) = acquire_slot(Some(&gate), true, Duration::from_secs(5)).await;
+        assert_eq!(first.outcome(), GateOutcome::Acquired);
+        assert!(waited < Duration::from_millis(50));
+
+        let g = gate.clone();
+        let second =
+            tokio::spawn(async move { acquire_slot(Some(&g), true, Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !second.is_finished(),
+            "the second call must queue behind the first"
+        );
+        drop(first);
+        let (slot, waited) = second.await.unwrap();
+        assert_eq!(slot.outcome(), GateOutcome::Acquired);
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        // Dropping the slot frees it.
+        drop(slot);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_queue_that_does_not_drain_lets_the_call_through_ungated() {
+        let gate = Arc::new(Semaphore::new(1));
+        let (_held, _) = acquire_slot(Some(&gate), true, Duration::from_secs(5)).await;
+        let started = std::time::Instant::now();
+        let (slot, waited) = acquire_slot(Some(&gate), true, Duration::from_millis(80)).await;
+        assert_eq!(slot.outcome(), GateOutcome::WaitExpired);
+        assert!(waited >= Duration::from_millis(80));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait is bounded"
+        );
+        // It took no slot it does not hold.
+        assert_eq!(gate.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_external_provider_and_a_disabled_gate_never_queue() {
+        let exhausted = Arc::new(Semaphore::new(0));
+        // External: not gated even when every slot is taken.
+        let (slot, waited) = acquire_slot(Some(&exhausted), false, Duration::from_secs(5)).await;
+        assert_eq!(slot.outcome(), GateOutcome::Ungated);
+        assert_eq!(waited, Duration::ZERO);
+        // Disabled gate.
+        let (slot, waited) = acquire_slot(None, true, Duration::from_secs(5)).await;
+        assert_eq!(slot.outcome(), GateOutcome::Ungated);
+        assert_eq!(waited, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_waiter_leaves_the_gate_usable() {
+        let gate = Arc::new(Semaphore::new(1));
+        let (held, _) = acquire_slot(Some(&gate), true, Duration::from_secs(5)).await;
+        let g = gate.clone();
+        let waiter =
+            tokio::spawn(
+                async move { acquire_slot(Some(&g), true, Duration::from_secs(30)).await },
+            );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waiter.abort();
+        let _ = waiter.await;
+        drop(held);
+        let (slot, _) = acquire_slot(Some(&gate), true, Duration::from_millis(200)).await;
+        assert_eq!(slot.outcome(), GateOutcome::Acquired);
+    }
+
+    /// The label spellings are the metric's: `talos-metrics` cannot depend on
+    /// this crate, so the two lists meet here.
+    #[test]
+    fn the_report_spellings_are_the_metric_label_sets() {
+        let ours: Vec<&str> = CallOutcome::ALL.iter().map(|o| o.as_str()).collect();
+        let theirs: Vec<&str> = talos_metrics::EmbeddingOutcome::ALL
+            .iter()
+            .map(|o| o.as_str())
+            .collect();
+        assert_eq!(ours, theirs);
+        let ours: Vec<&str> = GateOutcome::ALL.iter().map(|o| o.as_str()).collect();
+        let theirs: Vec<&str> = talos_metrics::EmbeddingGateOutcome::ALL
+            .iter()
+            .map(|o| o.as_str())
+            .collect();
+        assert_eq!(ours, theirs);
     }
 }

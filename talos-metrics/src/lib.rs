@@ -14,6 +14,7 @@ use prometheus::{
 use std::sync::{Arc, OnceLock};
 
 pub mod actor_budget;
+pub mod embedding;
 pub mod execution;
 pub mod execution_pause;
 pub mod google_push;
@@ -25,6 +26,7 @@ pub mod security;
 pub mod vault_token;
 pub mod webhook;
 pub use actor_budget::{BudgetCap, BudgetMode};
+pub use embedding::{EmbeddingGateOutcome, EmbeddingOutcome};
 pub use execution::ModuleExecutionOutcome;
 pub use execution_pause::{PauseGatePath, PauseRefusal};
 pub use google_push::{JwkRefreshOutcome, PushDeferReason, PushIntegration, PushRefusalReason};
@@ -896,6 +898,44 @@ pub fn record_advisory_db_sample_on(
         .advisory_db_age_samples_total
         .with_label_values(&[copy.as_str(), outcome.as_str()])
         .inc();
+}
+
+/// Record one call to the embedding provider: how it passed the in-flight
+/// gate, how long it queued for a slot, what it came to and how long the
+/// provider took. Inert without [`set_global`].
+pub fn record_embedding_call(
+    gate: EmbeddingGateOutcome,
+    queue_wait: std::time::Duration,
+    outcome: EmbeddingOutcome,
+    service: std::time::Duration,
+) {
+    if let Some(m) = global() {
+        record_embedding_call_on(m, gate, queue_wait, outcome, service);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_embedding_call_on(
+    metrics: &TalosMetrics,
+    gate: EmbeddingGateOutcome,
+    queue_wait: std::time::Duration,
+    outcome: EmbeddingOutcome,
+    service: std::time::Duration,
+) {
+    metrics
+        .embedding_gate_total
+        .with_label_values(&[gate.as_str()])
+        .inc();
+    metrics
+        .embedding_queue_wait_seconds
+        .observe(queue_wait.as_secs_f64());
+    metrics
+        .embedding_requests_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+    metrics
+        .embedding_request_duration_seconds
+        .observe(service.as_secs_f64());
 }
 
 /// Count one attempt to fetch Google's JWK set. Inert without [`set_global`].
@@ -1985,6 +2025,14 @@ pub struct TalosMetrics {
     // working; `on_budget_exceeded = 'alert'` raises an ops alert instead).
     pub actor_budget_refusals_total: CounterVec,
     pub google_jwk_refresh_total: CounterVec,
+    /// Embedding-provider calls by outcome (see [`EmbeddingOutcome`]).
+    pub embedding_requests_total: CounterVec,
+    /// Embedding-provider calls by how they passed the in-flight gate.
+    pub embedding_gate_total: CounterVec,
+    /// Time a provider call queued for an in-flight slot.
+    pub embedding_queue_wait_seconds: prometheus::Histogram,
+    /// The provider's own time per call (after the slot was taken).
+    pub embedding_request_duration_seconds: prometheus::Histogram,
 
     // Vault KEK-token renewal — added 2026-09-14 after the controller's transit
     // token was found to be minted periodic and renewed by nothing
@@ -3705,6 +3753,67 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        // Embedding provider (2026-10-01). Until this instrument a provider
+        // that timed out was a WARN line and nothing else: measured on the
+        // reference fleet, 164 of 2,975 requests (5.5 %) were cut at the
+        // client's timeout while queued behind other requests.
+        let embedding_requests_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_embedding_requests_total",
+                "Calls to the embedding provider by outcome: ok | rejected (4xx or wrong \
+                 dimensions; not retried) | unavailable (no usable answer after one retry — \
+                 the caller fell back to keyword search or stored a row with no embedding). \
+                 One per call that reached the provider: a cache hit, or a caller sharing \
+                 another caller's in-flight request, is not counted. Alerted by \
+                 TalosEmbeddingProviderUnavailable. All values pre-seeded at 0.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(embedding_requests_total.clone()))?;
+        for outcome in EmbeddingOutcome::ALL {
+            embedding_requests_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+        let embedding_gate_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_embedding_gate_total",
+                "Embedding-provider calls by how they passed the in-flight gate \
+                 (TALOS_EMBEDDING_MAX_IN_FLIGHT, local providers only): acquired (held a \
+                 slot) | wait_expired (no slot within the wait bound; the call went ahead \
+                 without one — the queue did not drain) | ungated (gate disabled or \
+                 provider external — a steady state, not a load signal). Nothing alerts on \
+                 it: acquired is the gate working. All values pre-seeded at 0.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(embedding_gate_total.clone()))?;
+        for outcome in EmbeddingGateOutcome::ALL {
+            embedding_gate_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+        let embedding_queue_wait_seconds = prometheus::Histogram::with_opts(
+            prometheus::HistogramOpts::new(
+                "talos_embedding_queue_wait_seconds",
+                "Time an embedding-provider call waited for an in-flight slot before it \
+                 was sent. Every provider call is observed, zero waits included, so \
+                 _count is the provider call count.",
+            )
+            .buckets(exponential_buckets(0.05, 2.0, 11).expect("valid exponential buckets")),
+        )?;
+        registry.register(Box::new(embedding_queue_wait_seconds.clone()))?;
+        let embedding_request_duration_seconds = prometheus::Histogram::with_opts(
+            prometheus::HistogramOpts::new(
+                "talos_embedding_request_duration_seconds",
+                "The embedding provider's own time per call, both attempts when one was \
+                 retried, measured from when the in-flight slot was taken (queue wait is \
+                 talos_embedding_queue_wait_seconds).",
+            )
+            .buckets(exponential_buckets(0.05, 2.0, 10).expect("valid exponential buckets")),
+        )?;
+        registry.register(Box::new(embedding_request_duration_seconds.clone()))?;
+
         // Vault KEK-token renewal
         let vault_token_renewals_total = CounterVec::new(
             prometheus::Opts::new(
@@ -4298,6 +4407,10 @@ impl TalosMetrics {
             webhook_duplicate_suppressed_total,
             actor_budget_refusals_total,
             google_jwk_refresh_total,
+            embedding_requests_total,
+            embedding_gate_total,
+            embedding_queue_wait_seconds,
+            embedding_request_duration_seconds,
             vault_token_renewals_total,
             vault_token_ttl_seconds,
             advisory_db_age_days,
@@ -4971,6 +5084,44 @@ mod tests {
         ));
         assert!(warm.contains("talos_google_jwk_refresh_total{outcome=\"failed\"} 1"));
         assert!(warm.contains("talos_google_jwk_refresh_total{outcome=\"ok\"} 0"));
+    }
+
+    /// The embedding instrument is pre-seeded, and one recorded call moves
+    /// exactly its own outcome and gate series and both histograms.
+    #[test]
+    fn the_embedding_instrument_is_seeded_and_one_call_moves_its_own_series() {
+        let m = TalosMetrics::new().expect("metrics");
+        let cold = m.render_prometheus().expect("render");
+        for o in EmbeddingOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_embedding_requests_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+        }
+        for g in EmbeddingGateOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_embedding_gate_total{{outcome=\"{}\"}} 0",
+                g.as_str()
+            )));
+        }
+        assert!(cold.contains("talos_embedding_queue_wait_seconds_count 0"));
+        record_embedding_call_on(
+            &m,
+            EmbeddingGateOutcome::Acquired,
+            std::time::Duration::from_millis(3_000),
+            EmbeddingOutcome::Unavailable,
+            std::time::Duration::from_secs(16),
+        );
+        let warm = m.render_prometheus().expect("render");
+        assert!(warm.contains("talos_embedding_requests_total{outcome=\"unavailable\"} 1"));
+        assert!(warm.contains("talos_embedding_requests_total{outcome=\"ok\"} 0"));
+        assert!(warm.contains("talos_embedding_gate_total{outcome=\"acquired\"} 1"));
+        assert!(warm.contains("talos_embedding_gate_total{outcome=\"wait_expired\"} 0"));
+        assert!(warm.contains("talos_embedding_queue_wait_seconds_count 1"));
+        assert!(warm.contains("talos_embedding_request_duration_seconds_count 1"));
+        // A 3 s wait is inside the wait histogram's range (top bucket 51.2 s).
+        assert!(warm.contains("talos_embedding_queue_wait_seconds_bucket{le=\"3.2\"} 1"));
+        assert!(warm.contains("talos_embedding_queue_wait_seconds_bucket{le=\"1.6\"} 0"));
     }
 
     /// The Vault token instruments (2026-09-14) are ABSENT on a cold registry —

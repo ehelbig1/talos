@@ -5399,3 +5399,111 @@ tests:
       - eval_time: 180m
         alertname: TalosAdvisoryDbUnreadable
         exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TalosEmbeddingProviderUnavailable — a ratio (> half) with a floor (>= 5)
+  # over 30 m, sustained 10 m. A healthy provider, the measured burst loss
+  # (a few lost calls among many), and a quiet deployment's one lost call
+  # all stay quiet; a provider that stops answering fires, and clears when
+  # it answers again.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: embedding — healthy, then burst loss, stay quiet
+    input_series:
+      # 2 ok per minute throughout; 6 calls lost in one burst at t=20m —
+      # past the floor, and about a tenth of the window's calls: the ratio
+      # is what keeps this quiet.
+      - series: 'talos_embedding_requests_total{job="talos-controller",outcome="ok"}'
+        values: "0+2x90"
+      - series: 'talos_embedding_requests_total{job="talos-controller",outcome="unavailable"}'
+        values: "0+0x20 6+0x70"
+      - series: 'talos_embedding_requests_total{job="talos-controller",outcome="rejected"}'
+        values: "0+0x90"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: TalosEmbeddingProviderUnavailable
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: TalosEmbeddingProviderUnavailable
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: TalosEmbeddingProviderUnavailable
+        exp_alerts: []
+
+  - interval: 1m
+    name: embedding — a quiet deployment losing its only few calls stays under the floor
+    input_series:
+      # Nothing succeeds, but only 4 calls were made in the window: 100 %
+      # of almost nothing.
+      - series: 'talos_embedding_requests_total{job="talos-controller",outcome="ok"}'
+        values: "0+0x90"
+      - series: 'talos_embedding_requests_total{job="talos-controller",outcome="unavailable"}'
+        values: "0+0x10 1+0x9 2+0x9 3+0x9 4+0x50"
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: TalosEmbeddingProviderUnavailable
+        exp_alerts: []
+
+  - interval: 1m
+    name: embedding — rejected calls are a configuration fault, not this alert
+    input_series:
+      - series: 'talos_embedding_requests_total{job="talos-controller",outcome="ok"}'
+        values: "0+0x90"
+      - series: 'talos_embedding_requests_total{job="talos-controller",outcome="unavailable"}'
+        values: "0+0x90"
+      - series: 'talos_embedding_requests_total{job="talos-controller",outcome="rejected"}'
+        values: "0+3x90"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: TalosEmbeddingProviderUnavailable
+        exp_alerts: []
+
+  - interval: 1m
+    name: embedding — a provider that stops answering fires, and clears on recovery
+    input_series:
+      # Healthy for 20 m (2 ok/min). From t=20m to t=60m nothing succeeds and
+      # one call a minute is lost. From t=60m it answers again.
+      - series: 'talos_embedding_requests_total{job="talos-controller",outcome="ok"}'
+        values: "0+2x20 40+0x39 40+2x60"
+      - series: 'talos_embedding_requests_total{job="talos-controller",outcome="unavailable"}'
+        values: "0+0x20 0+1x40 40+0x60"
+    alert_rule_test:
+      # 4 minutes in: 4 lost, under the floor.
+      - eval_time: 24m
+        alertname: TalosEmbeddingProviderUnavailable
+        exp_alerts: []
+      # The ratio passes half at t=41m (21 lost against 18 answered in the
+      # window) and must hold 10 m: still pending at 45m…
+      - eval_time: 45m
+        alertname: TalosEmbeddingProviderUnavailable
+        exp_alerts: []
+      # …firing at 55m, by when the window holds no success at all.
+      - eval_time: 55m
+        alertname: TalosEmbeddingProviderUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: reliability-degraded
+            exp_annotations:
+              summary: "More than half of embedding calls are getting no answer"
+              description: |
+                100% of calls to the embedding provider
+                in the last 30 minutes got no usable answer after a retry. While
+                this lasts, semantic memory recall silently falls back to keyword
+                search, new memories are stored without an embedding, and
+                ML-served classifications abstain to their LLM fallback.
+              action: |
+                1. Controller log: `Embedding API unavailable after retry` carries
+                   the provider URL and the last error (timeout / transport / http).
+                2. Is the provider up? For the bundled Ollama embedder: the
+                   container's health and its log.
+                3. `talos_embedding_gate_total{outcome="wait_expired"}` climbing
+                   with `talos_embedding_request_duration_seconds` high means the
+                   provider is up but slower than the demand: raise
+                   EMBEDDING_TIMEOUT_SECS, or give it a faster backend.
+                4. Rows stored without an embedding are backfilled once the
+                   provider answers again.
+      # 50 minutes after recovery: the window holds only successes.
+      - eval_time: 110m
+        alertname: TalosEmbeddingProviderUnavailable
+        exp_alerts: []

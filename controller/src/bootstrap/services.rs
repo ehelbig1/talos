@@ -91,9 +91,34 @@ pub(crate) async fn init_database() -> anyhow::Result<sqlx::Pool<sqlx::Postgres>
     // models on first request (~5 s cold). Without warmup, the first
     // user-facing write times out, stores `embedding = NULL`, and future
     // semantic searches on that row silently degrade to keyword fallback.
+    //
+    // The observer goes in FIRST so the warmup call is counted too: every
+    // call that reaches the embedding provider is recorded on
+    // `talos_embedding_requests_total` / `talos_embedding_gate_total`
+    // (talos-memory cannot depend on talos-metrics; this is where they meet).
+    talos_memory::embedding::set_call_observer(std::sync::Arc::new(record_embedding_call));
     tokio::spawn(talos_memory::embedding::warmup());
 
     Ok(db_pool)
+}
+
+/// Record one embedding-provider call on the controller's metrics. The two
+/// matches are exhaustive on purpose: a new outcome in `talos-memory` fails
+/// to compile here until it has a label.
+fn record_embedding_call(report: talos_memory::embedding::CallReport) {
+    use talos_memory::embedding::{CallOutcome, GateOutcome};
+    use talos_metrics::{EmbeddingGateOutcome, EmbeddingOutcome};
+    let gate = match report.gate {
+        GateOutcome::Acquired => EmbeddingGateOutcome::Acquired,
+        GateOutcome::WaitExpired => EmbeddingGateOutcome::WaitExpired,
+        GateOutcome::Ungated => EmbeddingGateOutcome::Ungated,
+    };
+    let outcome = match report.outcome {
+        CallOutcome::Ok => EmbeddingOutcome::Ok,
+        CallOutcome::Rejected => EmbeddingOutcome::Rejected,
+        CallOutcome::Unavailable => EmbeddingOutcome::Unavailable,
+    };
+    talos_metrics::record_embedding_call(gate, report.queue_wait, outcome, report.service);
 }
 
 /// Redis client init (TLS prod gate + connection test). Extracted verbatim
