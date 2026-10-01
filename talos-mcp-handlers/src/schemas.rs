@@ -135,7 +135,7 @@ pub fn capability_worlds() -> serde_json::Value {
                     "example": "pub fn run(input: String) -> Result<String, String> {\n    use talos::core::json;\n    use talos::core::logging::{self, Level};\n    let val = json::query(&input, \"$.key\").map_err(|e| format!(\"{:?}\", e))?;\n    logging::log(Level::Info, &val);\n    Ok(val)\n}"
                 },
                 "datetime": {
-                    "functions": ["now-unix() -> u64", "now-iso() -> string", "parse(date-str, format?) -> result<u64, error>", "format(timestamp, format) -> result<string, error>", "add-seconds(timestamp, seconds) -> u64", "diff-seconds(t1, t2) -> s64"],
+                    "functions": ["now-unix() -> u64", "now-iso() -> string", "parse(date-str, format?) -> result<u64, error>", "format(timestamp, format) -> result<string, error>", "add-seconds(timestamp, seconds) -> u64", "diff-seconds(t1, t2) -> s64", "local-offset-seconds(zone, timestamp) -> result<s32, error> — seconds east of UTC in an IANA zone (e.g. \"America/New_York\") at that instant, daylight saving included; add it to a timestamp before format() to get the zone's local date"],
                     "example": "pub fn run(input: String) -> Result<String, String> {\n    use talos::core::datetime;\n\nlet now = datetime::now_unix();\nlet iso = datetime::now_iso();\nlet future = datetime::add_seconds(now, 3600);"
                 },
                 "crypto": {
@@ -154,7 +154,7 @@ pub fn capability_worlds() -> serde_json::Value {
             "interfaces": {
                 "logging": { "functions": ["log(level, message)"], "example": "(see minimal world)" },
                 "json": { "functions": ["parse, query, merge, prettify, minify"], "example": "(see minimal world)" },
-                "datetime": { "functions": ["now-unix, now-iso, parse, format, add-seconds, diff-seconds"], "example": "(see minimal world)" },
+                "datetime": { "functions": ["now-unix, now-iso, parse, format, add-seconds, diff-seconds, local-offset-seconds"], "example": "(see minimal world)" },
                 "crypto": { "functions": ["hash, hmac, encode, decode, random-bytes, uuid"], "example": "(see minimal world)" },
                 "env": { "functions": ["get-var, get-all-vars, get-workflow-id, get-execution-id, get-module-id"], "example": "(see minimal world)" },
                 "http": {
