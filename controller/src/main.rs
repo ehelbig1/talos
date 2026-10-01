@@ -595,6 +595,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Err(e) = repo
                         .record_llm_usage(
                             Some(report.execution_id),
+                            report.workflow_id,
                             report.actor_id,
                             report.user_id,
                             &entries,
@@ -638,7 +639,7 @@ async fn main() -> anyhow::Result<()> {
                 let (user_id, actor_id) = (rec.user_id, rec.actor_id);
                 tokio::spawn(async move {
                     if let Err(e) = repo
-                        .record_llm_usage(None, actor_id, user_id, &[entry])
+                        .record_llm_usage(None, None, actor_id, user_id, &[entry])
                         .await
                     {
                         tracing::warn!(error = %e, "failed to record controller LLM usage");

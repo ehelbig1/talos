@@ -798,7 +798,7 @@ impl GraphRagService {
             calls: 1,
         };
         if let Err(e) = repo
-            .record_llm_usage(None, Some(actor_id), None, &[entry])
+            .record_llm_usage(None, None, Some(actor_id), None, &[entry])
             .await
         {
             tracing::warn!(
