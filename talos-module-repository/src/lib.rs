@@ -248,6 +248,10 @@ pub struct CatalogInstallResult {
     pub content_hash: String,
     pub compiled_at: chrono::DateTime<chrono::Utc>,
     pub bytes_changed: bool,
+    /// The fuel limit the row carries AFTER the install — read back from the
+    /// write, because a reinstall keeps the row's own limit unless the caller
+    /// passed one, so the value offered is not always the value stored.
+    pub max_fuel: i64,
 }
 
 /// Module metadata returned by `get_module_metadata`.
@@ -482,12 +486,15 @@ impl CatalogCopyState {
     }
 }
 
-/// The three egress grants stored on a user's module row.
+/// The three egress grants stored on a user's module row, and the fuel limit
+/// stored beside them — the settings a reinstall carries rather than
+/// overwrites.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredModuleGrants {
     pub hosts: Vec<String>,
     pub methods: Vec<String>,
     pub secrets: Vec<String>,
+    pub max_fuel: i64,
 }
 
 /// Row from the `user_modules` view (union of wasm_modules + node_templates).
@@ -3383,19 +3390,22 @@ impl ModuleRepository {
         user_id: Uuid,
         name: &str,
     ) -> Result<Option<StoredModuleGrants>> {
-        let row: Option<(Vec<String>, Vec<String>, Vec<String>)> = sqlx::query_as(
-            "SELECT allowed_hosts, allowed_methods, allowed_secrets \
+        let row: Option<(Vec<String>, Vec<String>, Vec<String>, i64)> = sqlx::query_as(
+            "SELECT allowed_hosts, allowed_methods, allowed_secrets, max_fuel \
              FROM modules WHERE user_id = $1 AND name = $2",
         )
         .bind(user_id)
         .bind(name)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(row.map(|(hosts, methods, secrets)| StoredModuleGrants {
-            hosts,
-            methods,
-            secrets,
-        }))
+        Ok(
+            row.map(|(hosts, methods, secrets, max_fuel)| StoredModuleGrants {
+                hosts,
+                methods,
+                secrets,
+                max_fuel,
+            }),
+        )
     }
 
     /// Phase 3.2 install path: write a catalog-installed module to the
@@ -3464,8 +3474,14 @@ impl ModuleRepository {
         // I expected to install" without having to follow up with a
         // get_module_info call. Surfaced through MCP as the recompile
         // receipt added 2026-04-30 (post-watch-ghas debug session).
-        let row: (Uuid, Vec<String>, String, chrono::DateTime<chrono::Utc>, bool) =
-            sqlx::query_as(
+        let row: (
+            Uuid,
+            Vec<String>,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            bool,
+            i64,
+        ) = sqlx::query_as(
                 "WITH prev AS ( \
                     SELECT content_hash AS prev_hash \
                     FROM modules \
@@ -3504,14 +3520,15 @@ impl ModuleRepository {
                                         ELSE modules.max_fuel END, \
                         compiled_at = NOW() \
                      /* updated_at deliberately NOT set — see talos-registry/src/lib.rs. */ \
-                     RETURNING id, allowed_secrets, content_hash, compiled_at \
+                     RETURNING id, allowed_secrets, content_hash, compiled_at, max_fuel \
                  ) \
                  SELECT \
                     upsert.id, \
                     upsert.allowed_secrets, \
                     upsert.content_hash, \
                     upsert.compiled_at, \
-                    COALESCE(prev.prev_hash IS DISTINCT FROM upsert.content_hash, true) AS bytes_changed \
+                    COALESCE(prev.prev_hash IS DISTINCT FROM upsert.content_hash, true) AS bytes_changed, \
+                    upsert.max_fuel \
                  FROM upsert LEFT JOIN prev ON true",
             )
             .bind(user_id)
@@ -3559,6 +3576,7 @@ impl ModuleRepository {
             content_hash: row.2,
             compiled_at: row.3,
             bytes_changed: row.4,
+            max_fuel: row.5,
         })
     }
 
