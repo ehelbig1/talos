@@ -67,6 +67,96 @@ pub fn capability_world_long(short: &str) -> String {
     }
 }
 
+/// The installed copy an install is about to overwrite, read under its row
+/// lock: capability world, the three grant lists and the content hash.
+type InstalledCopyBefore = (
+    String,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+);
+
+/// What an install wrote, for [`catalog_install_record`].
+struct InstalledCopyAfter<'a> {
+    capability_world: &'a str,
+    allowed_hosts: &'a [String],
+    allowed_methods: &'a [String],
+    allowed_secrets: &'a [String],
+    content_hash: &'a str,
+}
+
+/// The `admin_event_log` record for one catalog install: event type, summary
+/// and details. Pure, so what the record says can be tested without a database.
+///
+/// A first install records what was granted. A reinstall records every value
+/// it replaced beside the new one (`previous_<field>`), plus two booleans a
+/// reader can filter on: `code_changed` and `grants_changed`. The summary
+/// names a capability-world change and a grant change in words, because those
+/// are the two that alter what the module may do.
+fn catalog_install_record(
+    name: &str,
+    catalog_slug: Option<&str>,
+    previous: Option<&InstalledCopyBefore>,
+    after: &InstalledCopyAfter<'_>,
+) -> (&'static str, String, serde_json::Value) {
+    let slug = catalog_slug.unwrap_or("unknown");
+    let mut details = serde_json::json!({
+        "catalog_slug": catalog_slug,
+        "capability_world": after.capability_world,
+        "allowed_hosts": after.allowed_hosts,
+        "allowed_methods": after.allowed_methods,
+        "allowed_secrets": after.allowed_secrets,
+        "content_hash": after.content_hash,
+    });
+    let Some((world, hosts, methods, secrets, hash)) = previous else {
+        return (
+            "module_installed_from_catalog",
+            format!(
+                "Installed module '{name}' from catalog template '{slug}' ({})",
+                after.capability_world
+            ),
+            details,
+        );
+    };
+    let world_changed = world != after.capability_world;
+    let grants_changed = hosts.as_slice() != after.allowed_hosts
+        || methods.as_slice() != after.allowed_methods
+        || secrets.as_slice() != after.allowed_secrets;
+    let code_changed = hash.as_deref() != Some(after.content_hash);
+    if let Some(obj) = details.as_object_mut() {
+        obj.insert("previous_capability_world".into(), serde_json::json!(world));
+        obj.insert("previous_allowed_hosts".into(), serde_json::json!(hosts));
+        obj.insert(
+            "previous_allowed_methods".into(),
+            serde_json::json!(methods),
+        );
+        obj.insert(
+            "previous_allowed_secrets".into(),
+            serde_json::json!(secrets),
+        );
+        obj.insert("previous_content_hash".into(), serde_json::json!(hash));
+        obj.insert("code_changed".into(), serde_json::json!(code_changed));
+        obj.insert("grants_changed".into(), serde_json::json!(grants_changed));
+    }
+    let mut summary = format!(
+        "Reinstalled module '{name}' from catalog template '{slug}': code {}, grants {}",
+        if code_changed { "changed" } else { "unchanged" },
+        if grants_changed {
+            "changed"
+        } else {
+            "unchanged"
+        },
+    );
+    if world_changed {
+        summary.push_str(&format!(
+            ", capability world {world} -> {}",
+            after.capability_world
+        ));
+    }
+    ("module_reinstalled_from_catalog", summary, details)
+}
+
 /// What a recorded module-permission change replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModulePermissionChange {
@@ -3271,6 +3361,16 @@ impl ModuleRepository {
     /// keeping the same modules.id so workflows that reference it
     /// continue to resolve. Permissions are refreshed from the latest
     /// install args (matching the legacy ON CONFLICT semantic).
+    ///
+    /// **Recorded.** An install replaces a module's code and can replace its
+    /// capability world and all three grant lists, so it writes one
+    /// `admin_event_log` row in the SAME transaction as the write
+    /// (`module_installed_from_catalog` / `module_reinstalled_from_catalog`),
+    /// naming what it replaced. The existing row is locked first, so the
+    /// "previous" values are the ones this write overwrote. An install that
+    /// cannot be recorded does not happen. Until 2026-10-01 this was the one
+    /// module-grant writer with no record: a reinstall could widen
+    /// `allowed_secrets` to the template's whole grant and leave no trace.
     #[allow(clippy::too_many_arguments)]
     pub async fn install_catalog_module_to_modules(
         &self,
@@ -3290,6 +3390,19 @@ impl ModuleRepository {
         fuel_explicit: bool,
     ) -> Result<CatalogInstallResult> {
         let cw_long = capability_world_long(capability_world_short);
+
+        let mut tx = self.db_pool.begin().await?;
+        // Lock the row this install overwrites (none on a first install), so
+        // the record below describes exactly what was replaced.
+        let previous: Option<InstalledCopyBefore> = sqlx::query_as(
+            "SELECT capability_world, allowed_hosts, allowed_methods, allowed_secrets, \
+                    content_hash \
+             FROM modules WHERE user_id = $1 AND name = $2 FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
 
         // CTE pattern: capture prior content_hash in the SAME statement as the
         // upsert. `prev` and `upsert` see the same snapshot so the
@@ -3354,7 +3467,7 @@ impl ModuleRepository {
             )
             .bind(user_id)
             .bind(name)
-            .bind(cw_long)
+            .bind(&cw_long)
             .bind(config_schema)
             .bind(allowed_hosts)
             .bind(allowed_methods)
@@ -3367,8 +3480,30 @@ impl ModuleRepository {
             .bind(max_fuel)
             .bind(catalog_slug)
             .bind(fuel_explicit)
-            .fetch_one(&self.db_pool)
+            .fetch_one(&mut *tx)
             .await?;
+
+        let after = InstalledCopyAfter {
+            capability_world: &cw_long,
+            allowed_hosts,
+            allowed_methods,
+            allowed_secrets: &row.1,
+            content_hash: &row.2,
+        };
+        let (event_type, summary, details) =
+            catalog_install_record(name, catalog_slug, previous.as_ref(), &after);
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            user_id,
+            event_type,
+            "module",
+            Some(row.0),
+            &summary,
+            Some(&details),
+        )
+        .await?;
+        tx.commit().await?;
+
         Ok(CatalogInstallResult {
             module_id: row.0,
             allowed_secrets: row.1,
@@ -4149,6 +4284,80 @@ fn dependent_workflows_sql(third: &str) -> String {
                   OR lower(n -> 'data' ->> 'moduleId') = ANY($1::text[])) \
          ORDER BY w.updated_at DESC, w.id DESC LIMIT 50"
     )
+}
+
+#[cfg(test)]
+mod catalog_install_record_tests {
+    use super::{catalog_install_record, InstalledCopyAfter, InstalledCopyBefore};
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A reinstall that moves the capability world says so in the summary,
+    /// and a world change alone is not reported as a grant change.
+    #[test]
+    fn a_world_change_is_named_and_is_not_a_grant_change() {
+        let before: InstalledCopyBefore = (
+            "http-node".into(),
+            v(&["api.example.com"]),
+            v(&["GET"]),
+            vec![],
+            Some("h1".into()),
+        );
+        let (hosts, methods) = (v(&["api.example.com"]), v(&["GET"]));
+        let after = InstalledCopyAfter {
+            capability_world: "automation-node",
+            allowed_hosts: &hosts,
+            allowed_methods: &methods,
+            allowed_secrets: &[],
+            content_hash: "h1",
+        };
+        let (kind, summary, details) =
+            catalog_install_record("m", Some("slug"), Some(&before), &after);
+        assert_eq!(kind, "module_reinstalled_from_catalog");
+        assert!(
+            summary.contains("capability world http-node -> automation-node"),
+            "{summary}"
+        );
+        assert!(summary.contains("code unchanged") && summary.contains("grants unchanged"));
+        assert_eq!(details["previous_capability_world"], "http-node");
+        assert_eq!(details["capability_world"], "automation-node");
+        assert_eq!(details["grants_changed"], false);
+    }
+
+    /// Each of the three lists counts as a grant change on its own, and a row
+    /// that had no content hash reads as changed code.
+    #[test]
+    fn each_grant_list_and_a_missing_hash_count_as_changes() {
+        let base = (v(&["a"]), v(&["GET"]), v(&["s"]));
+        let cases: [(&[&str], &[&str], &[&str]); 3] = [
+            (&["b"], &["GET"], &["s"]),
+            (&["a"], &["POST"], &["s"]),
+            (&["a"], &["GET"], &["s", "t"]),
+        ];
+        for (hosts, methods, secrets) in cases {
+            let before: InstalledCopyBefore = (
+                "http-node".into(),
+                base.0.clone(),
+                base.1.clone(),
+                base.2.clone(),
+                None,
+            );
+            let (h, m, s) = (v(hosts), v(methods), v(secrets));
+            let after = InstalledCopyAfter {
+                capability_world: "http-node",
+                allowed_hosts: &h,
+                allowed_methods: &m,
+                allowed_secrets: &s,
+                content_hash: "h1",
+            };
+            let (_, summary, details) = catalog_install_record("m", None, Some(&before), &after);
+            assert_eq!(details["grants_changed"], true, "{summary}");
+            assert_eq!(details["code_changed"], true);
+            assert!(!summary.contains("capability world"), "{summary}");
+        }
+    }
 }
 
 #[cfg(test)]
