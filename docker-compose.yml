@@ -683,8 +683,20 @@ services:
       # consults when JAEGER_ENDPOINT is unset. Transporting them would reopen
       # trace export through the back door that prohibition closes.
       # Embeddings — Ollama (OpenAI-compatible API, local, no API key required).
-      # Override EMBEDDING_API_URL / EMBEDDING_API_KEY to switch providers (Azure, OpenAI, Jina…).
-      EMBEDDING_API_URL: "http://ollama:11434/v1/embeddings"
+      # Set EMBEDDING_API_URL (and EMBEDDING_API_KEY where the provider needs
+      # one) in .env to switch providers: Azure, OpenAI, Jina, or the host's
+      # own Ollama at http://host.docker.internal:11434/v1/embeddings. Unset,
+      # the bundled embedder below is used. Until 2026-10-01 the URL was a
+      # literal here and the key was not passed at all, so neither could be
+      # set from .env although this comment said to override them.
+      # A tier-1 actor's text is embedded only by a HOST-LOCAL provider; an
+      # external URL leaves those actors without semantic memory.
+      EMBEDDING_API_URL: ${EMBEDDING_API_URL:-http://ollama:11434/v1/embeddings}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      # Per-attempt timeout (seconds, 1-60) and simultaneous calls to a local
+      # embedder; empty means the built-in default (8 and 1).
+      EMBEDDING_TIMEOUT_SECS: ${EMBEDDING_TIMEOUT_SECS:-}
+      TALOS_EMBEDDING_MAX_IN_FLIGHT: ${TALOS_EMBEDDING_MAX_IN_FLIGHT:-}
       # mxbai-embed-large emits 1024-dim vectors, matching the `vector(1024)`
       # embedding columns (migration 20260429120000 resized them for the Voyage
       # provider). The previous default, nomic-embed-text, emits 768 dims, so
