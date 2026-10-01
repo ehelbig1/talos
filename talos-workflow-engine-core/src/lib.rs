@@ -125,6 +125,7 @@ mod event_sink;
 mod expression;
 mod graph_store;
 pub mod inference_wait;
+pub mod input_preview;
 mod judge_score_recorder;
 mod llm_tier;
 mod memory_freshness;

@@ -422,7 +422,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_node_io",
-            "description": "Get the input and output for a specific node in a workflow execution. Useful for debugging data flow between nodes.",
+            "description": "Get the stored input snapshot and the output of one node in a workflow execution — for debugging data flow between nodes. `input_status` says what `input` is: `complete`; `shortened` (the input was over 4096 bytes, so long strings, long arrays, wide objects and deep nesting are abbreviated with a '…' marker — keys and nesting are kept); `unparseable` (the stored text is not JSON — an older row cut mid-structure — and is returned raw as `truncated_preview`); `not_recorded` (system nodes such as collect/judge/sub_workflow and nodes that never ran store none); or `unreadable` (the read failed). Engine-supplied keys (__accumulated__, __actor_context__, __trigger_input__, __staleness__, __degraded_inputs__) are never in the snapshot although the node received them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7333,50 +7333,23 @@ async fn handle_get_node_io(
         // caller passing the rf_id (rather than a label) still resolves.
         .unwrap_or_else(|| talos_workflow_engine_core::engine_node_uuid(node_id_str));
 
-    // Query execution_events for node_input event
-    let node_input = match state
+    // The stored input snapshot. A failed read is REPORTED as unreadable: a
+    // bare `"input": null` would read as "this node recorded no input".
+    let input_read = state
         .execution_repo
         .get_latest_node_input_event(exec_id, node_uuid)
         .await
-    {
-        Ok(opt) => opt,
-        Err(e) => {
-            tracing::warn!(error = %e, "get_node_io: failed to query node_input events");
-            None
-        }
-    };
-
-    // Parse input as JSON if possible, otherwise return as string.
-    //
-    // MCP-32: the engine truncates oversized node_input previews with
-    // a literal "...(truncated)" suffix, which makes the stored
-    // log_message an invalid-JSON tail of a valid-JSON head. Strip
-    // the suffix before parsing so the structured object operators
-    // expect comes back; on failure (genuinely-bad JSON) fall back to
-    // the wrapped-string shape with a `truncated_preview` flag so the
-    // operator knows the structure couldn't be recovered.
-    //
-    // MCP-41: redact any `__actor_context__` memory values before
-    // returning. Same security invariant as get_execution_logs:
-    // node-input projections must not leak what list_actor_memories
-    // hides.
-    let input_value = match &node_input {
-        Some(s) => {
-            let redacted_str = redact_actor_context_in_log(s);
-            const TRUNCATION_SUFFIX: &str = "...(truncated)";
-            let parse_target = redacted_str
-                .strip_suffix(TRUNCATION_SUFFIX)
-                .unwrap_or(&redacted_str);
-            match serde_json::from_str::<serde_json::Value>(parse_target) {
-                Ok(v) => v,
-                Err(_) => serde_json::json!({
-                    "truncated_preview": redacted_str,
-                    "note": "log_message could not be parsed as JSON (likely truncated mid-structure). The value is the raw stored preview."
-                }),
-            }
-        }
-        None => serde_json::Value::Null,
-    };
+        .map_err(|e| {
+            tracing::warn!(
+                execution_id = %exec_id,
+                error = %e,
+                "get_node_io: failed to read the node_input event"
+            );
+        });
+    let input_report = node_input_report(match &input_read {
+        Ok(stored) => Ok(stored.as_deref()),
+        Err(()) => Err(()),
+    });
 
     // Extract node output from execution output_data. The engine's
     // canonical output map is keyed by node UUID (the SHA-256-derived
@@ -7405,11 +7378,167 @@ async fn handle_get_node_io(
         archived_at,
         serde_json::to_string_pretty(&serde_json::json!({
             "node_id": node_id_str,
-            "input": input_value,
+            "input": input_report.value,
+            "input_status": input_report.status,
+            "input_note": input_report.note,
             "output": output_value,
         }))
         .unwrap_or_default(),
     )
+}
+
+/// What `get_node_io` says about a node's stored input snapshot.
+struct NodeInputReport {
+    /// The snapshot as JSON; `null` when there is none to show.
+    value: serde_json::Value,
+    /// `complete` | `shortened` | `unparseable` | `not_recorded` | `unreadable`.
+    status: &'static str,
+    /// What the status means for the reader. Always present.
+    note: String,
+}
+
+/// Classifies the stored `node_input` snapshot (see
+/// `talos_workflow_engine_core::input_preview` for how it is written).
+///
+/// * `complete` — the input fitted the snapshot limit and is shown whole.
+/// * `shortened` — it did not; long strings, long arrays, wide objects and
+///   deep nesting are abbreviated, each marked with `…`, and the result is
+///   still one JSON document.
+/// * `unparseable` — the stored text is not JSON and is returned as a string:
+///   a row written before snapshots were shortened (a cut-off prefix), or one
+///   where string-level redaction replaced a `"key":"value"` pair as a single
+///   token (0 of 6,406 complete snapshots measured 2026-10-01).
+/// * `not_recorded` / `unreadable` — nothing stored, or the read failed.
+///   These are different answers and are never both rendered as `null`
+///   without saying which.
+fn node_input_report(read: Result<Option<&str>, ()>) -> NodeInputReport {
+    use talos_workflow_engine_core::input_preview::{
+        split_stored_preview, NODE_INPUT_PREVIEW_MAX_BYTES,
+    };
+    let omitted = format!(
+        "Engine-supplied keys ({}) are never stored in a snapshot; the node received them \
+         wherever the engine provided them.",
+        talos_workflow_engine_core::reserved_keys::ENGINE_AUTHORED_INPUT_KEYS.join(", ")
+    );
+    let stored = match read {
+        Err(()) => {
+            return NodeInputReport {
+                value: serde_json::Value::Null,
+                status: "unreadable",
+                note: "The input snapshot could not be read (database error). This is not a \
+                       statement that the node had no input; retry."
+                    .to_string(),
+            }
+        }
+        Ok(None) => {
+            return NodeInputReport {
+                value: serde_json::Value::Null,
+                status: "not_recorded",
+                note: "No input snapshot is stored for this node in this execution. A snapshot \
+                       is written when a module node is dispatched; system nodes (collect, \
+                       judge, sub_workflow, …) and nodes that never ran have none."
+                    .to_string(),
+            }
+        }
+        Ok(Some(s)) => s,
+    };
+    // MCP-41: rows written before the engine stopped storing
+    // `__actor_context__` may still carry memory values.
+    let redacted = redact_actor_context_in_log(stored);
+    let (body, shortened) = split_stored_preview(&redacted);
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) if shortened => NodeInputReport {
+            value,
+            status: "shortened",
+            note: format!(
+                "The input was larger than the {NODE_INPUT_PREVIEW_MAX_BYTES}-byte snapshot \
+                 limit, so long strings, long arrays, wide objects and deep nesting are \
+                 abbreviated; every abbreviation is marked with '…'. Keys and nesting are as \
+                 dispatched. {omitted}"
+            ),
+        },
+        Ok(value) => NodeInputReport {
+            value,
+            status: "complete",
+            note: omitted,
+        },
+        Err(_) => NodeInputReport {
+            value: serde_json::json!({ "truncated_preview": redacted }),
+            status: "unparseable",
+            note: format!(
+                "The stored snapshot does not parse as JSON; `truncated_preview` is the raw \
+                 stored text. Either it was written before oversized inputs were shortened \
+                 (it is then a cut-off prefix), or redaction replaced a `\"key\":\"value\"` \
+                 pair as one token. {omitted}"
+            ),
+        },
+    }
+}
+
+#[cfg(test)]
+mod node_input_report_tests {
+    use super::node_input_report;
+    use serde_json::json;
+    use talos_workflow_engine_core::input_preview::node_input_preview;
+
+    #[test]
+    fn a_small_input_is_complete_and_shown_whole() {
+        let input = json!({"config": {"MODEL": "m"}, "input": {"n": 1}});
+        let stored = node_input_preview(&input);
+        let report = node_input_report(Ok(Some(&stored)));
+        assert_eq!(report.status, "complete");
+        assert_eq!(report.value, input);
+        assert!(report.note.contains("__accumulated__"), "{}", report.note);
+    }
+
+    #[test]
+    fn an_oversized_input_comes_back_as_an_object_with_every_key() {
+        // The shape that used to come back as one raw string: a long value
+        // sorted ahead of the keys after it.
+        let input = json!({
+            "config": {"TO": "x"},
+            "html": "h".repeat(30_000),
+            "items": (0..200).map(|i| json!({"id": i})).collect::<Vec<_>>(),
+            "zeta": 1,
+        });
+        let stored = node_input_preview(&input);
+        let report = node_input_report(Ok(Some(&stored)));
+        assert_eq!(report.status, "shortened");
+        let obj = report.value.as_object().expect("a JSON object");
+        for key in ["config", "html", "items", "zeta"] {
+            assert!(obj.contains_key(key), "`{key}` missing");
+        }
+        assert!(obj.get("truncated_preview").is_none());
+        assert!(report.note.contains('…'), "{}", report.note);
+    }
+
+    #[test]
+    fn a_row_cut_mid_structure_is_reported_as_unparseable_not_as_structure() {
+        let old = r#"{"config":{"TO":"x"},"html":"<div style=...(truncated)"#;
+        let report = node_input_report(Ok(Some(old)));
+        assert_eq!(report.status, "unparseable");
+        assert_eq!(report.value["truncated_preview"], json!(old));
+    }
+
+    #[test]
+    fn an_unparseable_row_never_shows_actor_memory() {
+        let old =
+            r#"{"A":1,"__actor_context__":{"memories":[{"key":"k","value":"SECRET...(truncated)"#;
+        let report = node_input_report(Ok(Some(old)));
+        assert_eq!(report.status, "unparseable");
+        assert!(!report.value.to_string().contains("SECRET"));
+    }
+
+    #[test]
+    fn nothing_stored_and_a_failed_read_are_different_answers() {
+        let none = node_input_report(Ok(None));
+        let failed = node_input_report(Err(()));
+        assert_eq!(none.status, "not_recorded");
+        assert_eq!(failed.status, "unreadable");
+        assert!(none.value.is_null() && failed.value.is_null());
+        assert_ne!(none.note, failed.note);
+        assert!(failed.note.contains("not a statement"), "{}", failed.note);
+    }
 }
 
 #[cfg(test)]

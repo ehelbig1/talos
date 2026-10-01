@@ -440,29 +440,14 @@ impl ParallelWorkflowEngine {
             serde_json::Value::Object(merged)
         };
 
-        // Truncated input preview for the node-I/O inspector.
-        // Cut on a UTF-8 char boundary — slicing by bytes alone panics when
-        // the cut lands inside a multi-byte character (e.g. an em-dash in an
-        // INJECT_CONTEXT actor-memory payload, real prod symptom 2026-04-29).
+        // Bounded input snapshot for the node-I/O inspector. An input over the
+        // limit is SHORTENED (still one valid JSON document, every key kept)
+        // rather than cut mid-structure, and engine-authored keys (decrypted
+        // `__actor_context__`, `__accumulated__`, …) never reach this
+        // plaintext event row — see `input_preview`.
         {
-            let input_preview = {
-                // Engine-authored keys (decrypted `__actor_context__`,
-                // `__accumulated__`, …) never reach this plaintext event row.
-                let s = serde_json::to_string(
-                    &talos_workflow_engine_core::reserved_keys::WithoutEngineAuthoredKeys(
-                        &wrapped_input,
-                    ),
-                )
-                .unwrap_or_default();
-                if s.len() > 4096 {
-                    format!(
-                        "{}...(truncated)",
-                        crate::validation::truncate_at_char_boundary(&s, 4096)
-                    )
-                } else {
-                    s
-                }
-            };
+            let input_preview =
+                talos_workflow_engine_core::input_preview::node_input_preview(&wrapped_input);
             emit_event_spawn(
                 &self.event_sink,
                 NodeEventWrite {
