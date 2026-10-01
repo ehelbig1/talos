@@ -385,6 +385,47 @@ mod catalog_template_tests {
     /// template that reads `config.get("KEY")` is not covered — seven older
     /// templates disagree with their schema that way and are recorded in
     /// `docs/engineering-log/packages/2026-10-01-template-config-docs.md`.
+    /// A template's declared fuel must cover the largest request its own
+    /// schema documents. `gmail-list-messages` declared none, so a fresh
+    /// install took the generic baseline (~2.2 M) while one page at its
+    /// documented maximum of 25 messages needs about 2.3 M — measured
+    /// 2026-10-01 on the installed copy: 1,754,755 fuel for 19 messages
+    /// (~92 K each). Every node using it carried its own `max_fuel` to get
+    /// past the module's limit.
+    #[test]
+    fn a_templates_recommended_fuel_covers_its_documented_maximum_page() {
+        // (template, measured fuel per item, the page size its schema allows)
+        let measured: [(&str, u64, u64); 1] = [("gmail-list-messages", 92_000, 25)];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../module-templates");
+        for (template, per_item, max_items) in measured {
+            let path = root.join(template).join("talos.json");
+            let manifest: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+            )
+            .unwrap_or_else(|e| panic!("{template}: talos.json: {e}"));
+            let rec = manifest
+                .get("recommended_fuel")
+                .unwrap_or_else(|| panic!("{template} declares no recommended_fuel"));
+            let field = |k: &str| rec.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let limit = crate::scaffold::compute_max_fuel_with_llm_output(
+                field("expected_items"),
+                field("bytes_per_item"),
+                field("llm_output_bytes"),
+                rec.get("safety_multiplier")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(2.0),
+            );
+            // Twice the measured need: a page of larger messages still fits.
+            let need = per_item * max_items * 2;
+            assert!(
+                limit >= need,
+                "{template}: recommended fuel resolves to {limit}, below {need} \
+                 (2 x {per_item} measured per item x {max_items} items)"
+            );
+        }
+    }
+
     #[test]
     fn a_config_key_a_template_deserializes_by_name_is_in_its_config_schema() {
         let rename = regex::Regex::new(r#"#\[serde\([^)]*\brename\s*=\s*"([A-Z][A-Z0-9_]+)""#)

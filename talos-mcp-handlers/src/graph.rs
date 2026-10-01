@@ -1562,9 +1562,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "properties": {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow" },
                     "node_id": { "type": "string", "description": "ID of the node within the workflow graph" },
-                    "enabled": { "type": "boolean", "description": "true to enable continue_on_error, false to disable" }
+                    "enabled": { "type": "boolean", "description": "true to enable continue_on_error, false to disable" },
+                    "continue_on_error": { "type": "boolean", "description": "Alias for `enabled`, matching the name add_node_to_workflow, create_workflow and get_workflow use for this flag. Either is accepted; `enabled` wins when both are given." }
                 },
-                "required": ["workflow_id", "node_id", "enabled"]
+                "required": ["workflow_id", "node_id"]
             }
         }),
         serde_json::json!({
@@ -4718,13 +4719,17 @@ async fn handle_set_continue_on_error(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let enabled = match args.get("enabled").and_then(|v| v.as_bool()) {
+    // `continue_on_error` is the name add_node_to_workflow, create_workflow and
+    // get_workflow all use for this flag; accepted here as an alias.
+    let enabled = match crate::utils::arg_or_alias(args, "enabled", "continue_on_error")
+        .and_then(|v| v.as_bool())
+    {
         Some(e) => e,
         None => {
             return mcp_error(
                 req_id,
                 -32602,
-                "Missing or invalid 'enabled' parameter (must be boolean)",
+                "Missing or invalid 'enabled' parameter (must be boolean; 'continue_on_error' is accepted as an alias)",
             )
         }
     };
@@ -7386,5 +7391,58 @@ mod cycle_gate_tests {
                 "acyclic graph refused: {graph}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod set_continue_on_error_alias_tests {
+    /// Both halves: the alias is DECLARED (else it is undiscoverable) and READ
+    /// through `arg_or_alias` (else it fails at call time).
+    #[test]
+    fn the_alias_is_declared_and_read() {
+        let tools = super::tool_schemas();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "set_continue_on_error")
+            .expect("declared");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["properties"]["continue_on_error"]["type"], "boolean");
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            required,
+            ["workflow_id", "node_id"],
+            "neither spelling alone can be required"
+        );
+
+        let source = include_str!("graph.rs");
+        let handler = source
+            .split("async fn handle_set_continue_on_error")
+            .nth(1)
+            .expect("handler present");
+        let body = &handler[..handler.find("\nasync fn ").unwrap_or(handler.len())];
+        let call = ["arg_or_alias(args, \"enabled\"", ", \"continue_on_error\")"].concat();
+        assert!(body.contains(&call), "the handler must read the alias");
+    }
+
+    #[test]
+    fn enabled_wins_and_null_falls_through() {
+        use crate::utils::arg_or_alias;
+        let both = serde_json::json!({"enabled": false, "continue_on_error": true});
+        assert_eq!(
+            arg_or_alias(&both, "enabled", "continue_on_error").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let alias = serde_json::json!({"enabled": null, "continue_on_error": true});
+        assert_eq!(
+            arg_or_alias(&alias, "enabled", "continue_on_error").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let neither = serde_json::json!({"node_id": "n"});
+        assert!(arg_or_alias(&neither, "enabled", "continue_on_error").is_none());
     }
 }
