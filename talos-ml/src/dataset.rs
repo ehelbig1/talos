@@ -208,6 +208,52 @@ pub struct ContentDedupeOutcome {
     pub rows_without_embedding: i64,
 }
 
+/// Which of a dataset's rows a re-embed pass takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReEmbedScope {
+    /// Rows the ACTIVE embedding model cannot serve: no stored vector, or a
+    /// vector produced by another model. These rows are invisible to kNN
+    /// serving and to eval until re-embedded.
+    Stale,
+    /// Every row. For a change of embedding RUNTIME under the same model
+    /// name: the vectors are near-identical but not byte-identical, and
+    /// content de-duplication groups on the vector's bytes, so old and new
+    /// copies of one text stop collapsing until the old rows are re-embedded.
+    All,
+}
+
+/// What a dataset holds, by how the active embedding model sees it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ReEmbedSurvey {
+    pub total: i64,
+    /// No stored vector.
+    pub without_embedding: i64,
+    /// A vector produced by a model other than the active one (or by none
+    /// recorded).
+    pub other_model: i64,
+    /// A vector produced by the active model.
+    pub active_model: i64,
+}
+
+/// One bounded re-embed pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ReEmbedBatch {
+    /// Rows this pass looked at.
+    pub processed: usize,
+    /// Rows whose stored vector or model changed.
+    pub re_embedded: usize,
+    /// Rows whose new vector is byte-identical to the stored one (not
+    /// rewritten).
+    pub unchanged: usize,
+    /// Rows left as they were: the embedder gave no usable vector, or the
+    /// row could not be decrypted. A later pass can retry them.
+    pub failed: usize,
+    /// Pass this as `after` to continue. `None` when nothing was processed.
+    pub next_after: Option<Uuid>,
+    /// No rows remain past `next_after`.
+    pub done: bool,
+}
+
 /// The `DO UPDATE … WHERE` arm of the example upsert: a conflicting row is
 /// rewritten only when something a model can see would change.
 ///
@@ -272,6 +318,9 @@ type EncRow = (
     String,
     Option<String>,
 );
+/// Most rows one re-embed pass takes.
+pub const RE_EMBED_MAX_BATCH: i64 = 500;
+
 const ENC_ROW_COLS: &str = "id, features_enc, features_key_id, features_format, \
                             label_json->>'label', source, example_key";
 
@@ -1304,65 +1353,165 @@ impl DatasetService {
         })
     }
 
-    /// Decrypt the holdout set for eval: wipe-on-drop plaintext + the
-    /// STORED embedding (eval reuses it instead of re-embedding, which
-    /// Re-embed rows whose vector was produced by a DIFFERENT model
-    /// than the active one (provenance migration follow-path): decrypt
-    /// features, regenerate locally (`local_only = true`, matching the
-    /// append path — dataset text never leaves the host for embedding),
-    /// stamp the new model. Batched; call repeatedly until it returns
-    /// 0. Rows whose embedder call fails are left untouched (still
-    /// invisible to reads via the strict filter — degrade, never mix).
-    pub async fn re_embed_examples(
+    /// Count a dataset's rows by how `active_model` sees them.
+    pub async fn re_embed_survey(
         &self,
         conn: &mut PgConnection,
         dataset_id: Uuid,
-        limit: i64,
-    ) -> Result<usize> {
-        let Some(active) = talos_memory::embedding::active_embedding_model() else {
-            return Ok(0);
-        };
-        let limit = limit.clamp(1, 500);
-        let rows: Vec<(
-            Uuid,
-            Vec<u8>,
-            Uuid,
-            i16,
-            Option<String>,
-            String,
-            Option<String>,
-        )> = sqlx::query_as(&format!(
-            "SELECT {ENC_ROW_COLS} FROM ml_examples \
-                 WHERE dataset_id = $1 AND embedding IS NOT NULL \
-                   AND embedding_model IS DISTINCT FROM $2 \
-                 ORDER BY created_at ASC LIMIT $3",
-        ))
+        active_model: &str,
+    ) -> Result<ReEmbedSurvey> {
+        let (total, without_embedding, other_model): (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), \
+                    COUNT(*) FILTER (WHERE embedding IS NULL), \
+                    COUNT(*) FILTER (WHERE embedding IS NOT NULL \
+                                       AND embedding_model IS DISTINCT FROM $2) \
+               FROM ml_examples WHERE dataset_id = $1",
+        )
         .bind(dataset_id)
-        .bind(&active)
-        .bind(limit)
-        .fetch_all(&mut *conn)
-        .await?;
-
-        let mut done = 0usize;
-        for row in rows {
-            let (id, _label, _source, text) = self.decrypt_row(dataset_id, row).await?;
-            let Some(emb) = talos_memory::embedding::generate_embedding(&text, true).await else {
-                tracing::warn!(%id, "re_embed_examples: embedder unavailable — row left for retry");
-                continue;
-            };
-            sqlx::query(
-                "UPDATE ml_examples SET embedding = $1, embedding_model = $2 WHERE id = $3",
-            )
-            .bind(pgvector::Vector::from(emb))
-            .bind(&active)
-            .bind(id)
-            .execute(&mut *conn)
-            .await?;
-            done += 1;
-        }
-        Ok(done)
+        .bind(active_model)
+        .fetch_one(&mut *conn)
+        .await
+        .context("survey examples for re-embedding")?;
+        Ok(ReEmbedSurvey {
+            total,
+            without_embedding,
+            other_model,
+            active_model: total - without_embedding - other_model,
+        })
     }
 
+    /// Re-embed up to `limit` of a dataset's rows IN PLACE with the local
+    /// embedder, stamping the active model. See [`Self::re_embed_batch_with`].
+    ///
+    /// `local_only = true`, as on the append path: dataset text never leaves
+    /// the host to be embedded.
+    pub async fn re_embed_batch(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+        scope: ReEmbedScope,
+        after: Option<Uuid>,
+        limit: i64,
+        budget: std::time::Duration,
+    ) -> Result<ReEmbedBatch> {
+        let Some(active) = talos_memory::embedding::active_embedding_model() else {
+            anyhow::bail!("no embedding provider is configured");
+        };
+        self.re_embed_batch_with(
+            conn,
+            dataset_id,
+            scope,
+            after,
+            limit,
+            budget,
+            &active,
+            |text| async move { talos_memory::embedding::generate_embedding(&text, true).await },
+        )
+        .await
+    }
+
+    /// The pass itself, with the model identity and the embedder supplied by
+    /// the caller (so it is driven without a live provider in tests).
+    ///
+    /// Rows are taken in `id` order after `after`, so a pass is resumable and
+    /// a row that fails is stepped over rather than retried at the head of
+    /// every later pass. The pass stops at `limit` rows or when `budget` is
+    /// spent, whichever comes first, and reports where it stopped.
+    ///
+    /// A row is written only when its vector or model actually changes: the
+    /// same text on the same runtime yields the same bytes, and rewriting a
+    /// row to the value it holds is still a write. The dataset's
+    /// `updated_at` is NOT touched — that column drives retraining, and a
+    /// re-embed changes no label and no text.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn re_embed_batch_with<E, Fut>(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+        scope: ReEmbedScope,
+        after: Option<Uuid>,
+        limit: i64,
+        budget: std::time::Duration,
+        active_model: &str,
+        embed: E,
+    ) -> Result<ReEmbedBatch>
+    where
+        E: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Option<Vec<f32>>>,
+    {
+        let limit = limit.clamp(1, RE_EMBED_MAX_BATCH);
+        let rows: Vec<EncRow> = sqlx::query_as(&format!(
+            "SELECT {ENC_ROW_COLS} FROM ml_examples \
+              WHERE dataset_id = $1 \
+                AND ($2::uuid IS NULL OR id > $2) \
+                AND ($3 OR embedding IS NULL OR embedding_model IS DISTINCT FROM $4) \
+              ORDER BY id ASC LIMIT $5",
+        ))
+        .bind(dataset_id)
+        .bind(after)
+        .bind(scope == ReEmbedScope::All)
+        .bind(active_model)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await
+        .context("select examples to re-embed")?;
+
+        let fetched = rows.len();
+        let started = std::time::Instant::now();
+        let mut out = ReEmbedBatch::default();
+        for row in rows {
+            if out.processed > 0 && started.elapsed() >= budget {
+                break;
+            }
+            let id = row.0;
+            out.processed += 1;
+            out.next_after = Some(id);
+            let text = match self.decrypt_row(dataset_id, row).await {
+                Ok((_, _, _, text)) => text,
+                Err(e) => {
+                    tracing::warn!(target: "talos_ml", %id, error = %e, "re-embed: row not readable — left as is");
+                    out.failed += 1;
+                    continue;
+                }
+            };
+            let vector = match embed(text.to_string()).await {
+                Some(v) if v.len() == expected_embedding_dims() => v,
+                Some(_) | None => {
+                    out.failed += 1;
+                    continue;
+                }
+            };
+            let vector = pgvector::Vector::from(vector);
+            // `dataset_id` is re-asserted on the write; the guard makes an
+            // unchanged row a no-op instead of a rewrite.
+            let changed = sqlx::query(
+                "UPDATE ml_examples SET embedding = $1, embedding_model = $2 \
+                  WHERE id = $3 AND dataset_id = $4 \
+                    AND (embedding IS NULL OR embedding <> $1 \
+                         OR embedding_model IS DISTINCT FROM $2)",
+            )
+            .bind(&vector)
+            .bind(active_model)
+            .bind(id)
+            .bind(dataset_id)
+            .execute(&mut *conn)
+            .await
+            .context("write re-embedded example")?
+            .rows_affected();
+            if changed > 0 {
+                out.re_embedded += 1;
+            } else {
+                out.unchanged += 1;
+            }
+        }
+        // Done only when the select came back short AND every fetched row
+        // was looked at; a pass cut by the budget is never "done".
+        out.done = out.processed == fetched && (fetched as i64) < limit;
+        Ok(out)
+    }
+
+    /// Decrypt the holdout set for eval: wipe-on-drop plaintext + the
+    /// STORED embedding (eval reuses it instead of re-embedding, which
     /// is both ~N HTTP calls cheaper and deterministic w.r.t. the
     /// geometry knn actually searches).
     pub async fn load_holdout(
