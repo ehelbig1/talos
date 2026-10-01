@@ -1882,31 +1882,37 @@ static TOOL_ARG_INDEX: std::sync::OnceLock<
     std::collections::HashMap<String, std::collections::HashSet<String>>,
 > = std::sync::OnceLock::new();
 
+/// Every statically declared tool schema (the dynamic catalog-template tools
+/// are not here; their arguments are the module's config).
+fn all_static_tool_schemas() -> Vec<serde_json::Value> {
+    [
+        crate::advanced::tool_schemas(),
+        crate::platform::tool_schemas(),
+        crate::search::tool_schemas(),
+        crate::workflows::tool_schemas(),
+        crate::modules::tool_schemas(),
+        crate::sandbox::tool_schemas(),
+        crate::executions::tool_schemas(),
+        crate::actor::tool_schemas(),
+        crate::analytics::tool_schemas(),
+        crate::secrets::tool_schemas(),
+        crate::schedules::tool_schemas(),
+        crate::versions::tool_schemas(),
+        crate::webhooks::tool_schemas(),
+        crate::graph::tool_schemas(),
+        crate::knowledge_graph::tool_schemas(),
+        crate::alerts::tool_schemas(),
+        crate::schemas::tool_schemas(),
+        crate::ollama::tool_schemas(),
+    ]
+    .concat()
+}
+
 pub(crate) fn tool_arg_index(
 ) -> &'static std::collections::HashMap<String, std::collections::HashSet<String>> {
     TOOL_ARG_INDEX.get_or_init(|| {
-        let all: Vec<serde_json::Value> = [
-            crate::advanced::tool_schemas(),
-            crate::platform::tool_schemas(),
-            crate::search::tool_schemas(),
-            crate::workflows::tool_schemas(),
-            crate::modules::tool_schemas(),
-            crate::sandbox::tool_schemas(),
-            crate::executions::tool_schemas(),
-            crate::actor::tool_schemas(),
-            crate::analytics::tool_schemas(),
-            crate::secrets::tool_schemas(),
-            crate::schedules::tool_schemas(),
-            crate::versions::tool_schemas(),
-            crate::webhooks::tool_schemas(),
-            crate::graph::tool_schemas(),
-            crate::knowledge_graph::tool_schemas(),
-            crate::alerts::tool_schemas(),
-            crate::schemas::tool_schemas(),
-            crate::ollama::tool_schemas(),
-        ]
-        .concat();
-        all.iter()
+        all_static_tool_schemas()
+            .iter()
             .filter_map(|t| {
                 let name = t.get("name")?.as_str()?.to_string();
                 let props = t.get("inputSchema")?.get("properties")?.as_object()?;
@@ -1914,6 +1920,96 @@ pub(crate) fn tool_arg_index(
             })
             .collect()
     })
+}
+
+/// tool → argument → the JSON types its schema declares for it. An argument
+/// whose schema declares no `type` (or an unusual one) is absent: nothing is
+/// claimed about it.
+type ToolArgTypes =
+    std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>;
+static TOOL_ARG_TYPES: std::sync::OnceLock<ToolArgTypes> = std::sync::OnceLock::new();
+
+pub(crate) fn tool_arg_types() -> &'static ToolArgTypes {
+    TOOL_ARG_TYPES.get_or_init(|| {
+        all_static_tool_schemas()
+            .iter()
+            .filter_map(|t| {
+                let name = t.get("name")?.as_str()?.to_string();
+                let props = t.get("inputSchema")?.get("properties")?.as_object()?;
+                let typed = props
+                    .iter()
+                    .filter_map(|(arg, schema)| {
+                        let declared: Vec<String> = match schema.get("type")? {
+                            serde_json::Value::String(t) => vec![t.clone()],
+                            serde_json::Value::Array(ts) => ts
+                                .iter()
+                                .filter_map(|t| t.as_str().map(str::to_string))
+                                .collect(),
+                            _ => return None,
+                        };
+                        (!declared.is_empty()).then(|| (arg.clone(), declared))
+                    })
+                    .collect();
+                Some((name, typed))
+            })
+            .collect()
+    })
+}
+
+/// Whether a JSON value is of one of the declared JSON-Schema types. A JSON
+/// number satisfies both `number` and `integer` (handlers range-check).
+fn value_matches_declared_type(v: &serde_json::Value, declared: &[String]) -> bool {
+    let actual: &[&str] = match v {
+        serde_json::Value::Null => return true, // null = absent
+        serde_json::Value::Bool(_) => &["boolean"],
+        serde_json::Value::Number(_) => &["number", "integer"],
+        serde_json::Value::String(_) => &["string"],
+        serde_json::Value::Array(_) => &["array"],
+        serde_json::Value::Object(_) => &["object"],
+    };
+    declared.iter().any(|d| actual.contains(&d.as_str()))
+}
+
+/// A warning for arguments whose JSON type is not the one the tool declares.
+///
+/// Handlers read an argument as its declared type (`.as_str()`, `.as_u64()`),
+/// so a value of another type is treated as ABSENT and the call "succeeds"
+/// without it: `add_collect_node(connect_to: ["prepare"])` — an array where a
+/// string is declared — reported success and wired nothing downstream
+/// (2026-10-01). Like [`unknown_argument_warning`] this warns rather than
+/// rejects: some handlers deliberately accept more than their schema says,
+/// and a hard failure there would break callers that work today. Names and
+/// types only — never values.
+pub(crate) fn mistyped_argument_warning(tool: &str, args: &serde_json::Value) -> Option<String> {
+    let declared = tool_arg_types().get(tool)?;
+    let provided = args.as_object()?;
+    let mut notes: Vec<String> = provided
+        .iter()
+        .filter_map(|(arg, value)| {
+            let types = declared.get(arg)?;
+            if value_matches_declared_type(value, types) {
+                return None;
+            }
+            Some(format!(
+                "'{arg}' is declared {} but got {}",
+                types.join(" or "),
+                match json_type_name(value) {
+                    "bool" => "boolean",
+                    other => other,
+                }
+            ))
+        })
+        .collect();
+    if notes.is_empty() {
+        return None;
+    }
+    notes.sort();
+    Some(format!(
+        "⚠ argument type mismatch on '{tool}': {}. A handler reads an argument as its declared \
+         type, so a value of another type is usually treated as absent — check that the result \
+         reflects it.",
+        notes.join("; ")
+    ))
 }
 
 /// Bounded Levenshtein distance for did-you-mean suggestions. Inputs are
@@ -4068,5 +4164,92 @@ mod arg_alias_tests {
                  advertised name would be rejected at call time"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mistyped_argument_tests {
+    use super::{mistyped_argument_warning, tool_arg_types};
+    use serde_json::json;
+
+    /// The observed defect: an array where `connect_to` is declared a string.
+    #[test]
+    fn an_array_for_a_string_argument_is_named() {
+        let w = mistyped_argument_warning(
+            "add_collect_node",
+            &json!({"workflow_id": "w", "node_id": "collect", "connect_to": ["prepare"]}),
+        )
+        .expect("a warning");
+        assert!(
+            w.contains("'connect_to' is declared string but got array"),
+            "{w}"
+        );
+        assert!(w.contains("add_collect_node"), "{w}");
+        // The value itself never appears.
+        assert!(!w.contains("prepare"), "{w}");
+    }
+
+    /// CONTROLS: the declared type, a null, an argument whose schema declares
+    /// no type (`connect_from` takes a string or an array), and a tool that
+    /// is not statically declared all produce nothing.
+    #[test]
+    fn matching_types_nulls_untyped_arguments_and_unknown_tools_are_quiet() {
+        assert_eq!(
+            mistyped_argument_warning(
+                "add_collect_node",
+                &json!({"workflow_id": "w", "node_id": "c", "connect_to": "prepare",
+                        "connect_from": ["a", "b"]}),
+            ),
+            None
+        );
+        assert_eq!(
+            mistyped_argument_warning("add_collect_node", &json!({"connect_to": null})),
+            None
+        );
+        assert!(
+            !tool_arg_types()["add_collect_node"].contains_key("connect_from"),
+            "connect_from declares no type, so nothing may be claimed about it"
+        );
+        assert_eq!(
+            mistyped_argument_warning("Redis_Cache-v1", &json!({"anything": [1]})),
+            None
+        );
+    }
+
+    /// A number satisfies `number` and `integer`; a numeric string does not,
+    /// and several mismatches are listed in a stable order.
+    #[test]
+    fn numbers_and_several_mismatches() {
+        assert_eq!(
+            mistyped_argument_warning(
+                "test_module",
+                &json!({"module_id": "m", "timeout_secs": 30})
+            ),
+            None
+        );
+        let w = mistyped_argument_warning(
+            "test_module",
+            &json!({"module_id": 7, "timeout_secs": "30", "config": {}}),
+        )
+        .expect("a warning");
+        let first = w
+            .find("'module_id' is declared string but got number")
+            .expect("module_id");
+        let second = w
+            .find("'timeout_secs' is declared number but got string")
+            .expect("timeout");
+        assert!(first < second, "{w}");
+    }
+
+    /// The index is populated: a silent empty map would make every call quiet.
+    #[test]
+    fn the_declared_type_index_is_not_empty() {
+        let typed: usize = tool_arg_types().values().map(|m| m.len()).sum();
+        assert!(
+            tool_arg_types().len() > 100,
+            "tools: {}",
+            tool_arg_types().len()
+        );
+        assert!(typed > 400, "typed arguments: {typed}");
     }
 }

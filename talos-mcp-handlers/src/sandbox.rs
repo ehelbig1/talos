@@ -269,7 +269,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "lint_sandbox",
-            "description": "Fast syntax/type check of Rust WASM code without full compilation (~3-5s vs ~30-60s). Returns errors without producing a WASM binary. Limitation: runs against the base workspace only — code that imports third-party crates (uuid, chrono, reqwest, etc.) will produce 'unresolved import' errors even if those crates would be available via the dependencies parameter of compile_custom_sandbox. Use lint_sandbox for logic/type errors in stdlib + talos SDK code; use compile_custom_sandbox for full validation of code with external dependencies.",
+            "description": "Fast syntax/type check of Rust WASM code without full compilation (~3-5s vs ~30-60s). Returns errors without producing a WASM binary. Pass `dependencies` with the same map you will give compile_custom_sandbox (e.g. {\"chrono\": \"0.4\"}) so code that imports third-party crates lints against them; without it such imports report 'unresolved import'. The same crate allowlist applies.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -278,7 +278,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "type": "string",
                         "enum": worlds_enum.clone(),
                         "description": format!("WIT capability world (default: 'minimal-node'). Valid: {}", worlds_csv)
-                    }
+                    },
+                    "dependencies": { "type": "object", "description": "Optional map of crate name → version string (e.g. {\"chrono\": \"0.4\", \"base64\": \"0.22\"}), checked against the same allowlist as compile_custom_sandbox. serde and serde_json are pre-bundled." }
                 },
                 "required": ["rust_code"]
             }
@@ -334,7 +335,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_module",
-            "description": "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. NOTE: the run also INHERITS the actor's LLM/egress tier — and WITHOUT an actor_id it defaults to Tier-1 (local-egress-only). So a module that calls an EXTERNAL API (any non-loopback host — Google, Slack, etc.) will fail with a network error unless the actor permits public egress. That is the EGRESS axis, not the LLM tier: since `egress_scope` was split out, `max_llm_tier=tier1` + `egress_scope=public` reaches an external API while still refusing every external LLM provider — the house pattern for a privacy-sensitive reader, and the correct posture here. (This note used to say \"a Tier-2 actor\", which has been wrong since the split.) `vault://` references in config are delivered to the module AS THE LITERAL, exactly as the engine delivers them, and the host resolves them at the outbound call; the block is the egress ceiling, not the secret.\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
+            "description": "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call), so you can see how close a run came to its fuel and token limits. NOTE: the run also INHERITS the actor's LLM/egress tier — and WITHOUT an actor_id it defaults to Tier-1 (local-egress-only). So a module that calls an EXTERNAL API (any non-loopback host — Google, Slack, etc.) will fail with a network error unless the actor permits public egress. That is the EGRESS axis, not the LLM tier: since `egress_scope` was split out, `max_llm_tier=tier1` + `egress_scope=public` reaches an external API while still refusing every external LLM provider — the house pattern for a privacy-sensitive reader, and the correct posture here. (This note used to say \"a Tier-2 actor\", which has been wrong since the split.) `vault://` references in config are delivered to the module AS THE LITERAL, exactly as the engine delivers them, and the host resolves them at the outbound call; the block is the egress ceiling, not the secret.\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -342,6 +343,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "config": { "type": "object", "description": "Node config values — delivered to the module under `data[\"config\"]`, matching add_node_to_workflow's `config` semantics. Preferred param for config-taking modules." },
                     "input": { "type": "object", "description": "Simulated upstream node output — delivered to the module under `data[\"input\"]`, matching workflow-dispatch shape. When passed WITHOUT an explicit `config`, it is treated as config for backwards compatibility." },
                     "actor_id": { "type": "string", "description": "Optional UUID of an actor whose memories the module should see. Modules calling agent_memory::search / get / list-keys etc. will scope to this actor (mirrors workflow dispatch when the workflow is bound to an actor). The actor must be owned by you; cross-tenant actor_ids are rejected. Without this, memory calls run anonymously and return 0 hits." },
+                    "accumulated": { "type": "object", "description": "Optional. Outputs of EARLIER workflow nodes, keyed by node id, delivered to the module as `data[\"__accumulated__\"]` exactly as the engine does in a workflow. Use it to rehearse a module that reads a non-parent node's output (e.g. {\"prepare\": {\"refs\": {...}}}). Max 1 MB." },
                     "timeout_secs": { "type": "number", "description": "Execution timeout in seconds (default 30, max 120)" },
                     "allowed_secrets": {
                         "type": "array",
@@ -1616,9 +1618,12 @@ async fn handle_compile_custom_sandbox(
                  \n\
                  Module ID: {}\n\
                  \n\
+                 Fuel limit (max_fuel): {}. test_module enforces it; set `max_fuel` in a \
+                 node's config to override it for that node.\n\
+                 \n\
                  Pass it as `module_id` in create_workflow / add_node_to_workflow.\n\
                  To execute it directly, call test_module with module_id: {}.{}",
-                template_id_str, template_id_str, warning_text
+                template_id_str, computed_max_fuel, template_id_str, warning_text
             );
 
             JsonRpcResponse {
@@ -2697,9 +2702,21 @@ async fn handle_lint_sandbox(
         ));
     }
 
+    // The same third-party crates compile_custom_sandbox would link, behind
+    // the same allowlist. Until 2026-10-01 lint took none, so a module using
+    // chrono or base64 could not be linted at all.
+    let dependencies = args.get("dependencies").filter(|d| !d.is_null());
+    if let Err(dep_error) = validate_dependencies(dependencies) {
+        return Some(mcp_error(
+            req_id,
+            -32602,
+            &format!("Dependency validation failed: {}", dep_error),
+        ));
+    }
+
     match state
         .compiler
-        .lint_code(None, "lint-check", code, &world_full, None)
+        .lint_code(None, "lint-check", code, &world_full, dependencies)
         .await
     {
         Ok(errors) => {
@@ -2743,6 +2760,87 @@ async fn handle_lint_sandbox(
                 "Lint service error — see server logs",
             ))
         }
+    }
+}
+
+/// The payload `test_module` hands the module, shaped as the engine shapes a
+/// node's input: config and input keys merged at the root, the two objects
+/// also under `config` / `input`, and — when the caller supplies it — earlier
+/// nodes' outputs under `__accumulated__`.
+///
+/// `__accumulated__` is set LAST and only from the dedicated argument, so a
+/// same-named key inside `config` or `input` cannot stand in for it.
+pub(crate) fn test_module_payload(
+    config_val: &serde_json::Value,
+    input_val: &serde_json::Value,
+    accumulated: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut merged = serde_json::Map::new();
+    if let Some(obj) = config_val.as_object() {
+        for (k, v) in obj {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(obj) = input_val.as_object() {
+        for (k, v) in obj {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    if !config_val.is_null() && *config_val != serde_json::json!({}) {
+        merged.insert("config".to_string(), config_val.clone());
+    }
+    if !input_val.is_null() && *input_val != serde_json::json!({}) {
+        merged.insert("input".to_string(), input_val.clone());
+    }
+    match accumulated {
+        Some(acc) => {
+            merged.insert("__accumulated__".to_string(), acc.clone());
+        }
+        None => {
+            merged.remove("__accumulated__");
+        }
+    }
+    serde_json::Value::Object(merged)
+}
+
+/// LLM token usage of one in-process run, one entry per provider+model,
+/// sorted so the reply is stable. `null` when the module made no LLM call —
+/// "no call" and "zero tokens" are different answers.
+pub(crate) fn rendered_llm_usage(
+    acc: &talos_worker_runtime::context::LlmUsageAcc,
+) -> serde_json::Value {
+    let guard = acc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.is_empty() {
+        return serde_json::Value::Null;
+    }
+    let mut rows: Vec<(&(String, String), &(u64, u64, u32))> = guard.iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    serde_json::Value::Array(
+        rows.into_iter()
+            .map(|((provider, model), (prompt, completion, calls))| {
+                serde_json::json!({
+                    "provider": provider,
+                    "model": model,
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "calls": calls,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Fuel one in-process run consumed against its limit; `null` when no attempt
+/// reached the module (nothing was measured, which is not zero).
+pub(crate) fn rendered_fuel(acc: &talos_worker_runtime::context::FuelAcc) -> serde_json::Value {
+    match *acc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        Some(m) => serde_json::json!({ "consumed": m.consumed, "limit": m.limit }),
+        None => serde_json::Value::Null,
     }
 }
 
@@ -3367,6 +3465,29 @@ async fn handle_test_module(
             ));
         }
     }
+    let accumulated = match args.get("accumulated") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) if !v.is_object() => {
+            return Some(mcp_error(
+                req_id.clone(),
+                -32602,
+                &format!(
+                    "accumulated must be an object mapping node id to that node's output, got {}",
+                    crate::utils::json_type_name(v)
+                ),
+            ))
+        }
+        Some(v) => {
+            if serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) > 1_048_576 {
+                return Some(mcp_error(
+                    req_id.clone(),
+                    -32602,
+                    "accumulated exceeds 1 MB limit",
+                ));
+            }
+            Some(v.clone())
+        }
+    };
     let input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
     // New `config` param mirrors the node-config position in workflow dispatch.
     // When present, the module receives payload `{config: {...}, input: {...}, ...keys_at_root}`
@@ -3575,30 +3696,7 @@ async fn handle_test_module(
         None => (input.clone(), serde_json::json!({})),
     };
 
-    // Build payload. Match engine_dispatch_single.rs: merge both at root so
-    // `data["KEY"]` works for direct testing, and add `config` / `input`
-    // sub-objects so `data["config"]["KEY"]` / `data["input"]["KEY"]` work
-    // identically to workflow dispatch.
-    let payload = {
-        let mut merged = serde_json::Map::new();
-        if let Some(obj) = config_val.as_object() {
-            for (k, v) in obj {
-                merged.insert(k.clone(), v.clone());
-            }
-        }
-        if let Some(obj) = input_val.as_object() {
-            for (k, v) in obj {
-                merged.insert(k.clone(), v.clone());
-            }
-        }
-        if !config_val.is_null() && config_val != serde_json::json!({}) {
-            merged.insert("config".to_string(), config_val.clone());
-        }
-        if !input_val.is_null() && input_val != serde_json::json!({}) {
-            merged.insert("input".to_string(), input_val.clone());
-        }
-        serde_json::Value::Object(merged)
-    };
+    let payload = test_module_payload(&config_val, &input_val, accumulated.as_ref());
 
     // Auto-detect vault:// refs on the FULL payload (config + input) and
     // merge into allowed_secrets. Single source of truth in
@@ -3769,6 +3867,13 @@ async fn handle_test_module(
             sink.push(AIR_GAPPED_RUN_NOTE.to_string());
         }
     }
+    // What the run spent, reported on both arms: a failed run has no output
+    // to carry `__fuel_consumed__`, and nothing else says how many tokens an
+    // LLM-backed module used against its MAX_TOKENS.
+    let llm_usage: talos_worker_runtime::context::LlmUsageAcc =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let fuel: talos_worker_runtime::context::FuelAcc =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     let start = std::time::Instant::now();
     let execution_result = state
         .runtime
@@ -3814,11 +3919,11 @@ async fn handle_test_module(
             write_ceiling,
             http_verb_ceiling, // the actor's verb-inference override (None = inherit)
             egress.egress_scope, // egress_scope — Some(Public): private ranges DENIED in-process
-            None,              // llm_usage_out — internal sandbox path doesn't collect usage
+            Some(llm_usage.clone()), // llm_usage_out — reported to the caller below
             Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
             0,    // dispatch_attempt — an operator-invoked run, no controller retry loop above it
             None, // inference_wait (RFC 0014 P2): no controller is timing this call
-            None, // fuel_out: this caller reports no fuel
+            Some(fuel.clone()), // fuel_out — reported to the caller below
         )
         .await;
     let duration_ms = start.elapsed().as_millis();
@@ -3887,6 +3992,8 @@ async fn handle_test_module(
                     "success": true,
                     "output": output,
                     "duration_ms": duration_ms,
+                    "fuel": rendered_fuel(&fuel),
+                    "llm_usage": rendered_llm_usage(&llm_usage),
                     "memory_write": memory_write_note,
                     // Denied/failed host calls this run. Present on the
                     // SUCCESS arm too: a module can swallow a failed fetch in
@@ -3902,6 +4009,8 @@ async fn handle_test_module(
                 "success": false,
                 "error": format!("{}", e),
                 "duration_ms": duration_ms,
+                "fuel": rendered_fuel(&fuel),
+                "llm_usage": rendered_llm_usage(&llm_usage),
                 // The whole point: an opaque `networkerror` here is now
                 // accompanied by the host's reason for it.
                 "host_diagnostics": collected_host_diagnostics(&host_diags),
@@ -5308,5 +5417,90 @@ mod sandbox_method_default_tests {
                 "a non-array allowed_methods must not read as an empty declaration"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rehearsal_tool_tests {
+    use super::{rendered_fuel, rendered_llm_usage, test_module_payload};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// The payload matches the engine's node input: keys at the root, the two
+    /// objects under `config` / `input`, earlier outputs under
+    /// `__accumulated__`.
+    #[test]
+    fn the_payload_carries_accumulated_outputs_where_the_engine_puts_them() {
+        let p = test_module_payload(
+            &json!({"MODE": "merge"}),
+            &json!({"messages": []}),
+            Some(&json!({"prepare": {"refs": {"m1": {"id": "A"}}}})),
+        );
+        assert_eq!(p["MODE"], "merge");
+        assert_eq!(p["config"]["MODE"], "merge");
+        assert_eq!(p["input"]["messages"], json!([]));
+        assert_eq!(p["__accumulated__"]["prepare"]["refs"]["m1"]["id"], "A");
+    }
+
+    /// Only the dedicated argument sets the root `__accumulated__`: a
+    /// same-named key inside `input` or `config` is not promoted to it.
+    #[test]
+    fn a_key_named_accumulated_inside_input_does_not_become_the_engine_key() {
+        let p = test_module_payload(
+            &json!({"__accumulated__": {"from": "config"}}),
+            &json!({"__accumulated__": {"from": "input"}, "x": 1}),
+            None,
+        );
+        assert!(p.get("__accumulated__").is_none(), "{p}");
+        assert_eq!(p["x"], 1);
+        // The argument wins over both.
+        let p = test_module_payload(
+            &json!({}),
+            &json!({"__accumulated__": {"from": "input"}}),
+            Some(&json!({"from": "arg"})),
+        );
+        assert_eq!(p["__accumulated__"]["from"], "arg");
+    }
+
+    /// The legacy shapes are unchanged: an empty config or input adds no
+    /// sub-object.
+    #[test]
+    fn empty_config_and_input_add_no_sub_objects() {
+        let p = test_module_payload(&json!({}), &json!({}), None);
+        assert_eq!(p, json!({}));
+        let p = test_module_payload(&json!({"K": 1}), &json!({}), None);
+        assert_eq!(p, json!({"K": 1, "config": {"K": 1}}));
+    }
+
+    #[test]
+    fn usage_is_null_without_a_call_and_sorted_with_several() {
+        let acc = Arc::new(Mutex::new(HashMap::new()));
+        assert!(rendered_llm_usage(&acc).is_null());
+        acc.lock().unwrap().insert(
+            ("ollama".to_string(), "qwen3.6".to_string()),
+            (120u64, 40u64, 2u32),
+        );
+        acc.lock().unwrap().insert(
+            ("anthropic".to_string(), "m".to_string()),
+            (7u64, 3u64, 1u32),
+        );
+        let v = rendered_llm_usage(&acc);
+        assert_eq!(v[0]["provider"], "anthropic");
+        assert_eq!(v[1]["provider"], "ollama");
+        assert_eq!(v[1]["prompt_tokens"], 120);
+        assert_eq!(v[1]["completion_tokens"], 40);
+        assert_eq!(v[1]["calls"], 2);
+    }
+
+    #[test]
+    fn fuel_is_null_when_nothing_was_measured() {
+        let acc: talos_worker_runtime::context::FuelAcc = Arc::new(Mutex::new(None));
+        assert!(rendered_fuel(&acc).is_null());
+        talos_worker_runtime::context::add_attempt_fuel(&acc, 1_500, 4_000);
+        assert_eq!(
+            rendered_fuel(&acc),
+            json!({"consumed": 1500, "limit": 4000})
+        );
     }
 }

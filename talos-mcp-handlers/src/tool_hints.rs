@@ -697,6 +697,7 @@ mod tests {
                 graph_is_empty: false,
                 missing_config: vec![serde_json::json!("n1")],
                 required_secrets: ["anthropic/api_key".to_string()].into_iter().collect(),
+                missing_secrets: Some(vec!["anthropic/api_key".to_string()]),
                 description_warning: None,
                 name_collision_warning: None,
                 vault_warnings: vec![],
