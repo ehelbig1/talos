@@ -254,7 +254,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             "expected_items": { "type": "integer", "minimum": 0 },
                             "bytes_per_item": { "type": "integer", "minimum": 0 },
                             "llm_output_bytes": { "type": "integer", "minimum": 0 },
-                            "safety_multiplier": { "type": "number", "minimum": 1, "maximum": 5 }
+                            "safety_multiplier": { "type": "number", "minimum": 1, "maximum": 5 },
+                            "fuel_per_byte": { "type": "integer", "minimum": 1, "maximum": 100, "description": talos_compilation::scaffold::FUEL_PER_BYTE_GUIDANCE }
                         }
                     }
                 },
