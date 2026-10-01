@@ -1,14 +1,20 @@
 {
   "name": "google-calendar-list-events",
-  "version": "v1.0.0",
+  "version": "v1.1.0",
   "display_name": "Google Calendar: List Events",
-  "description": "List upcoming events from a Google Calendar over a time window. Returns structured event data (summary, start, end, location, attendees, hangout_link). Canonical building block for morning-brief / meeting-prep / schedule-awareness workflows.\n\nRequires a vault:// reference to a Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time.",
+  "description": "List upcoming events from a Google Calendar over a time window. Returns structured event data (summary, start, end, location, attendees, hangout_link) and, for each event, what a planner needs: whether it holds the time (`busy`), its kind (`event_type`: default, focusTime, outOfOffice, workingLocation …), the calendar owner's own answer (`response`), how many other people are invited (`guests`), and the invitation's `uid`, which is the same on every calendar the invitation sits on. `truncated` is true when the calendar holds more events in the window than were returned. Canonical building block for morning-brief / meeting-prep / schedule-awareness workflows.\n\nRequires a vault:// reference to a Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time.",
   "category": "Integration",
   "capability_world": "http-node",
   "allowed_hosts": ["www.googleapis.com"],
   "allowed_methods": ["GET"],
   "requires_secrets": ["oauth/google_calendar/*"],
   "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 50,
+    "bytes_per_item": 30000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 3.0
+  },
   "dependencies": {
     "chrono": "0.4"
   },
@@ -28,12 +34,16 @@
       "HOURS_AHEAD": {
         "type": "integer",
         "default": 24,
-        "description": "Window size in hours (1–168, i.e. up to 7 days). Events starting between now and now+HOURS_AHEAD are returned."
+        "description": "Window size in hours (1–336, i.e. up to 14 days). Events starting between now and now+HOURS_AHEAD are returned."
       },
       "MAX_RESULTS": {
         "type": "integer",
         "default": 20,
-        "description": "Maximum events to return (1–50)."
+        "description": "Maximum events to return (1–250; default 20). Costs roughly 140–270K fuel per event (more for events with long descriptions): above 50, set `max_fuel` on the node. When the calendar holds more, the output's `truncated` is true."
+      },
+      "TIME_ZONE": {
+        "type": "string",
+        "description": "Optional IANA zone name (e.g. 'America/New_York'). Start and end times are then returned in that zone's local time with its UTC offset, so a module can group events by local day without a time-zone database, across daylight-saving changes. Omitted: the calendar's own zone. The zone used is echoed as `time_zone`."
       }
     }
   },

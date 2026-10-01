@@ -311,7 +311,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "install_module_from_catalog",
-            "description": "Compile and install a built-in module template from the catalog. Returns a module_id ready for use in add_node_to_workflow. Much faster than writing custom code for common patterns. Response always includes module_id, name, wasm_sha256 (hex SHA-256 of the compiled bytes), compiled_at (RFC3339 UTC of when the WASM was written), and bytes_changed (true on first install OR when the source produced different bytes than the prior install — false signals an idempotent no-op). Use bytes_changed/wasm_sha256 to verify a reinstall actually picked up new source after a platform deploy. Check for optional warning fields: grant_empty_warning (module has deny-all secret access — every vault:// config value will fail at runtime, reinstall with allowed_secrets) and wildcard_grant_warning (module has wildcard [\"*\"] secret access — consider scoping to explicit paths to limit blast radius). A REINSTALL keeps your installed copy's allowed_hosts / allowed_methods / allowed_secrets, bounded by the new template's grant, unless you pass them: grants_carried_from_installed_copy says whether a copy existed and grants_not_carried lists anything the template no longer grants. Every install is recorded in the admin event log (module_installed_from_catalog / module_reinstalled_from_catalog) with the grants, capability world and content hash it wrote and replaced; an install that cannot be recorded is not made.",
+            "description": "Compile and install a built-in module template from the catalog. Returns a module_id ready for use in add_node_to_workflow. Much faster than writing custom code for common patterns. Response always includes module_id, name, wasm_sha256 (hex SHA-256 of the compiled bytes), compiled_at (RFC3339 UTC of when the WASM was written), and bytes_changed (true on first install OR when the source produced different bytes than the prior install — false signals an idempotent no-op). Use bytes_changed/wasm_sha256 to verify a reinstall actually picked up new source after a platform deploy. Check for optional warning fields: grant_empty_warning (module has deny-all secret access — every vault:// config value will fail at runtime, reinstall with allowed_secrets) and wildcard_grant_warning (module has wildcard [\"*\"] secret access — consider scoping to explicit paths to limit blast radius). A REINSTALL keeps your installed copy's allowed_hosts / allowed_methods / allowed_secrets, bounded by the new template's grant, unless you pass them: grants_carried_from_installed_copy says whether a copy existed and grants_not_carried lists anything the template no longer grants. Every install is recorded in the admin event log (module_installed_from_catalog / module_reinstalled_from_catalog) with the grants, capability world and content hash it wrote and replaced; an install that cannot be recorded is not made. FUEL: the reply's `fuel` block says what limit the copy carries and where it came from (`template`, `fuel_budget`, or `kept`). A REINSTALL keeps the copy's own limit unless `fuel_budget` is passed; when that kept limit is below what the template now recommends, the block says so (also in `dry_run`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3188,6 +3188,54 @@ pub(crate) struct InstallGrants {
     pub(crate) not_carried: serde_json::Map<String, serde_json::Value>,
 }
 
+/// What an install does with the copy's fuel limit, for the reply and the
+/// dry run.
+///
+/// `offered` is what a FIRST install writes: the caller's `fuel_budget` when
+/// passed, else the template's `recommended_fuel`, else the baseline. A
+/// REINSTALL keeps the copy's own limit unless the caller passed a
+/// `fuel_budget` (so an operator's tuning survives) — which also means a limit
+/// set by an older, smaller estimate stays forever, and nothing said so.
+/// Measured 2026-10-01: an installed `LLM Inference` copy at 1,404,000 against
+/// a template recommendation of 9,900,000, with all 18 nodes that use it
+/// carrying their own `max_fuel` to get past it.
+///
+/// `stored` is the limit on the row: before the install for a dry run, read
+/// back from the write for a real one. `None` is a first install.
+pub(crate) fn install_fuel_report(
+    stored: Option<i64>,
+    offered: i64,
+    fuel_explicit: bool,
+) -> serde_json::Value {
+    let (max_fuel, source) = match stored {
+        None => (
+            offered,
+            if fuel_explicit {
+                "fuel_budget"
+            } else {
+                "template"
+            },
+        ),
+        Some(_) if fuel_explicit => (offered, "fuel_budget"),
+        Some(kept) => (kept, "kept"),
+    };
+    let mut report = serde_json::json!({
+        "max_fuel": max_fuel,
+        "source": source,
+        "template_max_fuel": if fuel_explicit { serde_json::Value::Null } else { serde_json::json!(offered) },
+    });
+    if source == "kept" && max_fuel < offered {
+        report["note"] = format!(
+            "This copy keeps its own fuel limit ({max_fuel}), which is BELOW what the template now \
+             recommends ({offered}). A reinstall never changes a copy's limit on its own. To adopt \
+             the template's, reinstall with `fuel_budget` set to the template's `recommended_fuel`; \
+             until then a node that needs more must set `max_fuel` in its config."
+        )
+        .into();
+    }
+    report
+}
+
 /// What `install_module_from_catalog` would store, for `dry_run: true`.
 ///
 /// `grants` is the outcome of [`grants_for_install`] — the same value the real
@@ -3200,6 +3248,7 @@ pub(crate) fn install_dry_run_report(
     installed: Option<&talos_module_repository::StoredModuleGrants>,
     grants: &InstallGrants,
     secrets_not_granted: &[String],
+    fuel: serde_json::Value,
 ) -> serde_json::Value {
     fn as_set(v: &[String]) -> std::collections::BTreeSet<&str> {
         v.iter().map(String::as_str).collect()
@@ -3228,6 +3277,7 @@ pub(crate) fn install_dry_run_report(
         "grants_changed": grants_changed,
         "grants_not_carried": grants.not_carried,
         "secrets_not_granted": secrets_not_granted,
+        "fuel": fuel,
         "note": "Nothing was compiled, written or recorded. Run again without dry_run to install. \
                  The code itself is not compared here: get_catalog_status → installed_copies says \
                  whether your copy is behind the catalog.",
@@ -3685,6 +3735,7 @@ mod carry_grant_tests {
 
     fn stored(h: &[&str], m: &[&str], s: &[&str]) -> talos_module_repository::StoredModuleGrants {
         talos_module_repository::StoredModuleGrants {
+            max_fuel: 2_000_000,
             hosts: v(h),
             methods: v(m),
             secrets: v(s),
@@ -4658,6 +4709,19 @@ async fn handle_install_module_from_catalog(
     // compile and the write. Answer what the install WOULD store and stop —
     // nothing is compiled, written or recorded. Until 2026-10-01 the only way
     // to learn that a reinstall would drop a grant was to run it.
+    // The fuel limit a first install would write — caller's `fuel_budget`,
+    // else the template's `recommended_fuel`, else the baseline (~2.2M; the
+    // hardcoded 2M left LLM-backed templates fuel-starved, issue #381).
+    // Resolved here, from the arguments and the template metadata alone, so
+    // the dry run and the install report the same thing.
+    let fuel_explicit = args.get("fuel_budget").is_some();
+    let offered_max_fuel: i64 = if let Some(budget) = args.get("fuel_budget") {
+        crate::sandbox::compute_fuel_from_budget_value(budget) as i64
+    } else if let Some(rec) = meta.get("recommended_fuel") {
+        crate::sandbox::compute_fuel_from_budget_value(rec) as i64
+    } else {
+        talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64
+    };
     match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {
         Ok(false) => {}
         Ok(true) => {
@@ -4672,6 +4736,11 @@ async fn handle_install_module_from_catalog(
                     not_carried: grants_not_carried,
                 },
                 &secrets_not_granted,
+                install_fuel_report(
+                    installed_copy.as_ref().map(|c| c.max_fuel),
+                    offered_max_fuel,
+                    fuel_explicit,
+                ),
             );
             return mcp_text(
                 req_id,
@@ -4758,14 +4827,9 @@ async fn handle_install_module_from_catalog(
             // r236's hot_update fuel preservation; the reinstall path was the
             // unswept sibling (live bite 2026-07-17: tuned 10M silently reset
             // to 1.38M auto-calc).
-            let fuel_explicit = args.get("fuel_budget").is_some();
-            let max_fuel: i64 = if let Some(budget) = args.get("fuel_budget") {
-                crate::sandbox::compute_fuel_from_budget_value(budget) as i64
-            } else if let Some(rec) = meta.get("recommended_fuel") {
-                crate::sandbox::compute_fuel_from_budget_value(rec) as i64
-            } else {
-                talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64
-            };
+            // (`fuel_explicit` / `offered_max_fuel` are resolved above the
+            // dry-run branch.)
+            let max_fuel: i64 = offered_max_fuel;
 
             let install_result = match state
                 .module_repo
@@ -4897,6 +4961,14 @@ async fn handle_install_module_from_catalog(
                 "wasm_sha256": stored_content_hash,
                 "compiled_at": stored_compiled_at.to_rfc3339(),
                 "bytes_changed": bytes_changed,
+                // What the row carries now, read back from the write: a
+                // reinstall keeps the copy's own limit unless `fuel_budget`
+                // was passed, so the limit offered is not always the one stored.
+                "fuel": install_fuel_report(
+                    installed_copy.as_ref().map(|_| install_result.max_fuel),
+                    if installed_copy.is_some() { offered_max_fuel } else { install_result.max_fuel },
+                    fuel_explicit,
+                ),
             });
             if grant_empty {
                 resp["grant_empty_warning"] = serde_json::json!(
@@ -6018,7 +6090,7 @@ mod config_schema_projection_tests {
 
 #[cfg(test)]
 mod install_dry_run_tests {
-    use super::{grants_for_install, install_dry_run_report};
+    use super::{grants_for_install, install_dry_run_report, install_fuel_report};
     use talos_module_repository::StoredModuleGrants;
 
     fn v(xs: &[&str]) -> Vec<String> {
@@ -6031,6 +6103,7 @@ mod install_dry_run_tests {
     #[test]
     fn a_reinstall_preview_names_what_would_change_and_what_is_not_carried() {
         let stored = StoredModuleGrants {
+            max_fuel: 1_404_000,
             hosts: v(&["gmail.googleapis.com"]),
             methods: v(&["GET"]),
             secrets: v(&["oauth/gmail/u/a@example.com/access_token", "legacy/key"]),
@@ -6049,7 +6122,15 @@ mod install_dry_run_tests {
             Some(&stored),
             &grants,
             &[],
+            install_fuel_report(Some(stored.max_fuel), 5_850_000, false),
         );
+        // The copy's own limit is kept, and the preview says it is below the template's.
+        assert_eq!(r["fuel"]["max_fuel"], 1_404_000);
+        assert_eq!(r["fuel"]["source"], "kept");
+        assert!(r["fuel"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("BELOW what the template now recommends (5850000)"));
         assert_eq!(r["dry_run"], true);
         assert_eq!(r["first_install"], false);
         assert_eq!(
@@ -6070,6 +6151,7 @@ mod install_dry_run_tests {
     #[test]
     fn an_unchanged_reinstall_and_a_first_install_are_told_apart() {
         let stored = StoredModuleGrants {
+            max_fuel: 2_000_000,
             hosts: v(&["b.example.com", "a.example.com"]),
             methods: v(&["GET"]),
             secrets: vec![],
@@ -6082,7 +6164,14 @@ mod install_dry_run_tests {
             false,
             false,
         );
-        let r = install_dry_run_report("m", "http-node", Some(&stored), &grants, &[]);
+        let r = install_dry_run_report(
+            "m",
+            "http-node",
+            Some(&stored),
+            &grants,
+            &[],
+            install_fuel_report(Some(stored.max_fuel), 2_000_000, false),
+        );
         assert_eq!(r["grants_changed"], false, "{r}");
         assert!(r["grants_not_carried"].as_object().unwrap().is_empty());
 
@@ -6094,7 +6183,18 @@ mod install_dry_run_tests {
             false,
             false,
         );
-        let r = install_dry_run_report("m", "http-node", None, &first, &v(&["z/denied"]));
+        let r = install_dry_run_report(
+            "m",
+            "http-node",
+            None,
+            &first,
+            &v(&["z/denied"]),
+            install_fuel_report(None, 2_200_000, false),
+        );
+        assert_eq!(
+            r["fuel"],
+            serde_json::json!({"max_fuel": 2_200_000, "source": "template", "template_max_fuel": 2_200_000})
+        );
         assert_eq!(r["first_install"], true);
         assert!(r["current"].is_null());
         assert!(r["grants_changed"].is_null());
@@ -6103,5 +6203,66 @@ mod install_dry_run_tests {
             serde_json::json!(["x/y"])
         );
         assert_eq!(r["secrets_not_granted"], serde_json::json!(["z/denied"]));
+    }
+}
+
+#[cfg(test)]
+mod install_fuel_report_tests {
+    use super::install_fuel_report;
+    use serde_json::json;
+
+    #[test]
+    fn a_first_install_takes_the_offered_limit_and_says_where_it_came_from() {
+        assert_eq!(
+            install_fuel_report(None, 9_900_000, false),
+            json!({"max_fuel": 9_900_000, "source": "template", "template_max_fuel": 9_900_000})
+        );
+        assert_eq!(
+            install_fuel_report(None, 4_000_000, true),
+            json!({"max_fuel": 4_000_000, "source": "fuel_budget", "template_max_fuel": null})
+        );
+    }
+
+    #[test]
+    fn a_reinstall_keeps_the_copys_limit_and_says_when_that_is_below_the_template() {
+        let below = install_fuel_report(Some(1_404_000), 9_900_000, false);
+        assert_eq!(
+            (below["max_fuel"].as_i64(), below["source"].as_str()),
+            (Some(1_404_000), Some("kept"))
+        );
+        let note = below["note"]
+            .as_str()
+            .expect("a kept limit below the template is called out");
+        assert!(
+            note.contains("(1404000)")
+                && note.contains("(9900000)")
+                && note.contains("`fuel_budget`")
+        );
+        // At or above the template: kept, and nothing to say (an operator's tuning).
+        for kept in [9_900_000, 24_000_000] {
+            let r = install_fuel_report(Some(kept), 9_900_000, false);
+            assert_eq!(
+                (r["max_fuel"].as_i64(), r["source"].as_str()),
+                (Some(kept), Some("kept"))
+            );
+            assert!(r.get("note").is_none(), "{kept}");
+        }
+        // The caller passed a budget: it is applied, up or down, with no note.
+        let set = install_fuel_report(Some(1_404_000), 6_000_000, true);
+        assert_eq!(
+            set,
+            json!({"max_fuel": 6_000_000, "source": "fuel_budget", "template_max_fuel": null})
+        );
+    }
+
+    #[test]
+    fn the_tool_description_says_a_reinstall_keeps_the_limit() {
+        let tools = super::tool_schemas();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "install_module_from_catalog")
+            .expect("declared");
+        let d = tool["description"].as_str().unwrap();
+        assert!(d.contains("`fuel` block") && d.contains("keeps the copy's own limit"));
     }
 }
