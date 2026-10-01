@@ -438,6 +438,52 @@ groups:
             tail_worker_logs on a recent failed execution for the node-level
             cause.
 
+      # ── The embedding provider is not answering.
+      # When an embedding call gets no usable answer, recall falls back to
+      # keyword search and a memory write stores a row with no embedding —
+      # each visible only as one WARN line. Measured on the reference fleet
+      # before the in-flight gate (2026-10-01): 164 of 2,975 requests (5.5 %)
+      # were lost that way over 3.5 days, always in bursts.
+      #
+      # The rule is a ratio with a floor, over 30 m. The floor (5) keeps a
+      # quiet deployment's single lost call from being 100 %; the ratio (half)
+      # separates a provider that is down or drowning from the burst loss the
+      # gate is there to remove. `rejected` (a 4xx, a wrong-dimension vector)
+      # is a configuration fault, not availability, and is left out of both
+      # sides. Summed across replicas. Both series are pre-seeded at 0.
+      - alert: TalosEmbeddingProviderUnavailable
+        expr: |
+          (
+            sum(increase(talos_embedding_requests_total{outcome="unavailable"}[30m]))
+            /
+            sum(increase(talos_embedding_requests_total{outcome=~"ok|unavailable"}[30m]))
+          ) > 0.5
+          and
+          sum(increase(talos_embedding_requests_total{outcome="unavailable"}[30m])) >= 5
+        for: 10m
+        labels:
+          severity: warning
+          category: reliability-degraded
+        annotations:
+          summary: "More than half of embedding calls are getting no answer"
+          description: |
+            {{ $value | humanizePercentage }} of calls to the embedding provider
+            in the last 30 minutes got no usable answer after a retry. While
+            this lasts, semantic memory recall silently falls back to keyword
+            search, new memories are stored without an embedding, and
+            ML-served classifications abstain to their LLM fallback.
+          action: |
+            1. Controller log: `Embedding API unavailable after retry` carries
+               the provider URL and the last error (timeout / transport / http).
+            2. Is the provider up? For the bundled Ollama embedder: the
+               container's health and its log.
+            3. `talos_embedding_gate_total{outcome="wait_expired"}` climbing
+               with `talos_embedding_request_duration_seconds` high means the
+               provider is up but slower than the demand: raise
+               EMBEDDING_TIMEOUT_SECS, or give it a faster backend.
+            4. Rows stored without an embedding are backfilled once the
+               provider answers again.
+
       # ── The boot herd: every deploy failing every due schedule.
       # Grounded 2026-08-10. The controller starts, its scheduler's first
       # poll fires ~1.7s later, and EVERY schedule that came due while the
