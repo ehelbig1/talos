@@ -2010,6 +2010,33 @@ async fn handle_create_workflow(
     }
 }
 
+#[cfg(test)]
+mod create_workflow_node_controls_tests {
+    /// The node schema must declare the three controls the handler now reads:
+    /// an accepted-but-undeclared field is undiscoverable.
+    #[test]
+    fn the_node_schema_declares_the_controls_the_builder_reads() {
+        let tools = super::tool_schemas();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "create_workflow")
+            .expect("create_workflow is declared");
+        let node_props = &tool["inputSchema"]["properties"]["nodes"]["items"]["properties"];
+        for key in talos_workflow_creation_helpers::NODE_CONTROL_KEYS {
+            assert!(
+                node_props.get(key).is_some(),
+                "create_workflow nodes must declare `{key}`"
+            );
+        }
+        assert_eq!(node_props["continue_on_error"]["type"], "boolean");
+        let description = tool["description"].as_str().unwrap();
+        assert!(
+            description.contains("continue_on_error")
+                && !description.contains("set those via add_node_to_workflow")
+        );
+    }
+}
+
 /// Extract a node-level `max_fuel` override out of an `add_node_to_workflow`
 /// `config` argument. This is the value that lands in the node's graph-JSON
 /// `data` and that the engine prefers over the module-row default
@@ -14130,29 +14157,6 @@ mod trigger_as_actors_context_pin {
 }
 
 #[cfg(test)]
-mod create_workflow_node_controls_tests {
-    /// The node schema must declare the three controls the handler now reads:
-    /// an accepted-but-undeclared field is undiscoverable.
-    #[test]
-    fn the_node_schema_declares_the_controls_the_builder_reads() {
-        let tools = super::tool_schemas();
-        let tool = tools
-            .iter()
-            .find(|t| t["name"] == "create_workflow")
-            .expect("create_workflow is declared");
-        let node_props = &tool["inputSchema"]["properties"]["nodes"]["items"]["properties"];
-        for key in talos_workflow_creation_helpers::NODE_CONTROL_KEYS {
-            assert!(
-                node_props.get(key).is_some(),
-                "create_workflow nodes must declare `{key}`"
-            );
-        }
-        assert_eq!(node_props["continue_on_error"]["type"], "boolean");
-        let description = tool["description"].as_str().unwrap();
-        assert!(
-            description.contains("continue_on_error")
-                && !description.contains("set those via add_node_to_workflow")
-        );
 mod actor_budget_block_tests {
     use super::render_actor_budget;
     use talos_actor_budget_refusal::{BudgetCap, BudgetHeadroom, CapUse};
