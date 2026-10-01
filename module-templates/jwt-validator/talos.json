@@ -2,11 +2,13 @@
   "name": "jwt-validator",
   "version": "v1.0.0",
   "display_name": "JWT Validator",
-  "description": "Validates a JSON Web Token (JWT) signature and required claims using a secret key fetched from the vault. Set SECRET_NAME config key to the vault path where your JWT signing key is stored (canonical path: 'auth/jwt_secret').",
+  "description": "Validates an HS256 JSON Web Token: the signature (computed in the host, so the key never enters the module), the header's algorithm, the token's lifetime, and any required claims. An expired token, a token not yet valid ('nbf'), and a token with no 'exp' claim are refused; set ALLOW_NO_EXPIRY to accept tokens that never expire. Set SECRET_NAME to the vault path of your signing key (canonical path: 'auth/jwt_secret').",
   "category": "Security",
   "capability_world": "secrets-node",
   "allowed_hosts": [],
-  "requires_secrets": ["auth/jwt_secret"],
+  "requires_secrets": [
+    "auth/jwt_secret"
+  ],
   "setup_instructions": [
     "1. Store your JWT signing key: create_secret {name: 'auth/jwt_secret', value: 'your-hmac-key', namespace: 'auth'}",
     "2. Install this module with the vault path: install_module_from_catalog {name: 'jwt-validator', allowed_secrets: ['auth/jwt_secret']}",
@@ -15,7 +17,9 @@
   ],
   "config_schema": {
     "type": "object",
-    "required": ["SECRET_NAME"],
+    "required": [
+      "SECRET_NAME"
+    ],
     "properties": {
       "SECRET_NAME": {
         "type": "string",
@@ -24,11 +28,23 @@
       "ALGORITHM": {
         "type": "string",
         "default": "HS256",
-        "description": "JWT signing algorithm (currently only HS256 supported)"
+        "description": "JWT signing algorithm. Only HS256 is supported: any other value fails the node, and a token whose header names another algorithm is refused."
       },
       "REQUIRED_CLAIMS": {
         "type": "string",
-        "description": "Comma-separated claim names that must be present (e.g., 'sub,exp,iat')"
+        "description": "Comma-separated claim names that must be present (e.g. 'sub,iss'). 'exp' is required already unless ALLOW_NO_EXPIRY is true."
+      },
+      "ALLOW_NO_EXPIRY": {
+        "type": "boolean",
+        "default": false,
+        "description": "Accept a token that has no 'exp' claim. Default false: such a token is valid forever, so it is refused unless the node opts in. An 'exp' that is present and past is refused either way."
+      },
+      "LEEWAY_SECS": {
+        "type": "integer",
+        "default": 60,
+        "minimum": 0,
+        "maximum": 300,
+        "description": "Clock skew tolerated on 'exp' and 'nbf', in seconds (0–300, default 60). A token is refused from exp + leeway onward and accepted from nbf − leeway."
       },
       "TOKEN_FIELD": {
         "type": "string",
