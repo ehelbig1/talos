@@ -490,7 +490,7 @@ Several default **ON** as of the 2026-07 "Tier 3" learning-loops cutover.
 | `MEMORY_REFLECTION_INPUT_CAP` | `40` | Max memories fed to reflection | |
 | `MEMORY_REFLECTION_MIN_MEMORIES` | `8` | Min memories before reflecting | |
 | `MEMORY_REFLECTION_MAX_ACTORS_PER_TICK` | `25` | Actor fan-out cap per tick | |
-| `MEMORY_REFLECTION_MODEL` | `qwen2.5:7b` | Reflection LLM model | |
+| `MEMORY_REFLECTION_MODEL` | the value of `MEMORY_CONSOLIDATION_MODEL` | Reflection LLM model for the local path. Unset, it follows consolidation's model; set it only to make the two differ | |
 | `MEMORY_RANK_PROVENANCE_RETENTION_DAYS` | `90` | Provenance row retention | |
 | `MEMORY_RANK_PROVENANCE_SWEEP_INTERVAL_SECS` | `3600` (clamped 300..86400) | Cadence of the `execution_memory_context` provenance sweep that enforces the retention above | |
 | `ADAPTIVE_RANK_MIN_EXAMPLES` | `50` | Min examples before training | |
