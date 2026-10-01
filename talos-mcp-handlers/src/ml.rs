@@ -69,6 +69,17 @@ pub fn tool_schemas() -> Vec<Value> {
             }, "required": ["dataset_id"] }
         }),
         serde_json::json!({
+            "name": "ml_reembed_dataset",
+            "description": "Re-embed a dataset's training examples IN PLACE with the configured LOCAL embedding provider, so their vectors come from the embedder now in use. DEFAULTS TO DRY-RUN: without apply=true it only reports how many rows have no embedding, how many were embedded by another model, and how many by the active one. scope='stale' (default) takes the rows the active model cannot serve — no stored vector, or a vector from another model; these rows are invisible to kNN serving and to eval. scope='all' takes every row: use it after moving the SAME embedding model to another runtime (e.g. from the in-stack embedder to a GPU-backed one) — the vectors are near-identical but not byte-identical, and ml_dedupe_dataset groups on a vector's bytes, so old and new copies of one text do not collapse until the old rows are re-embedded. One call is one bounded pass (limit rows or about 20 seconds, whichever comes first): repeat with after=<next_after> until done=true. A row is rewritten only when its vector or model actually changes. Labels, text and the dataset's updated_at are not touched, so no retrain is triggered; run ml_eval_model afterwards. Refused when the embedding provider is not host-local: dataset text is never sent to an external embedder.",
+            "inputSchema": { "type": "object", "properties": {
+                "dataset_id": { "type": "string" },
+                "scope": { "type": "string", "enum": ["stale", "all"], "description": "stale (default): rows with no embedding or one from another model. all: every row." },
+                "apply": { "type": "boolean", "description": "false/omitted = dry-run (default): count only, change nothing. true = re-embed one pass." },
+                "limit": { "type": "number", "description": "Rows per pass, 1-500 (default 200)." },
+                "after": { "type": "string", "description": "Continue after this row id — the next_after of the previous pass." }
+            }, "required": ["dataset_id"] }
+        }),
+        serde_json::json!({
             "name": "ml_sample_examples",
             "description": "Decrypt up to N random examples per label for human spot-checking (the review step of the bootstrap→review→train→deploy loop).",
             "inputSchema": { "type": "object", "properties": {
@@ -222,6 +233,7 @@ pub async fn dispatch(
         "ml_append_examples" => Some(handle_append_examples(req_id, args, state, user_id).await),
         "ml_dataset_stats" => Some(handle_dataset_stats(req_id, args, state, user_id).await),
         "ml_dedupe_dataset" => Some(handle_dedupe_dataset(req_id, args, state, user_id).await),
+        "ml_reembed_dataset" => Some(handle_reembed_dataset(req_id, args, state, user_id).await),
         "ml_sample_examples" => Some(handle_sample_examples(req_id, args, state, user_id).await),
         "ml_create_model" => Some(handle_create_model(req_id, args, state, user_id).await),
         "ml_eval_model" => Some(handle_eval_model(req_id, args, state, user_id).await),
@@ -652,6 +664,217 @@ async fn handle_dedupe_dataset(
         }
         Err(e) => internal(req_id, "dedupe_dataset", &e),
     }
+}
+
+/// Wall-clock budget of one `ml_reembed_dataset` pass. The pass also stops
+/// at its row limit; whichever comes first.
+const RE_EMBED_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// Rows per pass when the caller names none.
+const RE_EMBED_DEFAULT_LIMIT: i64 = 200;
+
+/// The arguments of `ml_reembed_dataset` after `dataset_id`.
+#[derive(Debug, PartialEq, Eq)]
+struct ReEmbedArgs {
+    scope: talos_ml::ReEmbedScope,
+    apply: bool,
+    limit: i64,
+    after: Option<Uuid>,
+}
+
+/// Absent or non-boolean `apply` is a dry run, as on `ml_dedupe_dataset`: an
+/// unparseable argument must never be the one that rewrites rows. An unknown
+/// `scope` or a malformed `after` is an error rather than a default — `all`
+/// misread as `stale` would report "done" over rows it never looked at.
+fn parse_reembed_args(args: &Value) -> Result<ReEmbedArgs, String> {
+    let scope = match args.get("scope") {
+        None | Some(Value::Null) => talos_ml::ReEmbedScope::Stale,
+        Some(v) => match v.as_str() {
+            Some("stale") => talos_ml::ReEmbedScope::Stale,
+            Some("all") => talos_ml::ReEmbedScope::All,
+            _ => return Err("scope must be 'stale' or 'all'".to_string()),
+        },
+    };
+    let after = match args.get("after") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| "after must be a row id (UUID)".to_string())?,
+        ),
+    };
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => RE_EMBED_DEFAULT_LIMIT,
+        Some(v) => v
+            .as_i64()
+            .ok_or_else(|| "limit must be a whole number".to_string())?
+            .clamp(1, talos_ml::RE_EMBED_MAX_BATCH),
+    };
+    Ok(ReEmbedArgs {
+        scope,
+        apply: args.get("apply").and_then(Value::as_bool).unwrap_or(false),
+        limit,
+        after,
+    })
+}
+
+/// How many rows `scope` covers, from a survey.
+fn reembed_rows_in_scope(scope: talos_ml::ReEmbedScope, survey: &talos_ml::ReEmbedSurvey) -> i64 {
+    match scope {
+        talos_ml::ReEmbedScope::Stale => survey.without_embedding + survey.other_model,
+        talos_ml::ReEmbedScope::All => survey.total,
+    }
+}
+
+/// The reply body. `pass` is `None` for a dry run.
+fn reembed_reply(
+    args: &ReEmbedArgs,
+    active_model: &str,
+    survey: &talos_ml::ReEmbedSurvey,
+    pass: Option<&talos_ml::ReEmbedBatch>,
+) -> Value {
+    let scope = match args.scope {
+        talos_ml::ReEmbedScope::Stale => "stale",
+        talos_ml::ReEmbedScope::All => "all",
+    };
+    let next_step = match pass {
+        None => format!(
+            "dry-run only, nothing changed: {} row(s) are in scope '{scope}'. Re-run with \
+             apply=true; each call is one pass — repeat with after=<next_after> until done=true.",
+            reembed_rows_in_scope(args.scope, survey)
+        ),
+        Some(p) if !p.done => format!(
+            "pass complete, more rows remain: call again with apply=true and after={}.",
+            p.next_after.map(|id| id.to_string()).unwrap_or_default()
+        ),
+        Some(p) if p.failed > 0 => format!(
+            "last pass reached the end, but {} row(s) in it could not be re-embedded (embedder \
+             gave no usable vector, or the row was unreadable) and are unchanged. Check \
+             talos_embedding_requests_total and run the tool again from the start.",
+            p.failed
+        ),
+        Some(_) => "done. Run ml_dedupe_dataset (dry-run first) — identical content now shares \
+                    one vector — then ml_eval_model."
+            .to_string(),
+    };
+    serde_json::json!({
+        "dry_run": pass.is_none(),
+        "scope": scope,
+        "active_embedding_model": active_model,
+        "rows": survey,
+        "rows_meaning": if pass.is_some() { "after this pass" } else { "now" },
+        "pass": pass,
+        "next_step": next_step,
+    })
+}
+
+async fn handle_reembed_dataset(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let dataset_id = match parse_uuid(args, "dataset_id") {
+        Ok(v) => v,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    let parsed = match parse_reembed_args(args) {
+        Ok(p) => p,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    // Dataset text is embedded only by a host-local provider (the append
+    // path's rule). Refuse up front rather than fail every row.
+    let Some(config) = talos_memory::embedding::EmbeddingConfig::cached() else {
+        return mcp_error(
+            req_id,
+            -32000,
+            "No embedding provider is configured (EMBEDDING_API_URL), so nothing can be re-embedded.",
+        );
+    };
+    if !config.is_local_provider() {
+        return mcp_denied(
+            req_id,
+            -32000,
+            "The configured embedding provider is not host-local. Dataset text is never sent \
+             to an external embedder, so nothing can be re-embedded.",
+        );
+    }
+    let active_model = config.model;
+
+    let svc = dataset_service(state);
+    let mut tx = match user_tx(state, user_id).await {
+        Ok(tx) => tx,
+        Err(e) => return internal(req_id, "reembed_dataset", &e),
+    };
+    if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
+        return m.response(req_id);
+    }
+
+    let pass = if parsed.apply {
+        match svc
+            .re_embed_batch(
+                &mut tx,
+                dataset_id,
+                parsed.scope,
+                parsed.after,
+                parsed.limit,
+                RE_EMBED_PASS_BUDGET,
+            )
+            .await
+        {
+            Ok(p) => Some(p),
+            Err(e) => return internal(req_id, "reembed_dataset", &e),
+        }
+    } else {
+        None
+    };
+    let survey = match svc
+        .re_embed_survey(&mut tx, dataset_id, &active_model)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return internal(req_id, "reembed_dataset", &e),
+    };
+    // A pass that changed rows is recorded on its own transaction: a change
+    // that cannot be recorded does not happen.
+    if let Some(p) = pass.as_ref().filter(|p| p.re_embedded > 0) {
+        let details = serde_json::json!({
+            "scope": if parsed.scope == talos_ml::ReEmbedScope::All { "all" } else { "stale" },
+            "embedding_model": active_model,
+            "re_embedded": p.re_embedded,
+            "unchanged": p.unchanged,
+            "failed": p.failed,
+            "done": p.done,
+        });
+        if let Err(e) = talos_actor_repository::insert_admin_event_log_on_conn(
+            &mut tx,
+            user_id,
+            "ml_dataset_reembedded",
+            "ml_dataset",
+            Some(dataset_id),
+            &format!(
+                "Re-embedded {} example(s) of a dataset with '{active_model}'",
+                p.re_embedded
+            ),
+            Some(&details),
+        )
+        .await
+        {
+            return internal(req_id, "reembed_dataset", &e);
+        }
+    }
+    if let Err(e) = tx.commit().await {
+        return internal(req_id, "reembed_dataset", &anyhow::anyhow!(e));
+    }
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&reembed_reply(
+            &parsed,
+            &active_model,
+            &survey,
+            pass.as_ref(),
+        ))
+        .unwrap_or_default(),
+    )
 }
 
 async fn handle_sample_examples(
@@ -2602,5 +2825,146 @@ mod disagreements_render_tests {
         );
         assert_eq!(r["blocking_classes"], serde_json::json!([]));
         assert!(r.get("measurement").is_none());
+    }
+}
+
+#[cfg(test)]
+mod reembed_tool_tests {
+    use super::{parse_reembed_args, reembed_reply, reembed_rows_in_scope, ReEmbedArgs};
+    use serde_json::json;
+    use talos_ml::{ReEmbedBatch, ReEmbedScope, ReEmbedSurvey};
+    use uuid::Uuid;
+
+    #[test]
+    fn the_defaults_are_a_dry_run_over_the_stale_rows() {
+        assert_eq!(
+            parse_reembed_args(&json!({})),
+            Ok(ReEmbedArgs {
+                scope: ReEmbedScope::Stale,
+                apply: false,
+                limit: 200,
+                after: None
+            })
+        );
+        // A non-boolean `apply` must never be the value that rewrites rows.
+        for not_true in [json!("true"), json!(1), json!(null)] {
+            let parsed = parse_reembed_args(&json!({ "apply": not_true })).unwrap();
+            assert!(!parsed.apply, "{not_true}");
+        }
+        assert!(parse_reembed_args(&json!({"apply": true})).unwrap().apply);
+    }
+
+    #[test]
+    fn a_scope_or_cursor_that_cannot_be_read_is_an_error_not_a_default() {
+        // `all` misread as `stale` would answer "done" over rows it never saw.
+        for bad in [
+            json!("ALL"),
+            json!("everything"),
+            json!(true),
+            json!(["all"]),
+        ] {
+            assert!(
+                parse_reembed_args(&json!({ "scope": bad })).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            parse_reembed_args(&json!({"scope": "all"})).unwrap().scope,
+            ReEmbedScope::All
+        );
+        for bad in [json!("not-a-uuid"), json!(7)] {
+            assert!(
+                parse_reembed_args(&json!({ "after": bad })).is_err(),
+                "{bad}"
+            );
+        }
+        let id = Uuid::new_v4();
+        assert_eq!(
+            parse_reembed_args(&json!({"after": id.to_string()}))
+                .unwrap()
+                .after,
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn the_limit_is_clamped_and_a_non_number_is_refused() {
+        let limit =
+            |v: serde_json::Value| parse_reembed_args(&json!({ "limit": v })).map(|a| a.limit);
+        assert_eq!(limit(json!(0)), Ok(1));
+        assert_eq!(limit(json!(50)), Ok(50));
+        assert_eq!(limit(json!(100_000)), Ok(talos_ml::RE_EMBED_MAX_BATCH));
+        assert!(limit(json!("50")).is_err());
+    }
+
+    fn survey() -> ReEmbedSurvey {
+        ReEmbedSurvey {
+            total: 10,
+            without_embedding: 2,
+            other_model: 3,
+            active_model: 5,
+        }
+    }
+
+    #[test]
+    fn the_reply_says_what_to_do_next_in_each_state() {
+        let s = survey();
+        assert_eq!(reembed_rows_in_scope(ReEmbedScope::Stale, &s), 5);
+        assert_eq!(reembed_rows_in_scope(ReEmbedScope::All, &s), 10);
+        let args = |scope| ReEmbedArgs {
+            scope,
+            apply: true,
+            limit: 200,
+            after: None,
+        };
+
+        let dry = reembed_reply(&args(ReEmbedScope::All), "m", &s, None);
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["rows_meaning"], "now");
+        assert!(dry["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("10 row(s) are in scope 'all'"));
+
+        let cursor = Uuid::new_v4();
+        let more = ReEmbedBatch {
+            processed: 200,
+            re_embedded: 200,
+            next_after: Some(cursor),
+            done: false,
+            ..Default::default()
+        };
+        let reply = reembed_reply(&args(ReEmbedScope::Stale), "m", &s, Some(&more));
+        assert_eq!(reply["dry_run"], false);
+        assert_eq!(reply["rows_meaning"], "after this pass");
+        assert!(reply["next_step"]
+            .as_str()
+            .unwrap()
+            .contains(&cursor.to_string()));
+
+        // The end of the dataset with rows that failed is NOT reported as done.
+        let failed = ReEmbedBatch {
+            processed: 5,
+            re_embedded: 3,
+            failed: 2,
+            done: true,
+            ..Default::default()
+        };
+        let reply = reembed_reply(&args(ReEmbedScope::Stale), "m", &s, Some(&failed));
+        let next = reply["next_step"].as_str().unwrap();
+        assert!(
+            next.contains("2 row(s)") && !next.starts_with("done"),
+            "{next}"
+        );
+
+        let done = ReEmbedBatch {
+            processed: 5,
+            re_embedded: 5,
+            done: true,
+            ..Default::default()
+        };
+        let reply = reembed_reply(&args(ReEmbedScope::Stale), "m", &s, Some(&done));
+        assert!(reply["next_step"].as_str().unwrap().starts_with("done"));
+        assert_eq!(reply["pass"]["re_embedded"], 5);
     }
 }
