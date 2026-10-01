@@ -1725,6 +1725,28 @@ services:
   # API key is required for semantic search.
   # NOTE: No ports are exposed to the host to avoid conflicts with host Ollama.
   # This service is only accessible internally to other Docker services.
+  #
+  # RUNNING WITHOUT THIS SERVICE. A deployment that sends both its LLM calls
+  # (OLLAMA_URL) and its embeddings (EMBEDDING_API_URL) to another Ollama — the
+  # host's own, for example, which can use the GPU where this container is
+  # CPU-only — does not need it. The controller and the worker wait for it to
+  # be healthy, so it cannot simply be left out; disable it in a gitignored
+  # `docker-compose.override.yml`:
+  #
+  #   services:
+  #     ollama:
+  #       profiles: ["in-stack-ollama"]   # not started by `make up`
+  #     controller:
+  #       depends_on:
+  #         ollama: !reset null           # drop the start-up dependency
+  #     worker:
+  #       depends_on:
+  #         ollama: !reset null
+  #
+  # then `docker compose rm -sf ollama` once, before adding the block, to
+  # remove the running container. Checked with `docker compose config`
+  # (Compose 2.24+ for `!reset`): `ollama` leaves the service list and both
+  # dependency lists. Delete the block to bring the service back.
   ollama:
     build:
       context: .
