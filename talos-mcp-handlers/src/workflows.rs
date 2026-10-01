@@ -318,7 +318,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_workflow_draft",
-            "description": "Trigger the current draft graph_json directly, bypassing the published version. Useful for testing unpublished changes without publishing first. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound drafts run with the same __actor_context__ payload they would receive in production.",
+            "description": "Trigger the current draft graph_json directly, bypassing the published version. Useful for testing unpublished changes without publishing first. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound drafts run with the same __actor_context__ payload they would receive in production. BUDGET: a rehearsal is a real execution and counts toward the actor's budget; the reply's `actor_budget` block shows each cap the actor's policy sets (limit, used, remaining) and carries a `warning` once any cap is 80% spent — in `suspend` mode a start refused on the hourly cap suspends the actor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -482,7 +482,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_workflow",
-            "description": "Execute a workflow synchronously and run assertions against the result. Returns pass/fail with detailed assertion results. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound workflows run with the same __actor_context__ payload they would receive in production.",
+            "description": "Execute a workflow synchronously and run assertions against the result. Returns pass/fail with detailed assertion results. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound workflows run with the same __actor_context__ payload they would receive in production. BUDGET: a rehearsal is a real execution and counts toward the actor's budget; the reply's `actor_budget` block shows each cap the actor's policy sets (limit, used, remaining) and carries a `warning` once any cap is 80% spent — in `suspend` mode a start refused on the hourly cap suspends the actor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3559,19 +3559,22 @@ async fn handle_test_workflow_draft(
     // Return a structured envelope so downstream scripts/agents don't
     // have to string-strip a prose header. `message` preserves the old
     // human-facing summary for operators reading raw MCP output.
+    let mut reply = serde_json::json!({
+        "execution_id": exec_id.to_string(),
+        "status": "running",
+        "is_draft": true,
+        "next_step": "get_execution_status",
+        "message": format!(
+            "Draft workflow triggered. Execution ID: {}. Running the DRAFT graph, not the published version — use get_execution_status to check results.",
+            exec_id
+        ),
+    });
+    if let Some(budget) = actor_budget_block(&state.db_pool, draft_row_actor).await {
+        reply["actor_budget"] = budget;
+    }
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "execution_id": exec_id.to_string(),
-            "status": "running",
-            "is_draft": true,
-            "next_step": "get_execution_status",
-            "message": format!(
-                "Draft workflow triggered. Execution ID: {}. Running the DRAFT graph, not the published version — use get_execution_status to check results.",
-                exec_id
-            ),
-        }))
-        .unwrap_or_default(),
+        &serde_json::to_string_pretty(&reply).unwrap_or_default(),
     )
 }
 
@@ -5916,6 +5919,93 @@ fn annotate_unpersisted_status(body: &mut serde_json::Value, status_persisted: b
     );
 }
 
+/// A cap spent to this share or beyond is called out in a rehearsal's reply.
+const BUDGET_WARN_PERCENT: i64 = 80;
+
+/// The `actor_budget` block of a rehearsal reply (`test_workflow`,
+/// `test_workflow_draft`).
+///
+/// A rehearsal is a real execution: it counts toward the actor's hourly cap
+/// and its model calls toward the daily token cap, and under `suspend` a
+/// refused start suspends the actor — taking its scheduled workflows with it.
+/// Nothing said so. On 2026-10-01 an afternoon of rehearsals took a live
+/// actor to 30 of 40 executions an hour and 341 K of 500 K tokens a day, seen
+/// only because someone went looking.
+///
+/// Three answers, kept apart: a budget with its caps; `policy: "none"` for an
+/// actor with no policy; `unreadable: true` when the read failed — which says
+/// nothing about how much is left and must not render as "no caps".
+pub(crate) fn render_actor_budget<E>(
+    read: Result<Option<talos_actor_budget_refusal::BudgetHeadroom>, E>,
+) -> serde_json::Value {
+    let headroom = match read {
+        Err(_) => {
+            return serde_json::json!({
+                "unreadable": true,
+                "note": "the actor's budget could not be read; this says nothing about how much is left",
+            })
+        }
+        Ok(None) => return serde_json::json!({ "policy": "none" }),
+        Ok(Some(h)) => h,
+    };
+    let caps: Vec<serde_json::Value> = headroom
+        .caps
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "cap": c.cap.as_str(),
+                "limit": c.limit,
+                "used": c.used,
+                "remaining": c.remaining(),
+                "percent_used": c.percent_used(),
+            })
+        })
+        .collect();
+    let near: Vec<String> = headroom
+        .caps
+        .iter()
+        .filter(|c| c.percent_used() >= BUDGET_WARN_PERCENT)
+        .map(|c| {
+            format!(
+                "{}: {} of {} used ({}%)",
+                c.cap.as_str(),
+                c.used,
+                c.limit,
+                c.percent_used()
+            )
+        })
+        .collect();
+    let mut block = serde_json::json!({ "mode": headroom.mode, "caps": caps });
+    if !near.is_empty() {
+        let consequence = if headroom.mode == "suspend" {
+            "Once a cap is reached further starts are refused, and in `suspend` mode a refusal on the hourly cap SUSPENDS the actor, which stops its scheduled workflows too."
+        } else {
+            "Once a cap is reached further starts by this actor are refused, scheduled ones included."
+        };
+        block["warning"] = format!(
+            "{}. {consequence} Rehearsals count like any other run.",
+            near.join("; ")
+        )
+        .into();
+    }
+    block
+}
+
+/// Read the budget of the actor a rehearsal ran as and render it. `None` when
+/// the run had no actor (nothing to report). Runs AFTER the row is admitted,
+/// so the counts include this run.
+async fn actor_budget_block(
+    pool: &sqlx::PgPool,
+    actor_id: Option<uuid::Uuid>,
+) -> Option<serde_json::Value> {
+    let actor_id = actor_id?;
+    let read = talos_actor_budget_refusal::actor_budget_headroom(pool, actor_id).await;
+    if let Err(e) = &read {
+        tracing::warn!(actor_id = %actor_id, error = %e, "actor budget could not be read for a rehearsal reply");
+    }
+    Some(render_actor_budget(read))
+}
+
 /// Shared by the two sync-wait handlers (`call_workflow`, `test_workflow`):
 /// collapse a terminal-status write into a bool and WARN on failure, so the
 /// response builder can be honest about a status the platform did not record.
@@ -8181,7 +8271,6 @@ async fn handle_test_workflow(
         .with_actor_context(lifted_actor_context)
         .with_dry_run(dry_run)
         .with_timeout_override(600);
-    let _ = effective_test_actor; // kept for clarity; with_effective_actor encodes the same.
     let repo_for_test = state.workflow_repo.clone();
     let mut engine = match talos_engine::builder::for_workflow(
         registry,
@@ -8332,7 +8421,7 @@ async fn handle_test_workflow(
             // `running` response so the caller can poll via
             // `get_execution_status` rather than interpreting this as
             // a failure. Assertions are skipped (no output yet).
-            let running_result = serde_json::json!({
+            let mut running_result = serde_json::json!({
                 "passed": false,
                 "status": "running",
                 "execution_id": exec_id.to_string(),
@@ -8344,6 +8433,9 @@ async fn handle_test_workflow(
                     timeout_secs
                 ),
             });
+            if let Some(budget) = actor_budget_block(&state.db_pool, effective_test_actor).await {
+                running_result["actor_budget"] = budget;
+            }
             return Some(mcp_text(
                 req_id.clone(),
                 &serde_json::to_string_pretty(&running_result).unwrap_or_default(),
@@ -8376,6 +8468,9 @@ async fn handle_test_workflow(
     // Same pure helper as call_workflow so the two sync-wait handlers cannot
     // drift, and so one unit test covers both.
     annotate_unpersisted_status(&mut test_result, status_persisted);
+    if let Some(budget) = actor_budget_block(&state.db_pool, effective_test_actor).await {
+        test_result["actor_budget"] = budget;
+    }
 
     Some(mcp_text(
         req_id.clone(),
@@ -14058,5 +14153,111 @@ mod create_workflow_node_controls_tests {
             description.contains("continue_on_error")
                 && !description.contains("set those via add_node_to_workflow")
         );
+mod actor_budget_block_tests {
+    use super::render_actor_budget;
+    use talos_actor_budget_refusal::{BudgetCap, BudgetHeadroom, CapUse};
+
+    fn headroom(mode: &str, caps: &[(BudgetCap, i64, i64)]) -> BudgetHeadroom {
+        BudgetHeadroom {
+            mode: mode.to_string(),
+            caps: caps
+                .iter()
+                .map(|&(cap, limit, used)| CapUse { cap, limit, used })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn caps_are_listed_with_what_is_left_and_no_warning_below_the_threshold() {
+        let block = render_actor_budget::<()>(Ok(Some(headroom(
+            "suspend",
+            &[
+                (BudgetCap::PerHour, 40, 30),
+                (BudgetCap::LlmTokensPerDay, 500_000, 340_704),
+            ],
+        ))));
+        assert_eq!(block["mode"], "suspend");
+        assert_eq!(
+            block["caps"],
+            serde_json::json!([
+                {"cap": "per_hour", "limit": 40, "used": 30, "remaining": 10, "percent_used": 75},
+                {"cap": "llm_tokens_per_day", "limit": 500_000, "used": 340_704, "remaining": 159_296, "percent_used": 68},
+            ])
+        );
+        assert!(
+            block.get("warning").is_none(),
+            "75% and 68% are below the 80% threshold"
+        );
+    }
+
+    #[test]
+    fn a_cap_at_eighty_percent_is_called_out_with_what_suspend_does() {
+        let block = render_actor_budget::<()>(Ok(Some(headroom(
+            "suspend",
+            &[
+                (BudgetCap::PerHour, 40, 32),
+                (BudgetCap::LlmTokensPerDay, 500_000, 100),
+            ],
+        ))));
+        let warning = block["warning"].as_str().expect("32 of 40 is 80%");
+        assert!(
+            warning.starts_with("per_hour: 32 of 40 used (80%)."),
+            "{warning}"
+        );
+        assert!(warning.contains("SUSPENDS the actor") && !warning.contains("llm_tokens_per_day"));
+        // One under the threshold: quiet.
+        let quiet = render_actor_budget::<()>(Ok(Some(headroom(
+            "suspend",
+            &[(BudgetCap::PerHour, 40, 31)],
+        ))));
+        assert!(quiet.get("warning").is_none());
+        // Other modes refuse without suspending, and the warning does not claim otherwise.
+        for mode in ["block", "alert"] {
+            let b = render_actor_budget::<()>(Ok(Some(headroom(
+                mode,
+                &[
+                    (BudgetCap::PerHour, 40, 40),
+                    (BudgetCap::FuelPerHour, 100, 95),
+                ],
+            ))));
+            let w = b["warning"].as_str().unwrap();
+            assert!(
+                w.contains("per_hour: 40 of 40 used (100%); fuel_per_hour: 95 of 100 used (95%)")
+                    && !w.contains("SUSPENDS"),
+                "{mode}: {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_policy_and_an_unreadable_budget_are_different_answers() {
+        assert_eq!(
+            render_actor_budget::<()>(Ok(None)),
+            serde_json::json!({"policy": "none"})
+        );
+        let unreadable = render_actor_budget(Err("db down"));
+        assert_eq!(unreadable["unreadable"], true);
+        assert!(unreadable.get("caps").is_none() && unreadable.get("policy").is_none());
+        // A policy that sets no cap is a policy, with nothing to count.
+        let empty = render_actor_budget::<()>(Ok(Some(headroom("block", &[]))));
+        assert_eq!(empty, serde_json::json!({"mode": "block", "caps": []}));
+    }
+
+    #[test]
+    fn both_rehearsal_tools_document_the_block() {
+        let tools = super::tool_schemas();
+        for name in ["test_workflow", "test_workflow_draft"] {
+            let tool = tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is declared"));
+            assert!(
+                tool["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("`actor_budget`"),
+                "{name}"
+            );
+        }
     }
 }

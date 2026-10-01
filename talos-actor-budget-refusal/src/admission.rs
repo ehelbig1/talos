@@ -191,13 +191,7 @@ pub async fn admit_actor_budget_for(
     // comment this replaced said chain rows carried no actor — stale for
     // months, and the reason the first CK survey missed that path).
     if let Some(limit) = per_minute {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM workflow_executions \
-             WHERE actor_id = $1 AND started_at > now() - INTERVAL '1 minute'",
-        )
-        .bind(actor_id)
-        .fetch_one(&mut *conn)
-        .await?;
+        let count = executions_last_minute(&mut *conn, actor_id).await?;
         if count + starts > i64::from(limit) {
             return Ok(refuse(BudgetCap::PerMinute, i64::from(limit), count));
         }
@@ -217,13 +211,7 @@ pub async fn admit_actor_budget_for(
     // Rolling per-hour FUEL cap over execution_cost_rollup. `::bigint` is
     // required: SUM(bigint) returns NUMERIC, which sqlx cannot decode as i64.
     if let Some(limit) = fuel_per_hour {
-        let used: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(fuel_consumed), 0)::bigint FROM execution_cost_rollup \
-             WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '1 hour'",
-        )
-        .bind(actor_id)
-        .fetch_one(&mut *conn)
-        .await?;
+        let used = fuel_last_hour(&mut *conn, actor_id).await?;
         if used >= limit {
             return Ok(refuse(BudgetCap::FuelPerHour, limit, used));
         }
@@ -247,6 +235,36 @@ pub async fn admit_actor_budget_for(
 // statements, and the copies disagreed: the pre-check's lifetime count read
 // the live table only while this one added the archive (#746), so the same
 // actor passed one and failed the other. Both now call these.
+
+/// Executions attributed to `actor_id` that started in the rolling last
+/// minute. Counts only rows that carry this actor id.
+pub async fn executions_last_minute<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    actor_id: Uuid,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_executions \
+         WHERE actor_id = $1 AND started_at > now() - INTERVAL '1 minute'",
+    )
+    .bind(actor_id)
+    .fetch_one(executor)
+    .await
+}
+
+/// Fuel recorded for `actor_id` over the rolling last hour. `::bigint` is
+/// required: SUM(bigint) returns NUMERIC, which sqlx cannot decode as i64.
+pub async fn fuel_last_hour<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    actor_id: Uuid,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(fuel_consumed), 0)::bigint FROM execution_cost_rollup \
+         WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '1 hour'",
+    )
+    .bind(actor_id)
+    .fetch_one(executor)
+    .await
+}
 
 /// Executions attributed to `actor_id` that started in the rolling last hour.
 pub async fn executions_last_hour<'e, E: sqlx::PgExecutor<'e>>(
@@ -294,9 +312,143 @@ pub async fn llm_tokens_last_24h<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
+// ── Headroom: the same caps, read for a report ───────────────────────────
+
+/// One cap of an actor's budget and how much of it is spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapUse {
+    pub cap: BudgetCap,
+    pub limit: i64,
+    pub used: i64,
+}
+
+impl CapUse {
+    /// What is left before the cap refuses a start; never negative.
+    #[must_use]
+    pub fn remaining(&self) -> i64 {
+        (self.limit - self.used).max(0)
+    }
+
+    /// Spent share in whole percent (a cap of zero is fully spent).
+    #[must_use]
+    pub fn percent_used(&self) -> i64 {
+        if self.limit <= 0 {
+            return 100;
+        }
+        // i128: `used * 100` must not overflow for a fuel or token count.
+        (i128::from(self.used.max(0)) * 100 / i128::from(self.limit)).min(i128::from(i64::MAX))
+            as i64
+    }
+}
+
+/// An actor's budget as it stands: its mode and every cap the policy sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetHeadroom {
+    /// `on_budget_exceeded`: `suspend`, `alert` or `block`.
+    pub mode: String,
+    /// Only the caps the policy sets, in the order admission checks them.
+    pub caps: Vec<CapUse>,
+}
+
+/// Read `actor_id`'s budget and current spend, for reporting.
+///
+/// `Ok(None)` means the actor has no budget policy. An `Err` means the budget
+/// could not be read; a caller must say so rather than render "no caps".
+///
+/// This is a REPORT, not an admission: it takes no lock and its counts can
+/// move before the next start. The counts are the same statements
+/// [`admit_actor_budget_for`] runs, so the two cannot disagree on what a cap
+/// measures. A cap the policy does not set costs no query; the lifetime count
+/// (live table plus archive) runs only for an actor with a lifetime cap.
+pub async fn actor_budget_headroom(
+    pool: &sqlx::PgPool,
+    actor_id: Uuid,
+) -> sqlx::Result<Option<BudgetHeadroom>> {
+    let policy: Option<(
+        Option<i32>,
+        Option<i64>,
+        Option<i32>,
+        Option<i64>,
+        Option<i64>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT max_executions_per_hour, max_executions_total, \
+             max_workflows_per_minute, max_fuel_per_hour, max_llm_tokens_per_day, \
+             on_budget_exceeded \
+             FROM actor_budget_policies WHERE actor_id = $1",
+    )
+    .bind(actor_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((per_hour, total, per_minute, fuel_per_hour, llm_tokens_per_day, mode)) = policy
+    else {
+        return Ok(None);
+    };
+    let mut caps = Vec::with_capacity(5);
+    if let Some(limit) = per_minute {
+        let used = executions_last_minute(pool, actor_id).await?;
+        caps.push(CapUse {
+            cap: BudgetCap::PerMinute,
+            limit: i64::from(limit),
+            used,
+        });
+    }
+    if let Some(limit) = per_hour {
+        let used = executions_last_hour(pool, actor_id).await?;
+        caps.push(CapUse {
+            cap: BudgetCap::PerHour,
+            limit: i64::from(limit),
+            used,
+        });
+    }
+    if let Some(limit) = total {
+        let used = lifetime_executions(pool, actor_id).await?;
+        caps.push(CapUse {
+            cap: BudgetCap::Total,
+            limit,
+            used,
+        });
+    }
+    if let Some(limit) = fuel_per_hour {
+        let used = fuel_last_hour(pool, actor_id).await?;
+        caps.push(CapUse {
+            cap: BudgetCap::FuelPerHour,
+            limit,
+            used,
+        });
+    }
+    if let Some(limit) = llm_tokens_per_day {
+        let used = llm_tokens_last_24h(pool, actor_id).await?;
+        caps.push(CapUse {
+            cap: BudgetCap::LlmTokensPerDay,
+            limit,
+            used,
+        });
+    }
+    Ok(Some(BudgetHeadroom { mode, caps }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_use_arithmetic_is_bounded() {
+        let c = |limit, used| CapUse {
+            cap: BudgetCap::PerHour,
+            limit,
+            used,
+        };
+        assert_eq!((c(40, 30).remaining(), c(40, 30).percent_used()), (10, 75));
+        assert_eq!((c(40, 40).remaining(), c(40, 40).percent_used()), (0, 100));
+        // Past the cap (a batch, or a count that moved): no negative headroom.
+        assert_eq!((c(40, 55).remaining(), c(40, 55).percent_used()), (0, 137));
+        assert_eq!(c(0, 0).percent_used(), 100, "a zero cap is fully spent");
+        assert_eq!(c(500_000, 340_704).percent_used(), 68);
+        // A fuel-sized count does not overflow the percentage.
+        assert_eq!(c(i64::MAX, i64::MAX).percent_used(), 100);
+        assert_eq!(c(10, -3).percent_used(), 0);
+    }
 
     #[test]
     fn lock_key_is_deterministic_and_distinct() {
