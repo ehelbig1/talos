@@ -315,7 +315,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "Catalog module name (e.g. 'http-request', 'echo-debug'). Use list_module_catalog to see available names." },
+                    "name": { "type": "string", "description": "The catalog template to install: its slug (e.g. 'http-request', 'gmail-list-messages') or its display name as shown by list_module_catalog and get_catalog_status (e.g. 'HTTP Request', 'Gmail: List Messages')." },
                     "display_name": { "type": "string", "description": "Optional display name override. Defaults to the catalog template's display_name." },
                     "allowed_secrets": {
                         "type": "array",
@@ -3443,6 +3443,72 @@ mod catalog_template_resolver_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// The display names reports show — with a colon, a slash, parentheses —
+    /// are accepted as keys and resolve to their template.
+    #[test]
+    fn a_display_name_with_punctuation_is_accepted_and_resolves() {
+        let root = fixture();
+        let catalog = root.join("catalog");
+        for (dir, display) in [
+            ("gmail-list-messages", "Gmail: List Messages"),
+            ("echo-debug", "Echo/Debug"),
+            ("hybrid-classify-alerts", "Hybrid Classify (Alerts)"),
+        ] {
+            let path = catalog.join(dir);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(
+                path.join("talos.json"),
+                serde_json::json!({ "display_name": display }).to_string(),
+            )
+            .unwrap();
+            let key = super::catalog_template_key(display).expect("accepted");
+            assert_eq!(
+                resolve_catalog_template_dir(&catalog, key),
+                Some(path.clone())
+            );
+            // Padded input resolves the same way.
+            let padded = format!("  {display} ");
+            let key = super::catalog_template_key(&padded).expect("accepted");
+            assert_eq!(
+                resolve_catalog_template_dir(&catalog, key),
+                Some(path.clone())
+            );
+            // And so does the slug.
+            assert_eq!(resolve_catalog_template_dir(&catalog, dir), Some(path));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_empty_oversized_or_control_character_key_is_refused() {
+        for bad in ["", "   ", "a\nb", "a\0b", "a\u{1b}[31mb"] {
+            assert!(super::catalog_template_key(bad).is_err(), "{bad:?}");
+        }
+        assert!(super::catalog_template_key(&"x".repeat(129)).is_err());
+        assert!(super::catalog_template_key(&"x".repeat(128)).is_ok());
+    }
+
+    /// A path-shaped key is refused before the resolver. The resolver would
+    /// not leave the catalog for one (next test), but it matches by slug, so
+    /// without this `./llm-inference/..` would install LLM Inference.
+    #[test]
+    fn a_path_shaped_key_is_refused() {
+        for key in [
+            "../outside",
+            "..",
+            "/etc/passwd",
+            "./llm-inference/..",
+            "..\\outside",
+            "\\share",
+            ".hidden",
+            "a/../b",
+        ] {
+            assert!(super::catalog_template_key(key).is_err(), "{key:?}");
+        }
+        // A slash inside a real display name is not a path.
+        assert_eq!(super::catalog_template_key("Echo/Debug"), Ok("Echo/Debug"));
+    }
+
     /// A key is never joined onto the path unless it is one safe component,
     /// so nothing outside the catalog can be reached, whatever the key.
     #[test]
@@ -4255,6 +4321,34 @@ fn catalog_slug_of(s: &str) -> String {
         .join("-")
 }
 
+/// Longest catalog key accepted. The longest display name shipped is 32 bytes.
+const MAX_CATALOG_KEY_BYTES: usize = 128;
+
+/// The catalog key a caller passed to `install_module_from_catalog`, trimmed.
+///
+/// Either form a report shows is accepted: the slug (`gmail-list-messages`)
+/// or the display name (`Gmail: List Messages`, `Echo/Debug`). Until
+/// 2026-10-01 anything but ASCII alphanumerics and hyphens was refused here
+/// as "Invalid module name", before the resolver — which has always matched
+/// display names — was reached; every report names a copy by its display
+/// name, so the name on screen was the one the tool rejected.
+///
+/// This check bounds the key, keeps control characters out of the log lines
+/// and error text that echo it, and refuses a key shaped like a path. The
+/// path-safety control itself is [`resolve_catalog_template_dir`], which
+/// never joins a key onto the catalog path unless it is one safe component.
+fn catalog_template_key(raw: &str) -> Result<&str, String> {
+    let key = talos_validation::validate_display_name("name", raw, MAX_CATALOG_KEY_BYTES)
+        .map_err(|e| e.message)?;
+    // No template is named like a path. The resolver would not leave the
+    // catalog for such a key, but it matches by slug, so `./llm-inference/..`
+    // would quietly install LLM Inference; say no instead.
+    if key.contains("..") || key.starts_with(['/', '\\', '.']) {
+        return Err("Invalid module name: it looks like a path, not a template name".to_string());
+    }
+    Ok(key)
+}
+
 /// A key that is safe to join onto the catalog directory as ONE path
 /// component: non-empty ASCII alphanumerics and hyphens, not starting with a
 /// hyphen. Anything else (a display name with spaces, `..`, `/`) is never
@@ -4317,21 +4411,13 @@ async fn handle_install_module_from_catalog(
         None => return mcp_error(req_id, -32602, "Missing required argument: name"),
     };
 
-    // SECURITY: Validate name — only alphanumeric and hyphens; no path traversal.
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '-') || name.is_empty() {
-        return mcp_error(
-            req_id,
-            -32602,
-            "Invalid module name: only alphanumeric characters and hyphens are allowed",
-        );
-    }
-    if name.contains("..") || name.starts_with('/') || name.starts_with('.') {
-        return mcp_error(
-            req_id,
-            -32602,
-            "Invalid module name: path traversal detected",
-        );
-    }
+    // The key is a slug or a display name. Bounded and free of control
+    // characters here; `resolve_catalog_template_dir` is what keeps it inside
+    // the catalog (it never joins a key that is not one safe path component).
+    let name = match catalog_template_key(name) {
+        Ok(key) => key,
+        Err(message) => return mcp_error(req_id, -32602, &message),
+    };
 
     let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
 
@@ -4380,7 +4466,9 @@ async fn handle_install_module_from_catalog(
                 req_id,
                 -32000,
                 &format!(
-                    "Module '{}' not found in catalog. Use list_module_catalog to see available modules.",
+                    "Module '{}' not found in catalog: it matches no template's slug (e.g. 'http-request') \
+                     and no template's display name (e.g. 'HTTP Request'). Use list_module_catalog to see \
+                     available modules.",
                     name
                 ),
             )
