@@ -25,9 +25,10 @@
 
 mod admission;
 pub use admission::{
-    actor_advisory_lock_key, actor_budget_exceeded_message, admit_actor_budget,
-    admit_actor_budget_for, executions_last_hour, lifetime_executions, llm_tokens_last_24h,
-    BudgetAdmission, BudgetRefusal,
+    actor_advisory_lock_key, actor_budget_exceeded_message, actor_budget_headroom,
+    admit_actor_budget, admit_actor_budget_for, executions_last_hour, executions_last_minute,
+    fuel_last_hour, lifetime_executions, llm_tokens_last_24h, BudgetAdmission, BudgetHeadroom,
+    BudgetRefusal, CapUse,
 };
 
 use std::collections::HashMap;
