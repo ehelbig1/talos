@@ -3231,10 +3231,18 @@ pub(crate) fn install_fuel_report(
         "template_max_fuel": template,
     });
     if source == "fuel_budget" && max_fuel < template {
+        // What gets the template's figure differs by case, so the note says
+        // the one that applies. On a reinstall, omitting `fuel_budget` KEEPS
+        // the copy's current limit; it does not take the template's.
+        let to_take_the_templates = if stored.is_none() {
+            "To take the template's, omit fuel_budget."
+        } else {
+            "To take the template's, pass the template's recommended_fuel as fuel_budget; \
+             omitting fuel_budget on a reinstall keeps the copy's current limit."
+        };
         report["note"] = format!(
             "The fuel_budget passed gives a limit ({max_fuel}) BELOW what the template recommends \
-             ({template}). It is applied as given; omit fuel_budget on a first install to take the \
-             template's."
+             ({template}). It is applied as given. {to_take_the_templates}"
         )
         .into();
     }
@@ -6320,6 +6328,16 @@ mod install_fuel_report_tests {
             assert!(
                 note.contains("(6000000)") && note.contains("(9900000)"),
                 "{note}"
+            );
+            // The way to the template's figure is the one that works here:
+            // omitting the budget on a first install, passing the template's
+            // on a reinstall (where omitting keeps the copy's limit).
+            let keeps = note.contains("keeps the copy's current limit");
+            assert_eq!(keeps, stored.is_some(), "{stored:?}: {note}");
+            assert_eq!(
+                note.contains("omit fuel_budget."),
+                stored.is_none(),
+                "{stored:?}: {note}"
             );
         }
     }

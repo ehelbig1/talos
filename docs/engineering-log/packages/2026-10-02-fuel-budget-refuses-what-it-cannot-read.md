@@ -69,3 +69,9 @@ does not drive a successful compile with a well-formed budget (no compiler in
 that harness) — the unit tests and the unchanged formula carry that. The
 template-refusal branch is covered by the catalog test keeping it
 unreachable, not by a test that drives it.
+
+**Follow-up, same day.** The note for a passed budget below the template's
+figure said "omit fuel_budget on a first install to take the template's" in
+both cases. On a reinstall, omitting it keeps the copy's current limit. The
+note now states the route that applies: omit it on a first install; pass the
+template's `recommended_fuel` on a reinstall.
