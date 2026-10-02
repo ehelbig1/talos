@@ -661,6 +661,7 @@ export enum IntegrationService {
   Gmail = "GMAIL",
   GoogleCalendar = "GOOGLE_CALENDAR",
   GoogleCloud = "GOOGLE_CLOUD",
+  GoogleHealth = "GOOGLE_HEALTH",
   Jira = "JIRA",
   Slack = "SLACK",
 }

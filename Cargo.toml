@@ -153,6 +153,7 @@ members = [
     "talos-google-calendar",
     "talos-gmail",
     "talos-google-cloud",
+    "talos-google-health",
     "talos-github",
     "talos-github-repository",
     "talos-github-connect",

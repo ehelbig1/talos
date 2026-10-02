@@ -610,6 +610,14 @@ pub(crate) async fn build_platform_services(
         "Google Cloud integration service initialized (token encryption + dual-write enabled)"
     );
 
+    // ---------- Initialize Google Health connection ----------
+    // OAuth only: the readings are fetched by a sandboxed module with a
+    // vault:// reference, so this service holds no API client.
+    let google_health_service = std::sync::Arc::new(
+        google_health::GoogleHealthService::new(db_pool.clone())
+            .with_credentials_service(oauth_credential_service.clone()),
+    );
+
     // Write-tier (Phase C provisioning) sibling: same OAuth client, separate
     // consent under provider "google_cloud_write" with scope-narrowed
     // pubsub+monitoring grants. See GcpTier docs in talos-google-cloud.
@@ -1342,6 +1350,7 @@ pub(crate) async fn build_platform_services(
         google_cloud_integration_service,
         google_cloud_write_service,
         google_cloud_full_service,
+        google_health_service,
         github_connect_service,
         gmail_watch_service,
         gmail_pubsub_verifier,

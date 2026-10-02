@@ -2,7 +2,14 @@
  * Shared types + icon mapping for the IntegrationsManager panel.
  */
 
-import { Calendar, LayoutGrid, Mail, MessageSquare, Plug } from "lucide-react";
+import {
+  Calendar,
+  HeartPulse,
+  LayoutGrid,
+  Mail,
+  MessageSquare,
+  Plug,
+} from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 /** Shape returned by GET /api/integrations/providers */
@@ -29,6 +36,7 @@ export interface GithubInstallation {
 /** Maps an icon name string from the API to the corresponding Lucide component. */
 const ICON_MAP: Record<string, LucideIcon> = {
   Calendar,
+  HeartPulse,
   Mail,
   MessageSquare,
   LayoutGrid,

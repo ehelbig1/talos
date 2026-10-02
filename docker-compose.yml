@@ -730,6 +730,9 @@ services:
       # above). Must also be registered as an Authorized redirect URI on the
       # Google OAuth client. Used by the talos-google-calendar connect flow.
       GOOGLE_CALENDAR_REDIRECT_URI: ${GOOGLE_CALENDAR_REDIRECT_URI:-http://localhost:8000/api/google-calendar/callback}
+      # Google Health connect (Pixel Watch / Fitbit readings). Issued under the
+      # shared Google client above; this URI must be listed on that client.
+      GOOGLE_HEALTH_REDIRECT_URI: ${GOOGLE_HEALTH_REDIRECT_URI:-http://localhost:8000/api/google-health/callback}
       # OAuth - Okta
       OKTA_DOMAIN: ${OKTA_DOMAIN:-}
       OKTA_CLIENT_ID: ${OKTA_CLIENT_ID:-}
