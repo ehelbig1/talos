@@ -2834,23 +2834,42 @@ impl SecretsManager {
         Ok(secrets_map)
     }
 
-    /// Delete a secret
+    /// Delete a secret. A path that matches nothing the caller may delete is
+    /// an error; use [`Self::delete_secret_if_present`] when absence is an
+    /// expected answer.
     pub async fn delete_secret(
         &self,
         key_path: &str,
         deleter_user_id: Option<Uuid>,
         accessible_org_ids: &[Uuid],
     ) -> Result<()> {
-        // RETURNING (id, owner_user_id) so cache-invalidation can be scoped to
-        // the deleted secret's actual owner — same rationale as update_secret.
-        // DELETE + audit insert run in a single tx (L-5).
+        if self
+            .delete_secret_if_present(key_path, deleter_user_id, accessible_org_ids)
+            .await?
+        {
+            Ok(())
+        } else {
+            anyhow::bail!("Secret not found or access denied")
+        }
+    }
+
+    /// Delete a secret, telling "nothing to delete" apart from "could not
+    /// delete": `Ok(true)` removed, `Ok(false)` nothing the caller may delete
+    /// matched, `Err` the delete could not be made (and nothing was removed).
+    pub async fn delete_secret_if_present(
+        &self,
+        key_path: &str,
+        deleter_user_id: Option<Uuid>,
+        accessible_org_ids: &[Uuid],
+    ) -> Result<bool> {
+        // The audit rows and the DELETE run in a single tx (L-5).
         //
         // RFC 0005 S3 / RFC 0006 (b): scope the NON-admin path to the caller's
         // membership so the secrets RLS USING (owner OR membership) backs up the
         // `($user IS NULL OR owner OR created_by OR org_id = ANY($orgs))` gate
         // below; org-shared deletes by a member are allowed (owner pin is
         // personal-only). Admin/internal path (deleter_user_id = None) stays
-        // UNSCOPED by design. Safe + latent while TALOS_RLS_SET_ROLE is off.
+        // UNSCOPED by design.
         let mut tx = match deleter_user_id {
             Some(uid) => talos_db::begin_tenant_read_scoped(
                 &self.db_pool,
@@ -2865,64 +2884,88 @@ impl SecretsManager {
                 .context("Failed to begin secret-delete transaction")?,
         };
 
-        let deleted: Option<(Uuid, Option<Uuid>)> = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
-            r#"DELETE FROM secrets
+        // Lock the rows first. (id, owner_user_id) so cache invalidation can
+        // be scoped to each deleted secret's actual owner — same rationale as
+        // update_secret.
+        let doomed: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+            r#"SELECT id, owner_user_id FROM secrets
                WHERE key_path = $1
                  AND ($2::uuid IS NULL OR owner_user_id = $2::uuid OR created_by = $2::uuid OR org_id = ANY($3))
-               RETURNING id, owner_user_id"#,
+               FOR UPDATE"#,
         )
         .bind(key_path)
         .bind(deleter_user_id)
         .bind(accessible_org_ids)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
 
-        let (secret_id, owner_user_id) = match deleted {
-            Some(row) => row,
-            None => anyhow::bail!("Secret not found or access denied"),
-        };
+        if doomed.is_empty() {
+            return Ok(false);
+        }
 
-        Self::log_audit_in_tx(
-            &mut tx,
-            Some(secret_id),
-            "delete",
-            "user",
-            deleter_user_id,
-            None,
-            true,
-            None,
-            None,
-        )
-        .await
-        .context("Failed to insert audit row for delete_secret")?;
+        // The audit row goes in BEFORE the delete. `secret_audit_log`'s row
+        // security admits a row only while its parent secret exists, so under
+        // `talos_app` an audit insert AFTER the delete is refused and rolls
+        // the whole delete back (pinned by
+        // `controller/tests/secret_delete_under_rls_tests`).
+        for (secret_id, _) in &doomed {
+            Self::log_audit_in_tx(
+                &mut tx,
+                Some(*secret_id),
+                "delete",
+                "user",
+                deleter_user_id,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .context("Failed to insert audit row for delete_secret")?;
+        }
+
+        let ids: Vec<Uuid> = doomed.iter().map(|(id, _)| *id).collect();
+        let removed = sqlx::query("DELETE FROM secrets WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if removed != ids.len() as u64 {
+            anyhow::bail!(
+                "secret delete removed {removed} of {} locked row(s); nothing was committed",
+                ids.len()
+            );
+        }
 
         tx.commit()
             .await
             .context("Failed to commit secret-delete transaction")?;
 
         if is_llm_provider_key_path(key_path) {
-            match owner_user_id {
-                Some(owner) => {
-                    self.invalidate_llm_keys_cache(Some(owner));
-                    tracing::info!(
-                        key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
-                        owner_user_id = %owner,
-                        "Invalidated LLM-keys cache for secret owner after deletion"
-                    );
-                }
-                None => {
-                    self.invalidate_all_llm_keys_cache();
-                    tracing::info!(
-                        key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
-                        "Invalidated ALL LLM-keys cache entries after deletion (legacy secret with no owner)"
-                    );
+            for (_, owner_user_id) in &doomed {
+                match owner_user_id {
+                    Some(owner) => {
+                        self.invalidate_llm_keys_cache(Some(*owner));
+                        tracing::info!(
+                            key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
+                            owner_user_id = %owner,
+                            "Invalidated LLM-keys cache for secret owner after deletion"
+                        );
+                    }
+                    None => {
+                        self.invalidate_all_llm_keys_cache();
+                        tracing::info!(
+                            key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
+                            "Invalidated ALL LLM-keys cache entries after deletion (legacy secret with no owner)"
+                        );
+                    }
                 }
             }
         }
 
         tracing::info!(key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path), "Deleted secret");
 
-        Ok(())
+        Ok(true)
     }
 
     /// Convert a raw `sqlx::PgRow` into a `Secret` struct.
@@ -3875,7 +3918,7 @@ impl SecretsManager {
             .context("Failed to begin secret-delete-by-id transaction")?;
 
         let key_path: Option<String> = sqlx::query_scalar(
-            "DELETE FROM secrets WHERE id = $1 AND created_by = $2 RETURNING key_path",
+            "SELECT key_path FROM secrets WHERE id = $1 AND created_by = $2 FOR UPDATE",
         )
         .bind(secret_id)
         .bind(user_id)
@@ -3883,10 +3926,13 @@ impl SecretsManager {
         .await?;
 
         let Some(kp) = key_path else {
-            // Nothing was deleted; no audit row to write either.
+            // Nothing to delete; no audit row to write either.
             return Ok(false);
         };
 
+        // Audit BEFORE the delete: `secret_audit_log`'s row security admits a
+        // row only while its parent secret exists (see
+        // `delete_secret_if_present`).
         Self::log_audit_in_tx(
             &mut tx,
             Some(secret_id),
@@ -3900,6 +3946,18 @@ impl SecretsManager {
         )
         .await
         .context("Failed to insert audit row for delete_secret_by_id")?;
+
+        let removed = sqlx::query("DELETE FROM secrets WHERE id = $1 AND created_by = $2")
+            .bind(secret_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if removed != 1 {
+            anyhow::bail!(
+                "secret delete removed {removed} row(s) of the 1 locked; nothing was committed"
+            );
+        }
 
         tx.commit()
             .await

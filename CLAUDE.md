@@ -2237,6 +2237,7 @@ refused too. A new local-inference call site must go through one of the two.
 - No MCP handler, GraphQL query, or REST endpoint returns plaintext secret values. `get_secret` is internal-only. MCP is **read-only for secrets** (MCP-1201): `set_secret` / `delete_secret` / `set_secret_namespace` / `set_secret_expiry` / `rotate_secret` were removed because MCP API keys are long-lived bearer tokens with no 2FA equivalent — secret writes would have bypassed the `require_2fa + SecretsWrite` discipline the GraphQL surface enforces. Mutations go through `talos-api/src/schema/secrets/mutations.rs`; MCP retains the read surface (list, namespaces, usage, health, normalize). `refresh_oauth_token` is the lone MCP write that touches vault — provider-side token rotation, no MCP-supplied value crosses the boundary. The GraphQL `Secret` type has no `value` field.
 - DLP `redact_json()` is applied to module execution output before DB storage (catches `sk-*`, `ghp_*`, Bearer tokens, etc.).
 - Audit logs record `key_hash` (SHA-256 of path), never the value.
+- A `secret_audit_log` row is written BEFORE its secret is deleted: the table's row security admits a row only while the parent secret exists, so an audit insert after the `DELETE` is refused under `talos_app` and rolls the delete back (2026-10-02).
 - Error messages reference `key_path`/`name` only, never decrypted content.
 
 **Per-context AEAD subkeys + per-ORG root DEKs (formats v3/v4).** Every AES-GCM
@@ -2499,6 +2500,7 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
 - **Unit tests exercise real production code.** Don't shadow production logic with a test-local copy (it drifts). Extract the logic into a `pub(crate)` method and call it from both sides. See `SecretsManager::try_llm_keys_cache_hit` + `llm_keys_cache_tests` for the pattern.
 - **Stub constructors for test-only deps.** Use `SecretsManager::test_stub_for_cache()` as the pattern — a real struct with a lazy DB pool that panics if touched, so cache-layer tests don't need Postgres.
 - **Tests that hit async code** need `#[tokio::test]`, not `#[test]`. `sqlx::PgPoolOptions::connect_lazy` panics outside a Tokio runtime.
+- **A test whose meaning depends on row security sets `TALOS_RLS_SET_ROLE` itself** (2026-10-02). The controller harness loads a developer `.env`, so local runs may enforce row security while CI (no `.env`) does not, and the switch is read once per process — one setting per test binary. Under `talos_app` a table's policy can hide a row before a statement's own ownership predicate is consulted, so pin that predicate in a binary that sets the switch OFF (`secret_delete_predicate_tests`).
 - **Mutation testing is for security gates, not every change** (2026-09-25). Mutation-prove a change — apply the mutation, show the guarding test fail, revert, show it pass — when it guards tenancy, crypto, authentication/authorization, a write ceiling or an egress control: there a guard that passes its own mutation is a vulnerability. Elsewhere a test that fails on the pre-fix tree is enough, and a package record need not list mutations.
 
 ## Pre-deploy validation
