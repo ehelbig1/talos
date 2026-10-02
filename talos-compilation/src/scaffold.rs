@@ -156,7 +156,9 @@ pub fn compute_max_fuel_with_llm_output(
 /// only touching fewer bytes did.
 ///
 /// `fuel_per_byte` is clamped to `[1, FUEL_PER_BYTE_MAX]`; the result is
-/// clamped to `[FUEL_MIN, FUEL_MAX]` as before.
+/// clamped to `[FUEL_MIN, FUEL_MAX]` as before. A caller's budget object goes
+/// through [`max_fuel_from_budget`], which refuses an out-of-range rate
+/// instead of moving it.
 pub fn compute_max_fuel_with_rates(
     item_count: u64,
     bytes_per_item: u64,
@@ -184,10 +186,219 @@ pub fn compute_max_fuel_with_rates(
 
     // Safety multiplier guards against variance (unexpected field explosion,
     // retries, inline LLM calls). Minimum 1.0 (no reduction), maximum 5.0.
-    let mult = safety_multiplier.clamp(1.0, 5.0);
+    let mult = safety_multiplier.clamp(SAFETY_MULTIPLIER_MIN, SAFETY_MULTIPLIER_MAX);
     let scaled = (subtotal as f64 * mult) as u64;
 
     scaled.clamp(FUEL_MIN, FUEL_MAX)
+}
+
+/// The fields a fuel budget may carry. Anything else is a misspelling.
+pub const FUEL_BUDGET_FIELDS: [&str; 5] = [
+    "expected_items",
+    "bytes_per_item",
+    "llm_output_bytes",
+    "safety_multiplier",
+    "fuel_per_byte",
+];
+/// Smallest and largest `safety_multiplier` a budget may state.
+pub const SAFETY_MULTIPLIER_MIN: f64 = 1.0;
+/// See [`SAFETY_MULTIPLIER_MIN`].
+pub const SAFETY_MULTIPLIER_MAX: f64 = 5.0;
+
+/// The fuel limit a budget object asks for, or why the object cannot be read.
+///
+/// A budget is `{expected_items, bytes_per_item, llm_output_bytes,
+/// safety_multiplier, fuel_per_byte}`, every field optional (an absent or
+/// `null` field takes its default: 10 items, 2000 bytes, 0, 2.0, and
+/// [`FUEL_PER_BYTE`]).
+///
+/// Until 2026-10-02 a field that could not be read took its default WITHOUT
+/// a word: `"fuel_per_byte": "40"` (a string) sized the module at the default
+/// rate of 2, `"byte_per_item"` (a misspelling) at 2000 bytes, and a rate of
+/// 0 or 500 was moved to 1 or 100. The caller got a limit, compiled against
+/// it, and learned the budget had not been applied only when the module ran
+/// out of fuel. A field that cannot be read is now refused, naming the field,
+/// the accepted form and the value given.
+///
+/// Refused: a budget that is not an object; a field not in
+/// [`FUEL_BUDGET_FIELDS`]; a count that is not a whole number of zero or
+/// more; a `fuel_per_byte` outside `1..=FUEL_PER_BYTE_MAX`; a
+/// `safety_multiplier` that is not a finite number in
+/// `SAFETY_MULTIPLIER_MIN..=SAFETY_MULTIPLIER_MAX`.
+///
+/// NOT refused: a result outside `[FUEL_MIN, FUEL_MAX]`. That clamp is stated
+/// in every tool description and the reply reports the limit it produced.
+pub fn max_fuel_from_budget(budget: &serde_json::Value) -> Result<u64, String> {
+    let Some(fields) = budget.as_object() else {
+        return Err(format!(
+            "fuel_budget must be an object such as {{\"expected_items\": 20, \"bytes_per_item\": 8000}}; got {}",
+            shown(budget)
+        ));
+    };
+    if let Some(unknown) = fields
+        .keys()
+        .find(|k| !FUEL_BUDGET_FIELDS.contains(&k.as_str()))
+    {
+        return Err(format!(
+            "fuel_budget has no field '{}'; its fields are {}",
+            unknown.chars().take(60).collect::<String>(),
+            FUEL_BUDGET_FIELDS.join(", ")
+        ));
+    }
+    let present = |field: &str| fields.get(field).filter(|v| !v.is_null());
+    let count = |field: &str, default: u64| -> Result<u64, String> {
+        match present(field) {
+            None => Ok(default),
+            Some(v) => v.as_u64().ok_or_else(|| {
+                format!(
+                    "fuel_budget.{field} must be a whole number of zero or more; got {}",
+                    shown(v)
+                )
+            }),
+        }
+    };
+    let items = count("expected_items", 10)?;
+    let bytes = count("bytes_per_item", 2000)?;
+    let llm_output_bytes = count("llm_output_bytes", 0)?;
+    let fuel_per_byte = match present("fuel_per_byte") {
+        None => FUEL_PER_BYTE,
+        Some(v) => v
+            .as_u64()
+            .filter(|rate| (1..=FUEL_PER_BYTE_MAX).contains(rate))
+            .ok_or_else(|| {
+                format!(
+                    "fuel_budget.fuel_per_byte must be a whole number from 1 to {FUEL_PER_BYTE_MAX}; got {}",
+                    shown(v)
+                )
+            })?,
+    };
+    let safety_multiplier = match present("safety_multiplier") {
+        None => 2.0,
+        Some(v) => v
+            .as_f64()
+            .filter(|m| (SAFETY_MULTIPLIER_MIN..=SAFETY_MULTIPLIER_MAX).contains(m))
+            .ok_or_else(|| {
+                format!(
+                    "fuel_budget.safety_multiplier must be a number from {SAFETY_MULTIPLIER_MIN:.1} to {SAFETY_MULTIPLIER_MAX:.1}; got {}",
+                    shown(v)
+                )
+            })?,
+    };
+    Ok(compute_max_fuel_with_rates(
+        items,
+        bytes,
+        llm_output_bytes,
+        fuel_per_byte,
+        safety_multiplier,
+    ))
+}
+
+/// A caller's value as it is echoed in a refusal: its JSON text, cut short.
+fn shown(value: &serde_json::Value) -> String {
+    let text = value.to_string();
+    if text.chars().count() <= 60 {
+        text
+    } else {
+        let mut cut: String = text.chars().take(60).collect();
+        cut.push('…');
+        cut
+    }
+}
+
+#[cfg(test)]
+mod max_fuel_from_budget_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_well_formed_budget_computes_what_the_formula_does() {
+        assert_eq!(
+            max_fuel_from_budget(&json!({})),
+            Ok(compute_max_fuel(10, 2000, 2.0))
+        );
+        assert_eq!(
+            max_fuel_from_budget(
+                &json!({"expected_items": 20, "bytes_per_item": 60000, "safety_multiplier": 2.0})
+            ),
+            Ok(7_300_000)
+        );
+        assert_eq!(
+            max_fuel_from_budget(
+                &json!({"expected_items": 5, "bytes_per_item": 60000, "fuel_per_byte": 40})
+            ),
+            Ok(24_700_000)
+        );
+        // A whole-number multiplier is a number; an explicit null is "not given".
+        assert_eq!(
+            max_fuel_from_budget(
+                &json!({"expected_items": 20, "bytes_per_item": 60000, "safety_multiplier": 2, "fuel_per_byte": null})
+            ),
+            Ok(7_300_000)
+        );
+        // The edges of each range are inside it.
+        for edge in [
+            json!({"fuel_per_byte": 1}),
+            json!({"fuel_per_byte": FUEL_PER_BYTE_MAX}),
+            json!({"safety_multiplier": 1.0}),
+            json!({"safety_multiplier": 5.0}),
+            json!({"expected_items": 0}),
+        ] {
+            assert!(max_fuel_from_budget(&edge).is_ok(), "{edge}");
+        }
+    }
+
+    #[test]
+    fn a_field_that_cannot_be_read_is_refused_and_named() {
+        let cases = [
+            (json!({"fuel_per_byte": "40"}), "fuel_per_byte"),
+            (json!({"fuel_per_byte": 0}), "fuel_per_byte"),
+            (json!({"fuel_per_byte": 500}), "fuel_per_byte"),
+            (json!({"fuel_per_byte": 40.5}), "fuel_per_byte"),
+            (json!({"expected_items": "20"}), "expected_items"),
+            (json!({"expected_items": -1}), "expected_items"),
+            (json!({"bytes_per_item": 60000.5}), "bytes_per_item"),
+            (json!({"llm_output_bytes": true}), "llm_output_bytes"),
+            (json!({"safety_multiplier": "3"}), "safety_multiplier"),
+            (json!({"safety_multiplier": 0.5}), "safety_multiplier"),
+            (json!({"safety_multiplier": 10}), "safety_multiplier"),
+        ];
+        for (budget, field) in cases {
+            let refusal = max_fuel_from_budget(&budget).expect_err(&budget.to_string());
+            assert!(
+                refusal.contains(&format!("fuel_budget.{field} must be")),
+                "{budget}: {refusal}"
+            );
+            assert!(refusal.contains("got "), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn a_misspelled_field_or_a_budget_that_is_not_an_object_is_refused() {
+        let refusal = max_fuel_from_budget(&json!({"expected_items": 20, "byte_per_item": 60000}))
+            .unwrap_err();
+        assert!(
+            refusal.contains("no field 'byte_per_item'") && refusal.contains("bytes_per_item"),
+            "{refusal}"
+        );
+        for not_an_object in [
+            json!(5_000_000),
+            json!("large"),
+            json!([20, 60000]),
+            json!(null),
+        ] {
+            let refusal = max_fuel_from_budget(&not_an_object).unwrap_err();
+            assert!(refusal.contains("must be an object"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn a_long_value_is_cut_before_it_is_echoed() {
+        let refusal =
+            max_fuel_from_budget(&json!({"expected_items": "x".repeat(5000)})).unwrap_err();
+        assert!(refusal.chars().count() < 200, "{}", refusal.len());
+        let refusal = max_fuel_from_budget(&json!({ "é".repeat(5000): 1 })).unwrap_err();
+        assert!(refusal.chars().count() < 250, "{}", refusal.len());
+    }
 }
 
 // ============================================================================
@@ -215,7 +426,7 @@ pub const FUEL_PER_BYTE: u64 = 2;
 pub const FUEL_PER_BYTE_MAX: u64 = 100;
 /// The sentence every `fuel_budget` schema carries about the per-byte rate, so
 /// the four tools that take a budget cannot describe it four ways.
-pub const FUEL_PER_BYTE_GUIDANCE: &str = "`fuel_per_byte` (integer 1–100, default 2) is the cost of each input byte. The default suits small typed items; measured costs are about 11 per byte for a response that is only fetched and typed-parsed, and 30–40 per byte the module decodes or scans (base64, HTML, text). Set it for byte-heavy modules: at the default, 20 items of 60 KB are budgeted 7.3M where reading them took about 50M.";
+pub const FUEL_PER_BYTE_GUIDANCE: &str = "`fuel_per_byte` (integer 1–100, default 2) is the cost of each input byte. The default suits small typed items; measured costs are about 11 per byte for a response that is only fetched and typed-parsed, and 30–40 per byte the module decodes or scans (base64, HTML, text). Set it for byte-heavy modules: at the default, 20 items of 60 KB are budgeted 7.3M where reading them took about 50M. A budget field that cannot be read — a wrong type, a value out of range, or a misspelled field name — is REFUSED, never replaced by its default.";
 /// Dispatcher clamp floor — the smallest max_fuel any module is given.
 pub const FUEL_MIN: u64 = 1_000_000;
 /// Dispatcher clamp ceiling — the largest max_fuel any module is given.

@@ -372,19 +372,6 @@ mod catalog_template_tests {
         assert!(t.validate_dependencies().is_err());
     }
 
-    /// A config key a template deserializes by name is in its `config_schema`.
-    ///
-    /// The schema is what `get_module_info` and the node editor show, so a key
-    /// read by the code and absent from it can only be found by reading the
-    /// template source. Measured 2026-10-01: 52 such keys in 6 templates, 3
-    /// undocumented — LLM Inference's `USER_PROMPT` (the only way to stop the
-    /// node sending its whole input to the model) and
-    /// `ALLOW_EMPTY_TEMPLATE_VARS`, and HTTP Request's `MAX_RESPONSE_BYTES`.
-    ///
-    /// Scope, stated: only keys read through `#[serde(rename = "KEY")]`. A
-    /// template that reads `config.get("KEY")` is not covered — seven older
-    /// templates disagree with their schema that way and are recorded in
-    /// `docs/engineering-log/packages/2026-10-01-template-config-docs.md`.
     /// A template's declared fuel must cover the largest request its own
     /// schema documents. `gmail-list-messages` declared none, so a fresh
     /// install took the generic baseline (~2.2 M) while one page at its
@@ -407,15 +394,8 @@ mod catalog_template_tests {
             let rec = manifest
                 .get("recommended_fuel")
                 .unwrap_or_else(|| panic!("{template} declares no recommended_fuel"));
-            let field = |k: &str| rec.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-            let limit = crate::scaffold::compute_max_fuel_with_llm_output(
-                field("expected_items"),
-                field("bytes_per_item"),
-                field("llm_output_bytes"),
-                rec.get("safety_multiplier")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(2.0),
-            );
+            let limit = crate::scaffold::max_fuel_from_budget(rec)
+                .unwrap_or_else(|e| panic!("{template}: {e}"));
             // Twice the measured need: a page of larger messages still fits.
             let need = per_item * max_items * 2;
             assert!(
@@ -426,6 +406,50 @@ mod catalog_template_tests {
         }
     }
 
+    /// Every `recommended_fuel` in the shipped catalog is a budget the one
+    /// strict reader accepts. An install REFUSES a template whose
+    /// recommendation cannot be read (it used to size the copy by defaults
+    /// and say nothing), so a malformed one must not ship.
+    #[test]
+    fn every_templates_recommended_fuel_can_be_read() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../module-templates");
+        let mut read = 0usize;
+        for entry in std::fs::read_dir(&root).unwrap().flatten() {
+            let path = entry.path().join("talos.json");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let manifest: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let Some(rec) = manifest.get("recommended_fuel").filter(|v| !v.is_null()) else {
+                continue;
+            };
+            let limit = crate::scaffold::max_fuel_from_budget(rec)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(
+                (crate::scaffold::FUEL_MIN..=crate::scaffold::FUEL_MAX).contains(&limit),
+                "{}",
+                path.display()
+            );
+            read += 1;
+        }
+        // 10 on 2026-10-02. A scan that finds none has stopped looking.
+        assert!(read >= 8, "only {read} templates declare recommended_fuel");
+    }
+
+    /// A config key a template deserializes by name is in its `config_schema`.
+    ///
+    /// The schema is what `get_module_info` and the node editor show, so a key
+    /// read by the code and absent from it can only be found by reading the
+    /// template source. Measured 2026-10-01: 52 such keys in 6 templates, 3
+    /// undocumented — LLM Inference's `USER_PROMPT` (the only way to stop the
+    /// node sending its whole input to the model) and
+    /// `ALLOW_EMPTY_TEMPLATE_VARS`, and HTTP Request's `MAX_RESPONSE_BYTES`.
+    ///
+    /// Scope, stated: only keys read through `#[serde(rename = "KEY")]`. A
+    /// template that reads `config.get("KEY")` is not covered — seven older
+    /// templates disagree with their schema that way and are recorded in
+    /// `docs/engineering-log/packages/2026-10-01-template-config-docs.md`.
     #[test]
     fn a_config_key_a_template_deserializes_by_name_is_in_its_config_schema() {
         let rename = regex::Regex::new(r#"#\[serde\([^)]*\brename\s*=\s*"([A-Z][A-Z0-9_]+)""#)

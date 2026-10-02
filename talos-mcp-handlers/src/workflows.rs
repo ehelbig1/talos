@@ -2329,7 +2329,10 @@ async fn handle_add_node_to_workflow(
             Ok(n) => n,
             Err(reason) => return mcp_error(req_id, -32602, reason),
         };
-        let fuel_budget = crate::sandbox::parse_fuel_budget_arg(args);
+        let fuel_budget = match crate::sandbox::parse_fuel_budget_arg(args) {
+            Ok(limit) => limit,
+            Err(reason) => return mcp_error(req_id, -32602, &reason),
+        };
 
         let node_id_for_service = args
             .get("node_id")
