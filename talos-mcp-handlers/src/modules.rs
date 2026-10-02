@@ -3202,9 +3202,15 @@ pub(crate) struct InstallGrants {
 ///
 /// `stored` is the limit on the row: before the install for a dry run, read
 /// back from the write for a real one. `None` is a first install.
+///
+/// `template` is what the template alone gives (its `recommended_fuel`, else
+/// the baseline) and is ALWAYS reported as `template_max_fuel`. Until
+/// 2026-10-02 it read `null` whenever the caller passed a `fuel_budget` — the
+/// one case where the caller most needs the number to compare against.
 pub(crate) fn install_fuel_report(
     stored: Option<i64>,
     offered: i64,
+    template: i64,
     fuel_explicit: bool,
 ) -> serde_json::Value {
     let (max_fuel, source) = match stored {
@@ -3222,8 +3228,16 @@ pub(crate) fn install_fuel_report(
     let mut report = serde_json::json!({
         "max_fuel": max_fuel,
         "source": source,
-        "template_max_fuel": if fuel_explicit { serde_json::Value::Null } else { serde_json::json!(offered) },
+        "template_max_fuel": template,
     });
+    if source == "fuel_budget" && max_fuel < template {
+        report["note"] = format!(
+            "The fuel_budget passed gives a limit ({max_fuel}) BELOW what the template recommends \
+             ({template}). It is applied as given; omit fuel_budget on a first install to take the \
+             template's."
+        )
+        .into();
+    }
     if source == "kept" && max_fuel < offered {
         report["note"] = format!(
             "This copy keeps its own fuel limit ({max_fuel}), which is BELOW what the template now \
@@ -4471,6 +4485,13 @@ async fn handle_install_module_from_catalog(
         Err(message) => return mcp_error(req_id, -32602, &message),
     };
 
+    // A caller's fuel budget that cannot be read is refused here, from the
+    // arguments alone, before the catalog or the database is consulted.
+    let budget_max_fuel: Option<i64> = match crate::sandbox::parse_fuel_budget_arg(args) {
+        Ok(limit) => limit.map(|v| v as i64),
+        Err(reason) => return mcp_error(req_id, -32602, &reason),
+    };
+
     let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
 
     // Enforce per-user installed module limit to prevent storage exhaustion.
@@ -4714,14 +4735,36 @@ async fn handle_install_module_from_catalog(
     // hardcoded 2M left LLM-backed templates fuel-starved, issue #381).
     // Resolved here, from the arguments and the template metadata alone, so
     // the dry run and the install report the same thing.
-    let fuel_explicit = args.get("fuel_budget").is_some();
-    let offered_max_fuel: i64 = if let Some(budget) = args.get("fuel_budget") {
-        crate::sandbox::compute_fuel_from_budget_value(budget) as i64
-    } else if let Some(rec) = meta.get("recommended_fuel") {
-        crate::sandbox::compute_fuel_from_budget_value(rec) as i64
-    } else {
-        talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64
+    //
+    // Both budgets go through the one strict reader. The caller's was read
+    // at the top of the handler. A template whose `recommended_fuel` cannot
+    // be read is a defect in the catalog: the install is refused rather than
+    // sized by defaults nobody chose, and the refusal says a `fuel_budget` of
+    // the caller's own installs it anyway.
+    let fuel_explicit = budget_max_fuel.is_some();
+    let template_max_fuel: i64 = match meta.get("recommended_fuel").filter(|v| !v.is_null()) {
+        None => talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64,
+        Some(rec) => match talos_compilation::scaffold::max_fuel_from_budget(rec) {
+            Ok(limit) => limit as i64,
+            Err(reason) if fuel_explicit => {
+                tracing::warn!(template = %display_name, %reason, "catalog template's recommended_fuel cannot be read; the caller's fuel_budget is used");
+                talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64
+            }
+            Err(reason) => {
+                tracing::error!(template = %display_name, %reason, "catalog template's recommended_fuel cannot be read");
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    &format!(
+                        "The catalog template '{display_name}' declares a recommended_fuel that cannot be read \
+                         ({}). Pass a fuel_budget of your own to install it.",
+                        reason.replacen("fuel_budget", "recommended_fuel", 1)
+                    ),
+                );
+            }
+        },
     };
+    let offered_max_fuel: i64 = budget_max_fuel.unwrap_or(template_max_fuel);
     match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {
         Ok(false) => {}
         Ok(true) => {
@@ -4739,6 +4782,7 @@ async fn handle_install_module_from_catalog(
                 install_fuel_report(
                     installed_copy.as_ref().map(|c| c.max_fuel),
                     offered_max_fuel,
+                    template_max_fuel,
                     fuel_explicit,
                 ),
             );
@@ -4967,6 +5011,7 @@ async fn handle_install_module_from_catalog(
                 "fuel": install_fuel_report(
                     installed_copy.as_ref().map(|_| install_result.max_fuel),
                     if installed_copy.is_some() { offered_max_fuel } else { install_result.max_fuel },
+                    template_max_fuel,
                     fuel_explicit,
                 ),
             });
@@ -6122,7 +6167,7 @@ mod install_dry_run_tests {
             Some(&stored),
             &grants,
             &[],
-            install_fuel_report(Some(stored.max_fuel), 5_850_000, false),
+            install_fuel_report(Some(stored.max_fuel), 5_850_000, 5_850_000, false),
         );
         // The copy's own limit is kept, and the preview says it is below the template's.
         assert_eq!(r["fuel"]["max_fuel"], 1_404_000);
@@ -6170,7 +6215,7 @@ mod install_dry_run_tests {
             Some(&stored),
             &grants,
             &[],
-            install_fuel_report(Some(stored.max_fuel), 2_000_000, false),
+            install_fuel_report(Some(stored.max_fuel), 2_000_000, 2_000_000, false),
         );
         assert_eq!(r["grants_changed"], false, "{r}");
         assert!(r["grants_not_carried"].as_object().unwrap().is_empty());
@@ -6189,7 +6234,7 @@ mod install_dry_run_tests {
             None,
             &first,
             &v(&["z/denied"]),
-            install_fuel_report(None, 2_200_000, false),
+            install_fuel_report(None, 2_200_000, 2_200_000, false),
         );
         assert_eq!(
             r["fuel"],
@@ -6214,18 +6259,18 @@ mod install_fuel_report_tests {
     #[test]
     fn a_first_install_takes_the_offered_limit_and_says_where_it_came_from() {
         assert_eq!(
-            install_fuel_report(None, 9_900_000, false),
+            install_fuel_report(None, 9_900_000, 9_900_000, false),
             json!({"max_fuel": 9_900_000, "source": "template", "template_max_fuel": 9_900_000})
         );
         assert_eq!(
-            install_fuel_report(None, 4_000_000, true),
-            json!({"max_fuel": 4_000_000, "source": "fuel_budget", "template_max_fuel": null})
+            install_fuel_report(None, 12_000_000, 9_900_000, true),
+            json!({"max_fuel": 12_000_000, "source": "fuel_budget", "template_max_fuel": 9_900_000})
         );
     }
 
     #[test]
     fn a_reinstall_keeps_the_copys_limit_and_says_when_that_is_below_the_template() {
-        let below = install_fuel_report(Some(1_404_000), 9_900_000, false);
+        let below = install_fuel_report(Some(1_404_000), 9_900_000, 9_900_000, false);
         assert_eq!(
             (below["max_fuel"].as_i64(), below["source"].as_str()),
             (Some(1_404_000), Some("kept"))
@@ -6240,19 +6285,43 @@ mod install_fuel_report_tests {
         );
         // At or above the template: kept, and nothing to say (an operator's tuning).
         for kept in [9_900_000, 24_000_000] {
-            let r = install_fuel_report(Some(kept), 9_900_000, false);
+            let r = install_fuel_report(Some(kept), 9_900_000, 9_900_000, false);
             assert_eq!(
                 (r["max_fuel"].as_i64(), r["source"].as_str()),
                 (Some(kept), Some("kept"))
             );
             assert!(r.get("note").is_none(), "{kept}");
         }
-        // The caller passed a budget: it is applied, up or down, with no note.
-        let set = install_fuel_report(Some(1_404_000), 6_000_000, true);
-        assert_eq!(
-            set,
-            json!({"max_fuel": 6_000_000, "source": "fuel_budget", "template_max_fuel": null})
-        );
+    }
+
+    /// The caller passed a budget: it is applied, up or down, and the
+    /// template's own figure is still reported beside it.
+    #[test]
+    fn a_passed_budget_is_applied_and_the_templates_figure_is_still_shown() {
+        for stored in [None, Some(1_404_000)] {
+            let above = install_fuel_report(stored, 12_000_000, 9_900_000, true);
+            assert_eq!(
+                above,
+                json!({"max_fuel": 12_000_000, "source": "fuel_budget", "template_max_fuel": 9_900_000}),
+                "{stored:?}"
+            );
+            let below = install_fuel_report(stored, 6_000_000, 9_900_000, true);
+            assert_eq!(
+                (
+                    below["max_fuel"].as_i64(),
+                    below["source"].as_str(),
+                    below["template_max_fuel"].as_i64()
+                ),
+                (Some(6_000_000), Some("fuel_budget"), Some(9_900_000))
+            );
+            let note = below["note"]
+                .as_str()
+                .expect("a budget below the template is called out");
+            assert!(
+                note.contains("(6000000)") && note.contains("(9900000)"),
+                "{note}"
+            );
+        }
     }
 
     #[test]

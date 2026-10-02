@@ -524,49 +524,20 @@ pub(crate) fn parse_integration_name_arg(args: &Value) -> Result<Option<String>,
     Ok(Some(s.to_string()))
 }
 
-/// Run the fuel-budget formula against a budget descriptor object.
+/// The fuel limit a caller's `fuel_budget` argument asks for.
 ///
-/// Accepts the inner `{expected_items, bytes_per_item, llm_output_bytes,
-/// safety_multiplier}` shape directly so it can be reused for both:
-///   - operator-supplied `args.fuel_budget` (sandbox compile, hot update, install)
-///   - template-supplied `talos.json.recommended_fuel` (catalog default)
-///
-/// All fields default to the same sensible values
-/// `parse_fuel_budget_arg` historically used.
-pub(crate) fn compute_fuel_from_budget_value(budget: &Value) -> u64 {
-    let items = budget
-        .get("expected_items")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10);
-    let bytes = budget
-        .get("bytes_per_item")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(2000);
-    let llm_output_bytes = budget
-        .get("llm_output_bytes")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let mult = budget
-        .get("safety_multiplier")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(2.0);
-    // Absent (or not a whole number) → the default rate, so every budget
-    // written before the field existed computes exactly what it did.
-    let fuel_per_byte = budget
-        .get("fuel_per_byte")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(talos_compilation::scaffold::FUEL_PER_BYTE);
-    talos_compilation::scaffold::compute_max_fuel_with_rates(
-        items,
-        bytes,
-        llm_output_bytes,
-        fuel_per_byte,
-        mult,
-    )
-}
-
-pub(crate) fn parse_fuel_budget_arg(args: &Value) -> Option<u64> {
-    args.get("fuel_budget").map(compute_fuel_from_budget_value)
+/// `Ok(None)`: no budget was passed (absent, or an explicit `null`). `Err`:
+/// the budget cannot be read — see
+/// [`talos_compilation::scaffold::max_fuel_from_budget`], the one reader of a
+/// budget object, shared with a template's `recommended_fuel`. Every tool that
+/// takes a budget calls this BEFORE it compiles, so a budget that would not
+/// have been applied costs the caller a refusal rather than a compile and a
+/// module sized by defaults.
+pub(crate) fn parse_fuel_budget_arg(args: &Value) -> Result<Option<u64>, String> {
+    match args.get("fuel_budget").filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(budget) => talos_compilation::scaffold::max_fuel_from_budget(budget).map(Some),
+    }
 }
 
 /// Reject capability-world strings that are NOT compilable WIT worlds with a
@@ -1188,6 +1159,12 @@ async fn handle_compile_custom_sandbox(
         Ok(n) => n,
         Err(reason) => return mcp_error(req_id, -32602, reason),
     };
+    // Same for the fuel budget: one that cannot be read is refused here, not
+    // replaced by defaults after a compile.
+    let fuel_budget = match parse_fuel_budget_arg(args) {
+        Ok(limit) => limit,
+        Err(reason) => return mcp_error(req_id, -32602, &reason),
+    };
 
     // RBAC CHECK 1: Ensure agent is allowed to compile/use this capability world.
     // One shared predicate (`require_agent_role_permits_world`) — the inline
@@ -1521,7 +1498,7 @@ async fn handle_compile_custom_sandbox(
             // bare formula default of ~1.38M made every default-budget JS
             // module fail in workflows before user code ran). Clamped to
             // the dispatcher's 50M cap.
-            let computed_max_fuel: i64 = parse_fuel_budget_arg(args)
+            let computed_max_fuel: i64 = fuel_budget
                 .unwrap_or_else(|| talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0))
                 .saturating_add(talos_compilation::scaffold::interpreter_fuel_baseline(
                     &language_str,
@@ -2997,6 +2974,11 @@ async fn handle_hot_update_module(
     // Keep that distinction explicit so the reply can state which happened —
     // a caller who misspells the argument would otherwise get a success whose
     // fresh content_hash is indistinguishable from a real update.
+    // A fuel budget that cannot be read is refused before anything compiles.
+    let fuel_budget = match parse_fuel_budget_arg(args) {
+        Ok(limit) => limit,
+        Err(reason) => return Some(mcp_error(req_id.clone(), -32602, &reason)),
+    };
     let hot_update_source_supplied = args.get("rust_code").and_then(|v| v.as_str()).is_some();
     let hot_update_decode = args
         .get("rust_code")
@@ -3020,7 +3002,7 @@ async fn handle_hot_update_module(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         dependencies: args.get("dependencies").cloned(),
-        fuel_budget: parse_fuel_budget_arg(args),
+        fuel_budget,
     };
 
     // Role RBAC gate (2026-09-10). The EFFECTIVE world of a hot-update is the
@@ -5760,43 +5742,59 @@ mod test_module_fuel_limit_tests {
 
 #[cfg(test)]
 mod fuel_per_byte_tests {
-    use super::compute_fuel_from_budget_value;
+    use super::parse_fuel_budget_arg;
     use serde_json::json;
 
     #[test]
     fn a_budget_without_the_field_computes_what_it_always_did() {
         assert_eq!(
-            compute_fuel_from_budget_value(
-                &json!({"expected_items": 20, "bytes_per_item": 60000, "safety_multiplier": 2.0})
-            ),
-            7_300_000
+            parse_fuel_budget_arg(&json!({"fuel_budget":
+                {"expected_items": 20, "bytes_per_item": 60000, "safety_multiplier": 2.0}})),
+            Ok(Some(7_300_000))
         );
         assert_eq!(
-            compute_fuel_from_budget_value(&json!({})),
-            talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0)
+            parse_fuel_budget_arg(&json!({"fuel_budget": {}})),
+            Ok(Some(talos_compilation::scaffold::compute_max_fuel(
+                10, 2000, 2.0
+            )))
         );
-        // A value that is not a whole number is not a rate: the default applies.
-        for bad in [json!("40"), json!(40.5), json!(null), json!(-3)] {
-            assert_eq!(
-                compute_fuel_from_budget_value(
-                    &json!({"expected_items": 20, "bytes_per_item": 60000, "fuel_per_byte": bad})
-                ),
-                7_300_000
-            );
+    }
+
+    /// No budget, and an explicit `null`, are both "not given": the tool's own
+    /// default applies. Neither is an empty budget.
+    #[test]
+    fn an_absent_or_null_budget_is_not_a_budget() {
+        assert_eq!(parse_fuel_budget_arg(&json!({})), Ok(None));
+        assert_eq!(
+            parse_fuel_budget_arg(&json!({"fuel_budget": null})),
+            Ok(None)
+        );
+    }
+
+    /// Until 2026-10-02 each of these sized the module at the default rate
+    /// and said nothing.
+    #[test]
+    fn a_rate_that_cannot_be_read_is_refused_not_defaulted() {
+        for bad in [json!("40"), json!(40.5), json!(-3), json!(0), json!(500)] {
+            let refusal = parse_fuel_budget_arg(&json!({"fuel_budget":
+                {"expected_items": 20, "bytes_per_item": 60000, "fuel_per_byte": bad}}))
+            .expect_err(&bad.to_string());
+            assert!(refusal.contains("fuel_budget.fuel_per_byte"), "{refusal}");
         }
+        assert!(parse_fuel_budget_arg(&json!({"fuel_budget": 5_000_000})).is_err());
     }
 
     #[test]
     fn a_stated_rate_sizes_a_byte_heavy_module() {
         let at = |rate: u64| {
-            compute_fuel_from_budget_value(
-                &json!({"expected_items": 5, "bytes_per_item": 60000, "fuel_per_byte": rate, "safety_multiplier": 2.0}),
-            )
+            parse_fuel_budget_arg(&json!({"fuel_budget":
+                {"expected_items": 5, "bytes_per_item": 60000, "fuel_per_byte": rate, "safety_multiplier": 2.0}}))
+            .unwrap()
+            .unwrap()
         };
         assert_eq!(at(2), 1_900_000);
         assert_eq!(at(11), 7_300_000);
         assert_eq!(at(40), 24_700_000);
-        assert_eq!(at(100_000), at(100), "clamped at the maximum rate");
     }
 
     /// Four tools take a `fuel_budget`; each must declare the field, with the
