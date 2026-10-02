@@ -368,7 +368,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflow",
-            "description": "Canonical workflow-read tool — the `view` parameter selects the output shape. view='full' (default): the full definition of a workflow including all nodes, their configs, and edges. Each node surfaces: module_name (human-readable, including built-in nodes like 'Collect (built-in)'), config, skip_condition (when set), continue_on_error (when set), description (when set), and retry_count/retry_backoff_ms/retry_condition (only when non-default retry settings are explicitly configured). Workflow-level fields include readiness_score, capabilities, and tags. view='summary': comprehensive one-call operational overview — workflow definition, execution stats (last 7 days), version info, module dependencies, active schedules count, and active webhooks count (replaces the deprecated get_workflow_summary; for authoring/debugging use get_workflow_identity instead). view='raw_json': the raw graph JSON exactly as the engine's parser sees it — `{nodes: [...], edges: [...]}` with each node carrying its `kind`, `data`, `position`, etc. fields verbatim; useful for debugging parser-level issues the structured view papers over (replaces the deprecated get_workflow_raw_json; honors the `source` parameter). Each view emits the same JSON its legacy tool produced; the deprecated names still dispatch with a deprecation notice.",
+            "description": "Canonical workflow-read tool — the `view` parameter selects the output shape. view='full' (default): the full definition of a workflow including all nodes, their configs, and edges. Each node surfaces: module_name (human-readable, including built-in nodes like 'Collect (built-in)'), config, skip_condition (when set), continue_on_error (when set), timeout_secs (when set on the node; a `timeout_secs` inside config takes precedence at run time), description (when set), and retry_count/retry_backoff_ms/retry_condition (only when non-default retry settings are explicitly configured). Workflow-level fields include readiness_score, capabilities, and tags. view='summary': comprehensive one-call operational overview — workflow definition, execution stats (last 7 days), version info, module dependencies, active schedules count, and active webhooks count (replaces the deprecated get_workflow_summary; for authoring/debugging use get_workflow_identity instead). view='raw_json': the raw graph JSON exactly as the engine's parser sees it — `{nodes: [...], edges: [...]}` with each node carrying its `kind`, `data`, `position`, etc. fields verbatim; useful for debugging parser-level issues the structured view papers over (replaces the deprecated get_workflow_raw_json; honors the `source` parameter). Each view emits the same JSON its legacy tool produced; the deprecated names still dispatch with a deprecation notice.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3940,6 +3940,112 @@ async fn handle_get_workflow(
     }
 }
 
+/// Node-level settings `get_workflow` shows beside a node's `config`, each
+/// only when the node carries it. These live at the node's top level in the
+/// stored graph, outside `data`, so a key missing from this list is a setting
+/// an author can write and the engine obeys but the full view never shows.
+///
+/// `timeout_secs` was missing until 2026-10-02: `create_workflow`,
+/// `add_node_to_workflow` and the editor all store it here, and 9 live nodes
+/// carried one that only `view: "raw_json"` (or SQL) could reveal.
+const RENDERED_NODE_SETTINGS: [&str; 8] = [
+    "retry_count",
+    "retry_backoff_ms",
+    "retry_condition",
+    "retry_delay_expression",
+    "description",
+    "skip_condition",
+    "continue_on_error",
+    "timeout_secs",
+];
+
+/// One node of `get_workflow`'s full view: identity, position, `config` (the
+/// stored `data`), and each of [`RENDERED_NODE_SETTINGS`] the node carries.
+fn render_workflow_node(
+    node: &serde_json::Value,
+    module_id: &str,
+    module_name: &str,
+) -> serde_json::Value {
+    let mut node_info = serde_json::json!({
+        "id": node.get("id"),
+        "module_id": module_id,
+        "module_name": module_name,
+        "position": node.get("position"),
+        "config": node.get("data"),
+    });
+    if let Some(obj) = node_info.as_object_mut() {
+        for key in RENDERED_NODE_SETTINGS {
+            if let Some(value) = node.get(key) {
+                obj.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    node_info
+}
+
+#[cfg(test)]
+mod render_workflow_node_tests {
+    use super::{render_workflow_node, RENDERED_NODE_SETTINGS};
+    use serde_json::json;
+
+    #[test]
+    fn a_node_timeout_is_shown() {
+        let node = json!({
+            "id": "answer", "type": "m", "position": {"x": 1.0, "y": 2.0},
+            "data": {"MODEL": "local"}, "retry_count": 2, "timeout_secs": 90
+        });
+        let shown = render_workflow_node(&node, "m", "LLM Inference");
+        assert_eq!(shown["timeout_secs"], json!(90));
+        assert_eq!(shown["retry_count"], json!(2));
+        assert_eq!(shown["config"], json!({"MODEL": "local"}));
+        assert_eq!(shown["module_name"], json!("LLM Inference"));
+    }
+
+    #[test]
+    fn a_setting_the_node_does_not_carry_is_not_invented() {
+        let node = json!({"id": "a", "type": "m", "position": null, "data": {}});
+        let shown = render_workflow_node(&node, "m", "Mock");
+        let keys: Vec<&str> = shown
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["config", "id", "module_id", "module_name", "position"]
+        );
+    }
+
+    /// Every control `create_workflow` writes at a node's top level, and every
+    /// retry key `update_node_config` writes there, must be readable back.
+    #[test]
+    fn every_setting_an_authoring_tool_stores_on_the_node_is_shown() {
+        let stored = talos_workflow_creation_helpers::NODE_CONTROL_KEYS
+            .iter()
+            .copied()
+            .chain([
+                "retry_count",
+                "retry_backoff_ms",
+                "retry_condition",
+                "retry_delay_expression",
+            ]);
+        for key in stored {
+            assert!(
+                RENDERED_NODE_SETTINGS.contains(&key),
+                "{key} is stored on a node but get_workflow would not show it"
+            );
+            let mut node = json!({"id": "a", "type": "m", "data": {}});
+            node[key] = json!("x");
+            assert_eq!(
+                render_workflow_node(&node, "m", "Mock")[key],
+                json!("x"),
+                "{key}"
+            );
+        }
+    }
+}
+
 async fn handle_get_workflow_full(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -4033,37 +4139,7 @@ async fn handle_get_workflow_full(
                             .unwrap_or("unknown")
                             .to_string()
                     });
-                    let mut node_info = serde_json::json!({
-                        "id": n.get("id"),
-                        "module_id": module_id,
-                        "module_name": template_name,
-                        "position": n.get("position"),
-                        "config": n.get("data"),
-                    });
-                    if let Some(obj) = node_info.as_object_mut() {
-                        if let Some(rc) = n.get("retry_count") {
-                            obj.insert("retry_count".to_string(), rc.clone());
-                        }
-                        if let Some(rb) = n.get("retry_backoff_ms") {
-                            obj.insert("retry_backoff_ms".to_string(), rb.clone());
-                        }
-                        if let Some(rc) = n.get("retry_condition") {
-                            obj.insert("retry_condition".to_string(), rc.clone());
-                        }
-                        if let Some(rde) = n.get("retry_delay_expression") {
-                            obj.insert("retry_delay_expression".to_string(), rde.clone());
-                        }
-                        if let Some(desc) = n.get("description") {
-                            obj.insert("description".to_string(), desc.clone());
-                        }
-                        if let Some(sc) = n.get("skip_condition") {
-                            obj.insert("skip_condition".to_string(), sc.clone());
-                        }
-                        if let Some(coe) = n.get("continue_on_error") {
-                            obj.insert("continue_on_error".to_string(), coe.clone());
-                        }
-                    }
-                    node_info
+                    render_workflow_node(n, module_id, &template_name)
                 })
                 .collect()
         })
