@@ -3447,6 +3447,7 @@ impl ModuleRepository {
         config_schema: &serde_json::Value,
         catalog_slug: Option<&str>,
         fuel_explicit: bool,
+        dependencies: Option<&serde_json::Value>,
     ) -> Result<CatalogInstallResult> {
         let cw_long = capability_world_long(capability_world_short);
 
@@ -3491,12 +3492,12 @@ impl ModuleRepository {
                         user_id, name, kind, capability_world, config_schema, \
                         allowed_hosts, allowed_methods, allowed_secrets, requires_approval_for, \
                         source_code, wasm_bytes, content_hash, size_bytes, max_fuel, \
-                        catalog_slug, language, created_at, compiled_at, updated_at \
+                        catalog_slug, dependencies, language, created_at, compiled_at, updated_at \
                      ) VALUES ( \
                         $1, $2, 'catalog', $3, $4, \
                         $5, $6, $7, $8, \
                         $9, $10, $11, $12, $13, \
-                        $14, 'rust', NOW(), NOW(), NOW() \
+                        $14, $16, 'rust', NOW(), NOW(), NOW() \
                      ) \
                      ON CONFLICT (user_id, name) WHERE user_id IS NOT NULL DO UPDATE SET \
                         capability_world = EXCLUDED.capability_world, \
@@ -3510,6 +3511,9 @@ impl ModuleRepository {
                         wasm_bytes = EXCLUDED.wasm_bytes, \
                         content_hash = EXCLUDED.content_hash, \
                         size_bytes = EXCLUDED.size_bytes, \
+                        /* The crates THIS source was compiled with: a reinstall \
+                           replaces the source, so it replaces these too. */ \
+                        dependencies = EXCLUDED.dependencies, \
                         /* Operator fuel tuning survives re-install unless the \
                            caller EXPLICITLY passed a fuel_budget ($15) — the \
                            r236 hot_update semantic applied to the reinstall \
@@ -3546,6 +3550,7 @@ impl ModuleRepository {
             .bind(max_fuel)
             .bind(catalog_slug)
             .bind(fuel_explicit)
+            .bind(dependencies)
             .fetch_one(&mut *tx)
             .await?;
 

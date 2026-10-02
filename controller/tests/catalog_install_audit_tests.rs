@@ -58,6 +58,7 @@ async fn install(
             &json!({}),
             Some("gmail-list"),
             false,
+            None,
         )
         .await?
         .module_id)
@@ -235,6 +236,7 @@ async fn a_reinstall_keeps_the_copys_fuel_limit_and_reports_what_is_stored() {
                 &json!({}),
                 Some("gmail-list-messages"),
                 explicit,
+                None,
             )
             .await
             .expect("install")
@@ -272,5 +274,64 @@ async fn a_reinstall_keeps_the_copys_fuel_limit_and_reports_what_is_stored() {
     assert_eq!(
         (lowered.max_fuel, stored_limit().await),
         (1_000_000, 1_000_000)
+    );
+}
+
+/// An install records the crates the template was compiled with, and a
+/// reinstall replaces them with the new template's. `hot_update_module` reads
+/// them back from the installed copy (`get_wasm_module_dependencies`) to
+/// rebuild it; seen 2026-10-02, an installed copy of a template using `chrono`
+/// could not be recompiled because the install had stored none.
+#[tokio::test]
+async fn an_install_records_the_crates_it_was_compiled_with() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool).await;
+    let repo = ModuleRepository::new(pool.clone());
+    let install_with = |deps: Option<Value>, hash: &'static str| {
+        let repo = &repo;
+        async move {
+            repo.install_catalog_module_to_modules(
+                Some(user),
+                "Google Health: Daily Readings",
+                "http",
+                b"\0asm",
+                hash,
+                "fn run() {}",
+                2_000_000,
+                &["health.googleapis.com".to_string()],
+                &["GET".to_string()],
+                &[],
+                &[],
+                &json!({}),
+                Some("google-health-daily"),
+                false,
+                deps.as_ref(),
+            )
+            .await
+            .expect("install")
+            .module_id
+        }
+    };
+
+    let id = install_with(Some(json!({"chrono": "0.4"})), "h1").await;
+    assert_eq!(
+        repo.get_wasm_module_dependencies(id).await.unwrap(),
+        Some(json!({"chrono": "0.4"})),
+        "what hot_update reads to rebuild the installed copy"
+    );
+
+    let again = install_with(Some(json!({"chrono": "0.4", "url": "2"})), "h2").await;
+    assert_eq!(again, id, "a reinstall updates the same copy");
+    assert_eq!(
+        repo.get_wasm_module_dependencies(id).await.unwrap(),
+        Some(json!({"chrono": "0.4", "url": "2"})),
+        "a reinstall replaces the source, so it replaces the crates too"
+    );
+
+    install_with(None, "h3").await;
+    assert_eq!(
+        repo.get_wasm_module_dependencies(id).await.unwrap(),
+        None,
+        "a template that no longer declares crates leaves none behind"
     );
 }

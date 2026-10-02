@@ -4902,6 +4902,9 @@ async fn handle_install_module_from_catalog(
                     // stable under display-name renames (DX #14).
                     module_dir.file_name().and_then(|f| f.to_str()),
                     fuel_explicit,
+                    // The crates it was compiled with, so a later hot_update of
+                    // the installed copy can rebuild it without restating them.
+                    template.dependencies(),
                 )
                 .await
             {
