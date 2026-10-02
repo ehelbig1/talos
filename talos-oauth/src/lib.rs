@@ -1,6 +1,7 @@
 pub mod connect_binding;
 pub mod credentials;
 pub mod flow;
+pub(crate) mod google_grant;
 pub mod provider;
 pub mod refresh_task;
 pub mod resolver;
@@ -187,7 +188,17 @@ pub fn shared_google_client() -> (Option<String>, Option<String>) {
     )
 }
 
-pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bool> {
+/// Google's token revocation endpoint. Revoking ANY token of a Google account
+/// ends that account's whole grant to this OAuth client — see `google_grant`.
+pub(crate) const GOOGLE_REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
+
+/// Revoke `token` at its provider. `google_revoke_url` is a parameter so a test
+/// can stand in for Google; production passes [`GOOGLE_REVOKE_URL`].
+pub(crate) async fn revoke_at_provider(
+    provider: &str,
+    token: &str,
+    google_revoke_url: &str,
+) -> Result<bool> {
     let client = oauth_http_client();
 
     match provider {
@@ -204,7 +215,7 @@ pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bo
         // `google_revoke_arm_covers_every_google_provider`.)
         p if GOOGLE_REVOKE_PROVIDERS.contains(&p) => {
             let resp = client
-                .post("https://oauth2.googleapis.com/revoke")
+                .post(google_revoke_url)
                 .form(&[("token", token)])
                 .send()
                 .await

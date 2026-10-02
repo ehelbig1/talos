@@ -53,13 +53,16 @@ does not, but shows an unverified-app warning until Google has reviewed it.
 - A consent completed with every health scope unticked is refused at the
   callback (`google_health_error=no_health_scope`) and stores nothing.
 - A consent that returns no refresh token is refused and stores nothing.
-- Disconnecting deletes the vault entries and revokes at Google. **Google's
-  revoke is probably not per connection**: by Google's documentation a revoke
-  covers every scope of the account's authorization to the OAuth project, so
-  it may also end that account's Gmail and Calendar connections (and
-  disconnecting either of those may already end the others). This has not been
-  tested live. Until it is settled, disconnect a Google connection only when
-  you are prepared to reconnect the rest.
+- Disconnecting deletes this connection's tokens from the vault. **It revokes
+  at Google only when it is the last connection on that Google account.** A
+  Google revoke ends the account's whole grant to the OAuth client — tested
+  live on 2026-10-02: disconnecting Health on an account returned 401 on that
+  account's Calendar token two minutes later, and the next refresh was refused
+  with `invalid_grant`. So while Gmail, Calendar or Cloud is still connected on
+  the same Google account, the Health permissions stay granted at Google (with
+  no token stored here) until the last of them is disconnected. To remove them
+  sooner, use the Google account's third-party access page — that ends every
+  connection on the account.
 - The reader reports `nothing_recorded: true` when the API answered every
   reading with no data (the device was not worn, or has not synced), and lists
   under `unavailable` any reading the API refused. Those are different

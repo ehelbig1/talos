@@ -198,6 +198,16 @@ SSRF-safe, and OOM-bounded without you having to re-derive any of it.
    client than the one that issued it. `shared_client_providers_refresh_and_revoke`
    pins the two lists together.
 
+   **A Google revoke ends the account's whole grant to the shared client**, so
+   `OAuthCredentialService::revoke_and_cleanup` revokes at Google only for the
+   account's LAST connection (`talos_oauth::google_grant`). It recognises one
+   account by equal connection keys — Calendar, Cloud and Health all key by
+   the same UUID derived from the Google account id; derive yours the same way
+   — and relates Gmail (keyed by address) through the `account_email` an
+   integration's own table records. Record `account_email`, and if your table
+   is new, add it to `active_google_connections`: a connection whose account
+   cannot be identified makes every Gmail disconnect withhold its revoke.
+
 8. **Register the provider for the settings page**: an entry in
    `talos_integrations::provider_config::PROVIDERS` (listing and disconnecting
    are generic from there), a variant on the GraphQL `IntegrationService` enum
