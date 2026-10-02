@@ -332,13 +332,10 @@ impl talos_oauth::OAuthIntegration for GoogleHealthService {
         // rather than stored and discovered as three 403s tomorrow morning.
         //
         // The grant just issued is NOT revoked on this or the refusals below.
-        // Google documents that revoking a token of a combined authorization
-        // revokes all of its scopes, and a revoke is widely reported to end
-        // the account's whole grant to the OAuth project — which would end
-        // its Gmail and Calendar connections too. That has not been tested
-        // here (the test is the damage), so the cautious reading is taken:
-        // the tokens are dropped, unstored, and the owner can remove the
-        // grant at Google.
+        // A Google revoke ends the account's whole grant to the OAuth client
+        // (tested live 2026-10-02 — see `talos_oauth::google_grant`), which
+        // would end its Gmail and Calendar connections too. The tokens are
+        // dropped, unstored, and the owner can remove the grant at Google.
         if !granted_any_health_scope(&granted) {
             return Err(anyhow!(ConnectRefusal::NoHealthScope));
         }

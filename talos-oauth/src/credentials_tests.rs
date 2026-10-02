@@ -19,7 +19,7 @@ mod tests {
     async fn revoke_atlassian_returns_no_endpoint_marker() {
         // Atlassian has no public revoke endpoint — the wire-form contract
         // is `Ok(false)` so the caller knows local cleanup is the only path.
-        let result = revoke_at_provider("atlassian", "ATATT3xfake")
+        let result = revoke_at_provider("atlassian", "ATATT3xfake", crate::GOOGLE_REVOKE_URL)
             .await
             .expect("atlassian must not error");
         assert!(
@@ -32,7 +32,7 @@ mod tests {
     async fn revoke_unknown_provider_no_op() {
         // Defensive default — an unrecognised provider must not raise an
         // error or attempt a network call. Caller would log + continue.
-        let result = revoke_at_provider("does-not-exist", "ignored")
+        let result = revoke_at_provider("does-not-exist", "ignored", crate::GOOGLE_REVOKE_URL)
             .await
             .expect("unknown provider must not error");
         assert!(!result);
