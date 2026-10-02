@@ -208,6 +208,12 @@ SSRF-safe, and OOM-bounded without you having to re-derive any of it.
    is new, add it to `active_google_connections`: a connection whose account
    cannot be identified makes every Gmail disconnect withhold its revoke.
 
+   The Settings disconnect removes (or hides) your row BEFORE that decision is
+   made, so name the address column in the registry entry's
+   `account_email_column`: the row delete returns it and the resolver hands it
+   on. Without it a hard-deleted connection cannot be told apart from the
+   user's Gmail connections and never revokes.
+
 8. **Register the provider for the settings page**: an entry in
    `talos_integrations::provider_config::PROVIDERS` (listing and disconnecting
    are generic from there), a variant on the GraphQL `IntegrationService` enum

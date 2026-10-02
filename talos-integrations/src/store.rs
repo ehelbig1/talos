@@ -79,6 +79,9 @@ pub struct DisconnectOutcome {
     /// OAuth provider string is per-tier (GCP). `None` for single-namespace
     /// providers or when no row matched.
     pub tier: Option<String>,
+    /// The connected account's address (from `account_email_column`), read in
+    /// the same statement — after a hard-delete nothing else can supply it.
+    pub account_email: Option<String>,
 }
 
 /// Disconnect one integration row for a user. Soft-delete providers get
@@ -98,11 +101,13 @@ pub async fn disconnect_user_integration(
     // `::text` normalises Uuid key columns (oauth_account_id, provider_key) and
     // text ones (email_address, team_id, cloud_id) to a single String shape.
     // `tier_column` is optional → project a NULL literal when absent so the row
-    // shape is always (provider_key, tier).
+    // shape is always (provider_key, tier, account_email); the same goes for
+    // `account_email_column`.
     let tier_expr = provider.tier_column.unwrap_or("NULL");
+    let email_expr = provider.account_email_column.unwrap_or("NULL");
     let returning = format!(
-        "RETURNING {}::text AS provider_key, {}::text AS tier",
-        provider.provider_key_column, tier_expr
+        "RETURNING {}::text AS provider_key, {}::text AS tier, {}::text AS account_email",
+        provider.provider_key_column, tier_expr, email_expr
     );
     let sql = if provider.disconnect_is_soft_delete {
         format!(
@@ -117,7 +122,7 @@ pub async fn disconnect_user_integration(
         )
     };
 
-    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(&sql)
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(&sql)
         .bind(id)
         .bind(user_id)
         .fetch_optional(pool)
@@ -125,10 +130,11 @@ pub async fn disconnect_user_integration(
         .context("Failed to disconnect integration")?;
 
     Ok(match row {
-        Some((provider_key, tier)) => DisconnectOutcome {
+        Some((provider_key, tier, account_email)) => DisconnectOutcome {
             rows_affected: 1,
             provider_key,
             tier,
+            account_email: account_email.filter(|e| !e.trim().is_empty()),
         },
         None => DisconnectOutcome::default(),
     })

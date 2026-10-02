@@ -447,7 +447,12 @@ impl PlatformMutations {
                     match ctx.data::<std::sync::Arc<talos_oauth::OAuthCredentialService>>() {
                         Ok(cred_svc) => {
                             if let Err(e) = cred_svc
-                                .revoke_and_cleanup(*user_id, &oauth_provider, provider_key)
+                                .revoke_and_cleanup_for_account(
+                                    *user_id,
+                                    &oauth_provider,
+                                    provider_key,
+                                    outcome.account_email.as_deref(),
+                                )
                                 .await
                             {
                                 // Don't leak provider/key detail to the client;
