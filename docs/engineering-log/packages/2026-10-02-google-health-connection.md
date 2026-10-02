@@ -76,12 +76,15 @@ controller, and the token is never in a guest's address space.
   refresh/revoke list test, the reader's own tests (5, run natively), and the
   catalog's manifest checks.
 
-**Found in review, NOT fixed here: Google's revoke is not per token.**
-`oauth2.googleapis.com/revoke` removes every scope the account has granted to
-the OAuth PROJECT and invalidates the tokens of every client in it (Google's
-own documentation). Every Google integration here revokes on disconnect, and
-they share one project, so disconnecting any one of them ends all of that
-account's Google connections — Calendar's disconnect ends Gmail's today. This
+**Found in review, NOT fixed here: Google's revoke is probably not per token.**
+Google's OAuth documentation says that revoking a token of a combined
+authorization revokes access to ALL of that authorization's scopes, and a
+revoke is widely reported to end the account's whole grant to the OAuth
+project. NOT verified live: the only test is to disconnect one of the
+operator's working Google connections and watch the others. If it holds, then
+since every Google integration here revokes on disconnect and they share one
+project, disconnecting any one of them ends all of that account's Google
+connections — Calendar's disconnect would end Gmail's today. This
 package adds a third connection that can do it, and for that reason does NOT
 revoke the grant when a consent is refused after the exchange (the tokens are
 dropped unstored). The fix — revoke at Google only when it is the account's
