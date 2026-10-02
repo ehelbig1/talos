@@ -158,7 +158,40 @@ fn format_unix_timestamp(timestamp: u64, format: &str) -> Result<String, ()> {
     Ok(out)
 }
 
+/// Longest zone name accepted. The longest IANA name is 32 bytes
+/// (`America/Argentina/ComodRivadavia`); the bound only keeps a guest from
+/// making the host look up megabytes.
+const MAX_ZONE_NAME_BYTES: usize = 64;
+
+/// Seconds east of UTC in the IANA zone `zone` at `timestamp` (Unix seconds),
+/// by the zone's own rules. `None` for a name that is not a zone or an
+/// instant chrono cannot represent.
+///
+/// Why modules need it: a guest has no zone database, so until this existed
+/// every module that wanted "today" where its owner lives carried a fixed
+/// `UTC_OFFSET_HOURS` in its config — right for half the year.
+///
+/// Pure and bounded: one table lookup by name and one rule lookup by instant.
+fn zone_offset_seconds(zone: &str, timestamp: u64) -> Option<i32> {
+    use chrono::Offset as _;
+    if zone.is_empty() || zone.len() > MAX_ZONE_NAME_BYTES {
+        return None;
+    }
+    let tz: chrono_tz::Tz = zone.parse().ok()?;
+    let instant =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(i64::try_from(timestamp).ok()?, 0)?;
+    Some(instant.with_timezone(&tz).offset().fix().local_minus_utc())
+}
+
 impl wit_datetime::Host for TalosContext {
+    async fn local_offset_seconds(
+        &mut self,
+        zone: String,
+        timestamp: u64,
+    ) -> Result<i32, wit_datetime::Error> {
+        zone_offset_seconds(&zone, timestamp).ok_or(wit_datetime::Error::Invalidformat)
+    }
+
     async fn now_unix(&mut self) -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -217,6 +250,86 @@ impl wit_datetime::Host for TalosContext {
 
     async fn diff_seconds(&mut self, timestamp1: u64, timestamp2: u64) -> i64 {
         (timestamp1 as i64).saturating_sub(timestamp2 as i64)
+    }
+}
+
+#[cfg(test)]
+mod zone_offset_tests {
+    use super::zone_offset_seconds;
+
+    /// 2026-10-01T12:00:00Z and 2026-12-01T12:00:00Z.
+    const OCTOBER: u64 = 1_790_856_000;
+    const DECEMBER: u64 = 1_796_126_400;
+
+    #[test]
+    fn a_zones_own_rules_decide_the_offset() {
+        assert_eq!(
+            zone_offset_seconds("America/New_York", OCTOBER),
+            Some(-4 * 3600)
+        );
+        assert_eq!(
+            zone_offset_seconds("America/New_York", DECEMBER),
+            Some(-5 * 3600)
+        );
+        assert_eq!(zone_offset_seconds("Europe/Paris", OCTOBER), Some(2 * 3600));
+        assert_eq!(zone_offset_seconds("Europe/Paris", DECEMBER), Some(3600));
+        // No daylight saving, and a half-hour zone.
+        assert_eq!(
+            zone_offset_seconds("America/Phoenix", OCTOBER),
+            zone_offset_seconds("America/Phoenix", DECEMBER)
+        );
+        assert_eq!(
+            zone_offset_seconds("Asia/Kolkata", OCTOBER),
+            Some(5 * 3600 + 1800)
+        );
+        assert_eq!(zone_offset_seconds("UTC", OCTOBER), Some(0));
+        assert_eq!(zone_offset_seconds("Etc/GMT+5", OCTOBER), Some(-5 * 3600));
+    }
+
+    #[test]
+    fn the_change_happens_at_the_instant_the_zone_changes() {
+        // US clocks go back at 06:00 UTC on 2026-11-01 (02:00 EDT -> 01:00 EST).
+        let change = 1_793_512_800_u64;
+        assert_eq!(
+            zone_offset_seconds("America/New_York", change - 1),
+            Some(-4 * 3600)
+        );
+        assert_eq!(
+            zone_offset_seconds("America/New_York", change),
+            Some(-5 * 3600)
+        );
+        // The local date either side of midnight UTC is the zone's, not UTC's:
+        // 02:30 UTC on Oct 5 is still Oct 4 in New York.
+        let ts = 1_791_167_400_u64;
+        let offset = zone_offset_seconds("America/New_York", ts).unwrap();
+        let local =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(ts as i64 + i64::from(offset), 0)
+                .unwrap();
+        assert_eq!(
+            local.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-10-04 22:30"
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_zone_is_refused_not_guessed() {
+        for bad in [
+            "",
+            "New York",
+            "america/new_york",
+            "EST5",
+            "America/New_York\n",
+            "America/New_York; DROP",
+            "../../etc/localtime",
+            "-04:00",
+        ] {
+            assert_eq!(zone_offset_seconds(bad, 0), None, "{bad:?}");
+        }
+        assert_eq!(zone_offset_seconds(&"A".repeat(10_000), 0), None);
+        // An instant chrono cannot represent is refused, not wrapped.
+        assert_eq!(zone_offset_seconds("UTC", u64::MAX), None);
+        assert_eq!(zone_offset_seconds("UTC", i64::MAX as u64), None);
+        assert_eq!(zone_offset_seconds("UTC", 0), Some(0));
     }
 }
 

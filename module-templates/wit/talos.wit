@@ -304,6 +304,17 @@ interface datetime {
     format: func(timestamp: u64, format: string) -> result<string, error>;
     add-seconds: func(timestamp: u64, seconds: s64) -> u64;
     diff-seconds: func(timestamp1: u64, timestamp2: u64) -> s64;
+
+    /// The UTC offset in force in an IANA time zone at a given instant, in
+    /// seconds EAST of UTC (negative west of Greenwich): `America/New_York`
+    /// is `-14400` in summer and `-18000` in winter. Add it to a Unix
+    /// timestamp before formatting to get that zone's local date and time.
+    ///
+    /// `zone` is an IANA name such as `America/New_York` or `Europe/Paris`
+    /// (case-sensitive). The zone's own daylight-saving rules apply, so a
+    /// module never needs a fixed offset in its config. An unknown zone, or
+    /// a timestamp outside the representable range, is `invalidformat`.
+    local-offset-seconds: func(zone: string, timestamp: u64) -> result<s32, error>;
 }
 
 // ============================================================================

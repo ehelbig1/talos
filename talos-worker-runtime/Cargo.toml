@@ -93,6 +93,9 @@ rand = { version = "0.8", default-features = true, features = ["std"] }
 
 # Date/time operations
 chrono = { version = "0.4", features = ["serde"] }
+# IANA zone rules for `datetime::local-offset-seconds` (the scheduler and the
+# controller already use this crate, at this version).
+chrono-tz = "0.10"
 
 # Phase 3: Advanced capabilities (v3.0)
 # `fuel` feature gates per-render instruction budget (set_fuel) so a
