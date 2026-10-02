@@ -439,7 +439,15 @@ pub struct SecurityPolicy {
 ///             default; pinned off) and the explicit variable fuel costs
 ///             (`memory.grow` now 1 fuel per page). V9 blobs are rejected by
 ///             header and recompile on next use.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV10";
+///   TALOSV11 — 2026-10-02: wasmtime 49.0.1→49.0.2 security patch
+///             (RUSTSEC-2026-0320…0327: WASI preview 0 `poll_oneoff` fuel
+///             bypass, host memory exhaustion without stdio, `fd_readdir`
+///             uninitialized padding, a pre-epoch timestamp panic, two GC
+///             heap corruptions, an async-lifted callback stack overflow, a
+///             wasi-http zero-timeout panic). No engine config changed; the
+///             fingerprint's wasmtime line did. V10 blobs are rejected by
+///             header and recompile on next use.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV11";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
@@ -537,7 +545,7 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
 /// moment it mattered.
 macro_rules! wasmtime_version {
     () => {
-        "49.0.1"
+        "49.0.2"
     };
 }
 
@@ -949,7 +957,7 @@ mod aot_hmac_input_tests {
         // Pinned SHA-256 of the canonical fingerprint constant.
         // If this fails, ENGINE_CONFIG_FINGERPRINT was edited (config knob
         // or the wasmtime= line). See test doc for the update procedure.
-        const EXPECTED: &str = "d14274e00c7dcf3638ff14585b073ee61c56b2866110cf025c7e7a6e37e6f60b";
+        const EXPECTED: &str = "86a3c3d08506df0d2e0ff8b9baca94800685c2ab9a1364bdd876a05256921006";
         let actual = hex::encode(super::engine_config_fingerprint_hash());
         assert_eq!(
             actual, EXPECTED,

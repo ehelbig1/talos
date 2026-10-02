@@ -10,10 +10,10 @@ why, and when the operator should bump.
 
 | Crate                | Version  | Pinned in                          |
 |----------------------|----------|------------------------------------|
-| `wasmtime`           | 49.0.1   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime-wasi`      | 49.0.1   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime-wasi-http` | 49.0.1   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime`           | 49.0.1   | `worker/Cargo.toml` (dev-dep)      |
+| `wasmtime`           | 49.0.2   | `talos-worker-runtime/Cargo.toml`  |
+| `wasmtime-wasi`      | 49.0.2   | `talos-worker-runtime/Cargo.toml`  |
+| `wasmtime-wasi-http` | 49.0.2   | `talos-worker-runtime/Cargo.toml`  |
+| `wasmtime`           | 49.0.2   | `worker/Cargo.toml` (dev-dep)      |
 
 The runtime library (`TalosRuntime`, the engine config, the AOT cache) was
 extracted from `worker/` to `talos-worker-runtime/` in July 2026, so that
@@ -42,6 +42,14 @@ column is the version bumped *to*.
 
 | Version  | Identifier             | Class                                    |
 |----------|------------------------|------------------------------------------|
+| 49.0.2   | RUSTSEC-2026-0321      | WASI preview 0 `poll_oneoff` circumvents fuel consumption (GHSA-j366-h8gg-77pm) |
+| 49.0.2   | RUSTSEC-2026-0322      | Excessive host memory allocated when a guest has no stdio |
+| 49.0.2   | RUSTSEC-2026-0323      | `fd_readdir` copies uninitialized struct padding into guest memory |
+| 49.0.2   | RUSTSEC-2026-0324      | Guest can panic the host through a pre-epoch filesystem timestamp on wasip3 |
+| 49.0.2   | RUSTSEC-2026-0325      | Mis-typed WebAssembly tag imports can corrupt the GC heap (GHSA-cfhf-m2cr-62wj) |
+| 49.0.2   | RUSTSEC-2026-0326      | Missing rooting for GC values live across `try_call` can corrupt the GC heap |
+| 49.0.2   | RUSTSEC-2026-0327      | Component async-lifted callback result count unvalidated: native stack buffer overflow (GHSA-32h6-97mm-8q3c) |
+| 49.0.2   | RUSTSEC-2026-0320      | `wasi:http` panics on a zero timeout |
 | 49.0.1   | (support window)       | 48 stops receiving security backports once 50 ships; 49 also carries RUSTSEC-2026-0313…0316. Needs Rust 1.96 |
 | 48.0.3   | RUSTSEC-2026-0313      | `wasi:http` outgoing body write allows guest-driven host memory exhaustion |
 | 48.0.3   | RUSTSEC-2026-0314      | Guest can panic the host through a WASI filesystem datetime overflow |
