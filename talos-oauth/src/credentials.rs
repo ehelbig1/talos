@@ -404,6 +404,10 @@ impl OAuthCredentialService {
     /// provider-specific table soft-delete (e.g.
     /// `gmail_integrations.is_active = false`).
     ///
+    /// Returns `Err` when a token entry is still in the vault afterwards —
+    /// every other step has run by then. A vault entry that was simply not
+    /// there is not a failure.
+    ///
     /// `provider`/`provider_key` must match what was used in
     /// `store_credentials` (e.g. `("gmail", "alice@example.com")`,
     /// `("atlassian", "<cloud_id>")`).
@@ -462,36 +466,41 @@ impl OAuthCredentialService {
             );
         }
 
-        // Step 3: delete vault entries (access_token + refresh_token).
-        // delete_secret bails on "not found"; tolerate that since revoke
-        // already happened and we want the metadata flip to land regardless.
+        // Step 3: delete vault entries (access_token + refresh_token). An
+        // entry that is not there is fine (already cleaned up, or never
+        // stored). An entry that could NOT be deleted is a token left in the
+        // vault: it is logged as that, and reported to the caller once the
+        // metadata flip below has landed.
         let at_path = Self::access_token_path(provider, user_id, provider_key);
         let rt_path = Self::refresh_token_path(provider, user_id, provider_key);
-        if let Err(e) = self
-            .secrets_manager
-            .delete_secret(&at_path, Some(user_id), &[])
-            .await
-        {
-            tracing::debug!(
-                target: "talos_oauth_revoke",
-                user_id = %user_id,
-                provider,
-                error = %e,
-                "delete access_token vault entry: not present or already removed"
-            );
-        }
-        if let Err(e) = self
-            .secrets_manager
-            .delete_secret(&rt_path, Some(user_id), &[])
-            .await
-        {
-            tracing::debug!(
-                target: "talos_oauth_revoke",
-                user_id = %user_id,
-                provider,
-                error = %e,
-                "delete refresh_token vault entry: not present or already removed"
-            );
+        let mut entries_left = 0usize;
+        for (what, path) in [("access_token", &at_path), ("refresh_token", &rt_path)] {
+            match self
+                .secrets_manager
+                .delete_secret_if_present(path, Some(user_id), &[])
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!(
+                    target: "talos_oauth_revoke",
+                    user_id = %user_id,
+                    provider,
+                    entry = what,
+                    "vault entry not present or already removed"
+                ),
+                Err(e) => {
+                    entries_left += 1;
+                    tracing::warn!(
+                        target: "talos_oauth_revoke",
+                        event_kind = "oauth_disconnect_vault_entry_left",
+                        user_id = %user_id,
+                        provider,
+                        entry = what,
+                        error = %e,
+                        "vault entry could not be deleted — the token is still stored"
+                    );
+                }
+            }
         }
 
         // Step 4: soft-delete integration_credentials by (provider, provider_key).
@@ -528,6 +537,13 @@ impl OAuthCredentialService {
         // map's eviction threshold is hit).
         let lock_key = format!("{}:{}:{}", provider, user_id, provider_key);
         self.refresh_locks.remove(&lock_key);
+
+        if entries_left > 0 {
+            anyhow::bail!(
+                "OAuth disconnect left {entries_left} token entr{} in the vault",
+                if entries_left == 1 { "y" } else { "ies" }
+            );
+        }
 
         tracing::info!(
             user_id = %user_id,
