@@ -169,9 +169,14 @@ mod tests {
                 unidentified: 0
             }
         );
-        assert_eq!(grant_sharing(&gmail, &[other.clone()]), GrantSharing::Sole);
+        assert_eq!(
+            grant_sharing(&gmail, std::slice::from_ref(&other)),
+            GrantSharing::Sole
+        );
         // And from the other side.
-        assert!(grant_sharing(&same, &[gmail.clone()]).revoke_would_end_other_connections());
+        assert!(
+            grant_sharing(&same, std::slice::from_ref(&gmail)).revoke_would_end_other_connections()
+        );
         assert_eq!(grant_sharing(&other, &[gmail]), GrantSharing::Sole);
     }
 
@@ -190,7 +195,7 @@ mod tests {
         let gmail = conn("gmail", "a@x.test", None);
         let unknown = conn("google_calendar", K1, None);
         assert_eq!(
-            grant_sharing(&gmail, &[unknown.clone()]),
+            grant_sharing(&gmail, std::slice::from_ref(&unknown)),
             GrantSharing::Shared {
                 same_account: 0,
                 unidentified: 1
