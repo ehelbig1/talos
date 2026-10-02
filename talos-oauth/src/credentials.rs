@@ -25,6 +25,8 @@ pub struct OAuthCredentialService {
     secrets_manager: Arc<SecretsManager>,
     /// Per-credential refresh locks: key = `"{provider}:{user_id}:{provider_key}"`
     refresh_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Google's revoke endpoint. Always [`crate::GOOGLE_REVOKE_URL`] outside tests.
+    google_revoke_url: String,
 }
 
 /// Non-sensitive metadata for a stored OAuth integration credential.
@@ -49,7 +51,16 @@ impl OAuthCredentialService {
             db_pool,
             secrets_manager,
             refresh_locks: DashMap::new(),
+            google_revoke_url: crate::GOOGLE_REVOKE_URL.to_string(),
         }
+    }
+
+    /// Point Google revocation at a stand-in. Tests only: a disconnect must
+    /// never be able to send a token anywhere but Google.
+    #[doc(hidden)]
+    pub fn with_google_revoke_url_for_tests(mut self, url: &str) -> Self {
+        self.google_revoke_url = url.to_string();
+        self
     }
 
     /// Returns a reference to the database connection pool.
@@ -398,6 +409,13 @@ impl OAuthCredentialService {
     /// delete vault token entries, and soft-delete the `integration_credentials`
     /// row.
     ///
+    /// **Google is revoked only for the account's LAST connection.** A Google
+    /// revoke ends the account's whole grant to this OAuth client, so while
+    /// another of the user's connections is (or may be) on the same Google
+    /// account the revoke is WITHHELD: the tokens are deleted here and the
+    /// grant stays at Google until the last such connection is disconnected.
+    /// See [`crate::google_grant`].
+    ///
     /// Best-effort by design — every step is independently logged. A failed
     /// provider revoke does NOT prevent vault cleanup; a missing vault entry
     /// does NOT prevent the metadata flip. Caller still owns the
@@ -435,8 +453,13 @@ impl OAuthCredentialService {
         // — the local cleanup below proceeds regardless so a flaky provider
         // doesn't strand secrets in the vault.
         let token_for_revoke = refresh_token.as_deref().or(access_token.as_deref());
-        if let Some(tok) = token_for_revoke {
-            match super::revoke_at_provider(provider, tok).await {
+        let withheld = self
+            .google_revoke_withheld(user_id, provider, provider_key)
+            .await;
+        if withheld {
+            // Logged by `google_revoke_withheld`; local cleanup proceeds.
+        } else if let Some(tok) = token_for_revoke {
+            match super::revoke_at_provider(provider, tok, &self.google_revoke_url).await {
                 Ok(true) => tracing::info!(
                     target: "talos_oauth_revoke",
                     user_id = %user_id,
@@ -552,6 +575,108 @@ impl OAuthCredentialService {
         );
 
         Ok(())
+    }
+
+    /// Whether a Google revoke must be withheld because it would end other
+    /// connections. `false` for every non-Google provider. A lookup that fails
+    /// WITHHOLDS: an unrevoked grant nothing here holds a token for is the
+    /// smaller harm than taking working connections down.
+    async fn google_revoke_withheld(
+        &self,
+        user_id: Uuid,
+        provider: &str,
+        provider_key: &str,
+    ) -> bool {
+        if !crate::GOOGLE_REVOKE_PROVIDERS.contains(&provider) {
+            return false;
+        }
+        let connections = match self.active_google_connections(user_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: "talos_oauth_revoke",
+                    event_kind = "google_revoke_withheld",
+                    user_id = %user_id,
+                    provider,
+                    reason = "siblings_unreadable",
+                    error = %e,
+                    "could not read the user's other Google connections — revoke withheld"
+                );
+                return true;
+            }
+        };
+        let is_this = |c: &crate::google_grant::GoogleConnection| {
+            c.provider == provider && c.provider_key == provider_key
+        };
+        let this = connections.iter().find(|c| is_this(c)).cloned().unwrap_or(
+            crate::google_grant::GoogleConnection {
+                provider: provider.to_string(),
+                provider_key: provider_key.to_string(),
+                email: None,
+            },
+        );
+        let others: Vec<_> = connections.into_iter().filter(|c| !is_this(c)).collect();
+        let sharing = crate::google_grant::grant_sharing(&this, &others);
+        if sharing.revoke_would_end_other_connections() {
+            tracing::info!(
+                target: "talos_oauth_revoke",
+                event_kind = "google_revoke_withheld",
+                user_id = %user_id,
+                provider,
+                reason = "grant_shared",
+                sharing = ?sharing,
+                "other connections share this Google account's grant — tokens deleted here, \
+                 grant left at Google until the account's last connection is disconnected"
+            );
+        }
+        sharing.revoke_would_end_other_connections()
+    }
+
+    /// The user's ACTIVE Google credentials, each with the account address its
+    /// integration records (Gmail's key is the address).
+    async fn active_google_connections(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::google_grant::GoogleConnection>> {
+        let providers: Vec<String> = crate::GOOGLE_REVOKE_PROVIDERS
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            r#"SELECT c.provider::text, c.provider_key::text,
+                      CASE
+                        WHEN c.provider = 'gmail' THEN lower(c.provider_key)
+                        WHEN c.provider = 'google_calendar' THEN (
+                            SELECT lower(g.account_email) FROM google_calendar_integrations g
+                             WHERE g.user_id = c.user_id AND g.oauth_account_id::text = c.provider_key
+                             ORDER BY g.updated_at DESC LIMIT 1)
+                        WHEN c.provider = 'google_health' THEN (
+                            SELECT lower(h.account_email) FROM google_health_integrations h
+                             WHERE h.user_id = c.user_id AND h.provider_key::text = c.provider_key
+                             ORDER BY h.updated_at DESC LIMIT 1)
+                        ELSE (
+                            SELECT lower(x.account_email) FROM google_cloud_integrations x
+                             WHERE x.user_id = c.user_id AND x.provider_key::text = c.provider_key
+                             ORDER BY x.updated_at DESC LIMIT 1)
+                      END AS account_email
+                 FROM integration_credentials c
+                WHERE c.user_id = $1 AND c.is_active AND c.provider = ANY($2)"#,
+        )
+        .bind(user_id)
+        .bind(&providers)
+        .fetch_all(&self.db_pool)
+        .await
+        .context("read the user's active Google connections")?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(provider, provider_key, email)| crate::google_grant::GoogleConnection {
+                    provider,
+                    provider_key,
+                    email: email.filter(|e| !e.is_empty()),
+                },
+            )
+            .collect())
     }
 
     /// Internal helper: read access_token from vault without erroring if the
