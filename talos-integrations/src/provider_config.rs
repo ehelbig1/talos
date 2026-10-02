@@ -84,6 +84,13 @@ pub struct IntegrationProviderConfig {
     /// provider string so the RIGHT namespace is revoked. `None` for
     /// single-namespace providers.
     pub tier_column: Option<&'static str>,
+
+    /// Column on `db_table` holding the connected account's address, for the
+    /// Google providers. The generic disconnect `RETURNING`s it because a
+    /// hard-delete removes the row before the revoke decision is made, and
+    /// that decision relates a connection to the user's Gmail connections by
+    /// address (`talos_oauth::google_grant`). `None` where it is not needed.
+    pub account_email_column: Option<&'static str>,
 }
 
 impl IntegrationProviderConfig {
@@ -155,6 +162,7 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         provider_key_column: "oauth_account_id",
         credential_provider: "google_calendar",
         tier_column: None,
+        account_email_column: Some("account_email"),
     },
     IntegrationProviderConfig {
         id: "gmail",
@@ -174,6 +182,7 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         provider_key_column: "email_address",
         credential_provider: "gmail",
         tier_column: None,
+        account_email_column: Some("email_address"),
     },
     IntegrationProviderConfig {
         id: "slack",
@@ -193,6 +202,7 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         provider_key_column: "team_id",
         credential_provider: "slack",
         tier_column: None,
+        account_email_column: None,
     },
     IntegrationProviderConfig {
         id: "atlassian",
@@ -212,6 +222,7 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         provider_key_column: "cloud_id",
         credential_provider: "atlassian",
         tier_column: None,
+        account_email_column: None,
     },
     IntegrationProviderConfig {
         id: "gcp",
@@ -240,6 +251,7 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         // google_cloud / google_cloud_write / google_cloud_full.
         credential_provider: "google_cloud",
         tier_column: Some("tier"),
+        account_email_column: Some("account_email"),
     },
     IntegrationProviderConfig {
         id: "google-health",
@@ -263,6 +275,7 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         provider_key_column: "provider_key",
         credential_provider: "google_health",
         tier_column: None,
+        account_email_column: Some("account_email"),
     },
 ];
 
@@ -332,6 +345,24 @@ mod tests {
     /// NULL and is written for the no-join alias `t`, a soft delete that the
     /// list then filters out, and the provider string its tokens are stored
     /// under (a wrong one would revoke nothing on disconnect).
+    /// Every Google provider names the column its account address is in: the
+    /// disconnect needs it to relate a connection to the user's Gmail
+    /// connections after a hard-delete has removed the row.
+    #[test]
+    fn every_google_provider_names_its_account_address_column() {
+        for id in ["google-calendar", "gmail", "gcp", "google-health"] {
+            let p = PROVIDERS.iter().find(|p| p.id == id).expect(id);
+            assert!(
+                p.account_email_column.is_some(),
+                "{id} has no account_email_column"
+            );
+        }
+        for id in ["slack", "atlassian"] {
+            let p = PROVIDERS.iter().find(|p| p.id == id).expect(id);
+            assert!(p.account_email_column.is_none(), "{id}");
+        }
+    }
+
     #[test]
     fn google_health_is_listed_and_revoked_by_the_generic_paths() {
         let p = PROVIDERS

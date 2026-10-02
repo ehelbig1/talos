@@ -435,6 +435,23 @@ impl OAuthCredentialService {
         provider: &str,
         provider_key: &str,
     ) -> Result<()> {
+        self.revoke_and_cleanup_for_account(user_id, provider, provider_key, None)
+            .await
+    }
+
+    /// [`Self::revoke_and_cleanup`] for a caller that has ALREADY removed the
+    /// integration's own row. `account_email` is the address that row
+    /// recorded: without it the connection cannot be related to the user's
+    /// Gmail connections, and every one of them counts as possibly on the
+    /// same Google account — so the revoke is withheld even for an account's
+    /// last connection. Ignored when the row is still there to be read.
+    pub async fn revoke_and_cleanup_for_account(
+        &self,
+        user_id: Uuid,
+        provider: &str,
+        provider_key: &str,
+        account_email: Option<&str>,
+    ) -> Result<()> {
         // Step 1: best-effort fetch of refresh + access tokens before deletion.
         // Refresh token revoke is preferred — for Google, revoking a refresh
         // token revokes every access token issued from that grant in one call.
@@ -454,7 +471,7 @@ impl OAuthCredentialService {
         // doesn't strand secrets in the vault.
         let token_for_revoke = refresh_token.as_deref().or(access_token.as_deref());
         let withheld = self
-            .google_revoke_withheld(user_id, provider, provider_key)
+            .google_revoke_withheld(user_id, provider, provider_key, account_email)
             .await;
         if withheld {
             // Logged by `google_revoke_withheld`; local cleanup proceeds.
@@ -586,6 +603,7 @@ impl OAuthCredentialService {
         user_id: Uuid,
         provider: &str,
         provider_key: &str,
+        account_email: Option<&str>,
     ) -> bool {
         if !crate::GOOGLE_REVOKE_PROVIDERS.contains(&provider) {
             return false;
@@ -608,13 +626,20 @@ impl OAuthCredentialService {
         let is_this = |c: &crate::google_grant::GoogleConnection| {
             c.provider == provider && c.provider_key == provider_key
         };
-        let this = connections.iter().find(|c| is_this(c)).cloned().unwrap_or(
+        let mut this = connections.iter().find(|c| is_this(c)).cloned().unwrap_or(
             crate::google_grant::GoogleConnection {
                 provider: provider.to_string(),
                 provider_key: provider_key.to_string(),
                 email: None,
             },
         );
+        // The integration's own row may already be gone (a hard-delete
+        // disconnect); the caller's copy of its address stands in.
+        if this.email.is_none() {
+            this.email = account_email
+                .map(|e| e.trim().to_lowercase())
+                .filter(|e| !e.is_empty());
+        }
         let others: Vec<_> = connections.into_iter().filter(|c| !is_this(c)).collect();
         let sharing = crate::google_grant::grant_sharing(&this, &others);
         if sharing.revoke_would_end_other_connections() {

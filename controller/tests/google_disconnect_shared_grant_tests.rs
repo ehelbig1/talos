@@ -253,6 +253,157 @@ async fn a_connection_that_cannot_be_placed_withholds_the_revoke() {
     assert_eq!(w.vault_entries(user, "gmail", "one@example.test").await, 0);
 }
 
+/// A disconnect that has already removed the integration's own row passes the
+/// address it read from that row. With it the connection can be told apart
+/// from the user's Gmail connections; the same call with an address that
+/// MATCHES a Gmail connection withholds.
+#[tokio::test]
+async fn a_removed_row_is_placed_by_the_address_the_caller_kept() {
+    let w = world().await;
+    let user = seed_user(&w.pool).await;
+    let (a, b) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+    w.connect(user, "gmail", "one@example.test").await;
+    // Neither Calendar connection has an integration row to read.
+    w.connect(user, "google_calendar", &a).await;
+    w.connect(user, "google_calendar", &b).await;
+
+    w.creds
+        .revoke_and_cleanup_for_account(user, "google_calendar", &a, Some(" ONE@example.test "))
+        .await
+        .expect("disconnect");
+    assert!(
+        w.revoked().is_empty(),
+        "the address is the Gmail connection's: one account, revoke withheld"
+    );
+
+    w.creds
+        .revoke_and_cleanup_for_account(user, "google_calendar", &b, Some("two@example.test"))
+        .await
+        .expect("disconnect");
+    assert_eq!(
+        w.revoked(),
+        vec![format!("refresh-google_calendar-{b}")],
+        "a different address is a different account: this was its last connection"
+    );
+}
+
+/// The caller's address is a stand-in for a row that is gone. While the row is
+/// still there, the row is what counts.
+#[tokio::test]
+async fn a_row_that_is_still_there_outranks_the_callers_address() {
+    let w = world().await;
+    let user = seed_user(&w.pool).await;
+    let account = Uuid::new_v4();
+    w.connect(user, "gmail", "one@example.test").await;
+    w.connect(user, "google_calendar", &account.to_string())
+        .await;
+    w.record_account(user, "google_calendar", account, "two@example.test")
+        .await;
+
+    w.creds
+        .revoke_and_cleanup_for_account(
+            user,
+            "google_calendar",
+            &account.to_string(),
+            Some("one@example.test"),
+        )
+        .await
+        .expect("disconnect");
+
+    assert_eq!(
+        w.revoked(),
+        vec![format!("refresh-google_calendar-{account}")],
+        "the recorded address says this is a different account from the Gmail one"
+    );
+}
+
+/// The Settings disconnect, in the two steps its resolver takes. Calendar's
+/// row is HARD-deleted by the first, so the second can only place the
+/// connection by the address the first returned. Seen live 2026-10-02: without
+/// it an account's last Calendar connection withheld its revoke because the
+/// user had Gmail connections on other accounts.
+#[tokio::test]
+async fn the_settings_disconnect_carries_the_address_past_the_row_delete() {
+    let w = world().await;
+    let user = seed_user(&w.pool).await;
+    let account = Uuid::new_v4();
+    w.connect(user, "gmail", "one@example.test").await;
+    w.connect(user, "google_calendar", &account.to_string())
+        .await;
+    w.record_account(user, "google_calendar", account, "Two@Example.test")
+        .await;
+    let row: Uuid = sqlx::query_scalar(
+        "SELECT id FROM google_calendar_integrations WHERE user_id = $1 AND oauth_account_id = $2",
+    )
+    .bind(user)
+    .bind(account)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    let provider = talos_integrations::provider_config::PROVIDERS
+        .iter()
+        .find(|p| p.id == "google-calendar")
+        .expect("registry entry");
+
+    let outcome =
+        talos_integrations::store::disconnect_user_integration(&w.pool, provider, row, user)
+            .await
+            .expect("row disconnect");
+
+    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(
+        outcome.provider_key.as_deref(),
+        Some(account.to_string().as_str())
+    );
+    assert_eq!(
+        outcome.account_email.as_deref(),
+        Some("Two@Example.test"),
+        "the address is read in the statement that removes the row"
+    );
+    let left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM google_calendar_integrations WHERE id = $1")
+            .bind(row)
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        left, 0,
+        "the premise: the row is gone before the revoke decision"
+    );
+
+    w.creds
+        .revoke_and_cleanup_for_account(
+            user,
+            "google_calendar",
+            outcome.provider_key.as_deref().unwrap(),
+            outcome.account_email.as_deref(),
+        )
+        .await
+        .expect("disconnect");
+
+    assert_eq!(
+        w.revoked(),
+        vec![format!("refresh-google_calendar-{account}")],
+        "the account's last connection is revoked"
+    );
+}
+
+/// TEXTUAL pin: the resolver hands the returned address to the revoke
+/// decision. No GraphQL harness drives the resolver itself.
+#[test]
+fn the_settings_resolver_passes_the_returned_address() {
+    let src = include_str!("../../talos-api/src/schema/platform/mutations.rs");
+    let call = src
+        .split("revoke_and_cleanup_for_account(")
+        .nth(1)
+        .expect("the resolver calls revoke_and_cleanup_for_account");
+    let args = &call[..call.find(')').expect("call closes")];
+    assert!(
+        args.contains("outcome.account_email"),
+        "the disconnect resolver must pass the address the row delete returned: {args}"
+    );
+}
+
 /// Another user's connections, and this user's already-disconnected ones, are
 /// not siblings.
 #[tokio::test]
