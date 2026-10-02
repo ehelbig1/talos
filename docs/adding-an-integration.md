@@ -143,6 +143,7 @@ SSRF-safe, and OOM-bounded without you having to re-derive any of it.
                consumed.user_id, "myprovider", &provider_key,
                &tokens.access_token, tokens.refresh_token.as_deref(),
                talos_oauth::oauth_expires_at(tokens.expires_in), &granted_scope,
+               vec![], // allowed_modules: empty = the owner's modules, by grant
            ).await?;
 
            // 3. Upsert your integration row (user_id, provider_key, …) and return it.
@@ -184,6 +185,25 @@ SSRF-safe, and OOM-bounded without you having to re-derive any of it.
 
 6. **Add the provider hostname to the LLM/host allow/deny lists only if
    relevant**, and register the crate in the workspace `Cargo.toml`.
+
+7. **Tell the refresh and the revoke about the provider.** Both are matches on
+   the provider string in `talos-oauth`, and a provider missing from either
+   fails QUIETLY: left out of the refresh match its access token expires
+   un-refreshed (a connect that works for an hour); left out of revoke, a
+   disconnect leaves the grant alive at the provider. For a Google provider on
+   the shared client, add it to `GOOGLE_SHARED_CLIENT_PROVIDERS` (the refresh
+   key) and `GOOGLE_REVOKE_PROVIDERS`, and read the client with
+   `talos_oauth::shared_google_client()` in `authorize_request` — the refresh
+   uses that same resolution, and a token cannot be refreshed by a different
+   client than the one that issued it. `shared_client_providers_refresh_and_revoke`
+   pins the two lists together.
+
+8. **Register the provider for the settings page**: an entry in
+   `talos_integrations::provider_config::PROVIDERS` (listing and disconnecting
+   are generic from there), a variant on the GraphQL `IntegrationService` enum
+   with its two match arms, and the regenerated `frontend/schema.graphql` and
+   `frontend/src/generated/*`. `talos-google-health` is the smallest complete
+   example of an OAuth-only integration (no push channel).
 
 That's it — token refresh (`OAuthCredentialService` + the background sweep),
 user-scoped resolution (`vault://oauth/<provider>/<user_id>/<key>` in a module's
@@ -232,4 +252,6 @@ coding. Key extra rules:
 - [ ] Inbound requests authenticated (HMAC/JWT/`token_hash`) before DB work — **lint 41**
 - [ ] No token / refresh-token / email logged; secret structs have a redacting `Debug` — **lint 37**
 - [ ] Collections + paginated loops are bounded; DB lookups indexed, no N+1
+- [ ] The provider is in the token **refresh** match and the **revoke** list (`talos-oauth`), and in `PROVIDERS` for the settings page — **steps 7–8**
+- [ ] The new crate is in lint check 49's crate list (`scripts/lint-structural.sh`)
 - [ ] `make lint` (structural + clippy) and the new integration's tests pass

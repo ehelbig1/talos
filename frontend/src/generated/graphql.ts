@@ -90,6 +90,7 @@ export type IntegrationService =
   | "GMAIL"
   | "GOOGLE_CALENDAR"
   | "GOOGLE_CLOUD"
+  | "GOOGLE_HEALTH"
   | "JIRA"
   | "SLACK";
 

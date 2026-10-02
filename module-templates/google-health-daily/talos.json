@@ -1,0 +1,58 @@
+{
+  "name": "google-health-daily",
+  "version": "v1.0.0",
+  "display_name": "Google Health: Daily Readings",
+  "description": "Last night's sleep, yesterday's step count and the resting heart rate from the Google Health API (Pixel Watch and Fitbit devices). Read-only: three GET requests, nothing is written. Returns `sleep` (start and end in local time, minutes asleep and awake, minutes per stage, whether it ended this morning), `resting_heart_rate` (latest value and the mean over the last 7 days), `steps` (yesterday's total) and `nothing_recorded` (true only when the API answered ALL THREE readings and every answer was empty, i.e. the device was not worn or has not synced; false whenever a reading is under `unavailable`, since what was recorded is then not known). A reading that could not be read is listed under `unavailable` with its HTTP status and the others are still returned; a reading with no data is `null`. Canonical building block for a morning message.\n\nRequires a vault:// reference to a Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time.",
+  "category": "Integration",
+  "capability_world": "http-node",
+  "allowed_hosts": ["health.googleapis.com"],
+  "allowed_methods": ["GET"],
+  "requires_secrets": ["oauth/google_health/*"],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 3,
+    "bytes_per_item": 200000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 2.0,
+    "fuel_per_byte": 11
+  },
+  "dependencies": {
+    "chrono": "0.4"
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/google_health/{user_id}/{account}/access_token'). The controller resolves + refreshes the token if expired."
+      },
+      "TIME_ZONE": {
+        "type": "string",
+        "default": "UTC",
+        "description": "IANA zone name (e.g. 'America/New_York') whose local date decides what 'today', 'yesterday' and 'last night' are. The zone's own daylight-saving rules apply. An unknown zone is an error."
+      },
+      "DATA_SOURCE": {
+        "type": "string",
+        "description": "Which sources to read: 'all-sources' (the API's default when omitted), 'google-wearables' (watch and tracker only), 'google-sources' or 'self-sources'."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable the Google Health API",
+      "detail": "In https://console.cloud.google.com, enable the Google Health API (health.googleapis.com) for the project your Talos Google OAuth client belongs to, and add these scopes to the OAuth consent screen: 'https://www.googleapis.com/auth/googlehealth.sleep.readonly', 'https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly', 'https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly'."
+    },
+    {
+      "step": 2,
+      "title": "Authorize the integration",
+      "detail": "Connect Google Health from the Talos integrations page. The controller stores tokens at 'oauth/google_health/{user_id}/{account}/{access|refresh}_token' and tracks expiry."
+    },
+    {
+      "step": 3,
+      "title": "Configure AUTH_HEADER",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://oauth/google_health/{your_user_id}/{your_account}/access_token' and TIME_ZONE to your zone. For 401s, use refresh_oauth_token(vault_path) to force a refresh and inspect the outcome."
+    }
+  ]
+}

@@ -695,6 +695,7 @@ enum IntegrationService {
 	SLACK
 	JIRA
 	GOOGLE_CLOUD
+	GOOGLE_HEALTH
 }
 
 """

@@ -64,6 +64,7 @@ mod execution_repository;
 mod gmail;
 mod google_calendar;
 mod google_cloud;
+mod google_health;
 mod graph_rag;
 mod idempotency;
 mod integrations;
@@ -188,6 +189,7 @@ struct PlatformServices {
     google_cloud_integration_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
     google_cloud_write_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
     google_cloud_full_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
+    google_health_service: std::sync::Arc<google_health::GoogleHealthService>,
     github_connect_service: std::sync::Arc<talos_github_connect::GithubConnectService>,
     gmail_watch_service: Option<std::sync::Arc<gmail::watch::GmailWatchService>>,
     gmail_pubsub_verifier: Option<std::sync::Arc<gmail::pubsub_jwt::PubsubJwtVerifier>>,

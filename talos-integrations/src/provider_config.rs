@@ -241,6 +241,29 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         credential_provider: "google_cloud",
         tier_column: Some("tier"),
     },
+    IntegrationProviderConfig {
+        id: "google-health",
+        display_name: "Google Health",
+        description: "Read sleep, steps and heart rate from a Pixel Watch or Fitbit",
+        icon: "HeartPulse",
+        color: "#34A853",
+        graphql_enum: "GOOGLE_HEALTH",
+        oauth_hosts: &["accounts.google.com"],
+        // The shared Google client, as Google Calendar.
+        env_vars: &["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+        redirect_path: "/api/google-health/callback",
+        db_table: "google_health_integrations",
+        // No join, so the table alias is `t`. COALESCE: the identifier is
+        // non-nullable in the row struct, and one NULL fails the whole
+        // UNION ALL and hides every provider's integrations.
+        account_identifier_column: "COALESCE(t.account_email, 'Google Health')",
+        account_identifier_join: None,
+        extra_where: "AND t.is_active = true",
+        disconnect_is_soft_delete: true,
+        provider_key_column: "provider_key",
+        credential_provider: "google_health",
+        tier_column: None,
+    },
 ];
 
 #[cfg(test)]
@@ -302,6 +325,36 @@ mod tests {
                 p.id
             );
         }
+    }
+
+    /// Google Health is listed and disconnected by the generic paths, so its
+    /// entry must hold what those paths need: an identifier that is never
+    /// NULL and is written for the no-join alias `t`, a soft delete that the
+    /// list then filters out, and the provider string its tokens are stored
+    /// under (a wrong one would revoke nothing on disconnect).
+    #[test]
+    fn google_health_is_listed_and_revoked_by_the_generic_paths() {
+        let p = PROVIDERS
+            .iter()
+            .find(|p| p.id == "google-health")
+            .expect("google-health provider must exist");
+        assert_eq!(p.graphql_enum, "GOOGLE_HEALTH");
+        assert_eq!(p.db_table, "google_health_integrations");
+        assert!(p.account_identifier_join.is_none());
+        assert!(
+            p.account_identifier_column
+                .to_uppercase()
+                .starts_with("COALESCE(T."),
+            "{}",
+            p.account_identifier_column
+        );
+        assert!(p.disconnect_is_soft_delete && p.extra_where.contains("t.is_active = true"));
+        assert_eq!(p.provider_key_column, "provider_key");
+        assert_eq!(
+            revoke_provider_for(p, None).as_deref(),
+            Some("google_health")
+        );
+        assert_eq!(p.redirect_path, "/api/google-health/callback");
     }
 
     /// GCP tier → OAuth provider string must match
