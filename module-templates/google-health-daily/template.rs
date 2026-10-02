@@ -184,7 +184,9 @@ fn sleep_url(from: NaiveDate, source: &str) -> String {
     format!("{API}/sleep/dataPoints?pageSize={SLEEP_PAGE}&filter={}{source}", pct(&filter))
 }
 fn resting_url(from: NaiveDate, source: &str) -> String {
-    let filter = format!("dailyRestingHeartRate.date >= \"{}\"", from.format("%Y-%m-%d"));
+    // Filter members are snake_case. The camelCase JSON name is refused with
+    // 400 INVALID_DATA_POINT_FILTER_DATA_TYPE_RESTRICTION (seen live 2026-10-02).
+    let filter = format!("daily_resting_heart_rate.date >= \"{}\"", from.format("%Y-%m-%d"));
     format!("{API}/daily-resting-heart-rate/dataPoints?pageSize=31&filter={}{source}", pct(&filter))
 }
 fn steps_url(day: NaiveDate, source: &str, page_token: Option<&str>) -> String {
@@ -559,7 +561,7 @@ mod tests {
         let u = steps_url(d("2026-10-05"), &source_param(Some("google-wearables")).unwrap(), Some("a b&c"));
         assert!(u.contains("steps.interval.civil_start_time%20%3E%3D%20%222026-10-05%22%20AND%20steps.interval.civil_start_time%20%3C%20%222026-10-06%22"), "{u}");
         assert!(u.ends_with("&dataSourceFamily=users%2Fme%2FdataSourceFamilies%2Fgoogle-wearables&pageToken=a%20b%26c"), "{u}");
-        assert!(resting_url(d("2026-09-30"), "").contains("/daily-resting-heart-rate/dataPoints?pageSize=31&filter=dailyRestingHeartRate.date%20%3E%3D%20%222026-09-30%22"));
+        assert!(resting_url(d("2026-09-30"), "").contains("/daily-resting-heart-rate/dataPoints?pageSize=31&filter=daily_resting_heart_rate.date%20%3E%3D%20%222026-09-30%22"));
         assert!(source_param(Some("everything&x=1")).is_err());
         assert_eq!(source_param(None).unwrap(), "");
         assert!(valid_zone("America/New_York") && !valid_zone("America/New York") && !valid_zone(""));
