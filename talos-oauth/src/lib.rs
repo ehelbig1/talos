@@ -151,10 +151,41 @@ pub(crate) const GOOGLE_CLOUD_TIER_PROVIDERS: &[&str] =
 pub(crate) const GOOGLE_REVOKE_PROVIDERS: &[&str] = &[
     "gmail",
     "google_calendar",
+    "google_health",
     "google_cloud",
     "google_cloud_write",
     "google_cloud_full",
 ];
+
+/// The Google providers that refresh under the SHARED Google client
+/// (`GOOGLE_CLIENT_ID`, falling back to `GMAIL_CLIENT_ID`): distinct provider
+/// strings for vault-path isolation, one OAuth client. The refresh match in
+/// `credentials.rs` is keyed on this list, so a provider added here refreshes;
+/// `shared_client_providers_refresh_and_revoke` pins that each also revokes.
+pub(crate) const GOOGLE_SHARED_CLIENT_PROVIDERS: &[&str] =
+    &["gmail", "google_calendar", "google_health"];
+
+/// The shared Google OAuth client: `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`,
+/// each falling back to its legacy `GMAIL_*` spelling. Empty is unset (a helm
+/// placeholder `""` must not shadow the fallback, MCP-710).
+///
+/// ONE resolution for the token REFRESH of every provider in
+/// [`GOOGLE_SHARED_CLIENT_PROVIDERS`] and for the AUTHORIZE step of an
+/// integration that issues tokens under this client. They must agree: a token
+/// issued to one client cannot be refreshed with another (`invalid_client` an
+/// hour after a connect that looked fine).
+pub fn shared_google_client() -> (Option<String>, Option<String>) {
+    let read = |primary: &str, legacy: &str| {
+        std::env::var(primary)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var(legacy).ok().filter(|v| !v.is_empty()))
+    };
+    (
+        read("GOOGLE_CLIENT_ID", "GMAIL_CLIENT_ID"),
+        read("GOOGLE_CLIENT_SECRET", "GMAIL_CLIENT_SECRET"),
+    )
+}
 
 pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bool> {
     let client = oauth_http_client();
@@ -1736,6 +1767,7 @@ mod revoke_provider_coverage_tests {
         for p in [
             "gmail",
             "google_calendar",
+            "google_health",
             "google_cloud",
             "google_cloud_write",
             "google_cloud_full",
@@ -1744,6 +1776,27 @@ mod revoke_provider_coverage_tests {
                 GOOGLE_REVOKE_PROVIDERS.contains(&p),
                 "provider {p} refreshes via Google but is missing from GOOGLE_REVOKE_PROVIDERS — \
                  its disconnect would silently skip provider-side revocation"
+            );
+        }
+    }
+
+    /// The shared-client providers are the other refresh-match key. Each
+    /// must revoke at Google too, and `google_health` must be one of them:
+    /// left out of the refresh match its hourly token would expire unrefreshed
+    /// (the `google_cloud_full` bug); left out of revoke, a disconnect would
+    /// leave a live grant on health data at Google.
+    #[test]
+    fn shared_client_providers_refresh_and_revoke() {
+        for p in ["gmail", "google_calendar", "google_health"] {
+            assert!(
+                super::GOOGLE_SHARED_CLIENT_PROVIDERS.contains(&p),
+                "{p} missing from GOOGLE_SHARED_CLIENT_PROVIDERS (refresh match key)"
+            );
+        }
+        for p in super::GOOGLE_SHARED_CLIENT_PROVIDERS {
+            assert!(
+                GOOGLE_REVOKE_PROVIDERS.contains(p),
+                "{p} refreshes under the shared Google client but is missing from GOOGLE_REVOKE_PROVIDERS"
             );
         }
     }

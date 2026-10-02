@@ -895,25 +895,16 @@ impl OAuthCredentialService {
                     .ok()
                     .filter(|v| !v.is_empty()),
             ),
-            "gmail" | "google_calendar" => (
-                "https://oauth2.googleapis.com/token",
-                std::env::var("GOOGLE_CLIENT_ID")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .or_else(|| {
-                        std::env::var("GMAIL_CLIENT_ID")
-                            .ok()
-                            .filter(|v| !v.is_empty())
-                    }),
-                std::env::var("GOOGLE_CLIENT_SECRET")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .or_else(|| {
-                        std::env::var("GMAIL_CLIENT_SECRET")
-                            .ok()
-                            .filter(|v| !v.is_empty())
-                    }),
-            ),
+            // Keyed on the list, not on literals, so a provider added to the
+            // shared Google client cannot be left out of the refresh path.
+            p if crate::GOOGLE_SHARED_CLIENT_PROVIDERS.contains(&p) => {
+                let (client_id, client_secret) = crate::shared_google_client();
+                (
+                    "https://oauth2.googleapis.com/token",
+                    client_id,
+                    client_secret,
+                )
+            }
             // The google_cloud consent tiers (Phase A read / C write / D
             // full) all refresh IDENTICALLY under GOOGLE_CLOUD_CLIENT_ID —
             // distinct provider strings only for vault-path isolation.

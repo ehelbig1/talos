@@ -1620,6 +1620,7 @@ pub enum IntegrationService {
     Slack,
     Jira,
     GoogleCloud,
+    GoogleHealth,
 }
 
 #[derive(SimpleObject, Clone, Debug)]

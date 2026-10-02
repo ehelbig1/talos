@@ -2620,6 +2620,7 @@ pub(crate) fn build_router(
     let google_cloud_integration_service = services.google_cloud_integration_service.clone();
     let google_cloud_write_service = services.google_cloud_write_service.clone();
     let google_cloud_full_service = services.google_cloud_full_service.clone();
+    let google_health_service = services.google_health_service.clone();
     let github_connect_service = services.github_connect_service.clone();
     let gmail_watch_service = services.gmail_watch_service.clone();
     let gmail_pubsub_verifier = services.gmail_pubsub_verifier.clone();
@@ -2877,6 +2878,35 @@ pub(crate) fn build_router(
     let slack_callback_route = Router::new()
         .route("/api/slack/callback", get(slack::slack_callback_handler))
         .with_state(slack_integration_service.clone())
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
+    // Google Health connect — behind session auth, same stack as Slack's.
+    // Listing and disconnecting are the generic serviceIntegrations paths.
+    let google_health_connect_route = Router::new()
+        .route(
+            "/api/google-health/connect",
+            get(google_health::handlers::connect_handler),
+        )
+        .with_state(google_health_service.clone())
+        .layer(from_fn(rest_auth_middleware))
+        .layer(from_fn(rest_cookie_csrf_gate))
+        .layer(Extension(auth_service.clone()))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
+    // Google Health OAuth callback — NO auth middleware: the session cookie
+    // is SameSite=Strict and does not arrive on Google's redirect. The
+    // handler is authenticated by the state token (bound to the user at
+    // /connect, which IS behind auth) and by the browser-binding cookie.
+    let google_health_callback_route = Router::new()
+        .route(
+            "/api/google-health/callback",
+            get(google_health::handlers::callback_handler),
+        )
+        .with_state(google_health_service.clone())
         .layer(from_fn(rate_limit::rate_limit_middleware))
         .layer(Extension(api_limiter.clone()))
         .layer(Extension(whitelist.clone()));
@@ -3770,6 +3800,8 @@ pub(crate) fn build_router(
         .merge(gmail_callback_route)
         .merge(gcp_integration_routes)
         .merge(gcp_callback_route)
+        .merge(google_health_connect_route)
+        .merge(google_health_callback_route)
         .merge(github_connect_route)
         .merge(github_setup_callback_route);
     // Optional gmail push routes — `None` when GMAIL_PUBSUB_TOPIC

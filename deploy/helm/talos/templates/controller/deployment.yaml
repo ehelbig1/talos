@@ -317,6 +317,8 @@ spec:
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/gmail/callback"
             - name: GOOGLE_CLOUD_REDIRECT_URI
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/gcp/callback"
+            - name: GOOGLE_HEALTH_REDIRECT_URI
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/google-health/callback"
             - name: SLACK_REDIRECT_URI
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/slack/callback"
             - name: ATLASSIAN_REDIRECT_URI

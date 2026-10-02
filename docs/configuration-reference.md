@@ -286,6 +286,7 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 | `GMAIL_PUBSUB_SERVICE_ACCOUNT` | `gmail-api-push@system.gserviceaccount.com` | controller | Expected service-account email for Gmail push | 🔒 |
 | `GMAIL_DEFAULT_LABEL_IDS` | `INBOX` | controller | Default Gmail labels to watch | |
 | `GOOGLE_CALENDAR_REDIRECT_URI` | none (optional) | talos-google-calendar | Calendar-specific connect redirect | |
+| `GOOGLE_HEALTH_REDIRECT_URI` | `http://localhost:8000/api/google-health/callback` | talos-google-health | Redirect for the Google Health connect (Pixel Watch / Fitbit readings). The consent is issued under the shared Google client (`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`), so this URI must be on that client's list of authorized redirect URIs. The chart derives it from the ingress host. | |
 | `GOOGLE_CLOUD_CLIENT_ID` / `GOOGLE_CLOUD_CLIENT_SECRET` / `GOOGLE_CLOUD_REDIRECT_URI` | none (fall back to `GOOGLE_*`) | talos-google-cloud | GCP OAuth client credentials + redirect | 🔒 (id/secret) |
 | `GCP_PUBSUB_AUDIENCE` | none (optional) | controller | JWT audience for GCP Pub/Sub push verification | 🔒 |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_REDIRECT_URI` | none | talos-slack | Slack OAuth credentials + redirect | 🔒 (id/secret) |

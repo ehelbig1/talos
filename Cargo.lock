@@ -1797,6 +1797,7 @@ dependencies = [
  "talos-gmail",
  "talos-google-calendar",
  "talos-google-cloud",
+ "talos-google-health",
  "talos-graph-rag",
  "talos-hot-update-service",
  "talos-http-utils",
@@ -8476,6 +8477,31 @@ dependencies = [
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "talos-google-health"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "talos-config",
+ "talos-dlp-provider",
+ "talos-http-body",
+ "talos-http-utils",
+ "talos-oauth",
+ "talos-text-util",
  "tokio",
  "tracing",
  "urlencoding",
