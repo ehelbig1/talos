@@ -112,6 +112,18 @@ pub(crate) fn all_static_schema_modules() -> Vec<(&'static str, Vec<Value>)> {
     ]
 }
 
+/// Every static tool schema, in the order `tools/list` serves them.
+///
+/// The one flat list. `tool_search` and the argument-warning indexes each
+/// kept their own list of domains until 2026-10-03 (16 and 18 of the 21),
+/// and were blind to the tools of the domains they left out.
+pub(crate) fn all_static_tools() -> Vec<Value> {
+    all_static_schema_modules()
+        .into_iter()
+        .flat_map(|(_module, schemas)| schemas)
+        .collect()
+}
+
 /// Declared tool name → the set of property names its `inputSchema` declares.
 ///
 /// Built once from the live schemas, so it can never disagree with what
