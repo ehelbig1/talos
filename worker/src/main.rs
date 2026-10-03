@@ -37,6 +37,8 @@ use worker::runtime::TalosRuntime;
 mod fuel_emission_pin;
 #[cfg(test)]
 mod inference_wait_pin;
+#[cfg(test)]
+mod rehearsal_pin;
 mod rejected_jobs;
 #[cfg(test)]
 mod retry_policy_pin;
@@ -1630,6 +1632,10 @@ async fn execute_job(
         // Opt-in idempotency (Task 3): HMAC-bound on the JobRequest; the HTTP
         // host emits it as an `Idempotency-Key` header on mutating sends.
         idempotency_key: req.idempotency_key.clone(),
+        // Recorded HTTP answers are a controller-side rehearsal feature
+        // (`test_module`). A dispatched job always makes its real requests;
+        // nothing on the wire can ask otherwise. Pinned by `rehearsal_pin.rs`.
+        http_replay: None,
     };
 
     // Parse the capability world hint from the controller.  When present and non-Unknown,
@@ -2077,6 +2083,9 @@ async fn execute_pipeline_job(
                 // fns emit it as an `Idempotency-Key` header on mutating sends —
                 // the same path single-node dispatch uses.
                 idempotency_key: step.idempotency_key.clone(),
+                // A dispatched step makes its real requests (see the
+                // single-job policy above).
+                http_replay: None,
             },
             user_id: Some(req.user_id),
             // Per-step in-worker retry policy (2026-07-24). HMAC-bound via

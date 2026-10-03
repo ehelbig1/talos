@@ -38,6 +38,9 @@ impl wit_webhook::Host for TalosContext {
         &mut self,
         req: wit_webhook::WebhookRequest,
     ) -> Result<wit_webhook::WebhookResponse, wit_webhook::Error> {
+        if self.rehearsal_refuses("webhook::send").await {
+            return Err(wit_webhook::Error::Sendfailed);
+        }
         // MCP-785 (2026-05-14): pure-validation surfaces (URL parse,
         // host allowlist, SSRF IP-literal classification, allowed_hosts
         // pattern match, DNS-rebinding, Tier-1 LLM egress) MUST run

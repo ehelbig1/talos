@@ -217,6 +217,44 @@ authoritative and `dependencies` must be omitted (modules are
 self-contained — no network at componentize time). Python is identical with
 `language: "python"` and a module-level `def run(input: str) -> str:`.
 
+## Rehearsing a module against a recorded response
+
+`test_module` takes `http_fixtures`: an ordered list of recorded HTTP
+responses. When it is given, the run is a rehearsal and makes no request.
+
+```jsonc
+{
+  "module_id": "…",
+  "config": { "ACCESS_TOKEN": "vault://provider/access_token/example" },
+  "http_fixtures": [
+    { "method": "POST", "url_contains": "/v1/items", "status": 200, "body": { "items": [] } },
+    { "status": 429, "headers": { "retry-after": "2" }, "body": "slow down" }
+  ]
+}
+```
+
+* The Nth `http::fetch` (or `fetch_all` entry) is answered by the Nth item. A
+  string `body` is sent as written; any other JSON value is sent as compact
+  JSON; `status` defaults to 200.
+* `method` and `url_contains` say what the item expects. A request that does
+  not match is refused and reported, and so is any request after the last
+  item — a module is never handed the response recorded for another endpoint.
+* Everything that decides whether the request may be made still runs: a host
+  or verb the module was not granted is refused exactly as in a real run.
+* Nothing is sent, no DNS lookup is made, and no secret is resolved.
+  `vault://` references are not checked, so a module can be exercised before
+  the service is connected.
+* webhook, GraphQL, streaming and `wasi:http` calls are refused in a
+  rehearsal. LLM, email, object-storage, messaging and memory calls are not
+  affected by it.
+* The run is not retried. The reply's `http_replay` lists each request (host
+  and path, no query string) and which item answered it; `fuel` is the fuel
+  the module used, which is how a budget is sized before the first live call.
+* Limits: 64 items, 8 MB of bodies, each body within the response size cap.
+
+Only `test_module` can do this. A dispatched job always makes its real
+requests.
+
 ## Module input contract
 
 Regardless of language, `run(input)` receives a **JSON-encoded string of the

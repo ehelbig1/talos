@@ -126,6 +126,41 @@ backstopping a mis-set node ceiling**. (`tenant_quotas.max_fuel_per_execution`
 used to be named here too; that table never had a writer or a reader and was
 dropped 2026-09-12 — it was never a backstop.)
 
+## Measure before the first live call
+
+The per-byte rates in the `fuel_budget` description are estimates, and they
+were measured on long string values. JSON made of many short fields costs
+more per byte, because the parser's work follows the number of tokens:
+
+| input | measured |
+|---|---|
+| fetched and typed-parsed, long strings (mail bodies) | ~11 fuel per byte |
+| decoded or scanned byte by byte (base64, HTML) | 30–40 per byte touched |
+| ~2 KB records of several dozen short fields, typed structs, most fields skipped (bank transactions, 2026-10-03) | 110–127 K per record: the 60 K per item plus ~30 per byte |
+| number-heavy JSON read by a combining module (2026-10-03) | ~210 per byte of input, all told |
+| a whole input parsed into `serde_json::Value` (2026-10-01) | ~430 per byte |
+
+A module sized from the first two rows and fed the third ran out on its first
+live read. To find the number before connecting anything, save one realistic
+response and replay it:
+
+```jsonc
+// test_module
+{
+  "module_id": "…",
+  "config": { /* the node config */ },
+  "http_fixtures": [
+    { "method": "POST", "url_contains": "/transactions/get", "body": { /* the saved response */ } }
+  ]
+}
+```
+
+The run makes no request. The Nth `http::fetch` is answered by the Nth item,
+the module's host and verb grants are still enforced, and the reply carries
+`fuel.consumed` and an `http_replay` list of what was asked for. Size the
+budget from that figure at the node's configured maximum, then check it
+against a live run (step 7 below).
+
 ## Where the real numbers live
 
 * **`execution_cost_rollup`** — authoritative per-attempt `fuel_consumed`,
@@ -248,6 +283,8 @@ its configured maximum output alone puts the requirement near 4M before the
    `__actor_context__` budget.
 3. Derive from the node's **configured maximum** (`MAX_TOKENS`, item caps),
    not from the last observed run — the last run may be the small-payload one.
+   For a module that reads an HTTP response, measure it: `test_module` with
+   `http_fixtures` (see "Measure before the first live call").
 4. State the ceiling that still bounds the new value, and whether any
    per-actor or per-tenant budget interacts.
 5. Does the workflow run often enough for adaptive fuel to ever help? If it

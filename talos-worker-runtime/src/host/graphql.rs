@@ -846,6 +846,9 @@ impl TalosContext {
         // backoff cap each) bounded only by the job timeout. Shadowed here, at
         // the top, so no later line can read the raw value.
         let max_retries = clamp_graphql_retries(max_retries);
+        if self.rehearsal_refuses("graphql::execute").await {
+            return Err(wit_graphql::Error::Networkerror);
+        }
         // MCP-605 (2026-05-12): per-method capability gate. WIT-world
         // linkage already restricts `talos:core/graphql` to http-node
         // and above (minimal-node is the only world that does NOT

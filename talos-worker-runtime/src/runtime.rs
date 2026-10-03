@@ -364,6 +364,10 @@ pub struct SecurityPolicy {
     /// `Idempotency-Key` header on mutating outbound requests. `None` for every
     /// non-declaring node.
     pub idempotency_key: Option<String>,
+    /// Recorded HTTP answers for an in-process rehearsal (`test_module`).
+    /// `None` everywhere else: it is not a field of any wire message, so a
+    /// dispatched job cannot carry one. See [`crate::http_replay`].
+    pub http_replay: Option<std::sync::Arc<crate::http_replay::HttpReplay>>,
 }
 // ---------------------------------------------------------------------
 // AOT versioning
@@ -4430,6 +4434,8 @@ impl TalosRuntime {
         // `unauthorized` without any DB round-trip.
         context.integration_name = security_policy.integration_name.clone();
         context.idempotency_key = security_policy.idempotency_key.clone();
+        // A rehearsal's recorded HTTP answers (None on every dispatched job).
+        context.http_replay = security_policy.http_replay.clone();
 
         // Enable dry-run mode if requested (mocks non-GET HTTP, webhook, messaging calls).
         if dry_run {

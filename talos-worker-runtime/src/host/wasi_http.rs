@@ -85,7 +85,7 @@ pub(crate) const WASI_HTTP_TARGET_PREFIX: &str = "wasi:http";
 
 /// Upper bound on a response body read through this channel, the same knob
 /// and default as `talos:core/http::fetch`.
-fn max_response_bytes() -> usize {
+pub(crate) fn max_response_bytes() -> usize {
     talos_config::positive_env_or_default::<usize>("WASM_HTTP_MAX_RESPONSE_BYTES", 10 * 1024 * 1024)
 }
 
@@ -328,6 +328,17 @@ pub(crate) fn gated_handle(
     request: Resource<HostOutgoingRequest>,
     options: Option<Resource<wt::RequestOptions>>,
 ) -> HttpResult<Resource<HostFutureIncomingResponse>> {
+    // A rehearsal answers `talos:core/http` from recordings and sends nothing
+    // else. This function is synchronous, so the refusal is logged rather than
+    // written as a host diagnostic.
+    if ctx.http_replay.is_some() {
+        drop(ctx.table.delete(request));
+        tracing::info!(
+            module_id = ?ctx.module_id,
+            "wasi:http request refused: the run is a rehearsal (http_fixtures)"
+        );
+        return Err(wt::ErrorCode::HttpRequestDenied.into());
+    }
     let target = {
         let req = ctx.table.get(&request)?;
         WasiHttpTarget {
