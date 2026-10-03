@@ -8,10 +8,11 @@
   "allowed_hosts": [],
   "allowed_secrets": [],
   "recommended_fuel": {
-    "expected_items": 10,
+    "expected_items": 20,
     "bytes_per_item": 2000,
     "llm_output_bytes": 512,
-    "safety_multiplier": 2.5
+    "safety_multiplier": 2.5,
+    "fuel_per_byte": 50
   },
   "config_schema": {
     "type": "object",

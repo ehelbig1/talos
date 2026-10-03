@@ -2413,6 +2413,25 @@ pub(crate) async fn seed_templates(
             }
         };
 
+        // The shared row's fuel limit is the template's own recommendation,
+        // as a first install's is; a template that recommends nothing keeps
+        // the column default. A recommendation that cannot be read changes
+        // nothing: the row keeps the limit it has, and this says so, rather
+        // than the template being sized by a number nobody chose.
+        let max_fuel = match template.recommended_max_fuel() {
+            Ok(Some(limit)) => i64::try_from(limit).ok(),
+            Ok(None) => Some(talos_registry::reconcile::SHARED_CATALOG_DEFAULT_MAX_FUEL),
+            Err(reason) => {
+                tracing::warn!(
+                    template = %name,
+                    %reason,
+                    "catalog template's recommended_fuel cannot be read; the shared row keeps \
+                     the fuel limit it has"
+                );
+                None
+            }
+        };
+
         // Phase 5 / 2026-07-21 defect fix: seed the unified `modules` table
         // idempotently keyed on `catalog_slug` (rename-safe — prevents NEW
         // twins), returning whether the WASM needs (re)compilation. Unlike
@@ -2434,6 +2453,7 @@ pub(crate) async fn seed_templates(
                 capability_world_long: &cw_long,
                 catalog_slug: &catalog_slug,
                 dependencies: template.dependencies(),
+                max_fuel,
             },
         )
         .await;
@@ -2819,6 +2839,44 @@ mod catalog_seed_tests {
              missing-module-templates early returns — must call \
              spawn_catalog_missing_wasm_gauge, or the alert built on that gauge \
              cannot fire in that mode."
+        );
+    }
+
+    /// The seed sizes the shared row from the template's recommendation.
+    /// The row writer and the reader are tested where they live (a database
+    /// test and a unit test); what neither can see is this call site passing
+    /// something else. Textual, like the guard above, and for its reason.
+    #[test]
+    fn the_seed_sizes_the_shared_row_from_the_templates_recommendation() {
+        const SRC: &str = include_str!("services.rs");
+        let start = SRC
+            .find("pub(crate) async fn seed_templates(")
+            .expect("seed_templates moved — update this guard rather than deleting it");
+        let body = &SRC[start..];
+        let body = &body[..body.find("\n}\n").expect("the end of seed_templates")];
+        let read = ["template.recommended_", "max_fuel()"].concat();
+        let default = [
+            "Ok(None) => Some(talos_registry::reconcile::",
+            "SHARED_CATALOG_DEFAULT_MAX_FUEL)",
+        ]
+        .concat();
+        let passed = [
+            "dependencies: template.dependencies(),\n                ",
+            "max_fuel,\n",
+        ]
+        .concat();
+        assert_eq!(
+            body.matches(&read).count(),
+            1,
+            "the seed reads the recommendation once"
+        );
+        assert!(
+            body.contains(&default),
+            "a template that recommends nothing gets the column default"
+        );
+        assert!(
+            body.contains(&passed),
+            "the limit read is the limit written"
         );
     }
 

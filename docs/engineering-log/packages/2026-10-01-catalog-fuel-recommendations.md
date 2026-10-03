@@ -36,6 +36,8 @@ caller passes `fuel_budget` (so an operator's tuning survives — the
 - The other 66 templates without a recommendation: none is measured here.
   The calendar template is sized in its own package.
 - The system catalog rows' own limits, which nothing executes under.
+  (Superseded 2026-10-03: measured, 21 live nodes run on shared rows. See
+  `2026-10-03-seed-applies-recommended-fuel.md`.)
 
 **Follow-up on the reference deployment (operator's call).** Reinstall
 `LLM Inference` and `Gmail: List Messages` with `fuel_budget` set to the
