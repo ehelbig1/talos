@@ -118,6 +118,9 @@ struct Week {
     fixed: f64,
     #[serde(default)]
     income: f64,
+    /// The part of the week's spending that is a monthly charge.
+    #[serde(default)]
+    recurring: f64,
     #[serde(default)]
     count: usize,
 }
@@ -255,6 +258,7 @@ fn summarize(data: In) -> Result<String, String> {
         (None, None, None)
     };
     let accounts_total: usize = digests.iter().map(|d| d.accounts.len()).sum();
+    let cash_accounts = digests.iter().flat_map(|d| d.accounts.iter()).filter(|a| a.kind.as_deref() == Some("depository")).count();
     let accounts: Vec<serde_json::Value> = digests
         .iter()
         .flat_map(|d| d.accounts.iter().map(move |a| (*d, a)))
@@ -309,8 +313,13 @@ fn summarize(data: In) -> Result<String, String> {
         let income0 = sum_week(0, |w| w.income);
         let prior = used - 1;
         let usual = (prior >= MIN_PRIOR_WEEKS).then(|| median(&day_to_day[1..])).flatten();
-        let total_all: i64 = day_to_day.iter().sum::<i64>() + fixed.iter().sum::<i64>();
-        let monthly = (prior >= MIN_PRIOR_WEEKS).then(|| (total_all as f64 / used as f64 * WEEKS_PER_MONTH).round() as i64);
+        // A month of spending: the monthly charges once, plus everything
+        // else averaged by week. Averaging the monthly charges by week too
+        // would overstate them whenever the window holds one payment more
+        // than it holds months.
+        let monthly_charges: i64 = with_tx.iter().map(|(_, t)| cents(t.recurring_monthly_total.unwrap_or(0.0))).sum();
+        let other: i64 = (0..used).map(|i| day_to_day[i] + fixed[i] - sum_week(i, |w| w.recurring)).sum();
+        let monthly = (prior >= MIN_PRIOR_WEEKS).then(|| monthly_charges + (other as f64 / used as f64 * WEEKS_PER_MONTH).round() as i64);
 
         // Categories: last week beside each one's own usual week.
         let mut cats: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
@@ -342,7 +351,7 @@ fn summarize(data: In) -> Result<String, String> {
             .collect();
 
         if with_tx.iter().any(|(_, t)| t.truncated) {
-            notes.push("A bank had more transactions than were read, so its totals are low.".to_string());
+            notes.push("A bank had more transactions than are read at once, so fewer weeks are compared.".to_string());
         }
         let w0 = &with_tx[0].1.weeks[0];
         // Months of cash: only when every balance and every bank's spending
@@ -422,6 +431,7 @@ fn summarize(data: In) -> Result<String, String> {
         "cash_after_cards": after_cards.map(dollars),
         "accounts": accounts,
         "accounts_total": accounts_total,
+        "cash_accounts": cash_accounts,
         "spending": spending,
         "recurring": recurring,
         "notes": notes,
@@ -445,7 +455,11 @@ mod tests {
         let w: Vec<Value> = weeks
             .iter()
             .enumerate()
-            .map(|(i, v)| json!({"start": format!("2026-09-{:02}", 27 - i.min(26)), "end": "2026-10-03", "day_to_day": v, "fixed": if i % 4 == 0 { 1000.0 } else { 0.0 }, "income": 0.0, "count": if *v > 0.0 { 5 } else { 0 }}))
+            .map(|(i, v)| {
+                // Rent of 1000 every fourth week, which is also a monthly charge.
+                let rent = if i % 4 == 0 { 1000.0 } else { 0.0 };
+                json!({"start": format!("2026-09-{:02}", 27 - i.min(26)), "end": "2026-10-03", "day_to_day": v, "fixed": rent, "recurring": rent, "income": 0.0, "count": if *v > 0.0 { 5 } else { 0 }})
+            })
             .collect();
         json!({
             "kind": "bank_digest", "institution": bank, "as_of": "2026-10-04", "currency": "USD",
@@ -456,8 +470,8 @@ mod tests {
                 "by_category": {"FOOD_AND_DRINK": weeks},
                 "last_week": {"largest": [{"date": "2026-10-01", "name": format!("{bank} shop"), "amount": weeks[0], "category": "FOOD_AND_DRINK", "pending": false}],
                               "transfers_out": 100.0, "transfers_in": 0.0},
-                "recurring": [{"merchant": "Streamflix", "amount": 15.49, "last_date": "2026-09-20"}],
-                "recurring_count": 1, "recurring_monthly_total": 15.49,
+                "recurring": [{"merchant": "Landlord", "amount": 1000.0, "last_date": "2026-10-01"}],
+                "recurring_count": 1, "recurring_monthly_total": 1000.0,
                 "new_recurring": []
             },
             "unavailable": []
@@ -485,12 +499,15 @@ mod tests {
         // six prior weeks, median of [400, 440, 360, 1800, 420, 380] = 410.
         assert_eq!(s["weeks_compared"], 6);
         assert_eq!(s["usual_week_day_to_day"], 410.0, "one unusual week does not move the usual one");
-        // Seven weeks: day-to-day 4400, fixed 2 x 2000 = 4000 → 1200 a week.
-        assert_eq!(s["monthly_average"], 5217.86);
-        assert_eq!(s["months_of_cash"], 1.1);
+        // A month is the rent once (2 x 1000) plus the rest by week:
+        // 4400 over seven weeks = 628.57 a week = 2733.16 a month. The three
+        // rent payments in the seven weeks are not averaged in again.
+        assert_eq!(s["monthly_average"], 4733.16);
+        assert_eq!(s["months_of_cash"], 1.2);
+        assert_eq!(out["cash_accounts"], 2);
         assert_eq!(s["categories"][0], json!({"category": "FOOD_AND_DRINK", "last_week": 600.0, "usual_week": 410.0}));
         assert_eq!(s["largest"].as_array().unwrap().len(), 2);
-        assert_eq!(out["recurring"]["monthly_total"], 30.98);
+        assert_eq!(out["recurring"]["monthly_total"], 2000.0);
         assert_eq!(out["recurring"]["count"], 2);
         assert_eq!(out["missing"], json!([]));
     }

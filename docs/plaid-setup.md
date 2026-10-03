@@ -81,8 +81,13 @@ Each bank's access token appears in the secrets list as
 The reader builds the request with `vault://` references; the host replaces
 them when the request is sent, so the module never holds a credential, and
 what it returns is a digest: balances, weekly totals, the week's largest
-items and the charges that repeat monthly. Account numbers are not returned,
-and nothing is stored between runs.
+day-to-day items and the charges that repeat monthly. Banks put account digits
+inside names ("CHECKING ...1234"), so any word of a name carrying four or more
+digits is dropped. Nothing is stored between runs.
+
+The reader makes one request for the newest 300 transactions. A bank with more
+than that in the window is reported `truncated`, and only the weeks that were
+read whole are counted.
 
 A total that rests on a bank that could not be read is `null`, not a partial
 sum: cash and the months of cash covered need every bank.
