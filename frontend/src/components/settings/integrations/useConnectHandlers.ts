@@ -10,7 +10,7 @@ import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { validateOAuthUrl } from "@/lib/oauthUtils";
 import { authedFetch } from "../watch-channels/api";
-import { openPlaidLink } from "@/lib/plaidLink";
+import { openPlaidLink, plaidLinkIsOpen } from "@/lib/plaidLink";
 
 export function useConnectHandlers(refetchIntegrations: () => void) {
   const pollTimerRef = useRef<number | null>(null);
@@ -208,7 +208,17 @@ export function useConnectHandlers(refetchIntegrations: () => void) {
   // token, Plaid's own window handles the bank sign-in, and the resulting
   // public token goes straight back to the server, which keeps the long-lived
   // access token. Nothing that can read the bank reaches this page.
+  const plaidConnecting = useRef(false);
   const handleConnectPlaid = async () => {
+    // One sign-in at a time. Starting takes a second or two (a token from the
+    // server, then Plaid's script), and a second click in that gap opened a
+    // second window on top of the first.
+    if (plaidConnecting.current || plaidLinkIsOpen()) {
+      toast.info("The bank sign-in is already opening");
+      return;
+    }
+    plaidConnecting.current = true;
+    const opening = toast.loading("Opening the bank sign-in…");
     try {
       const res = await authedFetch("/api/plaid/link-token", {
         method: "POST",
@@ -220,6 +230,7 @@ export function useConnectHandlers(refetchIntegrations: () => void) {
         );
         return;
       }
+      toast.dismiss(opening);
       const outcome = await openPlaidLink(d.data.link_token);
       if (!outcome) return; // closed without connecting
       const saved = await authedFetch("/api/plaid/connect", {
@@ -253,6 +264,9 @@ export function useConnectHandlers(refetchIntegrations: () => void) {
           err instanceof Error ? err.message : "Error connecting a bank",
         ),
       );
+    } finally {
+      toast.dismiss(opening);
+      plaidConnecting.current = false;
     }
   };
 
