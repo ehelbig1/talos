@@ -430,6 +430,9 @@ test-alert-rules: ## promtool `check rules` on both alert files + `test rules` o
 check-catalog: ## Compile every module-templates/* against current WIT (used by CI)
 	@bash scripts/check-catalog.sh
 
+test-templates: ## Run every catalog template's own tests natively (also part of the workspace unit tests)
+	@cargo test -p talos-catalog-tests
+
 ci: lint-full lint-frontend-full audit test check-catalog ## Full local gate matching GitHub Actions CI
 	@printf '\033[1;32m✓ CI checks passed — safe to push\033[0m\n'
 
