@@ -1,0 +1,30 @@
+{
+  "name": "plaid-money-summary",
+  "version": "v1.0.0",
+  "display_name": "Plaid: Money Summary",
+  "description": "Combines the outputs of several `plaid-bank-digest` nodes (joined by a Collect node) into one money summary. Pure computation: no network, no memory, no clock. Returns `cash`, `owed_on_cards` and `cash_after_cards` across all banks; `spending` with last week's day-to-day and fixed totals, the usual week (the median of the earlier weeks, so one unusual week does not move it), a monthly average, `months_of_cash`, the top categories beside their own usual week and the largest items; and `recurring` monthly charges with the new ones. A figure that rests on a bank that could not be read is `null` rather than a partial sum: `cash` and `months_of_cash` need every bank, while spending from the banks that were read is still given with `partial: true`. Banks that failed upstream are listed under `missing` with the reason the engine recorded. Weeks before a bank's history begins are not counted as weeks of zero spending, and no usual week is stated from fewer than four earlier weeks.",
+  "category": "Data",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 10,
+    "bytes_per_item": 15000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 2.0,
+    "fuel_per_byte": 100
+  },
+  "config_schema": {
+    "type": "object",
+    "required": [],
+    "properties": {
+      "BANKS": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "The banks expected, by the INSTITUTION given to each plaid-bank-digest node. A bank listed here that produced no digest is reported under `missing`, and the totals that need it are null."
+      }
+    }
+  },
+  "setup_instructions": []
+}
