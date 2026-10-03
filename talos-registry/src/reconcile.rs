@@ -240,7 +240,33 @@ pub struct CatalogUpsert<'a> {
     /// 75 shipped rows had `dependencies IS NULL`), which made
     /// `compile_template` a fifth way to lose them.
     pub dependencies: Option<&'a serde_json::Value>,
+    /// The shared row's fuel limit: the template's `recommended_fuel`
+    /// resolved by `talos_compilation::recommended_max_fuel`, or
+    /// [`SHARED_CATALOG_DEFAULT_MAX_FUEL`] for a template that declares
+    /// none. `None` leaves the row's limit as it is (a new row takes the
+    /// column default): the seed passes it only for a manifest whose
+    /// recommendation cannot be read, so a rule nobody could read neither
+    /// raises nor lowers a limit.
+    ///
+    /// Before 2026-10-03 this struct had no such field, so the seed never
+    /// wrote `modules.max_fuel` for a shared catalog row: all 79 sat at the
+    /// column default (2,000,000) whatever their template recommended, while
+    /// an INSTALLED copy of the same template carried the recommendation.
+    /// Catalog rows are dispatched directly by workflow nodes (measured on
+    /// the reference deployment: 21 live nodes, 819 runs in 30 days), and a
+    /// node that sets no `max_fuel` of its own runs under this limit.
+    ///
+    /// Only the shared row is written. A user's installed copy keeps its own
+    /// limit, which the operator may have tuned.
+    pub max_fuel: Option<i64>,
 }
+
+/// `modules.max_fuel`'s column default, which a shared catalog row carries
+/// when its template recommends nothing. Written explicitly rather than left
+/// to the column so a template that STOPS recommending a limit goes back to
+/// it instead of keeping the old one. A database test holds it equal to the
+/// column's default.
+pub const SHARED_CATALOG_DEFAULT_MAX_FUEL: i64 = 2_000_000;
 
 /// Idempotently register a disk/OCI catalog template into the `modules`
 /// table, keyed on the **stable `catalog_slug`** rather than the mutable
@@ -284,7 +310,8 @@ pub async fn upsert_catalog_template_by_slug(
                  name = $2, category = $3, description = $4, config_schema = $5, \
                  source_code = $6, allowed_hosts = $7, allowed_secrets = $8, \
                  requires_approval_for = $9, capability_world = $10, \
-                 dependencies = $11, allowed_methods = $12 \
+                 dependencies = $11, allowed_methods = $12, \
+                 max_fuel = COALESCE($13, max_fuel) \
              WHERE id = $1",
         )
         .bind(id)
@@ -299,6 +326,7 @@ pub async fn upsert_catalog_template_by_slug(
         .bind(params.capability_world_long)
         .bind(params.dependencies)
         .bind(params.allowed_methods)
+        .bind(params.max_fuel)
         .execute(pool)
         .await?;
 
@@ -322,11 +350,12 @@ pub async fn upsert_catalog_template_by_slug(
                  user_id, name, kind, category, description, config_schema, \
                  source_code, allowed_hosts, allowed_secrets, requires_approval_for, \
                  capability_world, catalog_slug, dependencies, allowed_methods, \
-                 language, created_at, updated_at \
+                 max_fuel, language, created_at, updated_at \
              ) VALUES ( \
                  NULL, $1, 'catalog', $2, $3, $4, \
                  $5, $6, $7, $8, \
-                 $9, $10, $11, $12, 'rust', NOW(), NOW() \
+                 $9, $10, $11, $12, \
+                 COALESCE($13::bigint, 2000000), 'rust', NOW(), NOW() \
              ) \
              ON CONFLICT (name) WHERE user_id IS NULL DO UPDATE SET \
                  category = EXCLUDED.category, \
@@ -339,7 +368,8 @@ pub async fn upsert_catalog_template_by_slug(
                  requires_approval_for = EXCLUDED.requires_approval_for, \
                  capability_world = EXCLUDED.capability_world, \
                  dependencies = EXCLUDED.dependencies, \
-                 allowed_methods = EXCLUDED.allowed_methods \
+                 allowed_methods = EXCLUDED.allowed_methods, \
+                 max_fuel = COALESCE($13::bigint, modules.max_fuel) \
              /* updated_at deliberately NOT set — see talos-registry/src/lib.rs. */ \
              RETURNING id, \
                  (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS has_wasm \
@@ -361,6 +391,7 @@ pub async fn upsert_catalog_template_by_slug(
     .bind(params.catalog_slug)
     .bind(params.dependencies)
     .bind(params.allowed_methods)
+    .bind(params.max_fuel)
     .fetch_one(pool)
     .await?;
 

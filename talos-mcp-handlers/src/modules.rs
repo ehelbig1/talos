@@ -4751,27 +4751,24 @@ async fn handle_install_module_from_catalog(
     // sized by defaults nobody chose, and the refusal says a `fuel_budget` of
     // the caller's own installs it anyway.
     let fuel_explicit = budget_max_fuel.is_some();
-    let template_max_fuel: i64 = match meta.get("recommended_fuel").filter(|v| !v.is_null()) {
-        None => talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64,
-        Some(rec) => match talos_compilation::scaffold::max_fuel_from_budget(rec) {
-            Ok(limit) => limit as i64,
-            Err(reason) if fuel_explicit => {
-                tracing::warn!(template = %display_name, %reason, "catalog template's recommended_fuel cannot be read; the caller's fuel_budget is used");
-                talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64
-            }
-            Err(reason) => {
-                tracing::error!(template = %display_name, %reason, "catalog template's recommended_fuel cannot be read");
-                return mcp_error(
-                    req_id,
-                    -32000,
-                    &format!(
-                        "The catalog template '{display_name}' declares a recommended_fuel that cannot be read \
-                         ({}). Pass a fuel_budget of your own to install it.",
-                        reason.replacen("fuel_budget", "recommended_fuel", 1)
-                    ),
-                );
-            }
-        },
+    let template_max_fuel: i64 = match talos_compilation::recommended_max_fuel(&meta) {
+        Ok(Some(limit)) => limit as i64,
+        Ok(None) => talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64,
+        Err(reason) if fuel_explicit => {
+            tracing::warn!(template = %display_name, %reason, "catalog template's recommended_fuel cannot be read; the caller's fuel_budget is used");
+            talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64
+        }
+        Err(reason) => {
+            tracing::error!(template = %display_name, %reason, "catalog template's recommended_fuel cannot be read");
+            return mcp_error(
+                req_id,
+                -32000,
+                &format!(
+                    "The catalog template '{display_name}' declares a recommended_fuel that cannot be read \
+                     ({reason}). Pass a fuel_budget of your own to install it."
+                ),
+            );
+        }
     };
     let offered_max_fuel: i64 = budget_max_fuel.unwrap_or(template_max_fuel);
     match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {

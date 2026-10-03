@@ -99,6 +99,27 @@ impl std::fmt::Display for CatalogTemplateError {
 
 impl std::error::Error for CatalogTemplateError {}
 
+/// The fuel limit a catalog manifest (`talos.json`) recommends for its
+/// module: `Ok(None)` when it declares no `recommended_fuel` (absent or
+/// `null`), `Err` when it declares one that cannot be read.
+///
+/// The one reader of that key. Two writers size a module from it — a first
+/// install (`install_module_from_catalog`) and the boot seed of the shared
+/// catalog row — and until 2026-10-03 only the install did: all 79 shared
+/// rows sat at the column default whatever their template recommended.
+///
+/// The value goes through the strict budget reader, so the result is within
+/// `[FUEL_MIN, FUEL_MAX]` and a field that cannot be read is an error naming
+/// it, never a default.
+pub fn recommended_max_fuel(manifest: &serde_json::Value) -> Result<Option<u64>, String> {
+    match manifest.get("recommended_fuel").filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(budget) => crate::scaffold::max_fuel_from_budget(budget)
+            .map(Some)
+            .map_err(|reason| reason.replacen("fuel_budget", "recommended_fuel", 1)),
+    }
+}
+
 /// A catalog template directory's compile inputs, read as one unit.
 ///
 /// Construct only via [`load`](Self::load) — there is deliberately no way to
@@ -175,6 +196,12 @@ impl CatalogTemplate {
             Some(serde_json::Value::Null) | None => None,
             Some(v) => Some(v),
         }
+    }
+
+    /// The fuel limit this template's manifest recommends; see
+    /// [`recommended_max_fuel`].
+    pub fn recommended_max_fuel(&self) -> Result<Option<u64>, String> {
+        recommended_max_fuel(&self.manifest)
     }
 
     /// Reject a manifest whose declared dependencies are outside the
@@ -388,9 +415,14 @@ mod catalog_template_tests {
         // default MAX_ROWS. Its first manifest carried an estimate (20 per
         // byte) that nothing had measured, and the module it described
         // could not read 1,000 entries at all.
-        let measured: [(&str, u64, u64); 2] = [
+        // `hybrid-classify-alerts`: measured per RUN, not per item — 692 runs
+        // of the installed copy in the 30 days to 2026-10-03: median
+        // 1,768,663, p95 3,044,543, peak 3,977,347. Its manifest recommended
+        // 1,727,560, below the median, so a fresh install failed most runs.
+        let measured: [(&str, u64, u64); 3] = [
             ("gmail-list-messages", 92_000, 25),
             ("json-api-reader", 38_217, 100),
+            ("hybrid-classify-alerts", 3_977_347, 1),
         ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../module-templates");
         for (template, per_item, max_items) in measured {
@@ -411,6 +443,42 @@ mod catalog_template_tests {
                 limit >= need,
                 "{template}: recommended fuel resolves to {limit}, below {need} \
                  (2 x {per_item} measured per item x {max_items} items)"
+            );
+        }
+    }
+
+    /// The one reader of a manifest's recommendation: what it declares,
+    /// nothing when it declares nothing, and an error naming the field when
+    /// what it declares cannot be read — never a default in its place.
+    #[test]
+    fn a_manifests_recommended_fuel_is_read_or_absent_or_refused() {
+        use serde_json::json;
+        // 25 items x 8 KB x 3 per byte, doubled: the Gmail list template's.
+        let declared = json!({"recommended_fuel": {"expected_items": 25, "bytes_per_item": 8000, "fuel_per_byte": 3, "safety_multiplier": 3.0}});
+        let limit = recommended_max_fuel(&declared).unwrap().expect("declared");
+        assert_eq!(
+            limit,
+            crate::scaffold::max_fuel_from_budget(&declared["recommended_fuel"]).unwrap()
+        );
+        assert!((crate::scaffold::FUEL_MIN..=crate::scaffold::FUEL_MAX).contains(&limit));
+
+        assert_eq!(recommended_max_fuel(&json!({"name": "x"})), Ok(None));
+        assert_eq!(
+            recommended_max_fuel(&json!({"recommended_fuel": null})),
+            Ok(None)
+        );
+
+        // A misspelt field, a string where a number belongs, a non-object.
+        for bad in [
+            json!({"recommended_fuel": {"byte_per_item": 4000}}),
+            json!({"recommended_fuel": {"fuel_per_byte": "40"}}),
+            json!({"recommended_fuel": 5_000_000}),
+        ] {
+            let reason = recommended_max_fuel(&bad).expect_err("must be refused");
+            assert!(reason.contains("recommended_fuel"), "{bad}: {reason}");
+            assert!(
+                !reason.contains("fuel_budget"),
+                "the field is named as the manifest names it: {reason}"
             );
         }
     }
