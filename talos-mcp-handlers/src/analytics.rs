@@ -654,7 +654,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_fuel_usage_report",
-            "description": "Aggregate fuel (computation) consumption across recent workflow executions. Shows top fuel-intensive modules with p50, p95, max stats and flags modules near the fuel limit. Also reports two things the consumption aggregates structurally cannot contain: fuel_exhaustion_deaths (nodes the fuel meter KILLED — a killed node never completes, so it writes no execution_cost_rollup row and is absent from at_risk/high_utilisation_nodes), and node_ceiling_divergence (one module running under different per-node ceilings across workflows, read from the graphs, so it names a node BEFORE its first failure).",
+            "description": "Aggregate fuel (computation) consumption across recent workflow executions. Shows top fuel-intensive modules with p50, p95, max stats and flags modules near the fuel limit; high_utilisation_nodes judges each node against the ceiling its last run was held to or its configured max_fuel where that was raised since (those nodes are listed under raised_since_last_run). Also reports two things the consumption aggregates structurally cannot contain: fuel_exhaustion_deaths (nodes the fuel meter KILLED — a killed node never completes, so it writes no execution_cost_rollup row and is absent from at_risk/high_utilisation_nodes), and node_ceiling_divergence (one module running under different per-node ceilings across workflows, read from the graphs, so it names a node BEFORE its first failure).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7964,26 +7964,35 @@ async fn handle_get_fuel_usage_report(
             )
         }
     };
+    // A node at the threshold may have been given a larger limit since its
+    // last run; the next run uses it. Consulted for those nodes only. If it
+    // cannot be read the list is still right in the loud direction — it may
+    // name a node that was already raised — and the ledger says the
+    // configured limits were not consulted.
+    let mut headroom_rows = headroom_rows;
+    if let Err(e) = state
+        .analytics_repo
+        .attach_configured_limits(
+            &mut headroom_rows,
+            HIGH_UTILISATION_THRESHOLD,
+            Some(user_id),
+        )
+        .await
+    {
+        tracing::error!(
+            target: "talos_analytics",
+            event_kind = "fuel_headroom_configured_limits_unread",
+            error = %e,
+            "get_fuel_usage_report: configured node limits could not be read"
+        );
+        readings.mark_derived("high_utilisation_nodes.configured_max_fuel");
+        readings.mark_derived("raised_since_last_run");
+    }
     let enforced_evidence = enforced_evidence_from_headroom(&headroom_rows);
     let enforced_evidence_coverage =
         talos_measurement::Coverage::new(headroom_rows.len() as i64, HEADROOM_ROW_CAP);
-    let high_utilisation_nodes: Vec<serde_json::Value> = headroom_rows
-        .iter()
-        .filter(|r| r.utilisation() >= HIGH_UTILISATION_THRESHOLD)
-        .map(|r| {
-            serde_json::json!({
-                "workflow_id": r.workflow_id,
-                "workflow_name": r.workflow_name,
-                "node": r.node_label,
-                "samples": r.samples,
-                "peak_fuel": r.peak_fuel,
-                "enforced_ceiling": r.current_ceiling,
-                "utilization_pct": talos_analytics_repository::format_percent(
-                    r.utilisation() * 100.0,
-                ),
-            })
-        })
-        .collect();
+    let (high_utilisation_nodes, raised_since_last_run) =
+        headroom_sections(&headroom_rows, HIGH_UTILISATION_THRESHOLD);
 
     // ── Nodes that ALREADY DIED of fuel exhaustion ──────────────────────
     //
@@ -8085,6 +8094,7 @@ async fn handle_get_fuel_usage_report(
             "over_provisioned": over_provisioned.len(),
             "well_tuned": well_tuned.len(),
             "high_utilisation_nodes": high_utilisation_nodes.len(),
+            "raised_since_last_run": raised_since_last_run.len(),
             // Not derived from execution_cost_rollup. `at_risk: 0` beside a
             // non-zero count here is not a contradiction to resolve by trusting
             // the first number — it is the rollup source saying nothing about
@@ -8106,11 +8116,21 @@ async fn handle_get_fuel_usage_report(
         "high_utilisation_nodes": high_utilisation_nodes,
         "high_utilisation_error": high_utilisation_error,
         "high_utilisation_note": "Per (workflow, node) over a fixed 30-day window, test \
-             executions excluded: PEAK fuel_consumed against the ceiling a worker most \
-             recently ENFORCED, flagged at >=80%. Independent of `period_days` and \
-             `min_executions` above, and deliberately UNFLOORED on sample count — a node \
-             with one or two runs is exactly the case the per-module section cannot see. \
-             Backs the TalosFuelHeadroomLow alert.",
+             executions excluded: PEAK fuel_consumed against the ceiling in force \
+             (`ceiling_in_force`), flagged at >=80%. The ceiling in force is the one a \
+             worker most recently ENFORCED (`enforced_ceiling`), or the node's own \
+             configured max_fuel (`configured_max_fuel`) where that is larger — a limit \
+             raised since the last run, which the next run will use. Independent of \
+             `period_days` and `min_executions` above, and deliberately UNFLOORED on \
+             sample count — a node with one or two runs is exactly the case the \
+             per-module section cannot see. Backs the TalosFuelHeadroomLow alert.",
+        "raised_since_last_run": raised_since_last_run,
+        "raised_since_last_run_note": "Nodes that were at >=80% of the ceiling their last \
+             run was held to, and are below it against a max_fuel configured since. Not \
+             findings: listed so a node that left high_utilisation_nodes has its reason \
+             beside it. A configured limit counts only when every graph a run could load \
+             carries it — the active published version as well as the draft — so a raise \
+             that was not published is not here.",
         "utilization_basis": "utilization_p95_pct is the p95 of the PER-EXECUTION ratio \
              fuel_consumed / the ceiling that execution actually ran under \
              (execution_cost_rollup.max_fuel — the worker's own __fuel_limit__ stamp — \
@@ -8401,6 +8421,58 @@ impl CeilingDivergence {
             }).collect::<Vec<_>>(),
         })
     }
+}
+
+/// The two headroom lists of the fuel report, from one set of rows.
+///
+/// `high_utilisation_nodes`: nodes whose peak is at or above `threshold` of
+/// the ceiling in force — the one their last run was held to, or their own
+/// configured limit where that is larger. `raised_since_last_run`: nodes
+/// that were at the threshold against the last run's ceiling and are below
+/// it against a limit configured since. They are listed rather than dropped,
+/// so "this node is no longer reported" has a reason beside it.
+///
+/// Pure, so the split is tested without a database.
+pub(crate) fn headroom_sections(
+    rows: &[talos_analytics_repository::NodeFuelHeadroom],
+    threshold: f64,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let percent = |fraction: f64| talos_analytics_repository::format_percent(fraction * 100.0);
+    let high = rows
+        .iter()
+        .filter(|r| r.utilisation() >= threshold)
+        .map(|r| {
+            serde_json::json!({
+                "workflow_id": r.workflow_id,
+                "workflow_name": r.workflow_name,
+                "node": r.node_label,
+                "samples": r.samples,
+                "peak_fuel": r.peak_fuel,
+                "enforced_ceiling": r.current_ceiling,
+                "configured_max_fuel": r.configured_max_fuel,
+                "ceiling_in_force": r.ceiling_in_force(),
+                "utilization_pct": percent(r.utilisation()),
+            })
+        })
+        .collect();
+    let raised = rows
+        .iter()
+        .filter(|r| r.enforced_utilisation() >= threshold && r.utilisation() < threshold)
+        .map(|r| {
+            serde_json::json!({
+                "workflow_id": r.workflow_id,
+                "workflow_name": r.workflow_name,
+                "node": r.node_label,
+                "samples": r.samples,
+                "peak_fuel": r.peak_fuel,
+                "enforced_ceiling": r.current_ceiling,
+                "configured_max_fuel": r.configured_max_fuel,
+                "utilization_pct_of_last_run": percent(r.enforced_utilisation()),
+                "utilization_pct": percent(r.utilisation()),
+            })
+        })
+        .collect();
+    (high, raised)
 }
 
 /// Enforced-ceiling evidence keyed by the pair a rollup row identifies.
@@ -11690,6 +11762,59 @@ mod fuel_report_blindspot_tests {
     /// report is indistinguishable from a fleet where nothing has ever run.
     /// Driven over both PRODUCTION row types rather than a hand-built map,
     /// which could agree with a wrong key.
+    /// One set of rows, two lists: a node at the threshold stays in
+    /// `high_utilisation_nodes` unless a limit configured since lifts it
+    /// below, and then it is in `raised_since_last_run` — never in neither.
+    #[test]
+    fn a_raised_node_moves_to_its_own_list_and_is_never_dropped() {
+        let row = |node: &str, peak, enforced, configured| NodeFuelHeadroom {
+            workflow_id: uuid::Uuid::nil(),
+            workflow_name: "weekly-report".into(),
+            node_label: node.to_string(),
+            samples: 3,
+            peak_fuel: peak,
+            current_ceiling: enforced,
+            configured_max_fuel: configured,
+        };
+        let rows = vec![
+            row("raised", 8_057_136, 10_000_000, Some(20_000_000)),
+            row("raised_not_enough", 8_057_136, 10_000_000, Some(10_050_000)),
+            row("untouched", 1_359_999, 1_404_000, None),
+            row("healthy", 1_000_000, 4_000_000, Some(8_000_000)),
+        ];
+        let (high, raised) = super::headroom_sections(&rows, 0.80);
+        let names = |list: &[serde_json::Value]| -> Vec<String> {
+            list.iter()
+                .map(|n| n["node"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(names(&high), ["raised_not_enough", "untouched"]);
+        assert_eq!(names(&raised), ["raised"]);
+
+        // What each number is measured against is on the row.
+        assert_eq!(high[0]["enforced_ceiling"], 10_000_000);
+        assert_eq!(high[0]["configured_max_fuel"], 10_050_000);
+        assert_eq!(high[0]["ceiling_in_force"], 10_050_000);
+        assert_eq!(high[1]["configured_max_fuel"], serde_json::Value::Null);
+        assert_eq!(high[1]["ceiling_in_force"], 1_404_000);
+        assert_eq!(raised[0]["enforced_ceiling"], 10_000_000);
+        assert_eq!(raised[0]["configured_max_fuel"], 20_000_000);
+        assert_eq!(raised[0]["utilization_pct_of_last_run"], 80.6);
+        assert_eq!(raised[0]["utilization_pct"], 40.3);
+
+        // With no configured limit looked up, the split is what it always was.
+        let plain: Vec<NodeFuelHeadroom> = rows
+            .into_iter()
+            .map(|mut r| {
+                r.configured_max_fuel = None;
+                r
+            })
+            .collect();
+        let (high, raised) = super::headroom_sections(&plain, 0.80);
+        assert_eq!(names(&high), ["raised", "raised_not_enough", "untouched"]);
+        assert!(raised.is_empty());
+    }
+
     #[test]
     fn a_headroom_row_joins_to_the_graph_node_it_describes() {
         let m = Uuid::new_v4();
@@ -11720,6 +11845,7 @@ mod fuel_report_blindspot_tests {
             samples: 55,
             peak_fuel: 2_209_030,
             current_ceiling: 4_264_652,
+            configured_max_fuel: None,
         }];
         let out = detect_ceiling_divergence(&rows, &enforced_evidence_from_headroom(&headroom));
         let json = out[0].to_json();

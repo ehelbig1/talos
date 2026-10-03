@@ -810,6 +810,35 @@ pub(crate) fn publish_fuel_utilisation(
         m.fuel_high_utilisation_nodes.set(high);
     }
 
+    // A node that was at the threshold against its last run's ceiling and is
+    // below it against a limit configured since is not a finding: the
+    // operator already acted, and the next run uses the new limit. Said once
+    // per sweep at DEBUG so the raise is visible to someone looking for it.
+    let raised: Vec<String> = rows
+        .iter()
+        .filter(|r| r.enforced_utilisation() >= threshold && r.utilisation() < threshold)
+        .take(FUEL_HEADROOM_LOG_NAMES)
+        .map(|r| {
+            format!(
+                "{}/{} (peak {}, last run held to {}, now configured {})",
+                r.workflow_name,
+                r.node_label,
+                r.peak_fuel,
+                r.current_ceiling,
+                r.ceiling_in_force()
+            )
+        })
+        .collect();
+    if !raised.is_empty() {
+        tracing::debug!(
+            target: "talos_fuel",
+            event_kind = "fuel_headroom_raised_since_last_run",
+            nodes = %raised.join("; "),
+            "nodes at the threshold against the ceiling their last run was held to, \
+             whose configured limit has been raised since"
+        );
+    }
+
     if high == 0 {
         return;
     }
@@ -822,12 +851,17 @@ pub(crate) fn publish_fuel_utilisation(
         .take(FUEL_HEADROOM_LOG_NAMES)
         .map(|r| {
             format!(
-                "{}/{} {:.1}% (peak {} of {}, n={})",
+                "{}/{} {:.1}% (peak {} of {}{}, n={})",
                 r.workflow_name,
                 r.node_label,
                 r.utilisation() * 100.0,
                 r.peak_fuel,
-                r.current_ceiling,
+                r.ceiling_in_force(),
+                if r.raised_since_last_run() {
+                    " configured since the last run"
+                } else {
+                    ""
+                },
                 r.samples
             )
         })
@@ -842,11 +876,13 @@ pub(crate) fn publish_fuel_utilisation(
         window_days = FUEL_HEADROOM_WINDOW_DAYS,
         nodes = %named.join("; "),
         "nodes running with no fuel headroom: peak consumption is at or above \
-         the threshold share of the ceiling last enforced for them. A node at \
-         this level fails on its next larger payload, and the sample count is \
-         NOT a reason to discount it — the case this detector was built for had \
-         two samples. Size from the node's configured maximum \
-         (docs/fuel-budget-sizing.md), not from the last observed run."
+         the threshold share of the ceiling in force for them — the one their \
+         last run was held to, or the node's own configured limit where that \
+         has been raised since. A node at this level fails on its next larger \
+         payload, and the sample count is NOT a reason to discount it — the \
+         case this detector was built for had two samples. Size from the \
+         node's configured maximum (docs/fuel-budget-sizing.md), not from the \
+         last observed run."
     );
 }
 
@@ -1212,6 +1248,30 @@ pub(crate) fn spawn_metrics_gauge_tasks(
                                  under-reports the fleet (the high-utilisation \
                                  count is unaffected — the query orders by \
                                  utilisation descending)"
+                            );
+                        }
+                        // A node at the threshold may have been given a
+                        // larger limit since its last run. If that cannot be
+                        // read the sweep carries on against the last
+                        // enforced ceilings — it may then name a node that
+                        // was already raised, never miss one that was not.
+                        let mut rows = rows;
+                        if let Err(e) = repo
+                            .attach_configured_limits(
+                                &mut rows,
+                                FUEL_HIGH_UTILISATION_THRESHOLD,
+                                None,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "talos_fuel",
+                                event_kind = "fuel_headroom_configured_limits_unread",
+                                error = %e,
+                                "fuel-headroom sweep could not read the configured limits of the \
+                                 nodes at the threshold; they are judged against the ceiling \
+                                 their last run was held to, so a node whose limit was raised \
+                                 since may still be reported"
                             );
                         }
                         publish_fuel_utilisation(&rows, FUEL_HIGH_UTILISATION_THRESHOLD);
@@ -5865,6 +5925,7 @@ mod fuel_headroom_tests {
             samples,
             peak_fuel: peak,
             current_ceiling: ceiling,
+            configured_max_fuel: None,
         }
     }
 
@@ -6046,6 +6107,42 @@ mod fuel_headroom_tests {
              the new ceiling — the denominator does NOT change, because the \
              node is still observed"
         );
+
+        // ...and it must fall as soon as the limit is RAISED, without waiting
+        // for that run. `digest` runs weekly: until 2026-10-03 the gauge and
+        // the warning stayed up for the week after the operator fixed it.
+        let raised: Vec<NodeFuelHeadroom> = live_fleet_head()
+            .into_iter()
+            .map(|mut n| {
+                if n.node_label == "digest" {
+                    n.configured_max_fuel = Some(8_000_000); // last run still at 1,404,000
+                }
+                n
+            })
+            .collect();
+        publish_fuel_utilisation(&raised, FUEL_HIGH_UTILISATION_THRESHOLD);
+        assert_eq!(
+            read(),
+            (6, 0),
+            "a raised limit clears the flag before the next run"
+        );
+
+        // A configured limit that does not lift the node below the threshold
+        // clears nothing, and neither does one below what the last run was
+        // held to.
+        for not_enough in [Some(1_500_000), Some(1_000_000), None] {
+            let still: Vec<NodeFuelHeadroom> = live_fleet_head()
+                .into_iter()
+                .map(|mut n| {
+                    if n.node_label == "digest" {
+                        n.configured_max_fuel = not_enough;
+                    }
+                    n
+                })
+                .collect();
+            publish_fuel_utilisation(&still, FUEL_HIGH_UTILISATION_THRESHOLD);
+            assert_eq!(read(), (6, 1), "{not_enough:?}");
+        }
     }
 }
 
