@@ -13,7 +13,7 @@ mod common;
 use serde_json::json;
 use sqlx::{Pool, Postgres};
 use talos_registry::reconcile::{
-    upsert_catalog_template_by_slug, CatalogUpsert, SHARED_CATALOG_DEFAULT_MAX_FUEL,
+    upsert_catalog_template_by_slug, CatalogSource, CatalogUpsert, SHARED_CATALOG_DEFAULT_MAX_FUEL,
 };
 use uuid::Uuid;
 
@@ -26,7 +26,9 @@ async fn seed(pool: &Pool<Postgres>, slug: &str, name: &str, max_fuel: Option<i6
             category: "Network",
             description: "a made-up template",
             config_schema: &schema,
-            source_code: "pub fn run() {}",
+            source: CatalogSource::Disk {
+                source_code: "pub fn run() {}",
+            },
             allowed_hosts: &[],
             allowed_methods: &[],
             allowed_secrets: &[],

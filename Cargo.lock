@@ -9372,6 +9372,7 @@ dependencies = [
  "sqlx",
  "subtle",
  "talos-capability-world",
+ "talos-compilation",
  "talos-config",
  "talos-http-body",
  "talos-sigstore-policy",

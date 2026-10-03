@@ -2251,100 +2251,29 @@ pub(crate) async fn seed_templates(
                 continue;
             }
         };
-        let manifest = template.manifest();
-
-        let name = manifest
-            .get("display_name")
-            .or_else(|| manifest.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let category = manifest
-            .get("category")
-            .and_then(|v| v.as_str())
-            .unwrap_or("General")
-            .to_string();
-        let description = manifest
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let config_schema = manifest
-            .get("config_schema")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let allowed_hosts: Vec<String> = manifest
-            .get("allowed_hosts")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Err(msg) = crate::registry::validate_allowed_hosts(&allowed_hosts) {
+        // The manifest is read by the ONE parser both catalog writers use
+        // (this seed and the registry sync), so the two cannot carry
+        // different fields. It validates the grants and the capability
+        // world; a manifest it refuses is skipped — the controller still
+        // boots, that template is not seeded.
+        let parsed = match talos_registry::reconcile::CatalogManifest::parse(template.manifest()) {
+            Ok(parsed) => parsed,
+            Err(refusal) => {
+                tracing::warn!("Skipping template dir {}: {}", path.display(), refusal);
+                continue;
+            }
+        };
+        let name = parsed.name.clone();
+        // A recommendation that cannot be read changes nothing: the row
+        // keeps the fuel limit it has, and this says so, rather than the
+        // template being sized by a number nobody chose.
+        if let Some(reason) = &parsed.fuel_unreadable {
             tracing::warn!(
-                "Skipping template '{}': invalid allowed_hosts: {}",
-                name,
-                msg
+                template = %name,
+                %reason,
+                "catalog template's recommended_fuel cannot be read; the shared row keeps \
+                 the fuel limit it has"
             );
-            continue;
-        }
-        let allowed_secrets: Vec<String> = manifest
-            .get("requires_secrets")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // MCP-1125 (2026-05-16): sibling sweep of MCP-1124 to the
-        // third ingest boundary. The talos-registry api.rs and sync.rs
-        // paths got `validate_allowed_secrets` in MCP-1124; this
-        // disk-seeding path that ingests `module-templates/*/talos.json`
-        // at controller startup was the holdout. Same threat:
-        // a malformed `talos.json` (operator mistake or compromised
-        // image build) could persist garbage entries that the
-        // `vault_path_permitted` matcher then runs against on every
-        // secret-resolution call from the templated module. Skip the
-        // template (don't bail the whole startup loop) — the
-        // controller still boots; the bad template just isn't seeded.
-        if let Err(msg) = crate::registry::validate_allowed_secrets(&allowed_secrets) {
-            tracing::warn!(
-                "Skipping template '{}': invalid allowed_secrets: {}",
-                name,
-                msg
-            );
-            continue;
-        }
-        let requires_approval_for: Vec<String> = manifest
-            .get("requires_approval_for")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // HTTP verb allowlist. Empty (field absent, or every entry unrecognised)
-        // used to reproduce the pre-2026-08-25 behaviour exactly: the column is
-        // written as `{}`, which the worker read as "allow every verb". Since
-        // 2026-09-24 `{}` DENIES every verb, so an empty result is now the
-        // STRICTEST outcome rather than the loosest. A declared list is ENFORCED
-        // at all five egress gates (`host/http.rs` `fetch` / `fetch_all`,
-        // `host/graphql.rs`, `host/webhook.rs`, `host/http_stream.rs`), so an
-        // under-declared manifest is a runtime denial — declare the union of
-        // verbs the template's source can issue, never a guess. Parsing lives next to the column it feeds; see
-        // `parse_manifest_allowed_methods` for why an unknown verb is dropped
-        // rather than skipping the whole template.
-        let allowed_methods = talos_registry::reconcile::parse_manifest_allowed_methods(manifest);
-
-        let code_template = template.source();
-
-        if name.is_empty() {
-            continue;
         }
 
         // Name the disallowed crate PRECISELY, then fall through. This
@@ -2383,24 +2312,6 @@ pub(crate) async fn seed_templates(
             );
         }
 
-        // Read capability_world from talos.json; default to 'automation-node' when absent
-        // so unknown modules get maximum restriction (safest default for new templates).
-        let capability_world = manifest
-            .get("capability_world")
-            .and_then(|v| v.as_str())
-            .unwrap_or("automation-node")
-            .to_string();
-        // modules.capability_world is stored in long form to match the
-        // worker-side CapabilityWorld parser. The talos.json convention
-        // already uses the `-node` suffix but guard defensively.
-        let cw_long = if capability_world == "trusted" {
-            "automation-node".to_string()
-        } else if capability_world.ends_with("-node") {
-            capability_world.clone()
-        } else {
-            format!("{}-node", capability_world)
-        };
-
         // The stable template identity: the on-disk directory name. This —
         // NOT the mutable display `name` — is the natural key for a catalog
         // template, so a renamed `display_name` updates the existing row
@@ -2413,25 +2324,6 @@ pub(crate) async fn seed_templates(
             }
         };
 
-        // The shared row's fuel limit is the template's own recommendation,
-        // as a first install's is; a template that recommends nothing keeps
-        // the column default. A recommendation that cannot be read changes
-        // nothing: the row keeps the limit it has, and this says so, rather
-        // than the template being sized by a number nobody chose.
-        let max_fuel = match template.recommended_max_fuel() {
-            Ok(Some(limit)) => i64::try_from(limit).ok(),
-            Ok(None) => Some(talos_registry::reconcile::SHARED_CATALOG_DEFAULT_MAX_FUEL),
-            Err(reason) => {
-                tracing::warn!(
-                    template = %name,
-                    %reason,
-                    "catalog template's recommended_fuel cannot be read; the shared row keeps \
-                     the fuel limit it has"
-                );
-                None
-            }
-        };
-
         // Phase 5 / 2026-07-21 defect fix: seed the unified `modules` table
         // idempotently keyed on `catalog_slug` (rename-safe — prevents NEW
         // twins), returning whether the WASM needs (re)compilation. Unlike
@@ -2440,21 +2332,12 @@ pub(crate) async fn seed_templates(
         // row that previously persisted with NULL wasm_bytes.
         let registered = talos_registry::reconcile::upsert_catalog_template_by_slug(
             &registry.db_pool,
-            talos_registry::reconcile::CatalogUpsert {
-                name: &name,
-                category: &category,
-                description: &description,
-                config_schema: &config_schema,
-                source_code: code_template,
-                allowed_hosts: &allowed_hosts,
-                allowed_methods: &allowed_methods,
-                allowed_secrets: &allowed_secrets,
-                requires_approval_for: &requires_approval_for,
-                capability_world_long: &cw_long,
-                catalog_slug: &catalog_slug,
-                dependencies: template.dependencies(),
-                max_fuel,
-            },
+            parsed.upsert(
+                &catalog_slug,
+                talos_registry::reconcile::CatalogSource::Disk {
+                    source_code: template.source(),
+                },
+            ),
         )
         .await;
 
@@ -2842,41 +2725,38 @@ mod catalog_seed_tests {
         );
     }
 
-    /// The seed sizes the shared row from the template's recommendation.
-    /// The row writer and the reader are tested where they live (a database
-    /// test and a unit test); what neither can see is this call site passing
-    /// something else. Textual, like the guard above, and for its reason.
+    /// The seed writes its row through the shared manifest parser. What the
+    /// parser reads and what the writer stores are tested where they live;
+    /// what neither can see is this call site building the row some other
+    /// way. Textual, like the guard above, and for its reason.
     #[test]
-    fn the_seed_sizes_the_shared_row_from_the_templates_recommendation() {
+    fn the_seed_writes_its_row_through_the_shared_manifest_parser() {
         const SRC: &str = include_str!("services.rs");
         let start = SRC
             .find("pub(crate) async fn seed_templates(")
             .expect("seed_templates moved — update this guard rather than deleting it");
         let body = &SRC[start..];
         let body = &body[..body.find("\n}\n").expect("the end of seed_templates")];
-        let read = ["template.recommended_", "max_fuel()"].concat();
-        let default = [
-            "Ok(None) => Some(talos_registry::reconcile::",
-            "SHARED_CATALOG_DEFAULT_MAX_FUEL)",
-        ]
-        .concat();
-        let passed = [
-            "dependencies: template.dependencies(),\n                ",
-            "max_fuel,\n",
-        ]
-        .concat();
+        let parse = ["CatalogManifest::", "parse(template.manifest())"].concat();
+        let upsert = ["parsed.", "upsert("].concat();
+        let by_hand = ["CatalogUpsert", " {"].concat();
         assert_eq!(
-            body.matches(&read).count(),
+            body.matches(&parse).count(),
             1,
-            "the seed reads the recommendation once"
+            "the seed parses the manifest once"
+        );
+        assert_eq!(
+            body.matches(&upsert).count(),
+            1,
+            "the parsed manifest is what is written"
         );
         assert!(
-            body.contains(&default),
-            "a template that recommends nothing gets the column default"
+            !body.contains(&by_hand),
+            "the seed builds no row of its own"
         );
         assert!(
-            body.contains(&passed),
-            "the limit read is the limit written"
+            body.contains(&["CatalogSource::", "Disk"].concat()),
+            "a disk seed is a disk source"
         );
     }
 

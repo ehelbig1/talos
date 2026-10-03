@@ -23,7 +23,9 @@ mod target_cache;
 // Re-export the allowlist gate at the crate root so callers (and the
 // `mcp::utils` re-export shim in controller) can keep importing
 // `validate_dependencies` from a stable location.
-pub use catalog::{recommended_max_fuel, CatalogTemplate, CatalogTemplateError};
+pub use catalog::{
+    manifest_dependencies, recommended_max_fuel, CatalogTemplate, CatalogTemplateError,
+};
 pub use dependency_allowlist::{get_allowed_dependencies, validate_dependencies};
 pub use sandbox_run::{CompileSlot, RunError, SandboxCommand};
 use std::path::{Path, PathBuf};
