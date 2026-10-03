@@ -290,7 +290,9 @@ impl ModulesMutations {
             source_code: Some(source_code),
             template_id: Some(input.template_id),
             config: Some(config.clone()), // Config stored as metadata, NOT compiled into WASM
-            dependencies: None,
+            // The crates it was compiled with (forwarded to the compile above),
+            // so a later hot_update can rebuild it without restating them.
+            dependencies: template.dependencies.clone(),
             size_bytes,
             max_fuel: 1_000_000,
             max_memory_mb: 128,

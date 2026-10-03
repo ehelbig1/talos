@@ -2495,7 +2495,9 @@ async fn handle_compile_template(
                 user_id: Some(user_id),
                 capability_world: inspection.capability_world,
                 imported_interfaces: inspection.imported_interfaces,
-                dependencies: None,
+                // The crates it was compiled with, so a later hot_update of
+                // this module can rebuild it without the caller restating them.
+                dependencies: template.dependencies.clone(),
                 oci_url: None,
                 language: "rust".to_string(),
                 integration_name: None,

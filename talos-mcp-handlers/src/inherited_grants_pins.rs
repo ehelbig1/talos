@@ -209,3 +209,38 @@ fn marketplace_install_binds_every_grant_from_the_one_value() {
     }
     assert_eq!(installs, 2);
 }
+
+/// A module built from a template records the crates it was compiled with,
+/// so `hot_update_module` can rebuild it from the stored source (2026-10-02:
+/// both template-compile paths compiled WITH the template's `dependencies`
+/// and stored `None`). TEXTUAL: the struct literal that stores the module
+/// must take them from the template.
+#[test]
+fn template_compiles_store_the_dependencies_they_compiled_with() {
+    for (file, src) in [
+        (
+            "talos-mcp-handlers/src/sandbox.rs (compile_template)",
+            include_str!("sandbox.rs"),
+        ),
+        (
+            "talos-api/src/schema/modules/mutations.rs (createModuleFromTemplate)",
+            include_str!("../../talos-api/src/schema/modules/mutations.rs"),
+        ),
+    ] {
+        let needle = ["dependencies: ", "template.dependencies.clone(),"].concat();
+        assert!(
+            src.contains(&needle),
+            "{file}: the stored module must record the template's dependencies"
+        );
+    }
+    let install = include_str!("modules.rs");
+    let call = install
+        .split(["install_catalog_module", "_to_modules("].concat().as_str())
+        .nth(1)
+        .expect("the catalog install call");
+    let args = &call[..call.find(".await").expect("the call is awaited")];
+    assert!(
+        args.contains("template.dependencies()"),
+        "the catalog install must store the template's dependencies: {args}"
+    );
+}
