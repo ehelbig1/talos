@@ -97,3 +97,19 @@ made-up data, 100 entries, a 33.8 KB response.
   the guide, which is loud.
 * Nothing was published. The publish workflow's new gate was not exercised by
   a run.
+
+## First CI run
+
+The `catalog` job failed at link time (`cannot find 'ld'`). `make
+check-catalog` builds only wasm, in a scaffold outside the workspace, so the
+job had never linked native code and did not install `mold`, which
+`.cargo/config.toml` requires on Linux. `make check-catalog-fuel` builds
+`talos-catalog-tests` natively. The job now installs `mold` with the same
+step the other jobs use, and its time limit went from 30 to 45 minutes.
+
+Found while reading for that fix, and not yet observed: the production
+compile path holds a build to 60 seconds, which assumes a warm per-user
+target cache. A runner starts with an empty one. The check now tries a build
+that TIMED OUT again (the cache keeps what the killed attempt finished), up to
+three times, and retries nothing else. A cold build measured 9.7 s on a
+16-core machine; a runner's figure is not known until the job runs.

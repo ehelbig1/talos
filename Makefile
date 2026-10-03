@@ -22,6 +22,7 @@ SERVICE            ?= controller
 # `make test-changed` / `make changelog` printed "undefined variable" for them,
 # i.e. the flag warned on correct invocations and taught readers to ignore it.
 ARGS               ?=
+TEMPLATE           ?=
 CHANGELOG_WRITE    ?=
 CONTROLLER_URL     ?= http://localhost:8000
 

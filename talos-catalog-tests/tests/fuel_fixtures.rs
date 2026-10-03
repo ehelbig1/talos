@@ -146,6 +146,38 @@ fn recordings(root: &Path) -> Vec<Recording> {
     found
 }
 
+/// Build one template through the production compile path.
+///
+/// That path holds a build to 60 seconds, which is sized for a controller
+/// whose per-user target cache is warm. A CI runner starts with an empty
+/// one, and the first build there also compiles the proc-macro crates the
+/// module depends on. A build that TIMES OUT is therefore tried again: the
+/// cache keeps what the killed attempt finished, so the next one starts
+/// further along. Anything other than a timeout is a real failure and is
+/// not retried.
+async fn compile(
+    compiler: &talos_compilation::CompilationService,
+    slug: &str,
+    template: &talos_compilation::CatalogTemplate,
+) -> talos_compilation::CompilationResult {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        match compiler
+            .compile_catalog_template(uuid::Uuid::nil(), uuid::Uuid::new_v4(), slug, template)
+            .await
+        {
+            Ok(result) => return result,
+            Err(e) if attempt < ATTEMPTS && format!("{e:#}").contains("timed out") => {
+                eprintln!(
+                    "{slug}: build attempt {attempt} timed out on a cold cache; trying again"
+                );
+            }
+            Err(e) => panic!("{slug}: compile errored: {e:#}"),
+        }
+    }
+    unreachable!("the last attempt returns or panics")
+}
+
 async fn measure(
     compiler: &talos_compilation::CompilationService,
     runtime: &TalosRuntime,
@@ -179,10 +211,7 @@ async fn measure(
             .unwrap_or_else(|e| panic!("{slug}: fixtures/http.json: {e}")),
     );
 
-    let compiled = compiler
-        .compile_catalog_template(uuid::Uuid::nil(), uuid::Uuid::new_v4(), &slug, &template)
-        .await
-        .unwrap_or_else(|e| panic!("{slug}: compile errored: {e:#}"));
+    let compiled = compile(compiler, &slug, &template).await;
     assert!(
         compiled.success,
         "{slug}: does not compile: {:#?}",
