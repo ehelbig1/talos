@@ -543,7 +543,7 @@ services:
       TALOS_REGISTRY_URL: ${TALOS_REGISTRY_URL:-}
       # Whether this controller builds modules from source. UNSET => on.
       # `false` makes the deployment registry-only: every compile, lint and
-      # catalog install is refused, and the controller will not start unless
+      # hot update is refused, and the controller will not start unless
       # TALOS_REGISTRY_URL above is set.
       TALOS_MODULE_COMPILATION: ${TALOS_MODULE_COMPILATION:-}
       BASE_URL: ${BASE_URL:-http://localhost:8000}

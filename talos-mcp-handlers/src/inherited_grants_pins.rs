@@ -233,14 +233,26 @@ fn template_compiles_store_the_dependencies_they_compiled_with() {
             "{file}: the stored module must record the template's dependencies"
         );
     }
+    // The catalog install hands its writer ONE value for what the copy runs
+    // (`InstalledArtifact`); the compiled arm of it is where the template's
+    // dependencies must ride.
     let install = include_str!("modules.rs");
-    let call = install
-        .split(["install_catalog_module", "_to_modules("].concat().as_str())
+    let compiled_arm = install
+        .split(["InstalledArtifact::", "Compiled {"].concat().as_str())
+        .nth(1)
+        .expect("the catalog install builds a compiled artifact");
+    let fields = &compiled_arm[..compiled_arm.find('}').expect("the literal closes")];
+    assert!(
+        fields.contains(&["dependencies: ", "template.dependencies(),"].concat()),
+        "the catalog install must store the template's dependencies: {fields}"
+    );
+    let write = install
+        .split([".install_catalog", "_copy("].concat().as_str())
         .nth(1)
         .expect("the catalog install call");
-    let args = &call[..call.find(".await").expect("the call is awaited")];
+    let args = &write[..write.find(".await").expect("the call is awaited")];
     assert!(
-        args.contains("template.dependencies()"),
-        "the catalog install must store the template's dependencies: {args}"
+        args.contains("artifact,"),
+        "the catalog install must pass the artifact it built: {args}"
     );
 }

@@ -457,7 +457,7 @@ controller:
     namespace: ""
 
   # Whether the controller builds modules from source (compile, lint, hot
-  # update, catalog install). Default true.
+  # update). Default true.
   #
   # Set false for a REGISTRY-ONLY deployment: no toolchain is ever run over
   # module source on the controller, and every module a workflow runs is a

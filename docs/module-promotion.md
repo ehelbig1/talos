@@ -98,7 +98,9 @@ platform, and any secret grant that names your own connection.
    exact commit, then builds every template with the controller image, pushes
    each as an OCI artifact and signs it. A deployment that syncs the registry
    picks the template up on its next sync; the shared row's fuel limit is the
-   one the manifest declares.
+   one the manifest declares. `install_module_from_catalog` there makes a copy
+   that references the same signed artifact with the installer's own grants;
+   nothing is compiled on that deployment.
 
 ## The fixtures directory
 

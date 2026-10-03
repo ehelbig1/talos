@@ -351,8 +351,9 @@ The controller catalog has two source-of-truth modes, **mutually exclusive**:
 
 In OCI mode a deployment can also turn compiling off: `TALOS_MODULE_COMPILATION=false`
 in `/etc/talos/install.env` makes the controller refuse every compile, lint and
-catalog install, so the only modules it runs are the signed artifacts the
-registry provides. The controller will not start with compiling off and no
+hot update, so the only modules it runs are the signed artifacts the
+registry provides. Installing a catalog module still works: the copy references
+the registry's artifact with your own grants, and nothing is compiled. The controller will not start with compiling off and no
 `TALOS_REGISTRY_URL`. Leave it unset (on) if you write your own modules on the
 platform.
 

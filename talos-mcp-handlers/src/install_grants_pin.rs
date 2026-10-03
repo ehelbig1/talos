@@ -64,7 +64,7 @@ fn the_install_handler_reads_carries_and_writes_the_carried_grants() {
         "the rule's result is bound to the names the writer takes"
     );
     let write_at = body
-        .find(&[".install_catalog_module_to_", "modules("].concat())
+        .find(&[".install_catalog_", "copy("].concat())
         .expect("writer");
     assert!(
         body.find(&decide).expect("decision") < write_at,
@@ -95,7 +95,7 @@ fn a_dry_run_returns_before_the_compile_and_the_write() {
         .find(&[".compile_catalog", "_template("].concat())
         .expect("compile");
     let write = body
-        .find(&[".install_catalog_module", "_to_modules("].concat())
+        .find(&[".install_catalog", "_copy("].concat())
         .expect("write");
     assert!(decide < dry && dry < report, "decided, then previewed");
     assert!(

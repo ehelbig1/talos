@@ -48,7 +48,7 @@
 #                              Set this AFTER you've run the template-publish.yml workflow at
 #                              least once, otherwise the Library / Catalog will be empty.
 #   TALOS_MODULE_COMPILATION   false → registry-only: the controller never builds a module from
-#                              source (compile, lint and catalog install are refused). Requires
+#                              source (compile, lint and hot update are refused). Requires
 #                              TALOS_REGISTRY_URL. Default: true.
 #   TALOS_REGISTRY_NAMESPACE   Path prefix within the registry. Default: $TALOS_GHCR_OWNER/talos-tools
 #   TALOS_WORKER_TRUST         RFC 0010 worker trust (Ed25519 dispatch signing, per-worker
