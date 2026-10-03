@@ -2811,64 +2811,19 @@ async fn handle_lint_sandbox(
     }
 }
 
-/// The payload `test_module` hands the module, shaped as the engine shapes a
-/// node's input: config and input keys merged at the root, the two objects
-/// also under `config` / `input`, and — when the caller supplies it — earlier
-/// nodes' outputs under `__accumulated__`.
-///
-/// `__accumulated__` is set LAST and only from the dedicated argument, so a
-/// same-named key inside `config` or `input` cannot stand in for it.
+/// The payload `test_module` hands the module. One shaper for every
+/// rehearsal: [`talos_worker_runtime::rehearsal::node_payload`].
 pub(crate) fn test_module_payload(
     config_val: &serde_json::Value,
     input_val: &serde_json::Value,
     accumulated: Option<&serde_json::Value>,
 ) -> serde_json::Value {
-    let mut merged = serde_json::Map::new();
-    if let Some(obj) = config_val.as_object() {
-        for (k, v) in obj {
-            merged.insert(k.clone(), v.clone());
-        }
-    }
-    if let Some(obj) = input_val.as_object() {
-        for (k, v) in obj {
-            merged.insert(k.clone(), v.clone());
-        }
-    }
-    if !config_val.is_null() && *config_val != serde_json::json!({}) {
-        merged.insert("config".to_string(), config_val.clone());
-    }
-    if !input_val.is_null() && *input_val != serde_json::json!({}) {
-        merged.insert("input".to_string(), input_val.clone());
-    }
-    match accumulated {
-        Some(acc) => {
-            merged.insert("__accumulated__".to_string(), acc.clone());
-        }
-        None => {
-            merged.remove("__accumulated__");
-        }
-    }
-    serde_json::Value::Object(merged)
-}
-
-/// One recorded HTTP response as `test_module` takes it. Unknown fields are
-/// refused: a misspelled `url_contains` would otherwise be a fixture that
-/// matches anything.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HttpFixtureArg {
-    method: Option<String>,
-    url_contains: Option<String>,
-    status: Option<u16>,
-    #[serde(default)]
-    headers: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    body: serde_json::Value,
+    talos_worker_runtime::rehearsal::node_payload(config_val, input_val, accumulated)
 }
 
 /// `test_module`'s `http_fixtures`: `None` when absent (the run makes real
-/// requests), else the recorded answers, validated. A string body is sent as
-/// written; any other JSON value is sent as compact JSON; absent is empty.
+/// requests), else the recorded answers, validated. The JSON form has one
+/// parser, [`talos_worker_runtime::rehearsal::parse_http_fixtures`].
 pub(crate) fn parse_http_fixtures(
     raw: Option<&serde_json::Value>,
 ) -> Result<Option<std::sync::Arc<talos_worker_runtime::http_replay::HttpReplay>>, String> {
@@ -2876,26 +2831,7 @@ pub(crate) fn parse_http_fixtures(
         None | Some(serde_json::Value::Null) => return Ok(None),
         Some(v) => v,
     };
-    let args: Vec<HttpFixtureArg> = serde_json::from_value(raw.clone()).map_err(|e| {
-        format!(
-            "http_fixtures must be an array of recorded responses \
-             ({{method?, url_contains?, status?, headers?, body?}}): {e}"
-        )
-    })?;
-    let fixtures = args
-        .into_iter()
-        .map(|a| talos_worker_runtime::http_replay::HttpFixture {
-            method: a.method.map(|m| m.trim().to_ascii_uppercase()),
-            url_contains: a.url_contains,
-            status: a.status.unwrap_or(200),
-            headers: a.headers.into_iter().collect(),
-            body: match a.body {
-                serde_json::Value::Null => Vec::new(),
-                serde_json::Value::String(text) => text.into_bytes(),
-                other => other.to_string().into_bytes(),
-            },
-        })
-        .collect();
+    let fixtures = talos_worker_runtime::rehearsal::parse_http_fixtures(raw)?;
     talos_worker_runtime::http_replay::HttpReplay::for_rehearsal(fixtures)
         .map(|r| Some(std::sync::Arc::new(r)))
 }

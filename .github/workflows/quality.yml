@@ -293,12 +293,44 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+
+      # `make check-catalog` builds only wasm, in a scaffold outside this
+      # workspace, and never needed the host linker. `make check-catalog-fuel`
+      # builds talos-catalog-tests natively (the compile service and the worker
+      # runtime), so this job now needs mold like every other job that links
+      # the workspace.
+      - name: Install mold linker
+        # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
+        # so a Linux host can't link the workspace without mold installed.
+        # 2026-08-19: apt stalls on the hosted runners cancelled four jobs
+        # across #646 and #658 — the integration job burned its FULL 40-minute
+        # cap twice in a row on this exact line, and the migration job its
+        # 15-minute cap twice on the pgdg install. A stall with no step timeout
+        # costs the whole job budget and reports as a code failure, so this
+        # retries and fails fast instead.
+        timeout-minutes: 6
+        run: |
+          # 2026-08-19 (#659 follow-up): the retry alone did NOT help, because
+          # apt HANGS rather than failing — the first attempt consumed the whole
+          # 6-minute step budget and attempts 2/3 never ran. A retry only helps
+          # against a FAST failure; a hang needs a per-ATTEMPT timeout. Budget:
+          # 3 x 90s + 10s + 20s = 300s, inside the 6-minute step cap.
+          for attempt in 1 2 3; do
+            if sudo timeout 90 apt-get update -qq \
+               && sudo timeout 90 apt-get install -y -qq mold; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt}/3 failed or timed out; retrying" >&2
+            sleep $((attempt * 10))
+          done
+          echo "::error::apt-get failed to install mold after 3 attempts" >&2
+          exit 1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
@@ -318,6 +350,20 @@ jobs:
 
       - name: make check-catalog
         run: make check-catalog
+
+      # A template that carries a recorded run (`fixtures/http.json`) is built
+      # through the production compile path, run against the recording in the
+      # worker runtime, and held to the fuel limit its manifest declares. The
+      # measured figures land in the job summary.
+      - name: make check-catalog-fuel
+        run: make check-catalog-fuel
+
+      # The promotion script copies a privately authored module into this
+      # PUBLIC tree. Its refusals (a per-user secret path, an identifier in a
+      # fixture) are the only thing between that copy and a leak, so they are
+      # exercised here.
+      - name: Promotion script still refuses what it must
+        run: python3 scripts/promote-module.py --self-test
 
   # ── Integration tests: the env-gated DB suite (RLS isolation, crash ────────
   # recovery, memory, …). `make test-integration` provisions its own disposable

@@ -48,7 +48,7 @@ if has '^\.github/workflows/|^scripts/ci-changed-areas\.sh$|^scripts/ci_test_tar
 fi
 
 rust=false; frontend=false; observability=false; migrations=false
-has '\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/|^rust-toolchain\.toml$|^migrations/|^wit/|^module-templates/|^\.sqlx/|\.sql$|^deny\.toml$|^audit\.toml$|^clippy\.toml$|^scripts/(test-integration\.sh|lint-sql-prepare\.py|new-integration\.py)$|^scripts/integration-scaffold/' && rust=true
+has '\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/|^rust-toolchain\.toml$|^migrations/|^wit/|^module-templates/|^\.sqlx/|\.sql$|^deny\.toml$|^audit\.toml$|^clippy\.toml$|^scripts/(test-integration\.sh|lint-sql-prepare\.py|new-integration\.py|promote-module\.py)$|^scripts/integration-scaffold/' && rust=true
 has '^frontend/' && frontend=true
 has '^observability/|^deploy/helm/talos/templates/prometheusrule\.yaml$' && observability=true
 has '^migrations/' && migrations=true

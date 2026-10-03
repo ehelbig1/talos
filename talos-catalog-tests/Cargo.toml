@@ -20,6 +20,16 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 
+# The recorded-run fuel gate (tests/fuel_fixtures.rs): the production compile
+# path and the worker runtime that executes the result.
+[dev-dependencies]
+talos-compilation = { path = "../talos-compilation" }
+talos-worker-runtime = { path = "../talos-worker-runtime" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+tempfile = "3"
+uuid = { workspace = true }
+
 [build-dependencies]
 talos-module-testkit = { path = "../talos-module-testkit" }
 # The one reader of a template's manifest (structural check 68).

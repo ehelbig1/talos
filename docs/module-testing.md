@@ -96,3 +96,8 @@ in the kit holds its function names to `wit/talos.wit`. Interfaces not yet
 mirrored (`model`, `database`, `messaging`, `cache`, `files`, `governance`,
 `crypto`, `json`, `data_transform`) have to be added to the kit before a
 module that uses them can be tested this way.
+
+What a module COSTS is checked separately, for a template that carries a
+recorded run: `make check-catalog-fuel` builds it for the sandbox, runs it
+against `fixtures/http.json` and holds the fuel it used to the limit its
+manifest declares. See `docs/module-promotion.md`.

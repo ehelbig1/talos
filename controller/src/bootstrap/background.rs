@@ -738,7 +738,7 @@ pub(crate) fn spawn_worker_fleet_tasks(
 /// 71.0% and 96.9% exists to be moved across by a small change in the number.
 /// That gap is also not an accident — adaptive fuel's `2 × p95` ceiling settles
 /// a busy node near 50-60%, so the healthy population has a ceiling of its own.
-const FUEL_HIGH_UTILISATION_THRESHOLD: f64 = 0.80;
+const FUEL_HIGH_UTILISATION_THRESHOLD: f64 = talos_compilation::scaffold::HIGH_FUEL_UTILISATION;
 
 /// Window over which peak consumption is measured. Matches
 /// `talos_engine::adaptive_fuel::WINDOW_DAYS` so the detector and the learner

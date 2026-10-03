@@ -22,6 +22,7 @@ SERVICE            ?= controller
 # `make test-changed` / `make changelog` printed "undefined variable" for them,
 # i.e. the flag warned on correct invocations and taught readers to ignore it.
 ARGS               ?=
+TEMPLATE           ?=
 CHANGELOG_WRITE    ?=
 CONTROLLER_URL     ?= http://localhost:8000
 
@@ -32,7 +33,7 @@ export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null ||
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
-        check build lint lint-full lint-frontend lint-frontend-full hooks test test-changed test-integration test-clean coverage-html audit check-catalog test-integration-scaffold test-alert-rules ci \
+        check build lint lint-full lint-frontend lint-frontend-full hooks test test-changed test-integration test-clean coverage-html audit check-catalog check-catalog-fuel test-integration-scaffold test-alert-rules ci \
         drill drill-schedule drill-unschedule drill-schedule-status \
         offhost-upload offhost-backfill offhost-plan offhost-probe \
         offhost-schedule offhost-unschedule offhost-status \
@@ -433,10 +434,13 @@ check-catalog: ## Compile every module-templates/* against current WIT (used by 
 test-templates: ## Run every catalog template's own tests natively (also part of the workspace unit tests)
 	@cargo test -p talos-catalog-tests
 
+check-catalog-fuel: ## Build each template that has a recorded run and check its fuel against the declared limit (TEMPLATE=<slug> for one)
+	@TALOS_TEST_CATALOG_FUEL=1 TEMPLATE=$(TEMPLATE) cargo test -p talos-catalog-tests --test fuel_fixtures -- --nocapture
+
 test-integration-scaffold: ## Generate a throwaway integration from the scaffold, clippy + test it, remove it (also run by CI)
 	@python3 scripts/new-integration.py --self-test
 
-ci: lint-full lint-frontend-full audit test check-catalog ## Full local gate matching GitHub Actions CI
+ci: lint-full lint-frontend-full audit test check-catalog check-catalog-fuel ## Full local gate matching GitHub Actions CI
 	@printf '\033[1;32m✓ CI checks passed — safe to push\033[0m\n'
 
 ## ──── Ops ──────────────────────────────────────────────────────────

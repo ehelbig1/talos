@@ -7870,6 +7870,11 @@ dependencies = [
  "serde_json",
  "talos-compilation",
  "talos-module-testkit",
+ "talos-worker-runtime",
+ "talos-workflow-job-protocol",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
