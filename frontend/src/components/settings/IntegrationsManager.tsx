@@ -24,6 +24,7 @@ export function IntegrationsManager() {
   } = useIntegrationsData();
 
   const {
+    handleConnectPlaid,
     handleConnectGcal,
     handleConnectService,
     handleConnectGcpWrite,
@@ -131,7 +132,9 @@ export function IntegrationsManager() {
               onConnect={
                 provider.id === "google-calendar"
                   ? handleConnectGcal
-                  : () => handleConnectService(provider.id)
+                  : provider.id === "plaid"
+                    ? handleConnectPlaid
+                    : () => handleConnectService(provider.id)
               }
               secondaryLabel={
                 provider.id === "gcp" ? "Enable provisioning" : undefined

@@ -2621,6 +2621,7 @@ pub(crate) fn build_router(
     let google_cloud_write_service = services.google_cloud_write_service.clone();
     let google_cloud_full_service = services.google_cloud_full_service.clone();
     let google_health_service = services.google_health_service.clone();
+    let plaid_connect_service = services.plaid_connect_service.clone();
     let github_connect_service = services.github_connect_service.clone();
     let gmail_watch_service = services.gmail_watch_service.clone();
     let gmail_pubsub_verifier = services.gmail_pubsub_verifier.clone();
@@ -2890,6 +2891,26 @@ pub(crate) fn build_router(
             get(google_health::handlers::connect_handler),
         )
         .with_state(google_health_service.clone())
+        .layer(from_fn(rest_auth_middleware))
+        .layer(from_fn(rest_cookie_csrf_gate))
+        .layer(Extension(auth_service.clone()))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
+    // Bank connections through Plaid Link — both POSTs from the web app, behind
+    // session auth and the cookie-session CSRF gate. No callback: Plaid Link
+    // runs in Plaid's own window and hands its token back to the page.
+    let plaid_connect_routes = Router::new()
+        .route(
+            "/api/plaid/link-token",
+            post(talos_plaid_connect::handlers::link_token_handler),
+        )
+        .route(
+            "/api/plaid/connect",
+            post(talos_plaid_connect::handlers::connect_handler),
+        )
+        .with_state(plaid_connect_service.clone())
         .layer(from_fn(rest_auth_middleware))
         .layer(from_fn(rest_cookie_csrf_gate))
         .layer(Extension(auth_service.clone()))
@@ -3801,6 +3822,7 @@ pub(crate) fn build_router(
         .merge(gcp_integration_routes)
         .merge(gcp_callback_route)
         .merge(google_health_connect_route)
+        .merge(plaid_connect_routes)
         .merge(google_health_callback_route)
         .merge(github_connect_route)
         .merge(github_setup_callback_route);

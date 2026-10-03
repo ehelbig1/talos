@@ -242,6 +242,35 @@ struct SandboxPublicTokenResponse {
     public_token: String,
 }
 
+/// The name Plaid Link shows the person connecting a bank.
+const LINK_CLIENT_NAME: &str = "Talos";
+
+/// How much history a new connection asks for. Two years is Plaid's maximum;
+/// the first sync is slower for it, once.
+const TRANSACTION_HISTORY_DAYS: u32 = 730;
+
+/// A short-lived token that starts one Plaid Link session in a browser. Not a
+/// credential to the bank, but redacted all the same.
+pub struct LinkToken(String);
+
+impl LinkToken {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for LinkToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LinkToken(<redacted>)")
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LinkTokenResponse {
+    link_token: String,
+}
+
 #[derive(serde::Deserialize)]
 struct ExchangeResponse {
     access_token: String,
@@ -297,6 +326,9 @@ impl PlaidApiError {
 pub struct PlaidClient {
     http: reqwest::Client,
     config: PlaidConfig,
+    /// Replaces the environment's host. Tests only — see
+    /// [`PlaidClient::with_base_url_for_tests`].
+    base_override: Option<String>,
 }
 
 impl fmt::Debug for PlaidClient {
@@ -339,7 +371,18 @@ impl PlaidClient {
         Self {
             http: talos_http_utils::trusted_client::build_integration_client(REQUEST_TIMEOUT),
             config,
+            base_override: None,
         }
+    }
+
+    /// Point every request at a stand-in for Plaid. Tests only: deliberately
+    /// not configurable from the environment, so a deployment cannot send its
+    /// Plaid credentials anywhere but Plaid.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_base_url_for_tests(mut self, base_url: &str) -> Self {
+        self.base_override = Some(base_url.trim_end_matches('/').to_string());
+        self
     }
 
     #[must_use]
@@ -360,7 +403,11 @@ impl PlaidClient {
             obj.insert("client_id".into(), self.config.client_id.clone().into());
             obj.insert("secret".into(), self.config.secret().to_string().into());
         }
-        let url = format!("{}{path}", self.config.env.host());
+        let base = self
+            .base_override
+            .as_deref()
+            .unwrap_or(self.config.env.host());
+        let url = format!("{base}{path}");
         let resp = self.http.post(&url).json(&body).send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -452,6 +499,40 @@ impl PlaidClient {
             "exchanged a Plaid public token for an access token"
         );
         Ok((AccessToken::new(r.access_token), r.item_id))
+    }
+
+    /// Start a bank sign-in: a short-lived `link_token` the browser hands to
+    /// Plaid Link. `client_user_id` is Plaid's stable id for the person
+    /// connecting; it must not be personal information, so it is the Talos
+    /// user id. Transactions is the one product requested — balances come
+    /// with any connection.
+    pub async fn create_link_token(&self, client_user_id: &str) -> anyhow::Result<LinkToken> {
+        let r: LinkTokenResponse = self
+            .post(
+                "/link/token/create",
+                serde_json::json!({
+                    "client_name": LINK_CLIENT_NAME,
+                    "language": "en",
+                    "country_codes": ["US"],
+                    "user": { "client_user_id": client_user_id },
+                    "products": ["transactions"],
+                    "transactions": { "days_requested": TRANSACTION_HISTORY_DAYS },
+                }),
+            )
+            .await?;
+        Ok(LinkToken(r.link_token))
+    }
+
+    /// End a connection at Plaid: the access token stops working and the
+    /// Item no longer counts against the plan's limit.
+    pub async fn remove_item(&self, token: &AccessToken) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .post(
+                "/item/remove",
+                serde_json::json!({ "access_token": token.as_str() }),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn accounts(&self, token: &AccessToken) -> anyhow::Result<Vec<Account>> {

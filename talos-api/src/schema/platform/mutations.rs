@@ -398,6 +398,7 @@ impl PlatformMutations {
             IntegrationService::Jira => "JIRA",
             IntegrationService::GoogleCloud => "GOOGLE_CLOUD",
             IntegrationService::GoogleHealth => "GOOGLE_HEALTH",
+            IntegrationService::Plaid => "PLAID",
         };
 
         let provider = talos_integrations::provider_config::PROVIDERS
@@ -433,6 +434,32 @@ impl PlatformMutations {
         // broad cloud-platform token). Best-effort and idempotent (mirrors the
         // dedicated per-provider disconnect handlers): a revoke failure is
         // logged and the disconnect still succeeds — the row is already hidden.
+        // A bank connection is not an OAuth credential: its token lives at
+        // `plaid/access_token/{item_id}`, and it ends at Plaid with
+        // `/item/remove` (which also frees one of the plan's Items).
+        if provider.id == talos_integrations::provider_config::PLAID_PROVIDER_ID {
+            if let Some(item_id) = outcome.provider_key.as_deref() {
+                match ctx.data::<std::sync::Arc<talos_plaid_connect::PlaidConnectService>>() {
+                    Ok(svc) => {
+                        if let Err(e) = svc.remove_item(*user_id, item_id).await {
+                            tracing::warn!(
+                                provider = %provider.id,
+                                error = %e,
+                                "disconnect: the bank connection is hidden, but its token \
+                                 could not be deleted from the vault"
+                            );
+                        }
+                    }
+                    Err(_) => tracing::error!(
+                        provider = %provider.id,
+                        "disconnect: PlaidConnectService not present in schema data — \
+                         the bank connection was NOT ended; wire it into the schema builder"
+                    ),
+                }
+            }
+            return Ok(true);
+        }
+
         if let Some(provider_key) = outcome.provider_key.as_deref() {
             match talos_integrations::provider_config::revoke_provider_for(
                 provider,
