@@ -382,7 +382,16 @@ mod catalog_template_tests {
     #[test]
     fn a_templates_recommended_fuel_covers_its_documented_maximum_page() {
         // (template, measured fuel per item, the page size its schema allows)
-        let measured: [(&str, u64, u64); 1] = [("gmail-list-messages", 92_000, 25)];
+        // `json-api-reader`: 38,217 per kept entry when 9 fields are kept of
+        // a 350-byte, 15-field entry (3 fields: 19,343), measured 2026-10-03
+        // on the template compiled with the production profile; 100 is its
+        // default MAX_ROWS. Its first manifest carried an estimate (20 per
+        // byte) that nothing had measured, and the module it described
+        // could not read 1,000 entries at all.
+        let measured: [(&str, u64, u64); 2] = [
+            ("gmail-list-messages", 92_000, 25),
+            ("json-api-reader", 38_217, 100),
+        ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../module-templates");
         for (template, per_item, max_items) in measured {
             let path = root.join(template).join("talos.json");

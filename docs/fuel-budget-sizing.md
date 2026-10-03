@@ -139,6 +139,15 @@ more per byte, because the parser's work follows the number of tokens:
 | ~2 KB records of several dozen short fields, typed structs, most fields skipped (bank transactions, 2026-10-03) | 110–127 K per record: the 60 K per item plus ~30 per byte |
 | number-heavy JSON read by a combining module (2026-10-03) | ~210 per byte of input, all told |
 | a whole input parsed into `serde_json::Value` (2026-10-01) | ~430 per byte |
+| stepped over with serde_json's skipper (`IgnoredAny`), 350-byte entries of 15 fields (2026-10-03) | ~50 per byte; 8.5 for long text; ~97 for numbers |
+| a `Value` built per kept field and a map per row, 3 fields kept (2026-10-03) | ~35 K per row on top of reading it |
+| kept values copied as validated text, nothing built (`json-api-reader`, 2026-10-03) | ~26 per byte + ~1 K per row + ~3.2 K per kept field |
+
+What costs is building, not reading: every `String`, `Vec` and map node is a
+call into the module's allocator. A module that parses into typed structs
+with only the fields it needs, or copies what it keeps, is several times
+cheaper than one that builds a tree and filters it. The build profile is not
+the lever: `opt-level = 3` saved 27% on one module for a 33% larger binary.
 
 A module sized from the first two rows and fed the third ran out on its first
 live read. To find the number before connecting anything, save one realistic
