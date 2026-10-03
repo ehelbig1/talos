@@ -154,9 +154,9 @@ impl WorkflowRepository {
     /// Used by `instantiate_workflow_pattern` to avoid the class of bug
     /// where the resolver reports `missing_modules: []` because the
     /// name exists in `modules`, but the engine then fails at
-    /// execution time because no `wasm_bytes` carries the
-    /// compiled payload for that template. Returns `None` for templates
-    /// that exist but haven't been compiled — callers should treat
+    /// execution time because nothing carries the compiled payload for
+    /// that template — no `wasm_bytes` and no registry reference. Returns
+    /// `None` for templates that exist but cannot run — callers should treat
     /// these as missing and surface them so users install or compile
     /// the module before instantiation.
     pub async fn find_compiled_template_by_name(
@@ -164,13 +164,16 @@ impl WorkflowRepository {
         name: &str,
         user_id: Uuid,
     ) -> Result<Option<Uuid>> {
-        // Phase 5.1: query the unified `modules` table. Compiled-ness is
-        // signalled by a non-empty `wasm_bytes` column. Returns canonical id.
+        // Phase 5.1: query the unified `modules` table. A row a worker can
+        // run holds compiled bytes or names a registry artifact (`oci_url`);
+        // a row with neither is the one this exists to keep out. Returns
+        // canonical id.
         let id: Option<Uuid> = sqlx::query_scalar(
             "SELECT id \
                FROM modules \
               WHERE name = $1 \
-                AND wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0 \
+                AND ((wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) \
+                     OR COALESCE(oci_url, '') <> '') \
                 AND (user_id IS NULL OR user_id = $2) \
               LIMIT 1",
         )
@@ -598,7 +601,8 @@ impl WorkflowRepository {
     /// compact catalog of available node types.
     ///
     /// Phase 5.1: reads from the unified `modules` table by canonical id.
-    /// `is_compiled` is true when `wasm_bytes` is populated. `category`
+    /// `is_compiled` is true when a worker can run the row: `wasm_bytes` is
+    /// populated, or the row names a registry artifact (`oci_url`). `category`
     /// prefers the persisted Phase 1.5 column, falling back to `kind` so
     /// sandbox / extracted rows still label sensibly.
     pub async fn list_scaffolding_templates(
@@ -623,7 +627,8 @@ impl WorkflowRepository {
         let rows = sqlx::query(
             "SELECT id, name, \
                     COALESCE(category, kind) AS category, description, \
-                    (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS is_compiled \
+                    ((wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) \
+                     OR COALESCE(oci_url, '') <> '') AS is_compiled \
              FROM modules \
              WHERE (user_id IS NULL OR user_id = $1) \
              ORDER BY name LIMIT 1000",

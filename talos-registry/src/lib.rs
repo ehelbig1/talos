@@ -517,10 +517,11 @@ impl ModuleRegistry {
     /// the documented spelling for an agent with no user scope and yields the
     /// catalog alone.
     ///
-    /// The projection carries NO `wasm_bytes` and NO `source_code`; whether a
-    /// compiled binary exists is answered by `is_compiled`
-    /// (`wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0`), computed
-    /// server-side so the blob never crosses the wire. This is the listing
+    /// The projection carries NO `wasm_bytes` and NO `source_code`; whether
+    /// the row has something a worker can run is answered by `is_compiled` —
+    /// compiled bytes stored on the row, OR a registry reference (`oci_url`)
+    /// the worker pulls and verifies — computed server-side so the blob never
+    /// crosses the wire. This is the listing
     /// every caller-facing surface must use; `list_templates` is unscoped and
     /// loads every binary.
     pub async fn list_template_metadata_for_user(
@@ -535,7 +536,8 @@ impl ModuleRegistry {
                 "SELECT id, name, COALESCE(category, kind) AS category, description, \
                         config_schema, allowed_hosts, allowed_methods, allowed_secrets, \
                         requires_approval_for, capability_world, \
-                        (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS is_compiled \
+                        ((wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) \
+                         OR COALESCE(oci_url, '') <> '') AS is_compiled \
                  FROM modules \
                  WHERE COALESCE(category, kind) = $1 AND (user_id IS NULL OR user_id = $2) \
                  ORDER BY name ASC, id ASC",
@@ -549,7 +551,8 @@ impl ModuleRegistry {
                 "SELECT id, name, COALESCE(category, kind) AS category, description, \
                         config_schema, allowed_hosts, allowed_methods, allowed_secrets, \
                         requires_approval_for, capability_world, \
-                        (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS is_compiled \
+                        ((wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) \
+                         OR COALESCE(oci_url, '') <> '') AS is_compiled \
                  FROM modules \
                  WHERE user_id IS NULL OR user_id = $1 \
                  ORDER BY name ASC, id ASC",
@@ -1841,8 +1844,11 @@ pub struct NodeTemplateMetadata {
     pub allowed_secrets: Vec<String>,
     pub requires_approval_for: Vec<String>,
     pub capability_world: String,
-    /// `wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0`, computed in
-    /// SQL so a listing never loads the binary to ask whether it exists.
+    /// Whether a worker can run this row: it holds compiled bytes, or it
+    /// names a registry artifact (`oci_url`). Computed in SQL so a listing
+    /// never loads the binary to ask whether it exists. Until 2026-10-03 this
+    /// read bytes only, so every module a registry provides read as not
+    /// compiled.
     pub is_compiled: bool,
 }
 
@@ -2271,6 +2277,42 @@ pub struct CacheStats {
     pub total_size_bytes: i64,
     pub total_size_mb: f64,
     pub total_usage_count: i64,
+}
+
+/// What an in-process run is told about a module whose code is a registry
+/// artifact. Only a worker fetches one: it verifies the artifact's signature
+/// and digest before it runs it, and the controller has no such path.
+pub const REGISTRY_ARTIFACT_NOT_RUNNABLE_IN_PROCESS: &str =
+    "This module's code is a signed registry artifact, which only a worker fetches and \
+     verifies. It cannot be run in-process here (test_module, replay). Run it in a workflow.";
+
+/// [`WasmModule::in_process_bytes`] found no bytes to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryArtifactOnly;
+
+impl std::fmt::Display for RegistryArtifactOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REGISTRY_ARTIFACT_NOT_RUNNABLE_IN_PROCESS)
+    }
+}
+
+impl std::error::Error for RegistryArtifactOnly {}
+
+impl WasmModule {
+    /// The bytes an IN-PROCESS run (`test_module`, replay, GraphQL
+    /// `testModule`) can execute, or the reason there are none.
+    ///
+    /// `get_module` returns a registry row with EMPTY `wasm_bytes` and an
+    /// `oci_url`, which is right for dispatch — the worker pulls the artifact.
+    /// An in-process run handed those empty bytes fails inside the runtime
+    /// with a parse error that says nothing about the cause.
+    pub fn in_process_bytes(&self) -> std::result::Result<&[u8], RegistryArtifactOnly> {
+        if self.wasm_bytes.is_empty() {
+            Err(RegistryArtifactOnly)
+        } else {
+            Ok(&self.wasm_bytes)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

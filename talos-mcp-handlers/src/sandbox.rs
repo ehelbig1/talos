@@ -3979,6 +3979,13 @@ async fn handle_test_module(
         return Some(resp);
     }
 
+    // A registry row loads with no bytes (the worker pulls and verifies the
+    // artifact); this run is in-process and has nothing to run. Without this
+    // the runtime is handed an empty binary and fails with a parse error.
+    if let Err(only) = module.in_process_bytes() {
+        return Some(mcp_error(req_id.clone(), -32602, &only.to_string()));
+    }
+
     // governance-node requires the full workflow engine and cannot run in test_module.
     // Unknown means the WIT inspector couldn't identify the world — also unrunnable.
     if matches!(
