@@ -1,0 +1,12 @@
+{
+  "URL": "https://api.example.test/v1/items?limit=100",
+  "ROWS_AT": "data.items",
+  "FIELDS": {
+    "id": "id",
+    "name": "name",
+    "owner": "owner.name"
+  },
+  "TOP": {
+    "next": "data.next_cursor"
+  }
+}

@@ -319,6 +319,20 @@ jobs:
       - name: make check-catalog
         run: make check-catalog
 
+      # A template that carries a recorded run (`fixtures/http.json`) is built
+      # through the production compile path, run against the recording in the
+      # worker runtime, and held to the fuel limit its manifest declares. The
+      # measured figures land in the job summary.
+      - name: make check-catalog-fuel
+        run: make check-catalog-fuel
+
+      # The promotion script copies a privately authored module into this
+      # PUBLIC tree. Its refusals (a per-user secret path, an identifier in a
+      # fixture) are the only thing between that copy and a leak, so they are
+      # exercised here.
+      - name: Promotion script still refuses what it must
+        run: python3 scripts/promote-module.py --self-test
+
   # ── Integration tests: the env-gated DB suite (RLS isolation, crash ────────
   # recovery, memory, …). `make test-integration` provisions its own disposable
   # pgvector + Redis via Docker (available on ubuntu-latest), applies the full

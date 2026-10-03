@@ -7918,7 +7918,7 @@ async fn handle_get_fuel_usage_report(
     // per-module report above is still worth returning, and a missing section
     // is reported as such rather than as an empty one — an empty array would
     // read as "no node is at risk".
-    const HIGH_UTILISATION_THRESHOLD: f64 = 0.80;
+    const HIGH_UTILISATION_THRESHOLD: f64 = talos_compilation::scaffold::HIGH_FUEL_UTILISATION;
     // Every degraded read below lands in ONE ledger. The headroom section
     // already carried a bespoke `high_utilisation_error` string; it is
     // `mark_derived`-ed into the ledger too rather than left beside it, because

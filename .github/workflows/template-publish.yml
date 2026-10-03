@@ -31,9 +31,15 @@ on:
         required: false
         type: boolean
         default: false
+      skip_ci_check:
+        description: "Skip the green-quality.yml gate for this SHA. Deliberate bypass only: the templates are then published without their tests, compile check and recorded-run fuel check having passed for this commit."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: read     # gh run list over this repo's workflow runs (publish gate)
   packages: write   # ghcr.io push
   id-token: write   # Sigstore keyless signing (identity = this workflow @ refs/heads/main)
 
@@ -67,6 +73,40 @@ jobs:
             echo "Re-dispatch with:  gh workflow run template-publish.yml --ref main"
             exit 1
           fi
+
+      # Publish gate, the same one main-publish.yml applies to images: refuse
+      # to publish unless quality.yml is green for the EXACT commit. That run
+      # is what tested the templates being signed here — their own unit tests
+      # (talos-catalog-tests), the production-shaped compile (check-catalog)
+      # and, for a template that carries a recorded run, its fuel against the
+      # limit its manifest declares (check-catalog-fuel). Until 2026-10-03
+      # this workflow had no such gate: a template could be signed and
+      # published from a commit whose catalog job was red.
+      - name: Require green quality.yml for ${{ github.sha }}
+        if: ${{ !inputs.skip_ci_check }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          GREEN_RUNS="$(gh run list --repo "${{ github.repository }}" \
+                          --workflow quality.yml --commit "${{ github.sha }}" \
+                          --json conclusion \
+                          --jq '[.[] | select(.conclusion == "success")] | length')"
+          if [[ "${GREEN_RUNS:-0}" -lt 1 ]]; then
+            echo "::error::no successful quality.yml run found for ${{ github.sha }}."
+            echo "Trigger one:  gh workflow run quality.yml --ref main"
+            echo "Then re-dispatch this workflow once it is green."
+            echo "Deliberate bypass: re-run with the skip_ci_check input set."
+            exit 1
+          fi
+          echo "quality.yml green for ${{ github.sha }} (${GREEN_RUNS} successful run(s))"
+
+      - name: CI gate bypassed
+        if: ${{ inputs.skip_ci_check }}
+        run: |
+          echo "::warning::skip_ci_check=true — publishing templates WITHOUT a verified green quality.yml run for ${{ github.sha }}"
+          echo "### ⚠ Published without the quality gate" >> "$GITHUB_STEP_SUMMARY"
+          echo "skip_ci_check was set: these templates were signed without their tests, compile check and recorded-run fuel check having passed for ${{ github.sha }}." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

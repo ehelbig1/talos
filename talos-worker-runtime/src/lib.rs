@@ -27,6 +27,7 @@ pub mod local_llm_fleet;
 pub mod metrics;
 pub mod module_fetcher;
 pub mod reason_class;
+pub mod rehearsal;
 pub mod runtime;
 pub mod s3_signer;
 pub mod sql_validator;

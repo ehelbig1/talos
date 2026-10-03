@@ -443,6 +443,17 @@ pub const FUEL_PER_BYTE_MAX: u64 = 100;
 pub const FUEL_PER_BYTE_GUIDANCE: &str = "`fuel_per_byte` (integer 1–100, default 2): fuel charged per input byte. The default suits small typed items. Measured: about 11 for a response that is fetched and typed-parsed, 30–40 for bytes the module decodes or scans (base64, HTML, text), about 30 for JSON made of many short fields. To measure instead of estimating, run `test_module` with `http_fixtures`: it replays a recorded response without a request and reports the fuel used. A budget field that cannot be read — a wrong type, a value out of range, or a misspelled field name — is REFUSED, never replaced by its default.";
 /// Dispatcher clamp floor — the smallest max_fuel any module is given.
 pub const FUEL_MIN: u64 = 1_000_000;
+
+/// The share of its fuel limit above which a module has too little headroom:
+/// a larger payload than the one measured is likely to exhaust it.
+///
+/// ONE line, drawn in three places that must agree: the fleet gauge
+/// (`talos_fuel_high_utilisation_nodes`), the `get_fuel_usage_report`
+/// headroom section, and the catalog's recorded-run gate
+/// (`talos-catalog-tests/tests/fuel_fixtures.rs`), which refuses to let a
+/// template be published already above it. The controller's background task
+/// documents how 0.80 was chosen against the fleet's distribution.
+pub const HIGH_FUEL_UTILISATION: f64 = 0.80;
 /// Dispatcher clamp ceiling — the largest max_fuel any module is given.
 pub const FUEL_MAX: u64 = 50_000_000;
 
