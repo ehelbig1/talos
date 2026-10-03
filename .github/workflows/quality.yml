@@ -869,6 +869,14 @@ jobs:
             exit 1
           fi
 
+      # The integration scaffold (`scripts/new-integration.py`) is templates,
+      # and a template nothing builds rots with the first change to a crate
+      # it uses. This generates a throwaway crate from it, holds that crate
+      # to clippy `-D warnings` and its unit tests, and removes it. In THIS
+      # job because every dependency of the probe is already built here.
+      - name: Integration scaffold still generates a clean crate
+        run: python3 scripts/new-integration.py --self-test
+
   # ── The one required check ──────────────────────────────────────────────────
   # Branch protection and the merge queue require THIS job only. It passes
   # when every job above passed or was skipped as unaffected by the change

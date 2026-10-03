@@ -1,0 +1,75 @@
+# __NAME__ integration — what is left
+
+`scripts/new-integration.py` wrote this crate, its migration and the
+controller shim. This file lists what it did not do. Delete it when the list
+is done. The full guide is `docs/adding-an-integration.md`; `talos-google-health`
+is the smallest finished example of every step below.
+
+## In this crate
+
+- [ ] `src/lib.rs`: every `SCAFFOLD:` comment — the three endpoints, the
+      scopes, what makes the provider issue a refresh token, and the fields
+      of its account endpoint. `the_provider_endpoints_were_filled_in` fails
+      until the endpoints are real.
+- [ ] Read `migrations/__MIGRATION__` and keep or change the columns before it
+      is applied anywhere. An applied migration is never edited.
+
+## Wiring in the controller
+
+- [ ] `controller/Cargo.toml`: `talos-__ID__ = { path = "../talos-__ID__" }`.
+- [ ] `controller/src/main.rs`: `mod __SNAKE__;` and a
+      `__SNAKE___service: std::sync::Arc<__SNAKE__::__PASCAL__Service>` field
+      beside `google_health_service`.
+- [ ] `controller/src/bootstrap/services.rs`: build it the way
+      `google_health_service` is built
+      (`__PASCAL__Service::new(db_pool.clone()).with_credentials_service(oauth_credential_service.clone())`).
+- [ ] `controller/src/bootstrap/router.rs`: two routes, copied from the
+      `google_health_*_route` pair —
+      `/api/__ID__/connect` behind `rest_auth_middleware` + `rest_cookie_csrf_gate`,
+      and `/api/__ID__/callback` with NO session auth (rate-limited only),
+      then merge both.
+
+## Token refresh and revoke (a provider missing from either fails quietly)
+
+- [ ] `talos-oauth/src/credentials.rs`: add `"__SNAKE__"` to the refresh
+      `match provider` (token URL, client id, client secret), and to revoke if
+      the provider has a revoke endpoint. Left out of refresh, the connection
+      works for one token lifetime and then stops.
+
+## Settings page
+
+- [ ] `talos-integrations/src/provider_config.rs`: a `PROVIDERS` entry
+      (`id: "__ID__"`, `graphql_enum: "__UPPER__"`,
+      `db_table: "__SNAKE___integrations"`,
+      `account_identifier_column: "COALESCE(t.account_label, '__NAME__')"`,
+      `extra_where: "AND t.is_active = true"`,
+      `provider_key_column: "provider_key"`,
+      `credential_provider: "__SNAKE__"`,
+      `env_vars: &["__UPPER___CLIENT_ID", "__UPPER___CLIENT_SECRET"]`,
+      `redirect_path: "/api/__ID__/callback"`).
+      `list_connections` and the generic disconnect work from this entry.
+- [ ] `talos-api/src/schema/types.rs`: a `__PASCAL__` variant on
+      `IntegrationService`, with its arms in `platform/queries.rs`
+      (`"__UPPER__" => IntegrationService::__PASCAL__`) and
+      `platform/mutations.rs`.
+- [ ] `cd frontend && npm run codegen` and commit `schema.graphql` and
+      `src/generated/*`.
+
+## Configuration (lints 89 and 97 fail until these exist)
+
+- [ ] `docs/configuration-reference.md`: a row for
+      `__UPPER___CLIENT_ID` / `__UPPER___CLIENT_SECRET` / `__UPPER___REDIRECT_URI`.
+- [ ] `docker-compose.yml` controller `environment:` and the chart's
+      controller deployment: the same three, empty by default.
+
+## Lints and tests
+
+- [ ] `scripts/lint-structural.sh`, check 49: add `talos-__ID__/src` to the
+      integration crate list.
+- [ ] A controller DB test of the connect flow against a loopback provider,
+      modelled on `controller/tests/google_health_connect_tests.rs`: tokens
+      stored under the user who started the flow, a URL minted in one browser
+      refused in another, reconnect updates the row.
+- [ ] `make lint` and the crate's tests pass.
+- [ ] A setup page (`docs/__ID__-setup.md`): where to create the OAuth client
+      and which redirect URI to register.
