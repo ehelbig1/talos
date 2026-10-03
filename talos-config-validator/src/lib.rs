@@ -59,6 +59,9 @@ impl ConfigValidator {
         // Validate asymmetric JWT key requirements (RS256/ES256)
         Self::validate_jwt_asymmetric_keys(&mut errors);
 
+        // The compile switch and the registry it depends on
+        Self::validate_module_compilation(&mut errors);
+
         // Non-blocking production warnings
         Self::validate_redis_tls(&mut warnings);
 
@@ -393,6 +396,16 @@ impl ConfigValidator {
         }
     }
 
+    /// The compile switch (`TALOS_MODULE_COMPILATION`) and what it requires.
+    fn validate_module_compilation(errors: &mut Vec<String>) {
+        if let Some(error) = module_compilation_error(
+            talos_config::module_compilation(),
+            talos_config::registry_url().as_deref(),
+        ) {
+            errors.push(error);
+        }
+    }
+
     /// Warn if Redis is not using TLS in production.
     fn validate_redis_tls(warnings: &mut Vec<String>) {
         if talos_config::is_production() {
@@ -491,9 +504,66 @@ impl ConfigValidator {
     }
 }
 
+/// Why the compile switch's configuration cannot be started on, if it cannot.
+///
+/// Two refusals, both fail-closed:
+///
+/// * the switch is set to something that is not a boolean token. It turns a
+///   capability OFF, so a typo must not be read as the default (on);
+/// * compiling is off and no registry is configured. The catalog baked into
+///   the image is SOURCE — the boot seed compiles it — so with compiling off
+///   and no registry there is nothing this deployment could run, and every
+///   catalog row would sit without bytes behind a controller that looks up.
+fn module_compilation_error(
+    switch: std::result::Result<bool, String>,
+    registry_url: Option<&str>,
+) -> Option<String> {
+    match switch {
+        Err(raw) => Some(format!(
+            "  {var}: {raw:?} is not a boolean. Set it to 'false' to turn module \
+             compilation off (registry-only), or 'true' / unset to leave it on.",
+            var = talos_config::MODULE_COMPILATION_ENV,
+        )),
+        Ok(false) if registry_url.is_none() => Some(format!(
+            "  {var}=false turns module compilation off, which leaves the registry as the \
+             only source of modules, but {url} is not set. Set {url} to the OCI registry \
+             the catalog is published to, or leave {var} unset.",
+            var = talos_config::MODULE_COMPILATION_ENV,
+            url = talos_config::REGISTRY_URL_ENV,
+        )),
+        Ok(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiling_off_requires_a_registry_and_a_readable_switch() {
+        // The default, and every combination that leaves compiling on.
+        assert_eq!(module_compilation_error(Ok(true), None), None);
+        assert_eq!(
+            module_compilation_error(Ok(true), Some("https://ghcr.io")),
+            None
+        );
+        // Registry-only, configured.
+        assert_eq!(
+            module_compilation_error(Ok(false), Some("https://ghcr.io")),
+            None
+        );
+        // Registry-only with no registry: nothing could run.
+        let missing = module_compilation_error(Ok(false), None).expect("refused");
+        assert!(
+            missing.contains("TALOS_REGISTRY_URL is not set"),
+            "{missing}"
+        );
+        // A typo is refused whether or not a registry is configured.
+        for registry in [None, Some("https://ghcr.io")] {
+            let typo = module_compilation_error(Err("disabled".into()), registry).expect("refused");
+            assert!(typo.contains("\"disabled\" is not a boolean"), "{typo}");
+        }
+    }
 
     #[test]
     fn test_generate_command() {

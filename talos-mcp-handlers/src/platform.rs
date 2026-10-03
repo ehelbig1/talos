@@ -1354,6 +1354,9 @@ async fn handle_get_platform_info(
                             are not tools (they were listed as `<Name>-v1` install shortcuts \
                             until 2026-10-03): find one with list_module_catalog, install it \
                             with install_module_from_catalog.",
+        "module_compilation": crate::modules::module_compilation_report(
+            state.compiler.compilation_enabled(),
+        ),
         "database_status": db_status,
         "uptime_seconds": uptime_secs,
         "uptime_human": format!("{}h {}m {}s", uptime_secs / 3600, (uptime_secs % 3600) / 60, uptime_secs % 60),

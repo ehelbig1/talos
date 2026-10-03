@@ -437,16 +437,61 @@ fn compilation_semaphore() -> &'static Arc<Semaphore> {
     })
 }
 
-/// Wait (unbounded — callers wrap it in their own timeout) for a compile
-/// slot on the process-wide [`compilation_semaphore`].
-async fn acquire_compile_slot() -> std::result::Result<CompileSlot, tokio::sync::AcquireError> {
-    CompileSlot::acquire(Arc::clone(compilation_semaphore())).await
+/// The refusal every compile, lint and source-analysis entry point returns
+/// on a deployment that has turned module compilation off
+/// (`TALOS_MODULE_COMPILATION=false`, see [`talos_config::module_compilation`]).
+///
+/// A type, not a string, so a protocol surface can tell it from a toolchain
+/// failure ([`is_compilation_disabled`]): the first is the deployment's
+/// stated policy and is safe to say to the caller, the second can carry host
+/// paths and cargo's stderr and is logged instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompilationDisabled;
+
+/// What a caller is told when [`CompilationDisabled`] is the reason.
+pub const COMPILATION_DISABLED_MESSAGE: &str =
+    "Module compilation is turned off on this deployment (TALOS_MODULE_COMPILATION=false):      nothing is built from source here, and modules come from the registry.      Use list_module_catalog to see the modules this deployment offers.";
+
+/// What a caller is told for any other compile-service error. The detail
+/// (which can carry host paths and the toolchain's stderr) goes to the log.
+pub const COMPILATION_SERVICE_ERROR_MESSAGE: &str = "Compilation service error — see server logs";
+
+impl std::fmt::Display for CompilationDisabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(COMPILATION_DISABLED_MESSAGE)
+    }
+}
+
+impl std::error::Error for CompilationDisabled {}
+
+/// Whether a compile-service error is the deployment's "compilation is
+/// off" refusal, at any depth of the error's context chain.
+pub fn is_compilation_disabled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CompilationDisabled>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<CompilationDisabled>().is_some())
+}
+
+/// The sentence a protocol surface returns for an `Err` from this service:
+/// the policy refusal verbatim, anything else as the generic sentence. The
+/// ONE home for both, so a surface cannot answer "see server logs" for a
+/// refusal the operator chose.
+pub fn caller_facing_service_error(error: &anyhow::Error) -> &'static str {
+    if is_compilation_disabled(error) {
+        COMPILATION_DISABLED_MESSAGE
+    } else {
+        COMPILATION_SERVICE_ERROR_MESSAGE
+    }
 }
 
 pub struct CompilationService {
     workspace_root: PathBuf,
     wit_path: PathBuf,
     event_tx: talos_engine_events::CompilationEventSender,
+    /// `false` on a registry-only deployment. Read once at construction
+    /// from [`talos_config::module_compilation_enabled`].
+    compilation_enabled: bool,
 }
 
 impl CompilationService {
@@ -506,11 +551,62 @@ impl CompilationService {
             );
         }
 
+        let compilation_enabled = talos_config::module_compilation_enabled();
+        if !compilation_enabled {
+            tracing::info!(
+                target: "talos_compilation",
+                event_kind = "module_compilation_disabled",
+                "Module compilation is OFF (TALOS_MODULE_COMPILATION): every compile, lint and \
+                 source-analysis request is refused and no toolchain is run."
+            );
+        }
+
         Self {
             workspace_root,
             wit_path,
             event_tx,
+            compilation_enabled,
         }
+    }
+
+    /// Override the deployment switch. For a test, or an embedder that
+    /// decides the policy itself rather than through the environment.
+    pub fn with_compilation_enabled(mut self, enabled: bool) -> Self {
+        self.compilation_enabled = enabled;
+        self
+    }
+
+    /// Whether this service builds modules from source.
+    pub fn compilation_enabled(&self) -> bool {
+        self.compilation_enabled
+    }
+
+    /// Refuse, before any work, on a deployment that has compilation off.
+    /// Called first by every public entry point so a refused request does
+    /// not emit a progress event or a static-lint answer on its way to the
+    /// slot. [`Self::acquire_slot`] is the guarantee; this is the manners.
+    fn ensure_enabled(&self) -> Result<()> {
+        if self.compilation_enabled {
+            Ok(())
+        } else {
+            Err(anyhow::Error::new(CompilationDisabled))
+        }
+    }
+
+    /// Wait (unbounded — callers wrap it in their own timeout) for a compile
+    /// slot on the process-wide [`compilation_semaphore`].
+    ///
+    /// THE chokepoint for the compile switch. A sandbox child can only be
+    /// spawned with a `&CompileSlot` ([`sandbox_run::SandboxCommand::run`]),
+    /// and this is the only place the service obtains one, so a deployment
+    /// with compilation off cannot run a toolchain over module source by
+    /// any path — including one added later that forgets
+    /// [`Self::ensure_enabled`].
+    async fn acquire_slot(&self) -> Result<CompileSlot> {
+        self.ensure_enabled()?;
+        CompileSlot::acquire(Arc::clone(compilation_semaphore()))
+            .await
+            .map_err(|_| anyhow::anyhow!("Compilation semaphore closed"))
     }
 
     pub fn send_event(
@@ -756,6 +852,7 @@ impl CompilationService {
         config: &serde_json::Value,
         dependencies: Option<&serde_json::Value>,
     ) -> Result<CompilationResult> {
+        self.ensure_enabled()?;
         // wasm-security-review (2026-05-22): bound the source size
         // BEFORE acquiring a compilation slot or touching the filesystem.
         // A hostile 100 MiB source string would otherwise hold the
@@ -803,7 +900,7 @@ impl CompilationService {
         // permit is held until each child (and its container) is dead.
         let slot = tokio::time::timeout(
             std::time::Duration::from_secs(120), // 2 min wait for compilation slot
-            acquire_compile_slot(),
+            self.acquire_slot(),
         )
         .await
         .map_err(|_| {
@@ -815,8 +912,7 @@ impl CompilationService {
                 "Compilation queue full (max {} concurrent). All slots busy for >2 minutes. Try again shortly.",
                 max
             )
-        })?
-        .map_err(|_| anyhow::anyhow!("Compilation semaphore closed"))?;
+        })??;
 
         tracing::debug!(name, "starting compilation");
         let compile_start = std::time::Instant::now();
@@ -2358,6 +2454,7 @@ impl CompilationService {
         world: &str,
         job_id: &str,
     ) -> Result<Vec<u8>> {
+        self.ensure_enabled()?;
         // M-13: the compile runs SANDBOXED (container::tool_command — same
         // --network=none/read-only/non-root envelope as the Rust path)
         // whenever a container runtime is available. Only the host-fallback
@@ -2367,9 +2464,7 @@ impl CompilationService {
             require_host_lang_toolchain_allowed("javascript")?;
         }
 
-        let slot = acquire_compile_slot()
-            .await
-            .map_err(|_| anyhow::anyhow!("Compilation queue full — try again later"))?;
+        let slot = self.acquire_slot().await?;
 
         let workspace = self.workspace_root.join(format!("js-{}", job_id));
         tokio::fs::create_dir_all(&workspace).await?;
@@ -2476,6 +2571,7 @@ impl CompilationService {
         world: &str,
         job_id: &str,
     ) -> Result<Vec<u8>> {
+        self.ensure_enabled()?;
         // M-13: the compile runs SANDBOXED (container::tool_command — same
         // --network=none/read-only/non-root envelope as the Rust path)
         // whenever a container runtime is available. Only the host-fallback
@@ -2486,9 +2582,7 @@ impl CompilationService {
             require_host_lang_toolchain_allowed("python")?;
         }
 
-        let slot = acquire_compile_slot()
-            .await
-            .map_err(|_| anyhow::anyhow!("Compilation queue full — try again later"))?;
+        let slot = self.acquire_slot().await?;
 
         let workspace = self.workspace_root.join(format!("py-{}", job_id));
         tokio::fs::create_dir_all(&workspace).await?;
@@ -2769,6 +2863,7 @@ impl CompilationService {
         world: &str,
         dependencies: Option<&serde_json::Value>,
     ) -> Result<Vec<CompilationError>> {
+        self.ensure_enabled()?;
         // Static-lint pre-pass first — instant, no compile semaphore needed.
         // Mirrors compile_to_wasm_with_config so domain-specific hints
         // (e.g. `secrets::get` → `secrets::get_secret`) surface from BOTH
@@ -2784,10 +2879,9 @@ impl CompilationService {
         }
 
         // Acquire compilation permit (same semaphore as full builds)
-        let slot = tokio::time::timeout(std::time::Duration::from_secs(60), acquire_compile_slot())
+        let slot = tokio::time::timeout(std::time::Duration::from_secs(60), self.acquire_slot())
             .await
-            .map_err(|_| anyhow::anyhow!("Lint queue full. Try again shortly."))?
-            .map_err(|_| anyhow::anyhow!("Compilation semaphore closed"))?;
+            .map_err(|_| anyhow::anyhow!("Lint queue full. Try again shortly."))??;
 
         // Inject the talos_node macro preamble only when the source does not
         // already carry a proc-macro annotation.  The sandbox codegen in
@@ -2989,6 +3083,7 @@ impl CompilationService {
         language: Option<ModuleLanguage>,
         world_override: Option<&str>,
     ) -> Result<CompilationResult> {
+        self.ensure_enabled()?;
         match language {
             Some(ModuleLanguage::Python) => {
                 self.compile_python_module(
@@ -3143,20 +3238,18 @@ impl CompilationService {
             Some("Initializing Python compilation environment...".to_string()),
             Some(0.05),
         );
-        let slot =
-            tokio::time::timeout(std::time::Duration::from_secs(120), acquire_compile_slot())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "Python compilation queue full (max {} concurrent). Try again later.",
-                        compilation_semaphore().available_permits()
-                            + std::env::var("TALOS_MAX_COMPILATIONS")
-                                .ok()
-                                .and_then(|v| v.parse::<usize>().ok())
-                                .unwrap_or(3)
-                    )
-                })?
-                .map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+        let slot = tokio::time::timeout(std::time::Duration::from_secs(120), self.acquire_slot())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Python compilation queue full (max {} concurrent). Try again later.",
+                    compilation_semaphore().available_permits()
+                        + std::env::var("TALOS_MAX_COMPILATIONS")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(3)
+                )
+            })??;
 
         // Create temp workspace
         let workspace = self
@@ -3995,3 +4088,6 @@ mod reconcile_declared_world_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod compile_switch_tests;

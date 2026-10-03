@@ -2161,11 +2161,7 @@ pub(crate) async fn seed_templates(
     // empty URL → no templates loaded at all. Helm values.yaml
     // placeholders (`registryUrl: ""`) hit this footgun routinely.
     // Sibling fix to MCP-597 (read_env_or_file empty handling).
-    let has_registry_url = std::env::var("TALOS_REGISTRY_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some();
-    if has_registry_url {
+    if talos_config::registry_url().is_some() {
         tracing::info!(
             "TALOS_REGISTRY_URL set — disk template seeding disabled. \
              OCI registry is the source of truth."

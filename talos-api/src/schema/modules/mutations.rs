@@ -243,6 +243,12 @@ impl ModulesMutations {
                 )
                 .await
                 .map_err(|e| {
+                    if talos_compilation::is_compilation_disabled(&e) {
+                        return async_graphql::Error::new(
+                            talos_compilation::COMPILATION_DISABLED_MESSAGE,
+                        )
+                        .extend_safe();
+                    }
                     tracing::error!("Compilation failed: {}", e);
                     async_graphql::Error::new("Compilation failed").extend_safe()
                 })?;

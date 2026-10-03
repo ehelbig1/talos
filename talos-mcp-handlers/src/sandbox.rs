@@ -1732,7 +1732,7 @@ async fn handle_compile_custom_sandbox(
             mcp_error(
                 req_id,
                 -32000,
-                "Compilation service error — see server logs",
+                talos_compilation::caller_facing_service_error(&e),
             )
         }
     }
@@ -2024,7 +2024,7 @@ async fn handle_run_sandbox(
         Err(e) => {
             // 2026-09-10: generic message, chain logged (see compile_custom_sandbox).
             tracing::error!(error = %format!("{e:#}"), "run_sandbox: compilation service error");
-            return mcp_text(req_id, "Compilation service error — see server logs");
+            return mcp_text(req_id, talos_compilation::caller_facing_service_error(&e));
         }
     };
 
@@ -2626,7 +2626,11 @@ async fn handle_compile_template(
             mcp_error(
                 req_id,
                 -32000,
-                "Compilation infrastructure failed. Check controller logs.",
+                if talos_compilation::is_compilation_disabled(&e) {
+                    talos_compilation::COMPILATION_DISABLED_MESSAGE
+                } else {
+                    "Compilation infrastructure failed. Check controller logs."
+                },
             )
         }
     }
@@ -2797,7 +2801,11 @@ async fn handle_lint_sandbox(
             Some(mcp_error(
                 req_id.clone(),
                 -32000,
-                "Lint service error — see server logs",
+                if talos_compilation::is_compilation_disabled(&e) {
+                    talos_compilation::COMPILATION_DISABLED_MESSAGE
+                } else {
+                    "Lint service error — see server logs"
+                },
             ))
         }
     }
@@ -3390,7 +3398,7 @@ async fn handle_hot_update_module(
         Err(HotUpdateError::CompilerInvocation(_)) => Some(mcp_error(
             req_id.clone(),
             -32000,
-            "Compilation service error — see server logs",
+            talos_compilation::COMPILATION_SERVICE_ERROR_MESSAGE,
         )),
         Err(e) => Some(mcp_error(req_id.clone(), -32000, &e.to_string())),
     }

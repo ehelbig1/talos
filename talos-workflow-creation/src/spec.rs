@@ -478,7 +478,7 @@ fn node_build_error(
             BuildStage::Validate
         }
         E::LintFailed(_) => BuildStage::Lint,
-        E::CompilationFailed(_) | E::NoWasmEmitted => BuildStage::Compile,
+        E::CompilationFailed(_) | E::NoWasmEmitted | E::CompilationDisabled => BuildStage::Compile,
         E::NameCollision(_) | E::SharedModuleOverwrite(_) | E::PermissionDrift(_) => {
             BuildStage::NameCollision
         }

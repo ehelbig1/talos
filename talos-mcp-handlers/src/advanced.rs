@@ -1694,7 +1694,7 @@ async fn handle_run_scratch_session(
                 error = %format!("{e:#}"),
                 "run_scratch_session: compilation service error"
             );
-            let err_str = "Compilation service error — see server logs".to_string();
+            let err_str = talos_compilation::caller_facing_service_error(&e).to_string();
             if let Err(e) = state
                 .advanced_repo
                 .update_scratch_error(&err_str, user_id, session_name)
