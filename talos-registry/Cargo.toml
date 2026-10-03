@@ -21,6 +21,10 @@ async-trait = "0.1"
 subtle = "2.6"
 sha2 = "0.10"
 talos-capability-world = { path = "../talos-capability-world" }
+# The two pure readers of a catalog manifest that the compile crate owns:
+# `recommended_max_fuel` and `manifest_dependencies` (check 68 keeps the
+# `dependencies` key read there). No compile is started from this crate.
+talos-compilation = { path = "../talos-compilation" }
 talos-config = { path = "../talos-config" }
 talos-http-body = { path = "../talos-http-body" }
 talos-sigstore-policy = { path = "../talos-sigstore-policy" }

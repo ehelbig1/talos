@@ -194,6 +194,180 @@ pub fn parse_manifest_allowed_methods(manifest: &serde_json::Value) -> Vec<Strin
         .unwrap_or_default()
 }
 
+/// Where a shared catalog module's code comes from. The two modes are
+/// mutually exclusive per deployment (`TALOS_REGISTRY_URL` set or not), and
+/// a row says which one wrote it: dispatch prefers `oci_url` when it is set.
+#[derive(Debug, Clone, Copy)]
+pub enum CatalogSource<'a> {
+    /// The disk seed: the template's source, compiled on this controller.
+    /// Clears `oci_url`, so a deployment switched back from registry mode
+    /// does not keep dispatching to a registry it no longer syncs.
+    Disk { source_code: &'a str },
+    /// The registry sync: a signed artifact the worker pulls by this
+    /// digest-pinned URL. The row's stored source, if any, is left alone.
+    Registry { oci_url: &'a str },
+}
+
+/// Why a catalog manifest is not written. One list for both writers, so a
+/// manifest the disk seed refuses is refused by the registry sync too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestRefusal {
+    /// Neither `display_name` nor `name`.
+    NoName,
+    /// No `capability_world`. A module's world decides which host
+    /// interfaces it is linked against; it is declared, never defaulted.
+    NoCapabilityWorld,
+    /// A `capability_world` no module can be compiled for.
+    UnknownCapabilityWorld(String),
+    InvalidAllowedHosts(String),
+    InvalidAllowedSecrets(String),
+}
+
+impl std::fmt::Display for ManifestRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoName => f.write_str("the manifest has no name or display_name"),
+            Self::NoCapabilityWorld => f.write_str("the manifest declares no capability_world"),
+            Self::UnknownCapabilityWorld(world) => {
+                write!(
+                    f,
+                    "capability_world '{world}' is not a world a module can be compiled for"
+                )
+            }
+            Self::InvalidAllowedHosts(reason) => write!(f, "invalid allowed_hosts: {reason}"),
+            Self::InvalidAllowedSecrets(reason) => write!(f, "invalid requires_secrets: {reason}"),
+        }
+    }
+}
+
+/// What a catalog manifest (`talos.json`) says about its module — everything
+/// a shared catalog row stores that comes from the manifest.
+///
+/// The ONE reading of a manifest for both writers of shared catalog rows: the
+/// disk seed (`controller::bootstrap::services::seed_templates`) and the
+/// registry sync (`talos_registry::sync`). Until 2026-10-03 each parsed the
+/// manifest itself, and they had drifted: the registry sync wrote neither
+/// `allowed_methods` nor `capability_world` nor `dependencies` nor
+/// `max_fuel`, so a row it created kept those columns' defaults — no verb
+/// allowed, `minimal-node`, 2,000,000 — and no HTTP template synced from a
+/// registry could make a request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogManifest {
+    pub name: String,
+    pub category: String,
+    pub description: String,
+    pub config_schema: serde_json::Value,
+    pub allowed_hosts: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_secrets: Vec<String>,
+    pub requires_approval_for: Vec<String>,
+    /// Long form (`http-node`), as the worker's parser and the column want.
+    pub capability_world_long: String,
+    pub dependencies: Option<serde_json::Value>,
+    /// See [`CatalogUpsert::max_fuel`]: the recommendation, the column
+    /// default when the manifest recommends nothing, `None` when it
+    /// recommends something that cannot be read.
+    pub max_fuel: Option<i64>,
+    /// Why `recommended_fuel` could not be read, for the caller to log.
+    pub fuel_unreadable: Option<String>,
+}
+
+fn manifest_strings(manifest: &serde_json::Value, key: &str) -> Vec<String> {
+    manifest
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl CatalogManifest {
+    pub fn parse(manifest: &serde_json::Value) -> std::result::Result<Self, ManifestRefusal> {
+        let text = |key: &str| manifest.get(key).and_then(|v| v.as_str());
+        let name = text("display_name")
+            .or_else(|| text("name"))
+            .filter(|n| !n.is_empty())
+            .ok_or(ManifestRefusal::NoName)?
+            .to_string();
+
+        // `trusted` is the historical short spelling of the automation
+        // world; any other short form gains its `-node` suffix.
+        let declared = text("capability_world")
+            .filter(|w| !w.is_empty())
+            .ok_or(ManifestRefusal::NoCapabilityWorld)?;
+        let capability_world_long = if declared == "trusted" {
+            "automation-node".to_string()
+        } else if declared.ends_with("-node") {
+            declared.to_string()
+        } else {
+            format!("{declared}-node")
+        };
+        if !talos_capability_world::is_compilable_world(&capability_world_long) {
+            return Err(ManifestRefusal::UnknownCapabilityWorld(
+                declared.to_string(),
+            ));
+        }
+
+        let allowed_hosts = manifest_strings(manifest, "allowed_hosts");
+        crate::validate_allowed_hosts(&allowed_hosts)
+            .map_err(ManifestRefusal::InvalidAllowedHosts)?;
+        let allowed_secrets = manifest_strings(manifest, "requires_secrets");
+        crate::validate_allowed_secrets(&allowed_secrets)
+            .map_err(ManifestRefusal::InvalidAllowedSecrets)?;
+
+        let (max_fuel, fuel_unreadable) = match talos_compilation::recommended_max_fuel(manifest) {
+            Ok(Some(limit)) => (i64::try_from(limit).ok(), None),
+            Ok(None) => (Some(SHARED_CATALOG_DEFAULT_MAX_FUEL), None),
+            Err(reason) => (None, Some(reason)),
+        };
+
+        Ok(Self {
+            name,
+            category: text("category").unwrap_or("General").to_string(),
+            description: text("description").unwrap_or("").to_string(),
+            config_schema: manifest
+                .get("config_schema")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            allowed_hosts,
+            allowed_methods: parse_manifest_allowed_methods(manifest),
+            allowed_secrets,
+            requires_approval_for: manifest_strings(manifest, "requires_approval_for"),
+            capability_world_long,
+            dependencies: talos_compilation::manifest_dependencies(manifest).cloned(),
+            max_fuel,
+            fuel_unreadable,
+        })
+    }
+
+    /// The row this manifest writes for the template `catalog_slug`, with
+    /// its code coming from `source`.
+    pub fn upsert<'a>(
+        &'a self,
+        catalog_slug: &'a str,
+        source: CatalogSource<'a>,
+    ) -> CatalogUpsert<'a> {
+        CatalogUpsert {
+            name: &self.name,
+            category: &self.category,
+            description: &self.description,
+            config_schema: &self.config_schema,
+            source,
+            allowed_hosts: &self.allowed_hosts,
+            allowed_methods: &self.allowed_methods,
+            allowed_secrets: &self.allowed_secrets,
+            requires_approval_for: &self.requires_approval_for,
+            capability_world_long: &self.capability_world_long,
+            catalog_slug,
+            dependencies: self.dependencies.as_ref(),
+            max_fuel: self.max_fuel,
+        }
+    }
+}
+
 /// Parameters for [`upsert_catalog_template_by_slug`]. Mirrors the columns
 /// the disk seed writes.
 pub struct CatalogUpsert<'a> {
@@ -201,7 +375,8 @@ pub struct CatalogUpsert<'a> {
     pub category: &'a str,
     pub description: &'a str,
     pub config_schema: &'a serde_json::Value,
-    pub source_code: &'a str,
+    /// Where the module's code comes from; see [`CatalogSource`].
+    pub source: CatalogSource<'a>,
     pub allowed_hosts: &'a [String],
     /// HTTP verb allowlist, straight from the template manifest's
     /// `allowed_methods`.
@@ -296,22 +471,37 @@ pub async fn upsert_catalog_template_by_slug(
     .fetch_optional(pool)
     .await?;
 
+    // A disk row stores its source and no registry URL; a registry row the
+    // reverse, and its stored source (if a disk seed once wrote one) is left
+    // as it is.
+    let (source_code, oci_url): (Option<&str>, Option<&str>) = match params.source {
+        CatalogSource::Disk { source_code } => (Some(source_code), None),
+        CatalogSource::Registry { oci_url } => (None, Some(oci_url)),
+    };
+    // Only a disk row is compiled here; a registry row's bytes are the
+    // worker's to pull.
+    let recompile = |source_changed: bool, has_wasm: bool, deps_changed: bool| match params.source {
+        CatalogSource::Disk { .. } => needs_recompile(source_changed, has_wasm, deps_changed),
+        CatalogSource::Registry { .. } => false,
+    };
+
     if let Some(row) = existing {
         let id: Uuid = row.try_get("id")?;
         let prev_source: Option<String> = row.try_get("source_code")?;
         let prev_deps: Option<serde_json::Value> = row.try_get("dependencies")?;
         let has_wasm: bool = row.try_get::<Option<bool>, _>("has_wasm")?.unwrap_or(false);
-        let source_changed = prev_source.as_deref() != Some(params.source_code);
+        let source_changed = source_code.is_some_and(|code| prev_source.as_deref() != Some(code));
         let deps_changed = prev_deps.as_ref() != params.dependencies;
 
         // Rename-safe in-place update keyed on the canonical id.
         sqlx::query(
             "UPDATE modules SET \
                  name = $2, category = $3, description = $4, config_schema = $5, \
-                 source_code = $6, allowed_hosts = $7, allowed_secrets = $8, \
+                 source_code = COALESCE($6, source_code), allowed_hosts = $7, \
+                 allowed_secrets = $8, \
                  requires_approval_for = $9, capability_world = $10, \
                  dependencies = $11, allowed_methods = $12, \
-                 max_fuel = COALESCE($13, max_fuel) \
+                 max_fuel = COALESCE($13, max_fuel), oci_url = $14 \
              WHERE id = $1",
         )
         .bind(id)
@@ -319,7 +509,7 @@ pub async fn upsert_catalog_template_by_slug(
         .bind(params.category)
         .bind(params.description)
         .bind(params.config_schema)
-        .bind(params.source_code)
+        .bind(source_code)
         .bind(params.allowed_hosts)
         .bind(params.allowed_secrets)
         .bind(params.requires_approval_for)
@@ -327,12 +517,13 @@ pub async fn upsert_catalog_template_by_slug(
         .bind(params.dependencies)
         .bind(params.allowed_methods)
         .bind(params.max_fuel)
+        .bind(oci_url)
         .execute(pool)
         .await?;
 
         return Ok(RegisteredCatalog {
             id,
-            needs_recompile: needs_recompile(source_changed, has_wasm, deps_changed),
+            needs_recompile: recompile(source_changed, has_wasm, deps_changed),
         });
     }
 
@@ -350,26 +541,27 @@ pub async fn upsert_catalog_template_by_slug(
                  user_id, name, kind, category, description, config_schema, \
                  source_code, allowed_hosts, allowed_secrets, requires_approval_for, \
                  capability_world, catalog_slug, dependencies, allowed_methods, \
-                 max_fuel, language, created_at, updated_at \
+                 max_fuel, oci_url, language, created_at, updated_at \
              ) VALUES ( \
                  NULL, $1, 'catalog', $2, $3, $4, \
-                 $5, $6, $7, $8, \
+                 COALESCE($5, ''), $6, $7, $8, \
                  $9, $10, $11, $12, \
-                 COALESCE($13::bigint, 2000000), 'rust', NOW(), NOW() \
+                 COALESCE($13::bigint, 2000000), $14, 'rust', NOW(), NOW() \
              ) \
              ON CONFLICT (name) WHERE user_id IS NULL DO UPDATE SET \
                  category = EXCLUDED.category, \
                  catalog_slug = EXCLUDED.catalog_slug, \
                  description = EXCLUDED.description, \
                  config_schema = EXCLUDED.config_schema, \
-                 source_code = EXCLUDED.source_code, \
+                 source_code = COALESCE($5, modules.source_code), \
                  allowed_hosts = EXCLUDED.allowed_hosts, \
                  allowed_secrets = EXCLUDED.allowed_secrets, \
                  requires_approval_for = EXCLUDED.requires_approval_for, \
                  capability_world = EXCLUDED.capability_world, \
                  dependencies = EXCLUDED.dependencies, \
                  allowed_methods = EXCLUDED.allowed_methods, \
-                 max_fuel = COALESCE($13::bigint, modules.max_fuel) \
+                 max_fuel = COALESCE($13::bigint, modules.max_fuel), \
+                 oci_url = EXCLUDED.oci_url \
              /* updated_at deliberately NOT set — see talos-registry/src/lib.rs. */ \
              RETURNING id, \
                  (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS has_wasm \
@@ -383,7 +575,7 @@ pub async fn upsert_catalog_template_by_slug(
     .bind(params.category)
     .bind(params.description)
     .bind(params.config_schema)
-    .bind(params.source_code)
+    .bind(source_code)
     .bind(params.allowed_hosts)
     .bind(params.allowed_secrets)
     .bind(params.requires_approval_for)
@@ -392,6 +584,7 @@ pub async fn upsert_catalog_template_by_slug(
     .bind(params.dependencies)
     .bind(params.allowed_methods)
     .bind(params.max_fuel)
+    .bind(oci_url)
     .fetch_one(pool)
     .await?;
 
@@ -399,12 +592,12 @@ pub async fn upsert_catalog_template_by_slug(
     let has_wasm: bool = row.try_get::<Option<bool>, _>("has_wasm")?.unwrap_or(false);
     let prev_source: Option<String> = row.try_get("prev_source")?;
     let prev_deps: Option<serde_json::Value> = row.try_get("prev_deps")?;
-    let source_changed = prev_source.as_deref() != Some(params.source_code);
+    let source_changed = source_code.is_some_and(|code| prev_source.as_deref() != Some(code));
     let deps_changed = prev_deps.as_ref() != params.dependencies;
 
     Ok(RegisteredCatalog {
         id,
-        needs_recompile: needs_recompile(source_changed, has_wasm, deps_changed),
+        needs_recompile: recompile(source_changed, has_wasm, deps_changed),
     })
 }
 
@@ -551,6 +744,154 @@ pub async fn reconcile_duplicate_catalog_modules(pool: &Pool<Postgres>) -> Resul
     }
 
     Ok(dupe_sets.len())
+}
+
+#[cfg(test)]
+mod catalog_manifest_tests {
+    use super::{CatalogManifest, ManifestRefusal, SHARED_CATALOG_DEFAULT_MAX_FUEL};
+    use serde_json::json;
+
+    fn manifest() -> serde_json::Value {
+        json!({
+            "name": "example-reader",
+            "display_name": "Example Reader",
+            "category": "Network",
+            "description": "Reads one thing.",
+            "capability_world": "http-node",
+            "allowed_hosts": ["api.example.test"],
+            "allowed_methods": ["get", "POST"],
+            "requires_secrets": ["example/api_key"],
+            "requires_approval_for": ["send"],
+            "config_schema": {"type": "object", "properties": {"URL": {"type": "string"}}},
+            "dependencies": {"chrono": "0.4"},
+            "recommended_fuel": {"expected_items": 25, "bytes_per_item": 8000, "fuel_per_byte": 3, "safety_multiplier": 3.0}
+        })
+    }
+
+    /// Every field a shared row stores from the manifest, in one read.
+    #[test]
+    fn a_manifest_is_read_whole() {
+        let m = CatalogManifest::parse(&manifest()).expect("a complete manifest");
+        assert_eq!(m.name, "Example Reader");
+        assert_eq!(m.category, "Network");
+        assert_eq!(m.capability_world_long, "http-node");
+        assert_eq!(m.allowed_hosts, ["api.example.test"]);
+        assert_eq!(m.allowed_methods, ["GET", "POST"]);
+        assert_eq!(m.allowed_secrets, ["example/api_key"]);
+        assert_eq!(m.requires_approval_for, ["send"]);
+        assert_eq!(m.dependencies, Some(json!({"chrono": "0.4"})));
+        assert_eq!(
+            m.max_fuel,
+            talos_compilation::recommended_max_fuel(&manifest())
+                .unwrap()
+                .map(|v| v as i64)
+        );
+        assert_eq!(m.fuel_unreadable, None);
+    }
+
+    #[test]
+    fn what_a_manifest_leaves_out_is_the_narrowest_reading() {
+        let m = CatalogManifest::parse(&json!({"name": "bare", "capability_world": "minimal"}))
+            .expect("a name and a world are enough");
+        assert_eq!(m.name, "bare");
+        assert_eq!(
+            m.capability_world_long, "minimal-node",
+            "a short world gains its suffix"
+        );
+        assert!(m.allowed_hosts.is_empty() && m.allowed_methods.is_empty());
+        assert!(m.allowed_secrets.is_empty() && m.requires_approval_for.is_empty());
+        assert_eq!(m.dependencies, None);
+        assert_eq!(m.max_fuel, Some(SHARED_CATALOG_DEFAULT_MAX_FUEL));
+        // `trusted` is the historical short spelling of the automation world.
+        let trusted = CatalogManifest::parse(&json!({"name": "t", "capability_world": "trusted"}));
+        assert_eq!(trusted.unwrap().capability_world_long, "automation-node");
+    }
+
+    /// A world is declared, never defaulted, and must be one a module can be
+    /// compiled for. The disk seed used to default a missing world to
+    /// `automation-node`, the widest there is.
+    #[test]
+    fn a_manifest_that_cannot_be_trusted_with_a_row_is_refused() {
+        let with = |key: &str, value: serde_json::Value| {
+            let mut m = manifest();
+            m[key] = value;
+            CatalogManifest::parse(&m)
+        };
+        let without = |key: &str| {
+            let mut m = manifest();
+            m.as_object_mut().unwrap().remove(key);
+            m
+        };
+        assert_eq!(
+            CatalogManifest::parse(&without("capability_world")),
+            Err(ManifestRefusal::NoCapabilityWorld)
+        );
+        assert_eq!(
+            with("capability_world", json!("")),
+            Err(ManifestRefusal::NoCapabilityWorld)
+        );
+        for unknown in ["llm-node", "root", "http-node-plus"] {
+            assert_eq!(
+                with("capability_world", json!(unknown)),
+                Err(ManifestRefusal::UnknownCapabilityWorld(unknown.to_string())),
+            );
+        }
+        let mut nameless = without("display_name");
+        nameless.as_object_mut().unwrap().remove("name");
+        assert_eq!(
+            CatalogManifest::parse(&nameless),
+            Err(ManifestRefusal::NoName)
+        );
+        assert!(matches!(
+            with("allowed_hosts", json!(["https://not-a-host/path"])),
+            Err(ManifestRefusal::InvalidAllowedHosts(_))
+        ));
+        assert!(matches!(
+            with("requires_secrets", json!(["../escape"])),
+            Err(ManifestRefusal::InvalidAllowedSecrets(_))
+        ));
+    }
+
+    /// An unreadable recommendation is not a refusal: the row is still
+    /// written, with no fuel limit to apply and the reason to log.
+    #[test]
+    fn an_unreadable_fuel_recommendation_is_reported_not_guessed() {
+        let mut m = manifest();
+        m["recommended_fuel"] = json!({"byte_per_item": 4000});
+        let parsed = CatalogManifest::parse(&m).expect("still a row");
+        assert_eq!(parsed.max_fuel, None);
+        assert!(parsed
+            .fuel_unreadable
+            .as_deref()
+            .is_some_and(|r| r.contains("recommended_fuel")));
+    }
+
+    /// Every manifest this repository ships is accepted, with a world a
+    /// module can be compiled for. A parser stricter than the catalog it
+    /// reads would drop templates at the next boot.
+    #[test]
+    fn every_shipped_manifest_is_accepted() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../module-templates");
+        let mut read = 0usize;
+        for entry in std::fs::read_dir(&root)
+            .expect("module-templates")
+            .flatten()
+        {
+            let path = entry.path().join("talos.json");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let manifest: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let parsed = CatalogManifest::parse(&manifest)
+                .unwrap_or_else(|refusal| panic!("{}: {refusal}", path.display()));
+            assert!(parsed.fuel_unreadable.is_none(), "{}", path.display());
+            assert!(parsed.max_fuel.is_some_and(|f| f > 0), "{}", path.display());
+            read += 1;
+        }
+        // 79 on 2026-10-03. A scan that finds none has stopped looking.
+        assert!(read >= 70, "only {read} manifests read");
+    }
 }
 
 #[cfg(test)]

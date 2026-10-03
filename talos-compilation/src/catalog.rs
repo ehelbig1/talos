@@ -99,6 +99,19 @@ impl std::fmt::Display for CatalogTemplateError {
 
 impl std::error::Error for CatalogTemplateError {}
 
+/// A catalog manifest's declared extra crate dependencies: `None` when
+/// absent, `null` or `{}` (see [`CatalogTemplate::dependencies`] for why the
+/// three are one). The free form exists for a manifest that did not come
+/// from a template directory — the registry sync reads one out of an OCI
+/// config blob — and keeps this file the only reader of the key (check 68).
+pub fn manifest_dependencies(manifest: &serde_json::Value) -> Option<&serde_json::Value> {
+    match manifest.get("dependencies") {
+        Some(serde_json::Value::Object(m)) if m.is_empty() => None,
+        Some(serde_json::Value::Null) | None => None,
+        Some(v) => Some(v),
+    }
+}
+
 /// The fuel limit a catalog manifest (`talos.json`) recommends for its
 /// module: `Ok(None)` when it declares no `recommended_fuel` (absent or
 /// `null`), `Err` when it declares one that cannot be read.
@@ -191,11 +204,7 @@ impl CatalogTemplate {
     /// absent field writes, and the `deps_changed` arm of `needs_recompile`
     /// would rebuild the template on every boot forever.
     pub fn dependencies(&self) -> Option<&serde_json::Value> {
-        match self.manifest.get("dependencies") {
-            Some(serde_json::Value::Object(m)) if m.is_empty() => None,
-            Some(serde_json::Value::Null) | None => None,
-            Some(v) => Some(v),
-        }
+        manifest_dependencies(&self.manifest)
     }
 
     /// The fuel limit this template's manifest recommends; see

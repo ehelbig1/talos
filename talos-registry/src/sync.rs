@@ -813,13 +813,20 @@ async fn sync_template(
     let talos_manifest: serde_json::Value =
         serde_json::from_str(&config_str).context("Config blob is not valid JSON")?;
 
-    let name = match talos_manifest
-        .get("display_name")
-        .or_else(|| talos_manifest.get("name"))
-        .and_then(|v| v.as_str())
-    {
-        Some(n) => n,
-        None => {
+    // The manifest is read by the ONE parser both catalog writers use (this
+    // sync and the disk seed), and written through the one row writer. Until
+    // 2026-10-03 this function parsed the manifest and wrote the row itself,
+    // and carried neither `allowed_methods` nor `capability_world` nor
+    // `dependencies` nor `max_fuel`: a synced row kept those columns'
+    // defaults, so no HTTP template from a registry could make a request.
+    //
+    // The config blob comes from an upstream registry, so the parser's
+    // validation (grants, capability world) is the ingest boundary here. A
+    // manifest with no name is skipped, as before; any other refusal fails
+    // this template's sync and is counted.
+    let parsed = match crate::reconcile::CatalogManifest::parse(&talos_manifest) {
+        Ok(parsed) => parsed,
+        Err(crate::reconcile::ManifestRefusal::NoName) => {
             tracing::warn!(
                 "Skipping {}:{} — manifest config has no name/display_name field",
                 entry.name,
@@ -827,108 +834,40 @@ async fn sync_template(
             );
             return Ok(());
         }
+        Err(refusal) => anyhow::bail!("{}:{}: {refusal}", entry.name, entry.tag),
     };
-
-    let category = talos_manifest
-        .get("category")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Custom");
-    let description = talos_manifest
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let default_schema = serde_json::json!({ "type": "object", "properties": {} });
-    let config_schema = talos_manifest
-        .get("config_schema")
-        .cloned()
-        .unwrap_or(default_schema);
-
-    let allowed_hosts: Vec<String> = string_array(&talos_manifest, "allowed_hosts");
-    if let Err(msg) = super::validate_allowed_hosts(&allowed_hosts) {
-        anyhow::bail!(
-            "Invalid allowed_hosts for {}:{}: {}",
-            entry.name,
-            entry.tag,
-            msg
+    if let Some(reason) = &parsed.fuel_unreadable {
+        tracing::warn!(
+            template = %parsed.name,
+            %reason,
+            "catalog template's recommended_fuel cannot be read; the shared row keeps the \
+             fuel limit it has"
         );
     }
-    let allowed_secrets: Vec<String> = string_array(&talos_manifest, "requires_secrets");
-    // MCP-1124: validate allowed_secrets at the OCI ingest boundary too.
-    // Sibling sweep of MCP-1123 — both `allowed_hosts` and
-    // `allowed_secrets` come from the same untrusted upstream OCI
-    // manifest and need the same validator-at-boundary discipline.
-    if let Err(msg) = super::validate_allowed_secrets(&allowed_secrets) {
-        anyhow::bail!(
-            "Invalid allowed_secrets for {}:{}: {}",
-            entry.name,
-            entry.tag,
-            msg
-        );
-    }
-    let requires_approval_for: Vec<String> = string_array(&talos_manifest, "requires_approval_for");
 
     // Same OCI URL format the worker expects, carrying the VERIFIED digest so
     // the worker pulls exactly the artifact this sync attested (the digest
     // wins over the tag in `Reference` parsing).
+    // The OCI template name doubles as the catalog slug (published from the
+    // template dir name); normalized the same way for both.
+    let catalog_slug = entry.name.to_lowercase().replace(' ', "-");
     let oci_url = format!(
-        "oci://{host}/{namespace}/{}:{}@{verified_digest}",
-        entry.name.to_lowercase().replace(' ', "-"),
+        "oci://{host}/{namespace}/{catalog_slug}:{}@{verified_digest}",
         entry.tag
     );
 
-    sqlx::query(
-        "INSERT INTO modules ( \
-             user_id, name, kind, category, description, config_schema, source_code, oci_url, \
-             allowed_hosts, allowed_secrets, requires_approval_for, \
-             catalog_slug, language, created_at, updated_at \
-         ) \
-         VALUES ( \
-             NULL, $1, 'catalog', $2, $3, $4, '', $5, \
-             $6, $7, $8, \
-             $9, 'rust', NOW(), NOW() \
-         ) \
-         ON CONFLICT (name) WHERE user_id IS NULL DO UPDATE SET \
-             category               = EXCLUDED.category, \
-             catalog_slug           = EXCLUDED.catalog_slug, \
-             description            = EXCLUDED.description, \
-             config_schema          = EXCLUDED.config_schema, \
-             oci_url                = EXCLUDED.oci_url, \
-             allowed_hosts          = EXCLUDED.allowed_hosts, \
-             allowed_secrets        = EXCLUDED.allowed_secrets, \
-             requires_approval_for  = EXCLUDED.requires_approval_for \
-          /* updated_at deliberately NOT set — see talos-registry/src/lib.rs. This is \
-             the OCI source-of-truth mode; it re-syncs every catalog entry on a \
-             schedule, so an explicit stamp re-dates the whole catalog each pass. */",
+    crate::reconcile::upsert_catalog_template_by_slug(
+        &db.db_pool,
+        parsed.upsert(
+            &catalog_slug,
+            crate::reconcile::CatalogSource::Registry { oci_url: &oci_url },
+        ),
     )
-    .bind(name)
-    .bind(category)
-    .bind(description)
-    .bind(&config_schema)
-    .bind(&oci_url)
-    .bind(&allowed_hosts)
-    .bind(&allowed_secrets)
-    .bind(&requires_approval_for)
-    // The OCI template name doubles as the catalog slug (published from the
-    // template dir name); normalized the same way as the oci_url repo path.
-    .bind(entry.name.to_lowercase().replace(' ', "-"))
-    .execute(&db.db_pool)
     .await
     .context("Upsert into modules")?;
 
-    tracing::debug!("Synced {} from OCI registry", name);
+    tracing::debug!("Synced {} from OCI registry", parsed.name);
     Ok(())
-}
-
-fn string_array(manifest: &serde_json::Value, key: &str) -> Vec<String> {
-    manifest
-        .get(key)
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn strip_scheme(url: &str) -> &str {
@@ -1043,6 +982,33 @@ fn is_not_found_error(msg: &str) -> bool {
     }
 
     false
+}
+
+/// The registry sync writes a shared catalog row through the one parser and
+/// the one writer, and has no statement of its own. Textual: it sees this
+/// file's text, which is the thing that drifted.
+#[cfg(test)]
+mod one_catalog_writer_pin {
+    #[test]
+    fn the_sync_has_no_row_writer_of_its_own() {
+        let src = include_str!("sync.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the production part");
+        let own_insert = ["INSERT INTO", " modules"].concat();
+        assert!(
+            !production.contains(&own_insert),
+            "sync.rs writes a modules row itself"
+        );
+        for needed in [
+            ["CatalogManifest::", "parse(&talos_manifest)"].concat(),
+            ["upsert_catalog_", "template_by_slug("].concat(),
+            ["CatalogSource::", "Registry"].concat(),
+        ] {
+            assert_eq!(production.matches(&needed).count(), 1, "{needed}");
+        }
+    }
 }
 
 #[cfg(test)]
