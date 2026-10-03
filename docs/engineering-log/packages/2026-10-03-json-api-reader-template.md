@@ -2,6 +2,12 @@
 
 2026-10-03
 
+> Superseded the same day by
+> [`2026-10-03-json-api-reader-measured.md`](2026-10-03-json-api-reader-measured.md):
+> the parsing described below was measured, found to build a tree in the
+> common case, and replaced. The decisions about grants, credentials and
+> bounds stand.
+
 ## Why
 
 Most read integrations written this month are the same three steps: one
