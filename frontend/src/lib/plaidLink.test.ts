@@ -61,6 +61,24 @@ describe("openPlaidLink", () => {
     );
   });
 
+  it("opens one window at a time: a second call while one is open is refused", async () => {
+    let finish: (() => void) | undefined;
+    const { created } = fakePlaid((c) => {
+      finish = () => c.onExit?.(null);
+    });
+    const first = openPlaidLink("link-sandbox-1");
+    await Promise.resolve(); // let the first reach Plaid.create
+    await expect(openPlaidLink("link-sandbox-2")).rejects.toThrow(
+      "already open",
+    );
+    expect(created).toHaveLength(1);
+    finish?.();
+    await expect(first).resolves.toBeNull();
+    // Once it has closed, a new sign-in can start.
+    fakePlaid((c) => c.onExit?.(null));
+    await expect(openPlaidLink("link-sandbox-3")).resolves.toBeNull();
+  });
+
   it("loads the script from Plaid's CDN, never a bundled copy", () => {
     expect(PLAID_LINK_SCRIPT).toBe(
       "https://cdn.plaid.com/link/v2/stable/link-initialize.js",
