@@ -15,11 +15,18 @@ Two legs, both re-runnable:
                     paragraph shuffled; leg 3 will not.
 
   LEG 2 (decisions) Every DECISION-MARKER line in the pre-split CLAUDE.md must
-                    be either (a) still in CLAUDE.md, or (b) present verbatim in
-                    the archive AND represented in the digest that replaced its
-                    section. A marker that survives only in the archive is the
-                    exact failure this split must not ship: the archive is not
-                    read at session start.
+                    be either (a) still in CLAUDE.md or verbatim in the DIGEST
+                    (docs/engineering-log/DECISIONS.md), or (b) present verbatim
+                    in the archive AND represented in the digest subsection that
+                    points at its file. A marker that survives only in the
+                    narrative archive is the failure a split must not ship.
+
+  LEG 4 (index)     Every `###` subsection of the digest must be named, by its
+                    title, in CLAUDE.md's engineering-log section. Since
+                    2026-10-03 the digest is a file read on demand, not part of
+                    CLAUDE.md; the index line is what tells a session the
+                    digest exists, so a subsection the index does not name is
+                    a decision nobody will be sent to read.
 
 The marker set is the nine patterns measured on the pre-split tree (case
 insensitive, line-level union = 124 lines).
@@ -92,9 +99,15 @@ BASES = [
      "2026-09-25: the structural-lint check specifications -> structural-lint-checks.md"),
     ("7bc9e5c4997983b67a1fcdaa730beda41af80ae7", "6bda9e33e87e5b5051b998c7fbe1f711af386b2e",
      "2026-10-03: the package record bullets -> 2026-10-03-package-record.md (title index kept)"),
+    ("78675f441dcdfcfa9f19ffea14ef677370a7fb81", None,
+     "2026-10-03: the class digests -> DECISIONS.md (one index line each kept in CLAUDE.md)"),
 ]
 ARCHIVE = Path("docs/engineering-log")
 CLAUDE = Path("CLAUDE.md")
+# The digest's home since 2026-10-03. It is also an archive file for legs 1
+# and 3: the lines that move took out of CLAUDE.md are held to be in it.
+DIGEST_NAME = "DECISIONS.md"
+# The CLAUDE.md section that indexes the digest (and, before 2026-10-03, WAS it).
 DIGEST_HEADING = "## Engineering log — the decisions, kept"
 MIN_LEN = 1              # every non-blank removed line is checked
 
@@ -158,19 +171,25 @@ def tokens(text):
 def check(bases, now, archive_text, verbose=False, out=print):
     """ONE body for every leg. `bases` is [(label, [pre lines], [split-commit
     lines] or None)], `now` the current
-    CLAUDE.md lines, `archive_text` {filename: text}. Returns True when clean.
+    CLAUDE.md lines, `archive_text` {filename: text}, which includes the digest
+    under DIGEST_NAME. Returns True when clean.
     Both the real run and `--self-test` call this and nothing else."""
-    archive_files = sorted(archive_text)
-    if not archive_files:
+    if not archive_text:
         out("FAIL: no archive files under docs/engineering-log/")
         return False
+    if DIGEST_NAME not in archive_text:
+        out(f"FAIL: no digest at docs/engineering-log/{DIGEST_NAME}")
+        return False
+    # The narrative files a digest subsection must point at. The digest is not
+    # one of them: it is what does the pointing.
+    archive_files = sorted(n for n in archive_text if n != DIGEST_NAME)
     archive_lines = {}                       # stripped line -> set(filenames)
-    for name in archive_files:
+    for name in sorted(archive_text):
         for ln in archive_text[name].split("\n"):
             archive_lines.setdefault(ln.strip(), set()).add(name)
     now_set = {ln.strip() for ln in now}
 
-    # ---- digest subsections ------------------------------------------------
+    # ---- the index section of CLAUDE.md ------------------------------------
     try:
         d0 = now.index(DIGEST_HEADING)
     except ValueError:
@@ -181,18 +200,29 @@ def check(bases, now, archive_text, verbose=False, out=print):
         if now[i].startswith("## "):
             d1 = i
             break
-    digest = now[d0:d1]
-    sub_bounds = [i for i, l in enumerate(digest) if l.startswith("### ")] + [len(digest)]
-    file_to_digest = {}
-    for a, b in zip(sub_bounds, sub_bounds[1:]):
+    index_text = "\n".join(now[d0:d1])
+
+    # ---- digest subsections (a `###` runs to the next `###` or `##`) -------
+    digest = archive_text[DIGEST_NAME].split("\n")
+    digest_set = {ln.strip() for ln in digest}
+    heads = [i for i, l in enumerate(digest) if l.startswith("### ")]
+    file_to_digest, titles = {}, []
+    for a in heads:
+        b = len(digest)
+        for i in range(a + 1, len(digest)):
+            if digest[i].startswith("## ") or digest[i].startswith("### "):
+                b = i
+                break
+        titles.append(digest[a][4:].split(" → ")[0].strip())
         body = "\n".join(digest[a:b])
         for name in archive_files:
             if name in digest[a]:
                 file_to_digest.setdefault(name, "")
                 file_to_digest[name] += body + "\n"
     unpointed = [name for name in archive_files if name not in file_to_digest]
+    unindexed = [t for t in titles if t not in index_text]
 
-    bad = bool(unpointed)
+    bad = bool(unpointed or unindexed)
     out(f"now: {len(now)-1} lines; archive: {len(archive_files)} files, "
         f"{sum(len(t.split(chr(10)))-1 for t in archive_text.values())} lines")
     for label, base, after in bases:
@@ -229,7 +259,8 @@ def check(bases, now, archive_text, verbose=False, out=print):
         kept, archived_ok, not_in_archive, unrepresented = [], [], [], []
         for lineno, line in base_markers:
             st = line.strip()
-            if st in after_set:
+            # Still in CLAUDE.md at that split, or in the digest itself.
+            if st in after_set or st in digest_set:
                 kept.append((lineno, st))
                 continue
             if st not in archive_lines:
@@ -239,6 +270,8 @@ def check(bases, now, archive_text, verbose=False, out=print):
             want = tokens(ctx)
             best, best_n = None, -1
             for fname in sorted(archive_lines[st]):
+                if fname == DIGEST_NAME:
+                    continue
                 n = len(want & tokens(file_to_digest.get(fname, "")))
                 if n > best_n:
                     best, best_n = fname, n
@@ -258,7 +291,7 @@ def check(bases, now, archive_text, verbose=False, out=print):
         for st in broken[:20]:
             out(f"         BROKEN RUN starting: {st}")
         out(f"LEG 2  marker lines in base  : {len(base_markers)}")
-        out(f"LEG 2    still in CLAUDE.md  : {len(kept)}")
+        out(f"LEG 2    in CLAUDE.md or digest: {len(kept)}")
         out(f"LEG 2    archived + digested : {len(archived_ok)}")
         out(f"LEG 2    NOT in archive      : {len(not_in_archive)}")
         for lineno, st in not_in_archive:
@@ -280,6 +313,9 @@ def check(bases, now, archive_text, verbose=False, out=print):
         bad = bad or bool(missing or broken or not_in_archive or unrepresented)
     if unpointed:
         out(f"LEG 2  archive files no digest subsection points at: {unpointed}")
+    out(f"LEG 4  digest subsections: {len(titles)}; not named in CLAUDE.md's index: {len(unindexed)}")
+    for t in unindexed:
+        out(f"         UNINDEXED: {t}")
     out()
     out("FAIL" if bad else "PASS")
     return not bad
@@ -317,17 +353,28 @@ def self_test():
     bullet_a = "* Decision: the frobnicator cache stays bounded at ninety entries; its lint was REJECTED at 33% precision."
     bullet_b = "* Decision: the sprocket gadget ledger is written once per tick; the sweep was deliberately not widened."
 
-    def build(bullet_a_text, with_a=True):
-        head_a = ["### Bounded structures → [`a.md`](docs/engineering-log/a.md)", bullet_a_text] if with_a else []
-        digest = ["# CLAUDE", DIGEST_HEADING] + head_a + [
-            "### The gadget class → [`b.md`](docs/engineering-log/b.md)", bullet_b,
-            "## Next section", "kept line one"]
-        base1 = digest[:2] + story_a + digest[2:]                    # first split moved story_a
-        cut = 2 + len(head_a) + 2
-        base2 = digest[:cut] + story_b + digest[cut:]                # second split moved story_b
-        return [("one", base1, None), ("two", base2, None)], digest
+    title_a, title_b = "Bounded structures", "The gadget class"
 
-    clean_archive = {"a.md": "\n".join(story_a) + "\n", "b.md": "\n".join(story_b) + "\n"}
+    def build(bullet_a_text, with_a=True, index_a=True):
+        """(bases, CLAUDE.md now, digest text). The bases are the CLAUDE.md of
+        the days the digest still lived in it; `now` holds only the index."""
+        head_a = [f"### {title_a} → [`a.md`](docs/engineering-log/a.md)", bullet_a_text] if with_a else []
+        subs = head_a + [f"### {title_b} → [`b.md`](docs/engineering-log/b.md)", bullet_b]
+        old = ["# CLAUDE", DIGEST_HEADING] + subs + ["## Next section", "kept line one"]
+        # A blank line between a story and the digest, as in the real file: a
+        # run of removed lines ends at a blank, and each run must sit whole in
+        # ONE file (the story in its archive file, the subsections in the digest).
+        base1 = old[:2] + story_a + [""] + old[2:]                   # first split moved story_a
+        cut = 2 + len(head_a) + 2
+        base2 = old[:cut] + [""] + story_b + [""] + old[cut:]        # second split moved story_b
+        index = ([f"* {title_a} — bounded caches"] if with_a and index_a else []) + [f"* {title_b} — ledgers"]
+        now_ = ["# CLAUDE", DIGEST_HEADING] + index + ["## Next section", "kept line one"]
+        return [("one", base1, None), ("two", base2, None)], now_, "\n".join(subs) + "\n"
+
+    stories = {"a.md": "\n".join(story_a) + "\n", "b.md": "\n".join(story_b) + "\n"}
+
+    def with_digest(stories_, digest_text):
+        return dict(stories_, **{DIGEST_NAME: digest_text})
 
     def run(bases_, now_, archive_):
         lines = []
@@ -335,33 +382,35 @@ def self_test():
         return ok, "\n".join(lines)
 
     cases = 0
-    bases, now = build(bullet_a)
+    bases, now, digest = build(bullet_a)
+    clean_archive = with_digest(stories, digest)
     ok, rep = run(bases, now, clean_archive)
     assert ok, "clean fixture must PASS\n" + rep
     cases += 1
     # leg 1: a removed line missing from the archive (and nothing else wrong)
-    ok, rep = run(bases, now, {"a.md": "\n".join(story_a[1:]) + "\n", "b.md": clean_archive["b.md"]})
+    ok, rep = run(bases, now, with_digest({"a.md": "\n".join(story_a[1:]) + "\n", "b.md": stories["b.md"]}, digest))
     assert not ok and "LEG 1  missing from archive  : 1" in rep and "runs not contiguous in any archive file: 0" in rep, rep
     cases += 1
     # leg 3: both lines present, run reordered -> not contiguous, leg 1 clean
     reordered = "\n".join([story_a[1], story_a[0]] + story_a[2:]) + "\n"
-    ok, rep = run(bases, now, {"a.md": reordered, "b.md": clean_archive["b.md"]})
+    ok, rep = run(bases, now, with_digest({"a.md": reordered, "b.md": stories["b.md"]}, digest))
     assert not ok and "LEG 1  missing from archive  : 1" not in rep and "runs not contiguous in any archive file: 1" in rep, rep
     cases += 1
     # leg 2: the archive file has no digest subsection pointing at it
-    bases_na, now_na = build(bullet_a, with_a=False)
-    ok, rep = run(bases_na, now_na, clean_archive)
+    bases_na, now_na, digest_na = build(bullet_a, with_a=False)
+    ok, rep = run(bases_na, now_na, with_digest(stories, digest_na))
     assert not ok and "no digest subsection points at: ['a.md']" in rep and "LEG 1  missing from archive  : 1" not in rep, rep
     cases += 1
     # leg 2: the subsection survives but shares no distinctive token with the marker's neighbourhood
-    bases_t, now_t = build("* Decision: kept, but rewritten without any distinctive token.")
-    ok, rep = run(bases_t, now_t, clean_archive)
+    bases_t, now_t, digest_t = build("* Decision: kept, but rewritten without any distinctive token.")
+    ok, rep = run(bases_t, now_t, with_digest(stories, digest_t))
     assert not ok and "archived, NOT in digest : 1" in rep and "LEG 1  missing from archive  : 1" not in rep, rep
     cases += 1
     # multi-base: a line removed only relative to the SECOND base and absent from the archive
-    ok, rep = run(bases, now, {"a.md": clean_archive["a.md"], "b.md": story_b[0] + "\n"})
+    short_b = {"a.md": stories["a.md"], "b.md": story_b[0] + "\n"}
+    ok, rep = run(bases, now, with_digest(short_b, digest))
     assert not ok and "base two" in rep and "LEG 1  missing from archive  : 1" in rep, rep
-    ok1, _ = run(bases[:1], now, {"a.md": clean_archive["a.md"], "b.md": story_b[0] + "\n"})
+    ok1, _ = run(bases[:1], now, with_digest(short_b, digest))
     assert ok1, "with only the first base checked the second split's loss is invisible — that is what the list is for"
     cases += 1
     # a pinned split is charged only with what IT removed: an ordinary later
@@ -373,12 +422,28 @@ def self_test():
     ok, rep = run(bases, edited, clean_archive)
     assert not ok and "LEG 1  missing from archive  : 1" in rep, rep
     # ...and a pinned split still owes everything it DID remove
-    ok, rep = run(pinned, edited, {"a.md": "\n".join(story_a[1:]) + "\n", "b.md": clean_archive["b.md"]})
+    ok, rep = run(pinned, edited, with_digest({"a.md": "\n".join(story_a[1:]) + "\n", "b.md": stories["b.md"]}, digest))
     assert not ok and "LEG 1  missing from archive  : 1" in rep, rep
     cases += 1
     # no archive at all
     ok, rep = run(bases, now, {})
     assert not ok and "no archive files" in rep
+    cases += 1
+    # the narrative is there but the digest file is not: nothing to read on demand
+    ok, rep = run(bases, now, stories)
+    assert not ok and f"no digest at docs/engineering-log/{DIGEST_NAME}" in rep, rep
+    cases += 1
+    # leg 4: a digest subsection CLAUDE.md's index does not name (every other leg clean)
+    bases_x, now_x, digest_x = build(bullet_a, index_a=False)
+    ok, rep = run(bases_x, now_x, with_digest(stories, digest_x))
+    assert not ok and f"UNINDEXED: {title_a}" in rep and "LEG 1  missing from archive  : 1" not in rep \
+        and "archived, NOT in digest : 1" not in rep, rep
+    cases += 1
+    # a decision bullet that left CLAUDE.md is owed to the digest: dropping it
+    # from the digest file is a lost line (leg 1), not a quiet thinning
+    thin = digest.replace(bullet_b + "\n", "")
+    ok, rep = run(bases, now, with_digest(stories, thin))
+    assert not ok and "LEG 1  missing from archive  : 1" in rep, rep
     cases += 1
     print(f"self-test ok: {cases} cases")
     return 0
@@ -392,7 +457,7 @@ def main():
              for pre, post, what in BASES]
     now = CLAUDE.read_text().split("\n")
     archive_files = sorted(p for p in ARCHIVE.glob("*.md") if p.name != "README.md")
-    archive_text = {p.name: p.read_text() for p in archive_files}
+    archive_text = {p.name: p.read_text() for p in archive_files}  # includes DIGEST_NAME
     return 0 if check(bases, now, archive_text, verbose=verbose) else 1
 
 
