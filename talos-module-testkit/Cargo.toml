@@ -1,0 +1,17 @@
+[package]
+name = "talos-module-testkit"
+description = "A native stand-in for the host bindings, so a module's own tests run with cargo test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+chrono-tz = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+
+[lints]
+workspace = true

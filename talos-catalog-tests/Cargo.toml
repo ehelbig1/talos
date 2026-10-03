@@ -1,0 +1,30 @@
+[package]
+name = "talos-catalog-tests"
+description = "Runs the catalog templates' own tests natively, against the module test kit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lib]
+doctest = false
+
+# Besides the test kit: serde and serde_json (bundled into every module), and
+# each crate a tested template declares in its talos.json `dependencies`.
+# build.rs refuses a template whose crate is missing here.
+[dependencies]
+talos-module-testkit = { path = "../talos-module-testkit" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[build-dependencies]
+talos-module-testkit = { path = "../talos-module-testkit" }
+# The one reader of a template's manifest (structural check 68).
+talos-compilation = { path = "../talos-compilation" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

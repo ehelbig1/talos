@@ -155,6 +155,8 @@ members = [
     "talos-google-cloud",
     "talos-google-health",
     "talos-plaid-connect",
+    "talos-module-testkit",
+    "talos-catalog-tests",
     "talos-github",
     "talos-github-repository",
     "talos-github-connect",

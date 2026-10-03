@@ -7862,6 +7862,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-catalog-tests"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "talos-compilation",
+ "talos-module-testkit",
+]
+
+[[package]]
 name = "talos-child-run-ledger"
 version = "0.1.0"
 dependencies = [
@@ -9118,6 +9129,16 @@ dependencies = [
  "talos-registry",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "talos-module-testkit"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz 0.10.4",
+ "hmac 0.12.1",
+ "sha2 0.10.9",
 ]
 
 [[package]]
