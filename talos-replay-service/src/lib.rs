@@ -533,6 +533,11 @@ impl ReplayService {
         user_id: Uuid,
     ) -> Result<WasmModule, ReplayError> {
         if let Ok(m) = self.registry.get_module(module_id, user_id).await {
+            // A registry row loads with no bytes (the worker pulls them);
+            // a replay runs in-process and has nothing to run.
+            if let Err(only) = m.in_process_bytes() {
+                return Err(ReplayError::InvalidArg(only.to_string()));
+            }
             return Ok(m);
         }
         let template = self

@@ -598,6 +598,11 @@ impl ModulesMutations {
                 tracing::error!("Failed to load module {}: {}", module_id, e);
                 async_graphql::Error::new("Module not found or access denied").extend_safe()
             })?;
+        // A registry row loads with no bytes (the worker pulls them); this
+        // run is in-process and has nothing to run.
+        if let Err(only) = module.in_process_bytes() {
+            return Err(async_graphql::Error::new(only.to_string()).extend_safe());
+        }
 
         // MCP-868 (2026-05-14): size-cap the input JSON before parsing,
         // mirroring `test_workflow.mock_inputs` (MCP-666). Pre-fix

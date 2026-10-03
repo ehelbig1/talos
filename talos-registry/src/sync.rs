@@ -315,7 +315,9 @@ pub async fn start_registry_sync_loop(registry: Arc<ModuleRegistry>) -> TaskExit
              accept unverified template/index artifacts. Set TALOS_SIGSTORE_REQUIRED to \
              `required` (fail-closed verification, recommended), `audit` (verify+log+continue \
              during a migration window), or `disabled` (explicitly accept the risk of \
-             unsigned artifacts). Disk-seeded templates remain the source of truth meanwhile."
+             unsigned artifacts). The catalog is NOT refreshed meanwhile: disk seeding is \
+             skipped whenever TALOS_REGISTRY_URL is set, so this controller serves only the \
+             catalog rows an earlier sync left in the database."
         );
         return TaskExit::Declined(DeclineReason::PolicyNotExplicit);
     };
