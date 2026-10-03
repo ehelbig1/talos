@@ -631,6 +631,12 @@ introduced per-org v4 per table).
   user dirs sweep after 7 days (opportunistic, rate-limited).
   `TALOS_SDK_MACROS_PATH` overrides the baked `/app/talos_sdk_macros` for
   host-side runs (mirrors `TALOS_WIT_PATH`).
+- **A deployment can turn module compilation off** (`TALOS_MODULE_COMPILATION=false`,
+  2026-10-03): registry-only, no toolchain is run over module source. A new
+  path that runs one gets its slot from `CompilationService::acquire_slot`,
+  which is where the switch is enforced; a handler that turns a compile-service
+  `Err` into a response calls `talos_compilation::caller_facing_service_error`.
+  `TALOS_REGISTRY_URL` is read only through `talos_config::registry_url()`.
 
 ## WASM Module Development Rules (MUST follow)
 - NEVER use top-level `serde_json::Value` to parse upstream payloads. Use typed `#[derive(serde::Deserialize)]` structs — 3-10x cheaper in WASM fuel. The `Value` type allocates a `HashMap<String, Value>` per JSON object; typed structs skip unneeded fields entirely.

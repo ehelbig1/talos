@@ -74,6 +74,12 @@ pub enum HotUpdateError {
     NoWasmBytes,
     #[error("Compilation failed: {0}")]
     CompilerInvocation(String),
+    /// The deployment has module compilation turned off
+    /// (`TALOS_MODULE_COMPILATION=false`). Kept apart from
+    /// `CompilerInvocation`, whose detail is withheld from the caller: this
+    /// one is the operator's stated policy and is said verbatim.
+    #[error("{}", talos_compilation::COMPILATION_DISABLED_MESSAGE)]
+    CompilationDisabled,
     /// M3 (2026-05-22): the requested `capability_world` exceeds the
     /// strictest actor-capability ceiling among workflows currently
     /// binding this module. Returned BEFORE the compile budget is
@@ -329,6 +335,9 @@ impl HotUpdateService {
             )
             .await
             .map_err(|e| {
+                if talos_compilation::is_compilation_disabled(&e) {
+                    return HotUpdateError::CompilationDisabled;
+                }
                 tracing::error!(%module_id, "hot_update_module compilation failed: {}", e);
                 HotUpdateError::CompilerInvocation(e.to_string())
             })?;

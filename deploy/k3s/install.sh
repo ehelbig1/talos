@@ -47,6 +47,9 @@
 #                              Empty → controller seeds from disk (default for fresh deploys).
 #                              Set this AFTER you've run the template-publish.yml workflow at
 #                              least once, otherwise the Library / Catalog will be empty.
+#   TALOS_MODULE_COMPILATION   false → registry-only: the controller never builds a module from
+#                              source (compile, lint and catalog install are refused). Requires
+#                              TALOS_REGISTRY_URL. Default: true.
 #   TALOS_REGISTRY_NAMESPACE   Path prefix within the registry. Default: $TALOS_GHCR_OWNER/talos-tools
 #   TALOS_WORKER_TRUST         RFC 0010 worker trust (Ed25519 dispatch signing, per-worker
 #                              result signing, per-execution envelope sealing). Default
@@ -722,6 +725,10 @@ ${WT_CONTROLLER_ENV_BLOCK}
   ociRegistry:
     url: "${TALOS_REGISTRY_URL:-}"
     namespace: "${TALOS_REGISTRY_NAMESPACE:-${TALOS_GHCR_OWNER}/talos-tools}"
+  # Quoted so the value reaches the controller exactly as written in
+  # install.env; the controller's boot validator refuses anything that is
+  # not a boolean.
+  moduleCompilation: "${TALOS_MODULE_COMPILATION:-true}"
   ingress:
     enabled: true
     className: "traefik"

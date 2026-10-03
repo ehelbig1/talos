@@ -155,6 +155,8 @@ pub mod alerts;
 pub mod analytics;
 pub mod auth;
 pub mod capability_worlds;
+#[cfg(test)]
+mod compile_refusal_pins;
 pub mod configuration;
 pub mod evaluation;
 pub mod executions;

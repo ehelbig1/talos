@@ -456,6 +456,17 @@ controller:
     url: ""
     namespace: ""
 
+  # Whether the controller builds modules from source (compile, lint, hot
+  # update, catalog install). Default true.
+  #
+  # Set false for a REGISTRY-ONLY deployment: no toolchain is ever run over
+  # module source on the controller, and every module a workflow runs is a
+  # signed artifact the registry sync provides. Requires ociRegistry.url —
+  # the templates baked into the image are source, so with compiling off and
+  # no registry there would be nothing to run; the chart refuses to render
+  # and the controller refuses to start in that combination.
+  moduleCompilation: true
+
   # ------------------------------------------------------------------
   # WORM audit-ledger persistence to S3 / MinIO with Object Lock.
   # ------------------------------------------------------------------

@@ -126,6 +126,12 @@ pub enum InlineCompileError {
     #[error("{0}")]
     NameCollision(String),
 
+    /// The deployment has module compilation turned off
+    /// (`TALOS_MODULE_COMPILATION=false`). Maps to `-32000`. The message is
+    /// the operator's stated policy and is said verbatim, unlike `Internal`.
+    #[error("{}", talos_compilation::COMPILATION_DISABLED_MESSAGE)]
+    CompilationDisabled,
+
     /// Compile produced no WASM bytes despite reporting success — a
     /// CompilationService bug or a transient runner failure. Maps to
     /// `-32000`. Message is the literal pre-extraction string.
@@ -150,6 +156,7 @@ impl InlineCompileError {
             | Self::SharedModuleOverwrite(_)
             | Self::PermissionDrift(_)
             | Self::NoWasmEmitted
+            | Self::CompilationDisabled
             | Self::Internal(_) => -32000,
         }
     }
@@ -172,7 +179,7 @@ impl InlineCompileError {
             // — matches how `NoWasmEmitted` (a fixed-text Display) is
             // surfaced below.
             Self::DependencyValidation(_) => self.to_string(),
-            Self::NoWasmEmitted => self.to_string(),
+            Self::NoWasmEmitted | Self::CompilationDisabled => self.to_string(),
             Self::Internal(_) => "Internal error".to_string(),
         }
     }
@@ -493,6 +500,10 @@ impl InlineCompileService {
                 )));
             }
             Ok(_) => {}
+            // Not an outage to fall through: nothing is built here at all.
+            Err(e) if talos_compilation::is_compilation_disabled(&e) => {
+                return Err(InlineCompileError::CompilationDisabled);
+            }
             Err(e) => {
                 // L-32: lint runner errored (transient infra, OOM,
                 // advisory-DB load failure). The fast-path safety net
@@ -530,6 +541,9 @@ impl InlineCompileService {
 
         let res = match compile_result {
             Ok(r) => r,
+            Err(e) if talos_compilation::is_compilation_disabled(&e) => {
+                return Err(InlineCompileError::CompilationDisabled);
+            }
             Err(e) => {
                 tracing::error!(err = ?e, "add_node_to_workflow inline compile error");
                 return Err(InlineCompileError::Internal(anyhow::anyhow!(

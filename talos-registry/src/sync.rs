@@ -286,10 +286,7 @@ pub async fn start_registry_sync_loop(registry: Arc<ModuleRegistry>) -> TaskExit
     // AND OCI sync failing on every poll trying to parse `""` as a URL —
     // and the pod would come up with no templates at all. Sibling class
     // to MCP-590/591/597 (empty env-var asymmetry).
-    let Some(registry_url) = env::var("TALOS_REGISTRY_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-    else {
+    let Some(registry_url) = talos_config::registry_url() else {
         tracing::info!(
             "TALOS_REGISTRY_URL not set — OCI registry sync disabled. \
              Templates will be served from the disk-seeded set only."

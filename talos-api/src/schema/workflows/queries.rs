@@ -355,7 +355,15 @@ impl WorkflowsQueries {
         }
         let raw_errors = compiler
             .analyze_code("rhai_analysis", &input.script)
-            .await?;
+            .await
+            .map_err(|e| {
+                if talos_compilation::is_compilation_disabled(&e) {
+                    async_graphql::Error::new(talos_compilation::COMPILATION_DISABLED_MESSAGE)
+                        .extend_safe()
+                } else {
+                    async_graphql::Error::from(e)
+                }
+            })?;
 
         let errors = raw_errors
             .into_iter()

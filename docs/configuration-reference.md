@@ -237,6 +237,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
+| `TALOS_MODULE_COMPILATION` | on (unset or empty ⇒ on; any boolean token) | controller | Whether the controller builds modules from source. `false` makes the deployment registry-only: every compile, lint, source analysis, hot update and catalog install is refused with a stated reason, and no toolchain is run. Requires `TALOS_REGISTRY_URL` — the controller refuses to start with compiling off and no registry, and on a value that is not a boolean. Reported by `get_catalog_status` and `get_platform_info` | |
 | `TALOS_MAX_COMPILATIONS` | `3` (clamped ≥1) | talos-compilation | Concurrent-compile semaphore | |
 | `TALOS_WIT_PATH` | `$CARGO_MANIFEST_DIR/../wit/talos.wit` | talos-compilation | Override WIT fixture path (host-side runs) | |
 | `TALOS_SDK_MACROS_PATH` | `/app/talos_sdk_macros` | talos-compilation | Path to the SDK macros crate for scaffolding | |

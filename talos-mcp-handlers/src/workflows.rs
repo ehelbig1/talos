@@ -6601,7 +6601,15 @@ async fn handle_import_workflow(
                                 mid,
                                 e
                             );
-                            still_missing.push((mid_str, "the compiler could not be run"));
+                            still_missing.push((
+                                mid_str,
+                                if talos_compilation::is_compilation_disabled(&e) {
+                                    "module compilation is turned off on this deployment, so a \
+                                     module cannot be built from the source in the bundle"
+                                } else {
+                                    "the compiler could not be run"
+                                },
+                            ));
                         }
                     }
                 } else {

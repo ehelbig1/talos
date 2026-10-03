@@ -95,6 +95,20 @@ spec:
             - name: TALOS_REGISTRY_NAMESPACE
               value: {{ . | quote }}
             {{- end }}
+            # --- Module compilation switch (only emitted when not the default) ---
+            # Rendered VERBATIM whenever the value is anything but `true`, so
+            # every spelling of "off" reaches the controller's own parser and a
+            # typo reaches its boot validator, which refuses to start on one. A
+            # template that rendered only the literal `false` would turn `0` or
+            # a misspelling into "compilation stays on", silently.
+            {{- $moduleCompilation := toString .Values.controller.moduleCompilation }}
+            {{- if and (ne $moduleCompilation "true") (ne $moduleCompilation "<nil>") (ne $moduleCompilation "") (not (hasKey .Values.controller.env "TALOS_MODULE_COMPILATION")) }}
+            {{- if and (has (lower $moduleCompilation) (list "false" "0" "no" "off")) (not .Values.controller.ociRegistry.url) }}
+            {{- fail "controller.moduleCompilation is off, which leaves the registry as the only source of modules, but controller.ociRegistry.url is empty. Set controller.ociRegistry.url or leave controller.moduleCompilation true." }}
+            {{- end }}
+            - name: TALOS_MODULE_COMPILATION
+              value: {{ $moduleCompilation | quote }}
+            {{- end }}
             # --- Sigstore policy for the OCI catalog sync — ALWAYS emitted ---
             # The SAME three variables the worker Deployment renders, from the
             # SAME values block (`worker.sigstore`, which despite its prefix is

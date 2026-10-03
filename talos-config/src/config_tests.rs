@@ -1136,4 +1136,49 @@ mod tests {
         assert!(!empty_env_shadows_a_file(None));
         assert!(!empty_env_shadows_a_file(Some("")));
     }
+
+    /// The compile switch: unset is ON, a boolean token is honoured, and a
+    /// value that is not a boolean token is an error the boot validator
+    /// reports — never the default. A typo must not leave compiling on.
+    #[test]
+    fn the_compile_switch_does_not_fold_an_unreadable_value_into_the_default() {
+        use crate::{module_compilation_from, parse_bool_env, BoolEnv};
+        assert_eq!(module_compilation_from(BoolEnv::Unset), Ok(true));
+        assert_eq!(module_compilation_from(parse_bool_env("")), Ok(true));
+        assert_eq!(module_compilation_from(parse_bool_env("  ")), Ok(true));
+        for on in ["true", "1", "yes", "on", " TRUE "] {
+            assert_eq!(
+                module_compilation_from(parse_bool_env(on)),
+                Ok(true),
+                "{on:?}"
+            );
+        }
+        for off in ["false", "0", "no", "off", "Off"] {
+            assert_eq!(
+                module_compilation_from(parse_bool_env(off)),
+                Ok(false),
+                "{off:?}"
+            );
+        }
+        for typo in ["disabled", "none", "fales", "registry-only"] {
+            assert_eq!(
+                module_compilation_from(parse_bool_env(typo)),
+                Err(typo.to_string()),
+                "{typo:?}"
+            );
+        }
+    }
+
+    /// An empty or whitespace-only registry URL is unset, for every reader.
+    #[test]
+    fn an_empty_registry_url_is_unset() {
+        use crate::registry_url_from;
+        assert_eq!(registry_url_from(None), None);
+        assert_eq!(registry_url_from(Some(String::new())), None);
+        assert_eq!(registry_url_from(Some("   ".into())), None);
+        assert_eq!(
+            registry_url_from(Some(" https://ghcr.io ".into())),
+            Some("https://ghcr.io".to_string())
+        );
+    }
 }

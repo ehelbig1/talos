@@ -318,6 +318,61 @@ pub fn actor_context_injection_enabled() -> bool {
     bool_env_or_default("ENABLE_ACTOR_CONTEXT_INJECTION", true)
 }
 
+/// The env var behind [`module_compilation`].
+pub const MODULE_COMPILATION_ENV: &str = "TALOS_MODULE_COMPILATION";
+
+/// Whether this deployment builds modules from source. **Default ON.**
+///
+/// Set `TALOS_MODULE_COMPILATION=false|0|no|off` for a registry-only
+/// deployment: the controller then never runs a toolchain over module
+/// source — no compile, no lint, no source analysis — and every module it
+/// runs comes from the OCI registry (`TALOS_REGISTRY_URL`, which the boot
+/// validator requires in this mode).
+///
+/// `Err` carries the raw value when the variable is set to something that
+/// is not a boolean token. This switch turns a capability off, so an
+/// unreadable value is not folded into the default the way [`bool_env`]
+/// folds one: the boot validator refuses to start on it, and
+/// [`module_compilation_enabled`] reads it as OFF.
+pub fn module_compilation() -> Result<bool, String> {
+    module_compilation_from(read_bool_env(MODULE_COMPILATION_ENV))
+}
+
+/// [`module_compilation`] as a pure function of the value read.
+pub fn module_compilation_from(read: BoolEnv) -> Result<bool, String> {
+    match read {
+        BoolEnv::Unset => Ok(true),
+        BoolEnv::Value(v) => Ok(v),
+        BoolEnv::Unreadable(raw) => Err(raw),
+    }
+}
+
+/// [`module_compilation`] for a caller that must act: an unreadable value
+/// is OFF (fail closed — the operator set the switch and it cannot be read).
+pub fn module_compilation_enabled() -> bool {
+    module_compilation().unwrap_or(false)
+}
+
+/// The env var behind [`registry_url`].
+pub const REGISTRY_URL_ENV: &str = "TALOS_REGISTRY_URL";
+
+/// The OCI registry the shared module catalog is synced from, or `None`
+/// when this deployment seeds its catalog from the templates baked into
+/// the controller image.
+///
+/// The ONE reader. An empty or whitespace-only value is unset: a chart or
+/// compose placeholder (`TALOS_REGISTRY_URL=""`) once skipped the disk
+/// seed in one reader while the sync loop in another declined to start,
+/// and the controller came up with no catalog at all.
+pub fn registry_url() -> Option<String> {
+    registry_url_from(env::var(REGISTRY_URL_ENV).ok())
+}
+
+/// [`registry_url`] as a pure function of the value read.
+pub fn registry_url_from(raw: Option<String>) -> Option<String> {
+    raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
 /// Kill-switch for the boot-time warmup of LOCAL (Ollama) generation
 /// models. **Default ON.** Set `TALOS_LLM_BOOT_WARMUP=false|0|no|off` to
 /// skip it.
@@ -1427,15 +1482,10 @@ pub fn module_execution_retention_batch() -> i64 {
 /// resolver, the full set in the host limits) — so one env value could turn a
 /// control on at one layer and leave it off at the other.
 pub fn bool_env(var: &str) -> Option<bool> {
-    let raw = env::var(var).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Some(true),
-        "false" | "0" | "no" | "off" => Some(false),
-        _ => {
+    match read_bool_env(var) {
+        BoolEnv::Unset => None,
+        BoolEnv::Value(v) => Some(v),
+        BoolEnv::Unreadable(raw) => {
             tracing::warn!(
                 target: "talos_config",
                 event_kind = "env_bool_unrecognised_substituted",
@@ -1445,6 +1495,42 @@ pub fn bool_env(var: &str) -> Option<bool> {
             );
             None
         }
+    }
+}
+
+/// What a boolean env var says, with the unreadable case kept apart from
+/// the unset one. [`bool_env`] folds `Unreadable` into "unset" (and WARNs),
+/// which is right for a tuning flag and wrong for a switch that turns a
+/// capability OFF: there a typo must not leave the capability on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoolEnv {
+    /// Unset, or set to an empty / whitespace-only string.
+    Unset,
+    /// One of the tokens [`bool_env`] documents.
+    Value(bool),
+    /// Set to something that is not a boolean token (the raw value).
+    Unreadable(String),
+}
+
+/// Read `var` against the one boolean-token vocabulary without deciding
+/// what an unreadable value means.
+pub fn read_bool_env(var: &str) -> BoolEnv {
+    match env::var(var) {
+        Ok(raw) => parse_bool_env(&raw),
+        Err(_) => BoolEnv::Unset,
+    }
+}
+
+/// The token vocabulary itself, as a pure function of the raw value.
+pub fn parse_bool_env(raw: &str) -> BoolEnv {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return BoolEnv::Unset;
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => BoolEnv::Value(true),
+        "false" | "0" | "no" | "off" => BoolEnv::Value(false),
+        _ => BoolEnv::Unreadable(raw.to_string()),
     }
 }
 

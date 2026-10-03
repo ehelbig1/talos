@@ -349,6 +349,13 @@ The controller catalog has two source-of-truth modes, **mutually exclusive**:
 | **Disk-bundled** | `TALOS_REGISTRY_URL` unset | Templates baked into the controller image. No external dependency. To update a template, rebuild + redeploy the controller. Right for single-VM dev / first-deploy. |
 | **OCI registry** | `TALOS_REGISTRY_URL` set | Templates live as OCI artifacts (`ghcr.io/OWNER/talos-tools/{name}:{tag}`). Updates ship without redeploying the controller. Workers pull WASM from the registry at execution. Right for production multi-instance. |
 
+In OCI mode a deployment can also turn compiling off: `TALOS_MODULE_COMPILATION=false`
+in `/etc/talos/install.env` makes the controller refuse every compile, lint and
+catalog install, so the only modules it runs are the signed artifacts the
+registry provides. The controller will not start with compiling off and no
+`TALOS_REGISTRY_URL`. Leave it unset (on) if you write your own modules on the
+platform.
+
 #### Switching to OCI mode
 
 Disk-bundled is fine for single-VM Phase 1 — the only downside is "to

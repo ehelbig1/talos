@@ -399,6 +399,7 @@ impl CompilationService {
         name: &str,
         source_code: &str,
     ) -> Result<Vec<CompilationError>> {
+        self.ensure_enabled()?;
         // Run static lints first (instant, no compilation needed)
         let mut lint_warnings = lint_source_code(source_code);
 
@@ -407,10 +408,9 @@ impl CompilationService {
         // slot, so its children were outside the concurrency bound entirely.
         // It now waits for a slot like the lint path (same semaphore, same
         // 60 s wait) and every child it runs holds that slot until it is dead.
-        let slot = tokio::time::timeout(Duration::from_secs(60), super::acquire_compile_slot())
+        let slot = tokio::time::timeout(Duration::from_secs(60), self.acquire_slot())
             .await
-            .map_err(|_| anyhow::anyhow!("Source analysis queue full. Try again shortly."))?
-            .map_err(|_| anyhow::anyhow!("Compilation semaphore closed"))?;
+            .map_err(|_| anyhow::anyhow!("Source analysis queue full. Try again shortly."))??;
 
         let job_id = Uuid::new_v4();
 

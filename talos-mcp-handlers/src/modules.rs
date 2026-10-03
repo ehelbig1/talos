@@ -5086,7 +5086,7 @@ async fn handle_install_module_from_catalog(
             mcp_error(
                 req_id,
                 -32000,
-                "Compilation service error — see server logs",
+                talos_compilation::caller_facing_service_error(&e),
             )
         }
     }
@@ -5789,9 +5789,7 @@ async fn handle_get_catalog_status(
 
     // Mode: OCI sync owns the DB catalog when TALOS_REGISTRY_URL is set
     // (empty string treated as unset — the MCP-598 footgun).
-    let registry_url = std::env::var("TALOS_REGISTRY_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let registry_url = talos_config::registry_url();
     let mode = if registry_url.is_some() {
         "oci"
     } else {
@@ -6020,6 +6018,7 @@ async fn handle_get_catalog_status(
     let report = serde_json::json!({
         "mode": mode,
         "registry_url_set": registry_url.is_some(),
+        "module_compilation": module_compilation_report(state.compiler.compilation_enabled()),
         "disk": disk_read.as_ref().map(|d| serde_json::json!({
             "dir_exists": dir_exists,
             "template_count": d.len(),
@@ -6063,6 +6062,27 @@ async fn handle_get_catalog_status(
         req_id,
         &serde_json::to_string_pretty(&report).unwrap_or_default(),
     )
+}
+
+/// What `get_catalog_status` and `get_platform_info` say about the compile
+/// switch (`TALOS_MODULE_COMPILATION`). One wording for both.
+pub(crate) fn module_compilation_report(enabled: bool) -> serde_json::Value {
+    if enabled {
+        serde_json::json!({
+            "enabled": true,
+            "note": "Modules can be built from source on this deployment (compile, lint, \
+                     hot update, catalog install).",
+        })
+    } else {
+        serde_json::json!({
+            "enabled": false,
+            "note": "Module compilation is turned off (TALOS_MODULE_COMPILATION=false). \
+                     Nothing is built from source: compile_custom_sandbox, lint_sandbox, \
+                     hot_update_module, run_sandbox, compile_template, scratch sessions, \
+                     inline rust_code and install_module_from_catalog are refused. Workflows \
+                     use the shared catalog modules the registry sync provides.",
+        })
+    }
 }
 
 #[cfg(test)]
