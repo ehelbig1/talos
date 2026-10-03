@@ -12,6 +12,7 @@ impl wit_llm_tools::Host for TalosContext {
         &mut self,
         req: wit_llm_tools::ToolCompletionRequest,
     ) -> Result<wit_llm_tools::ToolCompletionResponse, wit_llm_tools::Error> {
+        self.host_call("llm-tools::complete-with-tools");
         // MCP-609 (2026-05-12): per-method capability gate. WIT linkage
         // restricts `talos:core/llm-tools` to llm-node, secrets-node,
         // database-node, agent-node, automation-node (verified by grep

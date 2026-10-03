@@ -1636,6 +1636,8 @@ async fn execute_job(
         // (`test_module`). A dispatched job always makes its real requests;
         // nothing on the wire can ask otherwise. Pinned by `rehearsal_pin.rs`.
         http_replay: None,
+        http_capture: None,
+        fuel_profile: None,
     };
 
     // Parse the capability world hint from the controller.  When present and non-Unknown,
@@ -2086,6 +2088,8 @@ async fn execute_pipeline_job(
                 // A dispatched step makes its real requests (see the
                 // single-job policy above).
                 http_replay: None,
+                http_capture: None,
+                fuel_profile: None,
             },
             user_id: Some(req.user_id),
             // Per-step in-worker retry policy (2026-07-24). HMAC-bound via

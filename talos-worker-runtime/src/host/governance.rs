@@ -13,6 +13,7 @@ use super::*;
 use crate::bindings::talos::core::governance;
 impl governance::Host for TalosContext {
     async fn request_approval(&mut self, reason: String) -> bool {
+        self.host_call("governance::request-approval");
         // MCP-655: per-method capability gate. Sibling of the
         // wit_messaging / wit_cache / wit_files inline checks that
         // MCP-586/601 made canonical for tier-3 sub-world Hosts.
@@ -315,6 +316,7 @@ impl wit_resource_quotas::Host for TalosContext {
         &mut self,
         metric: String,
     ) -> Result<wit_resource_quotas::UsageInfo, wit_resource_quotas::Error> {
+        self.host_call("resource-quotas::check-quota");
         if metric.is_empty() || metric.len() > MAX_QUOTA_METRIC_NAME_BYTES {
             return Err(wit_resource_quotas::Error::MetricNotFound);
         }
@@ -338,6 +340,7 @@ impl wit_resource_quotas::Host for TalosContext {
         metric: String,
         amount: u64,
     ) -> Result<wit_resource_quotas::UsageInfo, wit_resource_quotas::Error> {
+        self.host_call("resource-quotas::record-usage");
         if metric.is_empty() || metric.len() > MAX_QUOTA_METRIC_NAME_BYTES {
             return Err(wit_resource_quotas::Error::NotConfigured);
         }
@@ -380,6 +383,7 @@ impl wit_resource_quotas::Host for TalosContext {
     }
 
     async fn list_quotas(&mut self) -> Vec<wit_resource_quotas::UsageInfo> {
+        self.host_call("resource-quotas::list-quotas");
         let store = match self.quota_usage.lock() {
             Ok(s) => s,
             Err(_) => return vec![],

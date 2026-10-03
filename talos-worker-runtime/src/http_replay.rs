@@ -232,6 +232,112 @@ impl HttpReplay {
     }
 }
 
+/// Most responses one run's capture keeps.
+pub const MAX_CAPTURED: usize = MAX_FIXTURES;
+
+/// One response a real run received, in the shape a fixture has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedResponse {
+    pub method: &'static str,
+    pub host: String,
+    /// The URL path, without the query string (which can carry identifiers).
+    pub path: String,
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    responses: Vec<CapturedResponse>,
+    bytes: usize,
+    /// Responses that did not fit [`MAX_CAPTURED`] or the byte limit.
+    dropped: usize,
+}
+
+/// The responses a real `test_module` run received, kept so they can be
+/// replayed later as `http_fixtures`. Only the RESPONSE is kept: the request's
+/// headers and body carry resolved secrets and are never recorded. Bounded by
+/// count and by total body bytes; what does not fit is counted, not kept.
+pub struct HttpCapture {
+    max_total_bytes: usize,
+    state: Mutex<CaptureState>,
+}
+
+impl HttpCapture {
+    /// A capture holding at most [`MAX_TOTAL_BODY_BYTES`] of bodies, so that
+    /// everything it keeps can be handed back as one fixture set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_limit(MAX_TOTAL_BODY_BYTES)
+    }
+
+    #[must_use]
+    pub fn with_limit(max_total_bytes: usize) -> Self {
+        Self {
+            max_total_bytes,
+            state: Mutex::new(CaptureState::default()),
+        }
+    }
+
+    /// Keep one response, or count it as dropped when it does not fit.
+    pub fn record(
+        &self,
+        method: &'static str,
+        url: &url::Url,
+        status: u16,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.responses.len() >= MAX_CAPTURED
+            || state.bytes.saturating_add(body.len()) > self.max_total_bytes
+        {
+            state.dropped += 1;
+            return;
+        }
+        state.bytes += body.len();
+        let content_type = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone());
+        state.responses.push(CapturedResponse {
+            method,
+            host: url.host_str().unwrap_or_default().to_string(),
+            path: url.path().to_string(),
+            status,
+            content_type,
+            body: body.to_vec(),
+        });
+    }
+
+    /// What was kept, in the order the responses arrived, and how many were
+    /// dropped for not fitting.
+    #[must_use]
+    pub fn taken(&self) -> (Vec<CapturedResponse>, usize) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (state.responses.clone(), state.dropped)
+    }
+}
+
+/// Counts only: a captured body is somebody's data and is never printed.
+impl std::fmt::Debug for HttpCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        f.debug_struct("HttpCapture")
+            .field("responses", &state.responses.len())
+            .field("bytes", &state.bytes)
+            .field("dropped", &state.dropped)
+            .finish()
+    }
+}
+
+impl Default for HttpCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +470,53 @@ mod tests {
         )
         .unwrap_err()
         .contains("total"));
+    }
+
+    #[test]
+    fn a_capture_keeps_the_response_and_nothing_of_the_request() {
+        let capture = HttpCapture::new();
+        let url = url::Url::parse("https://api.example.test/v1/items?token=abc&cursor=9").unwrap();
+        capture.record(
+            "POST",
+            &url,
+            200,
+            &[
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Set-Cookie".to_string(), "session=1".to_string()),
+            ],
+            br#"{"items":[]}"#,
+        );
+        let (kept, dropped) = capture.taken();
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            kept,
+            vec![CapturedResponse {
+                method: "POST",
+                host: "api.example.test".to_string(),
+                path: "/v1/items".to_string(),
+                status: 200,
+                content_type: Some("application/json".to_string()),
+                body: br#"{"items":[]}"#.to_vec(),
+            }],
+            "no query string, and only the content type of the headers"
+        );
+    }
+
+    #[test]
+    fn what_does_not_fit_is_counted_not_kept() {
+        let url = url::Url::parse("https://api.example.test/a").unwrap();
+        let capture = HttpCapture::with_limit(10);
+        capture.record("GET", &url, 200, &[], b"12345678");
+        capture.record("GET", &url, 200, &[], b"123"); // 11 bytes in all: over
+        capture.record("GET", &url, 200, &[], b"12"); // fits
+        let (kept, dropped) = capture.taken();
+        assert_eq!((kept.len(), dropped), (2, 1));
+
+        let capture = HttpCapture::new();
+        for _ in 0..(MAX_CAPTURED + 3) {
+            capture.record("GET", &url, 204, &[], b"");
+        }
+        let (kept, dropped) = capture.taken();
+        assert_eq!((kept.len(), dropped), (MAX_CAPTURED, 3));
     }
 }

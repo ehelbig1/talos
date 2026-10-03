@@ -8,6 +8,7 @@ use super::*;
 
 impl wit_email::Host for TalosContext {
     async fn send(&mut self, msg: wit_email::Message) -> Result<(), wit_email::Error> {
+        self.host_call("email::send");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result: Result<(), wit_email::Error> = async move {

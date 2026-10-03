@@ -805,6 +805,7 @@ impl wit_graphql::Host for TalosContext {
         &mut self,
         req: wit_graphql::Request,
     ) -> Result<wit_graphql::Response, wit_graphql::Error> {
+        self.host_call("graphql::execute");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result = self.execute_graphql_inner(req, 0).await;
@@ -820,6 +821,7 @@ impl wit_graphql::Host for TalosContext {
         req: wit_graphql::Request,
         max_retries: u32,
     ) -> Result<wit_graphql::Response, wit_graphql::Error> {
+        self.host_call("graphql::execute-with-retry");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result = self.execute_graphql_inner(req, max_retries).await;

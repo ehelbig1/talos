@@ -307,6 +307,7 @@ impl wit_llm_streaming::Host for TalosContext {
         &mut self,
         req: wit_llm_streaming::StreamRequest,
     ) -> Result<String, wit_llm_streaming::Error> {
+        self.host_call("llm-streaming::start-stream");
         // MCP-697 (2026-05-13): audit-ledger parity (sibling of MCP-696).
         // The shared helper `require_llm_streaming_capability` is sync +
         // pure (takes `&CapabilityWorld`) so the audit emission can't
@@ -397,6 +398,7 @@ impl wit_llm_streaming::Host for TalosContext {
         &mut self,
         req: wit_llm_streaming::StreamToolRequest,
     ) -> Result<String, wit_llm_streaming::Error> {
+        self.host_call("llm-streaming::start-tool-stream");
         // MCP-697 (2026-05-13): audit-ledger parity — see start_stream above.
         let provider_label = req.provider.as_deref().unwrap_or("anthropic").to_string();
         if !matches!(
@@ -477,6 +479,7 @@ impl wit_llm_streaming::Host for TalosContext {
     }
 
     async fn next_event(&mut self, stream_id: String) -> Option<wit_llm_streaming::StreamEvent> {
+        self.host_call("llm-streaming::next-event");
         // Take the receiver out of the map so we don't hold the mutex during await.
         let mut rx = {
             let mut streams = self.streams.llm.lock().ok()?;
@@ -542,6 +545,7 @@ impl wit_llm_streaming::Host for TalosContext {
     }
 
     async fn cancel_stream(&mut self, stream_id: String) {
+        self.host_call("llm-streaming::cancel-stream");
         // Remove the receiver — the sender task will detect the closed channel and stop.
         if let Ok(mut streams) = self.streams.llm.lock() {
             streams.remove(&stream_id);

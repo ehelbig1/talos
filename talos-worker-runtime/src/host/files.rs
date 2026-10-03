@@ -8,6 +8,7 @@ use super::*;
 
 impl wit_files::Host for TalosContext {
     async fn read(&mut self, path: String) -> Result<Vec<u8>, wit_files::Error> {
+        self.host_call("files::read");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         // MCP-586: defense-in-depth — match the explicit capability
@@ -63,6 +64,7 @@ impl wit_files::Host for TalosContext {
     }
 
     async fn write(&mut self, path: String, contents: Vec<u8>) -> Result<(), wit_files::Error> {
+        self.host_call("files::write");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result: Result<(), wit_files::Error> = async move {
@@ -154,6 +156,7 @@ impl wit_files::Host for TalosContext {
     }
 
     async fn exists(&mut self, path: String) -> bool {
+        self.host_call("files::exists");
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
             self.capability_world,
@@ -178,6 +181,7 @@ impl wit_files::Host for TalosContext {
         &mut self,
         path: String,
     ) -> Result<wit_files::FileMetadata, wit_files::Error> {
+        self.host_call("files::metadata");
         // MCP-586: sibling defense-in-depth gate to `read`. The
         // `exists` accessor below already returns false for
         // non-Filesystem worlds; `metadata` returning a real result
@@ -216,6 +220,7 @@ impl wit_files::Host for TalosContext {
     }
 
     async fn list_dir(&mut self, path: String) -> Result<Vec<String>, wit_files::Error> {
+        self.host_call("files::list-dir");
         // MCP-586: sibling defense-in-depth gate. A non-Filesystem
         // module enumerating directory entries shouldn't even reach
         // the sandbox tempdir.
@@ -249,6 +254,7 @@ impl wit_files::Host for TalosContext {
     }
 
     async fn delete(&mut self, path: String) -> Result<(), wit_files::Error> {
+        self.host_call("files::delete");
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
             self.capability_world,

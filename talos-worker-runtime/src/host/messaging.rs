@@ -13,6 +13,7 @@ impl wit_messaging::Host for TalosContext {
         topic: String,
         payload: Vec<u8>,
     ) -> Result<(), wit_messaging::Error> {
+        self.host_call("messaging::publish");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result: Result<(), wit_messaging::Error> = async move {
@@ -140,6 +141,7 @@ impl wit_messaging::Host for TalosContext {
         &mut self,
         msg: wit_messaging::Message,
     ) -> Result<(), wit_messaging::Error> {
+        self.host_call("messaging::publish-with-headers");
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
             self.capability_world,
@@ -263,6 +265,7 @@ impl wit_messaging::Host for TalosContext {
         payload: Vec<u8>,
         timeout_ms: u32,
     ) -> Result<Vec<u8>, wit_messaging::Error> {
+        self.host_call("messaging::request");
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
             self.capability_world,
@@ -382,6 +385,7 @@ impl wit_messaging::Host for TalosContext {
 
 impl wit_events::Host for TalosContext {
     async fn emit(&mut self, event_type: String, payload: String) -> Result<(), wit_events::Error> {
+        self.host_call("events::emit");
         self.emit_with_metadata(event_type, payload, None).await
     }
 
@@ -391,6 +395,7 @@ impl wit_events::Host for TalosContext {
         payload: String,
         metadata: Option<String>,
     ) -> Result<(), wit_events::Error> {
+        self.host_call("events::emit-with-metadata");
         use crate::wit_inspector::CapabilityWorld;
         if matches!(
             self.capability_world,

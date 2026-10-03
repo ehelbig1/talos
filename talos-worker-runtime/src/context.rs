@@ -193,6 +193,15 @@ pub struct TalosContext {
     /// controller process (see [`crate::http_replay`]).
     pub http_replay: Option<std::sync::Arc<crate::http_replay::HttpReplay>>,
 
+    /// Keeps the responses a real run receives so they can be replayed later.
+    /// Set only from a hand-built `SecurityPolicy` in the controller process.
+    pub http_capture: Option<std::sync::Arc<crate::http_replay::HttpCapture>>,
+
+    /// The host call in progress, named by the call itself
+    /// ([`Self::host_call`]); read by the fuel profile's call hook when the
+    /// call returns. One store per host call, whether or not a profile is on.
+    pub(crate) host_call_label: &'static str,
+
     /// Pluggable secret provider — the single source of truth for all secret resolution.
     ///
     /// Backs three-tier secret access:
@@ -1588,6 +1597,8 @@ impl TalosContext {
             // None at construct time so non-declaring nodes add no header.
             idempotency_key: None,
             http_replay: None,
+            http_capture: None,
+            host_call_label: crate::fuel_profile::OTHER,
             provider,
             expose_call_count: std::sync::atomic::AtomicU64::new(0),
             secret_tier2_exposed: std::sync::atomic::AtomicBool::new(false),
@@ -2034,6 +2045,13 @@ impl TalosContext {
     /// answered from recordings. Every other HTTP surface calls this first and
     /// refuses when it returns true, so "a rehearsal sends nothing" holds for
     /// all of them rather than for the two that are replayed.
+    /// Name the host call now running, for the fuel profile. Every host
+    /// function calls this first; one that does not is reported as `other`.
+    #[inline]
+    pub(crate) fn host_call(&mut self, label: &'static str) {
+        self.host_call_label = label;
+    }
+
     pub(crate) async fn rehearsal_refuses(&mut self, surface: &'static str) -> bool {
         if self.http_replay.is_none() {
             return false;

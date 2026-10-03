@@ -137,6 +137,7 @@ impl wit_object_storage::Host for TalosContext {
         &mut self,
         req: wit_object_storage::PutRequest,
     ) -> Result<(), wit_object_storage::Error> {
+        self.host_call("object-storage::put");
         // MCP-697 (2026-05-13): audit-ledger parity (sibling of MCP-696).
         // `require_object_storage_capability` is sync/pure; inline the
         // audit at the call site before delegating. Pattern matches
@@ -243,6 +244,7 @@ impl wit_object_storage::Host for TalosContext {
         bucket: String,
         key: String,
     ) -> Result<wit_object_storage::GetResponse, wit_object_storage::Error> {
+        self.host_call("object-storage::get");
         // MCP-697 (2026-05-13): audit-ledger parity — see put above.
         if !matches!(
             self.capability_world,
@@ -380,6 +382,7 @@ impl wit_object_storage::Host for TalosContext {
         bucket: String,
         key: String,
     ) -> Result<(), wit_object_storage::Error> {
+        self.host_call("object-storage::delete");
         // MCP-697 (2026-05-13): audit-ledger parity — see put above.
         if !matches!(
             self.capability_world,
@@ -482,6 +485,7 @@ impl wit_object_storage::Host for TalosContext {
         prefix: Option<String>,
         max_keys: Option<u32>,
     ) -> Result<Vec<wit_object_storage::ListEntry>, wit_object_storage::Error> {
+        self.host_call("object-storage::list-objects");
         // MCP-697 (2026-05-13): audit-ledger parity — see put above.
         if !matches!(
             self.capability_world,

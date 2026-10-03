@@ -16,6 +16,7 @@ pub mod context;
 pub mod epoch_budget;
 pub mod error_sanitize;
 pub mod expose_fallback;
+pub mod fuel_profile;
 pub mod host;
 pub mod host_impl;
 pub mod http_replay;

@@ -13,6 +13,7 @@ impl wit_json::Host for TalosContext {
     /// Returns `Ok(())` if the string is valid JSON, `Err(Parseerror)` otherwise.
     /// Use `json::query` to parse and extract values in one call.
     async fn parse(&mut self, json_str: String) -> Result<(), wit_json::Error> {
+        self.host_call("json::parse");
         if let Err(_limit) = self.validate_json_size(&json_str, "json::parse") {
             return Err(wit_json::Error::Parseerror);
         }
@@ -25,6 +26,7 @@ impl wit_json::Host for TalosContext {
     }
 
     async fn query(&mut self, json_str: String, path: String) -> Result<String, wit_json::Error> {
+        self.host_call("json::query");
         // Use unified JSON size validation helper
         if let Err(_limit) = self.validate_json_size(&json_str, "json::query") {
             return Err(wit_json::Error::Parseerror);
@@ -38,6 +40,7 @@ impl wit_json::Host for TalosContext {
     }
 
     async fn merge(&mut self, json1: String, json2: String) -> Result<String, wit_json::Error> {
+        self.host_call("json::merge");
         // MCP-1049: route through the canonical `validate_json_size`
         // helper (worker/src/context.rs:978) so both inputs share the
         // OnceLock-cached env read, the MCP-772 `nonzero_env_or_default`
@@ -62,6 +65,7 @@ impl wit_json::Host for TalosContext {
     }
 
     async fn prettify(&mut self, json_str: String) -> Result<String, wit_json::Error> {
+        self.host_call("json::prettify");
         // MCP-1049: canonical `validate_json_size` helper.
         if self
             .validate_json_size(&json_str, "json::prettify")
@@ -75,6 +79,7 @@ impl wit_json::Host for TalosContext {
     }
 
     async fn minify(&mut self, json_str: String) -> Result<String, wit_json::Error> {
+        self.host_call("json::minify");
         // MCP-1049: canonical `validate_json_size` helper.
         if self.validate_json_size(&json_str, "json::minify").is_err() {
             return Err(wit_json::Error::Parseerror);
@@ -189,10 +194,12 @@ impl wit_datetime::Host for TalosContext {
         zone: String,
         timestamp: u64,
     ) -> Result<i32, wit_datetime::Error> {
+        self.host_call("datetime::local-offset-seconds");
         zone_offset_seconds(&zone, timestamp).ok_or(wit_datetime::Error::Invalidformat)
     }
 
     async fn now_unix(&mut self) -> u64 {
+        self.host_call("datetime::now-unix");
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -200,6 +207,7 @@ impl wit_datetime::Host for TalosContext {
     }
 
     async fn now_iso(&mut self) -> String {
+        self.host_call("datetime::now-iso");
         chrono::Utc::now().to_rfc3339()
     }
 
@@ -208,6 +216,7 @@ impl wit_datetime::Host for TalosContext {
         date_str: String,
         format: Option<String>,
     ) -> Result<u64, wit_datetime::Error> {
+        self.host_call("datetime::parse");
         // If a custom format is provided, use it via chrono's strftime parsing.
         if let Some(ref fmt) = format {
             if let Ok(dt) = chrono::DateTime::parse_from_str(&date_str, fmt) {
@@ -241,14 +250,17 @@ impl wit_datetime::Host for TalosContext {
         timestamp: u64,
         format: String,
     ) -> Result<String, wit_datetime::Error> {
+        self.host_call("datetime::format");
         format_unix_timestamp(timestamp, &format).map_err(|_| wit_datetime::Error::Invalidformat)
     }
 
     async fn add_seconds(&mut self, timestamp: u64, seconds: i64) -> u64 {
+        self.host_call("datetime::add-seconds");
         (timestamp as i64).saturating_add(seconds) as u64
     }
 
     async fn diff_seconds(&mut self, timestamp1: u64, timestamp2: u64) -> i64 {
+        self.host_call("datetime::diff-seconds");
         (timestamp1 as i64).saturating_sub(timestamp2 as i64)
     }
 }
@@ -385,6 +397,7 @@ impl wit_templates::Host for TalosContext {
         variables: String,
         _syntax: wit_templates::Syntax,
     ) -> Result<String, wit_templates::Error> {
+        self.host_call("templates::render");
         /// 1 MB template source limit — prevents parser memory exhaustion.
         const MAX_TEMPLATE_BYTES: usize = 1_000_000;
         /// 10 MB rendered output limit — prevents loop-amplification attacks.
@@ -455,6 +468,7 @@ impl wit_templates::Host for TalosContext {
         variables: String,
         syntax: wit_templates::Syntax,
     ) -> Result<String, wit_templates::Error> {
+        self.host_call("templates::render-file");
         let contents = <TalosContext as wit_files::Host>::read(self, path)
             .await
             .map_err(|_| wit_templates::Error::Parseerror)?;
@@ -583,6 +597,7 @@ impl wit_data_transform::Host for TalosContext {
         csv_input: String,
         options: Option<wit_data_transform::CsvOptions>,
     ) -> Result<String, wit_data_transform::Error> {
+        self.host_call("data-transform::csv-to-json");
         if csv_input.len() > MAX_CSV_BYTES {
             tracing::warn!(
                 "csv_to_json input too large ({} bytes, limit {})",
@@ -665,6 +680,7 @@ impl wit_data_transform::Host for TalosContext {
         json_input: String,
         options: Option<wit_data_transform::CsvOptions>,
     ) -> Result<String, wit_data_transform::Error> {
+        self.host_call("data-transform::json-to-csv");
         let delimiter = options
             .as_ref()
             .and_then(|o| o.delimiter.as_deref())
@@ -719,6 +735,7 @@ impl wit_data_transform::Host for TalosContext {
     }
 
     async fn xml_to_json(&mut self, xml: String) -> Result<String, wit_data_transform::Error> {
+        self.host_call("data-transform::xml-to-json");
         // MCP-1013: input-size cap, sibling parity with `csv_to_json`'s
         // MAX_CSV_BYTES gate. See MAX_XML_BYTES doc for full rationale.
         if xml.len() > MAX_XML_BYTES {
@@ -738,6 +755,7 @@ impl wit_data_transform::Host for TalosContext {
         json: String,
         root_element: String,
     ) -> Result<String, wit_data_transform::Error> {
+        self.host_call("data-transform::json-to-xml");
         // MCP-1013: input-size cap, sibling parity with the reverse
         // `xml_to_json` path and the canonical `csv_to_json` gate.
         // `json_value_to_xml` is unbounded-recursive and concatenates

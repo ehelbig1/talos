@@ -255,6 +255,21 @@ responses. When it is given, the run is a rehearsal and makes no request.
 Only `test_module` can do this. A dispatched job always makes its real
 requests.
 
+### Getting the recordings, and seeing where fuel goes
+
+* `capture_http: true` makes a REAL run that keeps the responses it received
+  and returns them as `http_captured.http_fixtures`, already in the shape
+  `http_fixtures` takes. Only responses are kept, never the request (its
+  headers and body carry resolved secrets); bodies pass the same redaction
+  stored module output passes; at most 64 responses and 8 MB. The run is not
+  retried. The reply can be large, so call it from a script, and replace
+  account data before a capture is kept anywhere shared.
+* `fuel_profile: true` adds `fuel_profile` to the reply: the run's fuel
+  charged to the host calls it was spent between. `guest[].after` names the
+  host call a stretch of module code followed (`start` for the code before the
+  first call), so "9.1 M after `http::fetch`" means parsing the response cost
+  9.1 M. It works on a real run and on a rehearsal.
+
 ## Module input contract
 
 Regardless of language, `run(input)` receives a **JSON-encoded string of the
