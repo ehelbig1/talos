@@ -57,14 +57,14 @@ use talos_metrics::McpToolOutcome;
 /// series — the whole point of the type being `&'static str`.
 pub const TOOL_LABEL_UNKNOWN: &str = "unknown";
 
-/// The one label value for a `*-v1` catalog-template invocation.
+/// The one label value for a call to a `*-v1` name.
 ///
-/// `handle_tools_call`'s tail routes any `-v1` name to
-/// `install_module_from_catalog`, and the catalog is DATA — its contents are
-/// rows, not literals in this binary — so a catalog name is as
-/// caller-influenced as any other string and must not be a label. One fixed
-/// value for the whole class keeps "a catalog template was invoked"
-/// distinguishable from "nobody recognised this name" at a cardinality of 1.
+/// Those names were catalog install shortcuts until 2026-10-03; a call to
+/// one is now refused with the tool that replaced it. The name is the
+/// caller's own string, so it must not be a label: one fixed value for the
+/// whole class keeps "a retired shortcut was called" distinguishable from
+/// "nobody recognised this name" at a cardinality of 1. The value is kept
+/// as it was, because the series is seeded and read under it.
 pub const TOOL_LABEL_CATALOG_TEMPLATE: &str = "catalog_template";
 
 /// Resolve a request's tool name to a label value from the closed set.

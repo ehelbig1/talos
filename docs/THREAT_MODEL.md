@@ -81,8 +81,9 @@ Talos is a workflow automation platform with user-submitted WASM module executio
 
 The MCP endpoint exposes several hundred static tools (the count is computed at
 runtime by `talos-mcp-handlers/src/lib.rs::static_tool_count` and rendered in the
-server instructions) plus dynamically registered catalog-template tools, via JSON-RPC over SSE and
-Streamable HTTP transports.
+server instructions), via JSON-RPC over SSE and Streamable HTTP transports. The tool list
+is fixed for the life of the process; catalog modules are not tools (they were, as install
+shortcuts, until 2026-10-03).
 
 ### Spoofing
 - **Threat:** Unauthenticated tool invocation; forged agent identity.

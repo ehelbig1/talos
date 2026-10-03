@@ -535,8 +535,7 @@ impl ModuleRegistry {
                 "SELECT id, name, COALESCE(category, kind) AS category, description, \
                         config_schema, allowed_hosts, allowed_methods, allowed_secrets, \
                         requires_approval_for, capability_world, \
-                        (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS is_compiled, \
-                        (user_id IS NULL) AS shared \
+                        (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS is_compiled \
                  FROM modules \
                  WHERE COALESCE(category, kind) = $1 AND (user_id IS NULL OR user_id = $2) \
                  ORDER BY name ASC, id ASC",
@@ -550,8 +549,7 @@ impl ModuleRegistry {
                 "SELECT id, name, COALESCE(category, kind) AS category, description, \
                         config_schema, allowed_hosts, allowed_methods, allowed_secrets, \
                         requires_approval_for, capability_world, \
-                        (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS is_compiled, \
-                        (user_id IS NULL) AS shared \
+                        (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS is_compiled \
                  FROM modules \
                  WHERE user_id IS NULL OR user_id = $1 \
                  ORDER BY name ASC, id ASC",
@@ -1846,11 +1844,6 @@ pub struct NodeTemplateMetadata {
     /// `wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0`, computed in
     /// SQL so a listing never loads the binary to ask whether it exists.
     pub is_compiled: bool,
-    /// The row is the shared catalog's (`user_id IS NULL`), not the caller's
-    /// own copy. A catalog module a user has installed is listed twice under
-    /// one name — the catalog row and their copy — and a reader that shows
-    /// one entry per name needs to know which is which.
-    pub shared: bool,
 }
 
 /// SQL fragment: the rows this cache sweep is permitted to EVICT (NULL the

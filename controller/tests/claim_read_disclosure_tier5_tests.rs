@@ -731,73 +731,68 @@ async fn two_failed_alternative_searches_refuse_rather_than_reporting_none() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 11. `get_platform_info` — an unread catalog is null, and so is the total.
+// 11. `get_platform_info` — the tool count depends on no read.
+//
+// Until 2026-10-03 the report counted one tool per catalog module, from two
+// reads that could fail, and this test held an unread catalog to `null`.
+// Catalog modules are no longer tools: the count is the static tools, and a
+// catalog that cannot be read changes nothing about it.
 // ───────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn an_unread_catalog_listing_nulls_the_tool_counts_rather_than_zeroing_them() {
+async fn the_tool_count_is_the_static_tools_whatever_the_catalog_holds() {
     let (pool, _db) = common::isolated_db_pool().await;
     let user_id = seed_user(&pool).await;
     seed_module(&pool, None, "p32-catalog-entry").await;
     let state = mcp_state(pool.clone()).await;
 
-    // CONTROL: the healthy report carries three numbers that add up.
-    let ok = controller::mcp::platform::dispatch(
-        "get_platform_info",
-        Some(serde_json::json!(1)),
-        &serde_json::json!({}),
-        &state,
-        agent(user_id),
-    )
-    .await
-    .expect("get_platform_info is dispatched");
-    let healthy = text_json(&ok);
+    let report = |id: i64| {
+        let state = &state;
+        async move {
+            let reply = controller::mcp::platform::dispatch(
+                "get_platform_info",
+                Some(serde_json::json!(id)),
+                &serde_json::json!({}),
+                state,
+                agent(user_id),
+            )
+            .await
+            .expect("get_platform_info is dispatched");
+            text_json(&reply)
+        }
+    };
+
+    let healthy = report(1).await;
     let stat = healthy
         .get("static_tool_count")
         .and_then(Value::as_i64)
         .expect("static count");
-    let cat = healthy
-        .get("catalog_tool_count")
-        .and_then(Value::as_i64)
-        .expect("catalog count is measured on a healthy tree");
+    assert!(stat > 300, "the static tools are counted: {stat}");
     assert_eq!(
         healthy.get("total_mcp_tools").and_then(Value::as_i64),
-        Some(stat + cat),
-        "control: the note's arithmetic must hold: {healthy}"
+        Some(stat),
+        "every tool is static: {healthy}"
+    );
+    assert!(
+        healthy.get("catalog_tool_count").is_none(),
+        "a catalog module is not a tool, so there is no count of them: {healthy}"
     );
     assert!(healthy.get("measurement").is_none());
 
+    // A catalog that cannot be listed changes neither number, and nothing is
+    // reported as unmeasured: the report no longer reads it.
     drop_column(&pool, "modules", "config_schema").await;
-
-    let degraded = controller::mcp::platform::dispatch(
-        "get_platform_info",
-        Some(serde_json::json!(2)),
-        &serde_json::json!({}),
-        &state,
-        agent(user_id),
-    )
-    .await
-    .expect("get_platform_info is dispatched");
-    let body = text_json(&degraded);
-    assert!(
-        body.get("catalog_tool_count")
-            .map(Value::is_null)
-            .unwrap_or(false),
-        "an unread catalog must be null, never 0: {body}"
-    );
-    assert!(
-        body.get("total_mcp_tools")
-            .map(Value::is_null)
-            .unwrap_or(false),
-        "a total derived from an unread half must be null too — pre-fix it \
-         silently equalled static_tool_count: {body}"
+    let after = report(2).await;
+    assert_eq!(
+        after.get("total_mcp_tools").and_then(Value::as_i64),
+        Some(stat),
+        "{after}"
     );
     assert_eq!(
-        body.get("static_tool_count").and_then(Value::as_i64),
-        Some(stat),
-        "the measured half must survive: {body}"
+        after.get("static_tool_count").and_then(Value::as_i64),
+        Some(stat)
     );
-    assert!(not_measured(&body).contains(&"catalog_tool_count".to_string()));
+    assert!(after.get("measurement").is_none(), "{after}");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

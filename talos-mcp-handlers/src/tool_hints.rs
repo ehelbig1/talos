@@ -80,9 +80,12 @@ use std::sync::LazyLock;
 
 use serde_json::Value;
 
-/// The canonical list of this crate's static tool-schema modules.
+/// The canonical list of this crate's static tool-schema modules, in the
+/// order `tools/list` serves them: meta and discovery tools first, so a
+/// client that truncates by position keeps `session_start`,
+/// `get_platform_info` and `tool_search`.
 ///
-/// Single source of truth for schema introspection. `static_tool_count()` in
+/// Single source of truth for schema introspection and for `tools/list`. `static_tool_count()` in
 /// `lib.rs` deliberately keeps its own independent sum rather than delegating
 /// here — `advertised_count_matches_static_tool_count` compares the two, and a
 /// pin whose expected value is derived from the pinned value proves nothing.
@@ -139,10 +142,6 @@ pub fn declared_tool_params() -> &'static BTreeMap<String, BTreeSet<String>> {
 }
 
 /// True when `name` is a tool this server advertises in `tools/list`.
-///
-/// Catalog-template tools are registered dynamically and are NOT included —
-/// no authoring hint names one, and treating an unknown name as declared would
-/// defeat the check.
 pub fn is_declared_tool(name: &str) -> bool {
     declared_tool_params().contains_key(name)
 }

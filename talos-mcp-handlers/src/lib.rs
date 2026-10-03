@@ -199,7 +199,7 @@ mod tests;
 // Utility functions (re-exported from utils submodule)
 // ============================================================================
 
-use utils::{mcp_error, sanitize_tool_name};
+use utils::mcp_error;
 
 // -----------------------------------------------------------------------------
 // MCP Types (re-exported from types submodule)
@@ -573,7 +573,7 @@ pub fn create_router(
                     let response = match payload.method.as_str() {
                         "initialize" => handle_initialize(payload),
                         "tools/list" => {
-                            handle_tools_list(payload, state.registry.clone(), agent.clone()).await
+                            handle_tools_list(payload)
                         }
                         "tools/call" => {
                             handle_tools_call(payload, state.clone(), agent.clone()).await
@@ -637,35 +637,6 @@ fn local_identity_refusal(id: Option<serde_json::Value>) -> JsonRpcResponse {
 
 /// Establish an SSE connection (acting as an MCP transport).
 /// Includes periodic token revalidation to propagate session revocations.
-/// Process-wide "the tool set changed" signal. Live SSE / streamable-HTTP
-/// GET streams subscribe and forward `notifications/tools/list_changed`
-/// to their client, so a module install / rename / delete registers or
-/// retires dynamic template tools in ALREADY-CONNECTED sessions instead
-/// of only at reconnect (2026-07-18 retrospective: tools added after a
-/// session started were uncallable until the client reconnected).
-/// Channel of () — receivers re-fetch tools/list themselves; lagged
-/// receivers still learn "something changed", which is all the signal
-/// carries.
-static TOOLS_CHANGED: std::sync::OnceLock<broadcast::Sender<()>> = std::sync::OnceLock::new();
-
-fn tools_changed_channel() -> &'static broadcast::Sender<()> {
-    TOOLS_CHANGED.get_or_init(|| broadcast::channel(16).0)
-}
-
-/// Signal every connected MCP stream that tools/list should be re-fetched.
-/// Fire-and-forget: with no connected listeners `send` errs, which is fine.
-pub(crate) fn notify_tools_list_changed() {
-    let _ = tools_changed_channel().send(());
-}
-
-fn list_changed_event() -> Event {
-    let data = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/tools/list_changed"
-    });
-    Event::default().event("message").data(data.to_string())
-}
-
 async fn sse_handler(
     State(state): State<McpState>,
     axum::extract::Extension(agent): axum::extract::Extension<std::sync::Arc<auth::AgentIdentity>>,
@@ -699,21 +670,6 @@ async fn sse_handler(
             let event = Event::default().event("message").data(data.to_string());
             if tx_notif.send(event).is_err() {
                 break; // client disconnected — stop sending
-            }
-        }
-    });
-
-    // Forward the process-wide tools-changed signal into this agent's
-    // stream for as long as the client is connected.
-    let tx_changes = tx.clone();
-    tokio::spawn(async move {
-        let mut rx = tools_changed_channel().subscribe();
-        // Lagged still means "something changed" — forward it; the loop
-        // ends on channel close (never for the static sender) or client
-        // disconnect (send error).
-        while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
-            if tx_changes.send(list_changed_event()).is_err() {
-                break; // client disconnected
             }
         }
     });
@@ -871,7 +827,7 @@ async fn message_handler(
 
     let response = match payload.method.as_str() {
         "initialize" => handle_initialize(payload),
-        "tools/list" => handle_tools_list(payload, state.registry.clone(), agent.clone()).await,
+        "tools/list" => handle_tools_list(payload),
         "tools/call" => handle_tools_call(payload, state.clone(), agent.clone()).await,
         "resources/list" => {
             handle_resources_list(payload, state.db_pool.clone(), agent.clone()).await
@@ -957,7 +913,7 @@ async fn streamable_http_handler(
     // Dispatch to the same handlers used by the SSE path
     let response = match payload.method.as_str() {
         "initialize" => handle_initialize(payload),
-        "tools/list" => handle_tools_list(payload, state.registry.clone(), agent.clone()).await,
+        "tools/list" => handle_tools_list(payload),
         "tools/call" => handle_tools_call(payload, state.clone(), agent.clone()).await,
         "resources/list" => {
             handle_resources_list(payload, state.db_pool.clone(), agent.clone()).await
@@ -1013,21 +969,11 @@ async fn streamable_http_get_handler(
                 Event::default().event("message").data(data.to_string())
             );
         }
-        let mut rx = tools_changed_channel().subscribe();
+        // The tool list is fixed for the life of the process (2026-10-03),
+        // so nothing follows but keepalives.
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                    yield Ok::<_, Infallible>(Event::default().comment("keepalive"));
-                }
-                res = rx.recv() => {
-                    match res {
-                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            yield Ok::<_, Infallible>(list_changed_event());
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            yield Ok::<_, Infallible>(Event::default().comment("keepalive"));
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
@@ -1051,21 +997,11 @@ async fn local_get_handler() -> impl IntoResponse {
                 Event::default().event("message").data(data.to_string())
             );
         }
-        let mut rx = tools_changed_channel().subscribe();
+        // The tool list is fixed for the life of the process (2026-10-03),
+        // so nothing follows but keepalives.
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                    yield Ok::<_, Infallible>(Event::default().comment("keepalive"));
-                }
-                res = rx.recv() => {
-                    match res {
-                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            yield Ok::<_, Infallible>(list_changed_event());
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            yield Ok::<_, Infallible>(Event::default().comment("keepalive"));
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
@@ -1139,7 +1075,8 @@ pub(crate) fn handle_initialize(req: JsonRpcRequest) -> JsonRpcResponse {
 
     let instructions = format!(
         "This is the Talos workflow-automation platform. Server version: {}. \
-         It has {}+ tools (plus dynamically registered catalog templates). \
+         It has {} tools. Catalog modules are not tools: find one with list_module_catalog and \
+         install it with install_module_from_catalog. \
          SCHEMA FRESHNESS: Call session_start() at the beginning of every session. \
          It returns the current server version under 'server_version'. If this differs from \
          what your cached tools/list shows, your schema is stale — reconnect or call tools/list again. \
@@ -1195,235 +1132,58 @@ async fn handle_resources_read(
     resources::handle_resources_read(req, db_pool, execution_repo, agent).await
 }
 
-/// The name a catalog module is listed under as a tool.
-fn catalog_tool_name(module_name: &str) -> String {
-    format!("{}-v1", sanitize_tool_name(module_name))
-}
-
-/// One row per catalog tool name, in the order given.
+/// `tools/list`: the static tools, and nothing else.
 ///
-/// A catalog module the caller has installed exists twice — the shared
-/// catalog row and their own copy, same name — and until 2026-10-03 both were
-/// listed, as two tools with ONE name (six such pairs on the reference
-/// deployment, 21 KB of schema). A tool name must be unique: a client keeps
-/// one of the two, or rejects the list. The shared row wins, because calling
-/// the tool installs from the catalog, so the catalog's description and
-/// config schema are the ones that describe what the call does; an installed
-/// copy can be older than the catalog. A name only the caller's rows carry
-/// keeps its first row.
-fn one_row_per_catalog_tool(
-    templates: Vec<talos_registry::NodeTemplateMetadata>,
-) -> Vec<talos_registry::NodeTemplateMetadata> {
-    let mut kept: Vec<talos_registry::NodeTemplateMetadata> = Vec::with_capacity(templates.len());
-    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for t in templates {
-        match at.get(&catalog_tool_name(&t.name)) {
-            None => {
-                at.insert(catalog_tool_name(&t.name), kept.len());
-                kept.push(t);
-            }
-            Some(&i) if t.shared && !kept[i].shared => kept[i] = t,
-            Some(_) => {}
-        }
-    }
-    kept
-}
-
-async fn handle_tools_list(
-    req: JsonRpcRequest,
-    registry: std::sync::Arc<ModuleRegistry>,
-    agent: std::sync::Arc<auth::AgentIdentity>,
-) -> JsonRpcResponse {
-    // 2026-09-10: TENANT-SCOPED and METADATA-ONLY. `list_templates(None)`
-    // read every tenant's `modules` rows WITH their `wasm_bytes` and
-    // `source_code` on every `tools/list` — a cross-tenant enumeration and a
-    // full-catalog blob load per call. An agent with no user scope passes
-    // `Uuid::nil()`, which yields the shared catalog alone.
-    let templates: Vec<talos_registry::NodeTemplateMetadata> = match registry
-        .list_template_metadata_for_user(agent.user_id.unwrap_or_else(uuid::Uuid::nil), None)
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            // MCP-337 (2026-05-11): pre-fix the error response embedded
-            // the raw `e: anyhow::Error` from registry.list_templates
-            // — sqlx/Postgres errors can carry connection strings,
-            // schema names, and the failing query text. Same MCP-217
-            // redaction family as the Ollama handlers. Log the full
-            // error server-side; return a generic message to the
-            // caller.
-            tracing::error!(
-                target: "talos_mcp",
-                event_kind = "tools_list_db_error",
-                error = ?e,
-                "list_templates query failed"
-            );
-            return JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: req.id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32000,
-                    message:
-                        "Database error: failed to list catalog templates (see controller logs)"
-                            .to_string(),
-                    data: None,
-                }),
-                error_kind: None,
-            };
-        }
-    };
-
-    // Local handle to the registry's pool; named `mcp_pool` (not
-    // `state_db_pool`) to avoid name-clash confusion with the
-    // worker's deleted `state_db_pool` field. This is just the
-    // controller's primary Postgres connection.
-    let mcp_pool = registry.db_pool.clone();
-
-    // Static tools ordered by priority: meta/discovery tools first so they appear
-    // in any client that truncates by position. session_start, tool_search, and
-    // get_platform_info must always be reachable regardless of client tool limits.
-    //
-    // Priority ordering:
-    //   1. advanced  — session_start, restore_pinned_modules (session lifecycle)
-    //   2. platform  — get_platform_info, get_platform_hygiene_report (health)
-    //   3. search    — tool_search, search_workflows, search_modules (discovery)
-    //   4. workflows — create_workflow, trigger_workflow, … (core ops)
-    //   5. modules   — list_modules, delete_module, … (module management)
-    //   6. sandbox   — compile_custom_sandbox, run_sandbox, … (compilation)
-    //   7. executions — get_execution_status, list_executions, … (results)
-    //   8–17: remaining domains by rough usage frequency
-    let mut tools: Vec<serde_json::Value> = [
-        advanced::tool_schemas(),   // positions  0–~25  — session_start FIRST
-        platform::tool_schemas(),   // positions ~26–~35  — get_platform_info
-        search::tool_schemas(),     // positions ~36–~47  — tool_search
-        workflows::tool_schemas(),  // positions ~48–~83  — core workflow ops
-        modules::tool_schemas(),    // positions ~84–~100 — module management
-        sandbox::tool_schemas(),    // positions ~101–~109 — compilation
-        executions::tool_schemas(), // positions ~110–~141 — execution results
-        actor::tool_schemas(),      // positions ~142–~168 — actor management
-        analytics::tool_schemas(),  // positions ~169–~200 — analytics
-        secrets::tool_schemas(),
-        schedules::tool_schemas(),
-        versions::tool_schemas(),
-        webhooks::tool_schemas(),
-        graph::tool_schemas(),
-        knowledge_graph::tool_schemas(),
-        alerts::tool_schemas(),
-        ops_alerts::tool_schemas(),
-        schemas::tool_schemas(),
-        ollama::tool_schemas(),
-        ml::tool_schemas(),
-        evaluation::tool_schemas(),
-    ]
-    .concat();
-
-    // Batch-fetch capability worlds for all templates in a single query (avoids N+1)
-    let template_ids: Vec<uuid::Uuid> = templates.iter().map(|t| t.id).collect();
-    let mod_repo = talos_module_repository::ModuleRepository::new(mcp_pool.clone());
-    let world_rows = mod_repo
-        .list_template_world_overrides(&template_ids)
-        .await
-        .unwrap_or_default();
-
-    let world_map: std::collections::HashMap<uuid::Uuid, String> = world_rows.into_iter().collect();
-
-    for t in one_row_per_catalog_tool(templates) {
-        // Skip non-executable template categories from the direct tool list:
-        // - sandbox: user-created sandboxes (available via list_modules)
-        // - workflow_template: saved workflow graphs (not Rust code, can't be JIT compiled)
-        if t.category == "sandbox" || t.category == "workflow_template" {
-            continue;
-        }
-
-        let template_world = world_map
-            .get(&t.id)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let world_base = talos_capability_world::world_short(&template_world);
-        let has_cap = agent.has_capability(world_base)
-            || agent
-                .allowed_capabilities
-                .iter()
-                .any(|c| format!("{}-node", c) == template_world);
-        if !has_cap && template_world != "minimal" {
-            continue;
-        }
-
-        // MCP TypeScript SDK clients (incl. Claude Code 2025+) validate every
-        // tool's inputSchema with strict Zod and require `type: "object"`.
-        // A SINGLE malformed schema causes the client to silently drop the
-        // ENTIRE tools/list response — every tool disappears from the UI.
-        // Catalog rows that persist `config_schema: {}` (empty object) or any
-        // value lacking `type: "object"` triggered exactly this in the wild
-        // (compute_window-v1 + persist-v1, 2026-04-23). Normalize defensively.
-        let default_schema = || {
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "input": {
-                        "type": "string",
-                        "description": "Input data for the node"
-                    }
-                },
-                "required": ["input"]
-            })
-        };
-        let input_schema = match t.config_schema {
-            serde_json::Value::Null => default_schema(),
-            serde_json::Value::Object(mut obj) => {
-                if obj.get("type").and_then(|v| v.as_str()) != Some("object") {
-                    obj.insert("type".to_string(), serde_json::json!("object"));
-                }
-                if !obj.contains_key("properties") {
-                    obj.insert("properties".to_string(), serde_json::json!({}));
-                }
-                serde_json::Value::Object(obj)
-            }
-            // Non-null, non-object value (string/number/array/bool) is invalid
-            // as a JSON Schema — replace with the safe default rather than
-            // emit something Zod will reject.
-            _ => default_schema(),
-        };
-
-        let base_desc = t.description.unwrap_or_default();
-        let raw_slug = sanitize_tool_name(&t.name).to_lowercase().replace('_', "-");
-        let catalog_slug = raw_slug
-            .split('-')
-            .filter(|p| !p.is_empty())
-            .collect::<Vec<_>>()
-            .join("-");
-        let full_desc = format!(
-            "{base_desc} \
-             [Catalog module: calling this tool installs it and returns a module_id \
-             ready for add_node_to_workflow. Equivalent to install_module_from_catalog(name: '{}').]",
-            catalog_slug
-        );
-        tools.push(serde_json::json!({
-            "name": catalog_tool_name(&t.name),
-            "description": full_desc,
-            "inputSchema": input_schema
-        }));
-    }
-
-    // Return all tools in a single response — no pagination.
-    //
-    // MCP pagination is optional (servers MAY support it). The overwhelming majority
-    // of MCP clients do NOT follow nextCursor, so paginating silently hides tools
-    // from clients that only issue one tools/list request. Returning all tools at once
-    // is both spec-compliant and universally compatible.
-    //
-    // Size budget: ~320 static tools (`static_tool_count()` is the live number —
-    // a hardcoded count here drifted 275→320 undetected) × ~700 bytes ≈ 220 KB —
-    // well within limits for stdio, SSE, and Streamable HTTP transports.
+/// Until 2026-10-03 the reply also carried one tool per catalog module
+/// (`<Name>-v1`), each an install shortcut whose input schema was the
+/// module's config. Measured on the reference deployment: 98 of 456 tools
+/// and 166 KB of a 549 KB reply (about 41,000 tokens of 137,000), read by
+/// every client at every connect, to offer what two static tools already
+/// do — `list_module_catalog` finds a module and `install_module_from_catalog`
+/// installs it. 22 of the 98 were not catalog modules at all (a caller's own
+/// modules outside the `sandbox` category); calling one failed.
+///
+/// With them gone the reply no longer depends on the caller or the database:
+/// no catalog read per `tools/list`, and no reason to tell connected clients
+/// the list changed when a module is installed, renamed or deleted.
+///
+/// Returned whole, with no pagination: MCP pagination is optional, most
+/// clients do not follow `nextCursor`, and a paginated list silently hides
+/// tools from a client that issues one request.
+///
+/// Order is by priority, meta and discovery tools first, so a client that
+/// truncates by position keeps `session_start`, `get_platform_info` and
+/// `tool_search`. The order is `tool_hints::all_static_schema_modules`'s.
+fn handle_tools_list(req: JsonRpcRequest) -> JsonRpcResponse {
+    static TOOLS: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
+        let tools: Vec<serde_json::Value> = tool_hints::all_static_schema_modules()
+            .into_iter()
+            .flat_map(|(_module, schemas)| schemas)
+            .collect();
+        serde_json::json!({ "tools": tools })
+    });
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id: req.id,
-        result: Some(serde_json::json!({ "tools": tools })),
+        result: Some(TOOLS.clone()),
         error: None,
         error_kind: None,
     }
+}
+
+/// The catalog slug a retired `<Name>-v1` shortcut stood for, when `name`
+/// has that shape: the suffix removed, lower-cased, underscores to hyphens,
+/// runs of hyphens collapsed (`Stripe__Create_Customer-v1` →
+/// `stripe-create-customer`).
+fn retired_catalog_shortcut(name: &str) -> Option<String> {
+    let sanitized = name.strip_suffix("-v1")?;
+    let raw = sanitized.to_lowercase().replace('_', "-");
+    let slug = raw
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    (!slug.is_empty()).then_some(slug)
 }
 
 /// The ONE `tools/call` chokepoint, and the ONE observation point for the
@@ -1637,32 +1397,22 @@ async fn handle_tools_call_inner(
         return decorate(r);
     }
 
-    // Dynamic catalog template tools (e.g. "Redis_Cache-v1", "HTTP_Request-v1") are in the
-    // manifest but have no static dispatch handler.  When called directly, route them to
-    // install_module_from_catalog so the module gets compiled and the caller receives a
-    // module_id ready for add_node_to_workflow.  The "-v1" suffix is stripped and the
-    // remaining sanitized name is lowercased + underscores-to-hyphens to recover the catalog slug.
-    if let Some(sanitized) = name.strip_suffix("-v1") {
-        // Collapse consecutive hyphens that arise from double-underscore display names
-        // (e.g. "Stripe__Create_Customer" → "stripe--create-customer" → "stripe-create-customer").
-        let raw = sanitized.to_lowercase().replace('_', "-");
-        let slug = raw
-            .split('-')
-            .filter(|p| !p.is_empty())
-            .collect::<Vec<_>>()
-            .join("-");
-        let install_args = serde_json::json!({ "name": slug });
-        if let Some(r) = modules::dispatch(
-            "install_module_from_catalog",
-            req.id.clone(),
-            &install_args,
-            &state,
-            agent.clone(),
-        )
-        .await
-        {
-            return r;
-        }
+    // A `<Name>-v1` name was a catalog install shortcut until 2026-10-03.
+    // A client holding a tool list from before then can still call one: it
+    // is told what replaced it rather than only that the name is unknown.
+    // Nothing is installed from here — `install_module_from_catalog` is the
+    // one route, with its own arguments, grants and audit record.
+    if let Some(slug) = retired_catalog_shortcut(name) {
+        return mcp_error(
+            req.id,
+            -32601,
+            &format!(
+                "'{name}' is not a tool: catalog install shortcuts are no longer listed. \
+                 Call install_module_from_catalog(name: \"{slug}\") to install that module, or \
+                 list_module_catalog(query: \"…\") to find one and see whether it needs \
+                 installing at all."
+            ),
+        );
     }
 
     // -32601 = MethodNotFound per JSON-RPC 2.0.
@@ -1682,76 +1432,79 @@ async fn handle_tools_call_inner(
 }
 
 #[cfg(test)]
-mod catalog_tool_dedup_tests {
+mod static_tool_list_tests {
     use super::*;
 
-    fn row(name: &str, shared: bool, description: &str) -> talos_registry::NodeTemplateMetadata {
-        talos_registry::NodeTemplateMetadata {
-            id: uuid::Uuid::new_v4(),
-            name: name.to_string(),
-            category: "catalog".to_string(),
-            description: Some(description.to_string()),
-            config_schema: serde_json::json!({}),
-            allowed_hosts: vec![],
-            allowed_methods: vec![],
-            allowed_secrets: vec![],
-            requires_approval_for: vec![],
-            capability_world: "minimal-node".to_string(),
-            is_compiled: true,
-            shared,
+    fn listed() -> Vec<serde_json::Value> {
+        let reply = handle_tools_list(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: None,
+        });
+        reply.result.expect("a result")["tools"]
+            .as_array()
+            .expect("tools")
+            .clone()
+    }
+
+    /// The reply is the static tools: every one, once, and no catalog
+    /// shortcut. It needs no database and no caller, which is the point.
+    #[test]
+    fn the_tool_list_is_the_static_tools_and_nothing_else() {
+        let tools = listed();
+        assert_eq!(tools.len(), static_tool_count());
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().expect("a name"))
+            .collect();
+        let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "a tool name is listed twice");
+        let shortcuts: Vec<&&str> = names
+            .iter()
+            .filter(|n| retired_catalog_shortcut(n).is_some())
+            .collect();
+        assert!(
+            shortcuts.is_empty(),
+            "catalog shortcuts are listed again: {shortcuts:?}"
+        );
+        // What replaced them is there.
+        for needed in [
+            "list_module_catalog",
+            "install_module_from_catalog",
+            "get_module_info",
+        ] {
+            assert!(names.contains(&needed), "{needed} is not listed");
         }
+        // Meta tools first, for a client that truncates by position.
+        assert_eq!(names[0], "session_start");
+        assert_eq!(listed(), tools, "two calls give one list");
     }
 
     #[test]
-    fn an_installed_copy_does_not_list_its_catalog_module_twice() {
-        // The query orders by name then id, so either row can come first.
-        for own_first in [true, false] {
-            let rows = if own_first {
-                vec![
-                    row("LLM Inference", false, "mine"),
-                    row("LLM Inference", true, "catalog"),
-                    row("Echo Debug", true, "catalog"),
-                ]
-            } else {
-                vec![
-                    row("LLM Inference", true, "catalog"),
-                    row("LLM Inference", false, "mine"),
-                    row("Echo Debug", true, "catalog"),
-                ]
-            };
-            let kept = one_row_per_catalog_tool(rows);
-            let names: Vec<String> = kept.iter().map(|t| catalog_tool_name(&t.name)).collect();
-            assert_eq!(
-                names,
-                ["LLM_Inference-v1", "Echo_Debug-v1"],
-                "own_first={own_first}"
-            );
-            assert_eq!(
-                kept[0].description.as_deref(),
-                Some("catalog"),
-                "the catalog row describes the tool"
-            );
+    fn a_retired_shortcut_names_the_slug_it_stood_for() {
+        assert_eq!(
+            retired_catalog_shortcut("HTTP_Request-v1").as_deref(),
+            Some("http-request")
+        );
+        assert_eq!(
+            retired_catalog_shortcut("Stripe__Create_Customer-v1").as_deref(),
+            Some("stripe-create-customer")
+        );
+        assert_eq!(
+            retired_catalog_shortcut("Send_HTML_Email__Gmail_-v1").as_deref(),
+            Some("send-html-email-gmail")
+        );
+        // Not that shape: an ordinary unknown name gets the ordinary answer.
+        for name in ["create_workflow", "schedule_wf", "-v1", "__-v1", "Thing-v2"] {
+            assert_eq!(retired_catalog_shortcut(name), None, "{name}");
         }
-    }
-
-    #[test]
-    fn names_that_sanitise_to_one_tool_name_are_one_tool() {
-        // What must be unique is the TOOL name, not the module name.
-        let (a, b) = ("Gmail: List", "Gmail; List");
-        assert_ne!(a, b);
-        assert_eq!(catalog_tool_name(a), catalog_tool_name(b), "premise");
-        let kept = one_row_per_catalog_tool(vec![row(a, false, "mine"), row(b, true, "catalog")]);
-        assert_eq!(kept.len(), 1);
-        assert!(kept[0].shared);
-    }
-
-    #[test]
-    fn a_module_only_the_caller_has_is_still_listed_once() {
-        let kept = one_row_per_catalog_tool(vec![
-            row("My Tool", false, "first"),
-            row("My Tool", false, "second"),
-        ]);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].description.as_deref(), Some("first"));
+        // No static tool has the shape, so none is shadowed by the refusal.
+        for (_module, schemas) in tool_hints::all_static_schema_modules() {
+            for schema in schemas {
+                let name = schema["name"].as_str().expect("a name");
+                assert_eq!(retired_catalog_shortcut(name), None, "{name}");
+            }
+        }
     }
 }
