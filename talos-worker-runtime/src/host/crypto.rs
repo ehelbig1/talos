@@ -17,6 +17,7 @@ const MAX_HMAC_KEY_BYTES: usize = 1024 * 1024;
 
 impl wit_crypto::Host for TalosContext {
     async fn hash(&mut self, algorithm: wit_crypto::HashAlgorithm, data: Vec<u8>) -> Vec<u8> {
+        self.host_call("crypto::hash");
         // Check if crypto budget is already exhausted.
         if self
             .crypto_budget_us
@@ -66,6 +67,7 @@ impl wit_crypto::Host for TalosContext {
         key: Vec<u8>,
         data: Vec<u8>,
     ) -> Vec<u8> {
+        self.host_call("crypto::hmac");
         // Check if crypto budget is already exhausted.
         if self
             .crypto_budget_us
@@ -139,6 +141,7 @@ impl wit_crypto::Host for TalosContext {
     }
 
     async fn encode(&mut self, encoding: wit_crypto::Encoding, data: Vec<u8>) -> String {
+        self.host_call("crypto::encode");
         match encoding {
             wit_crypto::Encoding::Hex => hex::encode(&data),
             wit_crypto::Encoding::Base64 => {
@@ -157,6 +160,7 @@ impl wit_crypto::Host for TalosContext {
         encoding: wit_crypto::Encoding,
         data: String,
     ) -> Result<Vec<u8>, wit_crypto::Error> {
+        self.host_call("crypto::decode");
         match encoding {
             wit_crypto::Encoding::Hex => {
                 hex::decode(&data).map_err(|_| wit_crypto::Error::Invalidinput)
@@ -177,6 +181,7 @@ impl wit_crypto::Host for TalosContext {
     }
 
     async fn random_bytes(&mut self, length: u32) -> Vec<u8> {
+        self.host_call("crypto::random-bytes");
         use rand::RngCore;
         const MAX_RANDOM_BYTES: u32 = 1_000_000; // 1 MB — prevents host memory exhaustion
         if length > MAX_RANDOM_BYTES {
@@ -207,6 +212,7 @@ impl wit_crypto::Host for TalosContext {
     }
 
     async fn uuid(&mut self) -> String {
+        self.host_call("crypto::uuid");
         uuid::Uuid::new_v4().to_string()
     }
 }

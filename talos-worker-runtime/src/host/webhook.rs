@@ -38,6 +38,7 @@ impl wit_webhook::Host for TalosContext {
         &mut self,
         req: wit_webhook::WebhookRequest,
     ) -> Result<wit_webhook::WebhookResponse, wit_webhook::Error> {
+        self.host_call("webhook::send");
         if self.rehearsal_refuses("webhook::send").await {
             return Err(wit_webhook::Error::Sendfailed);
         }

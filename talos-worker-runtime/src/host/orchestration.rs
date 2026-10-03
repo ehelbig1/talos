@@ -217,6 +217,7 @@ impl wit_agent_orchestration::Host for TalosContext {
         msg: wit_agent_orchestration::AgentMessage,
         timeout_ms: u32,
     ) -> Result<wit_agent_orchestration::AgentResponse, wit_agent_orchestration::Error> {
+        self.host_call("agent-orchestration::invoke");
         // Defense-in-depth: only Trusted world should use agent orchestration.
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
@@ -392,6 +393,7 @@ impl wit_agent_orchestration::Host for TalosContext {
         _module_id: String,
         _config: String,
     ) -> Result<String, wit_agent_orchestration::Error> {
+        self.host_call("agent-orchestration::inject-runtime-node");
         // To be implemented in Phase 3 (Signal to Controller).
         // SECURITY: When implemented, MUST validate that the injected node's
         // capability world does not exceed the calling actor's max_world ceiling.
@@ -405,6 +407,7 @@ impl wit_agent_orchestration::Host for TalosContext {
         &mut self,
         _node_id: String,
     ) -> Result<(), wit_agent_orchestration::Error> {
+        self.host_call("agent-orchestration::reroute-to-node");
         // To be implemented in Phase 3 (Signal to Controller).
         // SECURITY: When implemented, MUST verify the target node belongs to the
         // same workflow and the calling module has permission to alter control flow.
@@ -415,6 +418,7 @@ impl wit_agent_orchestration::Host for TalosContext {
         &mut self,
         msg: wit_agent_orchestration::AgentMessage,
     ) -> Result<(), wit_agent_orchestration::Error> {
+        self.host_call("agent-orchestration::send");
         // Defense-in-depth: only Trusted world should use agent orchestration.
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
@@ -531,6 +535,7 @@ impl wit_agent_orchestration::Host for TalosContext {
     }
 
     async fn list_agents(&mut self) -> Result<Vec<String>, wit_agent_orchestration::Error> {
+        self.host_call("agent-orchestration::list-agents");
         // MCP-669 (2026-05-13): per-method capability gate. Siblings
         // `invoke` and `send` both gate on Agent | Trusted; this one
         // didn't. Today the implementation returns an empty list so the

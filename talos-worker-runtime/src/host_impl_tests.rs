@@ -368,6 +368,94 @@ async fn spawn_loopback_capture_server() -> (u16, tokio::task::JoinHandle<String
     (port, handle)
 }
 
+/// A real fetch by a run that asked to keep what it received: the response
+/// is kept in the shape a fixture has, and nothing of the REQUEST is — its
+/// header value and body stand in for resolved secrets here.
+#[tokio::test]
+async fn a_real_response_is_captured_and_the_request_is_not() {
+    // Same dev-only loopback setup as the test below; nextest runs each test
+    // in its own process, so the variables are this test's alone.
+    std::env::set_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS", "1");
+    std::env::set_var("WASM_ALLOW_INSECURE_HTTP", "1");
+    let (port, server) = spawn_loopback_capture_server().await;
+
+    let mut ctx = TalosContext::new(
+        CapabilityWorld::Http,
+        vec!["localhost".to_string()],
+        vec!["POST".to_string()],
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+    let capture = std::sync::Arc::new(crate::http_replay::HttpCapture::new());
+    ctx.http_capture = Some(capture.clone());
+
+    let resp = wit_http::Host::fetch(
+        &mut ctx,
+        wit_http::Request {
+            method: wit_http::Method::Post,
+            url: format!("http://localhost:{port}/v1/items?cursor=request-only-query"),
+            headers: vec![(
+                "Authorization".to_string(),
+                "Bearer request-only-credential".to_string(),
+            )],
+            body: br#"{"secret":"request-only-body"}"#.to_vec(),
+            timeout_ms: None,
+        },
+    )
+    .await
+    .expect("the loopback server answers");
+    assert_eq!(resp.status, 200);
+    let sent = server.await.expect("server task");
+    assert!(
+        sent.contains("request-only-credential"),
+        "premise: the request really carried the header"
+    );
+
+    let (kept, dropped) = capture.taken();
+    assert_eq!(dropped, 0);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        (kept[0].method, kept[0].host.as_str(), kept[0].path.as_str()),
+        ("POST", "localhost", "/v1/items")
+    );
+    assert_eq!(
+        (kept[0].status, kept[0].body.as_slice()),
+        (200, b"{}".as_slice())
+    );
+    let everything = format!("{kept:?}");
+    assert!(
+        !everything.contains("request-only"),
+        "nothing of the request is kept: {everything}"
+    );
+
+    // Control: a run that did not ask keeps nothing (and pays one branch).
+    assert!(TalosContext::new(
+        CapabilityWorld::Http,
+        vec![],
+        vec![],
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap()
+    .http_capture
+    .is_none());
+}
+
 /// Regression for the `fetch_with_bearer` double-"Bearer" 401 bug.
 ///
 /// `SecretProvider::into_auth_header(slot, "Authorization")` ALREADY

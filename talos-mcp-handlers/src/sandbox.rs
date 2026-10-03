@@ -362,6 +362,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             "additionalProperties": false
                         }
                     },
+                    "capture_http": {
+                        "type": "boolean",
+                        "description": "Optional (default false). A REAL run that keeps the HTTP responses it received and returns them as `http_captured.http_fixtures`, in the shape `http_fixtures` takes — so a later run can be a rehearsal against real response shapes. Only responses are kept (never the request, whose headers and body carry resolved secrets); bodies pass the same redaction stored output passes; at most 64 responses and 8 MB. The run is not retried. Cannot be combined with http_fixtures. The reply can be large: use it from a script, and replace account data before keeping a capture anywhere shared."
+                    },
+                    "fuel_profile": {
+                        "type": "boolean",
+                        "description": "Optional (default false). Also return `fuel_profile`: the run's fuel charged to the host calls it was spent between — e.g. how much was burned before the first `http::fetch` (building the request) and how much after it (parsing the response). Works with or without http_fixtures."
+                    },
                     "allowed_secrets": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -2855,6 +2863,122 @@ pub(crate) fn parse_http_fixtures(
         .map(|r| Some(std::sync::Arc::new(r)))
 }
 
+/// `test_module`'s two observers: `capture_http` (keep the responses a real
+/// run receives, in the shape `http_fixtures` takes) and `fuel_profile`
+/// (charge the run's fuel to the host calls it was spent between). Both are
+/// strict booleans, absent meaning off. Capturing a rehearsal is refused: it
+/// makes no request, so there is nothing to keep.
+pub(crate) fn parse_test_observers(
+    args: &serde_json::Value,
+    rehearsal: bool,
+) -> Result<(bool, bool), String> {
+    let flag = |name: &str| match args.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(on)) => Ok(*on),
+        Some(other) => Err(format!("{name} must be true or false, got {other}")),
+    };
+    let capture = flag("capture_http")?;
+    let profile = flag("fuel_profile")?;
+    if capture && rehearsal {
+        return Err(
+            "capture_http cannot be combined with http_fixtures: a rehearsal makes no \
+             request, so there is no response to capture"
+                .to_string(),
+        );
+    }
+    Ok((capture, profile))
+}
+
+/// The responses a capturing run received, as an `http_fixtures` array that
+/// can be passed straight back. `null` when the run did not capture.
+///
+/// Bodies pass through the redaction module output passes through before it
+/// is stored (`talos_dlp_provider`): a response from a token endpoint must not
+/// hand a credential to the caller. A body that is not UTF-8 text is counted
+/// and left out, because a fixture carries text.
+pub(crate) fn rendered_http_capture(
+    capture: Option<&std::sync::Arc<talos_worker_runtime::http_replay::HttpCapture>>,
+) -> serde_json::Value {
+    let Some(capture) = capture else {
+        return serde_json::Value::Null;
+    };
+    let (kept, dropped) = capture.taken();
+    let mut binary = 0usize;
+    let fixtures: Vec<serde_json::Value> = kept
+        .iter()
+        .filter_map(|r| {
+            let Ok(text) = std::str::from_utf8(&r.body) else {
+                binary += 1;
+                return None;
+            };
+            let body = match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(parsed) => talos_dlp_provider::redact_json(&parsed),
+                Err(_) => serde_json::Value::String(talos_dlp_provider::redact_str(text)),
+            };
+            let mut fixture = serde_json::json!({
+                "method": r.method,
+                "url_contains": r.path,
+                "status": r.status,
+                "body": body,
+            });
+            if let Some(content_type) = &r.content_type {
+                fixture["headers"] = serde_json::json!({ "content-type": content_type });
+            }
+            Some(fixture)
+        })
+        .collect();
+    serde_json::json!({
+        "http_fixtures": fixtures,
+        "not_captured": dropped,
+        "binary_not_captured": binary,
+        "note": "The responses this run received, in request order, in the shape \
+                 http_fixtures takes. Only responses are kept — never the request, whose \
+                 headers and body carry resolved secrets — and each body has passed the \
+                 same redaction stored module output passes, so a redacted value differs \
+                 from what the module saw. The run was not retried. These are real \
+                 responses: they carry real account data until you replace it.",
+    })
+}
+
+/// Where the run's fuel went. `null` when no profile was asked for.
+pub(crate) fn rendered_fuel_profile(
+    profile: Option<&std::sync::Arc<talos_worker_runtime::fuel_profile::FuelProfile>>,
+) -> serde_json::Value {
+    let Some(profile) = profile else {
+        return serde_json::Value::Null;
+    };
+    let report = profile.report();
+    let share = |fuel: u64| {
+        if report.accounted == 0 {
+            0.0
+        } else {
+            // Two decimals of a percentage; precision loss is immaterial here.
+            #[allow(clippy::cast_precision_loss)]
+            let pct = fuel as f64 * 100.0 / report.accounted as f64;
+            (pct * 100.0).round() / 100.0
+        }
+    };
+    serde_json::json!({
+        "guest": report.guest.iter().map(|g| serde_json::json!({
+            "after": g.after, "fuel": g.fuel, "percent": share(g.fuel), "stretches": g.stretches,
+        })).collect::<Vec<_>>(),
+        "host_calls": report.host_calls.iter().map(|h| serde_json::json!({
+            "call": h.call, "count": h.count, "fuel_during": h.fuel_during,
+        })).collect::<Vec<_>>(),
+        "unnamed_host_calls": report.unnamed_host_calls,
+        "accounted": report.accounted,
+        "note": "Fuel is burned by the module's own code; a host call costs none. Each \
+                 `guest` row is the fuel burned AFTER the named host call returned, up to \
+                 the next named one (`start` = before the first). `fuel_during` is fuel \
+                 burned while a call was in progress — the module's allocator receiving \
+                 the result. A host transition that names nothing (a WASI clock read, \
+                 the runtime's own epoch check or memory growth) ends no stretch and has \
+                 no row; `unnamed_host_calls` counts them, and the count can differ \
+                 between two runs of the same input. Summed over attempts; `accounted` \
+                 equals fuel.consumed.",
+    })
+}
+
 /// What a rehearsal's requests were and which recording answered each.
 /// `null` when the run was not a rehearsal.
 pub(crate) fn rendered_http_replay(
@@ -3671,6 +3795,15 @@ async fn handle_test_module(
         Ok(r) => r,
         Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
     };
+    let (capture_http, want_fuel_profile) = match parse_test_observers(args, http_replay.is_some())
+    {
+        Ok(v) => v,
+        Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
+    };
+    let http_capture = capture_http
+        .then(|| std::sync::Arc::new(talos_worker_runtime::http_replay::HttpCapture::new()));
+    let fuel_profile = want_fuel_profile
+        .then(|| std::sync::Arc::new(talos_worker_runtime::fuel_profile::FuelProfile::new()));
     let accumulated = match args.get("accumulated") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) if !v.is_object() => {
@@ -4065,11 +4198,14 @@ async fn handle_test_module(
         allowed_secrets: module.allowed_secrets.clone(),
         integration_name: module.integration_name.clone(),
         http_replay: http_replay.clone(),
+        http_capture: http_capture.clone(),
+        fuel_profile: fuel_profile.clone(),
         ..Default::default()
     };
     // A rehearsal runs ONCE: the recordings are handed out in order, so an
     // in-process retry would run the module again against whatever is left.
-    let retry_policy = if http_replay.is_some() {
+    // So does a capturing run: a retry would capture each response twice.
+    let retry_policy = if http_replay.is_some() || http_capture.is_some() {
         talos_worker_runtime::runtime::RetryPolicy::controller_dispatched()
     } else {
         // Embedded rehearsal surface, no controller retry loop above it:
@@ -4229,6 +4365,8 @@ async fn handle_test_module(
                     // its own error handling and still return ok.
                     "host_diagnostics": collected_host_diagnostics(&host_diags),
                     "http_replay": rendered_http_replay(http_replay.as_ref()),
+                    "http_captured": rendered_http_capture(http_capture.as_ref()),
+                    "fuel_profile": rendered_fuel_profile(fuel_profile.as_ref()),
                 })
                 .to_string(),
             ))
@@ -4245,6 +4383,8 @@ async fn handle_test_module(
                 // accompanied by the host's reason for it.
                 "host_diagnostics": collected_host_diagnostics(&host_diags),
                 "http_replay": rendered_http_replay(http_replay.as_ref()),
+                "http_captured": rendered_http_capture(http_capture.as_ref()),
+                "fuel_profile": rendered_fuel_profile(fuel_profile.as_ref()),
             })
             .to_string(),
         )),
@@ -5248,6 +5388,119 @@ mod http_fixture_tests {
         ] {
             assert!(parse_http_fixtures(Some(&bad)).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn observers_are_strict_booleans_and_a_rehearsal_cannot_capture() {
+        assert_eq!(parse_test_observers(&json!({}), false), Ok((false, false)));
+        assert_eq!(
+            parse_test_observers(&json!({"capture_http": true, "fuel_profile": true}), false),
+            Ok((true, true))
+        );
+        assert_eq!(
+            parse_test_observers(&json!({"fuel_profile": true}), true),
+            Ok((false, true)),
+            "a profile of a rehearsal is the point of both"
+        );
+        for bad in [json!({"capture_http": "true"}), json!({"fuel_profile": 1})] {
+            assert!(parse_test_observers(&bad, false).is_err(), "{bad}");
+        }
+        let err = parse_test_observers(&json!({"capture_http": true}), true).unwrap_err();
+        assert!(
+            err.contains("cannot be combined with http_fixtures"),
+            "{err}"
+        );
+    }
+
+    /// A capture comes back as fixtures the same tool accepts, with a
+    /// credential-shaped value in a response body redacted on the way out.
+    #[test]
+    fn a_capture_is_returned_as_fixtures_that_can_be_replayed() {
+        use talos_worker_runtime::http_replay::HttpCapture;
+        assert_eq!(rendered_http_capture(None), serde_json::Value::Null);
+        let capture = std::sync::Arc::new(HttpCapture::new());
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        let json_type = [("Content-Type".to_string(), "application/json".to_string())];
+        capture.record(
+            "POST",
+            &url("https://api.example.test/v1/items?cursor=9"),
+            200,
+            &json_type,
+            br#"{"items":[{"name":"first"}],"access_token":"made-up-token-value-0123456789"}"#,
+        );
+        capture.record(
+            "GET",
+            &url("https://api.example.test/health"),
+            503,
+            &[],
+            b"try later",
+        );
+        capture.record(
+            "GET",
+            &url("https://api.example.test/logo"),
+            200,
+            &[],
+            &[0xff, 0xfe, 0x00],
+        );
+
+        let out = rendered_http_capture(Some(&capture));
+        assert_eq!(out["binary_not_captured"], 1);
+        assert_eq!(out["not_captured"], 0);
+        let fixtures = out["http_fixtures"].as_array().unwrap();
+        assert_eq!(fixtures.len(), 2);
+        assert_eq!(fixtures[0]["method"], "POST");
+        assert_eq!(fixtures[0]["url_contains"], "/v1/items");
+        assert_eq!(fixtures[0]["body"]["items"][0]["name"], "first");
+        assert!(
+            !out.to_string().contains("made-up-token-value"),
+            "a credential in a response body is not handed to the caller: {out}"
+        );
+        assert_eq!(fixtures[1]["status"], 503);
+        assert_eq!(fixtures[1]["body"], "try later");
+
+        // The shape contract: what was captured is accepted as http_fixtures
+        // and answers the same requests.
+        let replay = parse_http_fixtures(Some(&out["http_fixtures"]))
+            .unwrap()
+            .unwrap();
+        let first = replay
+            .answer(
+                "POST",
+                &url("https://api.example.test/v1/items?cursor=10"),
+                0,
+            )
+            .unwrap();
+        assert_eq!(first.status, 200);
+        assert!(replay
+            .answer("GET", &url("https://api.example.test/health"), 0)
+            .is_ok());
+    }
+
+    #[test]
+    fn the_fuel_profile_is_rendered_largest_first_with_shares() {
+        use talos_worker_runtime::fuel_profile::FuelProfile;
+        assert_eq!(rendered_fuel_profile(None), serde_json::Value::Null);
+        let profile = std::sync::Arc::new(FuelProfile::new());
+        profile.start(1000);
+        profile.calling_host(900);
+        profile.returned_from_host(900, "http::fetch");
+        // The runtime's own epoch check, mid-parse: counted, and no row.
+        profile.calling_host(500);
+        profile.returned_from_host(500, talos_worker_runtime::fuel_profile::UNNAMED);
+        profile.finish(100);
+        let out = rendered_fuel_profile(Some(&profile));
+        assert_eq!(out["accounted"], 900);
+        assert_eq!(out["unnamed_host_calls"], 1);
+        assert_eq!(out["guest"].as_array().map(Vec::len), Some(2));
+        assert_eq!(out["host_calls"].as_array().map(Vec::len), Some(1));
+        assert_eq!(out["guest"][0]["after"], "http::fetch");
+        assert_eq!(out["guest"][0]["fuel"], 800);
+        assert_eq!(out["guest"][0]["percent"], 88.89);
+        assert_eq!(out["guest"][1]["after"], "start");
+        assert_eq!(
+            out["host_calls"][0],
+            json!({"call": "http::fetch", "count": 1, "fuel_during": 0})
+        );
     }
 
     #[test]

@@ -145,6 +145,7 @@ impl TalosContext {
 
 impl wit_cache::Host for TalosContext {
     async fn get(&mut self, key: String) -> Result<String, wit_cache::Error> {
+        self.host_call("cache::get");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result = async move {
@@ -198,6 +199,7 @@ impl wit_cache::Host for TalosContext {
         value: String,
         ttl: Option<u32>,
     ) -> Result<(), wit_cache::Error> {
+        self.host_call("cache::set");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result: Result<(), wit_cache::Error> = async move {
@@ -256,6 +258,7 @@ impl wit_cache::Host for TalosContext {
     }
 
     async fn delete(&mut self, key: String) -> Result<(), wit_cache::Error> {
+        self.host_call("cache::delete");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result: Result<(), wit_cache::Error> = async move {
@@ -297,6 +300,7 @@ impl wit_cache::Host for TalosContext {
     }
 
     async fn exists(&mut self, key: String) -> bool {
+        self.host_call("cache::exists");
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
             self.capability_world,
@@ -332,6 +336,7 @@ impl wit_cache::Host for TalosContext {
     }
 
     async fn increment(&mut self, key: String, amount: i64) -> Result<i64, wit_cache::Error> {
+        self.host_call("cache::increment");
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
             self.capability_world,
@@ -370,6 +375,7 @@ impl wit_cache::Host for TalosContext {
     }
 
     async fn decrement(&mut self, key: String, amount: i64) -> Result<i64, wit_cache::Error> {
+        self.host_call("cache::decrement");
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
             self.capability_world,
@@ -418,6 +424,7 @@ impl wit_cache::Host for TalosContext {
     }
 
     async fn mget(&mut self, keys: Vec<String>) -> Result<Vec<Option<String>>, wit_cache::Error> {
+        self.host_call("cache::mget");
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
             self.capability_world,
@@ -488,6 +495,7 @@ impl wit_cache::Host for TalosContext {
     }
 
     async fn mset(&mut self, pairs: Vec<(String, String)>) -> Result<(), wit_cache::Error> {
+        self.host_call("cache::mset");
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
             self.capability_world,
@@ -573,6 +581,7 @@ impl wit_cache::Host for TalosContext {
     }
 
     async fn expire(&mut self, key: String, ttl: u32) -> Result<(), wit_cache::Error> {
+        self.host_call("cache::expire");
         use crate::wit_inspector::CapabilityWorld;
         if !matches!(
             self.capability_world,

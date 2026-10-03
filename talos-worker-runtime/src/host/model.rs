@@ -297,6 +297,7 @@ impl wit_model::Host for TalosContext {
         model_name: String,
         input: String,
     ) -> Result<Option<wit_model::Prediction>, wit_model::Error> {
+        self.host_call("model::predict");
         let reply = self
             .model_predict_rpc(model_name, vec![input], "model::predict")
             .await?;
@@ -314,6 +315,7 @@ impl wit_model::Host for TalosContext {
         model_name: String,
         inputs: Vec<String>,
     ) -> Result<wit_model::PredictReply, wit_model::Error> {
+        self.host_call("model::predict-batch");
         self.model_predict_rpc(model_name, inputs, "model::predict_batch")
             .await
     }
@@ -324,6 +326,7 @@ impl wit_model::Host for TalosContext {
         model_name: String,
         k: u32,
     ) -> Result<Vec<wit_model::FewShotExample>, wit_model::Error> {
+        self.host_call("model::few-shot");
         self.model_fewshot_rpc(model_name, k, "model::few_shot")
             .await
     }

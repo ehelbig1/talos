@@ -314,11 +314,24 @@ impl TalosContext {
 // HTTP
 // ============================================================================
 
+/// The verb as one of the five a module can declare, or `None`.
+fn static_method(method: &reqwest::Method) -> Option<&'static str> {
+    match method.as_str() {
+        "GET" => Some("GET"),
+        "POST" => Some("POST"),
+        "PUT" => Some("PUT"),
+        "PATCH" => Some("PATCH"),
+        "DELETE" => Some("DELETE"),
+        _ => None,
+    }
+}
+
 impl wit_http::Host for TalosContext {
     async fn fetch(
         &mut self,
         req: wit_http::Request,
     ) -> Result<wit_http::Response, wit_http::Error> {
+        self.host_call("http::fetch");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result: Result<wit_http::Response, wit_http::Error> = async move {
@@ -1168,6 +1181,13 @@ impl wit_http::Host for TalosContext {
             }
         }
 
+        // A real `test_module` run that asked to keep what it received: the
+        // response only, never the request (its headers and body carry
+        // resolved secrets).
+        if let Some(capture) = self.http_capture.as_ref() {
+            capture.record(method_str, &url, status, &resp_headers, &resp_body);
+        }
+
         Ok(wit_http::Response {
             status,
             headers: resp_headers,
@@ -1193,6 +1213,7 @@ impl wit_http::Host for TalosContext {
         &mut self,
         reqs: Vec<wit_http::Request>,
     ) -> Vec<Result<wit_http::Response, wit_http::Error>> {
+        self.host_call("http::fetch-all");
         if reqs.is_empty() {
             return Vec::new();
         }
@@ -1837,6 +1858,21 @@ impl wit_http::Host for TalosContext {
             /// Observed cancellation before its send.
             Cancelled,
         }
+        // What each entry asked for, kept only when the run is capturing: the
+        // responses are recorded after the join, in REQUEST order, which is
+        // the order a later rehearsal answers a batch in.
+        let capture_targets: Vec<Option<(String, &'static str)>> = if self.http_capture.is_some() {
+            validated
+                .iter()
+                .map(|v| {
+                    v.as_ref()
+                        .ok()
+                        .and_then(|p| Some((p.0.clone(), static_method(&p.1)?)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let stream =
             futures_util::stream::iter(validated.into_iter().enumerate().map(move |(idx, v)| {
                 let max_r = max_resp;
@@ -2018,6 +2054,21 @@ impl wit_http::Host for TalosContext {
         // Restore the documented input order (see the tagging comment
         // above) — completion order is an implementation detail.
         indexed.sort_unstable_by_key(|&(i, _, _)| i);
+        if let Some(capture) = self.http_capture.as_ref() {
+            for (idx, result, outcome) in &indexed {
+                // Only an entry that was actually sent and answered: a
+                // dry-run mock has no outcome and is not a response.
+                let (Ok(resp), Some(BatchSendOutcome::Status(_))) = (result, outcome) else {
+                    continue;
+                };
+                let Some(Some((url_str, method))) = capture_targets.get(*idx) else {
+                    continue;
+                };
+                if let Ok(url) = url::Url::parse(url_str) {
+                    capture.record(method, &url, resp.status, &resp.headers, &resp.body);
+                }
+            }
+        }
 
         // ── Settle the per-host permits with the WORST outcome per host ──────
         // Transport failure > any status (a 5xx fails a half-open trial, a 2xx
@@ -2193,6 +2244,7 @@ impl wit_http::Host for TalosContext {
         slot: u64,
         mut req: wit_http::Request,
     ) -> Result<wit_http::Response, wit_http::Error> {
+        self.host_call("http::fetch-with-bearer");
         // Resolve the slot to its plaintext value on the host side only.
         let auth_value = match self
             .provider
@@ -2242,6 +2294,7 @@ impl wit_http::Host for TalosContext {
         header_name: String,
         mut req: wit_http::Request,
     ) -> Result<wit_http::Response, wit_http::Error> {
+        self.host_call("http::fetch-with-header");
         let header_value = match self
             .provider
             .into_auth_header(talos_secrets::SlotHandle(slot), &header_name)

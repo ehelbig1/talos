@@ -55,6 +55,7 @@ fn require_agent_memory_capability(
 
 impl wit_agent_memory::Host for TalosContext {
     async fn get(&mut self, key: String) -> Result<String, wit_agent_memory::Error> {
+        self.host_call("agent-memory::get");
         // MCP-714 (2026-05-13): audit-ledger parity. Pre-fix the `?`
         // operator on `require_agent_memory_capability` propagated Err
         // without an audit row — operator-blind to the WORM ledger.
@@ -118,6 +119,7 @@ impl wit_agent_memory::Host for TalosContext {
         &mut self,
         key: String,
     ) -> Result<Option<wit_agent_memory::MemoryEntryDetail>, wit_agent_memory::Error> {
+        self.host_call("agent-memory::get-entry");
         if require_agent_memory_capability(&self.capability_world).is_err() {
             self.record_capability_denied("agent-memory-get-entry", "capability-world", &key)
                 .await;
@@ -181,6 +183,7 @@ impl wit_agent_memory::Host for TalosContext {
     }
 
     async fn set(&mut self, key: String, value: String) -> Result<(), wit_agent_memory::Error> {
+        self.host_call("agent-memory::set");
         // MCP-714 (2026-05-13): audit-parity — see `get` above for full
         // rationale. set is the highest-stakes of the keyed methods
         // because a denied write attempt is a stronger signal of
@@ -256,6 +259,7 @@ impl wit_agent_memory::Host for TalosContext {
     }
 
     async fn delete(&mut self, key: String) -> Result<(), wit_agent_memory::Error> {
+        self.host_call("agent-memory::delete");
         // MCP-714 (2026-05-13): audit-parity — see `get` above.
         if require_agent_memory_capability(&self.capability_world).is_err() {
             self.record_capability_denied("agent-memory-delete", "capability-world", &key)
@@ -298,6 +302,7 @@ impl wit_agent_memory::Host for TalosContext {
         &mut self,
         prefix: Option<String>,
     ) -> Result<Vec<String>, wit_agent_memory::Error> {
+        self.host_call("agent-memory::list-keys");
         // MCP-714 (2026-05-13): audit-parity. list_keys is the
         // enumeration surface — key names themselves may carry
         // semantic information that operators consider out-of-scope
@@ -331,6 +336,7 @@ impl wit_agent_memory::Host for TalosContext {
         &mut self,
         entry: wit_agent_memory::MemoryEntry,
     ) -> Result<(), wit_agent_memory::Error> {
+        self.host_call("agent-memory::store-with-embedding");
         // MCP-714 (2026-05-13): audit-parity. store_with_embedding is
         // the semantic-memory write path — a capability-deny here
         // means a module tried to poison the embedding index with
@@ -395,6 +401,7 @@ impl wit_agent_memory::Host for TalosContext {
         query: String,
         limit: u32,
     ) -> Result<Vec<wit_agent_memory::SearchResult>, wit_agent_memory::Error> {
+        self.host_call("agent-memory::search");
         // Bare search is a zero-exclusion specialisation of the filtered
         // variant — keeps the two host paths semantically identical.
         self.search_filtered(
@@ -412,6 +419,7 @@ impl wit_agent_memory::Host for TalosContext {
         query: String,
         opts: wit_agent_memory::SearchOptions,
     ) -> Result<Vec<wit_agent_memory::SearchResult>, wit_agent_memory::Error> {
+        self.host_call("agent-memory::search-filtered");
         // MCP-714 (2026-05-13): audit-parity. search_filtered is the
         // semantic-recall surface — query text may contain PII so we
         // hash before recording into the WORM ledger. Same hashing
@@ -648,6 +656,7 @@ impl wit_graph_memory::Host for TalosContext {
         max_depth: u32,
         limit: u32,
     ) -> Result<wit_graph_memory::GraphContext, wit_graph_memory::Error> {
+        self.host_call("graph-memory::graph-search");
         // MCP-608 (2026-05-12): per-method capability gate. WIT linkage
         // restricts `talos:core/graph-memory` to database-node, agent-node,
         // automation-node (verified by grep `import graph-memory` in

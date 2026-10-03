@@ -155,6 +155,10 @@ response and replay it:
 }
 ```
 
+Add `"fuel_profile": true` to see which part of the module the fuel went to
+(the code before the first host call, the code after each one), and get the
+recording itself from one real run with `"capture_http": true`.
+
 The run makes no request. The Nth `http::fetch` is answered by the Nth item,
 the module's host and verb grants are still enforced, and the reply carries
 `fuel.consumed` and an `http_replay` list of what was asked for. Size the

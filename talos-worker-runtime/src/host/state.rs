@@ -49,6 +49,7 @@ fn require_state_key_in_range(key: &str) -> Result<(), wit_state::Error> {
 
 impl wit_state::Host for TalosContext {
     async fn get(&mut self, key: String) -> Result<String, wit_state::Error> {
+        self.host_call("state::get");
         // MCP-712 (2026-05-13): audit-ledger emission for capability-
         // denial parity with exists() / list_keys() (which got it in
         // MCP-690) AND with the wit_secrets / wit_cache /
@@ -80,6 +81,7 @@ impl wit_state::Host for TalosContext {
     }
 
     async fn set(&mut self, key: String, value: String) -> Result<(), wit_state::Error> {
+        self.host_call("state::set");
         // MCP-712 (2026-05-13): see comment on `get` above for the
         // audit-parity rationale. set() is the most-important of the
         // three fallible siblings to audit because a denied write
@@ -141,6 +143,7 @@ impl wit_state::Host for TalosContext {
     }
 
     async fn delete(&mut self, key: String) -> Result<(), wit_state::Error> {
+        self.host_call("state::delete");
         // MCP-712 (2026-05-13): audit-parity with get/set/exists/list_keys.
         if require_state_capability(&self.capability_world).is_err() {
             self.record_capability_denied("state-delete", "capability-world", &key)
@@ -171,6 +174,7 @@ impl wit_state::Host for TalosContext {
     }
 
     async fn exists(&mut self, key: String) -> bool {
+        self.host_call("state::exists");
         // MCP-603: routed through the shared helper so the gate
         // stays in lockstep with get/set/delete/list_keys.
         if require_state_capability(&self.capability_world).is_err() {
@@ -199,6 +203,7 @@ impl wit_state::Host for TalosContext {
     }
 
     async fn list_keys(&mut self) -> Vec<String> {
+        self.host_call("state::list-keys");
         // MCP-603: per-method gate aligned with siblings. Pre-fix
         // a Minimal-world module could enumerate every state key
         // in its scoped namespace (key names may carry semantic
@@ -244,22 +249,27 @@ impl wit_state::Host for TalosContext {
 
 impl wit_env::Host for TalosContext {
     async fn get_var(&mut self, key: String) -> Option<String> {
+        self.host_call("env::get-var");
         self.env_vars.get(&key).cloned()
     }
 
     async fn get_all_vars(&mut self) -> String {
+        self.host_call("env::get-all-vars");
         serde_json::to_string(&self.env_vars).unwrap_or_else(|_| "{}".to_string())
     }
 
     async fn get_workflow_id(&mut self) -> String {
+        self.host_call("env::get-workflow-id");
         self.workflow_id.clone().unwrap_or_default()
     }
 
     async fn get_execution_id(&mut self) -> String {
+        self.host_call("env::get-execution-id");
         self.execution_id.clone().unwrap_or_default()
     }
 
     async fn get_module_id(&mut self) -> String {
+        self.host_call("env::get-module-id");
         self.module_id.clone().unwrap_or_default()
     }
 }

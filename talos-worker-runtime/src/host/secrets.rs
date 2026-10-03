@@ -51,6 +51,7 @@ impl wit_secrets::Host for TalosContext {
     /// receives only the u64 handle.  Slot persists until `release-slot` or
     /// execution end — use it with Tier-1 ops or Tier-2 `expose-secret`.
     async fn get_secret(&mut self, key_path: String) -> Result<u64, wit_secrets::Error> {
+        self.host_call("secrets::get-secret");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result: Result<u64, wit_secrets::Error> = async move {
@@ -207,6 +208,7 @@ impl wit_secrets::Host for TalosContext {
 
     /// Release a slot early — zeroes host-side memory immediately.
     async fn release_slot(&mut self, handle: u64) -> Result<(), wit_secrets::Error> {
+        self.host_call("secrets::release-slot");
         // MCP-673: defense-in-depth gate. release_slot is operationally
         // harmless against random u64 handles (provider returns Ok), but
         // adopting the gate keeps every wit_secrets method consistent so
@@ -239,6 +241,7 @@ impl wit_secrets::Host for TalosContext {
         handle: u64,
         data: Vec<u8>,
     ) -> Result<Vec<u8>, wit_secrets::Error> {
+        self.host_call("secrets::hmac-sign");
         // MCP-673: per-method capability gate. hmac_sign produces a
         // signature DERIVED from secret material; a Minimal-world
         // module that obtained a valid handle through accidental
@@ -284,6 +287,7 @@ impl wit_secrets::Host for TalosContext {
         handle: u64,
         reason: String,
     ) -> Result<String, wit_secrets::Error> {
+        self.host_call("secrets::expose-secret");
         // Wasm-security review 2026-05-23: the audit-row `reason` field is
         // operator-supplied free text that flows verbatim into the WORM
         // ledger AND NATS audit stream. The WIT-side handle bounds the
@@ -583,6 +587,7 @@ impl wit_secrets::Host for TalosContext {
         &mut self,
         config_value: String,
     ) -> Result<u64, wit_secrets::Error> {
+        self.host_call("secrets::resolve-config-vault");
         // This function is specifically for resolving vault:// config values.
         // Reject inputs without the prefix to prevent misuse as a get_secret alias.
         let path = match config_value.strip_prefix("vault://") {

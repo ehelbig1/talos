@@ -8,6 +8,7 @@ use super::*;
 
 impl wit_logging::Host for TalosContext {
     async fn log(&mut self, lvl: wit_logging::Level, mut msg: String) {
+        self.host_call("logging::log");
         let count = self
             .log_message_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -98,6 +99,7 @@ impl wit_logging::Host for TalosContext {
     }
 
     async fn log_json(&mut self, lvl: wit_logging::Level, json: String) {
+        self.host_call("logging::log-json");
         let count = self
             .log_message_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

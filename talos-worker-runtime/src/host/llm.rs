@@ -580,6 +580,7 @@ impl wit_llm::Host for TalosContext {
         &mut self,
         req: wit_llm::CompletionRequest,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        self.host_call("llm::complete");
         self.complete_impl(req, JsonMode::Off, None).await
     }
 
@@ -594,6 +595,7 @@ impl wit_llm::Host for TalosContext {
         req: wit_llm::CompletionRequest,
         json_schema: Option<String>,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        self.host_call("llm::complete-json");
         self.complete_impl(req, JsonMode::On(json_schema), None)
             .await
     }
@@ -611,6 +613,7 @@ impl wit_llm::Host for TalosContext {
         req: wit_llm::CompletionRequest,
         options: Option<String>,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        self.host_call("llm::complete-with-options");
         let extra = match options {
             None => None,
             Some(s) if s.trim().is_empty() => None,
@@ -1081,6 +1084,7 @@ impl TalosContext {
 
 impl wit_context_window::Host for TalosContext {
     async fn estimate_tokens(&mut self, text: String, model: Option<String>) -> u32 {
+        self.host_call("context-window::estimate-tokens");
         // Model-aware token estimation using character-class heuristics.
         // More accurate than naive len/4 -- handles code, CJK, and whitespace.
 
@@ -1141,6 +1145,7 @@ impl wit_context_window::Host for TalosContext {
     }
 
     async fn get_context_info(&mut self, model: Option<String>) -> wit_context_window::ContextInfo {
+        self.host_call("context-window::get-context-info");
         let model_name = model.as_deref().unwrap_or("claude-sonnet-4-20250514");
 
         // Model-specific context windows
@@ -1181,6 +1186,7 @@ impl wit_embedding::Host for TalosContext {
         text: String,
         model: Option<String>,
     ) -> Result<Vec<f32>, wit_embedding::Error> {
+        self.host_call("embedding::generate");
         if self.is_cancelled() {
             return Err(wit_embedding::Error::BudgetExhausted);
         }

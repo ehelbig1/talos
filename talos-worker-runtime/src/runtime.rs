@@ -368,6 +368,13 @@ pub struct SecurityPolicy {
     /// `None` everywhere else: it is not a field of any wire message, so a
     /// dispatched job cannot carry one. See [`crate::http_replay`].
     pub http_replay: Option<std::sync::Arc<crate::http_replay::HttpReplay>>,
+    /// Keeps the responses a real `test_module` run receives, for later
+    /// replay. `None` everywhere else, and not on the wire.
+    pub http_capture: Option<std::sync::Arc<crate::http_replay::HttpCapture>>,
+    /// Charges the run's fuel to the host calls it was spent between
+    /// ([`crate::fuel_profile`]). `None` everywhere else, and not on the wire:
+    /// only a run that asks pays for the call hook.
+    pub fuel_profile: Option<std::sync::Arc<crate::fuel_profile::FuelProfile>>,
 }
 // ---------------------------------------------------------------------
 // AOT versioning
@@ -4436,6 +4443,7 @@ impl TalosRuntime {
         context.idempotency_key = security_policy.idempotency_key.clone();
         // A rehearsal's recorded HTTP answers (None on every dispatched job).
         context.http_replay = security_policy.http_replay.clone();
+        context.http_capture = security_policy.http_capture.clone();
 
         // Enable dry-run mode if requested (mocks non-GET HTTP, webhook, messaging calls).
         if dry_run {
@@ -4555,6 +4563,31 @@ impl TalosRuntime {
         // Provide fuel to cap CPU usage (per-job override or global limit)
         store.set_fuel(effective_fuel_limit)?;
 
+        // Fuel profile (rehearsals only): at every guest↔host transition read
+        // the fuel left and charge what was burned to the host call it
+        // followed. The hook is installed only when a profile was asked for.
+        let fuel_profile = security_policy.fuel_profile.clone();
+        if let Some(profile) = fuel_profile.clone() {
+            profile.start(effective_fuel_limit);
+            store.call_hook(move |mut cx, transition| {
+                let Ok(remaining) = cx.get_fuel() else {
+                    return Ok(());
+                };
+                match transition {
+                    wasmtime::CallHook::CallingHost => profile.calling_host(remaining),
+                    wasmtime::CallHook::ReturningFromHost => {
+                        let label = std::mem::replace(
+                            &mut cx.data_mut().host_call_label,
+                            crate::fuel_profile::UNNAMED,
+                        );
+                        profile.returned_from_host(remaining, label);
+                    }
+                    wasmtime::CallHook::CallingWasm | wasmtime::CallHook::ReturningFromWasm => {}
+                }
+                Ok(())
+            });
+        }
+
         // ── InstancePre cache lookup ─────────────────────────────────────────
         // On cache hit:  zero compilation, zero linking — just instantiate.
         // On cache miss: compile → link → pre-instantiate → cache.
@@ -4662,6 +4695,9 @@ impl TalosRuntime {
                     .map(|(r,)| r);
                 let oom_msg = store.data().oom_error_message.clone();
                 let remaining_fuel = store.get_fuel().ok();
+                if let (Some(profile), Some(remaining)) = (fuel_profile.as_ref(), remaining_fuel) {
+                    profile.finish(remaining);
+                }
                 (res, oom_msg, remaining_fuel)
             },
         )

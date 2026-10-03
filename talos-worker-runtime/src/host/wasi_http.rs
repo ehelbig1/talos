@@ -328,6 +328,7 @@ pub(crate) fn gated_handle(
     request: Resource<HostOutgoingRequest>,
     options: Option<Resource<wt::RequestOptions>>,
 ) -> HttpResult<Resource<HostFutureIncomingResponse>> {
+    ctx.host_call("wasi-http::handle");
     // A rehearsal answers `talos:core/http` from recordings and sends nothing
     // else. This function is synchronous, so the refusal is logged rather than
     // written as a host diagnostic.

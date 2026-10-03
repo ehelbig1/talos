@@ -44,6 +44,7 @@ impl wit_integration_state::Host for TalosContext {
         &mut self,
         entry: wit_integration_state::StoredEntry,
     ) -> Result<(), wit_integration_state::Error> {
+        self.host_call("integration-state::set");
         // MCP-697 (2026-05-13): audit-ledger parity (sibling of MCP-696).
         // integration-state is the durability path for OAuth tokens +
         // push-notification watches — Minimal/Secrets-world probes of
@@ -106,6 +107,7 @@ impl wit_integration_state::Host for TalosContext {
         &mut self,
         key: String,
     ) -> Result<wit_integration_state::StoredEntry, wit_integration_state::Error> {
+        self.host_call("integration-state::get");
         // MCP-697 (2026-05-13): audit-ledger parity — see integration_state::set above.
         if !matches!(
             self.capability_world,
@@ -133,6 +135,7 @@ impl wit_integration_state::Host for TalosContext {
     }
 
     async fn delete(&mut self, key: String) -> Result<(), wit_integration_state::Error> {
+        self.host_call("integration-state::delete");
         // MCP-697 (2026-05-13): audit-ledger parity — see integration_state::set above.
         if !matches!(
             self.capability_world,
@@ -179,6 +182,7 @@ impl wit_integration_state::Host for TalosContext {
         &mut self,
         filter: wit_integration_state::ListFilter,
     ) -> Result<Vec<wit_integration_state::StoredEntry>, wit_integration_state::Error> {
+        self.host_call("integration-state::list-entries");
         // MCP-697 (2026-05-13): audit-ledger parity — see integration_state::set above.
         // filter has no single canonical target; empty target encodes the
         // enumerate-shaped probe.

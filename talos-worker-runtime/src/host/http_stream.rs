@@ -231,6 +231,7 @@ impl wit_http_stream::Host for TalosContext {
         url: String,
         headers: Vec<(String, String)>,
     ) -> Result<String, wit_http_stream::Error> {
+        self.host_call("http-stream::connect");
         use crate::wit_inspector::CapabilityWorld;
         if self.rehearsal_refuses("http_stream::connect").await {
             return Err(wit_http_stream::Error::ConnectionFailed);
@@ -653,6 +654,7 @@ impl wit_http_stream::Host for TalosContext {
     }
 
     async fn next_event(&mut self, stream_id: String) -> Option<wit_http_stream::SseEvent> {
+        self.host_call("http-stream::next-event");
         // Take the receiver out so we don't hold the mutex during await.
         let mut rx = {
             let mut streams = self.streams.sse.lock().ok()?;
@@ -699,6 +701,7 @@ impl wit_http_stream::Host for TalosContext {
     }
 
     async fn close(&mut self, stream_id: String) {
+        self.host_call("http-stream::close");
         // Removing the receiver causes the spawned task's tx.send() to fail,
         // which makes it exit cleanly — but only once it has something to
         // send. A reader blocked on a quiet upstream never reaches that

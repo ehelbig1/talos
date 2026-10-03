@@ -59,6 +59,7 @@ impl wit_database::Host for TalosContext {
         sql: String,
         params: Vec<String>,
     ) -> Result<wit_database::QueryResult, wit_database::Error> {
+        self.host_call("database::execute-query");
         let __start = std::time::Instant::now();
         let __metrics = self.metrics.clone();
         let __result: Result<wit_database::QueryResult, wit_database::Error> = async move {
@@ -467,6 +468,7 @@ impl wit_database::Host for TalosContext {
     }
 
     async fn get_last_error(&mut self) -> String {
+        self.host_call("database::get-last-error");
         self.last_db_error.clone()
     }
 }
