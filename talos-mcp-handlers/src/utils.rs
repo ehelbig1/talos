@@ -2003,27 +2003,10 @@ static TOOL_ARG_INDEX: std::sync::OnceLock<
 
 /// Every statically declared tool schema.
 fn all_static_tool_schemas() -> Vec<serde_json::Value> {
-    [
-        crate::advanced::tool_schemas(),
-        crate::platform::tool_schemas(),
-        crate::search::tool_schemas(),
-        crate::workflows::tool_schemas(),
-        crate::modules::tool_schemas(),
-        crate::sandbox::tool_schemas(),
-        crate::executions::tool_schemas(),
-        crate::actor::tool_schemas(),
-        crate::analytics::tool_schemas(),
-        crate::secrets::tool_schemas(),
-        crate::schedules::tool_schemas(),
-        crate::versions::tool_schemas(),
-        crate::webhooks::tool_schemas(),
-        crate::graph::tool_schemas(),
-        crate::knowledge_graph::tool_schemas(),
-        crate::alerts::tool_schemas(),
-        crate::schemas::tool_schemas(),
-        crate::ollama::tool_schemas(),
-    ]
-    .concat()
+    // The one list `tools/list` serves. This function kept its own until
+    // 2026-10-03 — 18 of the 21 tool domains — so a misspelt or mistyped
+    // argument to any tool of the other three drew no warning.
+    crate::tool_hints::all_static_tools()
 }
 
 pub(crate) fn tool_arg_index(

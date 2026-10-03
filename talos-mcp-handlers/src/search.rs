@@ -1385,84 +1385,14 @@ pub(crate) const TOOL_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
 ];
-
-async fn handle_tool_search(
-    req_id: Option<serde_json::Value>,
-    args: &serde_json::Value,
-) -> JsonRpcResponse {
-    // MCP-283 (2026-05-10): pre-fix `q.len() >= 2` accepted `"  "`
-    // (2 spaces) — passes the length gate, then lower-cased and
-    // substring-matched against tool names / descriptions, which
-    // produces empty results with no useful signal. Trim before
-    // length check. Same MCP-210 family.
-    let query = match args.get("query").and_then(|v| v.as_str()) {
-        Some(q) if q.len() > 1000 => {
-            return mcp_error(req_id, -32602, "Query must be ≤ 1000 characters")
-        }
-        Some(q) => {
-            let trimmed = q.trim();
-            if trimmed.len() < 2 {
-                return mcp_error(
-                    req_id,
-                    -32602,
-                    "Query must be at least 2 non-whitespace characters",
-                );
-            }
-            trimmed.to_lowercase()
-        }
-        None => return mcp_error(req_id, -32602, "Missing required parameter: query"),
-    };
-    // MCP-180 (2026-05-08): replace silent-clamp with explicit
-    // validation. Pre-fix `unwrap_or(10).min(50)` silently rewrote
-    // 99999 → 50 with no signal — agents asking for "give me as
-    // many tools as you can" got 50 every time without knowing.
-    let limit = match crate::utils::validate_range_u64(args, "limit", 1, 50, 10, &req_id) {
-        Ok(v) => v as usize,
-        Err(resp) => return resp,
-    };
-    // MCP-270 (2026-05-10): direction-class wrong-type rejection.
-    let compact = match crate::utils::validate_optional_bool(args, "compact", false, &req_id) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-
-    // Collect all static tool schemas from every domain module.
-    // Dynamic template-derived tools are intentionally excluded; use
-    // list_module_catalog / list_templates to browse those.
-    // Deduplicate by name (first occurrence wins, preserving domain priority order).
-    let all_tools: Vec<serde_json::Value> = {
-        let raw = [
-            super::sandbox::tool_schemas(),
-            super::workflows::tool_schemas(),
-            super::executions::tool_schemas(),
-            super::secrets::tool_schemas(),
-            super::schedules::tool_schemas(),
-            super::versions::tool_schemas(),
-            super::webhooks::tool_schemas(),
-            super::graph::tool_schemas(),
-            super::modules::tool_schemas(),
-            super::analytics::tool_schemas(),
-            super::search::tool_schemas(),
-            super::alerts::tool_schemas(),
-            super::schemas::tool_schemas(),
-            super::platform::tool_schemas(),
-            super::advanced::tool_schemas(),
-            super::actor::tool_schemas(),
-        ]
-        .concat();
-        let mut seen = std::collections::HashSet::new();
-        raw.into_iter()
-            .filter(|t| {
-                let name = t
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                seen.insert(name)
-            })
-            .collect()
-    };
-
+/// Every static tool that matches `query`, best first.
+///
+/// `tools` is the whole static tool list — `tool_hints::all_static_tools`, the
+/// list `tools/list` serves. Until 2026-10-03 this handler kept its own list
+/// of 16 of the 21 tool domains, so the 36 tools of the other five (machine
+/// learning, Ollama, the knowledge graph, ops alerts, evaluation) could not
+/// be found: searching `ml_predict` returned an unrelated tool.
+fn rank_tools(all_tools: Vec<serde_json::Value>, query: &str) -> Vec<(u32, serde_json::Value)> {
     // Tokenize the query: split on whitespace and underscores so multi-word
     // queries like "create workflow blank new" and underscore-joined queries
     // like "create_workflow add_node_to_workflow" search term-by-term rather
@@ -1475,7 +1405,7 @@ async fn handle_tool_search(
             .filter(|t| t.len() >= 3)
             .collect();
         if v.is_empty() {
-            vec![query.as_str()]
+            vec![query]
         } else {
             v
         }
@@ -1531,6 +1461,50 @@ async fn handle_tool_search(
             na.cmp(nb)
         })
     });
+    scored
+}
+
+async fn handle_tool_search(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+) -> JsonRpcResponse {
+    // MCP-283 (2026-05-10): pre-fix `q.len() >= 2` accepted `"  "`
+    // (2 spaces) — passes the length gate, then lower-cased and
+    // substring-matched against tool names / descriptions, which
+    // produces empty results with no useful signal. Trim before
+    // length check. Same MCP-210 family.
+    let query = match args.get("query").and_then(|v| v.as_str()) {
+        Some(q) if q.len() > 1000 => {
+            return mcp_error(req_id, -32602, "Query must be ≤ 1000 characters")
+        }
+        Some(q) => {
+            let trimmed = q.trim();
+            if trimmed.len() < 2 {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    "Query must be at least 2 non-whitespace characters",
+                );
+            }
+            trimmed.to_lowercase()
+        }
+        None => return mcp_error(req_id, -32602, "Missing required parameter: query"),
+    };
+    // MCP-180 (2026-05-08): replace silent-clamp with explicit
+    // validation. Pre-fix `unwrap_or(10).min(50)` silently rewrote
+    // 99999 → 50 with no signal — agents asking for "give me as
+    // many tools as you can" got 50 every time without knowing.
+    let limit = match crate::utils::validate_range_u64(args, "limit", 1, 50, 10, &req_id) {
+        Ok(v) => v as usize,
+        Err(resp) => return resp,
+    };
+    // MCP-270 (2026-05-10): direction-class wrong-type rejection.
+    let compact = match crate::utils::validate_optional_bool(args, "compact", false, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let scored = rank_tools(crate::tool_hints::all_static_tools(), &query);
 
     // Include the full inputSchema so agents have parameter names and types
     // in context — enabling correct tool calls without a separate schema lookup.
@@ -1646,6 +1620,83 @@ fn validate_tag_format(tag: &str) -> Result<(), String> {
         return Err("Tag cannot contain control characters".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tool_search_coverage_tests {
+    use super::rank_tools;
+    use crate::tool_hints::{all_static_schema_modules, all_static_tools};
+
+    fn found(query: &str) -> Vec<String> {
+        rank_tools(all_static_tools(), query)
+            .into_iter()
+            .filter_map(|(_, tool)| tool["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Every tool this server lists can be found by its own name. Measured
+    /// before the fix: 36 of 358 could not, every tool of five domains.
+    #[test]
+    fn every_listed_tool_is_found_by_its_own_name() {
+        let mut searched = 0;
+        for (module, schemas) in all_static_schema_modules() {
+            for schema in schemas {
+                let name = schema["name"].as_str().expect("a name");
+                assert!(
+                    found(name).iter().any(|n| n == name),
+                    "{name} ({module}) is listed and cannot be found by searching its name"
+                );
+                searched += 1;
+            }
+        }
+        assert_eq!(searched, crate::static_tool_count());
+    }
+
+    /// The five domains the old list left out, by a word a caller would use.
+    #[test]
+    fn the_domains_the_old_index_left_out_are_searched() {
+        for (query, expected) in [
+            ("ml_predict", "ml_predict"),
+            ("ollama", "ollama_list_models"),
+            ("graph_query", "graph_query"),
+            ("ops_alerts", "list_ops_alerts"),
+            ("memory_ab_eval", "run_memory_ab_eval"),
+        ] {
+            assert!(
+                found(query).iter().any(|n| n == expected),
+                "searching {query:?} did not find {expected}: {:?}",
+                found(query).iter().take(8).collect::<Vec<_>>()
+            );
+        }
+        // Control: a query that matches nothing still finds nothing.
+        assert!(found("zzqqxxnothing").is_empty());
+    }
+
+    /// The argument-warning indexes read the same list: a misspelt argument
+    /// to a tool of a domain the old list left out now draws a warning.
+    #[test]
+    fn argument_warnings_cover_every_listed_tool() {
+        let index = crate::utils::tool_arg_index();
+        for (module, schemas) in all_static_schema_modules() {
+            for schema in schemas {
+                let name = schema["name"].as_str().expect("a name");
+                let declares = schema["inputSchema"]["properties"].is_object();
+                assert_eq!(
+                    index.contains_key(name),
+                    declares,
+                    "{name} ({module}): the argument index and the listed schema disagree"
+                );
+            }
+        }
+        let warning = crate::utils::unknown_argument_warning(
+            "ml_predict",
+            &serde_json::json!({"no_such_argument": 1}),
+        );
+        assert!(
+            warning.is_some(),
+            "a misspelt ml_predict argument draws no warning"
+        );
+    }
 }
 
 #[cfg(test)]
