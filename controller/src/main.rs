@@ -190,6 +190,7 @@ struct PlatformServices {
     google_cloud_write_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
     google_cloud_full_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
     google_health_service: std::sync::Arc<google_health::GoogleHealthService>,
+    plaid_connect_service: std::sync::Arc<talos_plaid_connect::PlaidConnectService>,
     github_connect_service: std::sync::Arc<talos_github_connect::GithubConnectService>,
     gmail_watch_service: Option<std::sync::Arc<gmail::watch::GmailWatchService>>,
     gmail_pubsub_verifier: Option<std::sync::Arc<gmail::pubsub_jwt::PubsubJwtVerifier>>,

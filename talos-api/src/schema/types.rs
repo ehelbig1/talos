@@ -1621,6 +1621,7 @@ pub enum IntegrationService {
     Jira,
     GoogleCloud,
     GoogleHealth,
+    Plaid,
 }
 
 #[derive(SimpleObject, Clone, Debug)]

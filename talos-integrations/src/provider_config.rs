@@ -130,6 +130,11 @@ pub fn revoke_provider_for(
     }
 }
 
+/// The registry id of the Plaid bank-connection entry. The disconnect resolver
+/// branches on it: a bank connection ends through `talos-plaid-connect`, not
+/// the OAuth revoke path.
+pub const PLAID_PROVIDER_ID: &str = "plaid";
+
 pub static PROVIDERS: &[IntegrationProviderConfig] = &[
     IntegrationProviderConfig {
         id: "google-calendar",
@@ -276,6 +281,31 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         credential_provider: "google_health",
         tier_column: None,
         account_email_column: Some("account_email"),
+    },
+    IntegrationProviderConfig {
+        id: PLAID_PROVIDER_ID,
+        display_name: "Bank accounts",
+        description:
+            "Read balances and transactions through Plaid; one connection per bank sign-in",
+        icon: "Landmark",
+        color: "#111111",
+        graphql_enum: "PLAID",
+        // Plaid Link runs in Plaid's own window; nothing redirects here.
+        oauth_hosts: &[],
+        env_vars: &["PLAID_CLIENT_ID", "PLAID_SECRET", "PLAID_ENV"],
+        redirect_path: "",
+        db_table: "plaid_items",
+        account_identifier_column: "COALESCE(t.institution_name, 'Bank') || \
+             CASE WHEN t.environment = 'sandbox' THEN ' (sandbox)' ELSE '' END",
+        account_identifier_join: None,
+        extra_where: "AND t.is_active = true",
+        disconnect_is_soft_delete: true,
+        provider_key_column: "item_id",
+        // Not an OAuth credential; the disconnect resolver ends it through
+        // talos-plaid-connect (branching on PLAID_PROVIDER_ID).
+        credential_provider: "plaid",
+        tier_column: None,
+        account_email_column: None,
     },
 ];
 

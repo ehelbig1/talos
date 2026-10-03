@@ -696,6 +696,7 @@ enum IntegrationService {
 	JIRA
 	GOOGLE_CLOUD
 	GOOGLE_HEALTH
+	PLAID
 }
 
 """

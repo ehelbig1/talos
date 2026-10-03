@@ -618,6 +618,14 @@ pub(crate) async fn build_platform_services(
             .with_credentials_service(oauth_credential_service.clone()),
     );
 
+    // Bank connections through Plaid Link. Off (every request refused) unless
+    // PLAID_CLIENT_ID / PLAID_SECRET / PLAID_ENV are all set; the boot check
+    // below says which.
+    let plaid_connect_service = std::sync::Arc::new(talos_plaid_connect::PlaidConnectService::new(
+        db_pool.clone(),
+        secrets_manager.clone(),
+    ));
+
     // Write-tier (Phase C provisioning) sibling: same OAuth client, separate
     // consent under provider "google_cloud_write" with scope-narrowed
     // pubsub+monitoring grants. See GcpTier docs in talos-google-cloud.
@@ -1351,6 +1359,7 @@ pub(crate) async fn build_platform_services(
         google_cloud_write_service,
         google_cloud_full_service,
         google_health_service,
+        plaid_connect_service,
         github_connect_service,
         gmail_watch_service,
         gmail_pubsub_verifier,
@@ -1818,6 +1827,7 @@ pub(crate) fn build_schema_and_services(
     let api_key_service = services.api_key_service.clone();
     let oauth_service = services.oauth_service.clone();
     let google_calendar_service = services.google_calendar_service.clone();
+    let plaid_connect_service = services.plaid_connect_service.clone();
     let oauth_credential_service = services.oauth_credential_service.clone();
     let gmail_integration_service = services.gmail_integration_service.clone();
     let module_execution_service = services.module_execution_service.clone();
@@ -2039,6 +2049,8 @@ pub(crate) fn build_schema_and_services(
         .data(api_key_service.clone())
         .data(oauth_service.clone())
         .data(google_calendar_service.clone())
+        // Ends a bank connection on the Settings disconnect path.
+        .data(plaid_connect_service)
         // Generic OAuth credential service — used by oauthIntegrations query,
         // connectOAuthIntegration, and disconnectOAuthIntegration mutations.
         .data(oauth_credential_service.clone())

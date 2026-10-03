@@ -1829,6 +1829,7 @@ dependencies = [
  "talos-ops-alerts-repository",
  "talos-organizations",
  "talos-plaid",
+ "talos-plaid-connect",
  "talos-public-url",
  "talos-push-channel-inventory",
  "talos-rate-limit",
@@ -7659,6 +7660,7 @@ dependencies = [
  "talos-oauth",
  "talos-ops-alerts-repository",
  "talos-organizations",
+ "talos-plaid-connect",
  "talos-rate-limit",
  "talos-registry",
  "talos-rhai-sandbox",
@@ -9261,6 +9263,22 @@ dependencies = [
  "talos-http-utils",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "talos-plaid-connect"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "talos-organizations",
+ "talos-plaid",
+ "talos-secrets-manager",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

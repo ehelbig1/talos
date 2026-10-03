@@ -64,6 +64,7 @@ tower-cookies = "0.11"
 talos-worker-runtime = { path = "../talos-worker-runtime" }
 talos-google-calendar = { path = "../talos-google-calendar" }
 talos-integrations = { path = "../talos-integrations" }
+talos-plaid-connect = { path = "../talos-plaid-connect" }
 talos-llm = { path = "../talos-llm" }
 talos-mcp-tool-schema = { path = "../talos-mcp-tool-schema" }
 talos-module-executions = { path = "../talos-module-executions" }
