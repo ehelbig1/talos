@@ -7868,6 +7868,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "talos-compilation",
  "talos-module-testkit",
 ]
 

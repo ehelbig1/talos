@@ -15,6 +15,11 @@ pub struct Module {
     /// The Rust module name it is included under (`gmail_get_message`).
     pub name: String,
     pub source: PathBuf,
+    /// Tests kept in a file of their own, for a source that carries none
+    /// (a module pulled from a running platform is stored without its tests).
+    /// Included as `mod tests` inside the module, so the file reaches the
+    /// module's private items with its own `use super::*;`.
+    pub tests: Option<PathBuf>,
 }
 
 impl Module {
@@ -24,7 +29,15 @@ impl Module {
         Self {
             name: dir_name.replace('-', "_"),
             source,
+            tests: None,
         }
+    }
+
+    /// The same module with its tests read from `tests`.
+    #[must_use]
+    pub fn with_tests(mut self, tests: PathBuf) -> Self {
+        self.tests = Some(tests);
+        self
     }
 }
 
@@ -36,7 +49,12 @@ pub fn strip_sdk_macro(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     for line in source.lines() {
         let t = line.trim();
-        if t == "use talos_sdk_macros::talos_module;" || t.starts_with("#[talos_module") {
+        // The attribute is written both ways: bare after the import, and
+        // path-qualified with no import at all.
+        if t == "use talos_sdk_macros::talos_module;"
+            || t.starts_with("#[talos_module")
+            || t.starts_with("#[talos_sdk_macros::talos_module")
+        {
             continue;
         }
         out.push_str(line);
@@ -73,10 +91,23 @@ pub fn generate(modules: &[Module], out_dir: &Path) -> io::Result<()> {
         let prepared = out_dir.join(format!("{}.rs", m.name));
         std::fs::write(&prepared, strip_sdk_macro(&source))?;
         println!("cargo:rerun-if-changed={}", m.source.display());
-        // `{:?}` on the path writes it as a Rust string literal.
+        // `{:?}` on a path writes it as a Rust string literal.
+        let tests = match &m.tests {
+            None => String::new(),
+            Some(path) => {
+                println!("cargo:rerun-if-changed={}", path.display());
+                // Included from where it is, not copied: a compiler message
+                // about a test names the file the author edits.
+                let absolute = std::fs::canonicalize(path)?;
+                format!(
+                    "    #[cfg(test)]\n    mod tests {{\n        include!({:?});\n    }}\n",
+                    absolute.display().to_string()
+                )
+            }
+        };
         let _ = writeln!(
             index,
-            "#[allow(dead_code, unused_imports)]\npub mod {} {{\n    use crate::talos;\n    include!({:?});\n}}",
+            "#[allow(dead_code, unused_imports)]\npub mod {} {{\n    use crate::talos;\n    include!({:?});\n{tests}}}",
             m.name,
             prepared.display().to_string()
         );
@@ -95,6 +126,57 @@ mod tests {
             strip_sdk_macro(src),
             "use serde::Deserialize;\n\npub fn run() {}\n// talos_module in a comment stays\n"
         );
+        // The path-qualified attribute, written without the import.
+        assert_eq!(
+            strip_sdk_macro(
+                "#[talos_sdk_macros::talos_module(world = \"http-node\")]\nfn run() {}\n"
+            ),
+            "fn run() {}\n"
+        );
+    }
+
+    #[test]
+    fn a_separate_tests_file_is_included_inside_the_module() {
+        let dir = std::env::temp_dir().join(format!("testkit-gen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("module.rs");
+        let tests = dir.join("tests.rs");
+        std::fs::write(&source, "fn private() -> u8 { 1 }\n").unwrap();
+        std::fs::write(
+            &tests,
+            "use super::*;\n#[test]\nfn t() { assert_eq!(private(), 1); }\n",
+        )
+        .unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        generate(
+            &[
+                Module::new("with-tests", source.clone()).with_tests(tests.clone()),
+                Module::new("without", source),
+            ],
+            &out,
+        )
+        .unwrap();
+        let index = std::fs::read_to_string(out.join("modules.rs")).unwrap();
+        let (first, second) = index.split_once("pub mod without").unwrap();
+        assert!(first.contains("pub mod with_tests {"), "{index}");
+        assert!(
+            first.contains("#[cfg(test)]\n    mod tests {")
+                && first.contains(&format!(
+                    "{:?}",
+                    std::fs::canonicalize(&tests).unwrap().display().to_string()
+                )),
+            "the tests file is included inside the module: {index}"
+        );
+        assert!(!second.contains("mod tests"), "{index}");
+        // A tests file that is not there is an error, not a module without tests.
+        assert!(generate(
+            &[Module::new("gone", dir.join("module.rs")).with_tests(dir.join("absent.rs"))],
+            &out
+        )
+        .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -111,6 +193,7 @@ mod tests {
         let bad = Module {
             name: "x; mod y".into(),
             source: PathBuf::from("/nonexistent"),
+            tests: None,
         };
         assert!(
             generate(&[bad], &dir).is_err(),

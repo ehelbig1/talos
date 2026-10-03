@@ -75,6 +75,18 @@ pub use talos_module_testkit::talos;
 include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 ```
 
+A module pulled from a running platform is stored without tests. Keep them
+in a file beside the source and name it:
+
+```rust
+Module::new("week-plan", "modules/week-plan/module.rs".into())
+    .with_tests("modules/week-plan/tests.rs".into())
+```
+
+The file is included as `mod tests` inside the module, so it starts with
+`use super::*;` and reaches the module's private items. It is included from
+where it is, so a compiler message names the file you edit.
+
 ## What this proves
 
 The module's logic. It does not prove the module builds for the sandbox: the

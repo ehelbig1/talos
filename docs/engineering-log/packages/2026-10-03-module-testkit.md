@@ -37,6 +37,15 @@ month needed that stand-in rebuilt by hand (eight times).
 * **A template's crates must be linked by `talos-catalog-tests`.** The build
   refuses with the template and crate named, instead of an unresolved import.
 
+**Found by using it outside the catalog** (42 installed modules, 7 with
+tests kept beside them, 108 tests):
+* `Module::with_tests(path)`: a tests file of its own, for a source stored
+  without tests. A tests file that is missing is an error, not a module
+  without tests.
+* The SDK attribute is also written path-qualified
+  (`#[talos_sdk_macros::talos_module(…)]`, 8 of those 42 modules, 0 catalog
+  templates); `strip_sdk_macro` removes both spellings.
+
 **Not done.** Interfaces no tested template uses are not mirrored (`model`,
 `database`, `messaging`, `cache`, `files`, `governance`, `crypto`, `json`,
 `data_transform`).

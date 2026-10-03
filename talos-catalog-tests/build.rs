@@ -31,12 +31,13 @@ fn linked_crates(manifest: &str) -> BTreeSet<String> {
     out
 }
 
-fn declared_crates(talos_json: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(talos_json)
-        .unwrap_or_else(|e| panic!("{}: {e}", talos_json.display()));
-    let meta: serde_json::Value =
-        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", talos_json.display()));
-    meta.get("dependencies")
+/// The crates a template declares, through the one reader of a template's
+/// manifest (the same one every compile path uses).
+fn declared_crates(dir: &Path) -> Vec<String> {
+    let template = talos_compilation::CatalogTemplate::load(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    template
+        .dependencies()
         .and_then(serde_json::Value::as_object)
         .map(|deps| deps.keys().cloned().collect())
         .unwrap_or_default()
@@ -44,6 +45,7 @@ fn declared_crates(talos_json: &Path) -> Vec<String> {
 
 fn main() {
     let here = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    // allow-undocumented-env: OUT_DIR — set by cargo for a build script; not Talos configuration
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let templates = here.join("../module-templates");
     println!("cargo:rerun-if-changed={}", templates.display());
@@ -72,7 +74,7 @@ fn main() {
             .and_then(|n| n.to_str())
             .expect("template directory name")
             .to_string();
-        for krate in declared_crates(&dir.join("talos.json")) {
+        for krate in declared_crates(&dir) {
             let known = BUNDLED.contains(&krate.as_str())
                 || linked.contains(&krate)
                 || linked.contains(&krate.replace('-', "_"));

@@ -22,6 +22,8 @@ chrono = { workspace = true }
 
 [build-dependencies]
 talos-module-testkit = { path = "../talos-module-testkit" }
+# The one reader of a template's manifest (structural check 68).
+talos-compilation = { path = "../talos-compilation" }
 serde_json = { workspace = true }
 
 [lints]
