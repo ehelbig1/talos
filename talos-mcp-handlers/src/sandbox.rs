@@ -337,7 +337,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_module",
-            "description": "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call), so you can see how close a run came to its fuel and token limits. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. NOTE: the run also INHERITS the actor's LLM/egress tier — and WITHOUT an actor_id it defaults to Tier-1 (local-egress-only). So a module that calls an EXTERNAL API (any non-loopback host — Google, Slack, etc.) will fail with a network error unless the actor permits public egress. That is the EGRESS axis, not the LLM tier: since `egress_scope` was split out, `max_llm_tier=tier1` + `egress_scope=public` reaches an external API while still refusing every external LLM provider — the house pattern for a privacy-sensitive reader, and the correct posture here. (This note used to say \"a Tier-2 actor\", which has been wrong since the split.) `vault://` references in config are delivered to the module AS THE LITERAL, exactly as the engine delivers them, and the host resolves them at the outbound call; the block is the egress ceiling, not the secret.\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
+            "description": ([
+                "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call), so you can see how close a run came to its fuel and token limits. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. ",
+                TEST_MODULE_NETWORK_NOTE,
+                "\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
+            ]
+            .concat()),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -668,35 +673,6 @@ pub(crate) struct InProcessEgress {
     pub air_gapped: bool,
 }
 
-/// Resolve the egress posture for an IN-PROCESS run (`run_sandbox`,
-/// `test_module`, `run_scratch_session`) — 2026-09-10.
-///
-/// The worker's SSRF gate has two modes, keyed off `resolve_local_egress_only`:
-/// `local_egress_only = true` DENIES public hosts and ALLOWS loopback /
-/// private / link-local ones (it exists so a credential-free worker can reach
-/// a LAN Ollama); `false` is the inverse (public allowed, private denied).
-/// `egress_scope: None` + `LlmTier::Tier1` resolves to the FIRST mode — and
-/// every in-process surface passed exactly that pair. Inside the controller
-/// pod, "private allowed" means a caller-supplied module can `http::fetch`
-/// Postgres, Redis, NATS, Vault and the cloud metadata endpoint by hostname.
-///
-/// So for in-process execution `Some(Public)` is the FAIL-CLOSED choice, not
-/// the permissive one: it is the only value that makes the SSRF gate deny the
-/// private ranges, and it leaves the LLM-provider deny untouched because that
-/// is keyed to `max_llm_tier` alone (the documented `tier1 + egress=public`
-/// pattern). A caller with no bound actor gets that posture with its declared
-/// `allowed_hosts`.
-///
-/// When an actor IS bound, its real scope is honoured — with one translation.
-/// An actor whose resolved posture is LOCAL-ONLY (explicit `local`, or NULL on a
-/// Tier-1 actor) must not reach the public internet, but honouring `Local`
-/// in-process would open the pod's private network to it. There is no
-/// "deny both" value in the runtime signature, so we compose one: `Some(Public)`
-/// (private denied) PLUS an EMPTY `allowed_hosts` (every host denied — empty
-/// `allowed_hosts` is deny-all, see CLAUDE.md "Engine retry & wire-format
-/// rules"). The actor's air-gap is kept and the controller's network is not
-/// exposed. An unreadable scope gets the same treatment: a gate that cannot
-/// read its rule refuses.
 /// The HTTP verbs an ephemeral `run_sandbox` execution may issue.
 ///
 /// **This is the one grant on the sandbox path that defaults OPEN, and the
@@ -731,6 +707,59 @@ pub(crate) fn resolve_sandbox_methods(args: &serde_json::Value) -> Vec<String> {
     }
 }
 
+/// What `test_module`'s description says about network and model access.
+///
+/// One constant, held to [`in_process_egress_posture`] and the tier rule by
+/// `test_module_network_note_tests`. Until 2026-10-03 the description said a
+/// run with no `actor_id` was "Tier-1 (local-egress-only)" and that a call
+/// to an external API "will fail with a network error unless the actor
+/// permits public egress". That was the posture before 2026-09-10; since
+/// then such a run has public egress to the module's own hosts, and the
+/// description sent a caller looking for an actor they did not need.
+pub(crate) const TEST_MODULE_NETWORK_NOTE: &str = "NETWORK AND MODEL ACCESS: the run happens \
+    inside the controller, so it can never reach a loopback or private address, whatever the \
+    actor. WITHOUT an actor_id it may call the public hosts the module was granted \
+    (`allowed_hosts`) and no external LLM provider. WITH an actor_id it takes that actor's \
+    posture: an actor whose egress is public (`egress_scope=public`, or a tier-2 actor with \
+    none set) reaches the module's granted hosts; an actor whose egress is local-only \
+    (`egress_scope=local`, or a tier-1 actor with none set), or whose scope cannot be read, \
+    gets NO network access for this run — an in-process run cannot honour 'local' without \
+    exposing the controller's own network — and the reply's diagnostics say so. External LLM \
+    providers follow the actor's `max_llm_tier` (tier-1 when no actor is given, or when the \
+    tier cannot be read). `max_llm_tier=tier1` + `egress_scope=public` is the house pattern \
+    for a privacy-sensitive reader: it reaches an external API and refuses every external LLM \
+    provider. `vault://` references in config are delivered to the module AS THE LITERAL, \
+    exactly as the engine delivers them, and the host resolves them at the outbound call.";
+
+/// Resolve the egress posture for an IN-PROCESS run (`run_sandbox`,
+/// `test_module`, `run_scratch_session`) — 2026-09-10.
+///
+/// The worker's SSRF gate has two modes, keyed off `resolve_local_egress_only`:
+/// `local_egress_only = true` DENIES public hosts and ALLOWS loopback /
+/// private / link-local ones (it exists so a credential-free worker can reach
+/// a LAN Ollama); `false` is the inverse (public allowed, private denied).
+/// `egress_scope: None` + `LlmTier::Tier1` resolves to the FIRST mode — and
+/// every in-process surface passed exactly that pair. Inside the controller
+/// pod, "private allowed" means a caller-supplied module can `http::fetch`
+/// Postgres, Redis, NATS, Vault and the cloud metadata endpoint by hostname.
+///
+/// So for in-process execution `Some(Public)` is the FAIL-CLOSED choice, not
+/// the permissive one: it is the only value that makes the SSRF gate deny the
+/// private ranges, and it leaves the LLM-provider deny untouched because that
+/// is keyed to `max_llm_tier` alone (the documented `tier1 + egress=public`
+/// pattern). A caller with no bound actor gets that posture with its declared
+/// `allowed_hosts`.
+///
+/// When an actor IS bound, its real scope is honoured — with one translation.
+/// An actor whose resolved posture is LOCAL-ONLY (explicit `local`, or NULL on a
+/// Tier-1 actor) must not reach the public internet, but honouring `Local`
+/// in-process would open the pod's private network to it. There is no
+/// "deny both" value in the runtime signature, so we compose one: `Some(Public)`
+/// (private denied) PLUS an EMPTY `allowed_hosts` (every host denied — empty
+/// `allowed_hosts` is deny-all, see CLAUDE.md "Engine retry & wire-format
+/// rules"). The actor's air-gap is kept and the controller's network is not
+/// exposed. An unreadable scope gets the same treatment: a gate that cannot
+/// read its rule refuses.
 pub(crate) fn in_process_egress_posture(
     actor: ActorEgressRead,
     tier: talos_workflow_job_protocol::LlmTier,
@@ -5688,6 +5717,80 @@ mod in_process_egress_posture_tests {
         assert!(p.air_gapped);
         assert!(p.allowed_hosts.is_empty());
         assert_eq!(p.egress_scope, Some(EgressScope::Public));
+    }
+}
+
+#[cfg(test)]
+mod test_module_network_note_tests {
+    use super::{in_process_egress_posture, ActorEgressRead, TEST_MODULE_NETWORK_NOTE};
+    use talos_workflow_job_protocol::{EgressScope, LlmTier};
+
+    fn description() -> String {
+        super::tool_schemas()
+            .into_iter()
+            .find(|t| t["name"] == "test_module")
+            .and_then(|t| t["description"].as_str().map(str::to_string))
+            .expect("test_module has a description")
+    }
+
+    /// The description carries the note, once, and none of the sentences it
+    /// replaced.
+    #[test]
+    fn the_description_says_what_the_note_says() {
+        let description = description();
+        assert_eq!(description.matches(TEST_MODULE_NETWORK_NOTE).count(), 1);
+        for stale in [
+            ["local-egress", "-only"].concat(),
+            ["will fail with a network", " error"].concat(),
+            ["INHERITS the actor's", " LLM/egress tier"].concat(),
+        ] {
+            assert!(
+                !description.contains(&stale),
+                "the description still says: {stale}"
+            );
+        }
+        // The parts either side of the note are still there.
+        assert!(description.starts_with("Test a module in isolation"));
+        assert!(description.contains("BACKWARDS COMPATIBILITY"));
+    }
+
+    /// Each claim in the note, against the function that decides it. A
+    /// change to the posture fails here until the note is changed with it.
+    #[test]
+    fn each_claim_in_the_note_is_what_the_posture_function_does() {
+        let hosts = || vec!["api.example.com".to_string()];
+        let reaches = |actor, tier| {
+            let p = in_process_egress_posture(actor, tier, hosts());
+            // Never the mode that allows private ranges.
+            assert_eq!(p.egress_scope, Some(EgressScope::Public));
+            assert_eq!(p.air_gapped, p.allowed_hosts.is_empty());
+            !p.air_gapped
+        };
+
+        // "WITHOUT an actor_id it may call the public hosts the module was granted"
+        assert!(
+            TEST_MODULE_NETWORK_NOTE.contains("WITHOUT an actor_id it may call the public hosts")
+        );
+        assert!(reaches(ActorEgressRead::Unbound, LlmTier::Tier1));
+
+        // "`egress_scope=public`, or a tier-2 actor with none set … reaches"
+        assert!(TEST_MODULE_NETWORK_NOTE.contains("`egress_scope=public`, or a tier-2 actor with"));
+        assert!(reaches(
+            ActorEgressRead::Bound(Some(EgressScope::Public)),
+            LlmTier::Tier1
+        ));
+        assert!(reaches(ActorEgressRead::Bound(None), LlmTier::Tier2));
+
+        // "`egress_scope=local`, or a tier-1 actor with none set), or whose scope cannot be read … NO network access"
+        assert!(TEST_MODULE_NETWORK_NOTE.contains("`egress_scope=local`, or a tier-1 actor with"));
+        assert!(TEST_MODULE_NETWORK_NOTE.contains("or whose scope cannot be read"));
+        assert!(TEST_MODULE_NETWORK_NOTE.contains("gets NO network access for this run"));
+        assert!(!reaches(
+            ActorEgressRead::Bound(Some(EgressScope::Local)),
+            LlmTier::Tier2
+        ));
+        assert!(!reaches(ActorEgressRead::Bound(None), LlmTier::Tier1));
+        assert!(!reaches(ActorEgressRead::Unreadable, LlmTier::Tier2));
     }
 }
 
