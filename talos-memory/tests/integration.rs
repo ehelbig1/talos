@@ -264,6 +264,179 @@ async fn persist_recall_forget_roundtrip() {
         .expect("key_exists_at_all post-prefix-forget"));
 }
 
+/// The stored row's write-side columns, read raw: what "nothing was
+/// rewritten" has to leave alone.
+async fn raw_row(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    key: &str,
+) -> (
+    Vec<u8>,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+) {
+    sqlx::query_as(
+        "SELECT value_enc, updated_at, checked_at, expires_at FROM actor_memory \
+         WHERE actor_id = $1 AND key = $2",
+    )
+    .bind(actor_id)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .expect("read the row")
+}
+
+/// `skip_if_unchanged`: an equal value is not rewritten (same ciphertext,
+/// same `updated_at`), the row is marked checked, its expiry renewed, and the
+/// freshness probe reports the check — the point of the feature.
+#[tokio::test]
+async fn an_unchanged_value_is_marked_checked_not_rewritten() {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
+        return;
+    };
+    let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
+    let key = format!("{prefix}list");
+    let value = serde_json::json!({"items": [{"id": 1, "text": "call the bank"}]});
+    let meta = serde_json::json!({"kind": "list"});
+    mem::persist_memory_with_metadata_typed(
+        &pool,
+        actor_id,
+        &key,
+        &value,
+        Some(&meta),
+        "episodic",
+        Some(1.0),
+    )
+    .await
+    .expect("first write");
+    let (enc0, updated0, checked0, expires0) = raw_row(&pool, actor_id, &key).await;
+    assert!(checked0.is_none(), "a plain write marks nothing checked");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let outcome = mem::persist_memory_unless_unchanged_typed(
+        &pool,
+        actor_id,
+        &key,
+        &value,
+        Some(&meta),
+        "episodic",
+        Some(2.0),
+    )
+    .await
+    .expect("unless unchanged");
+    assert!(
+        matches!(outcome, mem::UnlessUnchanged::Unchanged),
+        "{outcome:?}"
+    );
+    let (enc1, updated1, checked1, expires1) = raw_row(&pool, actor_id, &key).await;
+    assert_eq!(enc1, enc0, "the ciphertext is not rewritten");
+    assert_eq!(
+        updated1, updated0,
+        "updated_at still says when the VALUE last changed"
+    );
+    let checked1 = checked1.expect("marked checked");
+    assert!(checked1 > updated0);
+    assert!(
+        expires1.unwrap() > expires0.unwrap(),
+        "the expiry is renewed"
+    );
+
+    let ages = mem::key_freshness(&pool, actor_id, std::slice::from_ref(&key))
+        .await
+        .expect("key_freshness");
+    assert_eq!(ages.get(&key), Some(&checked1), "freshness reads the check");
+
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+}
+
+/// Anything that is not equal is written exactly as a plain write: a new
+/// value, new metadata, another memory type, and a key that is not there.
+#[tokio::test]
+async fn anything_not_equal_is_written() {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
+        return;
+    };
+    let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
+    let key = format!("{prefix}list");
+    let meta = serde_json::json!({"kind": "list"});
+    let v1 = serde_json::json!({"items": [1]});
+
+    let first = mem::persist_memory_unless_unchanged_typed(
+        &pool,
+        actor_id,
+        &key,
+        &v1,
+        Some(&meta),
+        "episodic",
+        Some(1.0),
+    )
+    .await
+    .expect("absent key");
+    assert!(
+        matches!(first, mem::UnlessUnchanged::Written(_)),
+        "nothing stored yet"
+    );
+
+    let mut last = raw_row(&pool, actor_id, &key).await;
+    for (value, metadata, memory_type, what) in [
+        (
+            serde_json::json!({"items": [1, 2]}),
+            Some(meta.clone()),
+            "episodic",
+            "a new value",
+        ),
+        (
+            serde_json::json!({"items": [1, 2]}),
+            Some(serde_json::json!({"kind": "other"})),
+            "episodic",
+            "new metadata",
+        ),
+        (
+            serde_json::json!({"items": [1, 2]}),
+            None,
+            "episodic",
+            "metadata removed",
+        ),
+        (
+            serde_json::json!({"items": [1, 2]}),
+            None,
+            "semantic",
+            "another memory type",
+        ),
+    ] {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let outcome = mem::persist_memory_unless_unchanged_typed(
+            &pool,
+            actor_id,
+            &key,
+            &value,
+            metadata.as_ref(),
+            memory_type,
+            Some(1.0),
+        )
+        .await
+        .expect(what);
+        assert!(
+            matches!(outcome, mem::UnlessUnchanged::Written(_)),
+            "{what}: {outcome:?}"
+        );
+        let now = raw_row(&pool, actor_id, &key).await;
+        assert!(now.1 > last.1, "{what}: updated_at moves on a write");
+        last = now;
+    }
+    let ages = mem::key_freshness(&pool, actor_id, std::slice::from_ref(&key))
+        .await
+        .expect("key_freshness");
+    assert_eq!(
+        ages.get(&key),
+        Some(&last.1),
+        "never checked: freshness is the write time"
+    );
+
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+}
+
 /// MCP-S2 regression: the at-rest ciphertext is bound to its `(actor_id, key)`
 /// via AES-GCM AAD, so an attacker with raw DB write capability can't swap
 /// `value_enc` between two rows that share a `value_key_id` to read another

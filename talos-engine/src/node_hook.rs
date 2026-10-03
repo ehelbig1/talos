@@ -224,20 +224,64 @@ impl ControllerNodeHook {
         // dedicated actor_memory.metadata JSONB column (not merged into value).
         // Non-object metadata is ignored — the DB column is typed JSONB object.
         let metadata = mw.get("metadata").filter(|v| v.is_object()).cloned();
+        // `skip_if_unchanged: true` — write only if the stored value differs,
+        // otherwise mark the key checked (what a freshness contract reads).
+        // Anything other than a boolean is refused rather than read as
+        // `false`: the author asked for something specific, and a full write
+        // is the costlier answer to a typo.
+        let skip_if_unchanged = match skip_if_unchanged_flag(mw.get("skip_if_unchanged")) {
+            Ok(b) => b,
+            Err(()) => {
+                let key_preview: String = talos_dlp_provider::redact_str(&key)
+                    .chars()
+                    .take(120)
+                    .collect();
+                tracing::warn!(
+                    target: "talos_audit",
+                    key = %key_preview,
+                    "__memory_write__ skip_if_unchanged must be true or false — write dropped"
+                );
+                if let Some(m) = talos_metrics::global() {
+                    m.memory_write_failures_total
+                        .with_label_values(&["validation"])
+                        .inc();
+                }
+                return;
+            }
+        };
 
         let pool = self.pool.clone();
         tokio::spawn(async move {
-            if let Err(e) = talos_actor_memory_service::persist_memory_with_metadata_typed(
-                &pool,
-                actor_id,
-                &key,
-                &value,
-                metadata.as_ref(),
-                &memory_type,
-                ttl_hours,
-            )
-            .await
-            {
+            let result = if skip_if_unchanged {
+                talos_actor_memory_service::persist_memory_unless_unchanged_typed(
+                    &pool,
+                    actor_id,
+                    &key,
+                    &value,
+                    metadata.as_ref(),
+                    &memory_type,
+                    ttl_hours,
+                )
+                .await
+                .map(|outcome| {
+                    if matches!(outcome, talos_actor_memory_service::UnlessUnchanged::Unchanged) {
+                        tracing::debug!(%actor_id, %key, "__memory_write__ unchanged — marked checked");
+                    }
+                })
+            } else {
+                talos_actor_memory_service::persist_memory_with_metadata_typed(
+                    &pool,
+                    actor_id,
+                    &key,
+                    &value,
+                    metadata.as_ref(),
+                    &memory_type,
+                    ttl_hours,
+                )
+                .await
+                .map(|_| ())
+            };
+            if let Err(e) = result {
                 // Classify for metric label directly from the typed
                 // `MemoryWriteError` variant — set AT THE SOURCE inside
                 // `persist_memory_with_metadata_typed`, where the
@@ -546,6 +590,33 @@ const ENVELOPE_DEFAULT_TTL_HOURS: f64 = 168.0;
 /// contrary to the envelope's documented "semantic memories ignore TTL".
 /// `None` here reaches `talos_memory::default_expires_at`, whose `semantic`
 /// arm is exactly "no expiry".
+/// The envelope's `skip_if_unchanged`: absent or `null` is `false`, a boolean
+/// is itself, anything else is refused (`Err`) rather than read as `false`.
+fn skip_if_unchanged_flag(v: Option<&JsonValue>) -> Result<bool, ()> {
+    match v {
+        None | Some(JsonValue::Null) => Ok(false),
+        Some(JsonValue::Bool(b)) => Ok(*b),
+        Some(_) => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod skip_if_unchanged_flag_tests {
+    use super::skip_if_unchanged_flag;
+    use serde_json::json;
+
+    #[test]
+    fn absent_null_and_booleans_are_read_and_anything_else_is_refused() {
+        assert_eq!(skip_if_unchanged_flag(None), Ok(false));
+        assert_eq!(skip_if_unchanged_flag(Some(&json!(null))), Ok(false));
+        assert_eq!(skip_if_unchanged_flag(Some(&json!(true))), Ok(true));
+        assert_eq!(skip_if_unchanged_flag(Some(&json!(false))), Ok(false));
+        for v in [json!("true"), json!(1), json!({}), json!([true])] {
+            assert_eq!(skip_if_unchanged_flag(Some(&v)), Err(()), "{v}");
+        }
+    }
+}
+
 fn envelope_ttl_hours(memory_type: &str, explicit: Option<f64>) -> Option<f64> {
     match explicit {
         Some(hours) => Some(hours),

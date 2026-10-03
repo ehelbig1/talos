@@ -1114,6 +1114,110 @@ pub async fn persist_memory_with_metadata(
         .map_err(Into::into)
 }
 
+/// What [`persist_memory_unless_unchanged_typed`] did.
+#[derive(Clone, Copy, Debug)]
+pub enum UnlessUnchanged {
+    /// The stored value, memory type or metadata differed, or nothing live
+    /// was stored: written exactly as [`persist_memory_with_metadata_typed`]
+    /// writes.
+    Written(PersistOutcome),
+    /// Equal to what is stored. Nothing was rewritten — no new ciphertext, no
+    /// embedding, no graph extraction, `updated_at` untouched. The row's
+    /// `checked_at` is now, and its expiry is renewed as a write would renew
+    /// it.
+    Unchanged,
+}
+
+/// Write `value` under `key` unless the live stored row already holds it.
+///
+/// For a writer that runs often and changes the value rarely. A full write
+/// costs an embedding and a graph extraction, so such a writer used to write
+/// only on change — and a freshness contract (`requires_fresh`, which reads
+/// [`key_freshness`]) then could not tell "nothing changed today" from "the
+/// writer stopped running". This records the check instead: an unchanged value
+/// marks the row `checked_at = now()`, and `key_freshness` reports the later of
+/// that and `updated_at`.
+///
+/// "Unchanged" means the live row's decrypted value, memory type and metadata
+/// all equal the supplied ones. Anything that cannot be confirmed equal — no
+/// live row, a read or decrypt failure, a row that expired between the read
+/// and the mark — is written normally, so this never does LESS than a write.
+pub async fn persist_memory_unless_unchanged_typed(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    key: &str,
+    value: &serde_json::Value,
+    metadata: Option<&serde_json::Value>,
+    memory_type: &str,
+    ttl_hours: Option<f64>,
+) -> std::result::Result<UnlessUnchanged, MemoryWriteError> {
+    let trimmed = validate_memory_key(key)
+        .map_err(|e| MemoryWriteError::Validation(anyhow::anyhow!("{}", e)))?;
+    let canonical_type = validate_memory_type(memory_type).map_err(MemoryWriteError::Validation)?;
+    match stored_value_equals(pool, actor_id, trimmed, value, metadata, canonical_type).await {
+        Ok(true) => {
+            let expires_at = default_expires_at(canonical_type, ttl_hours);
+            let marked = sqlx::query(
+                "UPDATE actor_memory SET checked_at = now(), expires_at = $3 \
+                 WHERE actor_id = $1 AND key = $2 \
+                   AND (expires_at IS NULL OR expires_at > now())",
+            )
+            .bind(actor_id)
+            .bind(trimmed)
+            .bind(expires_at)
+            .execute(pool)
+            .await
+            .context("mark memory checked")
+            .map_err(MemoryWriteError::Db)?
+            .rows_affected();
+            if marked > 0 {
+                return Ok(UnlessUnchanged::Unchanged);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => tracing::debug!(
+            %actor_id,
+            error = %e,
+            "could not confirm the stored memory is unchanged — writing it"
+        ),
+    }
+    persist_memory_with_metadata_typed(pool, actor_id, key, value, metadata, memory_type, ttl_hours)
+        .await
+        .map(UnlessUnchanged::Written)
+}
+
+/// Whether the live row for `key` holds exactly `value`, `memory_type` and
+/// `metadata`. `Ok(false)` when there is no live row.
+async fn stored_value_equals(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    key: &str,
+    value: &serde_json::Value,
+    metadata: Option<&serde_json::Value>,
+    memory_type: &str,
+) -> Result<bool> {
+    // Same projection as `recall_entry`, plus `metadata`, so the shared
+    // decrypt path can dispatch on `value_format`.
+    let row = sqlx::query(
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, metadata \
+         FROM actor_memory \
+         WHERE actor_id = $1 AND key = $2 \
+           AND (expires_at IS NULL OR expires_at > now())",
+    )
+    .bind(actor_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .context("read the stored memory to compare")?;
+    let Some(row) = row else { return Ok(false) };
+    let stored_type: String = row.try_get("memory_type")?;
+    let stored_metadata: Option<serde_json::Value> = row.try_get("metadata")?;
+    if stored_type != memory_type || stored_metadata.as_ref() != metadata {
+        return Ok(false);
+    }
+    Ok(&decrypt_row_value(&row).await? == value)
+}
+
 /// Typed-error sibling of [`persist_memory_with_metadata`]. Same logic,
 /// same SQL, same validation — the only difference is that failures are
 /// classified into a [`MemoryWriteError`] variant AT THE SOURCE (where
@@ -1609,7 +1713,10 @@ pub async fn key_freshness(
         return Ok(std::collections::HashMap::new());
     }
     let rows = sqlx::query(
-        "SELECT key, updated_at \
+        // The later of the last write and the last "checked, unchanged"
+        // (`persist_memory_unless_unchanged_typed`). GREATEST ignores the
+        // NULL `checked_at` of a row never confirmed that way.
+        "SELECT key, GREATEST(updated_at, checked_at) AS updated_at \
          FROM actor_memory \
          WHERE actor_id = $1 AND key = ANY($2) \
            AND (expires_at IS NULL OR expires_at > now())",

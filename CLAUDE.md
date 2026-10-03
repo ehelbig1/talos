@@ -94,6 +94,14 @@ Accepted `__memory_write__` fields:
 * `ttl_hours` (number) — TTL from now. An explicit value always applies.
   Omitted, a `semantic` write never expires and every other type gets 168
   (until 2026-09-30 omitted meant 168 for `semantic` too)
+* `skip_if_unchanged` (bool, default false; 2026-10-03) — when the live row
+  already holds this value, memory type and metadata, nothing is rewritten (no
+  embedding, no graph extraction, `updated_at` untouched): the row is marked
+  `checked_at = now()` and its expiry renewed. A freshness contract
+  (`requires_fresh`) reads the later of `updated_at` and `checked_at`, so a
+  writer that runs often and changes rarely should send its full value every
+  run with this flag rather than writing only on change — otherwise a quiet
+  day reads as stale. A non-boolean is refused (the write is dropped).
 
 **The envelope obeys the actor's WRITE CEILING (#750).** `actors.max_write_ceiling`
 is ONE control with TWO enforcement surfaces, and until #750 only the worker's
