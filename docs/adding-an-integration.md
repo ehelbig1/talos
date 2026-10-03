@@ -93,6 +93,15 @@ SSRF-safe, and OOM-bounded without you having to re-derive any of it.
 
 ## Adding an OAuth integration — step by step
 
+**Start from the scaffold.** `scripts/new-integration.py <id> "<Display Name>"`
+writes steps 1–4 below as a crate that compiles (service, `OAuthIntegration`
+impl, the two handlers, unit tests), its table's migration and the controller
+shim, and leaves a `SCAFFOLD.md` in the crate listing every remaining edit to
+a shared file (steps 5–8, configuration, lints, tests). The crate's
+`SCAFFOLD:` comments mark what only you know: the provider's endpoints,
+scopes and account lookup. CI builds the scaffold on every Rust change
+(`make test-integration-scaffold`), so it tracks the crates it uses.
+
 1. **New crate** `talos-<provider>` (workspace member). Depend on `talos-oauth`,
    `talos-http-utils`, `talos-http-body`, `sqlx`, `uuid`, `anyhow`, `async-trait`.
 

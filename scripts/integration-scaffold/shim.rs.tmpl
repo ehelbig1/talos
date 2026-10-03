@@ -1,0 +1,11 @@
+//! Re-export shim for the `talos-__ID__` crate, preserving the
+//! `crate::__SNAKE__::*` path used for service construction and route wiring
+//! under `/api/__ID__/*`.
+
+#![allow(unused_imports)]
+
+pub use talos___SNAKE__::*;
+
+pub mod handlers {
+    pub use talos___SNAKE__::handlers::*;
+}
