@@ -1,0 +1,12 @@
+-- When a writer last confirmed a memory value is still current without
+-- rewriting it. Set only by `talos_memory::persist_memory_unless_unchanged_typed`
+-- (the `skip_if_unchanged` field of a `__memory_write__` envelope), which
+-- leaves the value, its embedding and `updated_at` alone.
+--
+-- A freshness contract (`requires_fresh`) reads the later of `updated_at` and
+-- this, so a store written only when it changes can still say "checked an
+-- hour ago" on a quiet day. NULL means never confirmed that way; readers fall
+-- back to `updated_at`.
+--
+-- Nullable with no default: adding it is a catalog-only change, no rewrite.
+ALTER TABLE actor_memory ADD COLUMN IF NOT EXISTS checked_at TIMESTAMPTZ;

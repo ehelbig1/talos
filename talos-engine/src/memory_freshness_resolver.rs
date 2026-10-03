@@ -1,6 +1,8 @@
 //! Controller implementation of [`MemoryFreshnessResolver`].
 //!
 //! Answers "how old is each of these actor-memory keys?" for the per-node
+//! (age = time since the key was last written, or last confirmed unchanged —
+//! `talos_memory::persist_memory_unless_unchanged_typed`)
 //! `requires_fresh` contract, via ONE batched metadata-only query
 //! (`talos_memory::key_freshness` → `key = ANY($2)`), so a multi-key contract
 //! is a single round-trip on the dispatch path.
