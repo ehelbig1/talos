@@ -209,7 +209,11 @@ by nothing.
 
 `talos_fuel_high_utilisation_nodes` counts `(workflow, node)` pairs whose
 **peak** `fuel_consumed` over the last 30 days is at or above **80%** of the
-ceiling a worker **most recently enforced** for them. Test executions are
+ceiling in force for them: the one a worker **most recently enforced**, or the
+node's own `max_fuel` where that has been raised since. A raised limit counts
+as soon as it is configured — a weekly node does not keep the warning up for
+a week after it was fixed — but only when every graph a run could load carries
+it: the active published version as well as the draft. Test executions are
 excluded. Published every 5 minutes by
 `controller::bootstrap::background::publish_fuel_utilisation`.
 

@@ -1891,8 +1891,9 @@ pub struct TalosMetrics {
     // FLOOR**. It fires at n=1. Adding one back — for smoothing, for
     // noise, for any reason — deletes the only case it was built for.
     /// `(workflow, node)` pairs whose peak observed `fuel_consumed` is at or
-    /// above [`crate`-external] threshold × the ceiling most recently enforced
-    /// for them, over the detector's window.
+    /// above [`crate`-external] threshold × the ceiling in force for them —
+    /// the one most recently enforced, or the node's own configured limit
+    /// where that has been raised since — over the detector's window.
     ///
     /// A GAUGE, recomputed from one query each sweep (always `set`, never
     /// `inc`), because the condition is durable state: an under-provisioned
@@ -3300,9 +3301,10 @@ impl TalosMetrics {
         let fuel_high_utilisation_nodes = IntGauge::new(
             "talos_fuel_high_utilisation_nodes",
             "(workflow, node) pairs whose PEAK observed fuel_consumed is at or \
-             above the detector threshold (default 80%) of the ceiling a worker \
-             most recently ENFORCED for them. Recomputed each sweep from \
-             execution_cost_rollup. NO SAMPLE FLOOR — it fires at n=1, which is \
+             above the detector threshold (default 80%) of the ceiling in force \
+             for them: the one a worker most recently ENFORCED, or the node's \
+             own configured max_fuel where that was raised since the last run. \
+             Recomputed each sweep from execution_cost_rollup. NO SAMPLE FLOOR — it fires at n=1, which is \
              the point: the node it was built for sat at 96.9% on two samples, \
              below every percentile-and-floor surface the platform had. Test \
              executions are excluded. Names are in the controller WARN log and \

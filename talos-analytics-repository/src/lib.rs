@@ -381,19 +381,128 @@ pub struct NodeFuelHeadroom {
     /// a worker genuinely enforced (the `__fuel_limit__` stamp), not a
     /// configured value that may never have reached a dispatch.
     pub current_ceiling: i64,
+    /// The node's own `max_fuel` in the graph its next run will load, when
+    /// [`AnalyticsRepository::attach_configured_limits`] looked it up and
+    /// found one. `None` from the query itself, for a node nobody looked up,
+    /// and for a node with no limit of its own. See [`configured_node_limit`]
+    /// for which graphs count.
+    ///
+    /// Consulted, never substituted: [`current_ceiling`](Self::current_ceiling)
+    /// stays what a worker enforced. This exists because the enforced ceiling
+    /// is the LAST RUN's — an operator who answers this detector by raising
+    /// the node's limit was told, on every sweep until the node next ran,
+    /// that nothing had changed (a weekly node: seven days of a warning
+    /// about a limit that no longer applied, 2026-10-03).
+    pub configured_max_fuel: Option<i64>,
 }
 
 impl NodeFuelHeadroom {
-    /// Peak consumption as a fraction of the ceiling now in force. `>= 1.0` is
-    /// possible in principle (a ceiling that has since been LOWERED), so callers
-    /// must not assume the value is bounded by 1.
-    pub fn utilisation(&self) -> f64 {
+    /// Peak consumption as a fraction of the ceiling the node's LAST run was
+    /// held to. `>= 1.0` is possible in principle (a ceiling that has since
+    /// been LOWERED), so callers must not assume the value is bounded by 1.
+    pub fn enforced_utilisation(&self) -> f64 {
         if self.current_ceiling <= 0 {
             return 0.0;
         }
         self.peak_fuel as f64 / self.current_ceiling as f64
     }
+
+    /// The ceiling the node's next run is held to, at least: the larger of
+    /// what its last run was held to and its own configured limit.
+    ///
+    /// A lower bound in both arms. The engine enforces
+    /// `max(configured, learned floor)`, so a configured limit above the last
+    /// enforced one is reached whatever the learned floor is. A configured
+    /// limit BELOW the last enforced one is not used: the last run's ceiling
+    /// already contains the learned floor, and reading the smaller number
+    /// would flag every node adaptive fuel has lifted.
+    pub fn ceiling_in_force(&self) -> i64 {
+        self.current_ceiling
+            .max(self.configured_max_fuel.unwrap_or(0))
+    }
+
+    /// Whether the node's configured limit is above the ceiling its last run
+    /// was held to — i.e. it was raised since, and no run has used it yet.
+    pub fn raised_since_last_run(&self) -> bool {
+        self.configured_max_fuel
+            .is_some_and(|configured| configured > self.current_ceiling)
+    }
+
+    /// Peak consumption as a fraction of [`ceiling_in_force`](Self::ceiling_in_force).
+    /// Equal to [`enforced_utilisation`](Self::enforced_utilisation) for a row
+    /// whose configured limit was not looked up.
+    pub fn utilisation(&self) -> f64 {
+        let ceiling = self.ceiling_in_force();
+        if ceiling <= 0 {
+            return 0.0;
+        }
+        self.peak_fuel as f64 / ceiling as f64
+    }
 }
+
+/// A graph node's own `data.max_fuel`: a positive whole number, as the engine
+/// reads it. Anything else is no override.
+fn node_max_fuel_override(node: &serde_json::Value) -> Option<i64> {
+    node.get("data")
+        .and_then(|d| d.get("max_fuel"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|v| *v > 0)
+}
+
+/// The `max_fuel` override of the node whose graph id is `label`, in `graph`.
+fn graph_node_max_fuel(graph: &serde_json::Value, label: &str) -> Option<i64> {
+    graph
+        .get("nodes")?
+        .as_array()?
+        .iter()
+        .find(|n| n.get("id").and_then(serde_json::Value::as_str) == Some(label))
+        .and_then(node_max_fuel_override)
+}
+
+/// A workflow's active published version, as far as a configured limit is
+/// concerned.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActiveGraph {
+    /// Nothing is published: every run loads the draft.
+    NoActiveVersion,
+    /// A version is active and its graph could not be read (too large for
+    /// the lookup, or not JSON).
+    Unreadable,
+    Graph(serde_json::Value),
+}
+
+/// The limit a node is configured with in EVERY graph a run of its workflow
+/// could load, or `None`.
+///
+/// A scheduled or triggered run loads the active published version when
+/// there is one and the draft otherwise; a run as a sub-workflow loads the
+/// draft. So with an active version both graphs must carry a limit for the
+/// node and the smaller is the answer; a raise made to the draft and not
+/// published is not a raise for the runs that load the published graph.
+/// Capped at the engine's per-node ceiling, which it cannot exceed.
+///
+/// `None` whenever the answer is not certain — no limit on the node, a graph
+/// that could not be read — which leaves the caller with the last enforced
+/// ceiling, the loud direction.
+pub fn configured_node_limit(
+    draft: Option<&serde_json::Value>,
+    active: &ActiveGraph,
+    label: &str,
+) -> Option<i64> {
+    let in_draft = graph_node_max_fuel(draft?, label)?;
+    let limit = match active {
+        ActiveGraph::NoActiveVersion => in_draft,
+        ActiveGraph::Unreadable => return None,
+        ActiveGraph::Graph(graph) => in_draft.min(graph_node_max_fuel(graph, label)?),
+    };
+    let cap = i64::try_from(talos_workflow_job_protocol::MAX_JOB_FUEL).unwrap_or(i64::MAX);
+    Some(limit.min(cap))
+}
+
+/// Workflows whose graphs one [`AnalyticsRepository::attach_configured_limits`]
+/// call reads. Only workflows with a node at the threshold are looked up, so
+/// this is a bound on a set that is normally empty or a handful.
+pub const CONFIGURED_LIMIT_MAX_WORKFLOWS: usize = 200;
 
 /// The classifier's verdict string for a fuel-meter kill.
 ///
@@ -6605,10 +6714,98 @@ impl AnalyticsRepository {
                         samples,
                         peak_fuel,
                         current_ceiling,
+                        configured_max_fuel: None,
                     }
                 },
             )
             .collect())
+    }
+
+    /// Look up the configured limit of every node in `rows` that is at or
+    /// above `threshold` of the ceiling its last run was held to, and record
+    /// it on the row ([`NodeFuelHeadroom::configured_max_fuel`]).
+    ///
+    /// Only those rows are looked up: a node below the threshold cannot be
+    /// moved across it by a larger ceiling, so on a fleet with no node at
+    /// the threshold this reads nothing. One batched read otherwise, of the
+    /// draft and the active version of at most
+    /// [`CONFIGURED_LIMIT_MAX_WORKFLOWS`] workflows, each graph bounded by
+    /// [`TWIN_SCAN_MAX_GRAPH_BYTES`]; a workflow past the bound, or a graph
+    /// that is too large or not JSON, leaves its rows as they were.
+    ///
+    /// `user_id` scopes the read to one owner's workflows, as it does in
+    /// [`get_node_fuel_headroom`](Self::get_node_fuel_headroom); `None` is
+    /// the controller's own fleet-wide sweep.
+    pub async fn attach_configured_limits(
+        &self,
+        rows: &mut [NodeFuelHeadroom],
+        threshold: f64,
+        user_id: Option<Uuid>,
+    ) -> Result<()> {
+        let mut workflow_ids: Vec<Uuid> = Vec::new();
+        for row in rows.iter() {
+            if row.enforced_utilisation() >= threshold && !workflow_ids.contains(&row.workflow_id) {
+                if workflow_ids.len() == CONFIGURED_LIMIT_MAX_WORKFLOWS {
+                    break;
+                }
+                workflow_ids.push(row.workflow_id);
+            }
+        }
+        if workflow_ids.is_empty() {
+            return Ok(());
+        }
+
+        let graph_rows = sqlx::query(
+            "SELECT w.id, \
+                    CASE WHEN octet_length(w.graph_json) <= $3 THEN w.graph_json END AS draft, \
+                    COALESCE(av.has_active, false) AS has_active, \
+                    av.active \
+               FROM workflows w \
+               LEFT JOIN LATERAL ( \
+                    SELECT true AS has_active, \
+                           CASE WHEN octet_length(v.graph_json::text) <= $3 \
+                                THEN v.graph_json::text END AS active \
+                      FROM workflow_versions v \
+                     WHERE v.workflow_id = w.id AND v.is_active \
+                     ORDER BY v.version_number DESC, v.id \
+                     LIMIT 1 \
+               ) av ON true \
+              WHERE w.id = ANY($1) \
+                AND ($2::uuid IS NULL OR w.user_id = $2)",
+        )
+        .bind(&workflow_ids)
+        .bind(user_id)
+        .bind(TWIN_SCAN_MAX_GRAPH_BYTES)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        let parse = |text: Option<String>| -> Option<serde_json::Value> {
+            serde_json::from_str(&text?).ok()
+        };
+        let mut graphs: std::collections::HashMap<Uuid, (Option<serde_json::Value>, ActiveGraph)> =
+            std::collections::HashMap::with_capacity(graph_rows.len());
+        for r in graph_rows {
+            let id: Uuid = r.try_get("id")?;
+            let draft = parse(r.try_get::<Option<String>, _>("draft")?);
+            let active = if r.try_get::<bool, _>("has_active")? {
+                parse(r.try_get::<Option<String>, _>("active")?)
+                    .map_or(ActiveGraph::Unreadable, ActiveGraph::Graph)
+            } else {
+                ActiveGraph::NoActiveVersion
+            };
+            graphs.insert(id, (draft, active));
+        }
+
+        for row in rows.iter_mut() {
+            if row.enforced_utilisation() < threshold {
+                continue;
+            }
+            if let Some((draft, active)) = graphs.get(&row.workflow_id) {
+                row.configured_max_fuel =
+                    configured_node_limit(draft.as_ref(), active, &row.node_label);
+            }
+        }
+        Ok(())
     }
 
     /// Nodes that DIED of fuel exhaustion in the last `days` days.
@@ -6781,11 +6978,7 @@ impl AnalyticsRepository {
                 else {
                     continue;
                 };
-                let node_max_fuel = node
-                    .get("data")
-                    .and_then(|d| d.get("max_fuel"))
-                    .and_then(serde_json::Value::as_i64)
-                    .filter(|v| *v > 0);
+                let node_max_fuel = node_max_fuel_override(node);
                 if !module_ids.contains(&module_id) {
                     module_ids.push(module_id);
                 }
@@ -7618,6 +7811,145 @@ mod reliability_gain_tests {
         assert_eq!(reliability_gain_from_success_rate(Some(0.0), -5), 0.0);
         // Out-of-range rates are clamped rather than producing negative points.
         assert_eq!(reliability_gain_from_success_rate(Some(1.5), 10), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod configured_limit_tests {
+    use super::{configured_node_limit, ActiveGraph, NodeFuelHeadroom};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn graph(limit: serde_json::Value) -> serde_json::Value {
+        json!({"nodes": [
+            {"id": "other", "type": "m", "data": {"max_fuel": 1_000_000}},
+            {"id": "compose", "type": "m", "data": {"TITLE": "x", "max_fuel": limit}},
+        ]})
+    }
+
+    fn row(peak: i64, enforced: i64, configured: Option<i64>) -> NodeFuelHeadroom {
+        NodeFuelHeadroom {
+            workflow_id: Uuid::nil(),
+            workflow_name: "wf".into(),
+            node_label: "compose".into(),
+            samples: 3,
+            peak_fuel: peak,
+            current_ceiling: enforced,
+            configured_max_fuel: configured,
+        }
+    }
+
+    /// The case this exists for: a weekly node at 80.6% of the 10 M its last
+    /// run was held to, raised to 20 M the same evening.
+    #[test]
+    fn a_limit_raised_since_the_last_run_is_the_ceiling_in_force() {
+        let before = row(8_057_136, 10_000_000, None);
+        assert!(before.utilisation() >= 0.80);
+        assert_eq!(before.utilisation(), before.enforced_utilisation());
+        assert!(!before.raised_since_last_run());
+
+        let after = row(8_057_136, 10_000_000, Some(20_000_000));
+        assert_eq!(after.ceiling_in_force(), 20_000_000);
+        assert!(after.raised_since_last_run());
+        assert!(after.utilisation() < 0.80, "{}", after.utilisation());
+        // What the last run was held to is still reported as it was.
+        assert!(after.enforced_utilisation() >= 0.80);
+        assert_eq!(after.current_ceiling, 10_000_000);
+    }
+
+    /// A configured limit BELOW the last enforced ceiling is not used: the
+    /// enforced one already contains the learned floor, and reading the
+    /// smaller number would flag every node adaptive fuel has lifted.
+    #[test]
+    fn a_configured_limit_below_the_enforced_ceiling_changes_nothing() {
+        // Configured 2.02 M, last run held to 4.26 M by the learned floor.
+        let lifted = row(2_209_030, 4_264_652, Some(2_020_000));
+        assert_eq!(lifted.ceiling_in_force(), 4_264_652);
+        assert!(!lifted.raised_since_last_run());
+        assert_eq!(lifted.utilisation(), lifted.enforced_utilisation());
+        assert!(lifted.utilisation() < 0.80);
+        // A row with no ceiling at all still reads zero, not a division.
+        assert_eq!(row(5_000, 0, None).utilisation(), 0.0);
+    }
+
+    #[test]
+    fn with_nothing_published_the_draft_is_the_graph_a_run_loads() {
+        let draft = graph(json!(20_000_000));
+        let limit =
+            |label| configured_node_limit(Some(&draft), &ActiveGraph::NoActiveVersion, label);
+        assert_eq!(limit("compose"), Some(20_000_000));
+        assert_eq!(limit("other"), Some(1_000_000));
+        assert_eq!(limit("absent"), None);
+        assert_eq!(
+            configured_node_limit(None, &ActiveGraph::NoActiveVersion, "compose"),
+            None
+        );
+    }
+
+    /// A raise made to the draft and not published is not a raise for the
+    /// runs that load the published graph.
+    #[test]
+    fn with_a_published_version_both_graphs_must_carry_the_limit() {
+        let draft = graph(json!(20_000_000));
+        let published = |limit| ActiveGraph::Graph(graph(limit));
+        assert_eq!(
+            configured_node_limit(Some(&draft), &published(json!(10_000_000)), "compose"),
+            Some(10_000_000),
+            "the smaller of the two"
+        );
+        assert_eq!(
+            configured_node_limit(Some(&draft), &published(json!(24_000_000)), "compose"),
+            Some(20_000_000)
+        );
+        // The published graph has the node with no limit of its own, or not
+        // at all, or could not be read: nothing is certain, so nothing.
+        assert_eq!(
+            configured_node_limit(Some(&draft), &published(json!(null)), "compose"),
+            None
+        );
+        let without = ActiveGraph::Graph(json!({"nodes": [{"id": "other", "data": {}}]}));
+        assert_eq!(
+            configured_node_limit(Some(&draft), &without, "compose"),
+            None
+        );
+        assert_eq!(
+            configured_node_limit(Some(&draft), &ActiveGraph::Unreadable, "compose"),
+            None
+        );
+    }
+
+    /// Only what the engine itself reads as a limit: a positive whole number,
+    /// and never more than the per-node ceiling it clamps to.
+    #[test]
+    fn only_a_positive_whole_number_is_a_limit_and_it_is_capped() {
+        let none = &ActiveGraph::NoActiveVersion;
+        for not_a_limit in [
+            json!("20000000"),
+            json!(0),
+            json!(-5),
+            json!(1.5),
+            json!(null),
+            json!([1]),
+        ] {
+            let draft = graph(not_a_limit.clone());
+            assert_eq!(
+                configured_node_limit(Some(&draft), none, "compose"),
+                None,
+                "{not_a_limit}"
+            );
+        }
+        let huge = graph(json!(900_000_000));
+        assert_eq!(
+            configured_node_limit(Some(&huge), none, "compose"),
+            Some(talos_workflow_job_protocol::MAX_JOB_FUEL as i64)
+        );
+        // A graph with no node list, or one that is not a list.
+        for shapeless in [json!({}), json!({"nodes": "x"}), json!([])] {
+            assert_eq!(
+                configured_node_limit(Some(&shapeless), none, "compose"),
+                None
+            );
+        }
     }
 }
 

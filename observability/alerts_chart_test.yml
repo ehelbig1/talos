@@ -2913,8 +2913,11 @@ tests:
               summary: "1 workflow node(s) running with no fuel headroom"
               description: |
                 One or more (workflow, node) pairs consumed at least 80% of the
-                fuel ceiling last enforced for them, at peak, over the past 30
-                days. A node at that level fails on its next larger payload —
+                fuel ceiling in force for them, at peak, over the past 30 days:
+                the ceiling their last run was held to, or the node's own
+                max_fuel where that has been raised since (a node already given
+                a larger limit is not counted while it waits for its next run).
+                A node at that level fails on its next larger payload —
                 and it fails AFTER paying for the whole LLM call, because
                 WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
                 fuel budget, so payload growth surfaces as fuel exhaustion in
@@ -2959,8 +2962,11 @@ tests:
               summary: "1 workflow node(s) running with no fuel headroom"
               description: |
                 One or more (workflow, node) pairs consumed at least 80% of the
-                fuel ceiling last enforced for them, at peak, over the past 30
-                days. A node at that level fails on its next larger payload —
+                fuel ceiling in force for them, at peak, over the past 30 days:
+                the ceiling their last run was held to, or the node's own
+                max_fuel where that has been raised since (a node already given
+                a larger limit is not counted while it waits for its next run).
+                A node at that level fails on its next larger payload —
                 and it fails AFTER paying for the whole LLM call, because
                 WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
                 fuel budget, so payload growth surfaces as fuel exhaustion in
@@ -3137,8 +3143,11 @@ tests:
               summary: "1 workflow node(s) running with no fuel headroom"
               description: |
                 One or more (workflow, node) pairs consumed at least 80% of the
-                fuel ceiling last enforced for them, at peak, over the past 30
-                days. A node at that level fails on its next larger payload —
+                fuel ceiling in force for them, at peak, over the past 30 days:
+                the ceiling their last run was held to, or the node's own
+                max_fuel where that has been raised since (a node already given
+                a larger limit is not counted while it waits for its next run).
+                A node at that level fails on its next larger payload —
                 and it fails AFTER paying for the whole LLM call, because
                 WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
                 fuel budget, so payload growth surfaces as fuel exhaustion in
@@ -3179,8 +3188,11 @@ tests:
               summary: "1 workflow node(s) running with no fuel headroom"
               description: |
                 One or more (workflow, node) pairs consumed at least 80% of the
-                fuel ceiling last enforced for them, at peak, over the past 30
-                days. A node at that level fails on its next larger payload —
+                fuel ceiling in force for them, at peak, over the past 30 days:
+                the ceiling their last run was held to, or the node's own
+                max_fuel where that has been raised since (a node already given
+                a larger limit is not counted while it waits for its next run).
+                A node at that level fails on its next larger payload —
                 and it fails AFTER paying for the whole LLM call, because
                 WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
                 fuel budget, so payload growth surfaces as fuel exhaustion in
@@ -3221,8 +3233,11 @@ tests:
               summary: "1 workflow node(s) running with no fuel headroom"
               description: |
                 One or more (workflow, node) pairs consumed at least 80% of the
-                fuel ceiling last enforced for them, at peak, over the past 30
-                days. A node at that level fails on its next larger payload —
+                fuel ceiling in force for them, at peak, over the past 30 days:
+                the ceiling their last run was held to, or the node's own
+                max_fuel where that has been raised since (a node already given
+                a larger limit is not counted while it waits for its next run).
+                A node at that level fails on its next larger payload —
                 and it fails AFTER paying for the whole LLM call, because
                 WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
                 fuel budget, so payload growth surfaces as fuel exhaustion in

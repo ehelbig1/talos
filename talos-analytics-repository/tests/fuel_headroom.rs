@@ -219,3 +219,189 @@ async fn the_detector_counts_production_and_subworkflow_rows_only() {
     both.sort();
     assert_eq!(pairs_for(&fleet, &ours), both);
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Configured limits (2026-10-03): a node at the threshold whose limit was
+// raised since its last run.
+// ───────────────────────────────────────────────────────────────────────────
+
+fn graph_with_limit(node: &str, limit: i64) -> String {
+    serde_json::json!({
+        "nodes": [{"id": node, "type": Uuid::new_v4().to_string(), "data": {"max_fuel": limit}}],
+        "edges": []
+    })
+    .to_string()
+}
+
+async fn set_draft(pool: &Pool<Postgres>, workflow_id: Uuid, graph: &str) {
+    sqlx::query("UPDATE workflows SET graph_json = $2 WHERE id = $1")
+        .bind(workflow_id)
+        .bind(graph)
+        .execute(pool)
+        .await
+        .expect("set draft graph");
+}
+
+async fn publish(pool: &Pool<Postgres>, user: Uuid, workflow_id: Uuid, graph: &str) {
+    sqlx::query(
+        "INSERT INTO workflow_versions \
+           (id, workflow_id, version_number, graph_json, is_active, published_by) \
+         VALUES (gen_random_uuid(), $1, 1, $2::jsonb, true, $3)",
+    )
+    .bind(workflow_id)
+    .bind(graph)
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("publish a version");
+}
+
+/// A node at 90% of the ceiling its one run was held to.
+async fn seed_hot_node(pool: &Pool<Postgres>, user: Uuid, name: &str) -> Uuid {
+    let wf = seed_workflow(pool, user, name).await;
+    let exec = seed_execution(pool, wf, user, false).await;
+    seed_rollup(
+        pool,
+        Some(wf),
+        exec,
+        "compose",
+        9_000_000,
+        10_000_000,
+        5,
+        "completed",
+    )
+    .await;
+    wf
+}
+
+fn row_for(rows: &[NodeFuelHeadroom], workflow: Uuid) -> &NodeFuelHeadroom {
+    rows.iter()
+        .find(|r| r.workflow_id == workflow)
+        .expect("the seeded pair is in the rows")
+}
+
+#[tokio::test]
+async fn a_limit_raised_since_the_last_run_is_found_in_the_graph_the_next_run_loads() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = AnalyticsRepository::new(pool.clone());
+    let user = seed_user(&pool, "cfg").await;
+
+    // Raised in the draft, nothing published: the draft is what runs.
+    let raised = seed_hot_node(&pool, user, "raised").await;
+    set_draft(&pool, raised, &graph_with_limit("compose", 20_000_000)).await;
+    // Raised in the draft, but the published version still says 10 M.
+    let unpublished = seed_hot_node(&pool, user, "unpublished").await;
+    set_draft(&pool, unpublished, &graph_with_limit("compose", 20_000_000)).await;
+    publish(
+        &pool,
+        user,
+        unpublished,
+        &graph_with_limit("compose", 10_000_000),
+    )
+    .await;
+    // Raised and published.
+    let published = seed_hot_node(&pool, user, "published").await;
+    set_draft(&pool, published, &graph_with_limit("compose", 24_000_000)).await;
+    publish(
+        &pool,
+        user,
+        published,
+        &graph_with_limit("compose", 16_000_000),
+    )
+    .await;
+    // The draft is not JSON; the node has no limit of its own.
+    let broken = seed_hot_node(&pool, user, "broken").await;
+    set_draft(&pool, broken, "{not json").await;
+    let bare = seed_hot_node(&pool, user, "bare").await;
+    // Well below the threshold, with a limit in its graph: never looked up.
+    let cool = seed_workflow(&pool, user, "cool").await;
+    let exec = seed_execution(&pool, cool, user, false).await;
+    seed_rollup(
+        &pool,
+        Some(cool),
+        exec,
+        "compose",
+        1_000_000,
+        10_000_000,
+        5,
+        "completed",
+    )
+    .await;
+    set_draft(&pool, cool, &graph_with_limit("compose", 20_000_000)).await;
+
+    let mut rows = repo
+        .get_node_fuel_headroom(Some(user), 30, 100)
+        .await
+        .expect("headroom read");
+    assert!(rows.iter().all(|r| r.configured_max_fuel.is_none()));
+    repo.attach_configured_limits(&mut rows, 0.80, Some(user))
+        .await
+        .expect("configured limits read");
+
+    let of = |wf| row_for(&rows, wf);
+    assert_eq!(of(raised).configured_max_fuel, Some(20_000_000));
+    assert!(of(raised).utilisation() < 0.80 && of(raised).enforced_utilisation() >= 0.80);
+    assert_eq!(
+        of(unpublished).configured_max_fuel,
+        Some(10_000_000),
+        "the published graph is what a triggered run loads"
+    );
+    assert!(of(unpublished).utilisation() >= 0.80);
+    assert_eq!(of(published).configured_max_fuel, Some(16_000_000));
+    assert!(of(published).utilisation() < 0.80);
+    for unknown in [broken, bare] {
+        assert_eq!(of(unknown).configured_max_fuel, None);
+        assert!(of(unknown).utilisation() >= 0.80, "unknown stays reported");
+    }
+    assert_eq!(
+        of(cool).configured_max_fuel,
+        None,
+        "a node below the threshold is not looked up"
+    );
+}
+
+/// The lookup is scoped to the caller's workflows, as the headroom read is.
+/// Rows naming another owner's workflow get nothing from it.
+#[tokio::test]
+async fn configured_limits_are_read_for_the_callers_workflows_only() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let repo = AnalyticsRepository::new(pool.clone());
+    let owner = seed_user(&pool, "cfg-owner").await;
+    let other = seed_user(&pool, "cfg-other").await;
+    let wf = seed_hot_node(&pool, owner, "owned").await;
+    set_draft(&pool, wf, &graph_with_limit("compose", 20_000_000)).await;
+
+    let fresh = || async {
+        repo.get_node_fuel_headroom(Some(owner), 30, 100)
+            .await
+            .expect("headroom read")
+    };
+
+    // The owner's rows, handed to a lookup scoped to someone else.
+    let mut rows = fresh().await;
+    repo.attach_configured_limits(&mut rows, 0.80, Some(other))
+        .await
+        .expect("configured limits read");
+    assert_eq!(
+        row_for(&rows, wf).configured_max_fuel,
+        None,
+        "another owner's scope must not read this workflow's graph"
+    );
+
+    // Control: the owner's scope, and the fleet-wide sweep, both read it.
+    for scope in [Some(owner), None] {
+        let mut rows = fresh().await;
+        repo.attach_configured_limits(&mut rows, 0.80, scope)
+            .await
+            .expect("configured limits read");
+        assert_eq!(
+            row_for(&rows, wf).configured_max_fuel,
+            Some(20_000_000),
+            "{scope:?}"
+        );
+    }
+}
