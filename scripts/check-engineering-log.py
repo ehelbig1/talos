@@ -90,7 +90,7 @@ BASES = [
      "2026-09-25: lint checks 74/88/83/65 compressed to specification only"),
     ("ef220804da63adf62cfbc1787e047f0932609c79", "1bd6015cba3c42b98ebee2a12ca5cbeb5404e60c",
      "2026-09-25: the structural-lint check specifications -> structural-lint-checks.md"),
-    ("7bc9e5c4997983b67a1fcdaa730beda41af80ae7", None,
+    ("7bc9e5c4997983b67a1fcdaa730beda41af80ae7", "6bda9e33e87e5b5051b998c7fbe1f711af386b2e",
      "2026-10-03: the package record bullets -> 2026-10-03-package-record.md (title index kept)"),
 ]
 ARCHIVE = Path("docs/engineering-log")
