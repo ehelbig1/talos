@@ -1229,81 +1229,6 @@ fn one_row_per_catalog_tool(
     kept
 }
 
-#[cfg(test)]
-mod catalog_tool_dedup_tests {
-    use super::*;
-
-    fn row(name: &str, shared: bool, description: &str) -> talos_registry::NodeTemplateMetadata {
-        talos_registry::NodeTemplateMetadata {
-            id: uuid::Uuid::new_v4(),
-            name: name.to_string(),
-            category: "catalog".to_string(),
-            description: Some(description.to_string()),
-            config_schema: serde_json::json!({}),
-            allowed_hosts: vec![],
-            allowed_methods: vec![],
-            allowed_secrets: vec![],
-            requires_approval_for: vec![],
-            capability_world: "minimal-node".to_string(),
-            is_compiled: true,
-            shared,
-        }
-    }
-
-    #[test]
-    fn an_installed_copy_does_not_list_its_catalog_module_twice() {
-        // The query orders by name then id, so either row can come first.
-        for own_first in [true, false] {
-            let rows = if own_first {
-                vec![
-                    row("LLM Inference", false, "mine"),
-                    row("LLM Inference", true, "catalog"),
-                    row("Echo Debug", true, "catalog"),
-                ]
-            } else {
-                vec![
-                    row("LLM Inference", true, "catalog"),
-                    row("LLM Inference", false, "mine"),
-                    row("Echo Debug", true, "catalog"),
-                ]
-            };
-            let kept = one_row_per_catalog_tool(rows);
-            let names: Vec<String> = kept.iter().map(|t| catalog_tool_name(&t.name)).collect();
-            assert_eq!(
-                names,
-                ["LLM_Inference-v1", "Echo_Debug-v1"],
-                "own_first={own_first}"
-            );
-            assert_eq!(
-                kept[0].description.as_deref(),
-                Some("catalog"),
-                "the catalog row describes the tool"
-            );
-        }
-    }
-
-    #[test]
-    fn names_that_sanitise_to_one_tool_name_are_one_tool() {
-        // What must be unique is the TOOL name, not the module name.
-        let (a, b) = ("Gmail: List", "Gmail; List");
-        assert_ne!(a, b);
-        assert_eq!(catalog_tool_name(a), catalog_tool_name(b), "premise");
-        let kept = one_row_per_catalog_tool(vec![row(a, false, "mine"), row(b, true, "catalog")]);
-        assert_eq!(kept.len(), 1);
-        assert!(kept[0].shared);
-    }
-
-    #[test]
-    fn a_module_only_the_caller_has_is_still_listed_once() {
-        let kept = one_row_per_catalog_tool(vec![
-            row("My Tool", false, "first"),
-            row("My Tool", false, "second"),
-        ]);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].description.as_deref(), Some("first"));
-    }
-}
-
 async fn handle_tools_list(
     req: JsonRpcRequest,
     registry: std::sync::Arc<ModuleRegistry>,
@@ -1754,4 +1679,79 @@ async fn handle_tools_call_inner(
          name itself is the issue."
         ),
     )
+}
+
+#[cfg(test)]
+mod catalog_tool_dedup_tests {
+    use super::*;
+
+    fn row(name: &str, shared: bool, description: &str) -> talos_registry::NodeTemplateMetadata {
+        talos_registry::NodeTemplateMetadata {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            category: "catalog".to_string(),
+            description: Some(description.to_string()),
+            config_schema: serde_json::json!({}),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            requires_approval_for: vec![],
+            capability_world: "minimal-node".to_string(),
+            is_compiled: true,
+            shared,
+        }
+    }
+
+    #[test]
+    fn an_installed_copy_does_not_list_its_catalog_module_twice() {
+        // The query orders by name then id, so either row can come first.
+        for own_first in [true, false] {
+            let rows = if own_first {
+                vec![
+                    row("LLM Inference", false, "mine"),
+                    row("LLM Inference", true, "catalog"),
+                    row("Echo Debug", true, "catalog"),
+                ]
+            } else {
+                vec![
+                    row("LLM Inference", true, "catalog"),
+                    row("LLM Inference", false, "mine"),
+                    row("Echo Debug", true, "catalog"),
+                ]
+            };
+            let kept = one_row_per_catalog_tool(rows);
+            let names: Vec<String> = kept.iter().map(|t| catalog_tool_name(&t.name)).collect();
+            assert_eq!(
+                names,
+                ["LLM_Inference-v1", "Echo_Debug-v1"],
+                "own_first={own_first}"
+            );
+            assert_eq!(
+                kept[0].description.as_deref(),
+                Some("catalog"),
+                "the catalog row describes the tool"
+            );
+        }
+    }
+
+    #[test]
+    fn names_that_sanitise_to_one_tool_name_are_one_tool() {
+        // What must be unique is the TOOL name, not the module name.
+        let (a, b) = ("Gmail: List", "Gmail; List");
+        assert_ne!(a, b);
+        assert_eq!(catalog_tool_name(a), catalog_tool_name(b), "premise");
+        let kept = one_row_per_catalog_tool(vec![row(a, false, "mine"), row(b, true, "catalog")]);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].shared);
+    }
+
+    #[test]
+    fn a_module_only_the_caller_has_is_still_listed_once() {
+        let kept = one_row_per_catalog_tool(vec![
+            row("My Tool", false, "first"),
+            row("My Tool", false, "second"),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].description.as_deref(), Some("first"));
+    }
 }
