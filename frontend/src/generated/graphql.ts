@@ -92,6 +92,7 @@ export type IntegrationService =
   | "GOOGLE_CLOUD"
   | "GOOGLE_HEALTH"
   | "JIRA"
+  | "PLAID"
   | "SLACK";
 
 /** Pagination input for list queries */

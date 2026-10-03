@@ -37,7 +37,7 @@ pub mod config;
 pub mod link;
 
 pub use client::{
-    AccessToken, Account, Balances, PfCategory, PlaidApiError, PlaidClient, PublicToken, SyncPage,
-    Transaction,
+    AccessToken, Account, Balances, LinkToken, PfCategory, PlaidApiError, PlaidClient, PublicToken,
+    SyncPage, Transaction,
 };
 pub use config::{ConfigError, PlaidConfig, PlaidEnv};

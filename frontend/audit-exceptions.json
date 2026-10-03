@@ -1,0 +1,11 @@
+{
+  "_doc": "Reviewed exceptions to the frontend dependency-advisory gate (scripts/frontend_audit_gate.py). Each names ONE advisory, says why it cannot be fixed yet and why it does not reach users, and EXPIRES: after the date the advisory fails the gate again and must be re-reviewed. Add one only when no patched release exists.",
+  "exceptions": [
+    {
+      "advisory": "https://github.com/advisories/GHSA-vfj7-8cjw-p6xm",
+      "package": "braces",
+      "reason": "No patched braces release exists (every version up to 3.0.3 is affected; published 2026-09-18). Reached only through @graphql-codegen/cli -> micromatch -> braces, a development tool that generates TypeScript types from this repository's own GraphQL files. It never parses untrusted input and is not in the shipped bundle.",
+      "expires": "2026-11-03"
+    }
+  ]
+}

@@ -10,6 +10,7 @@ import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { validateOAuthUrl } from "@/lib/oauthUtils";
 import { authedFetch } from "../watch-channels/api";
+import { openPlaidLink } from "@/lib/plaidLink";
 
 export function useConnectHandlers(refetchIntegrations: () => void) {
   const pollTimerRef = useRef<number | null>(null);
@@ -203,7 +204,60 @@ export function useConnectHandlers(refetchIntegrations: () => void) {
     }
   };
 
+  // Bank accounts through Plaid Link. The server mints a short-lived link
+  // token, Plaid's own window handles the bank sign-in, and the resulting
+  // public token goes straight back to the server, which keeps the long-lived
+  // access token. Nothing that can read the bank reaches this page.
+  const handleConnectPlaid = async () => {
+    try {
+      const res = await authedFetch("/api/plaid/link-token", {
+        method: "POST",
+      });
+      const d = await res.json().catch(() => null);
+      if (!res.ok || !d?.success || typeof d.data?.link_token !== "string") {
+        toast.error(
+          sanitizeErrorMessage(d?.error || `Service error: ${res.status}`),
+        );
+        return;
+      }
+      const outcome = await openPlaidLink(d.data.link_token);
+      if (!outcome) return; // closed without connecting
+      const saved = await authedFetch("/api/plaid/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          public_token: outcome.publicToken,
+          institution_id: outcome.institution?.institution_id ?? null,
+          institution_name: outcome.institution?.name ?? null,
+        }),
+      });
+      const s = await saved.json().catch(() => null);
+      if (!saved.ok || !s?.success) {
+        toast.error(
+          sanitizeErrorMessage(s?.error || `Service error: ${saved.status}`),
+        );
+        return;
+      }
+      const bank = s.data?.institution_name || "Bank";
+      const n = s.data?.accounts;
+      toast.success(
+        typeof n === "number"
+          ? `${bank} connected (${n} account${n === 1 ? "" : "s"})`
+          : `${bank} connected`,
+      );
+      refetchIntegrations();
+    } catch (err) {
+      if (import.meta.env.DEV) console.error("Plaid connect error:", err);
+      toast.error(
+        sanitizeErrorMessage(
+          err instanceof Error ? err.message : "Error connecting a bank",
+        ),
+      );
+    }
+  };
+
   return {
+    handleConnectPlaid,
     handleConnectGcal,
     handleConnectService,
     handleConnectGcpWrite,

@@ -412,6 +412,7 @@ impl PlatformQueries {
                 "JIRA" => IntegrationService::Jira,
                 "GOOGLE_CLOUD" => IntegrationService::GoogleCloud,
                 "GOOGLE_HEALTH" => IntegrationService::GoogleHealth,
+                "PLAID" => IntegrationService::Plaid,
                 // Safety: PROVIDERS is a compile-time constant; unknown values should not appear.
                 other => {
                     tracing::warn!(unknown_enum = other, "Unknown graphql_enum in PROVIDERS");

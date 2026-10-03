@@ -663,6 +663,7 @@ export enum IntegrationService {
   GoogleCloud = "GOOGLE_CLOUD",
   GoogleHealth = "GOOGLE_HEALTH",
   Jira = "JIRA",
+  Plaid = "PLAID",
   Slack = "SLACK",
 }
 

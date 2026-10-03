@@ -507,6 +507,14 @@ jobs:
         # Silence on an unreadable audit would be the worse bug: a green
         # tick that means "I did not look".
         #
+        # REVIEWED EXCEPTIONS (2026-10-03). An advisory with NO patched
+        # release blocked every frontend PR until upstream shipped one (first:
+        # braces GHSA-vfj7-8cjw-p6xm, dev-only via @graphql-codegen/cli). The
+        # decision now lives in scripts/frontend_audit_gate.py (--self-test):
+        # it works per ADVISORY, and an entry in frontend/audit-exceptions.json
+        # names one advisory with a reason and an EXPIRY — expired, it blocks
+        # again. Add one only when no fix exists.
+        #
         # BOUNDED (2026-09-04). #738 taught this step to distinguish "found
         # advisories" from "could not reach the service", but only for a
         # service that ANSWERS. A service that simply does not answer was
@@ -561,20 +569,12 @@ jobs:
             exit 0
           fi
 
-          crit=$(printf '%s' "$out" | jq -r '.metadata.vulnerabilities.critical // 0')
-          high=$(printf '%s' "$out" | jq -r '.metadata.vulnerabilities.high // 0')
-          mod=$(printf  '%s' "$out" | jq -r '.metadata.vulnerabilities.moderate // 0')
-          total=$((crit + high + mod))
-
-          echo "Frontend advisories — critical=$crit high=$high moderate=$mod"
-          if [ "$total" -gt 0 ]; then
-            printf '%s' "$out" | jq -r '
-              .vulnerabilities // {} | to_entries[]
-              | select(.value.severity == "critical" or .value.severity == "high" or .value.severity == "moderate")
-              | "  \(.value.severity)\t\(.key)\t\(.value.via | if type=="array" then (map(if type=="object" then .title else . end) | join("; ")) else tostring end)"'
-            echo "::error title=Frontend dependency advisories::$total moderate+ advisory(ies). The backlog is kept at ZERO on main, so these are newly introduced."
-            exit 1
-          fi
+          # The decision: every moderate+ ADVISORY must be fixed or covered by
+          # an unexpired, reviewed exception in frontend/audit-exceptions.json
+          # (one advisory each, with a reason and an expiry date). Excepted
+          # advisories are printed as warnings on every run.
+          python3 ../scripts/frontend_audit_gate.py --self-test >/dev/null
+          printf '%s' "$out" | python3 ../scripts/frontend_audit_gate.py --exceptions audit-exceptions.json
 
   # ── Migration baseline verifier (RFC 0009 phase 1) ─────────────────────────
   # Proves the committed migrations/.baseline/ artifacts (schema snapshot +
