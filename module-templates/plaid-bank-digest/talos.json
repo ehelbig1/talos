@@ -1,0 +1,89 @@
+{
+  "name": "plaid-bank-digest",
+  "version": "v1.0.0",
+  "display_name": "Plaid: Bank Digest",
+  "description": "One connected bank (a Plaid Item) reduced to what a weekly money summary needs. Read-only: one POST to Plaid's `/transactions/get` (and one to `/accounts/get` when transactions cannot be read); nothing is written and nothing is stored between runs. Returns `accounts` with balances, `cash` (depository accounts: the available balance, else the current one), `owed_on_cards`, and `transactions`: per-week totals counted back from yesterday (`day_to_day`, `fixed` = housing, utilities and loan payments, `income`), day-to-day spending per category per week, last week's five largest day-to-day items, the charges seen three months running at one price (`recurring`) and the ones seen for the second time last week (`new_recurring`, with `price_change` when the merchant's only monthly charge replaced another price). Transfers between accounts and credit-card payments are left out of spending and reported separately. A balance that could not be read is `null`, never 0. The newest 300 transactions are read; a bank with more in the window is reported `truncated` and only the weeks read whole are counted (`window.weeks`). When transactions cannot be read (history still loading) `transactions` is `null`, the reason is under `unavailable` and the balances are still returned; when the bank cannot be read at all the node fails with Plaid's error code. Account numbers are not returned: any word of an account or transaction name carrying four or more digits is dropped. Use one node per bank and combine them with `plaid-money-summary`.\n\nThe module never holds a credential: ACCESS_TOKEN is a vault:// reference and the app's Plaid credentials are read from the vault by the host when the request is sent.",
+  "category": "Integration",
+  "capability_world": "http-node",
+  "allowed_hosts": [
+    "production.plaid.com",
+    "sandbox.plaid.com"
+  ],
+  "allowed_methods": [
+    "POST"
+  ],
+  "requires_secrets": [
+    "plaid/client_id",
+    "plaid/secret",
+    "plaid/access_token/*"
+  ],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 300,
+    "bytes_per_item": 2000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 1.0,
+    "fuel_per_byte": 65
+  },
+  "dependencies": {
+    "chrono": "0.4"
+  },
+  "config_schema": {
+    "type": "object",
+    "required": [
+      "PLAID_ENV",
+      "ACCESS_TOKEN"
+    ],
+    "properties": {
+      "PLAID_ENV": {
+        "type": "string",
+        "enum": [
+          "production",
+          "sandbox"
+        ],
+        "description": "The Plaid environment the bank was connected in. There is no default."
+      },
+      "ACCESS_TOKEN": {
+        "type": "string",
+        "description": "The vault reference of one connected bank's access token: 'vault://plaid/access_token/{item_id}'. Each bank connected from Settings has its own; list_secrets shows them with the bank's name. Anything other than this reference is refused, so a token can never be pasted here."
+      },
+      "INSTITUTION": {
+        "type": "string",
+        "description": "The bank's name as it should appear in the output (e.g. 'Wells Fargo')."
+      },
+      "TIME_ZONE": {
+        "type": "string",
+        "default": "UTC",
+        "description": "IANA zone name (e.g. 'America/New_York') whose local date decides 'today'. Weeks are counted back from yesterday in that zone. An unknown zone is an error."
+      },
+      "WEEKS": {
+        "type": "integer",
+        "default": 14,
+        "minimum": 4,
+        "maximum": 26,
+        "description": "How many weeks of transactions to ask for. Fourteen always hold three charges of a monthly subscription."
+      },
+      "TODAY": {
+        "type": "string",
+        "description": "A fixed date (YYYY-MM-DD) to use instead of the clock. For tests."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Connect the bank",
+      "detail": "Set PLAID_ENV, PLAID_CLIENT_ID and PLAID_SECRET on the controller (docs/plaid-setup.md), then connect each bank from Settings > Integrations > Bank accounts. The controller stores each bank's access token at 'plaid/access_token/{item_id}' and the app credentials at 'plaid/client_id' and 'plaid/secret'."
+    },
+    {
+      "step": 2,
+      "title": "Use a restricted actor",
+      "detail": "Bind the workflow to an actor with max_llm_tier 'tier1' and egress_scope 'public' (bank data can then reach no outside model), max_write_ceiling 'readonly' and http_verb_ceiling 'write' (Plaid's reads are POSTs; nothing else the actor does may change anything)."
+    },
+    {
+      "step": 3,
+      "title": "One node per bank",
+      "detail": "Add one node per connected bank with PLAID_ENV, ACCESS_TOKEN 'vault://plaid/access_token/{item_id}', INSTITUTION and TIME_ZONE. Set continue_on_error on each so one bank that needs reconnecting does not hide the others, join them with a Collect node and follow it with 'plaid-money-summary'. These are reads, so an explicit retry_count of 1 or 2 is safe."
+    }
+  ]
+}

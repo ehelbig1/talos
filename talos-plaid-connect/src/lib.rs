@@ -91,6 +91,36 @@ fn label(raw: Option<&str>) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// The display name of a bank's access-token entry in the vault.
+fn access_token_name(institution_name: Option<&str>) -> String {
+    match institution_name {
+        Some(bank) => format!("Plaid access token ({bank})"),
+        None => "Plaid access token".to_string(),
+    }
+}
+
+/// Where a disconnect can end a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemovalAt {
+    /// At Plaid, with this server's credentials.
+    Plaid,
+    /// Only here: the connection was made in another Plaid environment, whose
+    /// host and app secret this server does not have. Sending its token to
+    /// the configured environment would only be refused.
+    HereOnly { connected_in: String },
+}
+
+/// `row_environment` is the environment recorded when the bank was connected;
+/// `None` (no row, or the row could not be read) leaves the decision to Plaid.
+fn removal_at(row_environment: Option<&str>, configured: &str) -> RemovalAt {
+    match row_environment {
+        Some(env) if env != configured => RemovalAt::HereOnly {
+            connected_in: env.to_string(),
+        },
+        _ => RemovalAt::Plaid,
+    }
+}
+
 /// A `public_token` worth sending to Plaid: present, bounded, the shape Plaid
 /// issues (`public-<env>-<uuid>`), no whitespace or control characters.
 fn check_public_token(raw: &str) -> Result<PublicToken, ConnectRefusal> {
@@ -258,6 +288,9 @@ impl PlaidConnectService {
         .execute(&self.pool)
         .await?;
         let config = client.config();
+        // The token's name says which bank it is, so the entry can be told
+        // from the others wherever secrets are listed.
+        let token_name = access_token_name(institution_name);
         for (name, path, value) in [
             (
                 "Plaid client id",
@@ -265,7 +298,7 @@ impl PlaidConnectService {
                 config.client_id.as_str(),
             ),
             ("Plaid app secret", PLAID_SECRET_PATH, config.secret()),
-            ("Plaid access token", token_path.as_str(), access.as_str()),
+            (token_name.as_str(), token_path.as_str(), access.as_str()),
         ] {
             self.secrets
                 .upsert_secret(
@@ -325,8 +358,27 @@ impl PlaidConnectService {
     /// A Plaid failure is logged and the vault entry is deleted anyway (no
     /// one here can use the connection after that). `Err` only when the token
     /// is still in the vault afterwards.
+    ///
+    /// A connection made in the other Plaid environment (a sandbox bank left
+    /// over after the switch to production) is not sent to Plaid at all: see
+    /// [`RemovalAt::HereOnly`].
     pub async fn remove_item(&self, user_id: Uuid, item_id: &str) -> anyhow::Result<()> {
         let path = access_token_path(item_id).map_err(|e| anyhow::anyhow!(e))?;
+        let row_environment: Option<String> = match sqlx::query_scalar::<_, String>(
+            "SELECT environment FROM plaid_items WHERE user_id = $1 AND item_id = $2",
+        )
+        .bind(user_id)
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!(target: "talos_plaid", %user_id, error = %e, "could not read the connection's environment; asking Plaid to remove it");
+                None
+            }
+        };
+        let mut removed_at_plaid = false;
         let org_ids = match talos_organizations::OrganizationService::create_personal_org(
             &self.pool, user_id, None,
         )
@@ -342,14 +394,29 @@ impl PlaidConnectService {
         {
             Ok(raw) => match self.client() {
                 Ok(client) => {
-                    if let Err(e) = client.remove_item(&AccessToken::new(raw)).await {
-                        tracing::warn!(
+                    match removal_at(row_environment.as_deref(), client.config().env.as_str()) {
+                        RemovalAt::Plaid => {
+                            match client.remove_item(&AccessToken::new(raw)).await {
+                                Ok(()) => removed_at_plaid = true,
+                                Err(e) => tracing::warn!(
+                                    target: "talos_plaid",
+                                    %user_id,
+                                    item_id = %item_id,
+                                    error = %e,
+                                    "Plaid did not confirm the removal; the token is deleted here regardless"
+                                ),
+                            }
+                        }
+                        RemovalAt::HereOnly { connected_in } => tracing::warn!(
                             target: "talos_plaid",
                             %user_id,
                             item_id = %item_id,
-                            error = %e,
-                            "Plaid did not confirm the removal; the token is deleted here regardless"
-                        );
+                            connected_in = %connected_in,
+                            configured = client.config().env.as_str(),
+                            "this connection was made in another Plaid environment, so it was not removed at Plaid; \
+                             the token is deleted here. A production connection left this way still counts against \
+                             the plan until it is removed in the Plaid dashboard"
+                        ),
                     }
                 }
                 Err(_) => tracing::warn!(
@@ -372,6 +439,7 @@ impl PlaidConnectService {
             event_kind = "plaid_item_disconnected",
             %user_id,
             item_id = %item_id,
+            removed_at_plaid,
             "bank disconnected"
         );
         Ok(())
@@ -400,6 +468,38 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_connection_from_another_environment_is_ended_here_only() {
+        assert_eq!(
+            removal_at(Some("production"), "production"),
+            RemovalAt::Plaid
+        );
+        assert_eq!(removal_at(Some("sandbox"), "sandbox"), RemovalAt::Plaid);
+        assert_eq!(
+            removal_at(Some("sandbox"), "production"),
+            RemovalAt::HereOnly {
+                connected_in: "sandbox".into()
+            }
+        );
+        assert_eq!(
+            removal_at(Some("production"), "sandbox"),
+            RemovalAt::HereOnly {
+                connected_in: "production".into()
+            }
+        );
+        // No row to say otherwise: Plaid decides.
+        assert_eq!(removal_at(None, "production"), RemovalAt::Plaid);
+    }
+
+    #[test]
+    fn the_token_entry_is_named_for_its_bank() {
+        assert_eq!(
+            access_token_name(Some("Wells Fargo")),
+            "Plaid access token (Wells Fargo)"
+        );
+        assert_eq!(access_token_name(None), "Plaid access token");
     }
 
     #[test]
