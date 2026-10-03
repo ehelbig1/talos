@@ -1,0 +1,72 @@
+{
+  "name": "json-api-reader",
+  "version": "v1.0.0",
+  "display_name": "JSON API Reader",
+  "description": "Read one JSON API and keep only the fields you name. One request (GET, or POST with a JSON body), then a streaming pass that walks to the list at ROWS_AT and keeps the FIELDS of each entry: `{rows, count, total, truncated, top, status}`. Everything not named is skipped without being built, so a field you did not ask for cannot appear in the output and the fuel cost stays near the cost of reading the bytes. An absent field is `null`; entries past MAX_ROWS are counted (`total`) and reported as `truncated`, not kept. TOP keeps fields beside the list, such as a paging cursor; this module makes one request and does not page. A response that is not 2xx fails the node with the host and the status, never the body.\n\nCREDENTIALS: the module never holds one. A HEADERS value or a string inside BODY may be a vault:// reference; the host replaces it when the request is sent.\n\nGRANTS: this template installs with NO allowed hosts and no secrets, so it can reach nothing until you say what it may reach: after installing, set the API's host with update_module_hosts and the secret paths with update_module_secrets (list_connections shows the reference and the paths for a connected service). Use one installed copy per API, so a credential can only ever be sent to the host it belongs to.",
+  "category": "Network",
+  "capability_world": "http-node",
+  "allowed_hosts": [],
+  "allowed_methods": [
+    "GET",
+    "POST"
+  ],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 100,
+    "bytes_per_item": 4000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 2.0,
+    "fuel_per_byte": 20
+  },
+  "config_schema": {
+    "type": "object",
+    "required": [
+      "URL",
+      "FIELDS"
+    ],
+    "properties": {
+      "URL": {
+        "type": "string",
+        "description": "The https:// URL to request, query string included."
+      },
+      "METHOD": {
+        "type": "string",
+        "enum": [
+          "GET",
+          "POST"
+        ],
+        "default": "GET",
+        "description": "GET, or POST for an API that takes its query in a JSON body. Nothing else: this module reads."
+      },
+      "HEADERS": {
+        "type": "object",
+        "description": "Request headers, name to value. A value may be a vault:// reference (for example {\"Authorization\": \"vault://oauth/...\"}); the host replaces it when the request is sent. At most 16."
+      },
+      "BODY": {
+        "description": "POST only: the JSON body. A string value anywhere inside it may be a vault:// reference. Sent as application/json."
+      },
+      "ROWS_AT": {
+        "type": "string",
+        "description": "Dotted path to the list in the response (\"data.items\"). Omit when the response itself is the list. A path that leads to one object yields one row."
+      },
+      "FIELDS": {
+        "description": "The fields of each entry to keep: a list of dotted paths ([\"id\", \"owner.name\"], each kept under its last segment) or an object of output name to path ({\"owner\": \"owner.name\"}). 1 to 32."
+      },
+      "TOP": {
+        "description": "Fields beside the list to keep, in the same two forms as FIELDS, with paths from the top of the response ({\"next\": \"data.next_cursor\"}). Needs ROWS_AT."
+      },
+      "MAX_ROWS": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000,
+        "default": 100,
+        "description": "Entries kept. The rest are counted in `total` and `truncated` is true."
+      },
+      "TIMEOUT_MS": {
+        "type": "integer",
+        "description": "Request timeout in milliseconds."
+      }
+    }
+  }
+}
