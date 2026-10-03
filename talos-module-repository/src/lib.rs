@@ -516,7 +516,15 @@ pub struct WasmModuleInfo {
     pub compiled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub template_id: Option<Uuid>,
     pub allowed_hosts: Vec<String>,
+    /// The HTTP verbs the module may use. Empty denies every verb.
+    pub allowed_methods: Vec<String>,
     pub allowed_secrets: Vec<String>,
+    /// The module's own fuel limit; `None` when the row sets none.
+    pub max_fuel: Option<i64>,
+    /// The crates the module was compiled with, as recorded; `None` when
+    /// nothing was recorded.
+    pub dependencies: Option<serde_json::Value>,
+    pub language: String,
     pub size_bytes: i64,
     pub has_source_code: bool,
     pub rate_limit_per_minute: Option<i32>,
@@ -1477,7 +1485,8 @@ impl ModuleRepository {
     ) -> Result<Option<WasmModuleInfo>> {
         let row = sqlx::query(
             "SELECT id, name, capability_world, compiled_at, \
-                    allowed_hosts, allowed_secrets, config_schema, \
+                    allowed_hosts, allowed_methods, allowed_secrets, config_schema, \
+                    max_fuel, dependencies, language, \
                     COALESCE(LENGTH(wasm_bytes)::bigint, size_bytes::bigint) AS size_bytes, \
                     (source_code IS NOT NULL) AS has_source_code, \
                     rate_limit_per_minute \
@@ -1508,9 +1517,13 @@ impl ModuleRepository {
                 allowed_hosts: r
                     .try_get::<Option<_>, _>("allowed_hosts")?
                     .unwrap_or_default(),
+                allowed_methods: r.try_get("allowed_methods")?,
                 allowed_secrets: r
                     .try_get::<Option<_>, _>("allowed_secrets")?
                     .unwrap_or_default(),
+                max_fuel: r.try_get("max_fuel")?,
+                dependencies: r.try_get("dependencies")?,
+                language: r.try_get("language")?,
                 size_bytes: r.try_get::<Option<_>, _>("size_bytes")?.unwrap_or(0),
                 has_source_code: r
                     .try_get::<Option<_>, _>("has_source_code")?

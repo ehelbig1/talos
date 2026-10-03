@@ -483,16 +483,35 @@ impl ParallelWorkflowEngine {
     /// preserved so downstream handlers have a reliable signal when a
     /// `continue_on_error` parent errored. `error_message` is already a
     /// non-prefixed field and passes through unconditionally.
+    ///
+    /// With `label_items` the output also carries `sources`: the node id of
+    /// each parent, in the same order as `items`, so `sources[i]` names the
+    /// branch `items[i]` came from. Engine-authored from the graph, never
+    /// read back from a branch's output.
     pub(crate) fn collect_parent_outputs_for_node(
         &self,
         node_idx: NodeIndex,
         results: &HashMap<Uuid, JsonValue>,
+        label_items: bool,
     ) -> JsonValue {
         let node_id = self.graph[node_idx];
+        let mut sources: Vec<JsonValue> = Vec::new();
         let parent_outputs: Vec<JsonValue> = self
             .graph
             .neighbors_directed(node_idx, Direction::Incoming)
-            .filter_map(|p| results.get(&self.graph[p]).cloned())
+            .filter_map(|p| {
+                let parent_id = self.graph[p];
+                let output = results.get(&parent_id).cloned()?;
+                if label_items {
+                    sources.push(JsonValue::String(
+                        self.node_labels
+                            .get(&parent_id)
+                            .cloned()
+                            .unwrap_or_else(|| parent_id.to_string()),
+                    ));
+                }
+                Some(output)
+            })
             .map(|v| {
                 if let JsonValue::Object(mut obj) = v {
                     obj.retain(|k, _| !k.starts_with("__") || k == "__error" || k == "__continued");
@@ -508,6 +527,9 @@ impl ParallelWorkflowEngine {
             "items": parent_outputs,
             "count": parent_count,
         });
+        if label_items {
+            collected["sources"] = JsonValue::Array(sources);
+        }
 
         // `count: N` is a claim about how many branches ARRIVED, not about how
         // many succeeded, and `items` is a POSITIONAL array with no labels —

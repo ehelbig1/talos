@@ -96,10 +96,11 @@ impl ParallelWorkflowEngine {
         execution_id: Uuid,
         results: &HashMap<Uuid, JsonValue>,
     ) -> Option<JsonValue> {
-        let (_, _, Some(SystemNodeKind::Collect)) = self.node_meta.get(&node_id)? else {
+        let (_, _, Some(SystemNodeKind::Collect { label_items })) = self.node_meta.get(&node_id)?
+        else {
             return None;
         };
-        let collected = self.collect_parent_outputs_for_node(node_idx, results);
+        let collected = self.collect_parent_outputs_for_node(node_idx, results, *label_items);
         let parent_count = collected.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
         self.emit_node_lifecycle_events(
             execution_id,

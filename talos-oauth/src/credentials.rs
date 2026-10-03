@@ -45,6 +45,19 @@ pub struct IntegrationCredential {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Where a connection's access token is stored — the path a module names as
+/// `vault://<path>`. The ONE spelling: `store_credentials` writes here and a
+/// tool that tells an author which reference to use reads here, so the two
+/// cannot disagree. (The refresh-token twin is host-reserved and never a
+/// module reference.)
+#[must_use]
+pub fn access_token_vault_path(provider: &str, user_id: Uuid, provider_key: &str) -> String {
+    format!(
+        "oauth/{}/{}/{}/access_token",
+        provider, user_id, provider_key
+    )
+}
+
 impl OAuthCredentialService {
     pub fn new(db_pool: Pool<Postgres>, secrets_manager: Arc<SecretsManager>) -> Self {
         Self {
@@ -73,10 +86,7 @@ impl OAuthCredentialService {
     // -------------------------------------------------------------------------
 
     fn access_token_path(provider: &str, user_id: Uuid, provider_key: &str) -> String {
-        format!(
-            "oauth/{}/{}/{}/access_token",
-            provider, user_id, provider_key
-        )
+        access_token_vault_path(provider, user_id, provider_key)
     }
 
     fn refresh_token_path(provider: &str, user_id: Uuid, provider_key: &str) -> String {

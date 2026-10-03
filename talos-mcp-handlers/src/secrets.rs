@@ -87,6 +87,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "list_connections",
+            "description": "List the services you have connected (Gmail, Google Calendar, Google Health, Google Cloud, Slack, Jira, bank accounts through Plaid) with the `vault://` reference a workflow node uses for each one's credential. For every connection: the service, the account it is (an address, a bank name), when it was connected, `vault_reference` (put this string in a node's config where the module expects a token — a header value or a JSON body field; the worker resolves it at the outbound call and the module never holds the value), `allowed_secrets` (the exact vault paths to grant the module), and `stored` (whether the credential is in the vault right now; null if that could not be read). A bank connection also lists the two application credentials its requests need. `module_readable: false` marks a credential modules can never read (it is used by the controller only). Read-only, your own connections only, and no secret value is ever returned. Use this instead of reading provider keys out of the database when wiring a module to a connected account.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
             "name": "refresh_oauth_token",
             "description": "Force-refresh a stored OAuth access token by calling the provider's token endpoint with the stored refresh_token. Use when a workflow is getting HTTP 401 from a provider (Gmail, Google Calendar, Atlassian) and you suspect the cached access_token is expired.\n\nPath format: `oauth/{provider}/{user_id}/{provider_key}/access_token`. You can only refresh tokens belonging to your own user_id — cross-user refresh attempts are rejected.\n\nReturns `{ refreshed: bool, reason: string, expires_in_seconds: int|null }`. `refreshed=true` means a new access_token was written to vault; `false` with `reason=\"still_valid\"` means no refresh was needed.",
             "inputSchema": {
@@ -119,6 +127,7 @@ pub async fn dispatch(
         "list_secret_namespaces" => {
             Some(handle_list_secret_namespaces(req_id, args, state, user_id).await)
         }
+        "list_connections" => Some(handle_list_connections(req_id, state, user_id).await),
         "list_secret_usage" => Some(handle_list_secret_usage(req_id, args, state, user_id).await),
         "list_expiring_secrets" => {
             Some(handle_list_expiring_secrets(req_id, args, state, user_id).await)
@@ -243,6 +252,154 @@ async fn handle_list_secret_namespaces(
             mcp_error(req_id, -32000, "Failed to list secret namespaces")
         }
     }
+}
+
+/// Where one connection's credential is stored, from the builders that store
+/// it: `talos_plaid::link::access_token_path` for a bank item,
+/// `talos_oauth::access_token_vault_path` under the provider namespace the
+/// row's tier selects (`revoke_provider_for`) for everything else.
+///
+/// # Errors
+/// When the row cannot name a credential: no provider key, a tier this build
+/// does not know, or an item id the path builder refuses.
+pub(crate) fn connection_token_path(
+    provider: &talos_integrations::provider_config::IntegrationProviderConfig,
+    user_id: Uuid,
+    provider_key: Option<&str>,
+    tier: Option<&str>,
+) -> Result<String, String> {
+    let key = provider_key
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| "this connection records no credential key".to_string())?;
+    if provider.id == talos_integrations::provider_config::PLAID_PROVIDER_ID {
+        return talos_plaid::link::access_token_path(key);
+    }
+    let namespace = talos_integrations::provider_config::revoke_provider_for(provider, tier)
+        .ok_or_else(|| "this connection's access tier is not recognised".to_string())?;
+    Ok(talos_oauth::credentials::access_token_vault_path(
+        &namespace, user_id, key,
+    ))
+}
+
+/// One connection as `list_connections` renders it. `stored` is the set of
+/// paths found in the vault, or `None` when that read failed — rendered as
+/// `null`, never as `false`.
+pub(crate) fn rendered_connection(
+    row: &talos_integrations::store::ConnectionRow,
+    user_id: Uuid,
+    stored: Option<&std::collections::HashSet<String>>,
+) -> serde_json::Value {
+    use talos_integrations::provider_config::{PLAID_PROVIDER_ID, PROVIDERS};
+    let provider = PROVIDERS.iter().find(|p| p.id == row.provider_id);
+    let mut out = serde_json::json!({
+        "service": row.provider_id,
+        "name": provider.map_or(row.provider_id.as_str(), |p| p.display_name),
+        "account": row.identifier,
+        "connected_at": row.created_at.to_rfc3339(),
+    });
+    let path = provider
+        .ok_or_else(|| "this service is not in the provider registry".to_string())
+        .and_then(|p| {
+            connection_token_path(p, user_id, row.provider_key.as_deref(), row.tier.as_deref())
+        });
+    let path = match path {
+        Ok(path) => path,
+        Err(why) => {
+            out["vault_reference"] = Value::Null;
+            out["note"] = Value::String(format!("No reference: {why}."));
+            return out;
+        }
+    };
+    out["stored"] = stored.map_or(Value::Null, |s| Value::Bool(s.contains(&path)));
+    // Host-reserved credentials (the full Google Cloud consent) are used by
+    // the controller only; the worker refuses them to every module.
+    if talos_workflow_job_protocol::is_controller_internal_vault_path(&path) {
+        out["module_readable"] = Value::Bool(false);
+        out["vault_reference"] = Value::Null;
+        out["note"] = Value::String(
+            "This credential is used by the controller only; no module can read it.".to_string(),
+        );
+        return out;
+    }
+    out["module_readable"] = Value::Bool(true);
+    out["vault_reference"] = Value::String(format!("vault://{path}"));
+    let mut grant = vec![path];
+    if row.provider_id == PLAID_PROVIDER_ID {
+        // A Plaid request carries the application's own two credentials in
+        // its JSON body beside the item's token.
+        let app = [
+            talos_plaid::link::PLAID_CLIENT_ID_PATH,
+            talos_plaid::link::PLAID_SECRET_PATH,
+        ];
+        out["also_required"] = serde_json::json!(app.map(|p| format!("vault://{p}")));
+        grant.extend(app.map(str::to_string));
+    }
+    out["allowed_secrets"] = serde_json::json!(grant);
+    out
+}
+
+async fn handle_list_connections(
+    req_id: Option<serde_json::Value>,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let rows = match talos_integrations::store::list_user_connections(&state.db_pool, user_id).await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("list_connections query failed: {:#}", e);
+            return mcp_error(req_id, -32000, "Failed to list connections");
+        }
+    };
+    // One batched existence read for every path. A failure leaves `stored`
+    // unknown (null) on every row rather than claiming nothing is stored.
+    let paths: Vec<String> = rows
+        .iter()
+        .filter_map(|row| {
+            let provider = talos_integrations::provider_config::PROVIDERS
+                .iter()
+                .find(|p| p.id == row.provider_id)?;
+            connection_token_path(
+                provider,
+                user_id,
+                row.provider_key.as_deref(),
+                row.tier.as_deref(),
+            )
+            .ok()
+        })
+        .collect();
+    let stored = match state
+        .secrets_manager
+        .existing_secret_key_paths(&paths, user_id)
+        .await
+    {
+        Ok(found) => Some(found),
+        Err(e) => {
+            // The paths name accounts; the error is logged without them.
+            tracing::warn!(error = %e, "list_connections: the vault existence read failed");
+            None
+        }
+    };
+    let connections: Vec<Value> = rows
+        .iter()
+        .map(|row| rendered_connection(row, user_id, stored.as_ref()))
+        .collect();
+    let truncated = i64::try_from(rows.len())
+        .is_ok_and(|n| n >= talos_integrations::store::MAX_LISTED_CONNECTIONS);
+    let envelope = serde_json::json!({
+        "count": connections.len(),
+        "truncated": truncated,
+        "stored_checked": stored.is_some(),
+        "connections": connections,
+        "usage": "Put vault_reference in the node's config where the module expects the \
+                  credential (a header value or a JSON body field) and grant the module the \
+                  paths in allowed_secrets (update_module_secrets). The value is resolved by \
+                  the worker at the outbound call; the module and this tool never see it.",
+    });
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&envelope).unwrap_or_default(),
+    )
 }
 
 async fn handle_list_secret_usage(
@@ -973,5 +1130,181 @@ mod oauth_refresh_message_tests {
         assert!(body.contains("mcp_error(req_id, -32000, OAUTH_REFRESH_FAILED_MESSAGE)"));
         assert!(!body.contains(&format!("OAuth refresh failed: {}", "{}")));
         assert!(!super::OAUTH_REFRESH_FAILED_MESSAGE.contains('{'));
+    }
+}
+
+#[cfg(test)]
+mod connection_reference_tests {
+    use super::{connection_token_path, rendered_connection};
+    use std::collections::HashSet;
+    use talos_integrations::provider_config::PROVIDERS;
+    use talos_integrations::store::ConnectionRow;
+    use uuid::Uuid;
+
+    fn provider(
+        id: &str,
+    ) -> &'static talos_integrations::provider_config::IntegrationProviderConfig {
+        PROVIDERS
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap_or_else(|| panic!("{id} is not in the provider registry"))
+    }
+
+    fn row(provider_id: &str, key: Option<&str>, tier: Option<&str>) -> ConnectionRow {
+        ConnectionRow {
+            id: Uuid::nil(),
+            identifier: "owner@example.com".to_string(),
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            provider_id: provider_id.to_string(),
+            provider_key: key.map(str::to_string),
+            tier: tier.map(str::to_string),
+        }
+    }
+
+    const USER: Uuid = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+
+    /// The path is the one the storing code writes: provider namespace, the
+    /// OWNER's id, the row's key.
+    #[test]
+    fn an_oauth_connection_names_its_access_token_under_the_owners_id() {
+        let path = connection_token_path(provider("gmail"), USER, Some("owner@example.com"), None)
+            .unwrap();
+        assert_eq!(
+            path,
+            format!("oauth/gmail/{USER}/owner@example.com/access_token")
+        );
+        assert_eq!(
+            path,
+            talos_oauth::credentials::access_token_vault_path("gmail", USER, "owner@example.com"),
+            "one spelling, shared with the code that stores the token"
+        );
+    }
+
+    #[test]
+    fn a_tiered_connection_is_named_under_its_own_tiers_namespace() {
+        let key = "3f2b0c1e-0000-4000-8000-000000000001";
+        for (tier, namespace) in [
+            ("read", "google_cloud"),
+            ("write", "google_cloud_write"),
+            ("full", "google_cloud_full"),
+        ] {
+            assert_eq!(
+                connection_token_path(provider("gcp"), USER, Some(key), Some(tier)).unwrap(),
+                format!("oauth/{namespace}/{USER}/{key}/access_token"),
+                "{tier}"
+            );
+        }
+        // An unknown tier names nothing rather than guessing a namespace.
+        assert!(connection_token_path(provider("gcp"), USER, Some(key), Some("admin")).is_err());
+        assert!(connection_token_path(provider("gcp"), USER, Some(key), None).is_err());
+    }
+
+    #[test]
+    fn a_bank_connection_uses_the_plaid_path_builder_and_its_refusals() {
+        assert_eq!(
+            connection_token_path(provider("plaid"), USER, Some("item-abc_123"), None).unwrap(),
+            "plaid/access_token/item-abc_123"
+        );
+        assert!(connection_token_path(provider("plaid"), USER, Some("a/b"), None).is_err());
+        assert!(connection_token_path(provider("plaid"), USER, None, None).is_err());
+        assert!(connection_token_path(provider("plaid"), USER, Some(""), None).is_err());
+    }
+
+    #[test]
+    fn a_bank_connection_lists_the_application_credentials_it_also_needs() {
+        let stored: HashSet<String> = ["plaid/access_token/item-abc_123".to_string()].into();
+        let out = rendered_connection(
+            &row("plaid", Some("item-abc_123"), None),
+            USER,
+            Some(&stored),
+        );
+        assert_eq!(out["service"], "plaid");
+        assert_eq!(
+            out["vault_reference"],
+            "vault://plaid/access_token/item-abc_123"
+        );
+        assert_eq!(
+            out["also_required"],
+            serde_json::json!(["vault://plaid/client_id", "vault://plaid/secret"])
+        );
+        assert_eq!(
+            out["allowed_secrets"],
+            serde_json::json!([
+                "plaid/access_token/item-abc_123",
+                "plaid/client_id",
+                "plaid/secret"
+            ])
+        );
+        assert_eq!(out["stored"], true);
+        assert_eq!(out["module_readable"], true);
+    }
+
+    /// Three answers, not two: stored, not stored, could not be read.
+    #[test]
+    fn stored_is_null_when_the_vault_could_not_be_read() {
+        let gmail = row("gmail", Some("owner@example.com"), None);
+        assert_eq!(
+            rendered_connection(&gmail, USER, None)["stored"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            rendered_connection(&gmail, USER, Some(&HashSet::new()))["stored"],
+            false
+        );
+    }
+
+    /// The full Google Cloud consent is host-only: the tool must not hand out
+    /// a reference the worker will refuse.
+    #[test]
+    fn a_host_only_credential_gets_no_reference() {
+        let key = "3f2b0c1e-0000-4000-8000-000000000001";
+        let out = rendered_connection(&row("gcp", Some(key), Some("full")), USER, None);
+        assert_eq!(out["module_readable"], false);
+        assert_eq!(out["vault_reference"], serde_json::Value::Null);
+        assert!(out.get("allowed_secrets").is_none());
+        // Control: the read tier of the same provider is a normal reference.
+        let read = rendered_connection(&row("gcp", Some(key), Some("read")), USER, None);
+        assert_eq!(read["module_readable"], true);
+        assert!(read["vault_reference"]
+            .as_str()
+            .unwrap()
+            .starts_with("vault://oauth/google_cloud/"));
+    }
+
+    #[test]
+    fn a_row_that_cannot_name_a_credential_says_so() {
+        let out = rendered_connection(&row("gmail", None, None), USER, None);
+        assert_eq!(out["vault_reference"], serde_json::Value::Null);
+        assert!(out["note"].as_str().unwrap().contains("no credential key"));
+        assert!(out.get("stored").is_none(), "nothing was looked up");
+    }
+
+    /// No rendered connection carries anything but paths: the tool has no
+    /// access to a secret value, and this pins that it never grows a field
+    /// for one.
+    #[test]
+    fn the_rendering_has_a_closed_set_of_fields() {
+        let out = rendered_connection(&row("plaid", Some("item-abc_123"), None), USER, None);
+        let mut keys: Vec<&str> = out
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "account",
+                "allowed_secrets",
+                "also_required",
+                "connected_at",
+                "module_readable",
+                "name",
+                "service",
+                "stored",
+                "vault_reference"
+            ]
+        );
     }
 }

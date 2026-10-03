@@ -1317,6 +1317,7 @@ pub(crate) const TOOL_GROUPS: &[(&str, &[&str])] = &[
         "secret",
         &[
             "list_secrets",
+            "list_connections",
             "list_secret_namespaces",
             "list_secret_usage",
             "list_expiring_secrets",

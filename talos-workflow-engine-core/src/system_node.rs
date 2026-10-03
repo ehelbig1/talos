@@ -130,7 +130,15 @@ pub enum SystemNodeKind {
         condition: String,
     },
     /// Collect branch outputs without otherwise transforming them.
-    Collect,
+    Collect {
+        /// Opt-in (`data.label_items: true`): the output also carries
+        /// `sources`, the node id of each parent in the same order as
+        /// `items`. `items` is ordered by the graph library, which is neither
+        /// the author's order nor stable, so without this a reader cannot tell
+        /// which branch an element came from. Off by default: the output of
+        /// every existing collect node stays byte-identical.
+        label_items: bool,
+    },
     /// Controller-side read of the ops-alerts triage store: digest
     /// counts over the active set plus the top-N active alerts. Output
     /// flows downstream as ordinary graph data (feeds daily-brief

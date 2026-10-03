@@ -66,6 +66,11 @@ talos-memory = { path = "../talos-memory" }
 talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-module-repository = { path = "../talos-module-repository" }
 talos-oauth = { path = "../talos-oauth" }
+# `list_connections`: the provider registry + the cross-provider listing, and
+# the Plaid vault-path builder, so the tool derives a connection's reference
+# from the code that stores it.
+talos-integrations = { path = "../talos-integrations" }
+talos-plaid = { path = "../talos-plaid" }
 # The push-channel inventory TRAIT. LEAF (types + one pure classification):
 # this crate must NOT depend on talos-gmail / talos-google-calendar /
 # talos-google-cloud, which sit above it.

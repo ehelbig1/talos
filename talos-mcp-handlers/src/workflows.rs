@@ -134,7 +134,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                                 "node_type": {
                                     "type": "string",
                                     "enum": ["collect", "loop", "sub_workflow", "capability_dispatch"],
-                                    "description": "Use instead of module_id for built-in structural nodes. When set, module_id is not required. Structural params can be placed at the top level of the node object OR inside config — both are accepted.\n\ncollect — FAN-IN node that merges outputs from 2+ incoming parallel branches into a single array. Output shape: {\"items\": [...], \"count\": N}. Downstream nodes access merged data as input.items[0].field_name, NOT input.field_name. ONLY use collect when multiple parallel branches converge; for sequential pipelines (A→B→C) connect nodes directly with edges — no collect needed. No extra params needed.\n\nloop — repeating node. Required param: body_node_id (string, must match another node ID in this call). Optional: max_iterations (number, default 10), condition (Rhai expression returning bool, default 'true'). Example: {\"id\":\"my-loop\",\"node_type\":\"loop\",\"body_node_id\":\"my-body\",\"max_iterations\":5,\"condition\":\"keep_going == true\"}\n\nsub_workflow — embeds another workflow by ID as a callable step. Required param: sub_workflow_id (UUID string). Optional: timeout_secs (default 60, bounded by global set_wasm_config ceiling max 300s). Example: {\"id\":\"sub\",\"node_type\":\"sub_workflow\",\"sub_workflow_id\":\"<uuid>\"}\n\ncapability_dispatch — routes to one of several named actor workflows based on a runtime capability key. Required param: required_capabilities (array of strings, non-empty). Optional: timeout_secs (default 60, bounded by global set_wasm_config ceiling max 300s). Example: {\"id\":\"dispatch\",\"node_type\":\"capability_dispatch\",\"required_capabilities\":[\"pdf_processing\"]}"
+                                    "description": "Use instead of module_id for built-in structural nodes. When set, module_id is not required. Structural params can be placed at the top level of the node object OR inside config — both are accepted.\n\ncollect — FAN-IN node that merges outputs from 2+ incoming parallel branches into a single array. Output shape: {\"items\": [...], \"count\": N}. Downstream nodes access merged data as input.items[0].field_name, NOT input.field_name. ONLY use collect when multiple parallel branches converge; for sequential pipelines (A→B→C) connect nodes directly with edges — no collect needed. No params are required. The order of items is not the order of the edges: pass label_items: true to also get `sources`, the node id of the branch each item came from (sources[i] names items[i]).\n\nloop — repeating node. Required param: body_node_id (string, must match another node ID in this call). Optional: max_iterations (number, default 10), condition (Rhai expression returning bool, default 'true'). Example: {\"id\":\"my-loop\",\"node_type\":\"loop\",\"body_node_id\":\"my-body\",\"max_iterations\":5,\"condition\":\"keep_going == true\"}\n\nsub_workflow — embeds another workflow by ID as a callable step. Required param: sub_workflow_id (UUID string). Optional: timeout_secs (default 60, bounded by global set_wasm_config ceiling max 300s). Example: {\"id\":\"sub\",\"node_type\":\"sub_workflow\",\"sub_workflow_id\":\"<uuid>\"}\n\ncapability_dispatch — routes to one of several named actor workflows based on a runtime capability key. Required param: required_capabilities (array of strings, non-empty). Optional: timeout_secs (default 60, bounded by global set_wasm_config ceiling max 300s). Example: {\"id\":\"dispatch\",\"node_type\":\"capability_dispatch\",\"required_capabilities\":[\"pdf_processing\"]}"
                                 },
                                 "config": { "type": "object", "description": "Node configuration (passed to the module at runtime)" },
                                 "position": { "type": "object", "properties": { "x": {"type":"number"}, "y": {"type":"number"} } },
@@ -143,7 +143,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                                 "retry_condition": { "type": "string", "description": "Rhai expression evaluated against the module's error output JSON. Return false to skip retries (fail immediately); return true to allow the retry. Variables in scope: all fields from the output JSON (e.g. status, error, error_message, is_error). Defaults to retry on evaluation error (safe default). Example: 'status != 429' (retry for everything except rate limits)" },
                                 "retry_delay_expression": { "type": "string", "description": "Rhai expression that returns a delay in ms computed from the error output. Variables in scope: same as retry_condition. Overrides exponential backoff when set. Capped at 60000ms. Example: 'if status == 429 { retry_after * 1000 } else { 1000 }'" },
                                 "skip_condition": { "type": "string", "description": "Module nodes only. Rhai expression evaluated before the node runs; true skips it and execution continues. Fields of the node's input bind as BARE variables (\"count == 0\"). FAIL-OPEN: an expression that cannot be evaluated does NOT skip. Same rules as add_node_to_workflow's skip_condition. Max 2000 chars." },
-                                "continue_on_error": { "type": "boolean", "description": "Module nodes only. If true, this node's failure does not fail the workflow: downstream nodes run and receive its error output (a collect node receives it as one of its items). Default false." },
+                                "continue_on_error": { "type": "boolean", "description": "If true, this node's failure does not fail the workflow: downstream nodes run and receive its error output (a collect node receives it as one of its items). Accepted on module nodes and, since 2026-10-03, on structural nodes such as sub_workflow. Default false." },
                                 "timeout_secs": { "type": "number", "description": "Per-node execution timeout in whole seconds (default 60). On a sub_workflow / capability_dispatch node this is that node's own child timeout parameter." }
                             },
                             "required": ["id"]
@@ -458,7 +458,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "input": { "type": "object", "description": "Optional input data passed to the first node(s)" },
                     "timeout_secs": { "type": "number", "description": "Maximum time to wait synchronously for completion in seconds (default: 30, max: 120). This bounds only how long the call blocks — it does NOT cap the workflow, which runs to its own execution_timeout_secs in the background. Sync MCP responses can't tie up the connection for >2 min; if the window elapses you get status='running' + execution_id, so for longer workflows prefer trigger_workflow (async) and poll get_execution_status." },
                     "dry_run": { "type": "boolean", "description": "When true, non-GET HTTP requests, webhook sends, and messaging publishes are mocked. Useful for testing workflow logic without side effects." },
-                    "output_mode": { "type": "string", "enum": ["full", "terminal_only", "summary"], "description": "Shape the returned per-node output (default 'full'). 'terminal_only' keeps only terminal (leaf) node outputs verbatim and elides intermediates to {__elided__, bytes}. 'summary' keeps every node but elides any single node output over 4KB. Use these when a workflow's intermediate nodes (fan-in / memory dumps) make 'full' output huge." }
+                    "output_mode": { "type": "string", "enum": ["full", "terminal_only", "summary", "none"], "description": "Shape the returned per-node output (default 'full'; 'none' when output_nodes is given). 'terminal_only' keeps only terminal (leaf) node outputs verbatim and elides intermediates to {__elided__, bytes}. 'summary' keeps every node but elides any single node output over 4KB. 'none' elides every node: the reply says which nodes ran and how large each output was. An unknown value is refused. The full output is still stored; read one node later with get_node_output." },
+                    "output_nodes": { "type": "array", "items": { "type": "string" }, "description": "Node ids whose output is returned whole. Every other node follows output_mode, which defaults to 'none' when this is given — so output_nodes: [\"summary\"] returns that one node and the size of the rest. A name that is not a node of the workflow is refused before the run starts." }
                 },
                 "required": ["workflow_id"]
             }
@@ -497,7 +498,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "actor_id": { "type": "string", "description": "Optional UUID of an actor to run the test as. Overrides the workflow's bound actor_id for both engine identity (memory writes / tier ceiling) and __actor_context__ injection. Validated for ownership + non-terminal status; budget and capability-ceiling checks are skipped (test path)." },
                     "inject_memory_context": { "type": "boolean", "description": "When actor_id is set, controls whether the actor's recent working/episodic memories are injected into the input as __actor_context__ (default: false). Pass true only when the memories are known to be non-sensitive — they appear inline in the execution trace once injected." },
                     "max_context_memories": { "type": "integer", "description": "Maximum number of working/episodic memories to inject when inject_memory_context=true (default: 10, max: 50)." },
-                    "output_mode": { "type": "string", "enum": ["full", "terminal_only", "summary"], "description": "Shape the returned per-node output (default 'full'). 'terminal_only' keeps only terminal (leaf) node outputs and elides intermediates; 'summary' elides any single node output over 4KB. Assertions still run against the FULL output — this only shapes what's returned." }
+                    "output_mode": { "type": "string", "enum": ["full", "terminal_only", "summary", "none"], "description": "Shape the returned per-node output (default 'full'; 'none' when output_nodes is given). 'terminal_only' keeps only terminal (leaf) node outputs and elides intermediates; 'summary' elides any single node output over 4KB; 'none' elides every node. An unknown value is refused. Assertions still run against the FULL output — this only shapes what's returned." },
+                    "output_nodes": { "type": "array", "items": { "type": "string" }, "description": "Node ids whose output is returned whole; every other node follows output_mode (default 'none' when this is given). A name that is not a node of the workflow is refused before the run starts." }
                 },
                 "required": ["workflow_id"]
             }
@@ -783,7 +785,11 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 Accepts catalog module names (not UUIDs), inline rust_code nodes, and edges in one round-trip — \
                 eliminating the 10+ call pattern of create_workflow + N×add_node_to_workflow + M×add_edge_to_workflow. \
                 Each node specifies either module_name (catalog lookup by name), module_id (UUID), \
-                or rust_code (compiled inline, ~30-60s per node). \
+                rust_code (compiled inline, ~30-60s per node), or node_type for a built-in structural \
+                node (collect, sub_workflow, loop, capability_dispatch) that runs no module. \
+                A module node may also carry retry_count / retry_backoff_ms / retry_condition / \
+                retry_delay_expression, timeout_secs, skip_condition and continue_on_error, so a \
+                fan-out with per-node retries, a collect and a sub-workflow is one call. \
                 Inline nodes compile through the same gates as add_node_to_workflow, and the node id \
                 becomes the MODULE name: a spec creates modules and never overwrites one, so an id \
                 already naming one of your modules is refused (reference it with module_id instead, or \
@@ -799,7 +805,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "description": { "type": "string", "description": "Human-readable description (also used for semantic search)" },
                     "nodes": {
                         "type": "array",
-                        "description": "Array of node specs. Each node must have an id plus ONE of: module_name (catalog lookup), module_id (UUID), or rust_code (inline compilation).",
+                        "description": "Array of node specs. Each node must have an id plus ONE of: module_name (catalog lookup), module_id (UUID), rust_code (inline compilation), or node_type (a structural node).",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -815,7 +821,22 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                                 "allowed_secrets": { "type": "array", "items": { "type": "string" }, "description": "Vault paths this inline node may access (e.g. [\"api/my-service\", \"*\"])" },
                                 "allowed_hosts": { "type": "array", "items": { "type": "string" }, "description": "Hosts this inline node's module may call over HTTP (e.g. [\"api.example.com\"]). Default: none. \"*\" is refused — a spec grants egress by host name; widen deliberately with update_module_hosts." },
                                 "allowed_methods": { "type": "array", "items": { "type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] }, "description": "HTTP verbs this inline node's module may use. Default: none (an empty list denies every verb)." },
-                                "config": { "type": "object", "description": "Node configuration key-value pairs, same as update_node_config" }
+                                "config": { "type": "object", "description": "Node configuration key-value pairs, same as update_node_config" },
+                                "node_type": {
+                                    "type": "string",
+                                    "enum": ["collect", "loop", "sub_workflow", "capability_dispatch"],
+                                    "description": "A built-in structural node, INSTEAD of a module (giving both is refused). Its parameters go at the top level of the node or inside config, exactly as in create_workflow.\n\ncollect — fan-in: merges the outputs of its incoming edges into {\"items\": [...], \"count\": N}. The order of items is not the order of the edges; pass label_items: true to also get `sources`, the node id each item came from.\n\nsub_workflow — runs another workflow as a step: sub_workflow_id (UUID of a workflow you own, required), timeout_secs (default 60; advisory unless enforce_timeout: true).\n\nloop — body_node_id (a node in this spec, required), condition, max_iterations.\n\ncapability_dispatch — required_capabilities (non-empty array), timeout_secs."
+                                },
+                                "sub_workflow_id": { "type": "string", "description": "sub_workflow nodes: UUID of the workflow to run." },
+                                "enforce_timeout": { "type": "boolean", "description": "sub_workflow nodes: enforce timeout_secs as a hard deadline. Omitted, the number is advisory and the child is bounded by the run's remaining budget." },
+                                "label_items": { "type": "boolean", "description": "collect nodes: also emit `sources`, the node id of the branch each item came from (sources[i] names items[i]). Default false." },
+                                "retry_count": { "type": "integer", "minimum": 0, "description": "Module nodes. Max retries on failure. Omit to take the module's method-aware default (read-only modules retry transient failures; modules that can change state do not). An explicit value always wins, including 0." },
+                                "retry_backoff_ms": { "type": "integer", "minimum": 0, "description": "Module nodes. Base backoff in ms, doubled each retry (default 500)." },
+                                "retry_condition": { "type": "string", "description": "Module nodes. Rhai expression over the module's error output; false means do not retry. Same rules as create_workflow." },
+                                "retry_delay_expression": { "type": "string", "description": "Module nodes. Rhai expression returning the delay in ms before the next retry." },
+                                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Module nodes: per-node execution timeout in whole seconds (default 60). On a sub_workflow / capability_dispatch node this is the child's timeout." },
+                                "skip_condition": { "type": "string", "description": "Module nodes only. Rhai expression evaluated before the node runs; true skips it. Fields of the node's input bind as bare variables. An expression that cannot be evaluated does NOT skip. Max 2000 chars." },
+                                "continue_on_error": { "type": "boolean", "description": "If true, this node's failure does not fail the workflow: downstream nodes run and receive its error output (a collect node receives it as one of its items). Accepted on module nodes and on structural nodes such as sub_workflow. Default false." }
                             },
                             "required": ["id"]
                         }
@@ -1397,99 +1418,29 @@ async fn validate_structural_nodes(
         .filter_map(|n| n.get("id").and_then(|v| v.as_str()))
         .collect();
     for node in structural_nodes {
-        let node_type = node.get("node_type").and_then(|v| v.as_str()).unwrap_or("");
-        let node_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-        // Helper: read a structural param from top-level node OR from
-        // node.config — both placements are accepted so callers can use
-        // whichever feels natural.
-        let cfg = node.get("config");
-        let get_str = |key: &str| -> &str {
-            node.get(key)
-                .or_else(|| cfg.and_then(|c| c.get(key)))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-        };
-        let get_arr_len = |key: &str| -> usize {
-            node.get(key)
-                .or_else(|| cfg.and_then(|c| c.get(key)))
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0)
-        };
-        match node_type {
-            "loop" => {
-                let body = get_str("body_node_id");
-                if body.is_empty() || !all_node_ids.contains(body) {
-                    return Err(mcp_error(req_id.clone(), -32602, &format!(
-                        "Structural node '{}' (loop): body_node_id '{}' must reference a node ID \
-                         defined in this call. Pass body_node_id at the top level of the node object \
-                         or inside config: {{\"body_node_id\": \"<id>\", \"max_iterations\": 10, \
-                         \"condition\": \"keep_going == true\"}}.",
-                        node_id, body
-                    )));
-                }
+        // Shape rules have one home, shared with `create_workflow_from_spec`.
+        let sub_workflow =
+            talos_workflow_creation_helpers::structural_node_error(node, &all_node_ids)
+                .map_err(|msg| mcp_error(req_id.clone(), -32602, &msg))?;
+        // Verify the sub-workflow actually exists and belongs to this user.
+        // Without this check a non-existent UUID is persisted and only
+        // surfaces as "Sub-workflow not found" at execution time.
+        if let Some(sub_wf_uuid) = sub_workflow {
+            if !state
+                .workflow_repo
+                .workflow_exists(sub_wf_uuid, user_id)
+                .await
+            {
+                let node_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                return Err(mcp_error(
+                    req_id.clone(),
+                    -32602,
+                    &talos_workflow_creation_helpers::sub_workflow_not_accessible_message(
+                        node_id,
+                        sub_wf_uuid,
+                    ),
+                ));
             }
-            "sub_workflow" => {
-                let sub_wf_id_str = get_str("sub_workflow_id");
-                if sub_wf_id_str.is_empty() {
-                    return Err(mcp_error(
-                        req_id.clone(),
-                        -32602,
-                        &format!(
-                            "Structural node '{}' (sub_workflow): sub_workflow_id is required. \
-                             Pass it at the top level or in config: \
-                             {{\"sub_workflow_id\": \"<uuid>\", \"timeout_secs\": 60}}.",
-                            node_id
-                        ),
-                    ));
-                }
-                // Validate UUID format and existence at create time so
-                // misconfiguration surfaces immediately instead of at
-                // execution (which failed silently with "graph load failed"
-                // in MCP testing prior to this check).
-                let sub_wf_uuid = match sub_wf_id_str.parse::<uuid::Uuid>() {
-                    Ok(u) => u,
-                    Err(_) => {
-                        return Err(mcp_error(
-                            req_id.clone(),
-                            -32602,
-                            &format!(
-                                "Structural node '{}' (sub_workflow): sub_workflow_id '{}' \
-                                 is not a valid UUID.",
-                                node_id, sub_wf_id_str
-                            ),
-                        ));
-                    }
-                };
-                // Allow self-reference at create time (some callers wire
-                // recursion pointing at themselves) — existence check would
-                // be a chicken-and-egg here since the current workflow
-                // doesn't exist yet.
-                if !state
-                    .workflow_repo
-                    .workflow_exists(sub_wf_uuid, user_id)
-                    .await
-                {
-                    return Err(mcp_error(
-                        req_id.clone(),
-                        -32602,
-                        &format!(
-                            "Structural node '{}' (sub_workflow): workflow {} does not exist \
-                             or is not owned by you. Create it first and pass its UUID.",
-                            node_id, sub_wf_uuid
-                        ),
-                    ));
-                }
-            }
-            "capability_dispatch" if get_arr_len("required_capabilities") == 0 => {
-                return Err(mcp_error(req_id.clone(), -32602, &format!(
-                        "Structural node '{}' (capability_dispatch): required_capabilities must be non-empty. \
-                         Pass it at the top level or in config: \
-                         {{\"required_capabilities\": [\"pdf_processing\"], \"timeout_secs\": 60}}.",
-                        node_id
-                    )));
-            }
-            _ => {}
         }
     }
     Ok(())
@@ -5663,15 +5614,14 @@ async fn handle_call_workflow(
     // Output shaping (IMP-5): resolved up front so it survives graph_json
     // moving into the run task. Applied to the RETURNED copy only — the full
     // output is still projected + persisted below.
-    let output_mode = args
-        .get("output_mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("full")
-        .to_string();
-    let terminal_nodes = serde_json::from_str::<serde_json::Value>(&graph_json)
-        .ok()
-        .map(|g| crate::utils::terminal_node_ids(&g))
-        .unwrap_or_default();
+    let parsed_graph =
+        serde_json::from_str::<serde_json::Value>(&graph_json).unwrap_or(serde_json::Value::Null);
+    // Refused here, before an execution exists, when it cannot be read.
+    let output_shape = match crate::utils::OutputShape::from_args(args, &parsed_graph) {
+        Ok(shape) => shape,
+        Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
+    };
+    let terminal_nodes = crate::utils::terminal_node_ids(&parsed_graph);
     let exec_id = uuid::Uuid::new_v4();
     // M T5-1: enforce max_concurrent_executions on call_workflow.
     // Pre-fix this used `create_execution` (the bypass path), so an
@@ -5941,8 +5891,7 @@ async fn handle_call_workflow(
         // Within-deadline success — EXACT pre-fix response shape (output_mode
         // 'full' is byte-identical; the shaping only elides on opt-in).
         Ok(Ok(Ok((status, output_json, status_persisted)))) => {
-            let shaped =
-                crate::utils::shape_response_output(&output_json, &terminal_nodes, &output_mode);
+            let shaped = output_shape.apply(&output_json, &terminal_nodes);
             Some(mcp_text(
                 req_id.clone(),
                 &serde_json::to_string_pretty(&call_workflow_terminal_body(
@@ -8313,15 +8262,14 @@ async fn handle_test_workflow(
 
     // Output shaping (IMP-5): assertions always run against the FULL output;
     // this only shapes the `output` field returned in the response.
-    let output_mode = args
-        .get("output_mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("full")
-        .to_string();
-    let terminal_nodes = serde_json::from_str::<serde_json::Value>(&graph_json)
-        .ok()
-        .map(|g| crate::utils::terminal_node_ids(&g))
-        .unwrap_or_default();
+    let parsed_graph =
+        serde_json::from_str::<serde_json::Value>(&graph_json).unwrap_or(serde_json::Value::Null);
+    // Refused here, before an execution exists, when it cannot be read.
+    let output_shape = match crate::utils::OutputShape::from_args(args, &parsed_graph) {
+        Ok(shape) => shape,
+        Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
+    };
+    let terminal_nodes = crate::utils::terminal_node_ids(&parsed_graph);
 
     // Create execution record with test flag
     let exec_id = uuid::Uuid::new_v4();
@@ -8641,8 +8589,7 @@ async fn handle_test_workflow(
 
     // Shape only the RETURNED output (assertions above already ran against the
     // full `output_json`). 'full' is byte-identical.
-    let shaped_output =
-        crate::utils::shape_response_output(&output_json, &terminal_nodes, &output_mode);
+    let shaped_output = output_shape.apply(&output_json, &terminal_nodes);
     let mut test_result = serde_json::json!({
         "passed": all_passed,
         "execution_id": exec_id.to_string(),
@@ -12331,6 +12278,24 @@ async fn handle_create_workflow_from_spec(
         }
     };
 
+    // A skip condition is a fail-open gate: checked as an expression here,
+    // wherever the node wrote it, as `create_workflow` does. (Its shape — and
+    // that of every other node control — is the service's to refuse.)
+    for node in &spec_nodes {
+        let named = node.get("skip_condition").and_then(|v| v.as_str());
+        let in_config = node
+            .get("config")
+            .and_then(|c| c.get("skip_condition"))
+            .and_then(|v| v.as_str());
+        let Some(expr) = named.or(in_config) else {
+            continue;
+        };
+        if let Err(msg) = crate::graph::validate_skip_condition(expr) {
+            let label = talos_workflow_creation::spec_node_id(node);
+            return mcp_error(req_id, -32602, &format!("node '{label}': {msg}"));
+        }
+    }
+
     // Role gate, per compiled world — the same gate every other compile path
     // runs (`require_agent_role_permits_world`). Before 2026-09-25 this path
     // compiled at whatever world the spec named, for any agent role. Runs over
@@ -12485,6 +12450,19 @@ async fn handle_create_workflow_from_spec(
             node_id: _,
             module_id,
         } => crate::utils::module_not_accessible_error(req_id, module_id),
+        CreateFromSpecOutcome::InvalidSpec { reason } => mcp_error(req_id, -32602, &reason),
+        // The same sentence `create_workflow` answers with.
+        CreateFromSpecOutcome::SubWorkflowNotAccessible {
+            node_id,
+            sub_workflow_id,
+        } => mcp_error(
+            req_id,
+            -32602,
+            &talos_workflow_creation_helpers::sub_workflow_not_accessible_message(
+                &node_id,
+                sub_workflow_id,
+            ),
+        ),
     }
 }
 

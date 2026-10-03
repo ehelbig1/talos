@@ -13,6 +13,166 @@ use uuid::Uuid;
 
 const STRUCTURAL_NODE_TYPES: &[&str] = &["collect", "loop", "sub_workflow", "capability_dispatch"];
 
+/// Is `node_type` one of the built-in structural kinds a creation tool
+/// builds (`collect` / `loop` / `sub_workflow` / `capability_dispatch`)?
+#[must_use]
+pub fn is_structural_node_type(node_type: &str) -> bool {
+    STRUCTURAL_NODE_TYPES.contains(&node_type)
+}
+
+/// The structural kinds, for a refusal that has to name them.
+#[must_use]
+pub fn structural_node_types() -> &'static [&'static str] {
+    STRUCTURAL_NODE_TYPES
+}
+
+/// Everything about ONE structural node that can be checked with no I/O.
+/// Shared by `create_workflow` and `create_workflow_from_spec`, so the two
+/// builders cannot accept different structural nodes.
+///
+/// `Ok(Some(id))` for a `sub_workflow` node: the workflow the caller must
+/// still confirm exists and is visible to the user (see
+/// [`sub_workflow_not_accessible_message`]). `Ok(None)` otherwise.
+pub fn structural_node_error(
+    node: &Value,
+    all_node_ids: &HashSet<&str>,
+) -> Result<Option<Uuid>, String> {
+    let node_type = node.get("node_type").and_then(|v| v.as_str()).unwrap_or("");
+    let node_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+    // Accept params at top level OR inside a `config` object.
+    let cfg = node.get("config");
+    let field = |key: &str| node.get(key).or_else(|| cfg.and_then(|c| c.get(key)));
+    let get_str = |key: &str| field(key).and_then(|v| v.as_str()).unwrap_or("");
+    match node_type {
+        "loop" => {
+            let body = get_str("body_node_id");
+            if body.is_empty() || !all_node_ids.contains(body) {
+                return Err(format!(
+                    "Structural node '{}' (loop): body_node_id '{}' must reference a node ID \
+                     defined in this call. Pass body_node_id at the top level of the node object \
+                     or inside config: {{\"body_node_id\": \"<id>\", \"max_iterations\": 10, \
+                     \"condition\": \"keep_going == true\"}}.",
+                    node_id, body
+                ));
+            }
+            Ok(None)
+        }
+        "sub_workflow" => {
+            let sub_wf_id_str = get_str("sub_workflow_id");
+            if sub_wf_id_str.is_empty() {
+                return Err(format!(
+                    "Structural node '{}' (sub_workflow): sub_workflow_id is required. \
+                     Pass it at the top level or in config: \
+                     {{\"sub_workflow_id\": \"<uuid>\", \"timeout_secs\": 60}}.",
+                    node_id
+                ));
+            }
+            // Validate UUID format early so the error names the bad value
+            // rather than reaching the engine as an unparseable string.
+            let sub_wf_uuid = sub_wf_id_str.parse::<Uuid>().map_err(|_| {
+                format!(
+                    "Structural node '{}' (sub_workflow): sub_workflow_id '{}' \
+                     is not a valid UUID.",
+                    node_id, sub_wf_id_str
+                )
+            })?;
+            if let Some(flag) = field("enforce_timeout").filter(|v| !v.is_null()) {
+                if !flag.is_boolean() {
+                    return Err(format!(
+                        "Structural node '{node_id}' (sub_workflow): enforce_timeout must be true or false, got {flag}"
+                    ));
+                }
+            }
+            Ok(Some(sub_wf_uuid))
+        }
+        "collect" => {
+            if let Some(flag) = field("label_items").filter(|v| !v.is_null()) {
+                if !flag.is_boolean() {
+                    return Err(format!(
+                        "Structural node '{node_id}' (collect): label_items must be true or false, got {flag}"
+                    ));
+                }
+            }
+            Ok(None)
+        }
+        "capability_dispatch"
+            if field("required_capabilities")
+                .and_then(|v| v.as_array())
+                .is_none_or(Vec::is_empty) =>
+        {
+            Err(format!(
+                "Structural node '{}' (capability_dispatch): required_capabilities must be non-empty. \
+                 Pass it at the top level or in config: \
+                 {{\"required_capabilities\": [\"pdf_processing\"], \"timeout_secs\": 60}}.",
+                node_id
+            ))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The one sentence for a `sub_workflow` node whose target is absent or not
+/// the caller's. Absent and foreign are one answer.
+#[must_use]
+pub fn sub_workflow_not_accessible_message(node_id: &str, sub_workflow_id: Uuid) -> String {
+    format!(
+        "Structural node '{node_id}' (sub_workflow): workflow {sub_workflow_id} does not exist \
+         or is not owned by you. Create it first and pass its UUID."
+    )
+}
+
+/// The retry fields a node may carry beside its controls.
+pub const NODE_RETRY_KEYS: [&str; 4] = [
+    "retry_count",
+    "retry_backoff_ms",
+    "retry_condition",
+    "retry_delay_expression",
+];
+
+/// Why a node's retry fields cannot be accepted as written, or `None`.
+/// The engine reads the two numbers with `as_u64()` and the two expressions
+/// with `as_str()`, so any other type is read as "not set": `"retry_count":
+/// "2"` would create a node that never retries, with no word that the value
+/// was dropped. Caps are the graph validator's job, not this one's.
+#[must_use]
+pub fn retry_fields_shape_error(input_node: &Value) -> Option<String> {
+    let label = input_node
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unnamed node>");
+    let present = |key: &str| input_node.get(key).filter(|v| !v.is_null());
+    for key in ["retry_count", "retry_backoff_ms"] {
+        if let Some(v) = present(key) {
+            if v.as_u64().is_none() {
+                return Some(format!(
+                    "node '{label}': {key} must be a whole number, 0 or more, got {v}"
+                ));
+            }
+        }
+    }
+    for key in ["retry_condition", "retry_delay_expression"] {
+        if let Some(v) = present(key) {
+            if !v.is_string() {
+                return Some(format!(
+                    "node '{label}': {key} must be a string (a Rhai expression), got {v}"
+                ));
+            }
+        }
+    }
+    let structural = input_node
+        .get("node_type")
+        .and_then(|v| v.as_str())
+        .is_some_and(is_structural_node_type);
+    if structural {
+        if let Some(key) = NODE_RETRY_KEYS.iter().find(|k| present(k).is_some()) {
+            return Some(format!(
+                "node '{label}': {key} applies to module nodes; a structural node does not retry"
+            ));
+        }
+    }
+    None
+}
+
 /// Partition `nodes` into (structural, regular). A node is structural if
 /// its `node_type` matches one of the built-in primitives (collect / loop /
 /// sub_workflow / capability_dispatch); otherwise it's a regular module
@@ -350,6 +510,19 @@ pub fn validate_edge_condition_lengths(edges: &[Value]) -> Result<(), String> {
 /// node OR nested under `node.config` — the closure-based getter
 /// preserves the original handler's tolerant parsing.
 pub fn build_structural_node_data(kind: &str, node: &Value) -> Value {
+    let mut data = structural_kind_data(kind, node);
+    // `continue_on_error: true` on the node: written into `data`, where
+    // `set_continue_on_error` writes it and the engine's graph loader reads
+    // it. A sub-workflow or dispatch node that may fail without failing the
+    // run no longer needs a second call. `false` writes nothing.
+    if node.get("continue_on_error").and_then(Value::as_bool) == Some(true) {
+        data["continue_on_error"] = Value::Bool(true);
+    }
+    data
+}
+
+/// The kind-specific parameters of a structural node.
+fn structural_kind_data(kind: &str, node: &Value) -> Value {
     let ncfg = node.get("config");
     let get_s = |k: &str| {
         node.get(k)
@@ -367,10 +540,22 @@ pub fn build_structural_node_data(kind: &str, node: &Value) -> Value {
             "condition": get_s("condition").unwrap_or("true"),
             "max_iterations": get_u("max_iterations").unwrap_or(10),
         }),
-        "sub_workflow" => serde_json::json!({
-            "sub_workflow_id": get_s("sub_workflow_id").unwrap_or(""),
-            "timeout_secs": get_u("timeout_secs").unwrap_or(60),
-        }),
+        "sub_workflow" => {
+            let mut data = serde_json::json!({
+                "sub_workflow_id": get_s("sub_workflow_id").unwrap_or(""),
+                "timeout_secs": get_u("timeout_secs").unwrap_or(60),
+            });
+            // The opt-in `add_sub_workflow_node` takes: without it the
+            // timeout is advisory. Written only when the author stated it.
+            if let Some(flag) = node
+                .get("enforce_timeout")
+                .or_else(|| ncfg.and_then(|c| c.get("enforce_timeout")))
+                .and_then(Value::as_bool)
+            {
+                data["enforce_timeout"] = Value::Bool(flag);
+            }
+            data
+        }
         "capability_dispatch" => {
             let caps = node
                 .get("required_capabilities")
@@ -381,6 +566,18 @@ pub fn build_structural_node_data(kind: &str, node: &Value) -> Value {
                 "required_capabilities": caps,
                 "timeout_secs": get_u("timeout_secs").unwrap_or(60),
             })
+        }
+        // `label_items: true` asks the engine to name each item's branch
+        // (`sources`). Written only when true, so an unlabelled collect keeps
+        // the empty `data` it has always had.
+        "collect"
+            if node
+                .get("label_items")
+                .or_else(|| ncfg.and_then(|c| c.get("label_items")))
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            serde_json::json!({ "label_items": true })
         }
         // collect (and any future variant we forgot to handle) → empty object.
         _ => serde_json::json!({}),
@@ -445,9 +642,10 @@ pub const NODE_CONTROL_KEYS: [&str; 3] = ["skip_condition", "continue_on_error",
 ///
 /// Refused rather than ignored:
 /// * a wrong type (a string `"true"`, a fractional or non-positive timeout);
-/// * `skip_condition` / `continue_on_error` on a structural node, where this
-///   builder does not write them (their own tools do), so accepting the key
-///   would drop it silently — `timeout_secs` is exempt there because it is a
+/// * `skip_condition` on a structural node, where this builder does not
+///   write it (`add_skip_condition` does), so accepting the key would drop it
+///   silently. `continue_on_error` IS written on a structural node since
+///   2026-10-03 (see [`build_structural_node_data`]), and `timeout_secs` is a
 ///   structural parameter of `sub_workflow` / `capability_dispatch`;
 /// * the same control given both on the node and inside `config` with
 ///   different values: the engine reads `config` first, so the node-level
@@ -478,18 +676,11 @@ pub fn node_controls_shape_error(input_node: &Value) -> Option<String> {
         }
     }
     if structural {
-        for key in ["skip_condition", "continue_on_error"] {
-            if present(key).is_some() {
-                return Some(format!(
-                    "node '{label}': {key} is not set on a structural node by create_workflow — \
-                     create the workflow, then use {} for this node",
-                    if key == "skip_condition" {
-                        "add_skip_condition"
-                    } else {
-                        "set_continue_on_error"
-                    }
-                ));
-            }
+        if present("skip_condition").is_some() {
+            return Some(format!(
+                "node '{label}': skip_condition is not set on a structural node at creation — \
+                 create the workflow, then use add_skip_condition for this node"
+            ));
         }
         return None;
     }
@@ -2073,6 +2264,157 @@ mod tests {
         let n = json!({"id": "c1", "node_type": "collect"});
         let data = build_structural_node_data("collect", &n);
         assert_eq!(data, json!({}));
+        // `false` is the default and writes nothing either.
+        let n = json!({"id": "c1", "node_type": "collect", "label_items": false});
+        assert_eq!(build_structural_node_data("collect", &n), json!({}));
+    }
+
+    #[test]
+    fn structural_collect_carries_the_label_opt_in_from_either_layer() {
+        for n in [
+            json!({"id": "c1", "node_type": "collect", "label_items": true}),
+            json!({"id": "c1", "node_type": "collect", "config": {"label_items": true}}),
+        ] {
+            assert_eq!(
+                build_structural_node_data("collect", &n),
+                json!({"label_items": true}),
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_structural_node_carries_continue_on_error_where_the_engine_reads_it() {
+        let wf = "550e8400-e29b-41d4-a716-446655440000";
+        let n = json!({"id": "s", "node_type": "sub_workflow", "sub_workflow_id": wf,
+                       "continue_on_error": true, "enforce_timeout": true, "timeout_secs": 120});
+        let data = build_structural_node_data("sub_workflow", &n);
+        assert_eq!(
+            data,
+            json!({"sub_workflow_id": wf, "timeout_secs": 120,
+                   "enforce_timeout": true, "continue_on_error": true})
+        );
+        // Not stated, not written: the timeout stays advisory and a failure
+        // still fails the run.
+        let n = json!({"id": "s", "node_type": "sub_workflow", "sub_workflow_id": wf,
+                       "continue_on_error": false});
+        assert_eq!(
+            build_structural_node_data("sub_workflow", &n),
+            json!({"sub_workflow_id": wf, "timeout_secs": 60})
+        );
+    }
+
+    #[test]
+    fn structural_node_rules_are_checked_with_no_io() {
+        let ids: HashSet<&str> = ["a", "b"].into_iter().collect();
+        let wf = "550e8400-e29b-41d4-a716-446655440000";
+        // A sub_workflow hands back the workflow the caller must still verify.
+        let ok = json!({"id": "s", "node_type": "sub_workflow", "config": {"sub_workflow_id": wf}});
+        assert_eq!(
+            structural_node_error(&ok, &ids),
+            Ok(Some(wf.parse().unwrap()))
+        );
+        assert_eq!(
+            structural_node_error(&json!({"id": "c", "node_type": "collect"}), &ids),
+            Ok(None)
+        );
+        assert_eq!(
+            structural_node_error(
+                &json!({"id": "l", "node_type": "loop", "body_node_id": "a"}),
+                &ids
+            ),
+            Ok(None)
+        );
+        let refused = [
+            (
+                json!({"id": "s", "node_type": "sub_workflow"}),
+                "sub_workflow_id is required",
+            ),
+            (
+                json!({"id": "s", "node_type": "sub_workflow", "sub_workflow_id": "nope"}),
+                "is not a valid UUID",
+            ),
+            (
+                json!({"id": "s", "node_type": "sub_workflow", "sub_workflow_id": wf, "enforce_timeout": "yes"}),
+                "enforce_timeout must be true or false",
+            ),
+            (
+                json!({"id": "l", "node_type": "loop", "body_node_id": "missing"}),
+                "must reference a node ID",
+            ),
+            (
+                json!({"id": "c", "node_type": "collect", "label_items": 1}),
+                "label_items must be true or false",
+            ),
+            (
+                json!({"id": "d", "node_type": "capability_dispatch"}),
+                "required_capabilities must be non-empty",
+            ),
+            (
+                json!({"id": "d", "node_type": "capability_dispatch", "required_capabilities": []}),
+                "required_capabilities must be non-empty",
+            ),
+        ];
+        for (node, want) in refused {
+            let err = structural_node_error(&node, &ids).expect_err(&node.to_string());
+            assert!(err.contains(want), "{node}: {err}");
+        }
+    }
+
+    #[test]
+    fn retry_fields_of_the_wrong_type_are_refused_not_read_as_unset() {
+        let module = |extra: Value| {
+            let mut n = json!({"id": "n1", "module_id": "00000000-0000-0000-0000-000000000001"});
+            for (k, v) in extra.as_object().unwrap() {
+                n[k] = v.clone();
+            }
+            n
+        };
+        for ok in [
+            json!({}),
+            json!({"retry_count": 0, "retry_backoff_ms": 250}),
+            json!({"retry_count": null, "retry_condition": "status != 429"}),
+        ] {
+            assert_eq!(retry_fields_shape_error(&module(ok.clone())), None, "{ok}");
+        }
+        for (extra, want) in [
+            (
+                json!({"retry_count": "2"}),
+                "retry_count must be a whole number",
+            ),
+            (
+                json!({"retry_count": -1}),
+                "retry_count must be a whole number",
+            ),
+            (
+                json!({"retry_count": 1.5}),
+                "retry_count must be a whole number",
+            ),
+            (
+                json!({"retry_backoff_ms": "500"}),
+                "retry_backoff_ms must be a whole number",
+            ),
+            (
+                json!({"retry_condition": true}),
+                "retry_condition must be a string",
+            ),
+            (
+                json!({"retry_delay_expression": 1000}),
+                "retry_delay_expression must be a string",
+            ),
+        ] {
+            let err = retry_fields_shape_error(&module(extra.clone()))
+                .unwrap_or_else(|| panic!("{extra} accepted"));
+            assert!(
+                err.starts_with("node 'n1': ") && err.contains(want),
+                "{extra}: {err}"
+            );
+        }
+        // A structural node does not retry; the field would be dropped.
+        let collect = json!({"id": "c", "node_type": "collect", "retry_count": 2});
+        assert!(retry_fields_shape_error(&collect)
+            .unwrap()
+            .contains("applies to module nodes"));
     }
 
     // ── apply_retry_policy ───────────────────────────────────────────
@@ -2303,7 +2645,8 @@ mod tests {
         assert!(node_controls_shape_error(&twice)
             .unwrap()
             .contains("set it once"));
-        // On a structural node the builder writes neither; say where to set them.
+        // On a structural node the builder writes continue_on_error (into
+        // `data`) and not skip_condition; say where to set the latter.
         let collect = |extra: Value| {
             let mut n = json!({"id": "c", "node_type": "collect"});
             for (k, v) in extra.as_object().unwrap() {
@@ -2311,10 +2654,15 @@ mod tests {
             }
             n
         };
+        assert_eq!(
+            node_controls_shape_error(&collect(json!({"continue_on_error": true}))),
+            None,
+            "written by build_structural_node_data"
+        );
         assert!(
-            node_controls_shape_error(&collect(json!({"continue_on_error": true})))
+            node_controls_shape_error(&collect(json!({"continue_on_error": "yes"})))
                 .unwrap()
-                .contains("set_continue_on_error")
+                .contains("must be true or false")
         );
         assert!(
             node_controls_shape_error(&collect(json!({"skip_condition": "x"})))

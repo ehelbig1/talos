@@ -85,8 +85,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_module_info",
-            "description": "Get detailed information about a compiled module: name, capability world, size, allowed hosts, \
-                allowed secrets, whether source code is available, and its CONFIG SCHEMA — the keys the module accepts, \
+            "description": "Get detailed information about a compiled module: name, capability world, size, its three grants \
+                (allowed hosts, allowed HTTP verbs — an empty list denies every verb — and allowed secrets), its fuel \
+                limit, the crates it was compiled with, whether source code is available, and its CONFIG SCHEMA — the keys the module accepts, \
                 their types, and which are required. Never returns actual wasm bytes or source code. \
                 Read `config_schema_status` before `config_schema`: 'declared' means `config_keys` / `required_config_keys` \
                 are authoritative; 'declared_empty' means the module genuinely takes no config; 'not_declared' means NO \
@@ -1032,7 +1033,14 @@ async fn handle_get_module_info(
             "size_bytes": info.size_bytes,
             "bytes_status": bytes_status,
             "allowed_hosts": info.allowed_hosts,
+            // The third grant. An empty list denies every verb, so a module
+            // with hosts and no verbs makes no HTTP call; until 2026-10-03
+            // this tool did not show it.
+            "allowed_methods": info.allowed_methods,
             "allowed_secrets": info.allowed_secrets,
+            "max_fuel": info.max_fuel,
+            "dependencies": info.dependencies,
+            "language": info.language,
             "host_managed_access": host_managed,
             "mutation_profile": mutation_profile_for_world(Some(info.capability_world.as_str())),
             "has_source_code": info.has_source_code,

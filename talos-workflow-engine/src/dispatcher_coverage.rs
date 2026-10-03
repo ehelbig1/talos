@@ -75,7 +75,7 @@ pub fn dispatcher_branch_for(kind: &SystemNodeKind) -> &'static str {
         SystemNodeKind::FanIn { .. } => "try_dispatch_fan_in",
         SystemNodeKind::SubWorkflow { .. } => "try_dispatch_sub_workflow",
         SystemNodeKind::Loop { .. } => "try_dispatch_loop",
-        SystemNodeKind::Collect => "try_dispatch_collect",
+        SystemNodeKind::Collect { .. } => "try_dispatch_collect",
         SystemNodeKind::OpsAlertsDigest { .. } => "try_dispatch_ops_alerts_digest",
         SystemNodeKind::PendingApprovals { .. } => "try_dispatch_pending_approvals",
         SystemNodeKind::AssistantReport { .. } => "try_dispatch_assistant_report",
@@ -176,7 +176,7 @@ pub fn error_routing_for(kind: &SystemNodeKind) -> SystemNodeErrorRouting {
         SystemNodeKind::WhileLoop { .. } => NeverSignalsError,
         SystemNodeKind::RepeatLoop { .. } => NeverSignalsError,
         SystemNodeKind::FanIn { .. } => NeverSignalsError,
-        SystemNodeKind::Collect => NeverSignalsError,
+        SystemNodeKind::Collect { .. } => NeverSignalsError,
         // ── Pass-through data ────────────────────────────────────
         // Carrying the upstream error IS the job.
         SystemNodeKind::ErrorHandler { .. } => OutputIsData,
@@ -249,7 +249,7 @@ mod tests {
                 max_iterations: 1,
                 condition: "true".into(),
             },
-            SystemNodeKind::Collect,
+            SystemNodeKind::Collect { label_items: false },
             SystemNodeKind::OpsAlertsDigest { top_limit: 10 },
             SystemNodeKind::PendingApprovals { limit: 10 },
             SystemNodeKind::AssistantReport { days: 7 },
