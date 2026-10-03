@@ -173,6 +173,8 @@ pub mod ops_alerts;
 pub mod platform;
 #[cfg(test)]
 mod push_channel_wiring_tests;
+#[cfg(test)]
+mod registry_catalog_tests;
 pub mod resources;
 #[cfg(test)]
 mod restore_pinned_pin;

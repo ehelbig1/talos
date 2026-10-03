@@ -4021,7 +4021,28 @@ async fn handle_list_module_catalog(
     // (~180 syscalls per dashboard load); post-cache only the FIRST
     // call pays the I/O cost.
     let catalog_dir_owned = catalog_dir.to_path_buf();
-    let entries: Vec<serde_json::Value> = if catalog_dir.is_dir() {
+    let entries: Vec<serde_json::Value> = if talos_config::registry_url().is_some() {
+        // Registry mode: the catalog IS the shared rows the registry sync
+        // wrote. The templates baked into the image are not what this
+        // deployment offers — the disk seed is skipped, so listing them would
+        // name modules `install_module_from_catalog` then builds from an
+        // image that may be behind the registry. Not cached: a sync changes
+        // it, and it is one bounded read. A failed read is refused for the
+        // reason the disk walk's is, below.
+        match state.module_repo.list_shared_registry_entries().await {
+            Ok(rows) => registry_catalog_items(&rows),
+            Err(e) => {
+                tracing::error!(error = %e, "list_module_catalog: registry catalog read failed");
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Could not read the module catalog (database error), so this listing \
+                     would be empty BECAUSE NOBODY COULD LOOK — that is not a statement that \
+                     the registry offers no modules. Retry, and check controller logs.",
+                );
+            }
+        }
+    } else if catalog_dir.is_dir() {
         // 2026-09-08: a FAILED walk must not be MEMOIZED.
         //
         // `get_or_init` + `.unwrap_or_default()` cached the empty vec a
@@ -4475,6 +4496,62 @@ pub(crate) fn resolve_catalog_template_dir(
         .map(|e| e.path())
 }
 
+/// Where an install's catalog entry came from.
+enum InstallSource {
+    /// A shared catalog row that names a registry artifact.
+    Registry(talos_module_repository::SharedRegistryEntry),
+    /// A template baked into the controller image.
+    Disk {
+        template: talos_compilation::CatalogTemplate,
+        module_dir: std::path::PathBuf,
+    },
+}
+
+/// A registry catalog row in the shape a template's `talos.json` has, so the
+/// install's grant logic and the catalog listing read one shape whichever
+/// source the entry came from. `name` is the slug and `display_name` the
+/// row's name, as in a manifest.
+pub(crate) fn registry_entry_manifest(
+    entry: &talos_module_repository::SharedRegistryEntry,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": entry.catalog_slug.as_deref().unwrap_or(&entry.name),
+        "display_name": entry.name,
+        "description": entry.description.as_deref().unwrap_or(""),
+        "category": entry.category.as_deref().unwrap_or("catalog"),
+        "capability_world": entry.capability_world,
+        "allowed_hosts": entry.allowed_hosts,
+        "allowed_methods": entry.allowed_methods,
+        "allowed_secrets": entry.allowed_secrets,
+        // The listing reads the manifest's older key for the same list.
+        "requires_secrets": entry.allowed_secrets,
+        "requires_approval_for": entry.requires_approval_for,
+        "config_schema": entry.config_schema,
+        "source": "registry",
+    })
+}
+
+/// The catalog a registry-mode deployment offers: its shared registry rows
+/// in manifest shape, ordered by category then slug — the order the listing
+/// of the image's templates uses.
+pub(crate) fn registry_catalog_items(
+    entries: &[talos_module_repository::SharedRegistryEntry],
+) -> Vec<serde_json::Value> {
+    let mut items: Vec<serde_json::Value> = entries.iter().map(registry_entry_manifest).collect();
+    let key = |item: &serde_json::Value, field: &str, absent: &str| {
+        item.get(field)
+            .and_then(|v| v.as_str())
+            .unwrap_or(absent)
+            .to_string()
+    };
+    items.sort_by(|a, b| {
+        key(a, "category", "Uncategorized")
+            .cmp(&key(b, "category", "Uncategorized"))
+            .then(key(a, "name", "").cmp(&key(b, "name", "")))
+    });
+    items
+}
+
 async fn handle_install_module_from_catalog(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -4536,61 +4613,101 @@ async fn handle_install_module_from_catalog(
         );
     }
 
-    let catalog_dir = std::path::Path::new("/app/module-templates");
-
-    // Resolve module directory: exact slug match first, then fuzzy display_name match.
-    // This handles cases where the tool name ("http-request-with-retry") differs from
-    // the directory name ("http-retry") but matches the talos.json display_name.
-    let module_dir = match resolve_catalog_template_dir(catalog_dir, name) {
-        Some(dir) => dir,
-        None => {
+    // What the key names. A shared catalog row that names a registry
+    // artifact IS the catalog entry: the registry sync wrote it from the
+    // published manifest, and the copy made here references the same signed
+    // artifact — nothing is compiled. Only when no such row matches is the
+    // template baked into the image read, as before. A lookup that FAILS is
+    // refused: falling through to the image would install different code
+    // from the one the catalog offers.
+    let source = match state.module_repo.find_shared_registry_entry(name).await {
+        Ok(Some(entry)) => InstallSource::Registry(entry),
+        Err(e) => {
+            tracing::error!(error = %e, "install_module_from_catalog: registry catalog read failed");
             return mcp_error(
                 req_id,
                 -32000,
-                &format!(
-                    "Module '{}' not found in catalog: it matches no template's slug (e.g. 'http-request') \
-                     and no template's display name (e.g. 'HTTP Request'). Use list_module_catalog to see \
-                     available modules.",
-                    name
-                ),
-            )
+                "Could not read the module catalog (database error), so the install was \
+                 refused rather than guess which module the name refers to. Retry.",
+            );
+        }
+        Ok(None) => {
+            let catalog_dir = std::path::Path::new("/app/module-templates");
+
+            // Resolve module directory: exact slug match first, then fuzzy display_name match.
+            // This handles cases where the tool name ("http-request-with-retry") differs from
+            // the directory name ("http-retry") but matches the talos.json display_name.
+            let module_dir = match resolve_catalog_template_dir(catalog_dir, name) {
+                Some(dir) => dir,
+                None => {
+                    return mcp_error(
+                        req_id,
+                        -32000,
+                        &format!(
+                            "Module '{}' not found in catalog: it matches no template's slug (e.g. 'http-request') \
+                             and no template's display name (e.g. 'HTTP Request'). Use list_module_catalog to see \
+                             available modules.",
+                            name
+                        ),
+                    )
+                }
+            };
+
+            // Metadata AND source come from the ONE catalog reader
+            // (`talos_compilation::CatalogTemplate`) so this path and the disk
+            // seeder cannot disagree about which source they compile or which
+            // dependencies they declare. Error strings preserved verbatim.
+            let template = match talos_compilation::CatalogTemplate::load(&module_dir) {
+                Ok(t) => t,
+                Err(talos_compilation::CatalogTemplateError::ReadManifest(e)) => {
+                    return mcp_error(
+                        req_id,
+                        -32000,
+                        &format!("Failed to read talos.json for '{}': {}", name, e),
+                    )
+                }
+                Err(talos_compilation::CatalogTemplateError::ParseManifest(e)) => {
+                    return mcp_error(
+                        req_id,
+                        -32000,
+                        &format!("Failed to parse talos.json for '{}': {}", name, e),
+                    )
+                }
+                Err(talos_compilation::CatalogTemplateError::ReadSource(_)) => {
+                    return mcp_error(
+                        req_id,
+                        -32000,
+                        &format!(
+                            "Source file not found for module '{}' (expected template.rs in {}).",
+                            name,
+                            module_dir.display()
+                        ),
+                    )
+                }
+            };
+            InstallSource::Disk {
+                template,
+                module_dir,
+            }
         }
     };
-
-    // Metadata AND source come from the ONE catalog reader
-    // (`talos_compilation::CatalogTemplate`) so this path and the disk
-    // seeder cannot disagree about which source they compile or which
-    // dependencies they declare. Error strings preserved verbatim.
-    let template = match talos_compilation::CatalogTemplate::load(&module_dir) {
-        Ok(t) => t,
-        Err(talos_compilation::CatalogTemplateError::ReadManifest(e)) => {
-            return mcp_error(
-                req_id,
-                -32000,
-                &format!("Failed to read talos.json for '{}': {}", name, e),
-            )
-        }
-        Err(talos_compilation::CatalogTemplateError::ParseManifest(e)) => {
-            return mcp_error(
-                req_id,
-                -32000,
-                &format!("Failed to parse talos.json for '{}': {}", name, e),
-            )
-        }
-        Err(talos_compilation::CatalogTemplateError::ReadSource(_)) => {
-            return mcp_error(
-                req_id,
-                -32000,
-                &format!(
-                    "Source file not found for module '{}' (expected template.rs in {}).",
-                    name,
-                    module_dir.display()
-                ),
-            )
-        }
+    let meta = match &source {
+        InstallSource::Registry(entry) => registry_entry_manifest(entry),
+        InstallSource::Disk { template, .. } => template.manifest().clone(),
     };
-    let meta = template.manifest().clone();
-    let rust_code = template.source().to_string();
+    let rust_code = match &source {
+        InstallSource::Registry(_) => String::new(),
+        InstallSource::Disk { template, .. } => template.source().to_string(),
+    };
+    // The catalog slug the copy records: the registry row's, or the resolved
+    // template DIR — stable under display-name renames (DX #14).
+    let catalog_slug: Option<String> = match &source {
+        InstallSource::Registry(entry) => entry.catalog_slug.clone(),
+        InstallSource::Disk { module_dir, .. } => module_dir
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(str::to_string),
+    };
 
     // Extract metadata fields.
     // capability_world: prefer talos.json, fall back to the #[talos_module(world = "...")] attribute
@@ -4751,7 +4868,12 @@ async fn handle_install_module_from_catalog(
     // sized by defaults nobody chose, and the refusal says a `fuel_budget` of
     // the caller's own installs it anyway.
     let fuel_explicit = budget_max_fuel.is_some();
-    let template_max_fuel: i64 = match talos_compilation::recommended_max_fuel(&meta) {
+    let template_fuel = match &source {
+        // The catalog writer resolved this from the published manifest.
+        InstallSource::Registry(entry) => Ok(Some(entry.max_fuel.max(0) as u64)),
+        InstallSource::Disk { .. } => talos_compilation::recommended_max_fuel(&meta),
+    };
+    let template_max_fuel: i64 = match template_fuel {
         Ok(Some(limit)) => limit as i64,
         Ok(None) => talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64,
         Err(reason) if fuel_explicit => {
@@ -4814,282 +4936,315 @@ async fn handle_install_module_from_catalog(
         .unwrap_or("catalog")
         .to_string();
 
-    // Use the resolved dir name as the Cargo package name — this is always a valid slug
-    // (e.g. "stripe-create-customer") even when the input was a fuzzy-matched variant
-    // like "stripe--create-customer" which Cargo would reject as an invalid label.
-    let compile_name = module_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(name);
-
-    // Compile the module. The template's declared `dependencies` ride along
+    // What the copy runs. A registry entry is referenced; a template from the
+    // image is compiled. The template's declared `dependencies` ride along
     // inside `CatalogTemplate`, so this path cannot lose them the way the
     // seeder, the OCI publisher and restore_pinned_modules all did. Templates
     // are author-signed; the compiler still gates deps through the allowlist
     // (validate_dependencies) inside create_workspace.
-    let job_id = uuid::Uuid::new_v4();
-    let compilation = state
-        .compiler
-        .compile_catalog_template(user_id, job_id, compile_name, &template)
-        .await;
-
-    match compilation {
-        Ok(res) if res.success => {
-            let wasm_bytes = match res.wasm_bytes {
-                Some(b) => b,
-                None => {
-                    return mcp_error(
-                        req_id,
-                        -32603,
-                        "Compilation succeeded but produced no WASM output",
-                    )
-                }
-            };
-
-            // Phase 3.2: writes go ONLY to the unified modules table.
-            // The legacy upsert_node_template_for_install + the wasm_modules
-            // upsert + the mirror were collapsed into a single
-            // install_catalog_module_to_modules call that has install-specific
-            // UPSERT semantics (refreshes permissions on re-install, unlike
-            // hot_update which preserves them).
-            //
-            // Variables that pre-existed only to thread results between the
-            // three legacy steps (upsert_sql / wasm_module_uuid) are gone.
-            let _ = caller_provided_allowed_secrets;
-            let _ = (&category, &description); // metadata embedded in modules row directly
-
-            let content_hash = catalog_wasm_content_hash(&wasm_bytes);
-            let cw_short = if capability_world == "automation-node" {
-                "trusted"
-            } else {
-                capability_world.trim_end_matches("-node")
-            };
-
-            // Resolve max_fuel with three-tier precedence:
-            //   1. caller-supplied `fuel_budget` (operator override)
-            //   2. template-declared `recommended_fuel` in talos.json (per-template default)
-            //   3. compute_max_fuel(10, 2000, 2.0) baseline (~2.2M)
-            // The hardcoded 2M was leaving LLM-backed templates fuel-starved on
-            // realistic actor-context payloads — see issue #381.
-            // On RE-install the existing row's max_fuel is PRESERVED unless
-            // the caller explicitly passed fuel_budget (fuel_explicit below) —
-            // template/baseline values only apply to fresh installs. Mirrors
-            // r236's hot_update fuel preservation; the reinstall path was the
-            // unswept sibling (live bite 2026-07-17: tuned 10M silently reset
-            // to 1.38M auto-calc).
-            // (`fuel_explicit` / `offered_max_fuel` are resolved above the
-            // dry-run branch.)
-            let max_fuel: i64 = offered_max_fuel;
-
-            let install_result = match state
-                .module_repo
-                .install_catalog_module_to_modules(
-                    agent.user_id,
-                    &display_name,
-                    cw_short,
-                    &wasm_bytes,
-                    &content_hash,
-                    &rust_code,
-                    max_fuel,
-                    &allowed_hosts,
-                    &allowed_methods,
-                    &allowed_secrets,
-                    &requires_approval_for,
-                    &config_schema,
-                    // The resolved template DIR is the canonical catalog slug —
-                    // stable under display-name renames (DX #14).
-                    module_dir.file_name().and_then(|f| f.to_str()),
-                    fuel_explicit,
-                    // The crates it was compiled with, so a later hot_update of
-                    // the installed copy can rebuild it without restating them.
-                    template.dependencies(),
-                )
+    let compiled: Option<(Vec<u8>, String)> = match &source {
+        InstallSource::Registry(_) => None,
+        InstallSource::Disk {
+            template,
+            module_dir,
+        } => {
+            // The resolved dir name is the Cargo package name — always a valid
+            // slug (e.g. "stripe-create-customer") even when the input was a
+            // fuzzy-matched variant like "stripe--create-customer" which Cargo
+            // would reject as an invalid label.
+            let compile_name = module_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(name);
+            let job_id = uuid::Uuid::new_v4();
+            match state
+                .compiler
+                .compile_catalog_template(user_id, job_id, compile_name, template)
                 .await
             {
-                Ok(x) => x,
-                Err(e) => {
-                    tracing::error!(
-                        module_name = name,
-                        capability_world,
-                        "install_module_from_catalog: modules-table install failed: {:#}",
-                        e
-                    );
+                Ok(res) if res.success => match res.wasm_bytes {
+                    Some(bytes) => {
+                        let hash = catalog_wasm_content_hash(&bytes);
+                        Some((bytes, hash))
+                    }
+                    None => {
+                        return mcp_error(
+                            req_id,
+                            -32603,
+                            "Compilation succeeded but produced no WASM output",
+                        )
+                    }
+                },
+                Ok(res) => {
+                    let errors: Vec<String> = res
+                        .errors
+                        .iter()
+                        .map(|e| {
+                            if let (Some(line), Some(col)) = (e.line, e.column) {
+                                format!("Line {}:{}: {}", line, col, e.message)
+                            } else {
+                                e.message.clone()
+                            }
+                        })
+                        .collect();
                     return mcp_error(
                         req_id,
                         -32000,
-                        "Compilation succeeded but failed to save module",
+                        &format!("Compilation failed for '{}':\n{}", name, errors.join("\n")),
                     );
                 }
-            };
-            let module_uuid = install_result.module_id;
-            let stored_allowed_secrets = install_result.allowed_secrets.clone();
-            let stored_content_hash = install_result.content_hash.clone();
-            let stored_compiled_at = install_result.compiled_at;
-            let bytes_changed = install_result.bytes_changed;
-            let module_id_str = module_uuid.to_string();
-            let wasm_module_uuid: Option<Uuid> = Some(module_uuid);
-
-            tracing::info!(
-                module_name = name,
-                module_id = %module_id_str,
-                capability_world,
-                "Installed module from catalog (modules-only write)"
-            );
-
-            // Pin the module if requested
-            // MCP-270 (2026-05-10): direction-class wrong-type rejection.
-            let pin_module =
-                match crate::utils::validate_optional_bool(args, "pin_module", false, &req_id) {
-                    Ok(v) => v,
-                    Err(resp) => return resp,
-                };
-            let (pinned, pin_warning) = if pin_module {
-                if let Some(uid) = agent.user_id {
-                    match state.module_repo.pin_user_module(uid, &display_name).await {
-                        Ok(_) => (true, None),
-                        Err(e) => {
-                            tracing::warn!(module_name = %display_name, "Failed to pin module: {:#}", e);
-                            (false, Some("Pin failed — user_module_pins table may not exist yet. Run migrations to enable module pinning."))
-                        }
-                    }
-                } else {
-                    (
-                        false,
-                        Some("Cannot pin: agent is not linked to a user account"),
-                    )
+                Err(e) => {
+                    // 2026-09-10: chain logged (it can carry host paths and cargo's
+                    // stderr), generic message returned — the sentence
+                    // `hot_update_module` already uses.
+                    tracing::error!(error = %format!("{e:#}"), "compile_module: compilation service error");
+                    return mcp_error(
+                        req_id,
+                        -32000,
+                        talos_compilation::caller_facing_service_error(&e),
+                    );
                 }
-            } else {
-                (false, None)
-            };
+            }
+        }
+    };
+    let artifact = match (&source, &compiled) {
+        (InstallSource::Registry(entry), _) => {
+            talos_module_repository::InstalledArtifact::Registry {
+                oci_url: &entry.oci_url,
+            }
+        }
+        (InstallSource::Disk { template, .. }, Some((bytes, hash))) => {
+            talos_module_repository::InstalledArtifact::Compiled {
+                wasm_bytes: bytes,
+                content_hash: hash,
+                source_code: &rust_code,
+                // The crates it was compiled with, so a later hot_update of
+                // the installed copy can rebuild it without restating them.
+                dependencies: template.dependencies(),
+            }
+        }
+        (InstallSource::Disk { .. }, None) => {
+            return mcp_error(
+                req_id,
+                -32603,
+                "Compilation succeeded but produced no WASM output",
+            )
+        }
+    };
+    let from_registry = matches!(source, InstallSource::Registry(_));
 
-            let setup_instructions = meta
-                .get("setup_instructions")
-                .cloned()
-                .unwrap_or(serde_json::json!([]));
-            // A template that declares zero required secrets (e.g. catalog
-            // llm-inference v2.0.0, which uses host-managed llm::complete) is
-            // legitimately secrets-free — an empty grant is the correct state,
-            // not a misconfiguration. Only fire the warning when the template
-            // itself asked for at least one path. (template_requires_secrets is
-            // captured up-front because catalog_secrets/talos_json_secrets are
-            // moved into `allowed_secrets` earlier.)
-            let grant_empty = stored_allowed_secrets.is_empty() && template_requires_secrets;
-            let has_wildcard_grant = stored_allowed_secrets.iter().any(|s| s == "*");
-            // setup_required: true when the operator needs to do something before secrets work.
-            //   - grant_empty: true  → deny-all grant on a template that needs secrets, must reinstall
-            //   - non-empty, non-wildcard → specific paths need provisioning in the vault
-            //   - wildcard grant → any existing secret is accessible, no specific provisioning
-            //   - template declares zero secrets → no setup needed
-            let setup_required =
-                grant_empty || (!has_wildcard_grant && !stored_allowed_secrets.is_empty());
-            // Return wasm_modules.id when available so this response is consistent with
-            // list_modules (which also returns wasm_modules.id for installed catalog modules).
-            // Fall back to node_templates.id when the wasm_modules write failed.
-            let final_module_id = wasm_module_uuid
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| module_id_str.clone());
-            // Recompile receipt (added 2026-04-30): wasm_sha256 +
-            // compiled_at + bytes_changed let the caller verify
-            // "the WASM I just installed is actually fresh" without
-            // a follow-up get_module_info — needed because catalog
-            // reinstalls after a platform deploy were silently
-            // upserting stale source against the operator's
-            // expectation that disk-based seed templates would
-            // pick up the new code (real symptom 2026-04-30 during
-            // r249 rollout).
-            let mut resp = serde_json::json!({
-                "module_id": final_module_id,
-                "template_id": module_id_str,
-                "name": display_name,
-                "capability_world": capability_world,
-                "allowed_hosts": allowed_hosts,
-                "message": "Ready to use in add_node_to_workflow",
-                "setup_required": setup_required,
-                "setup_instructions": setup_instructions,
-                "allowed_secrets": stored_allowed_secrets,
-                "pinned": pinned,
-                "wasm_sha256": stored_content_hash,
-                "compiled_at": stored_compiled_at.to_rfc3339(),
-                "bytes_changed": bytes_changed,
-                // What the row carries now, read back from the write: a
-                // reinstall keeps the copy's own limit unless `fuel_budget`
-                // was passed, so the limit offered is not always the one stored.
-                "fuel": install_fuel_report(
-                    installed_copy.as_ref().map(|_| install_result.max_fuel),
-                    if installed_copy.is_some() { offered_max_fuel } else { install_result.max_fuel },
-                    template_max_fuel,
-                    fuel_explicit,
-                ),
-            });
-            if grant_empty {
-                resp["grant_empty_warning"] = serde_json::json!(
+    // Phase 3.2: writes go ONLY to the unified modules table.
+    // The legacy upsert_node_template_for_install + the wasm_modules
+    // upsert + the mirror were collapsed into a single
+    // install_catalog_module_to_modules call that has install-specific
+    // UPSERT semantics (refreshes permissions on re-install, unlike
+    // hot_update which preserves them).
+    //
+    // Variables that pre-existed only to thread results between the
+    // three legacy steps (upsert_sql / wasm_module_uuid) are gone.
+    let _ = caller_provided_allowed_secrets;
+    let _ = (&category, &description); // metadata embedded in modules row directly
+
+    let cw_short = if capability_world == "automation-node" {
+        "trusted"
+    } else {
+        capability_world.trim_end_matches("-node")
+    };
+
+    // Resolve max_fuel with three-tier precedence:
+    //   1. caller-supplied `fuel_budget` (operator override)
+    //   2. template-declared `recommended_fuel` in talos.json (per-template default)
+    //   3. compute_max_fuel(10, 2000, 2.0) baseline (~2.2M)
+    // The hardcoded 2M was leaving LLM-backed templates fuel-starved on
+    // realistic actor-context payloads — see issue #381.
+    // On RE-install the existing row's max_fuel is PRESERVED unless
+    // the caller explicitly passed fuel_budget (fuel_explicit below) —
+    // template/baseline values only apply to fresh installs. Mirrors
+    // r236's hot_update fuel preservation; the reinstall path was the
+    // unswept sibling (live bite 2026-07-17: tuned 10M silently reset
+    // to 1.38M auto-calc).
+    // (`fuel_explicit` / `offered_max_fuel` are resolved above the
+    // dry-run branch.)
+    let max_fuel: i64 = offered_max_fuel;
+
+    let install_result = match state
+        .module_repo
+        .install_catalog_copy(
+            agent.user_id,
+            &display_name,
+            cw_short,
+            artifact,
+            max_fuel,
+            &allowed_hosts,
+            &allowed_methods,
+            &allowed_secrets,
+            &requires_approval_for,
+            &config_schema,
+            catalog_slug.as_deref(),
+            fuel_explicit,
+        )
+        .await
+    {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::error!(
+                module_name = name,
+                capability_world,
+                "install_module_from_catalog: modules-table install failed: {:#}",
+                e
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                if from_registry {
+                    "Failed to save the installed module"
+                } else {
+                    "Compilation succeeded but failed to save module"
+                },
+            );
+        }
+    };
+    let module_uuid = install_result.module_id;
+    let stored_allowed_secrets = install_result.allowed_secrets.clone();
+    let stored_content_hash = install_result.content_hash.clone();
+    let stored_compiled_at = install_result.compiled_at;
+    let bytes_changed = install_result.bytes_changed;
+    let module_id_str = module_uuid.to_string();
+    let wasm_module_uuid: Option<Uuid> = Some(module_uuid);
+
+    tracing::info!(
+        module_name = name,
+        module_id = %module_id_str,
+        capability_world,
+        from_registry,
+        "Installed module from catalog (modules-only write)"
+    );
+
+    // Pin the module if requested
+    // MCP-270 (2026-05-10): direction-class wrong-type rejection.
+    let pin_module = match crate::utils::validate_optional_bool(args, "pin_module", false, &req_id)
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let (pinned, pin_warning) = if pin_module {
+        if let Some(uid) = agent.user_id {
+            match state.module_repo.pin_user_module(uid, &display_name).await {
+                Ok(_) => (true, None),
+                Err(e) => {
+                    tracing::warn!(module_name = %display_name, "Failed to pin module: {:#}", e);
+                    (false, Some("Pin failed — user_module_pins table may not exist yet. Run migrations to enable module pinning."))
+                }
+            }
+        } else {
+            (
+                false,
+                Some("Cannot pin: agent is not linked to a user account"),
+            )
+        }
+    } else {
+        (false, None)
+    };
+
+    let setup_instructions = meta
+        .get("setup_instructions")
+        .cloned()
+        .unwrap_or(serde_json::json!([]));
+    // A template that declares zero required secrets (e.g. catalog
+    // llm-inference v2.0.0, which uses host-managed llm::complete) is
+    // legitimately secrets-free — an empty grant is the correct state,
+    // not a misconfiguration. Only fire the warning when the template
+    // itself asked for at least one path. (template_requires_secrets is
+    // captured up-front because catalog_secrets/talos_json_secrets are
+    // moved into `allowed_secrets` earlier.)
+    let grant_empty = stored_allowed_secrets.is_empty() && template_requires_secrets;
+    let has_wildcard_grant = stored_allowed_secrets.iter().any(|s| s == "*");
+    // setup_required: true when the operator needs to do something before secrets work.
+    //   - grant_empty: true  → deny-all grant on a template that needs secrets, must reinstall
+    //   - non-empty, non-wildcard → specific paths need provisioning in the vault
+    //   - wildcard grant → any existing secret is accessible, no specific provisioning
+    //   - template declares zero secrets → no setup needed
+    let setup_required = grant_empty || (!has_wildcard_grant && !stored_allowed_secrets.is_empty());
+    // Return wasm_modules.id when available so this response is consistent with
+    // list_modules (which also returns wasm_modules.id for installed catalog modules).
+    // Fall back to node_templates.id when the wasm_modules write failed.
+    let final_module_id = wasm_module_uuid
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| module_id_str.clone());
+    // Recompile receipt (added 2026-04-30): wasm_sha256 +
+    // compiled_at + bytes_changed let the caller verify
+    // "the WASM I just installed is actually fresh" without
+    // a follow-up get_module_info — needed because catalog
+    // reinstalls after a platform deploy were silently
+    // upserting stale source against the operator's
+    // expectation that disk-based seed templates would
+    // pick up the new code (real symptom 2026-04-30 during
+    // r249 rollout).
+    let mut resp = serde_json::json!({
+        "module_id": final_module_id,
+        "template_id": module_id_str,
+        "name": display_name,
+        "capability_world": capability_world,
+        "allowed_hosts": allowed_hosts,
+        "message": "Ready to use in add_node_to_workflow",
+        "setup_required": setup_required,
+        "setup_instructions": setup_instructions,
+        "allowed_secrets": stored_allowed_secrets,
+        "pinned": pinned,
+        // A compiled copy: the sha256 of its bytes. A registry copy
+        // holds no bytes; `content_hash` then names the artifact.
+        "wasm_sha256": if from_registry { serde_json::Value::Null } else { serde_json::json!(stored_content_hash) },
+        "content_hash": stored_content_hash,
+        "compiled_at": stored_compiled_at.to_rfc3339(),
+        "bytes_changed": bytes_changed,
+        "source": if from_registry { "registry" } else { "compiled" },
+        // What the row carries now, read back from the write: a
+        // reinstall keeps the copy's own limit unless `fuel_budget`
+        // was passed, so the limit offered is not always the one stored.
+        "fuel": install_fuel_report(
+            installed_copy.as_ref().map(|_| install_result.max_fuel),
+            if installed_copy.is_some() { offered_max_fuel } else { install_result.max_fuel },
+            template_max_fuel,
+            fuel_explicit,
+        ),
+    });
+    if grant_empty {
+        resp["grant_empty_warning"] = serde_json::json!(
                     "No secrets granted — allowed_secrets is empty (deny-all). \
                      This module cannot read any vault paths. \
                      Reinstall with allowed_secrets: [\"path/to/key\"] or [\"*\"] to enable secret access."
                 );
-            } else if has_wildcard_grant {
-                resp["wildcard_grant_warning"] = serde_json::json!(
-                    "Module has wildcard secret access (allowed_secrets: [\"*\"]) — \
+    } else if has_wildcard_grant {
+        resp["wildcard_grant_warning"] = serde_json::json!(
+            "Module has wildcard secret access (allowed_secrets: [\"*\"]) — \
                      can read any vault path. Consider restricting to specific paths \
                      for least-privilege operation."
-                );
-            }
-            if let Some(w) = pin_warning {
-                resp["pin_warning"] = serde_json::json!(w);
-            }
-            resp["grants_carried_from_installed_copy"] =
-                serde_json::json!(installed_copy.is_some());
-            if !grants_not_carried.is_empty() {
-                resp["grants_not_carried"] = serde_json::Value::Object(grants_not_carried);
-                resp["grants_not_carried_note"] = serde_json::json!(
-                    "Your installed copy held these grants and the new template no longer \
+        );
+    }
+    if let Some(w) = pin_warning {
+        resp["pin_warning"] = serde_json::json!(w);
+    }
+    resp["grants_carried_from_installed_copy"] = serde_json::json!(installed_copy.is_some());
+    if !grants_not_carried.is_empty() {
+        resp["grants_not_carried"] = serde_json::Value::Object(grants_not_carried);
+        resp["grants_not_carried_note"] = serde_json::json!(
+            "Your installed copy held these grants and the new template no longer \
                      grants them, so they were not carried onto the reinstall. A reinstall keeps \
                      your copy's grants only within the template's own grant."
-                );
-            }
-            if !secrets_not_granted.is_empty() {
-                resp["secrets_not_granted"] = serde_json::json!(secrets_not_granted);
-                resp["secrets_not_granted_note"] = serde_json::json!(
-                    "These caller-supplied allowed_secrets paths are OUTSIDE the template's own \
+        );
+    }
+    if !secrets_not_granted.is_empty() {
+        resp["secrets_not_granted"] = serde_json::json!(secrets_not_granted);
+        resp["secrets_not_granted_note"] = serde_json::json!(
+            "These caller-supplied allowed_secrets paths are OUTSIDE the template's own \
                      grant and were not installed. A caller may only NARROW a template's secret \
                      grant, never widen it; the template author's list is the ceiling."
-                );
-            }
-            mcp_text(
-                req_id,
-                &serde_json::to_string_pretty(&resp).unwrap_or_default(),
-            )
-        }
-        Ok(res) => {
-            let errors: Vec<String> = res
-                .errors
-                .iter()
-                .map(|e| {
-                    if let (Some(line), Some(col)) = (e.line, e.column) {
-                        format!("Line {}:{}: {}", line, col, e.message)
-                    } else {
-                        e.message.clone()
-                    }
-                })
-                .collect();
-            mcp_error(
-                req_id,
-                -32000,
-                &format!("Compilation failed for '{}':\n{}", name, errors.join("\n")),
-            )
-        }
-        Err(e) => {
-            // 2026-09-10: chain logged (it can carry host paths and cargo's
-            // stderr), generic message returned — the sentence
-            // `hot_update_module` already uses.
-            tracing::error!(error = %format!("{e:#}"), "compile_module: compilation service error");
-            mcp_error(
-                req_id,
-                -32000,
-                talos_compilation::caller_facing_service_error(&e),
-            )
-        }
+        );
     }
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&resp).unwrap_or_default(),
+    )
 }
 
 // ── restore_pinned_modules ────────────────────────────────────────────────────
@@ -6048,11 +6203,7 @@ async fn handle_get_catalog_status(
         // `null` when the read failed — never an empty list, which would
         // read as "nothing is behind".
         "installed_copies": copies_read.as_deref().map(installed_copies_json),
-        "surfaces": {
-            "list_templates": "DB modules table (kind='catalog'); default view filters to platform categories",
-            "list_module_catalog": "baked disk dir /app/module-templates (cached per process)",
-            "install_module_from_catalog": "baked disk dir (compiles template.rs on install)",
-        },
+        "surfaces": catalog_surfaces(registry_url.is_some()),
         "seeding": "Disk seeding runs at EVERY controller boot as an idempotent upsert into the modules table; it is skipped only when TALOS_REGISTRY_URL is set (OCI owns the catalog) or module-templates/ is missing.",
         "tips": tips,
     });
@@ -6062,6 +6213,23 @@ async fn handle_get_catalog_status(
         req_id,
         &serde_json::to_string_pretty(&report).unwrap_or_default(),
     )
+}
+
+/// What each catalog surface reads, by source-of-truth mode.
+pub(crate) fn catalog_surfaces(registry_mode: bool) -> serde_json::Value {
+    if registry_mode {
+        serde_json::json!({
+            "list_templates": "DB modules table (kind='catalog'); default view filters to platform categories",
+            "list_module_catalog": "DB shared catalog rows that name a registry artifact (written by the registry sync)",
+            "install_module_from_catalog": "the shared catalog row: your copy references the same signed registry artifact with your grants; nothing is compiled",
+        })
+    } else {
+        serde_json::json!({
+            "list_templates": "DB modules table (kind='catalog'); default view filters to platform categories",
+            "list_module_catalog": "baked disk dir /app/module-templates (cached per process)",
+            "install_module_from_catalog": "baked disk dir (compiles template.rs on install)",
+        })
+    }
 }
 
 /// What `get_catalog_status` and `get_platform_info` say about the compile
@@ -6078,9 +6246,10 @@ pub(crate) fn module_compilation_report(enabled: bool) -> serde_json::Value {
             "enabled": false,
             "note": "Module compilation is turned off (TALOS_MODULE_COMPILATION=false). \
                      Nothing is built from source: compile_custom_sandbox, lint_sandbox, \
-                     hot_update_module, run_sandbox, compile_template, scratch sessions, \
-                     inline rust_code and install_module_from_catalog are refused. Workflows \
-                     use the shared catalog modules the registry sync provides.",
+                     hot_update_module, run_sandbox, compile_template, scratch sessions and \
+                     inline rust_code are refused. Workflows use the catalog modules the \
+                     registry sync provides; install_module_from_catalog makes your own copy \
+                     of one (it references the registry artifact and compiles nothing).",
         })
     }
 }

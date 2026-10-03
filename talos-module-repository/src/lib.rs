@@ -67,6 +67,55 @@ pub fn capability_world_long(short: &str) -> String {
     }
 }
 
+/// What an installed copy of a catalog module RUNS.
+///
+/// A copy either holds code this platform compiled from the template's
+/// source, or names the signed registry artifact its catalog row names — in
+/// which case it holds no bytes and no source, and the worker pulls and
+/// verifies the artifact at dispatch. One writer stores both, so a reinstall
+/// that changes which of the two a copy is replaces every column of the
+/// other kind in the same statement: a row never keeps bytes beside a
+/// reference, which would leave two answers to "what does this run".
+#[derive(Debug, Clone, Copy)]
+pub enum InstalledArtifact<'a> {
+    Compiled {
+        wasm_bytes: &'a [u8],
+        content_hash: &'a str,
+        source_code: &'a str,
+        dependencies: Option<&'a serde_json::Value>,
+    },
+    Registry {
+        oci_url: &'a str,
+    },
+}
+
+/// The `content_hash` a registry-reference copy stores: the reference
+/// itself, so "did a reinstall change what this runs" has the same answer
+/// it has for a compiled copy (the hash differs when the code does).
+pub fn registry_reference_hash(oci_url: &str) -> String {
+    format!("oci:{oci_url}")
+}
+
+/// A shared catalog row that names a registry artifact — what an install in
+/// registry mode copies. Every field is the row's own column: the registry
+/// sync wrote them from the published manifest.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SharedRegistryEntry {
+    pub id: Uuid,
+    pub name: String,
+    pub catalog_slug: Option<String>,
+    pub category: Option<String>,
+    pub description: Option<String>,
+    pub config_schema: serde_json::Value,
+    pub capability_world: String,
+    pub allowed_hosts: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_secrets: Vec<String>,
+    pub requires_approval_for: Vec<String>,
+    pub max_fuel: i64,
+    pub oci_url: String,
+}
+
 /// The installed copy an install is about to overwrite, read under its row
 /// lock: capability world, the three grant lists and the content hash.
 type InstalledCopyBefore = (
@@ -84,6 +133,8 @@ struct InstalledCopyAfter<'a> {
     allowed_methods: &'a [String],
     allowed_secrets: &'a [String],
     content_hash: &'a str,
+    /// The registry artifact the copy now names, when it is a reference.
+    oci_url: Option<&'a str>,
 }
 
 /// The `admin_event_log` record for one catalog install: event type, summary
@@ -109,6 +160,9 @@ fn catalog_install_record(
         "allowed_secrets": after.allowed_secrets,
         "content_hash": after.content_hash,
     });
+    if let (Some(url), Some(obj)) = (after.oci_url, details.as_object_mut()) {
+        obj.insert("oci_url".into(), serde_json::json!(url));
+    }
     let Some((world, hosts, methods, secrets, hash)) = previous else {
         return (
             "module_installed_from_catalog",
@@ -738,6 +792,10 @@ pub struct HotUpdateContext {
     /// `compute_max_fuel(10, 2000, 2.0)` baseline. None for legacy rows
     /// where the column was null at the time of read.
     pub existing_max_fuel: Option<i64>,
+    /// The registry artifact this row names, when it is a registry-reference
+    /// copy (no bytes, no source). Dispatch runs the artifact, so writing
+    /// compiled bytes onto such a row would change nothing it runs.
+    pub oci_url: Option<String>,
 }
 
 /// Normalise a stored `capability_world` value to the suffixed form
@@ -1045,7 +1103,7 @@ impl ModuleRepository {
         // `wasm_bytes IS NULL OR length = 0`.
         let row_opt = sqlx::query(
             "SELECT id, name, source_code, config, \
-                    content_hash, capability_world, wasm_bytes, kind, max_fuel \
+                    content_hash, capability_world, wasm_bytes, kind, max_fuel, oci_url \
              FROM modules \
              WHERE id = $1 \
                AND user_id = $2 \
@@ -1089,6 +1147,9 @@ impl ModuleRepository {
                 old_content_hash: old_hash,
                 capability_world: world,
                 existing_max_fuel: existing_fuel,
+                oci_url: row
+                    .try_get::<Option<String>, _>("oci_url")?
+                    .filter(|u| !u.is_empty()),
             }));
         }
 
@@ -2124,8 +2185,10 @@ impl ModuleRepository {
 
     /// List a user's pinned modules with a flag indicating whether the
     /// module currently has compiled wasm bytes. Phase 5: LEFT JOIN
-    /// resolves against the unified `modules` table; "has_wasm" becomes
-    /// `wasm_bytes IS NOT NULL AND length > 0`. Used by
+    /// resolves against the unified `modules` table; "has_wasm" is true when
+    /// the copy holds compiled bytes OR names a registry artifact (a
+    /// reference copy has nothing to rebuild and no source to rebuild from).
+    /// Used by
     /// `restore_pinned_modules` to decide which entries need a recompile.
     ///
     /// The join carries `AND m.user_id = pm.user_id` because `modules.name` is
@@ -2140,7 +2203,8 @@ impl ModuleRepository {
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT pm.module_name, \
-                    (m.wasm_bytes IS NOT NULL AND octet_length(m.wasm_bytes) > 0) AS has_wasm \
+                    ((m.wasm_bytes IS NOT NULL AND octet_length(m.wasm_bytes) > 0) \
+                     OR COALESCE(m.oci_url, '') <> '') AS has_wasm \
              FROM user_module_pins pm \
              LEFT JOIN modules m ON m.name = pm.module_name AND m.user_id = pm.user_id \
              WHERE pm.user_id = $1 \
@@ -3421,6 +3485,54 @@ impl ModuleRepository {
         )
     }
 
+    /// The shared catalog row a key names, when that row names a registry
+    /// artifact. `key` is a catalog slug or a display name (the two an
+    /// install accepts); a slug match wins. `None` when no shared row
+    /// matches or the match holds no registry reference — the caller then
+    /// reads the template baked into the image, as before.
+    pub async fn find_shared_registry_entry(
+        &self,
+        key: &str,
+    ) -> Result<Option<SharedRegistryEntry>> {
+        let entry = sqlx::query_as::<_, SharedRegistryEntry>(
+            "SELECT id, name, catalog_slug, category, description, \
+                    COALESCE(config_schema, '{}'::jsonb) AS config_schema, \
+                    capability_world, allowed_hosts, allowed_methods, allowed_secrets, \
+                    requires_approval_for, COALESCE(max_fuel, 2000000) AS max_fuel, oci_url \
+             FROM modules \
+             WHERE user_id IS NULL AND kind = 'catalog' \
+               AND COALESCE(oci_url, '') <> '' \
+               AND (catalog_slug = $1 OR lower(name) = lower($1)) \
+             ORDER BY (catalog_slug = $1) DESC NULLS LAST, id \
+             LIMIT 1",
+        )
+        .bind(key)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(entry)
+    }
+
+    /// Every shared catalog row that names a registry artifact, by name —
+    /// the catalog a registry-mode deployment offers. Bounded: a registry
+    /// catalog is tens of rows, and the cap keeps a misbehaving sync from
+    /// making one listing unbounded.
+    pub async fn list_shared_registry_entries(&self) -> Result<Vec<SharedRegistryEntry>> {
+        let entries = sqlx::query_as::<_, SharedRegistryEntry>(
+            "SELECT id, name, catalog_slug, category, description, \
+                    COALESCE(config_schema, '{}'::jsonb) AS config_schema, \
+                    capability_world, allowed_hosts, allowed_methods, allowed_secrets, \
+                    requires_approval_for, COALESCE(max_fuel, 2000000) AS max_fuel, oci_url \
+             FROM modules \
+             WHERE user_id IS NULL AND kind = 'catalog' \
+               AND COALESCE(oci_url, '') <> '' \
+             ORDER BY name, id \
+             LIMIT 2000",
+        )
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(entries)
+    }
+
     /// Phase 3.2 install path: write a catalog-installed module to the
     /// unified `modules` table directly, with install-specific UPSERT
     /// semantics that DO refresh permission columns (unlike the
@@ -3462,7 +3574,80 @@ impl ModuleRepository {
         fuel_explicit: bool,
         dependencies: Option<&serde_json::Value>,
     ) -> Result<CatalogInstallResult> {
+        self.install_catalog_copy(
+            user_id,
+            name,
+            capability_world_short,
+            InstalledArtifact::Compiled {
+                wasm_bytes,
+                content_hash,
+                source_code: rust_code,
+                dependencies,
+            },
+            max_fuel,
+            allowed_hosts,
+            allowed_methods,
+            allowed_secrets,
+            requires_approval_for,
+            config_schema,
+            catalog_slug,
+            fuel_explicit,
+        )
+        .await
+    }
+
+    /// Write an installed copy of a catalog module — compiled here, or a
+    /// reference to the registry artifact its catalog row names (see
+    /// [`InstalledArtifact`]). The ONE writer of an installed copy: the
+    /// upsert semantics, the fuel-preservation rule and the
+    /// `admin_event_log` record described on
+    /// [`Self::install_catalog_module_to_modules`] hold for both.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn install_catalog_copy(
+        &self,
+        user_id: Option<Uuid>,
+        name: &str,
+        capability_world_short: &str,
+        artifact: InstalledArtifact<'_>,
+        max_fuel: i64,
+        allowed_hosts: &[String],
+        allowed_methods: &[String],
+        allowed_secrets: &[String],
+        requires_approval_for: &[String],
+        config_schema: &serde_json::Value,
+        catalog_slug: Option<&str>,
+        fuel_explicit: bool,
+    ) -> Result<CatalogInstallResult> {
         let cw_long = capability_world_long(capability_world_short);
+        let reference_hash;
+        let (wasm_bytes, content_hash, rust_code, dependencies, oci_url): (
+            Option<&[u8]>,
+            &str,
+            &str,
+            Option<&serde_json::Value>,
+            Option<&str>,
+        ) = match artifact {
+            InstalledArtifact::Compiled {
+                wasm_bytes,
+                content_hash,
+                source_code,
+                dependencies,
+            } => (
+                Some(wasm_bytes),
+                content_hash,
+                source_code,
+                dependencies,
+                None,
+            ),
+            InstalledArtifact::Registry { oci_url } => {
+                anyhow::ensure!(
+                    !oci_url.trim().is_empty(),
+                    "a registry-reference copy needs a registry reference"
+                );
+                reference_hash = registry_reference_hash(oci_url);
+                (None, reference_hash.as_str(), "", None, Some(oci_url))
+            }
+        };
 
         let mut tx = self.db_pool.begin().await?;
         // Lock the row this install overwrites (none on a first install), so
@@ -3505,12 +3690,13 @@ impl ModuleRepository {
                         user_id, name, kind, capability_world, config_schema, \
                         allowed_hosts, allowed_methods, allowed_secrets, requires_approval_for, \
                         source_code, wasm_bytes, content_hash, size_bytes, max_fuel, \
-                        catalog_slug, dependencies, language, created_at, compiled_at, updated_at \
+                        catalog_slug, dependencies, oci_url, language, \
+                        created_at, compiled_at, updated_at \
                      ) VALUES ( \
                         $1, $2, 'catalog', $3, $4, \
                         $5, $6, $7, $8, \
                         $9, $10, $11, $12, $13, \
-                        $14, $16, 'rust', NOW(), NOW(), NOW() \
+                        $14, $16, $17, 'rust', NOW(), NOW(), NOW() \
                      ) \
                      ON CONFLICT (user_id, name) WHERE user_id IS NOT NULL DO UPDATE SET \
                         capability_world = EXCLUDED.capability_world, \
@@ -3522,6 +3708,10 @@ impl ModuleRepository {
                         requires_approval_for = EXCLUDED.requires_approval_for, \
                         source_code = EXCLUDED.source_code, \
                         wasm_bytes = EXCLUDED.wasm_bytes, \
+                        /* Bytes OR a registry reference, never both: a \
+                           reinstall that changes which one this copy is \
+                           replaces the other in the same statement. */ \
+                        oci_url = EXCLUDED.oci_url, \
                         content_hash = EXCLUDED.content_hash, \
                         size_bytes = EXCLUDED.size_bytes, \
                         /* The crates THIS source was compiled with: a reinstall \
@@ -3559,11 +3749,12 @@ impl ModuleRepository {
             .bind(rust_code)
             .bind(wasm_bytes)
             .bind(content_hash)
-            .bind(wasm_bytes.len() as i32)
+            .bind(wasm_bytes.map_or(0, <[u8]>::len) as i32)
             .bind(max_fuel)
             .bind(catalog_slug)
             .bind(fuel_explicit)
             .bind(dependencies)
+            .bind(oci_url)
             .fetch_one(&mut *tx)
             .await?;
 
@@ -3573,6 +3764,7 @@ impl ModuleRepository {
             allowed_methods,
             allowed_secrets: &row.1,
             content_hash: &row.2,
+            oci_url,
         };
         let (event_type, summary, details) =
             catalog_install_record(name, catalog_slug, previous.as_ref(), &after);
@@ -4397,6 +4589,7 @@ mod catalog_install_record_tests {
             allowed_methods: &methods,
             allowed_secrets: &[],
             content_hash: "h1",
+            oci_url: None,
         };
         let (kind, summary, details) =
             catalog_install_record("m", Some("slug"), Some(&before), &after);
@@ -4436,6 +4629,7 @@ mod catalog_install_record_tests {
                 allowed_methods: &m,
                 allowed_secrets: &s,
                 content_hash: "h1",
+                oci_url: None,
             };
             let (_, summary, details) = catalog_install_record("m", None, Some(&before), &after);
             assert_eq!(details["grants_changed"], true, "{summary}");

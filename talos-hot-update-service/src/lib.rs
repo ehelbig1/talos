@@ -164,6 +164,11 @@ impl HotUpdateService {
             }
         };
 
+        // A registry-reference copy runs the artifact its catalog row names;
+        // dispatch sends that reference, not bytes on the row. Compiling new
+        // source onto it would report success and change nothing it runs.
+        refuse_registry_reference(ctx.oci_url.as_deref())?;
+
         // 2. Resolve effective source.
         let source_code = resolve_source(rust_code.as_deref(), ctx.stored_source.as_deref())?;
 
@@ -773,6 +778,25 @@ impl HotUpdateService {
     }
 }
 
+/// What a hot update of a registry-reference copy is told.
+pub const REGISTRY_REFERENCE_NOT_EDITABLE: &str =
+    "This module is a copy of a registry catalog module: it runs the registry's signed \
+     artifact and holds no code of its own, so there is nothing here to update. To change \
+     what it may reach, use update_module_hosts / update_module_methods / \
+     update_module_secrets; to give a node more fuel, set max_fuel in that node's config. \
+     To run different code, compile your own module \
+     (compile_custom_sandbox) and swap the node to it (swap_node_module).";
+
+/// Refuse a hot update of a row that names a registry artifact.
+pub fn refuse_registry_reference(oci_url: Option<&str>) -> Result<(), HotUpdateError> {
+    match oci_url {
+        Some(url) if !url.is_empty() => Err(HotUpdateError::InvalidArg(
+            REGISTRY_REFERENCE_NOT_EDITABLE.into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 // ── Pure helpers ─────────────────────────────────────────────────────────────
 
 pub fn resolve_source(
@@ -999,6 +1023,15 @@ async fn invalidate_redis_cache(module_id: Uuid, effective_wm_id: Uuid, user_id:
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_registry_reference_copy_is_not_hot_updated() {
+        assert!(refuse_registry_reference(None).is_ok());
+        assert!(refuse_registry_reference(Some("")).is_ok());
+        let refusal = refuse_registry_reference(Some("ghcr.io/o/talos-tools/x:v1")).unwrap_err();
+        assert!(matches!(refusal, HotUpdateError::InvalidArg(_)));
+        assert_eq!(refusal.to_string(), REGISTRY_REFERENCE_NOT_EDITABLE);
+    }
 
     #[test]
     fn resolve_source_prefers_provided_when_nonempty() {
