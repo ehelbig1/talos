@@ -337,7 +337,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_module",
-            "description": "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call), so you can see how close a run came to its fuel and token limits. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. NOTE: the run also INHERITS the actor's LLM/egress tier — and WITHOUT an actor_id it defaults to Tier-1 (local-egress-only). So a module that calls an EXTERNAL API (any non-loopback host — Google, Slack, etc.) will fail with a network error unless the actor permits public egress. That is the EGRESS axis, not the LLM tier: since `egress_scope` was split out, `max_llm_tier=tier1` + `egress_scope=public` reaches an external API while still refusing every external LLM provider — the house pattern for a privacy-sensitive reader, and the correct posture here. (This note used to say \"a Tier-2 actor\", which has been wrong since the split.) `vault://` references in config are delivered to the module AS THE LITERAL, exactly as the engine delivers them, and the host resolves them at the outbound call; the block is the egress ceiling, not the secret.\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
+            "description": "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call), so you can see how close a run came to its fuel and token limits. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. NOTE: the run also INHERITS the actor's LLM/egress tier — and WITHOUT an actor_id it defaults to Tier-1 (local-egress-only). So a module that calls an EXTERNAL API (any non-loopback host — Google, Slack, etc.) will fail with a network error unless the actor permits public egress. That is the EGRESS axis, not the LLM tier: since `egress_scope` was split out, `max_llm_tier=tier1` + `egress_scope=public` reaches an external API while still refusing every external LLM provider — the house pattern for a privacy-sensitive reader, and the correct posture here. (This note used to say \"a Tier-2 actor\", which has been wrong since the split.) `vault://` references in config are delivered to the module AS THE LITERAL, exactly as the engine delivers them, and the host resolves them at the outbound call; the block is the egress ceiling, not the secret.\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -347,6 +347,21 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "actor_id": { "type": "string", "description": "Optional UUID of an actor whose memories the module should see. Modules calling agent_memory::search / get / list-keys etc. will scope to this actor (mirrors workflow dispatch when the workflow is bound to an actor). The actor must be owned by you; cross-tenant actor_ids are rejected. Without this, memory calls run anonymously and return 0 hits." },
                     "accumulated": { "type": "object", "description": "Optional. Outputs of EARLIER workflow nodes, keyed by node id, delivered to the module as `data[\"__accumulated__\"]` exactly as the engine does in a workflow. Use it to rehearse a module that reads a non-parent node's output (e.g. {\"prepare\": {\"refs\": {...}}}). Max 1 MB." },
                     "timeout_secs": { "type": "number", "description": "Execution timeout in seconds (default 30, max 120)" },
+                    "http_fixtures": {
+                        "type": "array",
+                        "description": "Optional. Recorded HTTP responses: when given, the run is a REHEARSAL and makes no request. The Nth `http::fetch` (or `fetch_all` entry) is answered by the Nth item; nothing is sent, no DNS lookup is made, no secret is resolved, and vault:// references are not checked, so a module can be measured (fuel, parsing, output) against a realistic response before the service is connected. Everything that decides whether the request MAY be made still runs: a host or verb the module was not granted is refused exactly as in a real run. An item may name the `method` and a `url_contains` substring it expects; a request that does not match is refused (and reported) instead of being handed the wrong body, and so is any request after the last item. The run is not retried. At most 64 items, 8 MB of bodies. The reply's `http_replay` lists each request (host and path only) and which item answered it. Only `http::fetch` and `fetch_all` are replayed; webhook, GraphQL, streaming and `wasi:http` calls are refused in a rehearsal, so nothing is sent through them either. LLM, email, object-storage, messaging and memory host calls behave as in any other test_module run.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "method": { "type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "description": "The verb the request must use. Omit to accept any." },
+                                "url_contains": { "type": "string", "description": "A substring the request URL must contain. Omit to accept any URL." },
+                                "status": { "type": "integer", "minimum": 100, "maximum": 599, "description": "HTTP status to answer with (default 200)." },
+                                "headers": { "type": "object", "description": "Response headers, name to value." },
+                                "body": { "description": "The response body. A string is sent as written; any other JSON value is sent as compact JSON." }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
                     "allowed_secrets": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -2791,6 +2806,104 @@ pub(crate) fn test_module_payload(
     serde_json::Value::Object(merged)
 }
 
+/// One recorded HTTP response as `test_module` takes it. Unknown fields are
+/// refused: a misspelled `url_contains` would otherwise be a fixture that
+/// matches anything.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpFixtureArg {
+    method: Option<String>,
+    url_contains: Option<String>,
+    status: Option<u16>,
+    #[serde(default)]
+    headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    body: serde_json::Value,
+}
+
+/// `test_module`'s `http_fixtures`: `None` when absent (the run makes real
+/// requests), else the recorded answers, validated. A string body is sent as
+/// written; any other JSON value is sent as compact JSON; absent is empty.
+pub(crate) fn parse_http_fixtures(
+    raw: Option<&serde_json::Value>,
+) -> Result<Option<std::sync::Arc<talos_worker_runtime::http_replay::HttpReplay>>, String> {
+    let raw = match raw {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    let args: Vec<HttpFixtureArg> = serde_json::from_value(raw.clone()).map_err(|e| {
+        format!(
+            "http_fixtures must be an array of recorded responses \
+             ({{method?, url_contains?, status?, headers?, body?}}): {e}"
+        )
+    })?;
+    let fixtures = args
+        .into_iter()
+        .map(|a| talos_worker_runtime::http_replay::HttpFixture {
+            method: a.method.map(|m| m.trim().to_ascii_uppercase()),
+            url_contains: a.url_contains,
+            status: a.status.unwrap_or(200),
+            headers: a.headers.into_iter().collect(),
+            body: match a.body {
+                serde_json::Value::Null => Vec::new(),
+                serde_json::Value::String(text) => text.into_bytes(),
+                other => other.to_string().into_bytes(),
+            },
+        })
+        .collect();
+    talos_worker_runtime::http_replay::HttpReplay::for_rehearsal(fixtures)
+        .map(|r| Some(std::sync::Arc::new(r)))
+}
+
+/// What a rehearsal's requests were and which recording answered each.
+/// `null` when the run was not a rehearsal.
+pub(crate) fn rendered_http_replay(
+    replay: Option<&std::sync::Arc<talos_worker_runtime::http_replay::HttpReplay>>,
+) -> serde_json::Value {
+    use talos_worker_runtime::http_replay::ReplayOutcome;
+    let Some(replay) = replay else {
+        return serde_json::Value::Null;
+    };
+    let requests: Vec<serde_json::Value> = replay
+        .calls()
+        .into_iter()
+        .map(|c| {
+            let (answered_by, status, refused) = match c.outcome {
+                ReplayOutcome::Answered { fixture, status } => (Some(fixture), Some(status), None),
+                ReplayOutcome::Mismatch { fixture, expected } => (
+                    None,
+                    None,
+                    Some(format!("recorded response {fixture} expects {expected}")),
+                ),
+                ReplayOutcome::Exhausted => {
+                    (None, None, Some("no recorded response left".to_string()))
+                }
+            };
+            serde_json::json!({
+                "method": c.method,
+                "host": c.host,
+                "path": c.path,
+                "request_bytes": c.request_bytes,
+                "answered_by": answered_by,
+                "status": status,
+                "refused": refused,
+            })
+        })
+        .collect();
+    let (fixtures, unused) = replay.unused();
+    serde_json::json!({
+        "requests": requests,
+        "fixtures": fixtures,
+        "unused_fixtures": unused,
+        "note": "Rehearsal: every request was answered from http_fixtures. Nothing was sent, \
+                 no secret was resolved, and vault:// references were not checked. A request \
+                 the module's grants refuse never reaches a recording and is not listed here \
+                 (see host_diagnostics). webhook, GraphQL, streaming and wasi:http calls are \
+                 refused in a rehearsal; LLM, email, storage, messaging and memory calls are \
+                 not affected by it.",
+    })
+}
+
 /// LLM token usage of one in-process run, one entry per provider+model,
 /// sorted so the reply is stable. `null` when the module made no LLM call —
 /// "no call" and "zero tokens" are different answers.
@@ -3552,6 +3665,12 @@ async fn handle_test_module(
             ));
         }
     }
+    // Recorded HTTP answers: when given, this run is a rehearsal and makes no
+    // request. Refused here, before the module is loaded, if it cannot be read.
+    let http_replay = match parse_http_fixtures(args.get("http_fixtures")) {
+        Ok(r) => r,
+        Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
+    };
     let accumulated = match args.get("accumulated") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) if !v.is_object() => {
@@ -3820,10 +3939,15 @@ async fn handle_test_module(
     // it at the outbound call. Substituting here used to hand a sandbox guest
     // the plaintext that production never gives it — the one surface where the
     // scaffold's "modules MUST NOT see the plaintext secret" was untrue.
-    if let Err(msg) =
-        talos_workflow_engine::vault_resolver::check_vault_refs_resolvable(&secrets, &vault_refs)
-    {
-        return Some(mcp_error(req_id.clone(), -32602, &msg.to_string()));
+    // Not in a rehearsal: nothing is sent, so a reference to a secret that is
+    // not stored yet (a service not connected yet) must not stop the run.
+    if http_replay.is_none() {
+        if let Err(msg) = talos_workflow_engine::vault_resolver::check_vault_refs_resolvable(
+            &secrets,
+            &vault_refs,
+        ) {
+            return Some(mcp_error(req_id.clone(), -32602, &msg.to_string()));
+        }
     }
 
     // Thread integration_name + user_id into the security envelope so the
@@ -3940,7 +4064,17 @@ async fn handle_test_module(
     let security_policy = talos_worker_runtime::runtime::SecurityPolicy {
         allowed_secrets: module.allowed_secrets.clone(),
         integration_name: module.integration_name.clone(),
+        http_replay: http_replay.clone(),
         ..Default::default()
+    };
+    // A rehearsal runs ONCE: the recordings are handed out in order, so an
+    // in-process retry would run the module again against whatever is left.
+    let retry_policy = if http_replay.is_some() {
+        talos_worker_runtime::runtime::RetryPolicy::controller_dispatched()
+    } else {
+        // Embedded rehearsal surface, no controller retry loop above it:
+        // the old in-process policy, named rather than defaulted.
+        talos_worker_runtime::runtime::RetryPolicy::in_process_transient()
     };
     // Same rationale as run_sandbox: `test_module` passes
     // `execution_context: None` and writes no `module_executions` row, so the
@@ -3983,9 +4117,7 @@ async fn handle_test_module(
             secrets,
             None,
             std::time::Duration::from_secs(timeout_secs),
-            // Embedded rehearsal surface, no controller retry loop above it:
-            // the old in-process policy, named rather than defaulted.
-            talos_worker_runtime::runtime::RetryPolicy::in_process_transient(),
+            retry_policy,
             None,
             security_policy,
             None, // capability_world_hint
@@ -4096,6 +4228,7 @@ async fn handle_test_module(
                     // SUCCESS arm too: a module can swallow a failed fetch in
                     // its own error handling and still return ok.
                     "host_diagnostics": collected_host_diagnostics(&host_diags),
+                    "http_replay": rendered_http_replay(http_replay.as_ref()),
                 })
                 .to_string(),
             ))
@@ -4111,6 +4244,7 @@ async fn handle_test_module(
                 // The whole point: an opaque `networkerror` here is now
                 // accompanied by the host's reason for it.
                 "host_diagnostics": collected_host_diagnostics(&host_diags),
+                "http_replay": rendered_http_replay(http_replay.as_ref()),
             })
             .to_string(),
         )),
@@ -5061,6 +5195,86 @@ mod expensive_op_limiter_cap_tests {
         assert_eq!(EXPENSIVE_OP_LIMITER.len(), EXPENSIVE_OP_LIMITER_MAX_ENTRIES);
 
         EXPENSIVE_OP_LIMITER.clear();
+    }
+}
+
+// `test_module` rehearsal: `parse_http_fixtures` / `rendered_http_replay`.
+// Down here, not beside them: the textual pins below read everything above
+// the first test module as production source.
+#[cfg(test)]
+mod http_fixture_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn absent_means_real_requests_and_a_body_is_sent_as_given() {
+        assert!(parse_http_fixtures(None).unwrap().is_none());
+        assert!(parse_http_fixtures(Some(&json!(null))).unwrap().is_none());
+        let replay = parse_http_fixtures(Some(&json!([
+            {"method": "post", "url_contains": "/a", "body": {"k": [1, 2]}},
+            {"status": 404, "body": "not found", "headers": {"content-type": "text/plain"}},
+            {}
+        ])))
+        .unwrap()
+        .unwrap();
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        let first = replay.answer("POST", &url("https://x.test/a"), 0).unwrap();
+        assert_eq!(
+            (first.status, first.body.as_slice()),
+            (200, br#"{"k":[1,2]}"#.as_slice())
+        );
+        let second = replay.answer("GET", &url("https://x.test/b"), 0).unwrap();
+        assert_eq!(
+            (second.status, second.body.as_slice()),
+            (404, b"not found".as_slice())
+        );
+        assert!(replay
+            .answer("GET", &url("https://x.test/c"), 0)
+            .unwrap()
+            .body
+            .is_empty());
+    }
+
+    #[test]
+    fn a_fixture_that_cannot_be_read_is_refused_not_guessed() {
+        for bad in [
+            json!({"status": 200}),         // not an array
+            json!([]),                      // nothing recorded
+            json!([{"url_contain": "/a"}]), // misspelled field
+            json!([{"status": "200"}]),     // wrong type
+            json!([{"status": 42}]),        // not a status
+            json!([{"method": "HEAD"}]),    // a verb no module can declare
+            json!([{"headers": {"a": 1}}]), // header values are text
+        ] {
+            assert!(parse_http_fixtures(Some(&bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_reply_lists_each_request_and_what_answered_it() {
+        assert_eq!(rendered_http_replay(None), serde_json::Value::Null);
+        let replay = parse_http_fixtures(Some(&json!([{"url_contains": "/a", "status": 201}])))
+            .unwrap()
+            .unwrap();
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        let _ = replay.answer("GET", &url("https://x.test/b?token=t"), 3);
+        let _ = replay.answer("GET", &url("https://x.test/a"), 0);
+        let _ = replay.answer("GET", &url("https://x.test/a"), 0);
+        let out = rendered_http_replay(Some(&replay));
+        assert_eq!(out["fixtures"], 1);
+        assert_eq!(out["unused_fixtures"], 0);
+        assert_eq!(
+            out["requests"][0]["refused"],
+            "recorded response 0 expects a URL containing '/a'"
+        );
+        assert_eq!(out["requests"][0]["path"], "/b");
+        assert_eq!(out["requests"][1]["answered_by"], 0);
+        assert_eq!(out["requests"][1]["status"], 201);
+        assert_eq!(out["requests"][2]["refused"], "no recorded response left");
+        assert!(
+            !out.to_string().contains("token=t"),
+            "the query string is not shown"
+        );
     }
 }
 

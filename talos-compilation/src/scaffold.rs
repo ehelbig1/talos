@@ -150,6 +150,20 @@ pub fn compute_max_fuel_with_llm_output(
 ///
 /// So a module that only fetches and typed-parses costs about 11 per byte, and
 /// one that decodes or scans what it fetched costs 30–40 per byte it touches.
+/// Those rates are for long string values. JSON made of many short fields
+/// costs more per byte, because the parser's work follows the number of
+/// tokens and not the number of bytes. Measured 2026-10-03 on bank
+/// transaction records of about 2 KB and several dozen fields each, typed
+/// structs, most fields skipped: 110–127 K per record all told — the fixed
+/// 60 K per item plus about 30 per byte. A second module that read
+/// number-heavy JSON measured about 210 per byte of input all told, above
+/// [`FUEL_PER_BYTE_MAX`]; a budget for one states a larger `bytes_per_item`
+/// or a `safety_multiplier`.
+///
+/// A rate taken from this table is an estimate. `test_module` with
+/// `http_fixtures` runs a module against a recorded response without making
+/// a request, and its reply carries the fuel used.
+///
 /// With the default, 20 messages of 60 KB were budgeted 7.3 M; reading them
 /// took about 50 M. Loop style did not matter (iterator and indexed loops, and
 /// a table decoder in place of the `base64` crate, all measured the same);
@@ -426,7 +440,7 @@ pub const FUEL_PER_BYTE: u64 = 2;
 pub const FUEL_PER_BYTE_MAX: u64 = 100;
 /// The sentence every `fuel_budget` schema carries about the per-byte rate, so
 /// the four tools that take a budget cannot describe it four ways.
-pub const FUEL_PER_BYTE_GUIDANCE: &str = "`fuel_per_byte` (integer 1–100, default 2) is the cost of each input byte. The default suits small typed items; measured costs are about 11 per byte for a response that is only fetched and typed-parsed, and 30–40 per byte the module decodes or scans (base64, HTML, text). Set it for byte-heavy modules: at the default, 20 items of 60 KB are budgeted 7.3M where reading them took about 50M. A budget field that cannot be read — a wrong type, a value out of range, or a misspelled field name — is REFUSED, never replaced by its default.";
+pub const FUEL_PER_BYTE_GUIDANCE: &str = "`fuel_per_byte` (integer 1–100, default 2) is the cost of each input byte. The default suits small typed items; measured costs are about 11 per byte for a response that is only fetched and typed-parsed, and 30–40 per byte the module decodes or scans (base64, HTML, text). JSON made of many short fields costs more than its size suggests: 2 KB records of several dozen fields measured 110–127K each, which is the 60K per item plus about 30 per byte. To measure instead of estimating, run `test_module` with `http_fixtures`: it replays a recorded response without making a request and reports the fuel used. Set the rate for byte-heavy modules: at the default, 20 items of 60 KB are budgeted 7.3M where reading them took about 50M. A budget field that cannot be read — a wrong type, a value out of range, or a misspelled field name — is REFUSED, never replaced by its default.";
 /// Dispatcher clamp floor — the smallest max_fuel any module is given.
 pub const FUEL_MIN: u64 = 1_000_000;
 /// Dispatcher clamp ceiling — the largest max_fuel any module is given.

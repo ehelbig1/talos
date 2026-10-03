@@ -232,6 +232,9 @@ impl wit_http_stream::Host for TalosContext {
         headers: Vec<(String, String)>,
     ) -> Result<String, wit_http_stream::Error> {
         use crate::wit_inspector::CapabilityWorld;
+        if self.rehearsal_refuses("http_stream::connect").await {
+            return Err(wit_http_stream::Error::ConnectionFailed);
+        }
         if matches!(
             self.capability_world,
             CapabilityWorld::Minimal | CapabilityWorld::Unknown

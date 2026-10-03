@@ -187,6 +187,12 @@ pub struct TalosContext {
     /// `None` for every non-declaring node → no header is added.
     pub idempotency_key: Option<String>,
 
+    /// Recorded HTTP answers for a rehearsal. When `Some`, `http::fetch` and
+    /// `fetch_all` are answered from it after every policy gate has run, and
+    /// nothing is sent. Set only from a hand-built `SecurityPolicy` in the
+    /// controller process (see [`crate::http_replay`]).
+    pub http_replay: Option<std::sync::Arc<crate::http_replay::HttpReplay>>,
+
     /// Pluggable secret provider — the single source of truth for all secret resolution.
     ///
     /// Backs three-tier secret access:
@@ -1581,6 +1587,7 @@ impl TalosContext {
             // Populated downstream from the JobRequest (via SecurityPolicy) —
             // None at construct time so non-declaring nodes add no header.
             idempotency_key: None,
+            http_replay: None,
             provider,
             expose_call_count: std::sync::atomic::AtomicU64::new(0),
             secret_tier2_exposed: std::sync::atomic::AtomicBool::new(false),
@@ -2023,6 +2030,26 @@ impl TalosContext {
     // WASI stdio streams), so async methods must hold an exclusive ref
     // to keep their futures Send — same reason record_capability_denied
     // and every other async host method take `&mut self`.
+    /// In a rehearsal (`http_replay` set) only `http::fetch` / `fetch_all` are
+    /// answered from recordings. Every other HTTP surface calls this first and
+    /// refuses when it returns true, so "a rehearsal sends nothing" holds for
+    /// all of them rather than for the two that are replayed.
+    pub(crate) async fn rehearsal_refuses(&mut self, surface: &'static str) -> bool {
+        if self.http_replay.is_none() {
+            return false;
+        }
+        self.record_network_outcome(None);
+        self.emit_host_diagnostic(
+            "http-replay",
+            &format!(
+                "{surface} is not replayed: this run is a rehearsal (http_fixtures), \
+                 so the call was refused and nothing was sent"
+            ),
+        )
+        .await;
+        true
+    }
+
     pub async fn emit_host_diagnostic(&mut self, reason: &str, message: &str) {
         let count = self
             .host_diag_count

@@ -17,7 +17,7 @@
 /// `main.rs` with every column-0 `#[cfg(test)] mod … { … }` region and every
 /// whole-line comment removed, so neither test code nor prose can vouch for, or
 /// against, the production call.
-fn production_source() -> String {
+pub(crate) fn production_source() -> String {
     let src = include_str!("main.rs");
     let mut out = String::new();
     let mut lines = src.lines().peekable();

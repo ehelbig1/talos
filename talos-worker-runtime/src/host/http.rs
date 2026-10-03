@@ -258,6 +258,34 @@ fn deny_invalid_url(ctx: &TalosContext, class: &'static str) -> wit_http::Error 
 }
 
 impl TalosContext {
+    /// The `allowed_methods` gate of `http::fetch`: `Some(error)` when the
+    /// module did not declare the verb. One body for the live path and the
+    /// rehearsal path ([`crate::http_replay`]), so a rehearsal refuses exactly
+    /// what a real run refuses, with the same audit record.
+    async fn refuse_undeclared_method(
+        &mut self,
+        method_str: &str,
+        host: &str,
+    ) -> Option<wit_http::Error> {
+        if talos_workflow_job_protocol::method_permitted(&self.allowed_methods, method_str) {
+            return None;
+        }
+        self.record_capability_denied_detailed(
+            "http-fetch",
+            "method-allowlist",
+            &format!("{} {}", method_str, host),
+            Some(talos_workflow_job_protocol::METHOD_ALLOWLIST_REMEDY),
+        )
+        .await;
+        tracing::warn!(
+            host,
+            method = method_str,
+            allowed_methods = ?self.allowed_methods,
+            "WASM module attempted a disallowed HTTP method"
+        );
+        Some(deny_forbidden(self, reason_class::METHOD_ALLOWLIST))
+    }
+
     /// Record a URL-admission refusal for `op` and return the guest's error.
     ///
     /// The one place an [`admit_url`] refusal becomes a `wit_http::Error`, for
@@ -462,6 +490,41 @@ impl wit_http::Host for TalosContext {
             }
         }
 
+        // ── Rehearsal: answer from a recorded response, not a socket ────────
+        // Every gate above has run (capability world, URL admission, the write
+        // ceiling, the rate limits, cancellation). The verb gate and the
+        // request-body cap, which the live path applies further down, are
+        // applied here because nothing below this point runs: no DNS lookup,
+        // no circuit breaker, no secret resolved, nothing sent. Dry-run stays
+        // ahead of it — that is the caller's explicit choice for non-GET.
+        if let Some(replay) = self.http_replay.clone() {
+            let verb = method_token(&req.method);
+            if let Some(refused) = self.refuse_undeclared_method(verb, host).await {
+                return Err(refused);
+            }
+            if req.body.len() > MAX_OUTBOUND_HTTP_BODY_BYTES {
+                return Err(deny_forbidden(self, reason_class::REQUEST_BODY_CAP));
+            }
+            return match replay.answer(verb, &url, req.body.len()) {
+                Ok(recorded) => {
+                    self.record_network_outcome(None);
+                    Ok(wit_http::Response {
+                        status: recorded.status,
+                        headers: recorded.headers,
+                        body: recorded.body,
+                    })
+                }
+                Err(miss) => {
+                    // Not a network failure of any class a retry should read:
+                    // the rehearsal has no answer for this request. The
+                    // diagnostic says which, and the latch is cleared.
+                    self.record_network_outcome(None);
+                    self.emit_host_diagnostic("http-replay", &miss.0).await;
+                    Err(wit_http::Error::Networkerror)
+                }
+            };
+        }
+
         // ── Opt-in idempotency: header decision + worker-side dedup ─────────
         // Hoisted ABOVE the DNS lookup / breaker / vault-resolve (2026-09):
         // every input here is pure — the verb, the raw header names, the URL,
@@ -615,21 +678,8 @@ impl wit_http::Host for TalosContext {
 
         // Enforce method allowlist (empty = DENY every verb — see
         // `talos_workflow_job_protocol::method_permitted`).
-        if !talos_workflow_job_protocol::method_permitted(&self.allowed_methods, method_str) {
-            self.record_capability_denied_detailed(
-                "http-fetch",
-                "method-allowlist",
-                &format!("{} {}", method_str, host),
-                Some(talos_workflow_job_protocol::METHOD_ALLOWLIST_REMEDY),
-            )
-            .await;
-            tracing::warn!(
-                host,
-                method = method_str,
-                allowed_methods = ?self.allowed_methods,
-                "WASM module attempted a disallowed HTTP method"
-            );
-            return Err(deny_forbidden(self, reason_class::METHOD_ALLOWLIST));
+        if let Some(refused) = self.refuse_undeclared_method(method_str, host).await {
+            return Err(refused);
         }
 
         // Check circuit breaker before making request
@@ -1224,6 +1274,19 @@ impl wit_http::Host for TalosContext {
                 .iter()
                 .map(|_| Err(wit_http::Error::Forbiddenhost))
                 .collect();
+        }
+
+        // ── Rehearsal ───────────────────────────────────────────────────────
+        // Each entry takes the single-request path, which applies every gate
+        // and answers from the recorded responses in batch order. The batch
+        // pre-flight above (cancellation, capability world, batch size) has
+        // already run.
+        if self.http_replay.is_some() {
+            let mut answers = Vec::with_capacity(reqs.len());
+            for req in reqs {
+                answers.push(wit_http::Host::fetch(self, req).await);
+            }
+            return answers;
         }
 
         // ── Per-request validation ────────────────────────────────────────
@@ -2752,6 +2815,274 @@ mod fetch_all_budget_and_breaker_tests {
 
     fn latched(c: &TalosContext) -> Option<&'static str> {
         c.network_reason_handle().lock().unwrap().map(|r| r.class)
+    }
+
+    // ── Rehearsal: recorded HTTP answers (`crate::http_replay`) ──────────
+
+    fn recorded(
+        method: Option<&str>,
+        contains: Option<&str>,
+        status: u16,
+        body: &str,
+    ) -> crate::http_replay::HttpFixture {
+        crate::http_replay::HttpFixture {
+            method: method.map(str::to_string),
+            url_contains: contains.map(str::to_string),
+            status,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: body.as_bytes().to_vec(),
+        }
+    }
+    fn rehearsal(
+        fixtures: Vec<crate::http_replay::HttpFixture>,
+    ) -> std::sync::Arc<crate::http_replay::HttpReplay> {
+        std::sync::Arc::new(
+            crate::http_replay::HttpReplay::new(fixtures, 1 << 20).expect("fixtures"),
+        )
+    }
+    fn rehearsed_post(url: &str) -> wit_http::Request {
+        wit_http::Request {
+            method: wit_http::Method::Post,
+            url: url.to_string(),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: br#"{"a":1}"#.to_vec(),
+            timeout_ms: None,
+        }
+    }
+
+    /// `.invalid` never resolves, so a real request to it fails at the DNS
+    /// lookup. The rehearsal answers it, which is the proof that nothing
+    /// below the rehearsal block ran.
+    #[tokio::test]
+    async fn a_rehearsal_is_answered_from_the_recording_and_reaches_no_network() {
+        let mut live = ctx(&["bank.invalid"], false);
+        let err = wit_http::Host::fetch(
+            &mut live,
+            rehearsed_post("https://bank.invalid/transactions/get"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, wit_http::Error::Networkerror));
+        // A lookup failure, or (when a sibling test in this process has
+        // switched the private-target pre-check off) the connect failure
+        // behind it: either way the request needed the network.
+        assert!(
+            matches!(
+                latched(&live),
+                Some(reason_class::DNS | reason_class::CONNECT_FAILED)
+            ),
+            "control: without a rehearsal this request needs the network, got {:?}",
+            latched(&live)
+        );
+
+        let replay = rehearsal(vec![recorded(
+            Some("POST"),
+            Some("/transactions/get"),
+            200,
+            r#"{"ok":true}"#,
+        )]);
+        let mut c = ctx(&["bank.invalid"], false);
+        c.http_replay = Some(replay.clone());
+        let r = wit_http::Host::fetch(
+            &mut c,
+            rehearsed_post("https://bank.invalid/transactions/get"),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(
+            (r.status, r.body.as_slice()),
+            (200, br#"{"ok":true}"#.as_slice())
+        );
+        assert_eq!(latched(&c), None);
+        let calls = replay.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            (
+                calls[0].method,
+                calls[0].host.as_str(),
+                calls[0].path.as_str(),
+                calls[0].request_bytes
+            ),
+            ("POST", "bank.invalid", "/transactions/get", 7)
+        );
+    }
+
+    /// A rehearsal is for seeing what a real run would do, so it refuses what
+    /// a real run refuses, and a refused request is not handed a recording.
+    #[tokio::test]
+    async fn a_rehearsal_refuses_what_a_real_run_refuses() {
+        let replay = rehearsal(vec![recorded(None, None, 200, "x")]);
+
+        // A host the module was not granted.
+        let mut c = ctx(&["bank.invalid"], false);
+        c.http_replay = Some(replay.clone());
+        let err = wit_http::Host::fetch(&mut c, rehearsed_post("https://elsewhere.invalid/x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, wit_http::Error::Forbiddenhost));
+        assert_eq!(latched(&c), Some(reason_class::ALLOWED_HOSTS));
+
+        // A verb the module did not declare.
+        let mut c = ctx(&["bank.invalid"], false);
+        c.allowed_methods = vec!["GET".to_string()];
+        c.http_replay = Some(replay.clone());
+        let err = wit_http::Host::fetch(&mut c, rehearsed_post("https://bank.invalid/x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, wit_http::Error::Forbiddenhost));
+        assert_eq!(latched(&c), Some(reason_class::METHOD_ALLOWLIST));
+
+        // A module with no HTTP capability at all.
+        let mut c = ctx(&["bank.invalid"], false);
+        c.capability_world = CapabilityWorld::Minimal;
+        c.http_replay = Some(replay.clone());
+        assert!(
+            wit_http::Host::fetch(&mut c, rehearsed_post("https://bank.invalid/x"))
+                .await
+                .is_err()
+        );
+
+        assert!(
+            replay.calls().is_empty(),
+            "no refused request reached the recording"
+        );
+        assert_eq!(replay.unused(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_request_the_recording_cannot_answer_fails_and_says_why() {
+        let sink: crate::context::HostDiagSink =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replay = rehearsal(vec![recorded(Some("POST"), Some("/a"), 200, "one")]);
+        let mut c = ctx(&["bank.invalid"], false);
+        c.http_replay = Some(replay.clone());
+        c.host_diag_sink = Some(sink.clone());
+
+        // The wrong endpoint is not handed the recording for another.
+        let err = wit_http::Host::fetch(&mut c, rehearsed_post("https://bank.invalid/b"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, wit_http::Error::Networkerror));
+        assert!(
+            wit_http::Host::fetch(&mut c, rehearsed_post("https://bank.invalid/a"))
+                .await
+                .is_ok()
+        );
+        // And once the recordings are used up, the next request fails.
+        assert!(
+            wit_http::Host::fetch(&mut c, rehearsed_post("https://bank.invalid/a"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            latched(&c),
+            None,
+            "a missing recording is not a network failure class a retry should read"
+        );
+
+        let lines = sink.lock().unwrap().join("\n");
+        assert!(lines.contains("http-replay"), "{lines}");
+        assert!(
+            lines.contains("expects POST a URL containing '/a'"),
+            "{lines}"
+        );
+        assert!(lines.contains("no recorded response left"), "{lines}");
+    }
+
+    /// Only `fetch` / `fetch_all` are replayed. The other HTTP surfaces must
+    /// not send in a rehearsal, so they refuse — before any lookup.
+    #[tokio::test]
+    async fn the_http_surfaces_that_are_not_replayed_send_nothing_in_a_rehearsal() {
+        use super::super::{wit_graphql, wit_http_stream, wit_webhook};
+        let hook = || wit_webhook::WebhookRequest {
+            url: "https://bank.invalid/hook".to_string(),
+            headers: vec![],
+            body: "{}".to_string(),
+            max_retries: Some(0),
+            retry_delay_ms: None,
+        };
+        // Control: this module is not granted the host, and a real run says so.
+        let mut live = ctx(&["elsewhere.invalid"], false);
+        assert!(wit_webhook::Host::send(&mut live, hook()).await.is_err());
+        assert_eq!(
+            latched(&live),
+            Some(reason_class::ALLOWED_HOSTS),
+            "control: without a rehearsal the webhook reaches the host gate"
+        );
+
+        let sink: crate::context::HostDiagSink =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replay = rehearsal(vec![recorded(None, None, 200, "{}")]);
+        let mut c = ctx(&["elsewhere.invalid"], false);
+        c.http_replay = Some(replay.clone());
+        c.host_diag_sink = Some(sink.clone());
+
+        assert!(matches!(
+            wit_webhook::Host::send(&mut c, hook()).await,
+            Err(wit_webhook::Error::Sendfailed)
+        ));
+        assert!(matches!(
+            wit_graphql::Host::execute(
+                &mut c,
+                wit_graphql::Request {
+                    url: "https://bank.invalid/graphql".to_string(),
+                    query: "{ me { id } }".to_string(),
+                    variables: None,
+                    headers: None,
+                    timeout_ms: None,
+                },
+            )
+            .await,
+            Err(wit_graphql::Error::Networkerror)
+        ));
+        assert!(matches!(
+            wit_http_stream::Host::connect(
+                &mut c,
+                "https://bank.invalid/events".to_string(),
+                vec![]
+            )
+            .await,
+            Err(wit_http_stream::Error::ConnectionFailed)
+        ));
+        assert_eq!(
+            latched(&c),
+            None,
+            "the rehearsal refused each one before any gate or lookup"
+        );
+        assert!(replay.calls().is_empty(), "and none consumed a recording");
+
+        let lines = sink.lock().unwrap().join("\n");
+        for surface in ["webhook::send", "graphql::execute", "http_stream::connect"] {
+            assert!(
+                lines.contains(&format!("{surface} is not replayed")),
+                "{surface}: {lines}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_answered_in_request_order() {
+        let replay = rehearsal(vec![
+            recorded(None, Some("/1"), 200, "one"),
+            recorded(None, Some("/2"), 404, "two"),
+        ]);
+        let mut c = ctx(&["bank.invalid"], false);
+        c.http_replay = Some(replay.clone());
+        let out = wit_http::Host::fetch_all(
+            &mut c,
+            vec![
+                rehearsed_post("https://bank.invalid/1"),
+                rehearsed_post("https://bank.invalid/2"),
+                rehearsed_post("https://bank.invalid/3"),
+            ],
+        )
+        .await;
+        let statuses: Vec<Option<u16>> = out
+            .iter()
+            .map(|r| r.as_ref().ok().map(|r| r.status))
+            .collect();
+        assert_eq!(statuses, vec![Some(200), Some(404), None]);
+        assert_eq!(replay.calls().len(), 3);
     }
 
     fn bogus() -> wit_http::Request {
