@@ -99,7 +99,7 @@ BASES = [
      "2026-09-25: the structural-lint check specifications -> structural-lint-checks.md"),
     ("7bc9e5c4997983b67a1fcdaa730beda41af80ae7", "6bda9e33e87e5b5051b998c7fbe1f711af386b2e",
      "2026-10-03: the package record bullets -> 2026-10-03-package-record.md (title index kept)"),
-    ("78675f441dcdfcfa9f19ffea14ef677370a7fb81", None,
+    ("78675f441dcdfcfa9f19ffea14ef677370a7fb81", "9bb69072f47ac67455fba1390966d25902ba9bbc",
      "2026-10-03: the class digests -> DECISIONS.md (one index line each kept in CLAUDE.md)"),
 ]
 ARCHIVE = Path("docs/engineering-log")
