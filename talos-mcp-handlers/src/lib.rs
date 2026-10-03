@@ -1195,6 +1195,115 @@ async fn handle_resources_read(
     resources::handle_resources_read(req, db_pool, execution_repo, agent).await
 }
 
+/// The name a catalog module is listed under as a tool.
+fn catalog_tool_name(module_name: &str) -> String {
+    format!("{}-v1", sanitize_tool_name(module_name))
+}
+
+/// One row per catalog tool name, in the order given.
+///
+/// A catalog module the caller has installed exists twice — the shared
+/// catalog row and their own copy, same name — and until 2026-10-03 both were
+/// listed, as two tools with ONE name (six such pairs on the reference
+/// deployment, 21 KB of schema). A tool name must be unique: a client keeps
+/// one of the two, or rejects the list. The shared row wins, because calling
+/// the tool installs from the catalog, so the catalog's description and
+/// config schema are the ones that describe what the call does; an installed
+/// copy can be older than the catalog. A name only the caller's rows carry
+/// keeps its first row.
+fn one_row_per_catalog_tool(
+    templates: Vec<talos_registry::NodeTemplateMetadata>,
+) -> Vec<talos_registry::NodeTemplateMetadata> {
+    let mut kept: Vec<talos_registry::NodeTemplateMetadata> = Vec::with_capacity(templates.len());
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for t in templates {
+        match at.get(&catalog_tool_name(&t.name)) {
+            None => {
+                at.insert(catalog_tool_name(&t.name), kept.len());
+                kept.push(t);
+            }
+            Some(&i) if t.shared && !kept[i].shared => kept[i] = t,
+            Some(_) => {}
+        }
+    }
+    kept
+}
+
+#[cfg(test)]
+mod catalog_tool_dedup_tests {
+    use super::*;
+
+    fn row(name: &str, shared: bool, description: &str) -> talos_registry::NodeTemplateMetadata {
+        talos_registry::NodeTemplateMetadata {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            category: "catalog".to_string(),
+            description: Some(description.to_string()),
+            config_schema: serde_json::json!({}),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            requires_approval_for: vec![],
+            capability_world: "minimal-node".to_string(),
+            is_compiled: true,
+            shared,
+        }
+    }
+
+    #[test]
+    fn an_installed_copy_does_not_list_its_catalog_module_twice() {
+        // The query orders by name then id, so either row can come first.
+        for own_first in [true, false] {
+            let rows = if own_first {
+                vec![
+                    row("LLM Inference", false, "mine"),
+                    row("LLM Inference", true, "catalog"),
+                    row("Echo Debug", true, "catalog"),
+                ]
+            } else {
+                vec![
+                    row("LLM Inference", true, "catalog"),
+                    row("LLM Inference", false, "mine"),
+                    row("Echo Debug", true, "catalog"),
+                ]
+            };
+            let kept = one_row_per_catalog_tool(rows);
+            let names: Vec<String> = kept.iter().map(|t| catalog_tool_name(&t.name)).collect();
+            assert_eq!(
+                names,
+                ["LLM_Inference-v1", "Echo_Debug-v1"],
+                "own_first={own_first}"
+            );
+            assert_eq!(
+                kept[0].description.as_deref(),
+                Some("catalog"),
+                "the catalog row describes the tool"
+            );
+        }
+    }
+
+    #[test]
+    fn names_that_sanitise_to_one_tool_name_are_one_tool() {
+        // What must be unique is the TOOL name, not the module name.
+        let (a, b) = ("Gmail: List", "Gmail; List");
+        assert_ne!(a, b);
+        assert_eq!(catalog_tool_name(a), catalog_tool_name(b), "premise");
+        let kept = one_row_per_catalog_tool(vec![row(a, false, "mine"), row(b, true, "catalog")]);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].shared);
+    }
+
+    #[test]
+    fn a_module_only_the_caller_has_is_still_listed_once() {
+        let kept = one_row_per_catalog_tool(vec![
+            row("My Tool", false, "first"),
+            row("My Tool", false, "second"),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].description.as_deref(), Some("first"));
+    }
+}
+
 async fn handle_tools_list(
     req: JsonRpcRequest,
     registry: std::sync::Arc<ModuleRegistry>,
@@ -1294,7 +1403,7 @@ async fn handle_tools_list(
 
     let world_map: std::collections::HashMap<uuid::Uuid, String> = world_rows.into_iter().collect();
 
-    for t in templates {
+    for t in one_row_per_catalog_tool(templates) {
         // Skip non-executable template categories from the direct tool list:
         // - sandbox: user-created sandboxes (available via list_modules)
         // - workflow_template: saved workflow graphs (not Rust code, can't be JIT compiled)
@@ -1367,7 +1476,7 @@ async fn handle_tools_list(
             catalog_slug
         );
         tools.push(serde_json::json!({
-            "name": format!("{}-v1", sanitize_tool_name(&t.name)),
+            "name": catalog_tool_name(&t.name),
             "description": full_desc,
             "inputSchema": input_schema
         }));
