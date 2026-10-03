@@ -3327,9 +3327,6 @@ async fn handle_hot_update_module(
             if let Some(note) = hot_update_decode.as_ref().and_then(|d| d.note()) {
                 response["source_entity_repair"] = serde_json::Value::String(note);
             }
-            // The module's config schema / capability description may have
-            // changed — connected MCP streams should re-fetch tools/list.
-            crate::notify_tools_list_changed();
             Some(mcp_text(
                 req_id.clone(),
                 &serde_json::to_string_pretty(&response).unwrap_or_default(),

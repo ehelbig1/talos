@@ -12,28 +12,6 @@ pub use talos_compilation::dependency_allowlist::{
     get_allowed_dependencies, validate_dependencies,
 };
 
-/// Sanitize a template name into a valid MCP tool name.
-/// MCP requires: `^[a-zA-Z0-9_-]{1,64}$`
-pub fn sanitize_tool_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    // Truncate to fit within 64 chars (with room for "-v1" suffix)
-    let max_len = 60;
-    if sanitized.len() > max_len {
-        sanitized[..max_len].to_string()
-    } else {
-        sanitized
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Graph diff helper for MCP tools
 // -----------------------------------------------------------------------------
@@ -2023,8 +2001,7 @@ static TOOL_ARG_INDEX: std::sync::OnceLock<
     std::collections::HashMap<String, std::collections::HashSet<String>>,
 > = std::sync::OnceLock::new();
 
-/// Every statically declared tool schema (the dynamic catalog-template tools
-/// are not here; their arguments are the module's config).
+/// Every statically declared tool schema.
 fn all_static_tool_schemas() -> Vec<serde_json::Value> {
     [
         crate::advanced::tool_schemas(),
@@ -2196,7 +2173,7 @@ fn closest_declared_arg<'a>(
 
 /// Detect argument names the tool's advertised schema doesn't declare.
 /// Returns a human-readable warning, or `None` when everything matches,
-/// the tool isn't in the static index (dynamic `-v1` catalog tools), or
+/// the tool isn't in the static index (an unknown name), or
 /// the tool declares no properties at all.
 ///
 /// SECURITY: only argument NAMES are inspected and echoed — never values
@@ -2489,7 +2466,7 @@ mod unknown_arg_tests {
             &serde_json::json!({"workflow_id": "x", "node_id": "n", "connect_from": "a", "_meta": {}}),
         )
         .is_none());
-        // Unknown TOOL (dynamic -v1 catalog route) → no warning.
+        // Unknown TOOL (a retired `-v1` shortcut name) → no warning.
         assert!(
             unknown_argument_warning("Redis_Cache-v1", &serde_json::json!({"anything": 1}))
                 .is_none()
