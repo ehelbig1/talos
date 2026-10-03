@@ -253,7 +253,14 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
             .map(|s| s.to_string());
         Some(SystemNodeKind::ErrorHandler { error_pattern })
     } else if k == "collect" {
-        Some(SystemNodeKind::Collect)
+        // Strictly `true`: any other value (absent, a string) leaves the
+        // output as it has always been.
+        let label_items = node
+            .get("data")
+            .and_then(|d| d.get("label_items"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        Some(SystemNodeKind::Collect { label_items })
     } else if k == "assistant_report" {
         // Clamp defensively (default 7 days, cap one month).
         let days = node

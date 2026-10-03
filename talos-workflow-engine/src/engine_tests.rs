@@ -499,7 +499,7 @@ fn wait_handler_returns_none_for_non_wait_nodes() {
         collect_node,
         None,
         None,
-        Some(talos_workflow_engine_core::SystemNodeKind::Collect),
+        Some(talos_workflow_engine_core::SystemNodeKind::Collect { label_items: false }),
     );
     assert!(engine
         .try_dispatch_wait(collect_node, Uuid::new_v4())

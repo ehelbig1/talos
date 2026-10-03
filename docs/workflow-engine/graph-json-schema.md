@@ -310,10 +310,19 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 ### `collect`
 ```jsonc
 // Gathers every upstream branch's output into a single list on the
-// node's output payload. No configuration — the `data` object is empty
-// (or omitted). Pair with `synthesize` if you want to transform the
-// collected list before downstream consumption.
-{}
+// node's output payload: { "items": [...], "count": N }. Nothing is
+// required — the `data` object may be empty (or omitted). Pair with
+// `synthesize` if you want to transform the collected list before
+// downstream consumption.
+//
+// `items` is NOT in the order the edges were declared (the order is the
+// graph library's and is not stable). To tell which branch an element came
+// from, set `label_items: true`: the output then also carries `sources`,
+// the node id of each parent in the same order as `items`, so
+// `sources[i]` names the branch `items[i]` came from — including a failed
+// branch's error element. Off by default; an existing collect node's
+// output is unchanged.
+{ "label_items": true }
 ```
 
 ### `ops_alerts_digest`

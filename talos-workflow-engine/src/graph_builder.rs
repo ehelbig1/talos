@@ -39,7 +39,7 @@
 //!     .add_module("fetch", module_id, Some(json!({ "url": "https://example.com" })))
 //!     .add_system_node(
 //!         "aggregate",
-//!         SystemNodeKind::Collect,
+//!         SystemNodeKind::Collect { label_items: false },
 //!     )
 //!     .edge("fetch", "aggregate")
 //!     .build()
@@ -527,7 +527,14 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 "condition": condition,
             }),
         ),
-        SystemNodeKind::Collect => ("collect", json!({})),
+        SystemNodeKind::Collect { label_items } => (
+            "collect",
+            if *label_items {
+                json!({ "label_items": true })
+            } else {
+                json!({})
+            },
+        ),
         SystemNodeKind::OpsAlertsDigest { top_limit } => {
             ("ops_alerts_digest", json!({ "top_limit": top_limit }))
         }
@@ -960,7 +967,7 @@ mod tests {
     #[test]
     fn system_node_collect_has_empty_data() {
         let g = WorkflowGraphBuilder::new()
-            .add_system_node("c", SystemNodeKind::Collect)
+            .add_system_node("c", SystemNodeKind::Collect { label_items: false })
             .build()
             .unwrap();
         assert_eq!(g["nodes"][0]["kind"].as_str(), Some("collect"));
@@ -1069,7 +1076,7 @@ mod tests {
         let graph = WorkflowGraphBuilder::new()
             .execution_timeout(Duration::from_secs(42))
             .add_module("fetch", module_id, Some(json!({ "url": "x" })))
-            .add_system_node("aggregate", SystemNodeKind::Collect)
+            .add_system_node("aggregate", SystemNodeKind::Collect { label_items: false })
             .edge("fetch", "aggregate")
             .build()
             .unwrap();
@@ -1123,8 +1130,8 @@ mod tests {
         use crate::ParallelWorkflowEngine;
 
         let graph = WorkflowGraphBuilder::new()
-            .add_system_node("collect_a", SystemNodeKind::Collect)
-            .add_system_node("collect_b", SystemNodeKind::Collect)
+            .add_system_node("collect_a", SystemNodeKind::Collect { label_items: false })
+            .add_system_node("collect_b", SystemNodeKind::Collect { label_items: false })
             .edge("collect_a", "collect_b")
             .build()
             .unwrap();
@@ -1298,8 +1305,24 @@ mod tests {
 
     #[tokio::test]
     async fn system_node_collect_round_trips() {
-        let decoded = round_trip_kind("collect_node", SystemNodeKind::Collect).await;
-        assert!(matches!(decoded, SystemNodeKind::Collect));
+        let decoded = round_trip_kind(
+            "collect_node",
+            SystemNodeKind::Collect { label_items: false },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::Collect { label_items: false }
+        ));
+        let labelled = round_trip_kind(
+            "collect_node",
+            SystemNodeKind::Collect { label_items: true },
+        )
+        .await;
+        assert!(matches!(
+            labelled,
+            SystemNodeKind::Collect { label_items: true }
+        ));
     }
 
     #[tokio::test]

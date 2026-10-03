@@ -123,7 +123,7 @@ async fn pure_system_node_graph_runs_without_fetcher_or_user() {
     // attribution) is still runnable. This test guards against an
     // over-eager precheck that would block legitimate use cases.
     let graph = WorkflowGraphBuilder::new()
-        .add_system_node("collect", SystemNodeKind::Collect)
+        .add_system_node("collect", SystemNodeKind::Collect { label_items: false })
         .build()
         .unwrap();
 

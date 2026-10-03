@@ -96,7 +96,7 @@ async fn a_module_nodes_controls_are_stored_where_the_engine_reads_them() {
         "nodes": [
             {"id": "left", "module_id": module, "config": {"SIDE": "l"}, "continue_on_error": true, "timeout_secs": 45, "retry_count": 2},
             {"id": "right", "module_id": module, "continue_on_error": false},
-            {"id": "join", "node_type": "collect"},
+            {"id": "join", "node_type": "collect", "continue_on_error": true, "label_items": true},
             {"id": "work", "module_id": module, "skip_condition": "count == 0"},
             {"id": "plain", "module_id": module}
         ],
@@ -137,6 +137,15 @@ async fn a_module_nodes_controls_are_stored_where_the_engine_reads_them() {
         "the module's own config is left alone"
     );
     assert_eq!(node(&nodes, "right")["continue_on_error"], false);
+    // A structural node carries the flag in `data`, where
+    // `set_continue_on_error` writes it and the engine reads it. Until
+    // 2026-10-03 this was refused and needed a second call.
+    assert_eq!(
+        node(&nodes, "join")["data"]["continue_on_error"],
+        true,
+        "{nodes:?}"
+    );
+    assert_eq!(node(&nodes, "join")["data"]["label_items"], true);
     assert_eq!(node(&nodes, "work")["skip_condition"], "count == 0");
     let plain = node(&nodes, "plain");
     for key in ["skip_condition", "continue_on_error", "timeout_secs"] {
@@ -228,8 +237,8 @@ async fn a_malformed_control_is_refused_and_nothing_is_created() {
             "set it once",
         ),
         (
-            json!({"id": "n", "node_type": "collect", "continue_on_error": true}),
-            "set_continue_on_error",
+            json!({"id": "n", "node_type": "collect", "skip_condition": "count == 0"}),
+            "add_skip_condition",
         ),
         (
             json!({"id": "n", "module_id": module, "timeout_secs": 86400}),

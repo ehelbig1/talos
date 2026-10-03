@@ -33,6 +33,17 @@ pub async fn list_user_service_integrations(
     pool: &PgPool,
     user_id: Uuid,
 ) -> Result<Vec<ServiceIntegrationRow>> {
+    sqlx::query_as::<_, ServiceIntegrationRow>(&connections_union_sql())
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+        .context("Failed to list user service integrations")
+}
+
+/// The cross-provider listing, one `UNION ALL` branch per registry entry.
+/// Every interpolated fragment is a compile-time constant of `PROVIDERS`;
+/// the only bind is `user_id` ($1), and every branch filters on it.
+fn connections_union_sql() -> String {
     let union_branches: Vec<String> = PROVIDERS
         .iter()
         .map(|provider| {
@@ -42,8 +53,13 @@ pub async fn list_user_service_integrations(
                 "t"
             };
             let join_clause = provider.account_identifier_join.unwrap_or("");
+            let tier = provider
+                .tier_column
+                .map_or_else(|| "NULL".to_string(), |c| format!("{table_alias}.{c}"));
             format!(
-                "SELECT {alias}.id, {ident} as identifier, {alias}.created_at, '{enum_tag}' as service_tag \
+                "SELECT {alias}.id, {ident} as identifier, {alias}.created_at, '{enum_tag}' as service_tag, \
+                        '{provider_id}' as provider_id, {alias}.{key}::text as provider_key, \
+                        {tier}::text as tier \
                  FROM {table} {alias} {join} \
                  WHERE {alias}.user_id = $1 {extra}",
                 alias = table_alias,
@@ -52,16 +68,45 @@ pub async fn list_user_service_integrations(
                 join = join_clause,
                 extra = provider.extra_where,
                 enum_tag = provider.graphql_enum,
+                provider_id = provider.id,
+                key = provider.provider_key_column,
             )
         })
         .collect();
+    union_branches.join(" UNION ALL ")
+}
 
-    let sql = union_branches.join(" UNION ALL ");
-    sqlx::query_as::<_, ServiceIntegrationRow>(&sql)
+/// One connection with what is needed to name its stored credential: the
+/// registry id of its provider, the row's vault provider key and, for a
+/// tiered provider, its tier.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ConnectionRow {
+    pub id: Uuid,
+    pub identifier: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The registry entry's `id` (`"gmail"`, `"plaid"`, …).
+    pub provider_id: String,
+    pub provider_key: Option<String>,
+    pub tier: Option<String>,
+}
+
+/// Most connections one listing returns. A user holds a handful.
+pub const MAX_LISTED_CONNECTIONS: i64 = 500;
+
+/// [`list_user_service_integrations`] plus each row's provider key and tier,
+/// for the caller that tells an author which `vault://` reference a
+/// connection's token lives at. Same statement, same `user_id` filter in
+/// every branch; bounded at [`MAX_LISTED_CONNECTIONS`].
+pub async fn list_user_connections(pool: &PgPool, user_id: Uuid) -> Result<Vec<ConnectionRow>> {
+    let sql = format!(
+        "SELECT * FROM ({}) c ORDER BY provider_id, created_at, id LIMIT {MAX_LISTED_CONNECTIONS}",
+        connections_union_sql()
+    );
+    sqlx::query_as::<_, ConnectionRow>(&sql)
         .bind(user_id)
         .fetch_all(pool)
         .await
-        .context("Failed to list user service integrations")
+        .context("Failed to list user connections")
 }
 
 /// Outcome of a disconnect: whether a row was affected, plus the vault

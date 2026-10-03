@@ -1792,69 +1792,182 @@ pub fn terminal_node_ids(graph_json: &serde_json::Value) -> std::collections::Ha
     ids
 }
 
-/// Reshape a projected per-node output map for a requested `output_mode`, so a
-/// big workflow doesn't return 60 KB+ (intermediate fan-in / memory-dump nodes
-/// were the real offenders). Byte counts use the serialized length.
-///
-/// * `"full"` (default / unknown): unchanged.
-/// * `"terminal_only"`: terminal-node outputs kept verbatim; every non-terminal
-///   node's output replaced with a compact `{"__elided__": true, "bytes": N}`
-///   marker.
-/// * `"summary"`: every node kept, but any single node output larger than
-///   `SUMMARY_ELIDE_BYTES` is replaced with the same marker.
-pub fn shape_output_for_mode(
-    output: serde_json::Map<String, serde_json::Value>,
-    terminals: &std::collections::HashSet<String>,
-    mode: &str,
-) -> serde_json::Map<String, serde_json::Value> {
-    const SUMMARY_ELIDE_BYTES: usize = 4096;
-    let elide = |v: &serde_json::Value| {
-        let bytes = serde_json::to_string(v).map(|s| s.len()).unwrap_or(0);
-        serde_json::json!({ "__elided__": true, "bytes": bytes })
-    };
-    match mode {
-        "terminal_only" => output
-            .into_iter()
-            .map(|(k, v)| {
-                if terminals.contains(&k) {
-                    (k, v)
-                } else {
-                    let e = elide(&v);
-                    (k, e)
-                }
-            })
-            .collect(),
-        "summary" => output
-            .into_iter()
-            .map(|(k, v)| {
-                let bytes = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
-                if bytes > SUMMARY_ELIDE_BYTES {
-                    let e = elide(&v);
-                    (k, e)
-                } else {
-                    (k, v)
-                }
-            })
-            .collect(),
-        _ => output,
+/// How much of each node's output a synchronous run returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    /// Every node's output, unchanged.
+    Full,
+    /// Terminal (leaf) nodes verbatim; every other node elided.
+    TerminalOnly,
+    /// Every node kept, but any single output over 4 KB elided.
+    Summary,
+    /// Every node elided: the reply says which nodes ran and how large their
+    /// outputs were, and nothing else.
+    None,
+}
+
+impl OutputMode {
+    /// The values a caller may pass, in the order the schema lists them.
+    pub const ALL: [(&'static str, Self); 4] = [
+        ("full", Self::Full),
+        ("terminal_only", Self::TerminalOnly),
+        ("summary", Self::Summary),
+        ("none", Self::None),
+    ];
+
+    fn parse(raw: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .find(|(name, _)| *name == raw)
+            .map(|(_, mode)| *mode)
     }
 }
 
-/// Apply [`shape_output_for_mode`] to a response's output `Value` for the given
-/// `output_mode`. `"full"` (or a non-object output) is returned unchanged. This
-/// shapes only the RETURNED copy — callers persist the full output separately.
-pub fn shape_response_output(
-    output: &serde_json::Value,
+/// A caller's `output_mode` + `output_nodes`, validated before the run starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputShape {
+    mode: OutputMode,
+    /// Nodes returned whole whatever the mode says about them.
+    only: Option<std::collections::HashSet<String>>,
+}
+
+impl OutputShape {
+    /// Read `output_mode` and `output_nodes` from a tool call.
+    ///
+    /// * `output_mode`: absent means `full` — or `none` when `output_nodes` is
+    ///   given, so naming the nodes you want is enough to drop the rest. A
+    ///   value outside [`OutputMode::ALL`] is refused; until 2026-10-03 it was
+    ///   read as `full`, so a misspelling returned everything.
+    /// * `output_nodes`: node ids returned whole. Each must be a node of this
+    ///   workflow, which is checked HERE, before anything runs: a misspelled
+    ///   id must not cost an execution to discover.
+    pub fn from_args(
+        args: &serde_json::Value,
+        graph_json: &serde_json::Value,
+    ) -> Result<Self, String> {
+        let only = match args.get("output_nodes") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(items)) => {
+                let known: std::collections::HashSet<&str> = graph_json
+                    .get("nodes")
+                    .and_then(|n| n.as_array())
+                    .map(|nodes| {
+                        nodes
+                            .iter()
+                            .filter_map(|n| n.get("id").and_then(|v| v.as_str()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut only = std::collections::HashSet::with_capacity(items.len());
+                for item in items {
+                    let Some(id) = item.as_str() else {
+                        return Err(format!(
+                            "output_nodes must be an array of node ids (strings), got {item}"
+                        ));
+                    };
+                    if !known.contains(id) {
+                        return Err(format!(
+                            "output_nodes names '{id}', which is not a node of this workflow"
+                        ));
+                    }
+                    only.insert(id.to_string());
+                }
+                if only.is_empty() {
+                    return Err(
+                        "output_nodes must name at least one node; omit it to use output_mode alone"
+                            .to_string(),
+                    );
+                }
+                Some(only)
+            }
+            Some(other) => {
+                return Err(format!(
+                    "output_nodes must be an array of node ids, got {}",
+                    json_type_name(other)
+                ))
+            }
+        };
+        let mode = match args.get("output_mode") {
+            None | Some(serde_json::Value::Null) => {
+                if only.is_some() {
+                    OutputMode::None
+                } else {
+                    OutputMode::Full
+                }
+            }
+            Some(v) => v.as_str().and_then(OutputMode::parse).ok_or_else(|| {
+                format!(
+                    "output_mode must be one of {}; got {v}",
+                    OutputMode::ALL.map(|(name, _)| name).join(", ")
+                )
+            })?,
+        };
+        Ok(Self { mode, only })
+    }
+
+    /// Shape the RETURNED copy of a run's per-node output. The full output is
+    /// what the caller persisted and asserted against. A non-object output is
+    /// returned unchanged.
+    pub fn apply(
+        &self,
+        output: &serde_json::Value,
+        terminals: &std::collections::HashSet<String>,
+    ) -> serde_json::Value {
+        if self.mode == OutputMode::Full && self.only.is_none() {
+            return output.clone();
+        }
+        let Some(map) = output.as_object() else {
+            return output.clone();
+        };
+        let Some(only) = &self.only else {
+            return serde_json::Value::Object(shape_output_for_mode(
+                map.clone(),
+                terminals,
+                self.mode,
+            ));
+        };
+        let (named, rest): (serde_json::Map<_, _>, serde_json::Map<_, _>) = map
+            .clone()
+            .into_iter()
+            .partition(|(node, _)| only.contains(node));
+        let mut shaped = shape_output_for_mode(rest, terminals, self.mode);
+        shaped.extend(named);
+        serde_json::Value::Object(shaped)
+    }
+}
+
+/// Reshape a projected per-node output map for a requested mode, so a
+/// big workflow doesn't return 60 KB+ (intermediate fan-in / memory-dump nodes
+/// were the real offenders). Byte counts use the serialized length. An elided
+/// output is replaced with a compact `{"__elided__": true, "bytes": N}`.
+pub fn shape_output_for_mode(
+    output: serde_json::Map<String, serde_json::Value>,
     terminals: &std::collections::HashSet<String>,
-    mode: &str,
-) -> serde_json::Value {
-    if mode == "full" {
-        return output.clone();
+    mode: OutputMode,
+) -> serde_json::Map<String, serde_json::Value> {
+    const SUMMARY_ELIDE_BYTES: usize = 4096;
+    let size = |v: &serde_json::Value| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0);
+    let elided = |bytes: usize| serde_json::json!({ "__elided__": true, "bytes": bytes });
+    let keep = |node: &str, bytes: usize| match mode {
+        OutputMode::Full => true,
+        OutputMode::TerminalOnly => terminals.contains(node),
+        OutputMode::Summary => bytes <= SUMMARY_ELIDE_BYTES,
+        OutputMode::None => false,
+    };
+    if mode == OutputMode::Full {
+        return output;
     }
-    match output.as_object() {
-        Some(map) => serde_json::Value::Object(shape_output_for_mode(map.clone(), terminals, mode)),
-        None => output.clone(),
-    }
+    output
+        .into_iter()
+        .map(|(node, v)| {
+            let bytes = size(&v);
+            if keep(&node, bytes) {
+                (node, v)
+            } else {
+                (node, elided(bytes))
+            }
+        })
+        .collect()
 }
 
 /// Spawn the two best-effort post-create background tasks for a newly
@@ -3786,7 +3899,7 @@ mod ensure_graph_within_caps_tests {
 
 #[cfg(test)]
 mod output_shaping_tests {
-    use super::{shape_output_for_mode, terminal_node_ids};
+    use super::{shape_output_for_mode, terminal_node_ids, OutputMode, OutputShape};
 
     fn graph() -> serde_json::Value {
         // a → b → c ; b → d.  Terminals: c, d.
@@ -3822,11 +3935,93 @@ mod output_shaping_tests {
         m.insert("a".into(), serde_json::json!({"big": "x".repeat(9000)}));
         m.insert("c".into(), serde_json::json!({"ok": true}));
         let terminals = terminal_node_ids(&graph());
-        let out = shape_output_for_mode(m.clone(), &terminals, "full");
+        let out = shape_output_for_mode(m.clone(), &terminals, OutputMode::Full);
         assert_eq!(out, m);
-        // unknown mode also falls through to identity
-        let out2 = shape_output_for_mode(m.clone(), &terminals, "bogus");
-        assert_eq!(out2, m);
+    }
+
+    fn run_output() -> serde_json::Value {
+        serde_json::json!({
+            "a": {"intermediate": "data"},
+            "b": {"blob": "x".repeat(9000)},
+            "c": {"answer": 42},
+            "d": {"other": true},
+        })
+    }
+
+    #[test]
+    fn none_elides_every_node_and_keeps_its_size() {
+        let shape =
+            OutputShape::from_args(&serde_json::json!({"output_mode": "none"}), &graph()).unwrap();
+        let out = shape.apply(&run_output(), &terminal_node_ids(&graph()));
+        for node in ["a", "b", "c", "d"] {
+            assert_eq!(out[node]["__elided__"], true, "{node}");
+            assert!(out[node]["bytes"].as_u64().unwrap() > 0, "{node}");
+        }
+    }
+
+    #[test]
+    fn named_nodes_come_back_whole_and_the_rest_are_dropped_by_default() {
+        let terminals = terminal_node_ids(&graph());
+        let shape =
+            OutputShape::from_args(&serde_json::json!({"output_nodes": ["b"]}), &graph()).unwrap();
+        let out = shape.apply(&run_output(), &terminals);
+        assert_eq!(
+            out["b"],
+            run_output()["b"],
+            "named: whole, whatever its size"
+        );
+        for node in ["a", "c", "d"] {
+            assert_eq!(out[node]["__elided__"], true, "{node}");
+        }
+        // With a mode as well, the mode shapes the nodes that were not named.
+        let shape = OutputShape::from_args(
+            &serde_json::json!({"output_nodes": ["a"], "output_mode": "terminal_only"}),
+            &graph(),
+        )
+        .unwrap();
+        let out = shape.apply(&run_output(), &terminals);
+        assert_eq!(out["a"], run_output()["a"]);
+        assert_eq!(out["c"], run_output()["c"], "a terminal");
+        assert_eq!(out["b"]["__elided__"], true);
+    }
+
+    #[test]
+    fn absent_arguments_return_everything_unchanged() {
+        let shape = OutputShape::from_args(&serde_json::json!({}), &graph()).unwrap();
+        assert_eq!(
+            shape.apply(&run_output(), &terminal_node_ids(&graph())),
+            run_output()
+        );
+    }
+
+    #[test]
+    fn an_argument_that_cannot_be_read_is_refused_before_the_run() {
+        for (args, want) in [
+            (
+                serde_json::json!({"output_mode": "sumary"}),
+                "output_mode must be one of",
+            ),
+            (
+                serde_json::json!({"output_mode": 1}),
+                "output_mode must be one of",
+            ),
+            (
+                serde_json::json!({"output_nodes": "c"}),
+                "must be an array of node ids",
+            ),
+            (
+                serde_json::json!({"output_nodes": [1]}),
+                "must be an array of node ids",
+            ),
+            (serde_json::json!({"output_nodes": []}), "at least one node"),
+            (
+                serde_json::json!({"output_nodes": ["zz"]}),
+                "not a node of this workflow",
+            ),
+        ] {
+            let err = OutputShape::from_args(&args, &graph()).expect_err(&args.to_string());
+            assert!(err.contains(want), "{args}: {err}");
+        }
     }
 
     #[test]
@@ -3836,7 +4031,7 @@ mod output_shaping_tests {
         m.insert("b".into(), serde_json::json!({"intermediate": "more"}));
         m.insert("c".into(), serde_json::json!({"answer": 42}));
         let terminals = terminal_node_ids(&graph());
-        let out = shape_output_for_mode(m, &terminals, "terminal_only");
+        let out = shape_output_for_mode(m, &terminals, OutputMode::TerminalOnly);
         // terminal node kept verbatim
         assert_eq!(out.get("c").unwrap(), &serde_json::json!({"answer": 42}));
         // intermediates elided to a compact marker
@@ -3861,7 +4056,7 @@ mod output_shaping_tests {
         m.insert("small".into(), serde_json::json!({"k": "v"}));
         m.insert("big".into(), serde_json::json!({"blob": "x".repeat(9000)}));
         let terminals = std::collections::HashSet::new();
-        let out = shape_output_for_mode(m, &terminals, "summary");
+        let out = shape_output_for_mode(m, &terminals, OutputMode::Summary);
         // small kept verbatim
         assert_eq!(out.get("small").unwrap(), &serde_json::json!({"k": "v"}));
         // big elided (over the 4KB cap)

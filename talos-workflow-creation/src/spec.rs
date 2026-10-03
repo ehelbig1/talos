@@ -32,6 +32,7 @@
 use std::collections::HashSet;
 
 use serde_json::Value;
+use talos_workflow_creation_helpers as helpers;
 use uuid::Uuid;
 
 /// Maximum nodes accepted per spec. Mirrors the pre-extraction limit.
@@ -128,6 +129,17 @@ pub enum CreateFromSpecOutcome {
     /// Absent and foreign are ONE answer (a module-UUID existence oracle
     /// otherwise — `add_node_to_workflow`'s rule).
     ModuleNotAccessible { node_id: String, module_id: Uuid },
+    /// The spec cannot be accepted as written: a node id outside the charset
+    /// every other tool addresses nodes by, a node control or retry field of
+    /// the wrong type, a malformed structural node, a cycle, or a timeout or
+    /// retry count over the platform cap. `reason` names the node.
+    InvalidSpec { reason: String },
+    /// A `sub_workflow` node names no workflow the caller can see. Absent and
+    /// foreign are one answer.
+    SubWorkflowNotAccessible {
+        node_id: String,
+        sub_workflow_id: Uuid,
+    },
 }
 
 /// Per-node breakdown for the build-error path. Each variant of `stage`
@@ -165,12 +177,17 @@ impl BuildStage {
     }
 }
 
-/// How one spec node resolves to a module. The ONE place the precedence
-/// (`module_id` > `module_name` > `rust_code`) is written, shared by the
-/// service and by the MCP handler's role gate ([`inline_compile_worlds`]) so
-/// the gate sees exactly the nodes that will compile.
+/// How one spec node resolves. The ONE place the precedence (a structural
+/// `node_type` > `module_id` > `module_name` > `rust_code`) is written,
+/// shared by the service and by the MCP handler's role gate
+/// ([`inline_compile_worlds`]) so the gate sees exactly the nodes that will
+/// compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecNodeSource<'a> {
+    /// A built-in structural node (`collect`, `loop`, `sub_workflow`,
+    /// `capability_dispatch`): no module, built by the same helper
+    /// `create_workflow` uses.
+    Structural(&'a str),
     ModuleId(&'a str),
     ModuleName(&'a str),
     InlineRust {
@@ -184,6 +201,13 @@ pub enum SpecNodeSource<'a> {
 /// Classify a spec node by the resolution precedence.
 #[must_use]
 pub fn classify_spec_node(spec_node: &Value) -> SpecNodeSource<'_> {
+    if let Some(kind) = spec_node
+        .get("node_type")
+        .and_then(|v| v.as_str())
+        .filter(|t| helpers::is_structural_node_type(t))
+    {
+        return SpecNodeSource::Structural(kind);
+    }
     if let Some(mid) = spec_node.get("module_id").and_then(|v| v.as_str()) {
         return SpecNodeSource::ModuleId(mid);
     }
@@ -322,6 +346,7 @@ pub(crate) fn validate_spec_structure(
     spec_nodes: &[Value],
     spec_edges: &[Value],
 ) -> Option<CreateFromSpecOutcome> {
+    let invalid = |reason: String| Some(CreateFromSpecOutcome::InvalidSpec { reason });
     let mut ids: HashSet<&str> = HashSet::with_capacity(spec_nodes.len());
     for spec_node in spec_nodes {
         let node_id = spec_node_id(spec_node);
@@ -330,7 +355,19 @@ pub(crate) fn validate_spec_structure(
                 node_id: node_id.to_string(),
             });
         }
+        if let Some(reason) = node_type_error(node_id, spec_node) {
+            return invalid(reason);
+        }
+        // Controls and retry fields: refused when they could not take effect
+        // as written, never dropped.
+        if let Some(reason) = helpers::node_controls_shape_error(spec_node)
+            .or_else(|| helpers::retry_fields_shape_error(spec_node))
+        {
+            return invalid(reason);
+        }
         match classify_spec_node(spec_node) {
+            // Checked below, once every id is known (a loop names its body).
+            SpecNodeSource::Structural(_) => {}
             SpecNodeSource::ModuleId(mid) => {
                 if mid.parse::<Uuid>().is_err() {
                     return Some(CreateFromSpecOutcome::InvalidModuleId {
@@ -363,6 +400,20 @@ pub(crate) fn validate_spec_structure(
             }
         }
     }
+    // The charset every other tool addresses a node by; an id outside it
+    // would create a node no later call could name. After the per-node pass,
+    // so an inline node's name is still refused in the inline validator's
+    // own words.
+    if let Err(reason) = helpers::validate_node_ids(spec_nodes) {
+        return invalid(reason);
+    }
+    for spec_node in spec_nodes {
+        if matches!(classify_spec_node(spec_node), SpecNodeSource::Structural(_)) {
+            if let Err(reason) = helpers::structural_node_error(spec_node, &ids) {
+                return invalid(reason);
+            }
+        }
+    }
     for edge in spec_edges {
         let src = edge.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let tgt = edge.get("target").and_then(|v| v.as_str()).unwrap_or("");
@@ -384,7 +435,34 @@ pub(crate) fn validate_spec_structure(
             }
         }
     }
+    // A cycle (including a self-edge) is a workflow that can only fail at
+    // trigger time; `create_workflow` and `add_edge` refuse one already.
+    if let Err(reason) = helpers::validate_acyclic(spec_edges, &ids) {
+        return invalid(reason);
+    }
     None
+}
+
+/// Why a node's `node_type` cannot be accepted, or `None`. An unknown value
+/// is refused instead of being read as "a module node": `"collector"` would
+/// otherwise fail later with a message about a missing module.
+fn node_type_error(node_id: &str, spec_node: &Value) -> Option<String> {
+    let raw = spec_node.get("node_type").filter(|v| !v.is_null())?;
+    let Some(kind) = raw.as_str().filter(|t| helpers::is_structural_node_type(t)) else {
+        return Some(format!(
+            "Node '{node_id}': node_type {raw} is not one of {}. Omit node_type for a module node.",
+            helpers::structural_node_types().join(", ")
+        ));
+    };
+    ["module_id", "module_name", "rust_code"]
+        .into_iter()
+        .find(|field| spec_node.get(field).is_some_and(|v| !v.is_null()))
+        .map(|field| {
+            format!(
+                "Node '{node_id}': a {kind} node runs no module, but the node also carries {field}. \
+                 Give either node_type or a module, not both."
+            )
+        })
 }
 
 /// Map a compile/persist refusal onto the per-node breakdown. Uses the
@@ -478,13 +556,19 @@ impl super::WorkflowCreationService {
         };
 
         // ── Phase 3: Build graph JSON ────────────────────────────────
-        let graph_nodes = build_spec_graph_nodes(&resolved);
+        let graph_nodes = build_spec_graph_nodes(&resolved, req.spec_nodes);
         let graph_edges = build_spec_graph_edges(req.spec_edges);
         let graph_json_str = serde_json::json!({
             "nodes": graph_nodes,
             "edges": graph_edges,
         })
         .to_string();
+        // The platform caps on node timeout, retry count and backoff — the
+        // check every other graph write runs. Before 2026-10-03 this path
+        // built its graph without it.
+        if let Err(reason) = talos_workflow_types::validate_graph_timeouts(&graph_json_str) {
+            return Ok(CreateFromSpecOutcome::InvalidSpec { reason });
+        }
 
         // ── Phase 4: Insert workflow row ─────────────────────────────
         let description_opt = if req.description.is_empty() {
@@ -557,6 +641,35 @@ impl super::WorkflowCreationService {
                 .unwrap_or(serde_json::json!({}));
 
             match classify_spec_node(spec_node) {
+                // A structural node resolves to no module. A sub_workflow's
+                // target must be a workflow this user can see.
+                SpecNodeSource::Structural(_) => {
+                    let sub_workflow = spec_node
+                        .get("sub_workflow_id")
+                        .or_else(|| config.get("sub_workflow_id"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<Uuid>().ok());
+                    if let Some(sub_workflow_id) = sub_workflow {
+                        if !self
+                            .workflow_repo
+                            .workflow_exists(sub_workflow_id, user_id)
+                            .await
+                        {
+                            return Ok(ResolveResult::Outcome(
+                                CreateFromSpecOutcome::SubWorkflowNotAccessible {
+                                    node_id,
+                                    sub_workflow_id,
+                                },
+                            ));
+                        }
+                    }
+                    slots.push(Slot::Done(ResolvedSpecNode {
+                        id: node_id,
+                        module_id: String::new(),
+                        config,
+                        compilation_note: None,
+                    }));
+                }
                 // Path A — explicit module_id. Visibility-gated like
                 // `add_node_to_workflow` (2026-09-25): before this a spec
                 // accepted any tenant's module UUID at authoring time.
@@ -746,19 +859,45 @@ enum ResolveResult {
 
 /// Build the React-Flow node array. Pure projection — exposed for
 /// tests so the layout/positioning math is verified without going
-/// through the service.
-pub(crate) fn build_spec_graph_nodes(resolved: &[ResolvedSpecNode]) -> Vec<Value> {
+/// through the service. `spec_nodes` is the caller's node list, in the same
+/// order as `resolved` (resolution preserves it): a node's structural
+/// parameters, retry fields and controls are read from there, through the
+/// helpers `create_workflow` uses, so the two builders write one shape.
+pub(crate) fn build_spec_graph_nodes(
+    resolved: &[ResolvedSpecNode],
+    spec_nodes: &[Value],
+) -> Vec<Value> {
     let mut y = 100.0_f64;
     resolved
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(i, r)| {
             y += 130.0;
-            serde_json::json!({
+            let spec_node = spec_nodes.get(i).unwrap_or(&Value::Null);
+            let position = serde_json::json!({ "x": 250.0, "y": y });
+            if let SpecNodeSource::Structural(kind) = classify_spec_node(spec_node) {
+                return serde_json::json!({
+                    "id": r.id,
+                    "type": format!("system:{kind}"),
+                    "kind": kind,
+                    "position": position,
+                    "data": helpers::build_structural_node_data(kind, spec_node),
+                });
+            }
+            let mut node = serde_json::json!({
                 "id": r.id,
                 "type": r.module_id,
-                "position": { "x": 250.0, "y": y },
+                "position": position,
                 "data": r.config,
-            })
+            });
+            if let Some(obj) = node.as_object_mut() {
+                // Explicit retry fields only. With none given the node carries
+                // no retry_count and the engine applies the module's
+                // method-aware default, as before.
+                helpers::apply_retry_policy(obj, spec_node, &Value::Null, None);
+                helpers::apply_node_controls(obj, spec_node);
+            }
+            node
         })
         .collect()
 }
@@ -813,13 +952,174 @@ mod tests {
                 compilation_note: None,
             },
         ];
-        let nodes = build_spec_graph_nodes(&resolved);
+        let nodes = build_spec_graph_nodes(&resolved, &[]);
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0]["id"], "a");
         assert_eq!(nodes[0]["type"], "tid-1");
         assert_eq!(nodes[0]["position"]["y"], 230.0); // 100 + 130
         assert_eq!(nodes[1]["position"]["y"], 360.0); // 230 + 130
         assert_eq!(nodes[1]["data"]["k"], "v");
+    }
+
+    fn resolved(id: &str, module_id: &str, config: Value) -> ResolvedSpecNode {
+        ResolvedSpecNode {
+            id: id.into(),
+            module_id: module_id.into(),
+            config,
+            compilation_note: None,
+        }
+    }
+
+    /// The shape of the workflow this was written for: three readers with a
+    /// retry each, a labelled collect, a sub-workflow that may fail.
+    #[test]
+    fn a_spec_builds_structural_nodes_and_per_node_controls() {
+        let child = "550e8400-e29b-41d4-a716-446655440000";
+        let spec = vec![
+            serde_json::json!({"id": "bank_a", "module_id": "m-1", "config": {"K": 1},
+                "retry_count": 1, "retry_backoff_ms": 250, "timeout_secs": 40,
+                "continue_on_error": true, "skip_condition": "count == 0"}),
+            serde_json::json!({"id": "all", "node_type": "collect", "label_items": true}),
+            serde_json::json!({"id": "money", "node_type": "sub_workflow",
+                "sub_workflow_id": child, "timeout_secs": 150, "continue_on_error": true}),
+            serde_json::json!({"id": "plain", "module_id": "m-2"}),
+        ];
+        let resolved = vec![
+            resolved("bank_a", "m-1", serde_json::json!({"K": 1})),
+            resolved("all", "", serde_json::json!({})),
+            resolved("money", "", serde_json::json!({})),
+            resolved("plain", "m-2", serde_json::json!({})),
+        ];
+        let nodes = build_spec_graph_nodes(&resolved, &spec);
+
+        let bank = &nodes[0];
+        assert_eq!(bank["type"], "m-1");
+        assert_eq!(
+            bank["data"],
+            serde_json::json!({"K": 1}),
+            "config is untouched"
+        );
+        assert_eq!(bank["retry_count"], 1);
+        assert_eq!(bank["retry_backoff_ms"], 250);
+        assert_eq!(bank["timeout_secs"], 40);
+        assert_eq!(bank["continue_on_error"], true);
+        assert_eq!(bank["skip_condition"], "count == 0");
+
+        assert_eq!(nodes[1]["type"], "system:collect");
+        assert_eq!(nodes[1]["kind"], "collect");
+        assert_eq!(nodes[1]["data"], serde_json::json!({"label_items": true}));
+
+        assert_eq!(nodes[2]["type"], "system:sub_workflow");
+        assert_eq!(
+            nodes[2]["data"],
+            serde_json::json!({"sub_workflow_id": child, "timeout_secs": 150,
+                               "continue_on_error": true})
+        );
+
+        // Control: a node that states nothing carries nothing, so the engine
+        // applies the module's own retry default exactly as before.
+        let plain = nodes[3].as_object().unwrap();
+        let mut keys: Vec<&str> = plain.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["data", "id", "position", "type"]);
+    }
+
+    #[test]
+    fn classification_puts_a_structural_node_type_first() {
+        let collect = serde_json::json!({"id": "c", "node_type": "collect"});
+        assert_eq!(
+            classify_spec_node(&collect),
+            SpecNodeSource::Structural("collect")
+        );
+        // Nothing to compile, so nothing for the role gate.
+        assert!(inline_compile_worlds(std::slice::from_ref(&collect)).is_empty());
+        // An unknown node_type is not a structural node (and is refused by
+        // `validate_spec_structure`, below).
+        let odd = serde_json::json!({"id": "c", "node_type": "collector", "module_name": "x"});
+        assert_eq!(classify_spec_node(&odd), SpecNodeSource::ModuleName("x"));
+    }
+
+    #[test]
+    fn a_spec_that_could_not_run_as_written_is_refused_before_any_compile() {
+        let child = "550e8400-e29b-41d4-a716-446655440000";
+        let module = |id: &str| serde_json::json!({"id": id, "module_name": "echo"});
+        let edge = |a: &str, b: &str| serde_json::json!({"source": a, "target": b});
+
+        // Accepted: fan-out, labelled collect, sub-workflow, loop over a node.
+        let good = vec![
+            module("a"),
+            module("b"),
+            serde_json::json!({"id": "all", "node_type": "collect", "label_items": true}),
+            serde_json::json!({"id": "child", "node_type": "sub_workflow", "sub_workflow_id": child}),
+            serde_json::json!({"id": "again", "node_type": "loop", "body_node_id": "a"}),
+        ];
+        let edges = vec![edge("a", "all"), edge("b", "all"), edge("all", "child")];
+        assert!(validate_spec_structure(&good, &edges).is_none());
+
+        let refused: Vec<(Vec<Value>, Vec<Value>, &str)> = vec![
+            (
+                vec![serde_json::json!({"id": "c", "node_type": "collector"})],
+                vec![],
+                "is not one of collect, loop, sub_workflow, capability_dispatch",
+            ),
+            (
+                vec![serde_json::json!({"id": "c", "node_type": 7})],
+                vec![],
+                "is not one of",
+            ),
+            (
+                vec![serde_json::json!({"id": "c", "node_type": "collect", "module_name": "echo"})],
+                vec![],
+                "Give either node_type or a module, not both",
+            ),
+            (
+                vec![serde_json::json!({"id": "s", "node_type": "sub_workflow"})],
+                vec![],
+                "sub_workflow_id is required",
+            ),
+            (
+                vec![
+                    serde_json::json!({"id": "l", "node_type": "loop", "body_node_id": "nowhere"}),
+                ],
+                vec![],
+                "must reference a node ID",
+            ),
+            (
+                vec![serde_json::json!({"id": "a", "module_name": "echo", "retry_count": "2"})],
+                vec![],
+                "retry_count must be a whole number",
+            ),
+            (
+                vec![
+                    serde_json::json!({"id": "a", "module_name": "echo", "continue_on_error": "yes"}),
+                ],
+                vec![],
+                "continue_on_error must be true or false",
+            ),
+            (
+                vec![serde_json::json!({"id": "c", "node_type": "collect", "retry_count": 1})],
+                vec![],
+                "applies to module nodes",
+            ),
+            (
+                vec![serde_json::json!({"id": "has space", "module_name": "echo"})],
+                vec![],
+                "may only contain ASCII alphanumeric",
+            ),
+            (
+                vec![module("a"), module("b")],
+                vec![edge("a", "b"), edge("b", "a")],
+                "cycle",
+            ),
+        ];
+        for (nodes, edges, want) in refused {
+            match validate_spec_structure(&nodes, &edges) {
+                Some(CreateFromSpecOutcome::InvalidSpec { reason }) => {
+                    assert!(reason.contains(want), "{nodes:?}: {reason}");
+                }
+                other => panic!("{nodes:?} was not refused as an invalid spec: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -257,7 +257,7 @@ fn briefing_graph(
         .add_module("pa_gather", personal, None)
         .add_module("team_gather", team, None)
         .add_module("ops_gather", ops, None)
-        .add_system_node("collect", SystemNodeKind::Collect)
+        .add_system_node("collect", SystemNodeKind::Collect { label_items: false })
         .add_module("synthesize", compose, None)
         .add_system_node(
             "judge",
@@ -279,6 +279,78 @@ fn briefing_graph(
         .edge("synthesize", "judge")
         .build()
         .expect("graph builds")
+}
+
+// ── Labelled collect (`label_items`) ─────────────────────────────────
+
+/// Three branches with distinct outputs into one collect, then a reader.
+async fn labelled_collect_run(label_items: bool) -> JsonValue {
+    let (a, b, c, reader) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    let graph = WorkflowGraphBuilder::new()
+        .add_module("bank_a", a, None)
+        .add_module("bank_b", b, None)
+        .add_module("bank_c", c, None)
+        .add_system_node("collect", SystemNodeKind::Collect { label_items })
+        .add_module("reader", reader, None)
+        .with_continue_on_error("bank_b")
+        .edge("bank_a", "collect")
+        .edge("bank_b", "collect")
+        .edge("bank_c", "collect")
+        .edge("collect", "reader")
+        .build()
+        .expect("graph builds");
+    let outputs = HashMap::from([
+        (a, json!({ "from": "bank_a" })),
+        (c, json!({ "from": "bank_c" })),
+    ]);
+    // `bank_b` fails and continues: its element is an error envelope, which
+    // is exactly the element a reader most needs to be able to name.
+    let (dispatcher, seen) = RecordingDispatcher::with_outputs(vec![b], json!({}), outputs);
+    let engine = engine_for(&graph, &[a, b, c, reader]);
+    engine
+        .run_with_transport(dispatcher, None, Uuid::new_v4())
+        .await
+        .expect("continue_on_error keeps the run alive");
+    input_to(&seen, reader)
+}
+
+#[tokio::test]
+async fn a_labelled_collect_names_the_branch_each_item_came_from() {
+    let got = labelled_collect_run(true).await;
+    let items = got["items"].as_array().expect("items");
+    let sources = got["sources"].as_array().expect("sources");
+    assert_eq!(items.len(), 3);
+    assert_eq!(sources.len(), 3, "one source per item — got {got}");
+    let mut named: Vec<&str> = sources.iter().filter_map(JsonValue::as_str).collect();
+    named.sort_unstable();
+    assert_eq!(named, ["bank_a", "bank_b", "bank_c"]);
+    for (item, source) in items.iter().zip(sources) {
+        match source.as_str().expect("a source is a node id") {
+            "bank_b" => assert!(
+                item.get("__error").is_some(),
+                "sources[i] must name the branch items[i] came from: the failed \
+                 branch's element is the error envelope — got {got}"
+            ),
+            healthy => assert_eq!(item["from"], json!(healthy), "got {got}"),
+        }
+    }
+    assert_eq!(got["count"], json!(3));
+}
+
+/// Control: without the opt-in the output is what it has always been.
+#[tokio::test]
+async fn an_unlabelled_collect_carries_no_sources() {
+    let got = labelled_collect_run(false).await;
+    assert_eq!(got["items"].as_array().map(Vec::len), Some(3));
+    assert!(
+        got.get("sources").is_none(),
+        "label_items is opt-in: every existing collect node keeps its output — got {got}"
+    );
 }
 
 /// A verdict that only checks the SHAPE of the composed output — the real

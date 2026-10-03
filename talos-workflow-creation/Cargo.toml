@@ -21,6 +21,9 @@ talos-module-repository = { path = "../talos-module-repository" }
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
+# The platform caps on node timeout / retry count (`validate_graph_timeouts`),
+# the check every other graph write runs.
+talos-workflow-types = { path = "../talos-workflow-types" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tracing.workspace = true

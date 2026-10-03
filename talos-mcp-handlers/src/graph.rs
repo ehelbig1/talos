@@ -718,10 +718,10 @@ impl AddedSystemNode {
 // REQUIRED CONFIG FIELD and hard-errors when it is missing: `add_loop_node`
 // requires `body_node_id` (and checks it exists in the graph),
 // `add_judge_node` requires `judge_workflow_id`, `add_ensemble_node` requires
-// `child_workflow_id`, and so on. `collect` is the one kind with NO config at
-// all — `SystemNodeKind::Collect` is the sole unit variant of the enum — so
-// its entire specification is "which edges point at me", and that is exactly
-// the input nothing validated.
+// `child_workflow_id`, and so on. `collect` is the one kind with no REQUIRED
+// config — its only field is the optional `label_items` flag — so its entire
+// specification is "which edges point at me", and that is exactly the input
+// nothing validated.
 //
 // WHAT ACTUALLY HAPPENS AT RUNTIME (measured against the engine, not assumed):
 // a node with zero incoming edges is a graph ROOT, and
@@ -747,7 +747,8 @@ impl AddedSystemNode {
 /// System-node kinds whose output is a pure function of their INCOMING EDGES,
 /// with nothing else to fall back on.
 ///
-/// - `collect` — always. `SystemNodeKind::Collect` carries no config;
+/// - `collect` — always. `SystemNodeKind::Collect` carries only the
+///   `label_items` flag (whether to name each item's branch);
 ///   `collect_parent_outputs_for_node` reads `neighbors_directed(Incoming)`
 ///   and nothing else.
 /// - `synthesize` — only when it carries no `synthesis_expr`. In that state
@@ -1347,7 +1348,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_collect_node",
-            "description": "Add a collect node to an existing workflow. Gathers all parent branch outputs into a JSON array for aggregate operations after parallel fan-out. For new workflows, prefer declaring this node inline via node_type: 'collect' in create_workflow. Use this tool to add the node to an existing workflow. Use connect_from to wire one or more branch endpoints in the same call. connect_from is what this node IS: a collect with no incoming edges gathers nothing — it becomes a graph root and receives the trigger payload instead of the branches — so if you do not pass connect_from here you must add the parent edges with add_edge. The response reports inert: true when that has happened.",
+            "description": "Add a collect node to an existing workflow. Gathers all parent branch outputs into a JSON array for aggregate operations after parallel fan-out. Output: {items, count}; the order of items is NOT the order the branches were declared in, so pass label_items: true to also get `sources`, the node id of the branch each item came from (sources[i] names items[i]). For new workflows, prefer declaring this node inline via node_type: 'collect' in create_workflow. Use this tool to add the node to an existing workflow. Use connect_from to wire one or more branch endpoints in the same call. connect_from is what this node IS: a collect with no incoming edges gathers nothing — it becomes a graph root and receives the trigger payload instead of the branches — so if you do not pass connect_from here you must add the parent edges with add_edge. The response reports inert: true when that has happened.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1358,6 +1359,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "node_id": {
                         "type": "string",
                         "description": "Unique string ID for the new collect node"
+                    },
+                    "label_items": {
+                        "type": "boolean",
+                        "description": "Optional (default false). When true the output also carries `sources`: an array of parent node ids in the same order as `items`, so a reader can tell which branch each element came from — including a failed branch's error element. Off by default so an existing collect node's output does not change."
                     },
                     "connect_from": {
                         "description": "Node ID(s) to wire INTO this collect node. Accepts a single string or an array of strings for multi-branch wiring in one call.",
@@ -3470,16 +3475,20 @@ async fn handle_add_collect_node(
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    let added = match upsert_system_node(
-        &req_id,
-        args,
-        state,
-        &agent,
-        "collect",
-        serde_json::json!({}),
-    )
-    .await
-    {
+    // Written only when asked for: an unlabelled collect keeps `data: {}`.
+    let label_items = match args.get("label_items") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(_) => match validate_optional_bool(args, "label_items", false, &req_id) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        },
+    };
+    let data = if label_items {
+        serde_json::json!({ "label_items": true })
+    } else {
+        serde_json::json!({})
+    };
+    let added = match upsert_system_node(&req_id, args, state, &agent, "collect", data).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -3503,6 +3512,7 @@ async fn handle_add_collect_node(
             "workflow_id": added.workflow_id.to_string(),
             "node_id": added.node_id,
             "node_type": "collect",
+            "label_items": label_items,
             "parent_branches": connect_from_sources,
             "downstream": connect_to,
             "edges_wired": edges_wired,

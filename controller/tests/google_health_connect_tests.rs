@@ -313,6 +313,38 @@ async fn a_connect_stores_the_tokens_under_the_user_who_started_it() {
         .expect("list");
     assert!(theirs.iter().all(|r| r.service_tag != "GOOGLE_HEALTH"));
 
+    // The same listing with each row's provider key (what `list_connections`
+    // builds a vault reference from). The statement is assembled at runtime
+    // from the provider registry, so only running it proves every branch
+    // names real columns. The key it returns locates the token stored above.
+    let mine = talos_integrations::store::list_user_connections(&w.pool, alice)
+        .await
+        .expect("every provider branch prepares");
+    let health: Vec<_> = mine
+        .iter()
+        .filter(|r| r.provider_id == "google-health")
+        .collect();
+    assert_eq!(health.len(), 1, "{mine:?}");
+    assert_eq!(health[0].id, integration.id);
+    assert_eq!(health[0].identifier, "owner@example.com");
+    assert_eq!(health[0].tier, None, "not a tiered provider");
+    assert_eq!(
+        talos_oauth::credentials::access_token_vault_path(
+            "google_health",
+            alice,
+            health[0].provider_key.as_deref().expect("a provider key"),
+        ),
+        format!("oauth/google_health/{alice}/{key}/access_token"),
+        "the listed key names the stored token"
+    );
+    let theirs = talos_integrations::store::list_user_connections(&w.pool, bob)
+        .await
+        .expect("list");
+    assert!(
+        theirs.is_empty(),
+        "another user's connections are never listed: {theirs:?}"
+    );
+
     // The state is spent: the same redirect cannot be replayed.
     assert!(finish(&w, "code-a", &state, &cookies).await.is_err());
     assert_eq!(rows(&w.pool).await.len(), 1);
