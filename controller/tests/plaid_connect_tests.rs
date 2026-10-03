@@ -239,6 +239,15 @@ async fn a_connection_stores_the_token_for_its_owner_and_returns_none_of_it() {
         .await
         .expect("the owner can read it");
     assert_eq!(stored, "access-sandbox-1");
+    let name: String = sqlx::query_scalar("SELECT name FROM secrets WHERE key_path = $1")
+        .bind("plaid/access_token/item-1")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        name, "Plaid access token (Wells Fargo)",
+        "the entry says which bank it is"
+    );
     for path in ["plaid/client_id", "plaid/secret"] {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM secrets WHERE key_path = $1")
             .bind(path)
@@ -327,6 +336,34 @@ async fn a_disconnect_ends_the_connection_at_plaid_and_in_the_vault() {
         "ended at Plaid with its own token"
     );
     assert_eq!(w.vault_entries("item-3").await, 0, "and deleted here");
+}
+
+/// A bank connected in the other Plaid environment (a sandbox bank left over
+/// after the switch to production) is not sent to this environment's Plaid,
+/// which would refuse the token; it is still deleted here.
+#[tokio::test]
+async fn a_connection_from_another_environment_is_not_sent_to_plaid() {
+    let w = world(vec![("public-sandbox-5", "access-sandbox-5", "item-5")]).await;
+    let user = seed_user(&w.pool).await;
+    w.service
+        .connect(user, "public-sandbox-5", Institution::default())
+        .await
+        .expect("connect");
+    // The row says production; the service is configured for sandbox.
+    sqlx::query("UPDATE plaid_items SET environment = 'production' WHERE user_id = $1 AND item_id = 'item-5'")
+        .bind(user)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+
+    w.service.remove_item(user, "item-5").await.expect("remove");
+
+    assert!(
+        w.removed_tokens().is_empty(),
+        "nothing was sent to Plaid: {:?}",
+        w.paths()
+    );
+    assert_eq!(w.vault_entries("item-5").await, 0, "and it is deleted here");
 }
 
 /// Another user naming the same item id neither reaches Plaid with the
