@@ -3,8 +3,10 @@
 Narrative archive for `CLAUDE.md`. Each file below was moved out VERBATIM; the
 DECISIONS those narratives recorded — every rejected lint with its numbers, every
 `latent on this fleet` claim, every `deliberately NOT`, every measured population
-— stay in `CLAUDE.md`'s "Engineering log — the decisions, kept" section, which
-points at these files.
+— are digested in [`DECISIONS.md`](DECISIONS.md), one subsection per class, each
+pointing at its narrative file. Until 2026-10-03 that digest was a section of
+`CLAUDE.md`; `CLAUDE.md` now keeps one index line per subsection, and the digest
+is read on demand. **Before changing an area, read its subsection there.**
 
 **The split is by KIND, not by age.** Do not archive an entry because it is old:
 archive the STORY and keep the DECISION. An age-based sweep would take the

@@ -9360,7 +9360,11 @@ bold "▶ check 96: the CLAUDE.md engineering-log split lost nothing"
 # shallow CI checkout fetches it on demand). Since 2026-09-25 each split is
 # pinned as (pre-split commit, split commit) and held only to what IT
 # removed, so an ordinary later edit to CLAUDE.md is no longer charged to a
-# split. No opt-out.
+# split. Since 2026-10-03 the digest itself lives in
+# docs/engineering-log/DECISIONS.md (read on demand, not at session start);
+# leg 2 reads it there, and leg 4 requires every digest subsection to be named
+# by title in CLAUDE.md's index, so a digest nobody is pointed at fails.
+# No opt-out.
 CK96_RC=0
 CK96_OUT="$(cd "$ROOT" && python3 scripts/check-engineering-log.py --self-test 2>&1 && python3 scripts/check-engineering-log.py 2>&1)" || CK96_RC=$?
 if [ "$CK96_RC" -eq 0 ]; then
@@ -9369,7 +9373,8 @@ else
     echo "$CK96_OUT" | sed 's/^/  /'
     red "✗ the CLAUDE.md engineering-log split lost a line, an order, or a decision (or the checker could not run)"
     yellow "  → every line a split (BASES in scripts/check-engineering-log.py) removed from CLAUDE.md must appear VERBATIM and CONTIGUOUSLY under docs/engineering-log/,"
-    yellow "    and every decision-marker line must be kept or represented in the digest that points at its archive file."
+    yellow "    every decision-marker line must be kept or represented in the digest (docs/engineering-log/DECISIONS.md) that points at its archive file,"
+    yellow "    and every digest subsection must have an index line in CLAUDE.md naming its title."
     EXIT_CODE=1
 fi
 echo
@@ -9426,17 +9431,18 @@ if ! grep -q "${CHECK_COUNT} checks today" CLAUDE.md; then
     DOC_CLAIM="$(grep -oE '[0-9]+ checks today' CLAUDE.md | head -1 || true)"
     red "✗ CLAUDE.md check count is stale: says '${DOC_CLAIM:-<none found>}', script has ${CHECK_COUNT}"
     yellow "  → update the '<N> checks today' sentence in CLAUDE.md's pre-deploy section"
-    yellow "    (and add a one-line entry for any new check to the index)."
+    yellow "    (and add a one-line entry for any new check to the index in docs/engineering-log/DECISIONS.md)."
     META_FAIL=1
 fi
-# The one-line index in CLAUDE.md's "Structural lint checks" digest
-# subsection must name exactly checks 1..N. The long numbered list it replaced
+# The one-line index in the "Structural lint checks" digest subsection
+# (docs/engineering-log/DECISIONS.md since 2026-10-03; CLAUDE.md before) must
+# name exactly checks 1..N. The long numbered list it replaced
 # (2026-09-25) had drifted from the script with no check noticing: two entries
 # numbered 82, none for 84 or 97.
-INDEX_NUMS="$(awk '/^### Structural lint checks/ {on=1; next} on && /^##/ {exit} on' CLAUDE.md \
+INDEX_NUMS="$(awk '/^### Structural lint checks/ {on=1; next} on && /^##/ {exit} on' docs/engineering-log/DECISIONS.md \
     | grep -oE '^  [0-9]+\. ' | grep -oE '[0-9]+' | sort -n || true)"
 if [ "$INDEX_NUMS" != "$EXPECTED_NUMS" ]; then
-    red "✗ CLAUDE.md's structural-lint index does not name exactly checks 1..$CHECK_COUNT"
+    red "✗ the structural-lint index in docs/engineering-log/DECISIONS.md does not name exactly checks 1..$CHECK_COUNT"
     diff <(echo "$EXPECTED_NUMS") <(echo "$INDEX_NUMS") | sed 's/^/    /' || true
     yellow "  → one line per check, '  N. <title>', under '### Structural lint checks'."
     META_FAIL=1
