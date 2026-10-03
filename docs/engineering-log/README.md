@@ -11,6 +11,13 @@ archive the STORY and keep the DECISION. An age-based sweep would take the
 decisions with it, and the record of what has already been tried and rejected is
 the only thing that stops the next session redoing it.
 
+**One exception, 2026-10-03 (operator decision).** The package record — one
+self-contained digest bullet per package, 2026-09-10 to 2026-09-25, closed to
+new bullets — moved out whole to
+[`2026-10-03-package-record.md`](2026-10-03-package-record.md). `CLAUDE.md`
+keeps one title line per package. It was half of a file read at every session
+start. Before changing an area a title names, read its bullet there.
+
 **Adding an entry** (since 2026-09-25). A package writes its record to its OWN
 file under [`packages/`](packages/README.md) — never a bullet in `CLAUDE.md` and
 never an append to a shared file, because parallel PRs conflicted at exactly
@@ -39,3 +46,4 @@ Moving text out of `CLAUDE.md`? Add a `BASES` entry for your change.
 | [`2026-09-10-the-collection-nobody-read.md`](2026-09-10-the-collection-nobody-read.md) | a collection turned on with no reader | `pg_stat_statements`: what it does and does not normalise, why `talos_guest` is not the tenancy axis, the five availability states, and the cost that is not the reason |
 | [`2026-09-10-whole-codebase-review.md`](2026-09-10-whole-codebase-review.md) | the classes above, at the sites the per-class sweeps had not reached; since 2026-09-22 also the VERBATIM CLAUDE.md bullet of every follow-up package (C → DM), moved here when the section was compressed to decisions (package DN, check 96) | fourteen domain reviews + eight fix packages: the verification log, the consolidated pre-fix findings, and every package summary verbatim |
 | [`structural-lint-checks.md`](structural-lint-checks.md) | the long per-check entries of CLAUDE.md's lint list | every check's CLAUDE.md entry as it stood on 2026-09-25, moved verbatim when the list became a one-line index; the script's comment blocks are the specification |
+| [`2026-10-03-package-record.md`](2026-10-03-package-record.md) | the per-package decision record | one bullet per package, 2026-09-10 to 2026-09-25: decisions, `deliberately NOT`s, measured populations, stated limits — VERBATIM as it stood in `CLAUDE.md` on 2026-10-03, which now keeps a title index |
