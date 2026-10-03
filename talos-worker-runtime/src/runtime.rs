@@ -4578,7 +4578,7 @@ impl TalosRuntime {
                     wasmtime::CallHook::ReturningFromHost => {
                         let label = std::mem::replace(
                             &mut cx.data_mut().host_call_label,
-                            crate::fuel_profile::OTHER,
+                            crate::fuel_profile::UNNAMED,
                         );
                         profile.returned_from_host(remaining, label);
                     }

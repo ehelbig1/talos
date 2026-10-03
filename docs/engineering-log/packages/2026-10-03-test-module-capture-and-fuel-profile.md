@@ -25,8 +25,34 @@ spent between (`talos_worker_runtime::fuel_profile::FuelProfile`). The runtime
 installs a wasmtime call hook for that run only; at each guest→host transition
 it reads the fuel left and charges what the guest burned to the host call that
 preceded the stretch. Every host function names itself with one line
-(`self.host_call("http::fetch")`, 114 functions, added mechanically); one that
-does not is reported as `other`.
+(`self.host_call("http::fetch")`, 114 functions, added mechanically).
+
+**Only a named host call ends a stretch.** wasmtime fires the same hook for
+its own internal calls — the epoch check, memory growth — and for WASI
+imports. The first version gave those a row (`other`), and CI showed why that
+is wrong: on a slower machine an epoch check landed before the guest's first
+instruction, and the fuel the test expected under `start` was reported under
+`other`. The epoch check is timing-dependent, so on a slow module it would
+move fuel off the call it followed by an amount that changes between runs.
+Unnamed transitions now end no stretch and have no row; the reply counts them
+as `unnamed_host_calls`.
+
+**Naming is pinned, with a derived population.** A host function that does
+not name itself fails nothing: the fuel after it is reported under the call
+before it, a plausible and wrong report. `host/host_call_label_pins.rs` reads
+every production module `host/mod.rs` declares (a new host file fails the pin
+until it is in the table) and requires the first statement of every function
+of every `impl …::Host for TalosContext` block to be
+`self.host_call("<interface>::<function>")`, the label derived from the trait
+and function names; labels are unique. The raw `wasi:http` handler, which the
+JavaScript and Python module paths use for every HTTP call, is not a trait
+function and names itself `wasi-http::handle`, pinned separately. Shown
+failing with one call removed. The pin is textual: it proves the statement is
+there, not that the label reaches the profile — one end-to-end test drives
+that for one call. Not considered worth doing: generating the host
+implementations through a wrapper that names each call by construction. That
+would change how all 31 host files implement the generated traits, to guard a
+diagnostic.
 
 ## Decisions
 

@@ -140,8 +140,15 @@ async fn the_profile_charges_fuel_to_the_host_call_it_followed() {
         "the second loop is fifty times the first, so the fuel after the host \
          call must dwarf the fuel before it: {report:?}"
     );
-    // The host function named itself, and was called once.
+    // The host function named itself, and was called once. The runtime's own
+    // transitions (an epoch check lands wherever the clock puts it; on a slow
+    // machine, before the first instruction) have no row and move no fuel.
     assert_eq!(report.host_calls.len(), 1, "{report:?}");
+    assert_eq!(
+        report.guest.len(),
+        2,
+        "start and the one named call: {report:?}"
+    );
     assert_eq!(report.host_calls[0].call, "datetime::now-unix");
     assert_eq!(report.host_calls[0].count, 1);
     // Every unit the run consumed is on exactly one row.

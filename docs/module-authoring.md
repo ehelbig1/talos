@@ -268,7 +268,9 @@ requests.
   charged to the host calls it was spent between. `guest[].after` names the
   host call a stretch of module code followed (`start` for the code before the
   first call), so "9.1 M after `http::fetch`" means parsing the response cost
-  9.1 M. It works on a real run and on a rehearsal.
+  9.1 M. Only a host call the module makes by name ends a stretch; a WASI
+  clock read or the runtime's own epoch check does not, and is only counted
+  (`unnamed_host_calls`). It works on a real run and on a rehearsal.
 
 ## Module input contract
 

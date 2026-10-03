@@ -1598,7 +1598,7 @@ impl TalosContext {
             idempotency_key: None,
             http_replay: None,
             http_capture: None,
-            host_call_label: crate::fuel_profile::OTHER,
+            host_call_label: crate::fuel_profile::UNNAMED,
             provider,
             expose_call_count: std::sync::atomic::AtomicU64::new(0),
             secret_tier2_exposed: std::sync::atomic::AtomicBool::new(false),
@@ -2006,6 +2006,34 @@ impl TalosContext {
     /// appended and later new uses are resolved but not recorded.
     pub(crate) const SECRET_USE_LEDGER_CAP: usize = 64;
 
+    /// Name the host call now running, for the fuel profile. Every host
+    /// function calls this first; one that does not ends no stretch and is
+    /// only counted (`fuel_profile::UNNAMED`).
+    #[inline]
+    pub(crate) fn host_call(&mut self, label: &'static str) {
+        self.host_call_label = label;
+    }
+
+    /// In a rehearsal (`http_replay` set) only `http::fetch` / `fetch_all` are
+    /// answered from recordings. Every other HTTP surface calls this first and
+    /// refuses when it returns true, so "a rehearsal sends nothing" holds for
+    /// all of them rather than for the two that are replayed.
+    pub(crate) async fn rehearsal_refuses(&mut self, surface: &'static str) -> bool {
+        if self.http_replay.is_none() {
+            return false;
+        }
+        self.record_network_outcome(None);
+        self.emit_host_diagnostic(
+            "http-replay",
+            &format!(
+                "{surface} is not replayed: this run is a rehearsal (http_fixtures), \
+                 so the call was refused and nothing was sent"
+            ),
+        )
+        .await;
+        true
+    }
+
     /// Publish a sanitized host-side diagnostic into the per-execution
     /// log stream — the same `wasm.log.{execution_id}` channel guest
     /// `logging::log` uses, marked `source: "host"` — so it lands in
@@ -2041,33 +2069,6 @@ impl TalosContext {
     // WASI stdio streams), so async methods must hold an exclusive ref
     // to keep their futures Send — same reason record_capability_denied
     // and every other async host method take `&mut self`.
-    /// In a rehearsal (`http_replay` set) only `http::fetch` / `fetch_all` are
-    /// answered from recordings. Every other HTTP surface calls this first and
-    /// refuses when it returns true, so "a rehearsal sends nothing" holds for
-    /// all of them rather than for the two that are replayed.
-    /// Name the host call now running, for the fuel profile. Every host
-    /// function calls this first; one that does not is reported as `other`.
-    #[inline]
-    pub(crate) fn host_call(&mut self, label: &'static str) {
-        self.host_call_label = label;
-    }
-
-    pub(crate) async fn rehearsal_refuses(&mut self, surface: &'static str) -> bool {
-        if self.http_replay.is_none() {
-            return false;
-        }
-        self.record_network_outcome(None);
-        self.emit_host_diagnostic(
-            "http-replay",
-            &format!(
-                "{surface} is not replayed: this run is a rehearsal (http_fixtures), \
-                 so the call was refused and nothing was sent"
-            ),
-        )
-        .await;
-        true
-    }
-
     pub async fn emit_host_diagnostic(&mut self, reason: &str, message: &str) {
         let count = self
             .host_diag_count

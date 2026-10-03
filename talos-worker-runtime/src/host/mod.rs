@@ -32,6 +32,9 @@ pub(crate) use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 mod ceiling_axis_pins;
+// Every host function names itself for the fuel profile (derived population).
+#[cfg(test)]
+mod host_call_label_pins;
 #[cfg(test)]
 #[path = "../host_impl_tests.rs"]
 mod host_impl_tests;

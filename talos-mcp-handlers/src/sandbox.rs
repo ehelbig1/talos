@@ -2965,13 +2965,17 @@ pub(crate) fn rendered_fuel_profile(
         "host_calls": report.host_calls.iter().map(|h| serde_json::json!({
             "call": h.call, "count": h.count, "fuel_during": h.fuel_during,
         })).collect::<Vec<_>>(),
+        "unnamed_host_calls": report.unnamed_host_calls,
         "accounted": report.accounted,
         "note": "Fuel is burned by the module's own code; a host call costs none. Each \
                  `guest` row is the fuel burned AFTER the named host call returned, up to \
-                 the next one (`start` = before the first; `other` = a call that does not \
-                 name itself, such as a WASI clock read). `fuel_during` is fuel burned \
-                 while a call was in progress — the module's allocator receiving the \
-                 result. Summed over attempts; `accounted` equals fuel.consumed.",
+                 the next named one (`start` = before the first). `fuel_during` is fuel \
+                 burned while a call was in progress — the module's allocator receiving \
+                 the result. A host transition that names nothing (a WASI clock read, \
+                 the runtime's own epoch check or memory growth) ends no stretch and has \
+                 no row; `unnamed_host_calls` counts them, and the count can differ \
+                 between two runs of the same input. Summed over attempts; `accounted` \
+                 equals fuel.consumed.",
     })
 }
 
@@ -5480,9 +5484,15 @@ mod http_fixture_tests {
         profile.start(1000);
         profile.calling_host(900);
         profile.returned_from_host(900, "http::fetch");
+        // The runtime's own epoch check, mid-parse: counted, and no row.
+        profile.calling_host(500);
+        profile.returned_from_host(500, talos_worker_runtime::fuel_profile::UNNAMED);
         profile.finish(100);
         let out = rendered_fuel_profile(Some(&profile));
         assert_eq!(out["accounted"], 900);
+        assert_eq!(out["unnamed_host_calls"], 1);
+        assert_eq!(out["guest"].as_array().map(Vec::len), Some(2));
+        assert_eq!(out["host_calls"].as_array().map(Vec::len), Some(1));
         assert_eq!(out["guest"][0]["after"], "http::fetch");
         assert_eq!(out["guest"][0]["fuel"], 800);
         assert_eq!(out["guest"][0]["percent"], 88.89);
