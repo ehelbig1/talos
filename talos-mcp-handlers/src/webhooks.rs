@@ -447,11 +447,13 @@ async fn handle_create_webhook(
             let webhook_url = format!("{}/webhooks/{}", base_url, webhook_id);
 
             let auth_note = if signing_secret_opt.is_some() {
-                "HMAC auth REQUIRED (signing_secret is set, static-token fallback is intentionally disabled to prevent downgrade attacks). Send ONE of: \
-                 (1) X-Hub-Signature-256: sha256=<hex_hmac_sha256(body, signing_secret)>  — GitHub style, simplest; \
-                 (2) X-Slack-Signature: v0=<hex_hmac_sha256(\"v0:\"+ts+\":\"+body, signing_secret)> + X-Slack-Request-Timestamp: <unix_secs>  — Slack style with timestamp; \
-                 (3) X-Signature: <hex_hmac_sha256(ts+body, signing_secret)> + X-Webhook-Timestamp: <unix_secs>  — generic format with replay protection. \
-                 The verification_token returned in this response is ONLY for callers that cannot compute HMAC; it is NOT accepted on this webhook.".to_string()
+                // The formats are described next to the verifier that
+                // accepts them (`talos_webhooks::HMAC_SENDER_NOTE`).
+                format!(
+                    "HMAC auth REQUIRED (signing_secret is set, static-token fallback is intentionally disabled to prevent downgrade attacks). {} \
+                     The verification_token returned in this response is ONLY for callers that cannot compute HMAC; it is NOT accepted on this webhook.",
+                    talos_webhooks::HMAC_SENDER_NOTE
+                )
             } else {
                 "Static-token auth only. Include header X-Verification-Token: <the verification_token returned here>. \
                  To enable HMAC auth on a future webhook, pass a `signing_secret` to create_webhook (HMAC-secured webhooks reject static-token requests outright)."
