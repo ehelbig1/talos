@@ -6,6 +6,31 @@
     "headers": {
       "content-type": "application/json"
     },
-    "body": []
+    "body": [
+      {
+        "entity_id": "light.made_up_0",
+        "state": "off",
+        "attributes": {
+          "friendly_name": "Made-up light",
+          "supported_color_modes": [
+            "brightness",
+            "color_temp"
+          ],
+          "color_mode": null,
+          "brightness": null,
+          "min_color_temp_kelvin": 2000,
+          "max_color_temp_kelvin": 6535,
+          "supported_features": 44
+        },
+        "last_changed": "2026-10-04T12:00:00.000000+00:00",
+        "last_reported": "2026-10-04T12:00:00.000000+00:00",
+        "last_updated": "2026-10-04T12:00:00.000000+00:00",
+        "context": {
+          "id": "01MADEUPMADEUPMADEUPMADEUP",
+          "parent_id": null,
+          "user_id": "made-up-user-id"
+        }
+      }
+    ]
   }
 ]

@@ -55,11 +55,19 @@ writes an entity id as a target.
 ## What an adapter returns
 
 ```jsonc
-{ "provider": "home-assistant", "skipped": false, "dry_run": true,
-  "done": 0, "refused": 1, "failed": 0, "not_run": 0,
-  "results": [ { "target": "office_lights", "action": "turn_off", "status": "dry_run" },
+{ "provider": "home-assistant", "skipped": false, "dry_run": false,
+  "done": 1, "refused": 1, "failed": 0, "unchanged": 0, "not_run": 0,
+  "results": [ { "target": "office_lights", "action": "turn_off", "status": "done", "changed": 1 },
                { "target": "garage", "action": "turn_on", "status": "refused", "reason": "unknown_target" } ] }
 ```
+
+`done` means the system ACCEPTED the command. That is not the same as
+something happening: Home Assistant accepts a command for an entity that
+does not exist. So a `done` result carries `changed`, how many things the
+system says changed, and the verdict counts `unchanged`, the done commands
+that changed nothing. `changed: 0` is a mistyped entity in `TARGETS`, or a
+thing that was already in the state asked for. An adapter whose system does
+not say omits `changed`.
 
 `DRY_RUN` defaults to true: an adapter reports what it would do and sends
 nothing until the node's config turns it off. One command failing is
