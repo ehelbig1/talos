@@ -816,6 +816,10 @@ pub struct ParallelWorkflowEngine {
     /// (out-of-tree consumers, tests without a store) makes the node pass
     /// its input on with every placeholder fallen back, never fail.
     pub(crate) action_link_minter: Option<Arc<dyn talos_workflow_engine_core::ActionLinkMinter>>,
+    /// Read-side port for the user's connected services — powers the
+    /// `connections` system node. Same None-degrades contract as
+    /// `ops_alerts_reader`.
+    pub(crate) connections_reader: Option<Arc<dyn talos_workflow_engine_core::ConnectionsReader>>,
     /// Read-side port for the weekly assistant report — powers the
     /// `assistant_report` system node. Same None-degrades contract as
     /// `ops_alerts_reader`.
@@ -985,6 +989,7 @@ pub struct AdapterSet {
     ops_alerts_reader: Option<Arc<dyn talos_workflow_engine_core::OpsAlertsReader>>,
     pending_approvals_reader: Option<Arc<dyn talos_workflow_engine_core::PendingApprovalsReader>>,
     action_link_minter: Option<Arc<dyn talos_workflow_engine_core::ActionLinkMinter>>,
+    connections_reader: Option<Arc<dyn talos_workflow_engine_core::ConnectionsReader>>,
     assistant_report_reader: Option<Arc<dyn talos_workflow_engine_core::AssistantReportReader>>,
     operator_digest_reader: Option<Arc<dyn talos_workflow_engine_core::OperatorDigestReader>>,
     judge_score_recorder: Option<Arc<dyn talos_workflow_engine_core::JudgeScoreRecorder>>,
@@ -1096,6 +1101,7 @@ impl AdapterSet {
         engine.ops_alerts_reader = self.ops_alerts_reader;
         engine.pending_approvals_reader = self.pending_approvals_reader;
         engine.action_link_minter = self.action_link_minter;
+        engine.connections_reader = self.connections_reader;
         engine.assistant_report_reader = self.assistant_report_reader;
         engine.operator_digest_reader = self.operator_digest_reader;
         engine.judge_score_recorder = self.judge_score_recorder;
@@ -1220,6 +1226,7 @@ impl ParallelWorkflowEngine {
             ops_alerts_reader: None,
             pending_approvals_reader: None,
             action_link_minter: None,
+            connections_reader: None,
             assistant_report_reader: None,
             operator_digest_reader: None,
             judge_score_recorder: None,
@@ -1268,6 +1275,7 @@ impl ParallelWorkflowEngine {
             ops_alerts_reader: self.ops_alerts_reader.clone(),
             pending_approvals_reader: self.pending_approvals_reader.clone(),
             action_link_minter: self.action_link_minter.clone(),
+            connections_reader: self.connections_reader.clone(),
             assistant_report_reader: self.assistant_report_reader.clone(),
             operator_digest_reader: self.operator_digest_reader.clone(),
             judge_score_recorder: self.judge_score_recorder.clone(),
@@ -2331,6 +2339,33 @@ impl ParallelWorkflowEngine {
                 if let Some(output) = await_polling_in_flight!(
                     self.try_dispatch_pending_approvals(node_id, execution_id)
                 ) {
+                    let chains_ctx = if chains_live {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx,
+                        output,
+                        execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut joins,
+                        &mut ready,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                // ── Connections (controller-side read of connected services) ─
+                // Same async + route-downstream + degrade-not-fail contract as
+                // the readers above. No credential leaves the controller: the
+                // output carries references.
+                if let Some(output) =
+                    await_polling_in_flight!(self.try_dispatch_connections(node_id, execution_id))
+                {
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {

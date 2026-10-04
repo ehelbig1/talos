@@ -118,6 +118,7 @@ pub mod attempt_window;
 mod checkpoint;
 mod child_run_recorder;
 pub mod child_workflow_refs;
+pub mod connections_reader;
 mod context;
 mod dispatcher;
 mod edge;
@@ -171,6 +172,7 @@ pub use child_workflow_refs::{
     child_workflow_ids, child_workflow_ids_checked, collect_child_workflow_references,
     CHILD_WORKFLOW_ID_MAP_KEYS, CHILD_WORKFLOW_ID_SUFFIX,
 };
+pub use connections_reader::ConnectionsReader;
 pub use context::WorkflowContext;
 pub use dispatcher::{
     dispatch_chain_sequential, ChainDispatchRequest, ChainDispatchResult, ChainStepResult,

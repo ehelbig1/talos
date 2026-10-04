@@ -14,7 +14,10 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-oauth = { path = "../talos-oauth" }
+talos-plaid = { path = "../talos-plaid" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tracing.workspace = true
 uuid.workspace = true
 

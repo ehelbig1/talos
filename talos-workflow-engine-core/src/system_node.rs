@@ -198,6 +198,16 @@ pub enum SystemNodeKind {
         /// Link lifetime in hours (`None` = the minter's default).
         ttl_hours: Option<u32>,
     },
+    /// Controller-side read of the running user's CONNECTED SERVICES (bank
+    /// items, mail accounts, calendars), each with the `vault://` reference
+    /// its credential is stored at. Output flows downstream as ordinary graph
+    /// data. Executes via the injected [`crate::ConnectionsReader`] — no
+    /// worker dispatch, and no credential: a reference is a string.
+    Connections {
+        /// Keep one service's connections (a provider id such as `plaid`);
+        /// `None` keeps all.
+        provider: Option<String>,
+    },
     /// Synthesize a value from prior outputs, optionally via expression.
     Synthesize {
         /// Optional expression building the synthesized value.

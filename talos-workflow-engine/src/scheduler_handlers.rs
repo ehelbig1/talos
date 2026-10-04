@@ -337,6 +337,115 @@ impl ParallelWorkflowEngine {
         Some(output)
     }
 
+    /// [`SystemNodeKind::Connections`] — controller-side read of the running
+    /// user's connected services through the injected
+    /// [`talos_workflow_engine_core::ConnectionsReader`] port. Same contract
+    /// as [`Self::try_dispatch_pending_approvals`]: `None` when the node
+    /// isn't this kind; otherwise ALWAYS `Some(envelope)`, degrading to
+    /// `{"available": false, "reason": …}` (a generic reason only) instead of
+    /// failing the workflow.
+    ///
+    /// The output names accounts (an address, a bank) and where each
+    /// credential is stored. It is the owner's own data and flows as node
+    /// output; only counts are logged here.
+    ///
+    /// Tenancy: `self.user_id` — the execution's resolved identity, never
+    /// node config.
+    pub(crate) async fn try_dispatch_connections(
+        &self,
+        node_id: Uuid,
+        execution_id: Uuid,
+    ) -> Option<JsonValue> {
+        let (_, _, Some(SystemNodeKind::Connections { provider })) =
+            self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        let provider = provider.clone();
+        let unavailable = |reason: &str| {
+            let mut envelope = serde_json::json!({
+                "available": false,
+                "reason": reason,
+            });
+            if let (Some(p), Some(obj)) = (provider.as_ref(), envelope.as_object_mut()) {
+                obj.insert("provider".to_string(), serde_json::json!(p));
+            }
+            envelope
+        };
+
+        let Some(reader) = self.connections_reader.clone() else {
+            tracing::warn!(%node_id, "connections: no ConnectionsReader wired — emitting unavailable envelope");
+            self.emit_node_lifecycle_events(
+                execution_id,
+                node_id,
+                "Completed",
+                "connections unavailable (reader not wired)".to_string(),
+            );
+            return Some(unavailable(
+                "the connections store is not available in this deployment",
+            ));
+        };
+        let Some(user_id) = self.user_id else {
+            tracing::warn!(%node_id, "connections: execution has no resolved user identity");
+            self.emit_node_lifecycle_events(
+                execution_id,
+                node_id,
+                "Completed",
+                "connections unavailable (no tenant identity)".to_string(),
+            );
+            return Some(unavailable("execution has no tenant identity"));
+        };
+
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let output = match tokio::time::timeout(
+            READ_TIMEOUT,
+            reader.connections(user_id, provider.as_deref()),
+        )
+        .await
+        {
+            Ok(Ok(mut listed)) => {
+                let count = listed
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if let Some(obj) = listed.as_object_mut() {
+                    obj.insert("available".to_string(), serde_json::json!(true));
+                    if let Some(p) = provider.as_ref() {
+                        obj.insert("provider".to_string(), serde_json::json!(p));
+                    }
+                }
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    format!("connections fetched ({count})"),
+                );
+                listed
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%node_id, error = %e, "connections: read failed");
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    "connections unavailable (storage error)".to_string(),
+                );
+                unavailable("the connections read failed")
+            }
+            Err(_) => {
+                tracing::warn!(%node_id, "connections: read timed out");
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    "connections unavailable (timeout)".to_string(),
+                );
+                unavailable("the connections read timed out")
+            }
+        };
+        Some(output)
+    }
+
     /// [`SystemNodeKind::ActionLinks`] — mint the action links the parent's
     /// output asks for and pass that output on with every placeholder
     /// replaced (see [`talos_workflow_engine_core::action_links`]).

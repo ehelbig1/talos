@@ -79,6 +79,7 @@ pub fn dispatcher_branch_for(kind: &SystemNodeKind) -> &'static str {
         SystemNodeKind::OpsAlertsDigest { .. } => "try_dispatch_ops_alerts_digest",
         SystemNodeKind::PendingApprovals { .. } => "try_dispatch_pending_approvals",
         SystemNodeKind::ActionLinks { .. } => "try_dispatch_action_links",
+        SystemNodeKind::Connections { .. } => "try_dispatch_connections",
         SystemNodeKind::AssistantReport { .. } => "try_dispatch_assistant_report",
         SystemNodeKind::OperatorDigest { .. } => "try_dispatch_operator_digest",
         SystemNodeKind::Synthesize { .. } => "try_dispatch_synthesize",
@@ -189,6 +190,7 @@ pub fn error_routing_for(kind: &SystemNodeKind) -> SystemNodeErrorRouting {
         SystemNodeKind::PendingApprovals { .. } => ReactorFailurePath,
         // Passes its parent's output on; an upstream error envelope stays one.
         SystemNodeKind::ActionLinks { .. } => ReactorFailurePath,
+        SystemNodeKind::Connections { .. } => ReactorFailurePath,
         SystemNodeKind::AssistantReport { .. } => ReactorFailurePath,
         SystemNodeKind::OperatorDigest { .. } => ReactorFailurePath,
         SystemNodeKind::Verify { .. } => ReactorFailurePath,
@@ -259,6 +261,7 @@ mod tests {
                 targets: std::collections::BTreeMap::new(),
                 ttl_hours: None,
             },
+            SystemNodeKind::Connections { provider: None },
             SystemNodeKind::AssistantReport { days: 7 },
             SystemNodeKind::OperatorDigest { days: 7 },
             SystemNodeKind::Synthesize {
@@ -365,18 +368,18 @@ mod tests {
     /// the constructor here. This test fails with a clear message if
     /// the count drifts.
     ///
-    /// Counts as of 2026-10-04 (after `ActionLinks` addition):
-    ///   17 always-available (`Wait`, `WhileLoop`, `RepeatLoop`,
+    /// Counts as of 2026-10-04 (after `ActionLinks` and `Connections`):
+    ///   18 always-available (`Wait`, `WhileLoop`, `RepeatLoop`,
     ///   `ErrorHandler`, `FanIn`, `SubWorkflow`, `Loop`, `Collect`,
     ///   `OpsAlertsDigest`, `PendingApprovals`, `ActionLinks`,
-    ///   `AssistantReport`, `OperatorDigest`, `Synthesize`, `Verify`,
+    ///   `Connections`, `AssistantReport`, `OperatorDigest`, `Synthesize`, `Verify`,
     ///   `DynamicDispatch`, `CapabilityDispatch`)
     ///   + 8 llm-primitives (`AgentLoop`, `Judge`, `InlineJudge`, `Ensemble`,
     ///   `ConfidenceGate`, `ReActLoop`, `ReflectiveRetry`, `LlmDispatch`)
-    ///   = 25 total.
+    ///   = 26 total.
     #[test]
     fn sample_count_matches_known_enum_size() {
-        const ALWAYS_AVAILABLE: usize = 17;
+        const ALWAYS_AVAILABLE: usize = 18;
         #[cfg(feature = "llm-primitives")]
         const EXPECTED: usize = ALWAYS_AVAILABLE + 8;
         #[cfg(not(feature = "llm-primitives"))]
@@ -478,6 +481,7 @@ mod tests {
             "try_dispatch_ops_alerts_digest",
             "try_dispatch_pending_approvals",
             "try_dispatch_action_links",
+            "try_dispatch_connections",
             "try_dispatch_assistant_report",
             "try_dispatch_operator_digest",
             "try_dispatch_synthesize",
@@ -543,6 +547,7 @@ mod tests {
         exists(ParallelWorkflowEngine::try_dispatch_loop);
         exists(ParallelWorkflowEngine::try_dispatch_pending_approvals);
         exists(ParallelWorkflowEngine::try_dispatch_action_links);
+        exists(ParallelWorkflowEngine::try_dispatch_connections);
         exists(ParallelWorkflowEngine::try_dispatch_synthesize);
         exists(ParallelWorkflowEngine::try_dispatch_verify);
         exists(ParallelWorkflowEngine::try_dispatch_dynamic_dispatch);

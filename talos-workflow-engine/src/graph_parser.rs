@@ -295,6 +295,16 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
             .and_then(serde_json::Value::as_u64)
             .map_or(10u32, |v| v.clamp(1, 25) as u32);
         Some(SystemNodeKind::PendingApprovals { limit })
+    } else if k == "connections" {
+        // A provider id is a short lowercase token; anything else is read as
+        // "no filter" rather than carried into the node as written.
+        let provider = node
+            .get("data")
+            .and_then(|d| d.get("provider"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|p| talos_workflow_engine_core::connections_reader::provider_id_usable(p))
+            .map(str::to_string);
+        Some(SystemNodeKind::Connections { provider })
     } else if k == "action_links" {
         // Targets are bounded and shape-checked at parse time (names
         // `[A-Za-z0-9_-]`, ids that parse as UUIDs, at most 16) and the
