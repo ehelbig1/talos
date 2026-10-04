@@ -12,8 +12,9 @@ verifier (`talos_webhooks::signature`) signs `ts + "." + body`. A sender
 following the note computed a different MAC and got 401. The GitHub and
 Slack descriptions were right.
 
-Population: one description, one format of three. No webhook on this fleet
-uses the generic format, so nothing live was failing.
+Population: one description, one format of three. Measured on this fleet:
+one webhook, none with a signing secret (0 of 1), so no sender here signs
+at all and nothing live was failing.
 
 ## The fix
 
