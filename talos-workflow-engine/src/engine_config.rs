@@ -450,6 +450,17 @@ impl ParallelWorkflowEngine {
         self.pending_approvals_reader = Some(reader);
     }
 
+    /// Inject the action-link mint port (powers the `action_links` system
+    /// node). Wired by the controller engine builder; absent in out-of-tree
+    /// consumers, where the node passes its input on with every link fallen
+    /// back.
+    pub fn set_action_link_minter(
+        &mut self,
+        minter: Arc<dyn talos_workflow_engine_core::ActionLinkMinter>,
+    ) {
+        self.action_link_minter = Some(minter);
+    }
+
     /// Inject the assistant-report read port (powers the
     /// `assistant_report` system node). Wired by the controller engine
     /// builder; absent in out-of-tree consumers, where the node degrades

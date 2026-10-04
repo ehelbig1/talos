@@ -1,6 +1,7 @@
 //! Webhook router manages incoming webhook requests with security features
 //! including circuit breakers, rate limiting, HMAC verification, and DLQ support.
 
+mod action_links;
 mod approval;
 mod approval_actions;
 
@@ -36,6 +37,7 @@ mod types;
 pub use rate_limiter::CircuitBreaker;
 pub use rate_limiter::CircuitBreakerFailureType;
 
+pub use action_links::{action_link_apply, action_link_preview};
 pub use approval::{
     approval_gate_handler, approval_gate_preview, approval_handler, ApprovalPayload,
 };

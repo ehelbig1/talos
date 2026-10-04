@@ -541,6 +541,18 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
         SystemNodeKind::PendingApprovals { limit } => {
             ("pending_approvals", json!({ "limit": limit }))
         }
+        SystemNodeKind::ActionLinks { targets, ttl_hours } => {
+            let targets: serde_json::Map<String, serde_json::Value> = targets
+                .iter()
+                .map(|(name, id)| (name.clone(), json!(id.to_string())))
+                .collect();
+            let mut data = serde_json::Map::new();
+            data.insert("targets".into(), serde_json::Value::Object(targets));
+            if let Some(hours) = ttl_hours {
+                data.insert("ttl_hours".into(), json!(hours));
+            }
+            ("action_links", serde_json::Value::Object(data))
+        }
         SystemNodeKind::AssistantReport { days } => ("assistant_report", json!({ "days": days })),
         SystemNodeKind::OperatorDigest { days } => ("operator_digest", json!({ "days": days })),
         SystemNodeKind::Synthesize { synthesis_expr } => (
@@ -1351,6 +1363,44 @@ mod tests {
             parsed,
             Some(SystemNodeKind::OpsAlertsDigest { top_limit: 25 })
         ));
+    }
+
+    #[tokio::test]
+    async fn system_node_action_links_round_trips_and_is_bounded_at_parse() {
+        let list = uuid::Uuid::from_u128(1);
+        let kind = SystemNodeKind::ActionLinks {
+            targets: std::collections::BTreeMap::from([("list".to_string(), list)]),
+            ttl_hours: Some(48),
+        };
+        assert_eq!(round_trip_kind("links", kind.clone()).await, kind);
+        // No lifetime is no key, and comes back as none.
+        let default_ttl = SystemNodeKind::ActionLinks {
+            targets: std::collections::BTreeMap::from([("list".to_string(), list)]),
+            ttl_hours: None,
+        };
+        assert_eq!(
+            round_trip_kind("links2", default_ttl.clone()).await,
+            default_ttl
+        );
+
+        // A hand-written graph: unusable targets are dropped and the
+        // lifetime is clamped.
+        let hand_written = serde_json::json!({
+            "id": "links",
+            "type": "system:action_links",
+            "kind": "action_links",
+            "data": {
+                "targets": { "list": list.to_string(), "bad name": list.to_string(), "x": "pa-list" },
+                "ttl_hours": 999_999
+            }
+        });
+        assert_eq!(
+            crate::graph_parser::parse_system_node_kind("action_links", &hand_written),
+            Some(SystemNodeKind::ActionLinks {
+                targets: std::collections::BTreeMap::from([("list".to_string(), list)]),
+                ttl_hours: Some(336),
+            })
+        );
     }
 
     #[tokio::test]

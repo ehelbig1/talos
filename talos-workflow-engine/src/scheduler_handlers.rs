@@ -337,6 +337,167 @@ impl ParallelWorkflowEngine {
         Some(output)
     }
 
+    /// [`SystemNodeKind::ActionLinks`] — mint the action links the parent's
+    /// output asks for and pass that output on with every placeholder
+    /// replaced (see [`talos_workflow_engine_core::action_links`]).
+    ///
+    /// `None` when the node isn't this kind; otherwise ALWAYS
+    /// `Some(output)`. Nothing here fails the node: with no minter, no
+    /// tenant identity, a failed mint or a timed-out one, every placeholder
+    /// falls back and the report says why — the message still goes out,
+    /// with the links it would have had before this node existed.
+    ///
+    /// The minted URLs are capability secrets. They travel in the output
+    /// (that is the node's purpose) and are never logged here: only counts.
+    ///
+    /// Tenancy: `self.user_id` — the execution's resolved identity. The
+    /// targets come from the node's configuration; the module's output
+    /// names one of them and can name nothing else.
+    pub(crate) async fn try_dispatch_action_links(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        execution_id: Uuid,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> Option<JsonValue> {
+        use talos_workflow_engine_core::action_links::{
+            apply_action_links, plan_action_links, ActionLinkSpec, ResolvedLink,
+        };
+        let (_, _, Some(SystemNodeKind::ActionLinks { targets, ttl_hours })) =
+            self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        let ttl_hours = *ttl_hours;
+        let input = self.gather_inputs(node_idx, results);
+        let (planned, unidentified) = plan_action_links(&input, targets);
+        let node_label = self
+            .node_labels
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_else(|| node_id.to_string());
+
+        // Every request falls back, for one stated reason.
+        let all_fall_back = |reason: &str| -> Vec<ResolvedLink> {
+            planned
+                .iter()
+                .map(|p| ResolvedLink {
+                    id: p.id.clone(),
+                    url: None,
+                    fallback: p.fallback.clone(),
+                    refused: Some(p.spec.as_ref().err().map_or(reason, |r| *r).to_string()),
+                })
+                .collect()
+        };
+
+        let specs: Vec<ActionLinkSpec> = planned
+            .iter()
+            .filter_map(|p| p.spec.as_ref().ok().cloned())
+            .collect();
+        let (resolved, unavailable): (Vec<ResolvedLink>, Option<&str>) = if specs.is_empty() {
+            // Nothing to mint: no requests, or every one refused at planning.
+            (all_fall_back("not_minted"), None)
+        } else if let (Some(minter), Some(user_id)) =
+            (self.action_link_minter.clone(), self.user_id)
+        {
+            // Engine-side backstop; the minter bounds its own write too.
+            const MINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+            match tokio::time::timeout(
+                MINT_TIMEOUT,
+                minter.mint(user_id, execution_id, &node_label, ttl_hours, &specs),
+            )
+            .await
+            {
+                Ok(Ok(minted)) if minted.len() == specs.len() => {
+                    let mut minted = minted.into_iter();
+                    let resolved = planned
+                        .iter()
+                        .map(|p| match &p.spec {
+                            Err(reason) => ResolvedLink {
+                                id: p.id.clone(),
+                                url: None,
+                                fallback: p.fallback.clone(),
+                                refused: Some((*reason).to_string()),
+                            },
+                            Ok(_) => match minted.next() {
+                                Some(Ok(url)) => ResolvedLink {
+                                    id: p.id.clone(),
+                                    url: Some(url),
+                                    fallback: p.fallback.clone(),
+                                    refused: None,
+                                },
+                                Some(Err(reason)) => ResolvedLink {
+                                    id: p.id.clone(),
+                                    url: None,
+                                    fallback: p.fallback.clone(),
+                                    refused: Some(reason),
+                                },
+                                None => ResolvedLink {
+                                    id: p.id.clone(),
+                                    url: None,
+                                    fallback: p.fallback.clone(),
+                                    refused: Some("not_minted".to_string()),
+                                },
+                            },
+                        })
+                        .collect();
+                    (resolved, None)
+                }
+                Ok(Ok(_)) => {
+                    tracing::warn!(%node_id, "action_links: minter returned a misaligned result");
+                    (
+                        all_fall_back("unavailable"),
+                        Some("the link store returned an unusable answer"),
+                    )
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(%node_id, error = %e, "action_links: mint failed");
+                    (
+                        all_fall_back("unavailable"),
+                        Some("the link store could not be written"),
+                    )
+                }
+                Err(_) => {
+                    tracing::warn!(%node_id, "action_links: mint timed out");
+                    (
+                        all_fall_back("unavailable"),
+                        Some("minting the links timed out"),
+                    )
+                }
+            }
+        } else if self.action_link_minter.is_none() {
+            tracing::warn!(%node_id, "action_links: no ActionLinkMinter wired — every link falls back");
+            (
+                all_fall_back("unavailable"),
+                Some("action links are not available in this deployment"),
+            )
+        } else {
+            tracing::warn!(%node_id, "action_links: execution has no resolved user identity");
+            (
+                all_fall_back("unavailable"),
+                Some("execution has no tenant identity"),
+            )
+        };
+
+        let minted = resolved.iter().filter(|l| l.url.is_some()).count();
+        self.emit_node_lifecycle_events(
+            execution_id,
+            node_id,
+            "Completed",
+            // Counts only — never a URL.
+            format!(
+                "action links: {minted} minted of {} requested",
+                resolved.len() + unidentified
+            ),
+        );
+        Some(apply_action_links(
+            input,
+            &resolved,
+            unidentified,
+            unavailable,
+        ))
+    }
+
     /// [`SystemNodeKind::AssistantReport`] — controller-side weekly
     /// activity + learning-health snapshot through the injected
     /// [`talos_workflow_engine_core::AssistantReportReader`] port.

@@ -183,6 +183,21 @@ pub enum SystemNodeKind {
         /// 1..=25).
         limit: u32,
     },
+    /// Controller-side mint of ACTION LINKS for a composed message: the
+    /// parent's output asks for links under `__action_links__` and marks
+    /// where each belongs with `talos-action:<id>`; this node mints them
+    /// through the injected [`crate::ActionLinkMinter`] and passes the output
+    /// on with every placeholder replaced. A link, once its owner confirms
+    /// it, starts ONE of the workflows named here with the payload the
+    /// module supplied. See [`crate::action_links`].
+    ActionLinks {
+        /// Target name → workflow id: the only workflows a link minted by
+        /// this node may start. Written by the graph's author; a module
+        /// names a target, never a workflow.
+        targets: std::collections::BTreeMap<String, uuid::Uuid>,
+        /// Link lifetime in hours (`None` = the minter's default).
+        ttl_hours: Option<u32>,
+    },
     /// Synthesize a value from prior outputs, optionally via expression.
     Synthesize {
         /// Optional expression building the synthesized value.

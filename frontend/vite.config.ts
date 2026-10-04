@@ -61,6 +61,7 @@ export default defineConfig({
       '/webhooks/': controllerProxy(),
       '/approvals/': controllerProxy(),
       '/approval-actions/': controllerProxy(),
+      '/action-links/': controllerProxy(),
       '/corrections/': controllerProxy(),
       '/ws': {
         target: proxyTarget,

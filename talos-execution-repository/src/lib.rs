@@ -29,6 +29,7 @@ pub enum RetryReset {
 
 /// One-click email approve/reject capability links for suspended
 /// confidence-gate executions (`/approval-actions/{token}/{action}`).
+pub mod action_links;
 pub mod approval_links;
 
 /// The fleet-wide stale-execution sweep and the attribution it writes —

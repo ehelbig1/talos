@@ -295,6 +295,20 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
             .and_then(serde_json::Value::as_u64)
             .map_or(10u32, |v| v.clamp(1, 25) as u32);
         Some(SystemNodeKind::PendingApprovals { limit })
+    } else if k == "action_links" {
+        // Targets are bounded and shape-checked at parse time (names
+        // `[A-Za-z0-9_-]`, ids that parse as UUIDs, at most 16) and the
+        // lifetime is clamped, so a hand-written graph cannot configure an
+        // unbounded target set or an everlasting link.
+        let data = node.get("data");
+        let targets = talos_workflow_engine_core::action_links::parse_action_targets(
+            data.and_then(|d| d.get("targets")),
+        );
+        let ttl_hours = data
+            .and_then(|d| d.get("ttl_hours"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v.clamp(1, 336) as u32);
+        Some(SystemNodeKind::ActionLinks { targets, ttl_hours })
     } else if k == "synthesize" {
         let data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
         Some(SystemNodeKind::Synthesize {

@@ -223,6 +223,20 @@ data:
             proxy_set_header X-Forwarded-Proto $scheme;
         }
 
+        # /action-links — links in a composed message that start one
+        # workflow once their owner confirms. Token-authenticated on the
+        # controller. The capability token is the last path segment, so this
+        # location writes no access-log line.
+        location /action-links/ {
+            access_log off;
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
         # /mcp — Model Context Protocol endpoint on the controller. Used
         # by remote MCP clients (Claude Code, Claude Desktop, etc.) to
         # invoke the controller's tool surface. Bearer-token auth is

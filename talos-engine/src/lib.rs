@@ -1,3 +1,4 @@
+pub mod action_link_minter;
 pub mod actor_binding;
 pub mod adaptive_fuel;
 pub mod approval_gate;
