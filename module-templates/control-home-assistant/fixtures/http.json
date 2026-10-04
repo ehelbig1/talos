@@ -1,0 +1,11 @@
+[
+  {
+    "method": "POST",
+    "url_contains": "home.example.test/api/services/",
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": []
+  }
+]

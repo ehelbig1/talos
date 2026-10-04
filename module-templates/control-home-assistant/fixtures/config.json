@@ -1,0 +1,71 @@
+{
+  "BASE_URL": "https://home.example.test",
+  "AUTH_HEADER": "Bearer made-up-not-a-token",
+  "DRY_RUN": false,
+  "TARGETS": {
+    "target_0": {
+      "entity": "light.made_up_0",
+      "allow": [
+        "turn_on",
+        "turn_off",
+        "toggle"
+      ]
+    },
+    "target_1": {
+      "entity": "light.made_up_1",
+      "allow": [
+        "turn_on",
+        "turn_off",
+        "toggle"
+      ]
+    },
+    "target_2": {
+      "entity": "light.made_up_2",
+      "allow": [
+        "turn_on",
+        "turn_off",
+        "toggle"
+      ]
+    },
+    "target_3": {
+      "entity": "light.made_up_3",
+      "allow": [
+        "turn_on",
+        "turn_off",
+        "toggle"
+      ]
+    },
+    "target_4": {
+      "entity": "light.made_up_4",
+      "allow": [
+        "turn_on",
+        "turn_off",
+        "toggle"
+      ]
+    },
+    "target_5": {
+      "entity": "light.made_up_5",
+      "allow": [
+        "turn_on",
+        "turn_off",
+        "toggle"
+      ]
+    },
+    "target_6": {
+      "entity": "light.made_up_6",
+      "allow": [
+        "turn_on",
+        "turn_off",
+        "toggle"
+      ]
+    },
+    "target_7": {
+      "entity": "light.made_up_7",
+      "allow": [
+        "turn_on",
+        "turn_off",
+        "toggle"
+      ]
+    }
+  }
+}
