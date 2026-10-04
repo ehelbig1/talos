@@ -353,6 +353,7 @@ async fn a_reinstall_that_changes_the_kind_of_copy_replaces_the_other_kind() {
                 &json!({}),
                 Some("flip-probe"),
                 false,
+                &talos_module_repository::OwnerAddedGrants::default(),
             )
             .await
             .expect("the copy is written")
@@ -426,6 +427,7 @@ async fn a_reinstall_that_changes_the_kind_of_copy_replaces_the_other_kind() {
             &json!({}),
             Some("flip-probe"),
             false,
+            &talos_module_repository::OwnerAddedGrants::default(),
         )
         .await
         .is_err());

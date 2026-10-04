@@ -415,7 +415,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "properties": {
                     "module_id": {
                         "type": "string",
-                        "description": "UUID of the module to update (from list_modules)"
+                        "description": "UUID of the module to update (from list_modules) REINSTALL: an entry you add here that the module did not already hold from its catalog template is recorded as yours (the reply's `owner_added`) and is kept when the module is reinstalled from the catalog; an entry inherited from the template is kept only while the template still grants it."
                     },
                     "allowed_secrets": {
                         "type": "array",
@@ -428,7 +428,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "update_module_hosts",
-            "description": "Update the allowed_hosts list for a compiled module. Controls which external hostnames the module may reach via talos::core::http::*. Companion to update_module_secrets. Use this after compile_custom_sandbox / hot_update_module if a same-named module existed with stricter hosts than you intended.",
+            "description": "Update the allowed_hosts list for a compiled module. Controls which external hostnames the module may reach via talos::core::http::*. Companion to update_module_secrets. Use this after compile_custom_sandbox / hot_update_module if a same-named module existed with stricter hosts than you intended. REINSTALL: an entry you add here that the module did not already hold from its catalog template is recorded as yours (the reply's `owner_added`) and is kept when the module is reinstalled from the catalog; an entry inherited from the template is kept only while the template still grants it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -447,7 +447,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "update_module_methods",
-            "description": "Update the allowed_methods list for a compiled module. Controls which HTTP verbs the module may issue (e.g. GET / POST / PATCH). EMPTY DENIES EVERY VERB at all five egress gates (http fetch / fetch_all, graphql, webhook, SSE connect) — the same rule allowed_hosts and allowed_secrets have always had; before 2026-09-24 empty meant allow-all, which made this the one grant where declaring nothing granted everything. There is no wildcard: the verb set is closed at five, so \"every verb\" is [\"GET\",\"POST\",\"PUT\",\"PATCH\",\"DELETE\"] written out. Empty also forfeits the automatic transient-retry default (an undeclared list is UNKNOWN, so nodes created from the module default to retry_count 0); declare [\"GET\"] to get read-only retries. Companion to update_module_hosts.",
+            "description": "Update the allowed_methods list for a compiled module. Controls which HTTP verbs the module may issue (e.g. GET / POST / PATCH). EMPTY DENIES EVERY VERB at all five egress gates (http fetch / fetch_all, graphql, webhook, SSE connect) — the same rule allowed_hosts and allowed_secrets have always had; before 2026-09-24 empty meant allow-all, which made this the one grant where declaring nothing granted everything. There is no wildcard: the verb set is closed at five, so \"every verb\" is [\"GET\",\"POST\",\"PUT\",\"PATCH\",\"DELETE\"] written out. Empty also forfeits the automatic transient-retry default (an undeclared list is UNKNOWN, so nodes created from the module default to retry_count 0); declare [\"GET\"] to get read-only retries. Companion to update_module_hosts. REINSTALL: an entry you add here that the module did not already hold from its catalog template is recorded as yours (the reply's `owner_added`) and is kept when the module is reinstalled from the catalog; an entry inherited from the template is kept only while the template still grants it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3413,7 +3413,12 @@ async fn handle_update_module_secrets(
     // inside the repository (package CT); a failed record fails the call.
     let change = match state
         .module_repo
-        .update_module_allowed_secrets(module_id, user_id, &allowed_secrets)
+        .update_module_allowed_secrets(
+            module_id,
+            user_id,
+            &allowed_secrets,
+            &crate::modules::secrets_beyond,
+        )
         .await
     {
         Ok(Some(change)) => change,
@@ -3454,6 +3459,10 @@ async fn handle_update_module_secrets(
         "module_id": module_id,
         "allowed_secrets": allowed_secrets,
         "previous_allowed_secrets": change.previous,
+        // The entries recorded as yours: a catalog reinstall keeps these
+        // whatever the template grants. Everything else in the list was
+        // inherited from the template and narrows with it.
+        "owner_added": change.owner_added,
         "rows_affected": 1,
     });
     Some(mcp_text(
@@ -3541,7 +3550,12 @@ async fn handle_update_module_hosts(
     // Replace + record in ONE transaction (package CT).
     let change = match state
         .module_repo
-        .update_module_allowed_hosts(module_id, user_id, &allowed_hosts)
+        .update_module_allowed_hosts(
+            module_id,
+            user_id,
+            &allowed_hosts,
+            &crate::modules::hosts_beyond,
+        )
         .await
     {
         Ok(Some(change)) => change,
@@ -3581,6 +3595,10 @@ async fn handle_update_module_hosts(
         "module_id": module_id,
         "allowed_hosts": allowed_hosts,
         "previous_allowed_hosts": change.previous,
+        // The entries recorded as yours: a catalog reinstall keeps these
+        // whatever the template grants. Everything else in the list was
+        // inherited from the template and narrows with it.
+        "owner_added": change.owner_added,
         "rows_affected": 1,
     });
     Some(mcp_text(
@@ -3664,7 +3682,12 @@ async fn handle_update_module_methods(
     // Replace + record in ONE transaction (package CT).
     let change = match state
         .module_repo
-        .update_module_allowed_methods(module_id, user_id, &allowed_methods)
+        .update_module_allowed_methods(
+            module_id,
+            user_id,
+            &allowed_methods,
+            &crate::modules::methods_beyond,
+        )
         .await
     {
         Ok(Some(change)) => change,
@@ -3704,6 +3727,10 @@ async fn handle_update_module_methods(
         "module_id": module_id,
         "allowed_methods": allowed_methods,
         "previous_allowed_methods": change.previous,
+        // The entries recorded as yours: a catalog reinstall keeps these
+        // whatever the template grants. Everything else in the list was
+        // inherited from the template and narrows with it.
+        "owner_added": change.owner_added,
         "rows_affected": 1,
     });
     Some(mcp_text(
