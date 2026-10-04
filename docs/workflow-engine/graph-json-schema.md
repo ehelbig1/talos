@@ -90,6 +90,9 @@ Unknown top-level keys are ignored.
   //   "pending_approvals" | "assistant_report" | "action_links"
   //   "connections"
   //
+  // One kind sits on a MODULE node (its `type` is the module id) rather
+  // than replacing it: "for_each_connection".
+  //
   // LLM-flavored kinds (gated by the `llm-primitives` feature, on by
   // default):
   //
@@ -378,6 +381,66 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 // unreachable store emits { available: false } instead of failing the
 // workflow. An unusable `provider` is read as "no filter".
 { "provider": "plaid" }   // optional: one service id; omit for all
+```
+
+### `for_each_connection`
+```jsonc
+// On a MODULE node: run the node's module once per connection of one
+// service (each connected bank, each calendar) instead of once. The node
+// keeps its `type` (the module id), its config, its limits and its retry
+// policy; `kind` and one `data` key are what make it a fan-out:
+//
+//   { "id": "banks", "type": "<module uuid>", "kind": "for_each_connection",
+//     "data": {
+//       "PLAID_ENV": "production",            // the node's config, every run
+//       "for_each_connection": {
+//         "provider": "plaid",
+//         "bind": { "ACCESS_TOKEN": "vault_reference",
+//                   "INSTITUTION":  "account" },
+//         "max_connections": 8                // 1-16, default 8
+//       } } }
+//
+// For each of the running user's connections of `provider`, the engine sets
+// the bound config keys from the connection — `vault_reference` (the
+// vault:// reference of its credential), `account`, `service` or
+// `connected_at` — and dispatches the module through the ordinary
+// single-node path: the same capability ceiling, approval gate, retry
+// budget, actor ceilings and secrets pipeline as any module node. Four runs
+// at a time, in listing order. The `for_each_connection` key itself is
+// removed from the config a run receives.
+//
+// Output — the shape `collect` emits, so a consumer of one reads the other:
+//   { "items": [ <run output>, …,
+//                { "__error": true, "error_message": "…",
+//                  "account": "…", "service": "…" } ],
+//     "count": N,
+//     "connections": { "provider", "listed", "read",
+//                      "failed":  [ { "account", "reason" } ],
+//                      "skipped": [ { "account", "reason" } ],
+//                      "not_run", "truncated" } }
+//
+// A connection is SKIPPED, never dispatched, when a key is bound to
+// `vault_reference` and: the connection has no module-readable reference
+// (`no_reference`), the vault is known not to hold it (`not_stored`), or
+// the module's own `allowed_secrets` does not admit the path
+// (`not_granted`). The node grants nothing: a run can read only what the
+// module could already read had an author written the reference into a
+// node by hand.
+//
+// Each run's output is handled as a node's output is: a returned
+// `__memory_write__` is persisted (or removed under a `readonly` write
+// ceiling), `__ops_alert__` and `__ml_distill__` are processed. Give such a
+// write a key that includes the account, or the runs overwrite each other.
+//
+// The node FAILS (error edges and continue_on_error apply) when the listing
+// cannot be read, or connections exist and none was read. No connections at
+// all is an empty `items`, not a failure. One run failing is reported in
+// `items` and `connections.failed`, and the workflow continues.
+//
+// Bound keys must be config keys: letters, digits, underscore; a key
+// starting with `__` is engine-authored and is dropped. Settings that bind
+// nothing, or name an unusable provider, are not a fan-out: the node then
+// runs once, as the plain module node it also is.
 ```
 
 ### `action_links`

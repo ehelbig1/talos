@@ -1429,6 +1429,8 @@ impl ParallelWorkflowEngine {
     pub(crate) async fn build_dispatch_secrets(
         &self,
         node_id: Uuid,
+        module_id: Uuid,
+        allowed_secrets: &[String],
         execution_id: Uuid,
         worker_shared_key: &Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> crate::secrets_pipeline::DispatchSecrets {
@@ -1436,6 +1438,11 @@ impl ParallelWorkflowEngine {
         else {
             return crate::secrets_pipeline::DispatchSecrets::default();
         };
+        // Two different ids, and each lookup needs its own. A node's config
+        // is keyed by the NODE; a module's secrets are keyed by the MODULE.
+        // Until 2026-10-04 this took one id and the loop passed the module's,
+        // so the config lookup missed and a loop body's `vault://` references
+        // were never fetched.
         let vault_paths = self
             .node_configs
             .get(&node_id)
@@ -1444,10 +1451,12 @@ impl ParallelWorkflowEngine {
         crate::secrets_pipeline::build_dispatch_secrets_for(
             resolver.as_ref(),
             self.secret_envelope.as_ref(),
-            node_id,
+            module_id,
             self.user_id,
             &vault_paths,
-            &[],
+            // The module's grant, as the single-node path passes it: an
+            // exact-path entry is delivered on the grant alone.
+            allowed_secrets,
             key.as_bytes(),
             self.max_llm_tier,
             execution_id.as_bytes(),
@@ -2359,6 +2368,53 @@ impl ParallelWorkflowEngine {
                     continue;
                 }
 
+                // ── For-each-connection (this node's module, once per connection)
+                // Checked before the single-node dispatch below, which is what
+                // this node would otherwise get: it is a MODULE node. The
+                // accumulated snapshot is built here because the memo lives
+                // here; every run receives the same one.
+                if matches!(
+                    self.node_meta.get(&node_id),
+                    Some((_, _, Some(SystemNodeKind::ForEachConnection { .. })))
+                ) {
+                    let accumulated_snapshot = Self::build_accumulated_context_memo(
+                        &self.node_labels,
+                        &results,
+                        results.version,
+                        &mut accumulated_memo,
+                    );
+                    if let Some(output) = await_polling_in_flight!(self
+                        .try_dispatch_for_each_connection(
+                            node_idx,
+                            node_id,
+                            execution_id,
+                            &dispatcher,
+                            &worker_shared_key,
+                            &results,
+                            accumulated_snapshot,
+                        ))
+                    {
+                        let chains_ctx = if chains_live {
+                            Some((chains.as_slice(), &node_to_chain))
+                        } else {
+                            None
+                        };
+                        self.route_system_node_output(
+                            node_idx,
+                            output,
+                            execution_id,
+                            0, // the runs are timed individually; the node has no single span
+                            chains_ctx,
+                            &exec_ctx,
+                            &mut results,
+                            &mut joins,
+                            &mut ready,
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+
                 // ── Connections (controller-side read of connected services) ─
                 // Same async + route-downstream + degrade-not-fail contract as
                 // the readers above. No credential leaves the controller: the
@@ -3117,6 +3173,7 @@ impl ParallelWorkflowEngine {
                     trigger_input_val,
                     degraded_inputs,
                     execution_sandbox.clone(),
+                    None,
                 );
                 // Per-node timing + node_started event: always emitted
                 // so callers using WorkflowContext.node_timings get

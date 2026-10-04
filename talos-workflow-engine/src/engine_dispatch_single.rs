@@ -38,6 +38,21 @@ pub(crate) struct ModuleDispatchClearance {
     pub(crate) max_retries: u32,
 }
 
+/// What differs for ONE run when the engine dispatches the same node more
+/// than once (`for_each_connection`). Everything else about the run — the
+/// module, its grants, the actor's ceilings, the retry budget, the secrets
+/// pipeline — is the node's, resolved exactly as for a single dispatch.
+#[derive(Debug, Clone)]
+pub(crate) struct RunVariation {
+    /// Config keys written for this run. They replace the node's own keys of
+    /// the same name. Authored by the ENGINE from the controller's listing of
+    /// the running user's connections — never from a node's input.
+    pub config_overlay: serde_json::Map<String, JsonValue>,
+    /// This run's position, recorded on its events so a trace tells the runs
+    /// apart.
+    pub iteration_index: i32,
+}
+
 impl ParallelWorkflowEngine {
     /// The gates every engine MODULE dispatch passes between "the module is
     /// fetched" and "a `DispatchJob` is built", in order:
@@ -196,6 +211,7 @@ impl ParallelWorkflowEngine {
         trigger_input: Option<JsonValue>,
         degraded_inputs: Option<JsonValue>,
         _execution_sandbox: Option<Arc<cap_std::fs::Dir>>,
+        variation: Option<RunVariation>,
     ) -> (NodeIndex, Result<JsonValue, String>) {
         let module_id_resolved = self.resolve_module_id(node_id);
 
@@ -268,12 +284,37 @@ impl ParallelWorkflowEngine {
             module_config
         };
 
+        // One run of several over the same node (`for_each_connection`): the
+        // engine's config keys for THIS run replace the node's, and the
+        // fan-out's own settings never reach the guest. Applied here, before
+        // the idempotency key, the vault-path extraction and the input
+        // envelope are derived, so each of them sees this run's config. A
+        // config that is not an object cannot carry the keys, and dispatching
+        // without them would run the module on whatever the node happened to
+        // name — refused.
+        let iteration_index = variation.as_ref().map(|v| v.iteration_index);
+        let mut module_config = module_config;
+        if let Some(variation) = variation {
+            let Some(obj) = module_config.as_object_mut() else {
+                return (
+                    node_idx,
+                    Err(
+                        "per-connection run refused: the node's config is not an object"
+                            .to_string(),
+                    ),
+                );
+            };
+            obj.remove(talos_workflow_engine_core::connections_reader::FOR_EACH_CONNECTION_KEY);
+            for (key, value) in variation.config_overlay {
+                obj.insert(key, value);
+            }
+        }
+
         // Opt-in idempotency (Task 3). Resolve the node's declared idempotency
         // key from its merged config, then STRIP `__idempotency_key__` so the
         // engine-only directive never reaches guest code as module input. The
         // key travels to the worker HMAC-bound on `JobRequest.idempotency_key`,
         // not in the payload.
-        let mut module_config = module_config;
         let idempotency_key = talos_workflow_engine_core::reserved_keys::resolve_idempotency_key(
             Some(&module_config),
             &execution_id,
@@ -456,7 +497,7 @@ impl ParallelWorkflowEngine {
                     node_id: Some(node_id),
                     status: "Input".to_string(),
                     log_message: Some(input_preview),
-                    iteration_index: None,
+                    iteration_index,
                     error_class: None,
                     // `node_input` is a payload snapshot, not a lifecycle boundary.
                     // The trigger ignores this event type entirely.
@@ -1102,6 +1143,7 @@ mod single_node_ledger_finalize_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .1
@@ -1462,6 +1504,7 @@ mod oauth_repair_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .1;
@@ -1721,6 +1764,7 @@ mod reserved_key_set_or_remove_tests {
                 trigger_input,
                 None,
                 None,
+                None,
             )
             .await;
         res.expect("dispatch succeeds");
@@ -1882,6 +1926,7 @@ mod capability_ceiling_dispatch_tests {
                 dispatcher.clone() as Arc<dyn NodeDispatcher>,
                 None,
                 json!({}),
+                None,
                 None,
                 None,
                 None,

@@ -79,7 +79,7 @@ fn inactive_inputs_skip_envelope() -> JsonValue {
 /// Per-node output size guard: `Some(reason)` when `output` serializes past
 /// `max_bytes` (default 5 MiB; `set_max_node_output_bytes`). A multi-MB value
 /// would otherwise be cloned into every downstream input and the final output.
-fn oversized_output_error(output: &JsonValue, max_bytes: usize) -> Option<String> {
+pub(crate) fn oversized_output_error(output: &JsonValue, max_bytes: usize) -> Option<String> {
     let len = serde_json::to_vec(output).map(|b| b.len()).ok()?;
     (len > max_bytes).then(|| {
         format!(
@@ -299,6 +299,105 @@ impl ParallelWorkflowEngine {
         }
     }
 
+    /// What every MODULE output goes through before it is anyone's input:
+    /// sanitised, engine-authored input keys stripped, the write ceiling
+    /// applied to a returned `__memory_write__` envelope (a refusal recorded
+    /// through the hook), and the completion hook fired — which is what
+    /// persists a permitted memory write, an ops alert or a distill row.
+    ///
+    /// ONE implementation, two callers: `handle_node_success` for a node's
+    /// output, and the `for_each_connection` handler for EACH run's output.
+    /// A second copy would be a route past the write ceiling.
+    pub(crate) fn apply_output_protocols(
+        &self,
+        node_id: Uuid,
+        execution_id: Uuid,
+        wall_time_ms: u64,
+        output: &mut JsonValue,
+    ) {
+        sanitize_node_output(output);
+        // A module's committed output is the next node's gathered INPUT, so an
+        // engine-authored INPUT key riding on it (a module that echoes its
+        // input, a custom dispatcher, an LLM asked to "return the input plus a
+        // field") would be inherited by every successor whose own dispatch
+        // declines to write that key. Strip the fixed list here — ONE list,
+        // the same one the trigger-seed install and the controller seam use.
+        // Output-side protocol keys (`__error`, `__continued`,
+        // `__memory_write__`, `__ops_alert__`, `__ml_distill__`,
+        // `__fuel_consumed__`, `__judge_*`, …) are NOT on that list and pass
+        // through untouched — see `ENGINE_AUTHORED_INPUT_KEYS`.
+        talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys(output);
+
+        // ── Write ceiling on the `__memory_write__` envelope (#750) ──
+        // A module reaches actor_memory two ways: an `agent_memory::set` host
+        // call (gated in the worker) and a returned `__memory_write__`
+        // envelope (this path, which had NO gate — so a `readonly` actor was
+        // refused one and permitted the other on the same job). Applied HERE,
+        // before `results.insert`, so a refused envelope never reaches the
+        // stored output, the downstream nodes' gathered inputs, or the
+        // lifecycle hook that would persist it. The ceiling is the ENGINE's
+        // — on a sub-engine that is the value `bind_subengine_actor_and_ceilings`
+        // already narrowed, so a sub-workflow bound to a stricter actor is
+        // gated at the stricter ceiling.
+        let refused_memory_write = crate::write_ceiling_gate::apply_memory_write_ceiling(
+            output,
+            self.max_write_ceiling,
+            crate::write_ceiling_gate::controller_write_ceiling_enforced(),
+            |s| self.redact_str(s),
+        );
+        if let Some(ref refusal) = refused_memory_write {
+            // DEBUG, not WARN, and deliberately so: the ONE operator-facing
+            // WARN for a refusal is emitted by the hook
+            // (`ControllerNodeHook::record_memory_write_refusal`), which owns
+            // the audit vocabulary and the metric. Logging it at WARN here too
+            // would double-count every refusal for anyone grepping
+            // `talos_audit`. This line exists to carry the `execution_id` the
+            // hook signature does not receive, and to leave a breadcrumb on an
+            // engine wired with no hook at all.
+            tracing::debug!(
+                key = %refusal.key,
+                node_id = %node_id,
+                actor_id = ?self.actor_id,
+                %execution_id,
+                "write-ceiling: __memory_write__ envelope removed from node output"
+            );
+            if let Some(hook) = self.node_hook.as_ref() {
+                hook.on_memory_write_refused(
+                    self.actor_id,
+                    Some(node_id),
+                    &refusal.key,
+                    self.max_write_ceiling,
+                );
+            }
+        }
+
+        // Post-completion hook: drives `__memory_write__` persistence and
+        // any future cross-cutting per-node observers (fuel is recorded by
+        // the dispatcher's fuel sink, per verified attempt). Fire-and-forget — the hook returns
+        // quickly; impls spawn internally. `wall_time_ms` is the
+        // monotonic reading from `node_start_times` on BOTH entry points
+        // (see the note on `handle_completed_future`); `0` means the
+        // caller started no timer, not that the node was instantaneous.
+        if let Some(hook) = self.node_hook.as_ref() {
+            let node_label = self.node_labels.get(&node_id).map(String::as_str);
+            let module_id = self.node_meta.get(&node_id).and_then(|(m, _, _)| *m);
+            hook.on_node_completed(
+                talos_workflow_engine_core::NodeCompletionContext {
+                    workflow_id: self.cost_attribution_workflow_id(execution_id),
+                    execution_id,
+                    node_id,
+                    node_label,
+                    module_id,
+                    actor_id: self.actor_id,
+                    max_write_ceiling: self.max_write_ceiling,
+                    http_verb_ceiling: self.http_verb_ceiling,
+                    wall_time_ms,
+                },
+                output,
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_node_success(
         &self,
@@ -344,88 +443,8 @@ impl ParallelWorkflowEngine {
 
         // The output size guard ran in `handle_completed_future`.
         let mut output = output;
-        sanitize_node_output(&mut output);
-        // A module's committed output is the next node's gathered INPUT, so an
-        // engine-authored INPUT key riding on it (a module that echoes its
-        // input, a custom dispatcher, an LLM asked to "return the input plus a
-        // field") would be inherited by every successor whose own dispatch
-        // declines to write that key. Strip the fixed list here — ONE list,
-        // the same one the trigger-seed install and the controller seam use.
-        // Output-side protocol keys (`__error`, `__continued`,
-        // `__memory_write__`, `__ops_alert__`, `__ml_distill__`,
-        // `__fuel_consumed__`, `__judge_*`, …) are NOT on that list and pass
-        // through untouched — see `ENGINE_AUTHORED_INPUT_KEYS`.
-        talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys(&mut output);
-
-        // ── Write ceiling on the `__memory_write__` envelope (#750) ──
-        // A module reaches actor_memory two ways: an `agent_memory::set` host
-        // call (gated in the worker) and a returned `__memory_write__`
-        // envelope (this path, which had NO gate — so a `readonly` actor was
-        // refused one and permitted the other on the same job). Applied HERE,
-        // before `results.insert`, so a refused envelope never reaches the
-        // stored output, the downstream nodes' gathered inputs, or the
-        // lifecycle hook that would persist it. The ceiling is the ENGINE's
-        // — on a sub-engine that is the value `bind_subengine_actor_and_ceilings`
-        // already narrowed, so a sub-workflow bound to a stricter actor is
-        // gated at the stricter ceiling.
-        let refused_memory_write = crate::write_ceiling_gate::apply_memory_write_ceiling(
-            &mut output,
-            self.max_write_ceiling,
-            crate::write_ceiling_gate::controller_write_ceiling_enforced(),
-            |s| self.redact_str(s),
-        );
+        self.apply_output_protocols(finished_id, execution_id, wall_time_ms, &mut output);
         results.insert(finished_id, output.clone());
-        if let Some(ref refusal) = refused_memory_write {
-            // DEBUG, not WARN, and deliberately so: the ONE operator-facing
-            // WARN for a refusal is emitted by the hook
-            // (`ControllerNodeHook::record_memory_write_refusal`), which owns
-            // the audit vocabulary and the metric. Logging it at WARN here too
-            // would double-count every refusal for anyone grepping
-            // `talos_audit`. This line exists to carry the `execution_id` the
-            // hook signature does not receive, and to leave a breadcrumb on an
-            // engine wired with no hook at all.
-            tracing::debug!(
-                key = %refusal.key,
-                node_id = %finished_id,
-                actor_id = ?self.actor_id,
-                %execution_id,
-                "write-ceiling: __memory_write__ envelope removed from node output"
-            );
-            if let Some(hook) = self.node_hook.as_ref() {
-                hook.on_memory_write_refused(
-                    self.actor_id,
-                    Some(finished_id),
-                    &refusal.key,
-                    self.max_write_ceiling,
-                );
-            }
-        }
-
-        // Post-completion hook: drives `__memory_write__` persistence and
-        // any future cross-cutting per-node observers (fuel is recorded by
-        // the dispatcher's fuel sink, per verified attempt). Fire-and-forget — the hook returns
-        // quickly; impls spawn internally. `wall_time_ms` is the
-        // monotonic reading from `node_start_times` on BOTH entry points
-        // (see the note on `handle_completed_future`); `0` means the
-        // caller started no timer, not that the node was instantaneous.
-        if let Some(hook) = self.node_hook.as_ref() {
-            let node_label = self.node_labels.get(&finished_id).map(String::as_str);
-            let module_id = self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
-            hook.on_node_completed(
-                talos_workflow_engine_core::NodeCompletionContext {
-                    workflow_id: self.cost_attribution_workflow_id(execution_id),
-                    execution_id,
-                    node_id: finished_id,
-                    node_label,
-                    module_id,
-                    actor_id: self.actor_id,
-                    max_write_ceiling: self.max_write_ceiling,
-                    http_verb_ceiling: self.http_verb_ceiling,
-                    wall_time_ms,
-                },
-                &output,
-            );
-        }
 
         // Phase C (opt-in): best-effort per-node checkpoint. Disabled
         // unless the controller wired a CheckpointStore onto the top-level

@@ -85,6 +85,11 @@ listing was unavailable; a failed node would take the whole message with it.
 
 ## Open decision: reading every connected account
 
+**Decided 2026-10-04: the per-connection fan-out, built in
+`2026-10-04-for-each-connection.md`.** The paragraphs below are kept as the
+options that were put to the operator; the claim that it "touches the secrets
+pipeline" turned out to be wrong, and that record says why.
+
 Two engine facts stand between this node and a reader that follows
 connections on its own:
 
