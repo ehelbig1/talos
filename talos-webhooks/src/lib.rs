@@ -48,6 +48,7 @@ pub use dlq::{
     dlq_entry_was_authenticated, DlqMetrics, DlqService, ReplayRefused, DLQ_AUTHENTICATED_KEY,
 };
 pub use router::{insert_webhook_module_execution, webhook_handler, WebhookRouter};
+pub use signature::HMAC_SENDER_NOTE;
 pub use signature::{
     body_fingerprint, dedup_fingerprint, header_is_sensitive, VerifiedSignatureFormat,
     WebhookAuthOutcome,
