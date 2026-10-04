@@ -1,0 +1,36 @@
+{
+  "commands": [
+    {
+      "target": "target_0",
+      "action": "turn_off"
+    },
+    {
+      "target": "target_1",
+      "action": "turn_off"
+    },
+    {
+      "target": "target_2",
+      "action": "turn_off"
+    },
+    {
+      "target": "target_3",
+      "action": "turn_off"
+    },
+    {
+      "target": "target_4",
+      "action": "turn_off"
+    },
+    {
+      "target": "target_5",
+      "action": "turn_off"
+    },
+    {
+      "target": "target_6",
+      "action": "turn_off"
+    },
+    {
+      "target": "target_7",
+      "action": "turn_off"
+    }
+  ]
+}

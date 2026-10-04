@@ -1,0 +1,106 @@
+{
+  "name": "control-home-assistant",
+  "version": "v1.0.0",
+  "display_name": "Home control: Home Assistant",
+  "description": "Carry out home commands through Home Assistant. INPUT (service-neutral, docs/home-control-contract.md): the node before this one returns `commands: [{target, action, value?}]`; `skip: true` does nothing. Actions: turn_on, turn_off, toggle, run (a scene or script), set_temperature (needs `value`). At most 8 commands; the rest are counted as not_run. ALLOW-LIST: the TARGETS config maps each neutral target name to one Home Assistant entity and lists the actions that target allows; set_temperature also needs min and max. A target not in the map, an action it does not allow, or a value outside its bounds is REFUSED and nothing is sent for it — a workflow (or a model) can only do what this node's config names. DRY_RUN DEFAULTS TO TRUE: it reports what it would do and sends nothing until you set DRY_RUN false. OUTPUT: {provider, skipped, dry_run, done, refused, failed, not_run, results: [{target, action, status: done|dry_run|refused|failed, reason?}]}; the results use the neutral names, never an entity id. One command failing is recorded and the rest continue. Written from Home Assistant's documented REST API and not exercised against a live server. BASE_URL must be an https:// address the worker can reach: a home-network address is refused by the worker; use the external address. GRANTS: installs with NO allowed hosts and no secrets: set Home Assistant's external host with update_module_hosts and the token's exact path with update_module_secrets. CREDENTIALS: the module never holds one; AUTH_HEADER carries a vault:// reference the host replaces when the request is sent.",
+  "category": "Automation",
+  "capability_world": "http-node",
+  "allowed_hosts": [],
+  "allowed_methods": [
+    "POST"
+  ],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 8,
+    "bytes_per_item": 1000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 3.0
+  },
+  "config_schema": {
+    "type": "object",
+    "required": [
+      "BASE_URL",
+      "AUTH_HEADER",
+      "TARGETS"
+    ],
+    "properties": {
+      "BASE_URL": {
+        "type": "string",
+        "description": "Home Assistant's external https:// address."
+      },
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "'Bearer vault://homeassistant/token' — a long-lived access token stored in the vault."
+      },
+      "TARGETS": {
+        "type": "object",
+        "description": "Neutral target name -> {entity, allow, min?, max?}. `entity` is the Home Assistant entity id; `allow` lists the actions this target permits; `min` and `max` bound set_temperature. Names: lowercase letters, digits and '_'. At most 64.",
+        "additionalProperties": {
+          "type": "object",
+          "required": [
+            "entity",
+            "allow"
+          ],
+          "properties": {
+            "entity": {
+              "type": "string"
+            },
+            "allow": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "turn_on",
+                  "turn_off",
+                  "toggle",
+                  "run",
+                  "set_temperature"
+                ]
+              }
+            },
+            "min": {
+              "type": "number"
+            },
+            "max": {
+              "type": "number"
+            }
+          }
+        }
+      },
+      "DRY_RUN": {
+        "type": "boolean",
+        "default": true,
+        "description": "true (the default): report what would be done, send nothing."
+      },
+      "TIMEOUT_MS": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 30000,
+        "default": 10000
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Store a token",
+      "detail": "Create a long-lived access token in your Home Assistant profile and store it in the vault under homeassistant/token. Tokens are not stored through MCP."
+    },
+    {
+      "step": 2,
+      "title": "Grant the installed copy",
+      "detail": "update_module_hosts with Home Assistant's external host; update_module_secrets with homeassistant/token."
+    },
+    {
+      "step": 3,
+      "title": "Name the targets",
+      "detail": "In the node's TARGETS, give each thing a workflow may act on a neutral name, its entity id and the actions it allows. Leave out anything a workflow should never touch."
+    },
+    {
+      "step": 4,
+      "title": "Rehearse",
+      "detail": "Leave DRY_RUN true and read `results`. Set DRY_RUN false when they are what you expect."
+    }
+  ]
+}
