@@ -89,6 +89,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 (allowed hosts, allowed HTTP verbs — an empty list denies every verb — and allowed secrets), its fuel \
                 limit, the crates it was compiled with, whether source code is available, and its CONFIG SCHEMA — the keys the module accepts, \
                 their types, and which are required. Never returns actual wasm bytes or source code. \
+                REINSTALL: `owner_added_hosts` / `owner_added_methods` / `owner_added_secrets` are the entries of the three grants \
+                recorded as added by the module's owner (with update_module_hosts / update_module_methods / update_module_secrets). \
+                A catalog reinstall keeps those whatever the template grants; every other entry of a grant is kept only while \
+                the template still grants it. The lists are always present, and are empty for a shared catalog module and for a \
+                copy with nothing recorded — a copy granted before 2026-10-04 has grants and an EMPTY record, so whatever it \
+                holds beyond its template is dropped by its next reinstall until you set it again with those tools. This tool \
+                does not compare with the template: install_module_from_catalog with dry_run: true says what a reinstall \
+                would drop (`grants_not_carried`) and keep (`grants_kept_as_owner_added`). \
                 Read `config_schema_status` before `config_schema`: 'declared' means `config_keys` / `required_config_keys` \
                 are authoritative; 'declared_empty' means the module genuinely takes no config; 'not_declared' means NO \
                 schema was ever recorded, which is NOT the same as taking no config — catalog modules declare one in \
@@ -1053,6 +1061,11 @@ async fn handle_get_module_info(
         // ("missing required config key 'SELECTOR'") asks. It previously did
         // not, and the answer was only reachable through
         // list_module_catalog.config_schema_keys.
+        // Beside the three grants above: which of their entries the owner
+        // added, and so which a catalog reinstall keeps. Always emitted —
+        // an empty record is the answer for a copy granted before the record
+        // existed, and it is the answer that says its grants are at risk.
+        merge_object(&mut result, owner_added_report(&info.owner_added));
         merge_object(
             &mut result,
             project_config_schema(info.config_schema.as_ref()),
@@ -1265,6 +1278,103 @@ fn project_config_schema(config_schema: Option<&serde_json::Value>) -> serde_jso
 
 /// Copy every key of `extra` (a JSON object) into `target` (a JSON object).
 /// No-op if either is not an object.
+/// The legend `get_module_info` prints beside a module's owner-added record.
+/// One sentence, and it states the rule `grants_for_install` applies: an
+/// entry is kept when the record names it AND the grant list still holds it.
+pub(crate) const OWNER_ADDED_NOTE: &str =
+    "Entries of allowed_hosts / allowed_methods / allowed_secrets recorded as added by this \
+     module's owner (with update_module_hosts / update_module_methods / update_module_secrets, \
+     or as extra verbs passed to an install): a catalog reinstall keeps such an entry whatever \
+     the template grants, for as long as the grant list still holds it, while every other entry \
+     of the three lists is kept only if the template still grants it.";
+
+/// The owner-added record of a module, as `get_module_info` reports it: the
+/// three lists exactly as stored, and the legend.
+///
+/// All three lists are ALWAYS present. An empty list is an answer — nothing
+/// in that grant is recorded as the owner's, so all of it narrows with the
+/// template on a reinstall — and omitting the field would make "nothing
+/// recorded" indistinguishable from "this tool does not report it". That is
+/// the state of a shared catalog row and of every copy granted before the
+/// record existed (2026-10-04).
+///
+/// The record is shown as stored, not filtered against the grant lists: it
+/// is the record that is being made visible, and the legend states the
+/// condition under which an entry of it is kept.
+pub(crate) fn owner_added_report(
+    owner_added: &talos_module_repository::OwnerAddedGrants,
+) -> serde_json::Value {
+    serde_json::json!({
+        "owner_added_hosts": owner_added.hosts,
+        "owner_added_methods": owner_added.methods,
+        "owner_added_secrets": owner_added.secrets,
+        "owner_added_note": OWNER_ADDED_NOTE,
+    })
+}
+
+#[cfg(test)]
+mod owner_added_report_tests {
+    use super::{owner_added_report, OWNER_ADDED_NOTE};
+    use talos_module_repository::OwnerAddedGrants;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn each_list_is_reported_under_its_own_grant() {
+        let report = owner_added_report(&OwnerAddedGrants {
+            hosts: v(&["home.example.test"]),
+            methods: v(&["PUT"]),
+            secrets: v(&["svc/token"]),
+        });
+        assert_eq!(
+            report["owner_added_hosts"],
+            serde_json::json!(["home.example.test"])
+        );
+        assert_eq!(report["owner_added_methods"], serde_json::json!(["PUT"]));
+        assert_eq!(
+            report["owner_added_secrets"],
+            serde_json::json!(["svc/token"])
+        );
+    }
+
+    /// A copy granted before the record existed, and a shared catalog row:
+    /// the three lists are present and empty, never absent or null.
+    #[test]
+    fn nothing_recorded_is_three_empty_lists_not_missing_fields() {
+        let report = owner_added_report(&OwnerAddedGrants::default());
+        for key in [
+            "owner_added_hosts",
+            "owner_added_methods",
+            "owner_added_secrets",
+        ] {
+            assert_eq!(report[key], serde_json::json!([]), "{key}");
+        }
+        assert_eq!(report["owner_added_note"], OWNER_ADDED_NOTE);
+    }
+
+    /// The legend says both halves: what the record keeps, and that the rest
+    /// narrows with the template. It names the tools that write the record.
+    #[test]
+    fn the_legend_states_what_is_kept_and_what_narrows() {
+        assert!(OWNER_ADDED_NOTE.contains("a catalog reinstall keeps such an entry"));
+        assert!(OWNER_ADDED_NOTE.contains("only if the template still grants it"));
+        for tool in [
+            "update_module_hosts",
+            "update_module_methods",
+            "update_module_secrets",
+        ] {
+            assert!(OWNER_ADDED_NOTE.contains(tool), "{tool}");
+        }
+        assert_eq!(
+            OWNER_ADDED_NOTE.matches(". ").count(),
+            0,
+            "one sentence: {OWNER_ADDED_NOTE}"
+        );
+    }
+}
+
 fn merge_object(target: &mut serde_json::Value, extra: serde_json::Value) {
     if let (Some(t), serde_json::Value::Object(e)) = (target.as_object_mut(), extra) {
         for (k, v) in e {

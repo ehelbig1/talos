@@ -671,6 +671,12 @@ pub struct WasmModuleInfo {
     /// The HTTP verbs the module may use. Empty denies every verb.
     pub allowed_methods: Vec<String>,
     pub allowed_secrets: Vec<String>,
+    /// The entries of the three grant lists above recorded as the OWNER's
+    /// additions — the ones a catalog reinstall keeps whatever the template
+    /// grants. Empty on a shared catalog row and on a copy with nothing
+    /// recorded, which is a real answer: such a copy's grants all narrow
+    /// with its template.
+    pub owner_added: OwnerAddedGrants,
     /// The module's own fuel limit; `None` when the row sets none.
     pub max_fuel: Option<i64>,
     /// The crates the module was compiled with, as recorded; `None` when
@@ -1645,6 +1651,7 @@ impl ModuleRepository {
         let row = sqlx::query(
             "SELECT id, name, capability_world, compiled_at, \
                     allowed_hosts, allowed_methods, allowed_secrets, config_schema, \
+                    owner_added_hosts, owner_added_methods, owner_added_secrets, \
                     max_fuel, dependencies, language, \
                     COALESCE(LENGTH(wasm_bytes)::bigint, size_bytes::bigint) AS size_bytes, \
                     (source_code IS NOT NULL) AS has_source_code, \
@@ -1680,6 +1687,14 @@ impl ModuleRepository {
                 allowed_secrets: r
                     .try_get::<Option<_>, _>("allowed_secrets")?
                     .unwrap_or_default(),
+                // NOT NULL columns: a failed decode is an error, never an
+                // empty record — "nothing recorded" is a claim a reader
+                // acts on (it says a reinstall keeps none of these grants).
+                owner_added: OwnerAddedGrants {
+                    hosts: r.try_get("owner_added_hosts")?,
+                    methods: r.try_get("owner_added_methods")?,
+                    secrets: r.try_get("owner_added_secrets")?,
+                },
                 max_fuel: r.try_get("max_fuel")?,
                 dependencies: r.try_get("dependencies")?,
                 language: r.try_get("language")?,
