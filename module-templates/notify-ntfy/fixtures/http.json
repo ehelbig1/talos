@@ -1,0 +1,16 @@
+[
+  {
+    "method": "POST",
+    "url_contains": "ntfy.example.test/",
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "id": "made-up-id",
+      "time": 1790000000,
+      "event": "message",
+      "topic": "made-up-topic"
+    }
+  }
+]

@@ -1,0 +1,11 @@
+[
+  {
+    "method": "POST",
+    "url_contains": "home.example.test/api/services/notify/mobile_app_made_up_phone",
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": []
+  }
+]

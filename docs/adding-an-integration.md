@@ -24,6 +24,37 @@ SSRF-safe, and OOM-bounded without you having to re-derive any of it.
 | Inbound webhook token lookup | `WHERE token_hash = sha256_hex(provided)` + constant-time compare | `WHERE token = $1` raw equality (lint 41) |
 | Secret-holding struct | hand-written `Debug` that redacts | `#[derive(Debug)]` over a token (lint 37) |
 
+## A service with a fixed token (no OAuth)
+
+Many services (ntfy, Home Assistant, most self-hosted tools) authenticate
+with one long-lived token and have no consent flow. Such a service needs NO
+controller code and is not a connection in the `PROVIDERS` registry. It is a
+module and a vault entry:
+
+1. **The owner stores the token**, through Settings or the secrets mutation
+   (never through MCP, which cannot write secrets), under
+   `<service>/token`.
+2. **A catalog module calls the service.** Prefer a template that already
+   fits (`json-api-reader` to read, a `notify-*` adapter to notify); write a
+   new template only when none does. The module takes the credential as
+   config (`AUTH_HEADER: "Bearer vault://<service>/token"`) and never holds
+   it: the host replaces the reference when the request is sent.
+3. **The installed copy is granted exactly what it needs**: the service's
+   host (`update_module_hosts`) and the token's EXACT path
+   (`update_module_secrets`). An exact-path grant is delivered on the grant
+   alone; a prefix or `*` grant is not. One installed copy per server, so a
+   token can only ever be sent to the host it belongs to.
+4. **The address must be one the worker will reach**: `https://`, and not a
+   private address. A home-network address (192.168.x.x, a `.local` name)
+   is refused by the worker's resolver; use the service's external address.
+   Do not turn that refusal off for a deployment that holds real
+   credentials.
+
+When a workflow could plausibly use a different service for the same job
+later, do not put the service's vocabulary upstream of the module that
+calls it: define a neutral shape for what is sent and one adapter per
+service. `docs/notification-contract.md` is the reference.
+
 ## Non-negotiable rules
 
 1. **Tenancy — resolve credentials scoped to the *requesting/owning* user.**

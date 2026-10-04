@@ -1,0 +1,5 @@
+{
+  "BASE_URL": "https://home.example.test",
+  "NOTIFY_SERVICE": "mobile_app_made_up_phone",
+  "AUTH_HEADER": "Bearer made-up-not-a-token"
+}
