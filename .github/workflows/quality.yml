@@ -34,6 +34,25 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # WHO MAY SAVE A BUILD CACHE: a run on `main`, and nothing else (2026-10-04).
+  #
+  # GitHub scopes a cache to the ref that saved it. A pull request can read
+  # caches saved on its own ref and on its base branch — not another pull
+  # request's. Until this line every job saved on every run, so each cache
+  # lived on `refs/pull/N/merge`, where only a re-run of the SAME pull request
+  # could read it, and each pull request wrote about 6.4 GB against a 10 GB
+  # repository limit. Two pull requests evicted everything, including what the
+  # nightly run had saved on `main`. Measured: 9 caches, 11.8 GB, all on pull
+  # request refs, and "No cache found" in the first run of a new pull request
+  # — every job compiled every dependency from nothing.
+  #
+  # Now only `main` saves (the nightly `schedule` run, or a `workflow_dispatch`
+  # on main), and every pull request restores from it. A pull request also
+  # cannot write a cache that another run would restore.
+  #
+  # Every `Swatinem/rust-cache` step below carries `save-if` with this value.
+  # A new job that caches must carry it too, or it reintroduces the eviction.
+  CACHE_SAVE: ${{ github.ref == 'refs/heads/main' }}
   # Single source of truth for the toolchain — keep in lockstep with ci.yml
   # and rust-toolchain.toml.
   RUST_TOOLCHAIN: "1.96"
@@ -229,6 +248,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: quality-test
+          save-if: ${{ env.CACHE_SAVE == 'true' }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
@@ -342,6 +362,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: catalog
+          save-if: ${{ env.CACHE_SAVE == 'true' }}
 
       - name: Install cargo-component
         uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
@@ -440,8 +461,8 @@ jobs:
           shared-key: quality-integration
           # Three shards share one key; letting all three save races for the
           # same cache entry. Shard 1 saves; the dependency graph it caches is
-          # what the other two reuse.
-          save-if: ${{ matrix.shard == 1 }}
+          # what the other two reuse. And only on `main` — see CACHE_SAVE.
+          save-if: ${{ env.CACHE_SAVE == 'true' && matrix.shard == 1 }}
 
       - name: Install sqlx-cli
         # `make test-integration` provisions its migrated DBs from the RFC 0009
@@ -780,6 +801,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: quality-sqlx
+          save-if: ${{ env.CACHE_SAVE == 'true' }}
 
       - name: Install sqlx-cli
         uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
@@ -892,6 +914,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: clippy
+          save-if: ${{ env.CACHE_SAVE == 'true' }}
 
       # `--all-targets` since 2026-09-22 (package DO). Until then this job
       # linted lib + bin targets only, and the test targets accumulated 107

@@ -85,6 +85,28 @@ reads a `TALOS_TEST_{DATABASE,REDIS,NATS}` variable but has no marker is
 refused: in the DB-free job it would early-return green over zero assertions.
 Structural check 64 runs the classifier and verifies both runners still ask it.
 
+## Build caches are saved on `main` only
+
+GitHub scopes a cache to the ref that saved it: a pull request can read a
+cache saved on its own ref or on its base branch, never another pull
+request's. So a cache saved by a pull-request run helps only a re-run of that
+same pull request, and counts against the repository's 10 GB limit.
+
+Every `Swatinem/rust-cache` step carries `save-if` with the workflow's
+`CACHE_SAVE` value, which is true only when the run's ref is
+`refs/heads/main` — the nightly `schedule` run, or a `workflow_dispatch` on
+main. Pull-request and merge-queue runs restore that cache and save nothing.
+
+* **A new job that caches must carry the same `save-if`.** One job saving on
+  pull-request refs is enough to evict main's caches again.
+* **To refresh the cache without waiting for the nightly run** (after a large
+  dependency change, say): `gh workflow run quality.yml --ref main`.
+* A pull request whose `Cargo.lock` differs from main's restores main's cache
+  by key prefix and compiles only what changed.
+* The cache holds dependencies, not this workspace's own crates
+  (`rust-cache`'s default): cargo decides whether a workspace crate is fresh
+  by file time, and a fresh checkout makes every file new.
+
 ## The integration job runs as three shards
 
 `TALOS_IT_SHARD=i/n make test-integration` runs every n-th work item
