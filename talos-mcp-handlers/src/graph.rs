@@ -768,7 +768,7 @@ impl AddedSystemNode {
 /// `dispatch`) run a target against whatever input they receive — running
 /// straight off the trigger is the ordinary shape of a workflow's first node,
 /// and their required target IS validated as a config field. Consumer kinds
-/// (`verify`, `inline_judge`, `judge`, `confidence_gate`) read
+/// (`verify`, `inline_judge`, `judge`, `confidence_gate`, `action_links`) read
 /// `gather_inputs`, which for a root resolves to the trigger payload —
 /// verifying or judging the trigger is a legitimate authoring choice.
 pub(crate) fn kind_is_edge_driven(kind: &str, data: &serde_json::Value) -> bool {
@@ -1344,6 +1344,44 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     }
                 },
                 "required": ["workflow_id", "node_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "add_action_links_node",
+            "description": "Add an action-links node to an existing workflow, between the node that composes a message and the node that sends it. Controller-side system node: it turns the links a module ASKS for into real ones. The compose module returns its output with `__action_links__: [{id, target, label, payload, fallback?}]` and writes `talos-action:<id>` wherever a link belongs (an href); this node mints one link per request and passes the output on with every placeholder replaced, the request removed, and `__action_links_report__: {available, requested, minted, not_minted: [{id, reason, fell_back}]}` added. A link opens a confirmation page naming the workflow and the label; when its owner confirms, the TARGET workflow starts once with `payload` as its trigger input. WHAT A LINK MAY START is decided here, not by the module: `targets` maps a short name to a workflow you own, and a request naming anything else is refused (`unknown_target`). Links are single-use, expire (`ttl_hours`, default 72, max 336), and are stored only as a hash. If a link cannot be minted its placeholder becomes the request's `fallback` (a mailto: or https: link) or `#`, so the message still sends. The target workflow starts through the same gates as trigger_workflow (pause, liveness, its actor's budget and ceilings, input schema, concurrency limit).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "UUID of the workflow to add the node to"
+                    },
+                    "node_id": {
+                        "type": "string",
+                        "description": "Unique string ID for the new node"
+                    },
+                    "targets": {
+                        "type": "object",
+                        "description": "Target name → workflow UUID: the only workflows a link minted by this node may start. 1 to 16 entries; names are 1-40 characters of letters, digits, '_' and '-'; each workflow must be yours.",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "ttl_hours": {
+                        "type": "number",
+                        "description": "How long a link stays usable, in hours (1-336, default 72)."
+                    },
+                    "connect_from": {
+                        "description": "Node ID(s) to wire INTO this node — the node that composes the message.",
+                        "oneOf": [
+                            { "type": "string" },
+                            { "type": "array", "items": { "type": "string" } }
+                        ]
+                    },
+                    "connect_to": {
+                        "type": "string",
+                        "description": "Optional: ID of an existing node to connect this node TO — the node that sends the message."
+                    }
+                },
+                "required": ["workflow_id", "node_id", "targets"]
             }
         }),
         serde_json::json!({
@@ -1962,6 +2000,9 @@ pub async fn dispatch(
         }
         "add_pending_approvals_node" => {
             Some(handle_add_pending_approvals_node(req_id, args, state, agent).await)
+        }
+        "add_action_links_node" => {
+            Some(handle_add_action_links_node(req_id, args, state, agent).await)
         }
         "add_assistant_report_node" => {
             Some(handle_add_assistant_report_node(req_id, args, state, agent).await)
@@ -3721,6 +3762,124 @@ async fn handle_add_pending_approvals_node(
             "downstream": connect_to,
             "message": format!(
                 "Pending-approvals node '{}' added to workflow {}. Emits {{available, count, approvals: [{{execution_id, workflow_id, workflow_name, node_id, requested_at, waiting_seconds, required_for, approve_url, reject_url}}]}} for downstream notify-after-pause compose nodes.{}",
+                added.node_id, added.workflow_id, added.auto_publish_note
+            ),
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+// ── add_action_links_node ────────────────────────────────────────────────────
+
+/// Read and check the `targets` argument: 1 to 16 entries, each a usable
+/// name mapped to a workflow UUID. Pure, so the refusals are testable
+/// without a database; ownership is checked by the handler.
+pub(crate) fn parse_action_link_targets(
+    args: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<String, uuid::Uuid>, String> {
+    use talos_workflow_engine_core::action_links::{action_name_valid, MAX_ACTION_TARGETS};
+    let Some(raw) = args.get("targets").and_then(serde_json::Value::as_object) else {
+        return Err(
+            "Missing or invalid 'targets': an object of target name → workflow UUID".to_string(),
+        );
+    };
+    if raw.is_empty() || raw.len() > MAX_ACTION_TARGETS {
+        return Err(format!(
+            "'targets' must name 1 to {MAX_ACTION_TARGETS} workflows; got {}",
+            raw.len()
+        ));
+    }
+    let mut targets = std::collections::BTreeMap::new();
+    for (name, value) in raw {
+        if !action_name_valid(name) {
+            // The name is caller-supplied: echo a bounded, printable prefix.
+            let shown: String = name.chars().filter(|c| !c.is_control()).take(60).collect();
+            return Err(format!(
+                "Target name '{shown}' is not usable: 1-40 characters of letters, digits, '_' and '-'"
+            ));
+        }
+        let Some(id) = value.as_str().and_then(|s| uuid::Uuid::parse_str(s).ok()) else {
+            return Err(format!("Target '{name}' must be a workflow UUID"));
+        };
+        targets.insert(name.clone(), id);
+    }
+    Ok(targets)
+}
+
+async fn handle_add_action_links_node(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    agent: Arc<auth::AgentIdentity>,
+) -> JsonRpcResponse {
+    let targets = match parse_action_link_targets(args) {
+        Ok(t) => t,
+        Err(message) => return mcp_error(req_id, -32602, &message),
+    };
+    // Each target must be a workflow the caller owns. One answer for
+    // "does not exist" and "is not yours". The mint re-checks ownership
+    // every time a link is made; this is the early, readable refusal.
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    for (name, id) in &targets {
+        if !state.workflow_repo.workflow_exists(*id, user_id).await {
+            return mcp_error(
+                req_id,
+                -32602,
+                &format!("Target '{name}': workflow {id} not found or not accessible"),
+            );
+        }
+    }
+    // Clamp mirrors the graph parser (a hand-edited graph re-clamps there).
+    let ttl_hours = args
+        .get("ttl_hours")
+        .and_then(serde_json::Value::as_u64)
+        .map(|v| v.clamp(1, 336));
+    let connect_to = args
+        .get("connect_to")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let target_json: serde_json::Map<String, serde_json::Value> = targets
+        .iter()
+        .map(|(name, id)| (name.clone(), serde_json::json!(id.to_string())))
+        .collect();
+    let mut data = serde_json::Map::new();
+    data.insert(
+        "targets".to_string(),
+        serde_json::Value::Object(target_json.clone()),
+    );
+    if let Some(hours) = ttl_hours {
+        data.insert("ttl_hours".to_string(), serde_json::json!(hours));
+    }
+
+    let added = match upsert_system_node(
+        &req_id,
+        args,
+        state,
+        &agent,
+        "action_links",
+        serde_json::Value::Object(data),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "workflow_id": added.workflow_id.to_string(),
+            "node_id": added.node_id,
+            "node_type": "action_links",
+            "targets": target_json,
+            "ttl_hours": ttl_hours.unwrap_or(72),
+            "downstream": connect_to,
+            "message": format!(
+                "Action-links node '{}' added to workflow {}. The node before it asks for links with \
+                 `__action_links__: [{{id, target, label, payload, fallback?}}]` and writes \
+                 `talos-action:<id>` where each belongs; this node replaces them and reports under \
+                 `__action_links_report__`.{}",
                 added.node_id, added.workflow_id, added.auto_publish_note
             ),
         }))
@@ -7303,9 +7462,46 @@ mod fan_in_posture_tests {
         // These read `gather_inputs`, which for a root resolves to the
         // trigger payload — verifying or judging the trigger is a real
         // authoring choice, so zero parents is not a defect.
-        for kind in ["verify", "inline_judge", "judge", "confidence_gate"] {
+        for kind in [
+            "verify",
+            "inline_judge",
+            "judge",
+            "confidence_gate",
+            "action_links",
+        ] {
             assert!(!kind_is_edge_driven(kind, &json!({})), "{kind}");
         }
+    }
+
+    #[test]
+    fn action_link_targets_are_names_to_workflow_ids_and_refused_otherwise() {
+        use super::parse_action_link_targets;
+        let id = uuid::Uuid::from_u128(5).to_string();
+        let ok = parse_action_link_targets(&json!({ "targets": { "list": id, "bills-due": id } }))
+            .expect("accepted");
+        assert_eq!(ok.len(), 2);
+        for (args, why) in [
+            (json!({}), "Missing or invalid 'targets'"),
+            (json!({ "targets": [] }), "Missing or invalid 'targets'"),
+            (json!({ "targets": {} }), "must name 1 to 16"),
+            (json!({ "targets": { "a b": id } }), "is not usable"),
+            (
+                json!({ "targets": { "list": "pa-list-capture" } }),
+                "must be a workflow UUID",
+            ),
+            (
+                json!({ "targets": { "list": 7 } }),
+                "must be a workflow UUID",
+            ),
+        ] {
+            let refusal = parse_action_link_targets(&args).unwrap_err();
+            assert!(refusal.contains(why), "{args}: {refusal}");
+        }
+        let many: serde_json::Map<String, serde_json::Value> =
+            (0..17).map(|n| (format!("t{n}"), json!(id))).collect();
+        assert!(parse_action_link_targets(&json!({ "targets": many }))
+            .unwrap_err()
+            .contains("must name 1 to 16"));
     }
 
     #[test]

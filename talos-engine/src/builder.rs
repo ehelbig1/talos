@@ -85,6 +85,9 @@ pub(super) fn build_controller_engine_registry_only(
     engine.set_pending_approvals_reader(Arc::new(
         crate::pending_approvals_reader::PostgresPendingApprovalsReader::new(pool.clone()),
     ));
+    engine.set_action_link_minter(Arc::new(
+        crate::action_link_minter::PostgresActionLinkMinter::new(pool.clone()),
+    ));
     engine.set_assistant_report_reader(Arc::new(
         crate::assistant_report_reader::PostgresAssistantReportReader::new(pool.clone()),
     ));

@@ -811,6 +811,11 @@ pub struct ParallelWorkflowEngine {
     /// None-degrades contract as `ops_alerts_reader`.
     pub(crate) pending_approvals_reader:
         Option<Arc<dyn talos_workflow_engine_core::PendingApprovalsReader>>,
+    /// Mint port for action links — powers the `action_links` system node
+    /// (controller-side capability mint; not reachable from workers). `None`
+    /// (out-of-tree consumers, tests without a store) makes the node pass
+    /// its input on with every placeholder fallen back, never fail.
+    pub(crate) action_link_minter: Option<Arc<dyn talos_workflow_engine_core::ActionLinkMinter>>,
     /// Read-side port for the weekly assistant report — powers the
     /// `assistant_report` system node. Same None-degrades contract as
     /// `ops_alerts_reader`.
@@ -979,6 +984,7 @@ pub struct AdapterSet {
     approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
     ops_alerts_reader: Option<Arc<dyn talos_workflow_engine_core::OpsAlertsReader>>,
     pending_approvals_reader: Option<Arc<dyn talos_workflow_engine_core::PendingApprovalsReader>>,
+    action_link_minter: Option<Arc<dyn talos_workflow_engine_core::ActionLinkMinter>>,
     assistant_report_reader: Option<Arc<dyn talos_workflow_engine_core::AssistantReportReader>>,
     operator_digest_reader: Option<Arc<dyn talos_workflow_engine_core::OperatorDigestReader>>,
     judge_score_recorder: Option<Arc<dyn talos_workflow_engine_core::JudgeScoreRecorder>>,
@@ -1089,6 +1095,7 @@ impl AdapterSet {
         engine.approval_gate = self.approval_gate;
         engine.ops_alerts_reader = self.ops_alerts_reader;
         engine.pending_approvals_reader = self.pending_approvals_reader;
+        engine.action_link_minter = self.action_link_minter;
         engine.assistant_report_reader = self.assistant_report_reader;
         engine.operator_digest_reader = self.operator_digest_reader;
         engine.judge_score_recorder = self.judge_score_recorder;
@@ -1212,6 +1219,7 @@ impl ParallelWorkflowEngine {
             approval_gate: None,
             ops_alerts_reader: None,
             pending_approvals_reader: None,
+            action_link_minter: None,
             assistant_report_reader: None,
             operator_digest_reader: None,
             judge_score_recorder: None,
@@ -1259,6 +1267,7 @@ impl ParallelWorkflowEngine {
             approval_gate: self.approval_gate.clone(),
             ops_alerts_reader: self.ops_alerts_reader.clone(),
             pending_approvals_reader: self.pending_approvals_reader.clone(),
+            action_link_minter: self.action_link_minter.clone(),
             assistant_report_reader: self.assistant_report_reader.clone(),
             operator_digest_reader: self.operator_digest_reader.clone(),
             judge_score_recorder: self.judge_score_recorder.clone(),
@@ -2322,6 +2331,36 @@ impl ParallelWorkflowEngine {
                 if let Some(output) = await_polling_in_flight!(
                     self.try_dispatch_pending_approvals(node_id, execution_id)
                 ) {
+                    let chains_ctx = if chains_live {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx,
+                        output,
+                        execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut joins,
+                        &mut ready,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                // ── Action links (controller-side capability mint) ───────────
+                // Reads its parent's output, mints the links it asks for and
+                // passes the output on. Same async + route-downstream +
+                // degrade-not-fail contract as the readers above.
+                if let Some(output) = await_polling_in_flight!(self.try_dispatch_action_links(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    &results
+                )) {
                     let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {

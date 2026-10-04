@@ -55,6 +55,7 @@ const KNOWN_SYSTEM_KINDS_BASE: &[&str] = &[
     "collect",
     "ops_alerts_digest",
     "pending_approvals",
+    "action_links",
     "assistant_report",
     "operator_digest",
     "synthesize",

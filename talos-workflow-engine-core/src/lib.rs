@@ -110,6 +110,7 @@
 /// `talos-workflow-engine-core` while disabling it on the engine.
 pub const HAS_LLM_PRIMITIVES: bool = cfg!(feature = "llm-primitives");
 
+pub mod action_links;
 mod actor_ceilings;
 mod approval_gate;
 mod assistant_report_reader;
@@ -151,6 +152,7 @@ mod transport;
 mod wasm_cache;
 mod write_ceiling;
 
+pub use action_links::ActionLinkMinter;
 pub use actor_ceilings::ActorCeilings;
 pub use approval_gate::{ApprovalGate, ApprovalStatus};
 pub use assistant_report_reader::AssistantReportReader;

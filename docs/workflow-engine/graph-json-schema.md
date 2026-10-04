@@ -87,7 +87,7 @@ Unknown top-level keys are ignored.
   //   "while_loop"    | "repeat_loop"     | "fan_in"         | "error_handler"
   //   "collect"       | "synthesize"      | "verify"         |
   //   "dispatch"      | "capability_dispatch" | "ops_alerts_digest"
-  //   "pending_approvals" | "assistant_report"
+  //   "pending_approvals" | "assistant_report" | "action_links"
   //
   // LLM-flavored kinds (gated by the `llm-primitives` feature, on by
   // default):
@@ -354,6 +354,42 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 // entry rather than dropping it; an unreachable store emits
 // { available: false } instead of failing the workflow.
 { "limit": 10 }   // pending approvals included verbatim (1-25, default 10)
+```
+
+### `action_links`
+```jsonc
+// Controller-side mint of ACTION LINKS for a composed message. Sits
+// between the node that composes a message and the node that sends it.
+// The parent's output asks for links and marks where each belongs:
+//
+//   { "html": "… <a href=\"talos-action:done-12\">done</a> …",
+//     "__action_links__": [
+//       { "id": "done-12", "target": "list",
+//         "label": "Done: call the dentist",
+//         "payload": { "op": "done", "item": 12 },
+//         "fallback": "mailto:me+todo@example.com?subject=done%2012" } ] }
+//
+// The node mints one link per request and emits the same output with every
+// `talos-action:<id>` replaced, `__action_links__` REMOVED, and
+// `__action_links_report__: { available, requested, minted,
+//   not_minted: [{id, reason, fell_back}] }` added.
+//
+// A link opens a confirmation page (GET changes nothing); when its owner
+// confirms, the target workflow starts ONCE with `payload` as its trigger
+// input, through the same gates as trigger_workflow. Links are single-use,
+// expire, and are stored only as a hash.
+//
+// `targets` is the AUTHOR's list of what a link from this node may start: a
+// module names a target, never a workflow, and a request naming anything
+// else is refused (`unknown_target`). Tenancy comes from the execution's
+// resolved identity; a target must be a workflow that user owns.
+//
+// Nothing here fails the node. A link that cannot be minted becomes its
+// `fallback` (a mailto: or https: link) or `#`, and the report says why.
+{
+  "targets": { "list": "<workflow uuid>" },   // 1-16 names → workflow ids
+  "ttl_hours": 72                              // 1-336, default 72
+}
 ```
 
 ### `assistant_report`

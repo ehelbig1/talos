@@ -74,7 +74,7 @@ pub struct ApprovalTokenContext {
     pub expires_at: DateTime<Utc>,
 }
 
-fn new_raw_token() -> String {
+pub(crate) fn new_raw_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)

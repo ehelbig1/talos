@@ -3484,6 +3484,23 @@ pub(crate) fn build_router(
         .layer(Extension(webhook_limiter.clone()))
         .layer(Extension(whitelist.clone()));
 
+    // Public action-link routes (capability URLs minted by the `action_links`
+    // system node): the owner confirms, and ONE named workflow starts with
+    // ONE fixed payload. Same trust model as the approval links above: the
+    // random token in the path is the auth, GET renders a confirmation page
+    // only (prefetch-safe), POST claims the single-use token and starts the
+    // workflow through `ExecutionOrchestrationService::trigger`, and the
+    // webhook limiter guards enumeration.
+    let action_link_routes = Router::new()
+        .route(
+            "/action-links/{token}",
+            get(webhooks::action_link_preview).post(webhooks::action_link_apply),
+        )
+        .layer(DefaultBodyLimit::max(4096))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(webhook_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
     // Public suspension callback routes.
     // Auth is the 64-hex correlation_id (256-bit random) embedded in the URL.
     // Rate-limited to prevent enumeration brute-force.
@@ -3886,6 +3903,7 @@ pub(crate) fn build_router(
         .merge(approval_gate_routes)
         .merge(correction_routes)
         .merge(approval_action_routes)
+        .merge(action_link_routes)
         .merge(suspension_callback_routes)
         .merge(google_calendar_routes)
         .merge(google_calendar_webhook_routes)
