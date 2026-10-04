@@ -541,3 +541,63 @@ async fn one_users_reference_copy_is_never_a_catalog_entry() {
         error_message(&resp)
     );
 }
+
+/// A copy keeps the registry reference it was installed with. While its
+/// catalog row names the same one the copy is current; when the catalog moves
+/// to a new tag the copy is behind until it is reinstalled — and the report
+/// says which, instead of "unknown".
+#[tokio::test]
+async fn a_reference_copy_is_current_until_the_catalog_moves_to_a_new_artifact() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let user = create_test_user(&ctx.auth_service, "registry_install_drift@example.com").await;
+    let shared = registry_row(&pool).await;
+    let state = state_without_a_compiler(&pool).await;
+    let repo = ModuleRepository::new(pool.clone());
+    install(&state, user, json!({ "name": shared.slug })).await;
+
+    async fn standing(repo: &ModuleRepository, user: Uuid) -> (&'static str, Vec<&'static str>) {
+        let rows = repo
+            .list_catalog_copy_drift(user)
+            .await
+            .expect("the drift report reads");
+        assert_eq!(rows.len(), 1, "one installed copy");
+        (
+            talos_module_repository::CatalogCopyState::of(&rows[0]).as_str(),
+            rows[0].differs_in(),
+        )
+    }
+    assert_eq!(standing(&repo, user).await, ("current", vec![]));
+
+    // The registry publishes a new version: the sync rewrites the shared row
+    // with the new tag. Same slug, same manifest.
+    let moved = format!("registry.example.test/talos-tools/{}:v1.1.0", shared.slug);
+    let manifest = json!({
+        "name": shared.slug,
+        "display_name": shared.name,
+        "category": "Network",
+        "description": "Reads one thing.",
+        "capability_world": "http-node",
+        "allowed_hosts": ["api.example.test"],
+        "allowed_methods": ["GET"],
+        "requires_secrets": ["example/api_key", "example/other_key"],
+        "config_schema": {"type": "object", "properties": {"URL": {"type": "string"}}},
+        "recommended_fuel": {"expected_items": 25, "bytes_per_item": 8000, "fuel_per_byte": 3, "safety_multiplier": 3.0}
+    });
+    let rewritten = upsert_catalog_template_by_slug(
+        &pool,
+        CatalogManifest::parse(&manifest)
+            .expect("accepted")
+            .upsert(&shared.slug, CatalogSource::Registry { oci_url: &moved }),
+    )
+    .await
+    .expect("the shared row is rewritten")
+    .id;
+    assert_eq!(rewritten, shared.id, "the sync rewrote a different row");
+    assert_eq!(standing(&repo, user).await, ("behind", vec!["artifact"]));
+
+    // A reinstall takes the catalog's reference.
+    let body = install(&state, user, json!({ "name": shared.slug })).await;
+    assert_eq!(body["bytes_changed"], true, "{body}");
+    assert_eq!(standing(&repo, user).await, ("current", vec![]));
+}

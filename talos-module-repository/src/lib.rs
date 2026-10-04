@@ -431,6 +431,13 @@ pub struct CatalogCopyRow {
     pub catalog_source_absent: bool,
     /// The copy's source is byte-identical to the catalog row's.
     pub source_matches: bool,
+    /// `Some` when the copy AND its catalog row each name a registry
+    /// artifact: whether it is the same reference. A reference copy holds no
+    /// source, so this — not `source_matches` — is how its code is compared.
+    /// A copy keeps the reference it was installed with: a republish under
+    /// that tag reaches it, a catalog row that moves to a new tag does not
+    /// until the copy is reinstalled. `None` for every other pairing.
+    pub artifact_matches: Option<bool>,
     /// The rest of what a reinstall copies from the catalog row matches it:
     /// the config schema (what `get_module_info` and the node editor show),
     /// the capability world and the approval list. Grants and `max_fuel` are
@@ -459,7 +466,22 @@ impl CatalogCopyRow {
     /// and when there is no catalog row to compare with.
     #[must_use]
     pub fn differs_in(&self) -> Vec<&'static str> {
-        if !self.in_catalog || self.catalog_source_absent {
+        if !self.in_catalog {
+            return Vec::new();
+        }
+        if let Some(same_artifact) = self.artifact_matches {
+            return [
+                (same_artifact, "artifact"),
+                (self.schema_matches, "config_schema"),
+                (self.world_matches, "capability_world"),
+                (self.approvals_match, "requires_approval_for"),
+            ]
+            .into_iter()
+            .filter(|(matches, _)| !matches)
+            .map(|(_, column)| column)
+            .collect();
+        }
+        if self.catalog_source_absent {
             return Vec::new();
         }
         [
@@ -499,8 +521,10 @@ pub enum CatalogCopyState {
     Behind,
     /// The copy was edited in place, so its source differing is deliberate.
     Detached,
-    /// The catalog row carries no source (OCI mode): drift is not knowable
-    /// here. Never reported as current.
+    /// The catalog row carries no source (OCI mode) and the copy holds code
+    /// compiled here: there is nothing to compare its code with. Never
+    /// reported as current. A copy that REFERENCES the registry artifact is
+    /// not this — its reference is compared with the catalog row's.
     Unknown,
     /// No catalog row maps to this copy any more.
     NotInCatalog,
@@ -516,6 +540,13 @@ impl CatalogCopyState {
     pub fn of(row: &CatalogCopyRow) -> Self {
         if !row.in_catalog {
             Self::NotInCatalog
+        } else if let Some(same_artifact) = row.artifact_matches {
+            // Both name a registry artifact: the references are the code.
+            if same_artifact && row.manifest_matches() {
+                Self::Current
+            } else {
+                Self::Behind
+            }
         } else if row.catalog_source_absent {
             Self::Unknown
         } else if row.source_matches && row.manifest_matches() {
@@ -3409,6 +3440,8 @@ impl ModuleRepository {
                     s.id IS NOT NULL AS in_catalog, \
                     COALESCE(s.source_code, '') = '' AS catalog_source_absent, \
                     u.source_code IS NOT DISTINCT FROM s.source_code AS source_matches, \
+                    CASE WHEN COALESCE(u.oci_url, '') <> '' AND COALESCE(s.oci_url, '') <> '' \
+                         THEN u.oci_url = s.oci_url END AS artifact_matches, \
                     u.config_schema IS NOT DISTINCT FROM s.config_schema AS schema_matches, \
                     u.capability_world IS NOT DISTINCT FROM s.capability_world AS world_matches, \
                     u.requires_approval_for IS NOT DISTINCT FROM s.requires_approval_for AS approvals_match, \
@@ -3420,7 +3453,8 @@ impl ModuleRepository {
                FROM modules u \
                LEFT JOIN LATERAL ( \
                     SELECT c.id, c.source_code, c.updated_at, c.config_schema, \
-                           c.capability_world, c.requires_approval_for FROM modules c \
+                           c.capability_world, c.requires_approval_for, c.oci_url \
+                      FROM modules c \
                      WHERE c.user_id IS NULL AND c.kind = 'catalog' \
                        AND (c.catalog_slug = u.catalog_slug \
                             OR (u.catalog_slug IS NULL AND c.name = u.name)) \
@@ -3443,6 +3477,7 @@ impl ModuleRepository {
                 in_catalog: r.try_get(3)?,
                 catalog_source_absent: r.try_get(4)?,
                 source_matches: r.try_get("source_matches")?,
+                artifact_matches: r.try_get("artifact_matches")?,
                 schema_matches: r.try_get("schema_matches")?,
                 world_matches: r.try_get("world_matches")?,
                 approvals_match: r.try_get("approvals_match")?,
@@ -4929,6 +4964,7 @@ mod catalog_copy_state_tests {
             in_catalog,
             catalog_source_absent: absent,
             source_matches: matches,
+            artifact_matches: None,
             schema_matches: true,
             world_matches: true,
             approvals_match: true,
@@ -4967,6 +5003,43 @@ mod catalog_copy_state_tests {
         edited.schema_matches = false;
         assert_eq!(S::of(&edited), S::Detached);
         assert_eq!(edited.differs_in(), vec!["source", "config_schema"]);
+    }
+
+    /// A copy that references a registry artifact is compared by that
+    /// reference. It is never "unknown": the catalog row's missing source is
+    /// beside the point when neither side holds source.
+    #[test]
+    fn a_registry_copy_is_compared_by_its_reference() {
+        // Registry mode: the catalog row has no source, the copy has none.
+        let reference = |same: bool| CatalogCopyRow {
+            artifact_matches: Some(same),
+            ..row(true, true, true, false)
+        };
+        assert_eq!(S::of(&reference(true)), S::Current);
+        assert!(reference(true).differs_in().is_empty());
+
+        // The catalog row moved to a new tag; the copy keeps the one it was
+        // installed with until it is reinstalled.
+        assert_eq!(S::of(&reference(false)), S::Behind);
+        assert_eq!(reference(false).differs_in(), vec!["artifact"]);
+
+        // Same artifact, but the published manifest's schema changed.
+        let stale_schema = CatalogCopyRow {
+            schema_matches: false,
+            ..reference(true)
+        };
+        assert_eq!(S::of(&stale_schema), S::Behind);
+        assert_eq!(stale_schema.differs_in(), vec!["config_schema"]);
+
+        // A copy COMPILED here, on a deployment whose catalog row has no
+        // source, is still the one case with nothing to compare.
+        assert_eq!(S::of(&row(true, true, true, false)), S::Unknown);
+        // And a reference copy with no catalog row is not in the catalog.
+        let orphan = CatalogCopyRow {
+            artifact_matches: None,
+            ..row(false, true, false, false)
+        };
+        assert_eq!(S::of(&orphan), S::NotInCatalog);
     }
 
     #[test]
