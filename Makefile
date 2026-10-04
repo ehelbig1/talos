@@ -490,6 +490,9 @@ deploy-prod: ## One-command production deploy: publish (gated+signed) -> pin dig
 smoke: ## End-to-end probe of a deployed cluster (BASE_URL=https://… SMOKE_AGENT_TOKEN=… SMOKE_ACTOR_ID=…)
 	@bash scripts/smoke.sh
 
+confirm-deploy: ## Read-only: is origin/main the commit that is running, and is the stack healthy? Run after `git pull && make up` (CONTROLLER_URL=http://localhost:8000)
+	@CONTROLLER_URL="$(CONTROLLER_URL)" bash scripts/confirm-deploy.sh
+
 check-route-extensions: ## Crawl a running controller for routes missing an axum Extension (CONTROLLER_URL=http://localhost:8000)
 	@python3 scripts/check-route-extensions.py --controller-url "$(CONTROLLER_URL)"
 
