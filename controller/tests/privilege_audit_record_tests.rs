@@ -337,6 +337,13 @@ async fn module_permission_changes_are_recorded_with_what_they_replaced() {
         text_json(&secrets)["previous_allowed_secrets"],
         serde_json::json!(["team/old_key"])
     );
+    // The reply says which entries were marked as the owner's: the ones a
+    // catalog reinstall keeps. `team/new_key` is not under the path the
+    // module held before, so it is one.
+    assert_eq!(
+        text_json(&secrets)["owner_added"],
+        serde_json::json!(["team/new_key"])
+    );
     call(
         &state,
         user,
@@ -355,19 +362,19 @@ async fn module_permission_changes_are_recorded_with_what_they_replaced() {
     assert_eq!(
         events(&pool, "module_allowed_secrets_updated", module).await,
         vec![
-            serde_json::json!({"allowed_secrets": ["team/new_key"], "previous_allowed_secrets": ["team/old_key"]})
+            serde_json::json!({"allowed_secrets": ["team/new_key"], "previous_allowed_secrets": ["team/old_key"], "owner_added": ["team/new_key"]})
         ]
     );
     assert_eq!(
         events(&pool, "module_allowed_hosts_updated", module).await,
         vec![
-            serde_json::json!({"allowed_hosts": ["api.example.com"], "previous_allowed_hosts": []})
+            serde_json::json!({"allowed_hosts": ["api.example.com"], "previous_allowed_hosts": [], "owner_added": ["api.example.com"]})
         ]
     );
     assert_eq!(
         events(&pool, "module_allowed_methods_updated", module).await,
         vec![
-            serde_json::json!({"allowed_methods": ["GET", "POST"], "previous_allowed_methods": []})
+            serde_json::json!({"allowed_methods": ["GET", "POST"], "previous_allowed_methods": [], "owner_added": ["GET", "POST"]})
         ]
     );
 
@@ -490,7 +497,12 @@ async fn the_recorded_writers_refuse_another_users_row_and_record_nothing() {
     assert!(tier.is_none());
     let modules = talos_module_repository::ModuleRepository::new(pool.clone());
     let hosts = modules
-        .update_module_allowed_hosts(module, stranger, &["evil.example.com".to_string()])
+        .update_module_allowed_hosts(
+            module,
+            stranger,
+            &["evil.example.com".to_string()],
+            &|_: &[String], new: &[String]| new.to_vec(),
+        )
         .await
         .unwrap();
     assert!(hosts.is_none());

@@ -215,6 +215,61 @@ fn catalog_install_record(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModulePermissionChange {
     pub previous: Vec<String>,
+    /// The entries of the NEW list recorded as the owner's own additions —
+    /// the ones a catalog reinstall keeps whatever the template grants.
+    pub owner_added: Vec<String>,
+}
+
+/// The entries of a module's three grant lists that its OWNER added (with an
+/// `update_module_*` tool, or as extra verbs on an install), as opposed to
+/// the ones it inherited from its catalog template. A catalog reinstall keeps
+/// these; everything else in a grant list narrows with the template.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnerAddedGrants {
+    pub hosts: Vec<String>,
+    pub methods: Vec<String>,
+    pub secrets: Vec<String>,
+}
+
+/// Given the part of a list that was NOT added by the owner and a new list,
+/// the entries of the new list that go BEYOND that part. The matching rule
+/// differs per grant (a host pattern, a verb, a vault path) and lives with
+/// the callers that already hold those matchers; this crate only applies it,
+/// inside the row lock.
+pub type BeyondGrant<'a> = &'a (dyn Fn(&[String], &[String]) -> Vec<String> + Send + Sync);
+
+/// Which entries of `new` are the owner's additions, given the list being
+/// replaced and what was recorded for it.
+///
+/// * An entry already recorded as the owner's stays so while it is still in
+///   the list.
+/// * A new entry is the owner's when the INHERITED part of the previous list
+///   (the previous list without the owner's own entries) did not already
+///   grant it. Narrowing inside what the template granted is therefore not
+///   an addition, and still narrows with the template later.
+///
+/// The result is always a subset of `new`.
+pub fn owner_added_after(
+    previous: &[String],
+    owner_added_before: &[String],
+    new: &[String],
+    beyond: BeyondGrant<'_>,
+) -> Vec<String> {
+    let inherited: Vec<String> = previous
+        .iter()
+        .filter(|e| !owner_added_before.contains(e))
+        .cloned()
+        .collect();
+    let mut after: Vec<String> = Vec::new();
+    for e in owner_added_before
+        .iter()
+        .chain(beyond(&inherited, new).iter())
+    {
+        if new.contains(e) && !after.contains(e) {
+            after.push(e.clone());
+        }
+    }
+    after
 }
 
 /// A module's three permission lists, which share one recorded writer. A
@@ -238,25 +293,35 @@ impl ModulePermission {
     fn lock_sql(self) -> &'static str {
         match self {
             Self::Secrets => {
-                "SELECT allowed_secrets FROM modules WHERE id = $1 AND user_id = $2 FOR UPDATE"
+                "SELECT allowed_secrets, owner_added_secrets FROM modules \
+                 WHERE id = $1 AND user_id = $2 FOR UPDATE"
             }
             Self::Hosts => {
-                "SELECT allowed_hosts FROM modules WHERE id = $1 AND user_id = $2 FOR UPDATE"
+                "SELECT allowed_hosts, owner_added_hosts FROM modules \
+                 WHERE id = $1 AND user_id = $2 FOR UPDATE"
             }
             Self::Methods => {
-                "SELECT allowed_methods FROM modules WHERE id = $1 AND user_id = $2 FOR UPDATE"
+                "SELECT allowed_methods, owner_added_methods FROM modules \
+                 WHERE id = $1 AND user_id = $2 FOR UPDATE"
             }
         }
     }
 
+    /// The list and its owner-added record are written by ONE statement, so
+    /// the record can never describe a list other than the one beside it.
     fn update_sql(self) -> &'static str {
         match self {
             Self::Secrets => {
-                "UPDATE modules SET allowed_secrets = $1 WHERE id = $2 AND user_id = $3"
+                "UPDATE modules SET allowed_secrets = $1, owner_added_secrets = $4 \
+                 WHERE id = $2 AND user_id = $3"
             }
-            Self::Hosts => "UPDATE modules SET allowed_hosts = $1 WHERE id = $2 AND user_id = $3",
+            Self::Hosts => {
+                "UPDATE modules SET allowed_hosts = $1, owner_added_hosts = $4 \
+                 WHERE id = $2 AND user_id = $3"
+            }
             Self::Methods => {
-                "UPDATE modules SET allowed_methods = $1 WHERE id = $2 AND user_id = $3"
+                "UPDATE modules SET allowed_methods = $1, owner_added_methods = $4 \
+                 WHERE id = $2 AND user_id = $3"
             }
         }
     }
@@ -580,6 +645,8 @@ pub struct StoredModuleGrants {
     pub methods: Vec<String>,
     pub secrets: Vec<String>,
     pub max_fuel: i64,
+    /// The entries of the three lists above that the owner added.
+    pub owner_added: OwnerAddedGrants,
 }
 
 /// Row from the `user_modules` view (union of wasm_modules + node_templates).
@@ -3502,22 +3569,37 @@ impl ModuleRepository {
         user_id: Uuid,
         name: &str,
     ) -> Result<Option<StoredModuleGrants>> {
-        let row: Option<(Vec<String>, Vec<String>, Vec<String>, i64)> = sqlx::query_as(
-            "SELECT allowed_hosts, allowed_methods, allowed_secrets, max_fuel \
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            Vec<String>,
+            Vec<String>,
+            Vec<String>,
+            i64,
+            Vec<String>,
+            Vec<String>,
+            Vec<String>,
+        )> = sqlx::query_as(
+            "SELECT allowed_hosts, allowed_methods, allowed_secrets, max_fuel, \
+                    owner_added_hosts, owner_added_methods, owner_added_secrets \
              FROM modules WHERE user_id = $1 AND name = $2",
         )
         .bind(user_id)
         .bind(name)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(
-            row.map(|(hosts, methods, secrets, max_fuel)| StoredModuleGrants {
+        Ok(row.map(
+            |(hosts, methods, secrets, max_fuel, oh, om, os)| StoredModuleGrants {
                 hosts,
                 methods,
                 secrets,
                 max_fuel,
-            }),
-        )
+                owner_added: OwnerAddedGrants {
+                    hosts: oh,
+                    methods: om,
+                    secrets: os,
+                },
+            },
+        ))
     }
 
     /// The shared catalog row a key names, when that row names a registry
@@ -3627,6 +3709,8 @@ impl ModuleRepository {
             config_schema,
             catalog_slug,
             fuel_explicit,
+            // A template's grant written as-is: nothing in it is the owner's.
+            &OwnerAddedGrants::default(),
         )
         .await
     }
@@ -3652,8 +3736,20 @@ impl ModuleRepository {
         config_schema: &serde_json::Value,
         catalog_slug: Option<&str>,
         fuel_explicit: bool,
+        owner_added: &OwnerAddedGrants,
     ) -> Result<CatalogInstallResult> {
         let cw_long = capability_world_long(capability_world_short);
+        // The record never names an entry its list does not hold.
+        for (list, added, what) in [
+            (allowed_hosts, &owner_added.hosts, "host"),
+            (allowed_methods, &owner_added.methods, "method"),
+            (allowed_secrets, &owner_added.secrets, "secret"),
+        ] {
+            anyhow::ensure!(
+                added.iter().all(|e| list.contains(e)),
+                "an owner-added {what} is not in the grant being installed"
+            );
+        }
         let reference_hash;
         let (wasm_bytes, content_hash, rust_code, dependencies, oci_url): (
             Option<&[u8]>,
@@ -3726,12 +3822,14 @@ impl ModuleRepository {
                         allowed_hosts, allowed_methods, allowed_secrets, requires_approval_for, \
                         source_code, wasm_bytes, content_hash, size_bytes, max_fuel, \
                         catalog_slug, dependencies, oci_url, language, \
+                        owner_added_hosts, owner_added_methods, owner_added_secrets, \
                         created_at, compiled_at, updated_at \
                      ) VALUES ( \
                         $1, $2, 'catalog', $3, $4, \
                         $5, $6, $7, $8, \
                         $9, $10, $11, $12, $13, \
-                        $14, $16, $17, 'rust', NOW(), NOW(), NOW() \
+                        $14, $16, $17, 'rust', \
+                        $18, $19, $20, NOW(), NOW(), NOW() \
                      ) \
                      ON CONFLICT (user_id, name) WHERE user_id IS NOT NULL DO UPDATE SET \
                         capability_world = EXCLUDED.capability_world, \
@@ -3740,6 +3838,11 @@ impl ModuleRepository {
                         allowed_hosts = EXCLUDED.allowed_hosts, \
                         allowed_methods = EXCLUDED.allowed_methods, \
                         allowed_secrets = EXCLUDED.allowed_secrets, \
+                        /* Written with the lists they describe, in the same \
+                           statement. */ \
+                        owner_added_hosts = EXCLUDED.owner_added_hosts, \
+                        owner_added_methods = EXCLUDED.owner_added_methods, \
+                        owner_added_secrets = EXCLUDED.owner_added_secrets, \
                         requires_approval_for = EXCLUDED.requires_approval_for, \
                         source_code = EXCLUDED.source_code, \
                         wasm_bytes = EXCLUDED.wasm_bytes, \
@@ -3790,6 +3893,9 @@ impl ModuleRepository {
             .bind(fuel_explicit)
             .bind(dependencies)
             .bind(oci_url)
+            .bind(&owner_added.hosts)
+            .bind(&owner_added.methods)
+            .bind(&owner_added.secrets)
             .fetch_one(&mut *tx)
             .await?;
 
@@ -4167,12 +4273,14 @@ impl ModuleRepository {
         module_id: Uuid,
         user_id: Uuid,
         allowed_secrets: &[String],
+        beyond: BeyondGrant<'_>,
     ) -> Result<Option<ModulePermissionChange>> {
         self.set_module_permission_recorded(
             module_id,
             user_id,
             ModulePermission::Secrets,
             allowed_secrets,
+            beyond,
         )
         .await
     }
@@ -4185,12 +4293,14 @@ impl ModuleRepository {
         module_id: Uuid,
         user_id: Uuid,
         allowed_hosts: &[String],
+        beyond: BeyondGrant<'_>,
     ) -> Result<Option<ModulePermissionChange>> {
         self.set_module_permission_recorded(
             module_id,
             user_id,
             ModulePermission::Hosts,
             allowed_hosts,
+            beyond,
         )
         .await
     }
@@ -4202,12 +4312,14 @@ impl ModuleRepository {
         module_id: Uuid,
         user_id: Uuid,
         allowed_methods: &[String],
+        beyond: BeyondGrant<'_>,
     ) -> Result<Option<ModulePermissionChange>> {
         self.set_module_permission_recorded(
             module_id,
             user_id,
             ModulePermission::Methods,
             allowed_methods,
+            beyond,
         )
         .await
     }
@@ -4225,21 +4337,25 @@ impl ModuleRepository {
         user_id: Uuid,
         which: ModulePermission,
         new: &[String],
+        beyond: BeyondGrant<'_>,
     ) -> Result<Option<ModulePermissionChange>> {
         let mut tx = self.db_pool.begin().await?;
-        let previous: Option<Vec<String>> = sqlx::query_scalar(which.lock_sql())
+        let locked: Option<(Vec<String>, Vec<String>)> = sqlx::query_as(which.lock_sql())
             .bind(module_id)
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?;
-        let Some(previous) = previous else {
+        let Some((previous, owner_added_before)) = locked else {
             tx.rollback().await?;
             return Ok(None);
         };
+        // Decided under the row lock, from the list actually being replaced.
+        let owner_added = owner_added_after(&previous, &owner_added_before, new, beyond);
         sqlx::query(which.update_sql())
             .bind(new)
             .bind(module_id)
             .bind(user_id)
+            .bind(&owner_added)
             .execute(&mut *tx)
             .await?;
         let column = which.column();
@@ -4257,11 +4373,15 @@ impl ModuleRepository {
             Some(&serde_json::json!({
                 column: new,
                 format!("previous_{column}"): &previous,
+                "owner_added": &owner_added,
             })),
         )
         .await?;
         tx.commit().await?;
-        Ok(Some(ModulePermissionChange { previous }))
+        Ok(Some(ModulePermissionChange {
+            previous,
+            owner_added,
+        }))
     }
 
     /// `workflow_executions JOIN workflows` graph_json fetch by execution id.
@@ -5064,5 +5184,85 @@ mod catalog_copy_state_tests {
         // even though an empty copy source would compare equal.
         assert_eq!(S::of(&row(true, true, true, false)), S::Unknown);
         assert_eq!(S::of(&row(false, true, false, false)), S::NotInCatalog);
+    }
+}
+
+#[cfg(test)]
+mod owner_added_tests {
+    use super::owner_added_after;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+    /// A stand-in matcher: an entry is beyond the inherited part unless that
+    /// part holds it, or holds `"*"`.
+    fn beyond(inherited: &[String], new: &[String]) -> Vec<String> {
+        new.iter()
+            .filter(|e| !inherited.contains(e) && !inherited.iter().any(|i| i == "*"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn an_entry_the_module_did_not_hold_is_the_owners() {
+        // A copy that inherited nothing; the owner grants one host.
+        assert_eq!(
+            owner_added_after(&[], &[], &v(&["home.example.test"]), &beyond),
+            v(&["home.example.test"])
+        );
+        // Beside an inherited entry, only the new one is the owner's.
+        assert_eq!(
+            owner_added_after(
+                &v(&["api.example.com"]),
+                &[],
+                &v(&["api.example.com", "mine.test"]),
+                &beyond
+            ),
+            v(&["mine.test"])
+        );
+    }
+
+    #[test]
+    fn what_the_inherited_part_already_granted_is_not_an_addition() {
+        // Restating an inherited entry, or narrowing under an inherited "*".
+        assert!(owner_added_after(&v(&["a.test"]), &[], &v(&["a.test"]), &beyond).is_empty());
+        assert!(owner_added_after(&v(&["*"]), &[], &v(&["a.test"]), &beyond).is_empty());
+    }
+
+    #[test]
+    fn the_owners_own_wide_entry_does_not_vouch_for_a_narrower_one() {
+        // The owner had added "*"; replacing it with one host must leave
+        // that host recorded as the owner's. The inherited part is empty.
+        assert_eq!(
+            owner_added_after(&v(&["*"]), &v(&["*"]), &v(&["a.test"]), &beyond),
+            v(&["a.test"])
+        );
+    }
+
+    #[test]
+    fn an_entry_stays_the_owners_until_it_is_removed() {
+        let after = owner_added_after(
+            &v(&["t.test", "mine.test"]),
+            &v(&["mine.test"]),
+            &v(&["t.test", "mine.test", "more.test"]),
+            &beyond,
+        );
+        assert_eq!(after, v(&["mine.test", "more.test"]));
+        // Removed from the list, it is no longer recorded.
+        assert!(owner_added_after(
+            &v(&["t.test", "mine.test"]),
+            &v(&["mine.test"]),
+            &v(&["t.test"]),
+            &beyond
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_record_is_always_within_the_new_list() {
+        // A stale record, and a matcher that answers with something else.
+        let liar = |_: &[String], _: &[String]| v(&["not-in-the-list.test"]);
+        let after = owner_added_after(&v(&["a.test"]), &v(&["gone.test"]), &v(&["a.test"]), &liar);
+        assert!(after.is_empty(), "{after:?}");
     }
 }

@@ -313,7 +313,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "install_module_from_catalog",
-            "description": "Install your own copy of a catalog module. Returns a module_id ready for use in add_node_to_workflow. Much faster than writing custom code for common patterns. What the copy runs depends on where this deployment's catalog comes from, and the reply's `source` says which: `compiled` — the template shipped with the platform is compiled for you; `registry` — on a deployment whose catalog is synced from a registry, the copy references the registry's signed artifact with your grants and nothing is compiled (such a copy holds no code, so hot_update_module is refused on it). Response always includes module_id, name, source, content_hash, compiled_at (RFC3339 UTC of when the copy was written), and bytes_changed (true on first install OR when the copy now runs different code than before — false signals an idempotent no-op). wasm_sha256 is the hex SHA-256 of the compiled bytes, and null for a registry copy. Use bytes_changed/content_hash to verify a reinstall actually picked up new code after a platform deploy. Check for optional warning fields: grant_empty_warning (module has deny-all secret access — every vault:// config value will fail at runtime, reinstall with allowed_secrets) and wildcard_grant_warning (module has wildcard [\"*\"] secret access — consider scoping to explicit paths to limit blast radius). A REINSTALL keeps your installed copy's allowed_hosts / allowed_methods / allowed_secrets, bounded by the new template's grant, unless you pass them: grants_carried_from_installed_copy says whether a copy existed and grants_not_carried lists anything the template no longer grants. Every install is recorded in the admin event log (module_installed_from_catalog / module_reinstalled_from_catalog) with the grants, capability world and content hash it wrote and replaced; an install that cannot be recorded is not made. FUEL: the reply's `fuel` block says what limit the copy carries and where it came from (`template`, `fuel_budget`, or `kept`). A REINSTALL keeps the copy's own limit unless `fuel_budget` is passed; when that kept limit is below what the template now recommends, the block says so (also in `dry_run`).",
+            "description": "Install your own copy of a catalog module. Returns a module_id ready for use in add_node_to_workflow. Much faster than writing custom code for common patterns. What the copy runs depends on where this deployment's catalog comes from, and the reply's `source` says which: `compiled` — the template shipped with the platform is compiled for you; `registry` — on a deployment whose catalog is synced from a registry, the copy references the registry's signed artifact with your grants and nothing is compiled (such a copy holds no code, so hot_update_module is refused on it). Response always includes module_id, name, source, content_hash, compiled_at (RFC3339 UTC of when the copy was written), and bytes_changed (true on first install OR when the copy now runs different code than before — false signals an idempotent no-op). wasm_sha256 is the hex SHA-256 of the compiled bytes, and null for a registry copy. Use bytes_changed/content_hash to verify a reinstall actually picked up new code after a platform deploy. Check for optional warning fields: grant_empty_warning (module has deny-all secret access — every vault:// config value will fail at runtime, reinstall with allowed_secrets) and wildcard_grant_warning (module has wildcard [\"*\"] secret access — consider scoping to explicit paths to limit blast radius). A REINSTALL keeps your installed copy's allowed_hosts / allowed_methods / allowed_secrets unless you pass them: an entry your copy inherited from the template is kept while the new template still grants it, and an entry YOU added (with update_module_hosts / update_module_methods / update_module_secrets) is kept whatever the template grants. grants_carried_from_installed_copy says whether a copy existed, grants_kept_as_owner_added lists what was kept because you added it, and grants_not_carried lists inherited entries the template no longer grants. Every install is recorded in the admin event log (module_installed_from_catalog / module_reinstalled_from_catalog) with the grants, capability world and content hash it wrote and replaced; an install that cannot be recorded is not made. FUEL: the reply's `fuel` block says what limit the copy carries and where it came from (`template`, `fuel_budget`, or `kept`). A REINSTALL keeps the copy's own limit unless `fuel_budget` is passed; when that kept limit is below what the template now recommends, the block says so (also in `dry_run`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3186,8 +3186,69 @@ pub(crate) struct InstallGrants {
     pub(crate) hosts: Vec<String>,
     pub(crate) methods: Vec<String>,
     pub(crate) secrets: Vec<String>,
-    /// Per grant, the stored entries the new template no longer grants.
+    /// Per grant, the stored entries the new template no longer grants and
+    /// the owner did not add.
     pub(crate) not_carried: serde_json::Map<String, serde_json::Value>,
+    /// Per grant, the stored entries the new template does not grant that
+    /// were KEPT because the owner added them.
+    pub(crate) kept_as_owner_added: serde_json::Map<String, serde_json::Value>,
+    /// The entries of the three lists above that are the owner's additions —
+    /// written beside them, so the next reinstall keeps them too.
+    pub(crate) owner_added: talos_module_repository::OwnerAddedGrants,
+}
+
+/// The entries of `list` that `granted` does not grant, per grant kind — the
+/// "dropped" half of the same three matchers the reinstall rule bounds with,
+/// so "beyond the template" has one meaning for a host, a verb and a vault
+/// path. Passed to the repository's permission writer as its
+/// [`talos_module_repository::BeyondGrant`].
+pub(crate) fn hosts_beyond(granted: &[String], list: &[String]) -> Vec<String> {
+    carry_host_grant(list, granted).1
+}
+
+/// See [`hosts_beyond`].
+pub(crate) fn methods_beyond(granted: &[String], list: &[String]) -> Vec<String> {
+    carry_method_grant(list, granted).1
+}
+
+/// See [`hosts_beyond`]. `"*"` is beyond anything but `"*"` itself.
+pub(crate) fn secrets_beyond(granted: &[String], list: &[String]) -> Vec<String> {
+    list.iter()
+        .filter(|e| {
+            if e.as_str() == "*" {
+                !granted.iter().any(|g| g == "*")
+            } else {
+                !talos_workflow_job_protocol::vault_path_permitted(granted, e)
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// A carried list with the owner's additions put back: `(written, dropped,
+/// kept_as_owner_added, owner_added_after)`. An entry the template bound
+/// dropped is kept only when it is BOTH in the stored list (it came out of
+/// it) and recorded as the owner's; nothing is added that the copy did not
+/// already hold.
+fn keep_owner_added(
+    carried: Vec<String>,
+    dropped: Vec<String>,
+    owner_added: &[String],
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let (kept, dropped): (Vec<String>, Vec<String>) =
+        dropped.into_iter().partition(|e| owner_added.contains(e));
+    let mut written = carried;
+    for e in &kept {
+        if !written.contains(e) {
+            written.push(e.clone());
+        }
+    }
+    let owner_after = owner_added
+        .iter()
+        .filter(|e| written.contains(e))
+        .cloned()
+        .collect();
+    (written, dropped, kept, owner_after)
 }
 
 /// What an install does with the copy's fuel limit, for the reply and the
@@ -3300,6 +3361,7 @@ pub(crate) fn install_dry_run_report(
         // `null` on a first install: there is nothing to compare with.
         "grants_changed": grants_changed,
         "grants_not_carried": grants.not_carried,
+        "grants_kept_as_owner_added": grants.kept_as_owner_added,
         "secrets_not_granted": secrets_not_granted,
         "fuel": fuel,
         "note": "Nothing was compiled, written or recorded. Run again without dry_run to install. \
@@ -3317,6 +3379,16 @@ pub(crate) fn install_dry_run_report(
 /// stored grant, bounded by those template values; a grant the caller did
 /// pass keeps today's rule. Hosts have no caller parameter, so they are
 /// always carried.
+///
+/// **What the owner added is kept (2026-10-04).** The bound above dropped
+/// every stored entry the new template does not grant — including the host
+/// and the secret an owner added on purpose to a template that installs with
+/// none, so a reinstall left such a copy able to reach nothing. An entry the
+/// bound drops is now kept when the copy's `owner_added` record names it.
+/// Everything else still narrows with the template: an inherited entry the
+/// template stops granting is dropped exactly as before, and nothing is
+/// written that the copy did not already hold. `template_methods` is the
+/// template's own verbs, before the caller's are added.
 pub(crate) fn grants_for_install(
     installed: Option<&talos_module_repository::StoredModuleGrants>,
     hosts: Vec<String>,
@@ -3324,34 +3396,65 @@ pub(crate) fn grants_for_install(
     secrets: Vec<String>,
     caller_passed_methods: bool,
     caller_passed_secrets: bool,
+    template_methods: &[String],
 ) -> InstallGrants {
+    use talos_module_repository::OwnerAddedGrants;
     let mut not_carried = serde_json::Map::new();
+    let mut kept_as_owner_added = serde_json::Map::new();
+    // Verbs the caller passed are ADDED to the template's; the extra ones are
+    // the owner's, on a first install and on a reinstall alike.
+    let passed_verbs_beyond = |written: &[String]| methods_beyond(template_methods, written);
     let Some(stored) = installed else {
+        let owner_added = OwnerAddedGrants {
+            methods: if caller_passed_methods {
+                passed_verbs_beyond(&methods)
+            } else {
+                Vec::new()
+            },
+            ..OwnerAddedGrants::default()
+        };
         return InstallGrants {
             hosts,
             methods,
             secrets,
             not_carried,
+            kept_as_owner_added,
+            owner_added,
         };
     };
-    let (hosts, hosts_dropped) = carry_host_grant(&stored.hosts, &hosts);
-    let (methods, methods_dropped) = if caller_passed_methods {
-        (methods, Vec::new())
+    let was = &stored.owner_added;
+
+    let (carried, dropped) = carry_host_grant(&stored.hosts, &hosts);
+    let (hosts, hosts_dropped, hosts_kept, owner_hosts) =
+        keep_owner_added(carried, dropped, &was.hosts);
+
+    let (methods, methods_dropped, methods_kept, owner_methods) = if caller_passed_methods {
+        let owner = passed_verbs_beyond(&methods);
+        (methods, Vec::new(), Vec::new(), owner)
     } else {
-        carry_method_grant(&stored.methods, &methods)
+        let (carried, dropped) = carry_method_grant(&stored.methods, &methods);
+        keep_owner_added(carried, dropped, &was.methods)
     };
-    let (secrets, secrets_dropped) = if caller_passed_secrets {
-        (secrets, Vec::new())
+
+    // An explicit `allowed_secrets` replaces the grant, and can only narrow
+    // the template's: nothing in it is beyond the template.
+    let (secrets, secrets_dropped, secrets_kept, owner_secrets) = if caller_passed_secrets {
+        (secrets, Vec::new(), Vec::new(), Vec::new())
     } else {
-        narrow_secret_grant(&secrets, &stored.secrets)
+        let (carried, dropped) = narrow_secret_grant(&secrets, &stored.secrets);
+        keep_owner_added(carried, dropped, &was.secrets)
     };
-    for (key, dropped) in [
-        ("allowed_hosts", hosts_dropped),
-        ("allowed_methods", methods_dropped),
-        ("allowed_secrets", secrets_dropped),
+
+    for (key, dropped, kept) in [
+        ("allowed_hosts", hosts_dropped, hosts_kept),
+        ("allowed_methods", methods_dropped, methods_kept),
+        ("allowed_secrets", secrets_dropped, secrets_kept),
     ] {
         if !dropped.is_empty() {
             not_carried.insert(key.to_string(), serde_json::json!(dropped));
+        }
+        if !kept.is_empty() {
+            kept_as_owner_added.insert(key.to_string(), serde_json::json!(kept));
         }
     }
     InstallGrants {
@@ -3359,6 +3462,12 @@ pub(crate) fn grants_for_install(
         methods,
         secrets,
         not_carried,
+        kept_as_owner_added,
+        owner_added: OwnerAddedGrants {
+            hosts: owner_hosts,
+            methods: owner_methods,
+            secrets: owner_secrets,
+        },
     }
 }
 
@@ -3764,6 +3873,7 @@ mod carry_grant_tests {
             hosts: v(h),
             methods: v(m),
             secrets: v(s),
+            owner_added: talos_module_repository::OwnerAddedGrants::default(),
         }
     }
 
@@ -3777,6 +3887,7 @@ mod carry_grant_tests {
             v(&["oauth/gmail/*"]),
             false,
             false,
+            &v(&["GET"]),
         );
         assert_eq!(
             (g.hosts, g.methods, g.secrets),
@@ -3801,6 +3912,7 @@ mod carry_grant_tests {
             v(&["oauth/gmail/*"]),
             false,
             false,
+            &v(&["GET", "POST"]),
         );
         assert_eq!(g.hosts, copy.hosts);
         assert_eq!(g.methods, copy.methods);
@@ -3810,6 +3922,184 @@ mod carry_grant_tests {
 
     /// A parameter the caller passes explicitly still follows today's rule,
     /// and whatever the new template no longer grants is dropped and named.
+    fn owned(
+        mut copy: talos_module_repository::StoredModuleGrants,
+        h: &[&str],
+        m: &[&str],
+        s: &[&str],
+    ) -> talos_module_repository::StoredModuleGrants {
+        copy.owner_added = talos_module_repository::OwnerAddedGrants {
+            hosts: v(h),
+            methods: v(m),
+            secrets: v(s),
+        };
+        copy
+    }
+
+    /// The case that was live on 2026-10-04: a template that installs with no
+    /// host and no secret, a copy its owner granted one of each, and a plain
+    /// reinstall. The grants are the owner's, so they stay.
+    #[test]
+    fn what_the_owner_added_survives_a_reinstall_of_a_template_that_grants_nothing() {
+        let copy = owned(
+            stored(&["home.example.test"], &["POST"], &["homeassistant/token"]),
+            &["home.example.test"],
+            &[],
+            &["homeassistant/token"],
+        );
+        let g = super::grants_for_install(
+            Some(&copy),
+            vec![],
+            v(&["POST"]),
+            vec![],
+            false,
+            false,
+            &v(&["POST"]),
+        );
+        assert_eq!(g.hosts, v(&["home.example.test"]));
+        assert_eq!(g.secrets, v(&["homeassistant/token"]));
+        assert_eq!(g.methods, v(&["POST"]));
+        assert!(g.not_carried.is_empty(), "{:?}", g.not_carried);
+        assert_eq!(
+            serde_json::Value::Object(g.kept_as_owner_added.clone()),
+            serde_json::json!({ "allowed_hosts": ["home.example.test"], "allowed_secrets": ["homeassistant/token"] })
+        );
+        // And the record travels with them, so the NEXT reinstall keeps them too.
+        assert_eq!(g.owner_added.hosts, v(&["home.example.test"]));
+        assert_eq!(g.owner_added.secrets, v(&["homeassistant/token"]));
+    }
+
+    /// The 2026-09-29 rule is intact for what a copy INHERITED: a template
+    /// that stops granting a host, a verb or a path narrows the copy, whether
+    /// or not the owner added something else beside it.
+    #[test]
+    fn an_inherited_entry_still_narrows_with_the_template() {
+        let copy = owned(
+            stored(
+                &["old.example.com", "mine.example.com"],
+                &["GET", "DELETE"],
+                &["legacy/key", "mine/key"],
+            ),
+            &["mine.example.com"],
+            &[],
+            &["mine/key"],
+        );
+        let g = super::grants_for_install(
+            Some(&copy),
+            v(&["api.example.com"]),
+            v(&["GET"]),
+            v(&["slack/token"]),
+            false,
+            false,
+            &v(&["GET"]),
+        );
+        assert_eq!(g.hosts, v(&["mine.example.com"]));
+        assert_eq!(g.methods, v(&["GET"]));
+        assert_eq!(g.secrets, v(&["mine/key"]));
+        assert_eq!(
+            serde_json::Value::Object(g.not_carried.clone()),
+            serde_json::json!({
+                "allowed_hosts": ["old.example.com"],
+                "allowed_methods": ["DELETE"],
+                "allowed_secrets": ["legacy/key"],
+            })
+        );
+    }
+
+    /// The record cannot ADD anything: an entry named there that the copy's
+    /// list does not hold is not written. A reinstall never grants what the
+    /// copy did not already have.
+    #[test]
+    fn a_record_naming_an_entry_the_copy_does_not_hold_grants_nothing() {
+        let copy = owned(
+            stored(&["a.example.com"], &["GET"], &["x/y"]),
+            &["evil.example.com", "*"],
+            &["DELETE"],
+            &["*", "anthropic/api_key"],
+        );
+        let g = super::grants_for_install(
+            Some(&copy),
+            vec![],
+            v(&["GET"]),
+            vec![],
+            false,
+            false,
+            &v(&["GET"]),
+        );
+        assert!(g.hosts.is_empty(), "{:?}", g.hosts);
+        assert!(g.secrets.is_empty(), "{:?}", g.secrets);
+        assert_eq!(g.methods, v(&["GET"]));
+        assert!(g.kept_as_owner_added.is_empty());
+        // The record written back names only what is in the lists.
+        assert_eq!(
+            g.owner_added,
+            talos_module_repository::OwnerAddedGrants::default()
+        );
+    }
+
+    /// Verbs passed to an install are added to the template's, and the extra
+    /// ones are the caller's own: recorded, so a later plain reinstall keeps
+    /// them. A secrets parameter can only narrow, so it records nothing.
+    #[test]
+    fn verbs_passed_to_an_install_are_the_owners_and_are_kept_next_time() {
+        let first = super::grants_for_install(
+            None,
+            vec![],
+            v(&["GET", "PUT"]),
+            v(&["x/y"]),
+            true,
+            true,
+            &v(&["GET"]),
+        );
+        assert_eq!(first.owner_added.methods, v(&["PUT"]));
+        assert!(first.owner_added.secrets.is_empty());
+        let copy = owned(stored(&[], &["GET", "PUT"], &["x/y"]), &[], &["PUT"], &[]);
+        let again = super::grants_for_install(
+            Some(&copy),
+            vec![],
+            v(&["GET"]),
+            v(&["x/y"]),
+            false,
+            false,
+            &v(&["GET"]),
+        );
+        assert_eq!(again.methods, v(&["GET", "PUT"]));
+        assert_eq!(again.owner_added.methods, v(&["PUT"]));
+    }
+
+    /// "Beyond" is decided by the same matchers the bound uses.
+    #[test]
+    fn beyond_uses_the_matchers_the_bound_uses() {
+        use super::{hosts_beyond, methods_beyond, secrets_beyond};
+        assert_eq!(
+            hosts_beyond(
+                &v(&[".example.com"]),
+                &v(&["api.example.com", "other.test"])
+            ),
+            v(&["other.test"])
+        );
+        assert_eq!(
+            hosts_beyond(&v(&["*"]), &v(&["anything.test"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(hosts_beyond(&[], &v(&["a.test"])), v(&["a.test"]));
+        assert_eq!(
+            methods_beyond(&v(&["GET"]), &v(&["get", "POST"])),
+            v(&["POST"])
+        );
+        assert_eq!(
+            secrets_beyond(
+                &v(&["oauth/gmail/*"]),
+                &v(&["oauth/gmail/u/a/access_token", "plaid/secret", "*"])
+            ),
+            v(&["plaid/secret", "*"])
+        );
+        assert_eq!(
+            secrets_beyond(&v(&["*"]), &v(&["*", "x/y"])),
+            Vec::<String>::new()
+        );
+    }
+
     #[test]
     fn an_explicit_parameter_wins_and_dropped_entries_are_reported() {
         let copy = stored(&["old.example.com"], &["DELETE"], &["gone/key"]);
@@ -3820,6 +4110,8 @@ mod carry_grant_tests {
             v(&["slack/token"]),
             true,
             false,
+            // The template grants GET; PUT is the caller's.
+            &v(&["GET"]),
         );
         assert_eq!(g.methods, v(&["GET", "PUT"]), "explicit methods win");
         assert!(g.hosts.is_empty());
@@ -4752,6 +5044,7 @@ async fn handle_install_module_from_catalog(
     // MCP-243: caller side trimmed; talos.json side trusted (template-author signed).
     let talos_json_methods = crate::utils::json_string_array_field(&meta, "allowed_methods");
     let caller_methods = crate::utils::json_string_array_field_trimmed(args, "allowed_methods");
+    let template_methods: Vec<String> = talos_json_methods.clone();
     let mut allowed_methods: Vec<String> = talos_json_methods;
     for m in caller_methods {
         if !allowed_methods.contains(&m) {
@@ -4846,6 +5139,8 @@ async fn handle_install_module_from_catalog(
         methods: allowed_methods,
         secrets: allowed_secrets,
         not_carried: grants_not_carried,
+        kept_as_owner_added: grants_kept_as_owner_added,
+        owner_added,
     } = grants_for_install(
         installed_copy.as_ref(),
         allowed_hosts,
@@ -4853,6 +5148,7 @@ async fn handle_install_module_from_catalog(
         allowed_secrets,
         caller_provided_allowed_methods,
         caller_provided_allowed_secrets,
+        &template_methods,
     );
     // DRY RUN: every grant decision is made above this line, before the
     // compile and the write. Answer what the install WOULD store and stop —
@@ -4907,6 +5203,8 @@ async fn handle_install_module_from_catalog(
                     methods: allowed_methods,
                     secrets: allowed_secrets,
                     not_carried: grants_not_carried,
+                    kept_as_owner_added: grants_kept_as_owner_added,
+                    owner_added,
                 },
                 &secrets_not_granted,
                 install_fuel_report(
@@ -5084,6 +5382,7 @@ async fn handle_install_module_from_catalog(
             &config_schema,
             catalog_slug.as_deref(),
             fuel_explicit,
+            &owner_added,
         )
         .await
     {
@@ -5230,9 +5529,17 @@ async fn handle_install_module_from_catalog(
     if !grants_not_carried.is_empty() {
         resp["grants_not_carried"] = serde_json::Value::Object(grants_not_carried);
         resp["grants_not_carried_note"] = serde_json::json!(
-            "Your installed copy held these grants and the new template no longer \
-                     grants them, so they were not carried onto the reinstall. A reinstall keeps \
-                     your copy's grants only within the template's own grant."
+            "Your installed copy held these grants, the new template does not grant them, \
+                     and they are not recorded as ones you added, so they were not carried onto \
+                     the reinstall. Set them again with update_module_hosts / update_module_methods \
+                     / update_module_secrets: a grant you add that way is kept by later reinstalls."
+        );
+    }
+    if !grants_kept_as_owner_added.is_empty() {
+        resp["grants_kept_as_owner_added"] = serde_json::Value::Object(grants_kept_as_owner_added);
+        resp["grants_kept_as_owner_added_note"] = serde_json::json!(
+            "The template does not grant these. They were kept because you added them to \
+                     your copy; remove one with the update_module_* tool that set it."
         );
     }
     if !secrets_not_granted.is_empty() {
@@ -6348,6 +6655,7 @@ mod install_dry_run_tests {
             hosts: v(&["gmail.googleapis.com"]),
             methods: v(&["GET"]),
             secrets: v(&["oauth/gmail/u/a@example.com/access_token", "legacy/key"]),
+            owner_added: talos_module_repository::OwnerAddedGrants::default(),
         };
         let grants = grants_for_install(
             Some(&stored),
@@ -6356,6 +6664,7 @@ mod install_dry_run_tests {
             v(&["oauth/gmail/*"]),
             false,
             false,
+            &v(&["GET"]),
         );
         let r = install_dry_run_report(
             "Gmail: List Messages",
@@ -6396,6 +6705,7 @@ mod install_dry_run_tests {
             hosts: v(&["b.example.com", "a.example.com"]),
             methods: v(&["GET"]),
             secrets: vec![],
+            owner_added: talos_module_repository::OwnerAddedGrants::default(),
         };
         let grants = grants_for_install(
             Some(&stored),
@@ -6404,6 +6714,7 @@ mod install_dry_run_tests {
             vec![],
             false,
             false,
+            &v(&["GET"]),
         );
         let r = install_dry_run_report(
             "m",
@@ -6423,6 +6734,7 @@ mod install_dry_run_tests {
             v(&["x/y"]),
             false,
             false,
+            &v(&["GET"]),
         );
         let r = install_dry_run_report(
             "m",
