@@ -57,6 +57,7 @@ const KNOWN_SYSTEM_KINDS_BASE: &[&str] = &[
     "pending_approvals",
     "action_links",
     "connections",
+    "for_each_connection",
     "assistant_report",
     "operator_digest",
     "synthesize",

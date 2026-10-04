@@ -1347,6 +1347,25 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "set_for_each_connection",
+            "description": "Make an existing MODULE node run once per connected account of one service (every connected bank, every calendar) instead of once. Use it in place of one hand-wired node per account: an account connected later is read on the next run with no graph edit. Each run is the node's own module with the node's own config, limits and grants, plus the config keys you bind, written by the engine from the owner's connections: `bind` maps a config key to `vault_reference` (the vault:// reference of that account's credential), `account` (its label), `service` or `connected_at`. Output: {items: [each run's output, in listing order; a failed run is {__error, error_message, account, service}], count, connections: {provider, listed, read, failed, skipped, not_run, truncated}} — the shape a collect node emits, so a node that read `collect` reads this. The node fails only when the listing cannot be read or accounts exist and none was read; one account failing is reported and the workflow continues. WHAT A RUN MAY READ is unchanged: the module's allowed_secrets grant must admit the account's credential path (for example `plaid/access_token/*`), or that account is skipped as `not_granted` and never dispatched; the response lists what would run right now. Pass provider: null to turn the node back into a plain module node. Runs are capped at max_connections (default 8, max 16), four at a time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": { "type": "string", "description": "UUID of the workflow" },
+                    "node_id": { "type": "string", "description": "ID of an existing module node in the workflow graph" },
+                    "provider": { "type": ["string", "null"], "description": "The service whose connections are read, as list_connections reports it (for example 'plaid'). null removes the setting." },
+                    "bind": {
+                        "type": "object",
+                        "description": "Config key -> what of the connection it is set to: 'vault_reference', 'account', 'service' or 'connected_at'. 1 to 8 keys; letters, digits and underscore; not starting with '__'. Example: {\"ACCESS_TOKEN\": \"vault_reference\", \"INSTITUTION\": \"account\"}.",
+                        "additionalProperties": { "type": "string", "enum": ["vault_reference", "account", "service", "connected_at"] }
+                    },
+                    "max_connections": { "type": "integer", "minimum": 1, "maximum": 16, "description": "Most connections run (default 8). The rest are counted in the output as not_run." }
+                },
+                "required": ["workflow_id", "node_id", "provider"]
+            }
+        }),
+        serde_json::json!({
             "name": "add_connections_node",
             "description": "Add a connections node to an existing workflow. Controller-side system node: reads which services the workflow's owner has connected (bank items, mail accounts, calendars) and emits {available, count, truncated, stored_checked, connections: [{service, name, account, connected_at, vault_reference, allowed_secrets, stored, module_readable}]} as node output — the same listing list_connections returns. Use it so a workflow can say what is connected, for example a summary that reports a connected bank no node reads. It emits each credential's vault:// REFERENCE, never a credential, and a reference arriving in a node's input is NOT resolved at dispatch: a module can use a credential only when the reference is in its own node's configuration and its allowed_secrets grant covers the path. No worker dispatch, tenancy from the execution's resolved identity. Degrades to {available: false} instead of failing the workflow when the store is unreachable.",
             "inputSchema": {
@@ -2036,6 +2055,9 @@ pub async fn dispatch(
         }
         "add_connections_node" => {
             Some(handle_add_connections_node(req_id, args, state, agent).await)
+        }
+        "set_for_each_connection" => {
+            Some(handle_set_for_each_connection(req_id, args, state, agent).await)
         }
         "add_action_links_node" => {
             Some(handle_add_action_links_node(req_id, args, state, agent).await)
@@ -3873,6 +3895,279 @@ async fn handle_add_connections_node(
         }))
         .unwrap_or_default(),
     )
+}
+
+// ── set_for_each_connection ──────────────────────────────────────────────────
+
+/// What `set_for_each_connection` was asked to write: `None` removes the
+/// setting.
+type ForEachSettings = Option<(
+    String,
+    std::collections::BTreeMap<
+        String,
+        talos_workflow_engine_core::connections_reader::ConnectionField,
+    >,
+    u32,
+)>;
+
+/// Read and check the arguments. Everything the graph parser would silently
+/// drop (an unknown service, an unusable or reserved key, an unknown field)
+/// is refused here, because a dropped binding is a module run without the
+/// value its author meant it to have.
+fn parse_for_each_args(args: &serde_json::Value) -> Result<ForEachSettings, String> {
+    use talos_workflow_engine_core::connections_reader::{
+        binding_key_usable, ConnectionField, DEFAULT_FAN_OUT, MAX_BINDINGS, MAX_FAN_OUT,
+    };
+    let Some(provider) = args.get("provider") else {
+        return Err("Missing 'provider' (a service id, or null to remove the setting)".to_string());
+    };
+    if provider.is_null() {
+        return Ok(None);
+    }
+    let provider = parse_connections_provider(args)?
+        .ok_or_else(|| "'provider' must be a service id".to_string())?;
+    let Some(bind_arg) = args.get("bind").and_then(serde_json::Value::as_object) else {
+        return Err(
+            "Missing or invalid 'bind' (an object of config key to connection field)".to_string(),
+        );
+    };
+    if bind_arg.is_empty() || bind_arg.len() > MAX_BINDINGS {
+        return Err(format!("'bind' must name 1 to {MAX_BINDINGS} config keys"));
+    }
+    let mut bind = std::collections::BTreeMap::new();
+    for (key, field) in bind_arg {
+        if !binding_key_usable(key) {
+            return Err(format!(
+                "'bind' key '{}' is not usable: letters, digits and underscore, at most 64, not starting with '__'",
+                key.chars().filter(|c| !c.is_control()).take(64).collect::<String>()
+            ));
+        }
+        let Some(field) = field.as_str().and_then(ConnectionField::parse) else {
+            return Err(format!(
+                "'bind.{key}' must be one of: vault_reference, account, service, connected_at"
+            ));
+        };
+        bind.insert(key.clone(), field);
+    }
+    let max = match args.get("max_connections").filter(|v| !v.is_null()) {
+        None => DEFAULT_FAN_OUT,
+        Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(n) if (1..=MAX_FAN_OUT).contains(&n) => n,
+            _ => return Err(format!("'max_connections' must be 1 to {MAX_FAN_OUT}")),
+        },
+    };
+    Ok(Some((provider, bind, max)))
+}
+
+/// Write (or remove) the setting on `node_id` in `graph`. Returns the node's
+/// module id. Refuses a node that is not a module node, and one that already
+/// has a different kind — a node is one kind of thing.
+fn apply_for_each_setting(
+    graph: &mut serde_json::Value,
+    node_id: &str,
+    settings: &ForEachSettings,
+) -> Result<uuid::Uuid, String> {
+    use talos_workflow_engine_core::connections_reader::FOR_EACH_CONNECTION_KEY;
+    const KIND: &str = "for_each_connection";
+    let node = graph
+        .get_mut("nodes")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|nodes| {
+            nodes
+                .iter_mut()
+                .find(|n| n.get("id").and_then(serde_json::Value::as_str) == Some(node_id))
+        })
+        .ok_or_else(|| format!("Node '{node_id}' not found in workflow graph"))?;
+    let module_id = talos_workflow_engine_core::node_module_id(node).ok_or_else(|| {
+        format!(
+            "Node '{node_id}' is not a module node; only a module node can run once per connection"
+        )
+    })?;
+    let existing_kind = node
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if let Some(other) = existing_kind.as_deref().filter(|k| *k != KIND) {
+        return Err(format!(
+            "Node '{node_id}' is already a '{other}' node and cannot also run once per connection"
+        ));
+    }
+    let Some(obj) = node.as_object_mut() else {
+        return Err("Invalid graph JSON".to_string());
+    };
+    let data = obj
+        .entry("data")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("Node '{node_id}' has config that is not an object"))?;
+    match settings {
+        None => {
+            data.remove(FOR_EACH_CONNECTION_KEY);
+            obj.remove("kind");
+        }
+        Some((provider, bind, max)) => {
+            let bind: serde_json::Map<String, serde_json::Value> = bind
+                .iter()
+                .map(|(k, f)| (k.clone(), serde_json::json!(f.as_str())))
+                .collect();
+            data.insert(
+                FOR_EACH_CONNECTION_KEY.to_string(),
+                serde_json::json!({ "provider": provider, "bind": bind, "max_connections": max }),
+            );
+            obj.insert("kind".to_string(), serde_json::json!(KIND));
+        }
+    }
+    Ok(module_id)
+}
+
+async fn handle_set_for_each_connection(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    agent: Arc<auth::AgentIdentity>,
+) -> JsonRpcResponse {
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let workflow_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let node_id = match crate::utils::require_node_id(args, "node_id", req_id.clone()) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let settings = match parse_for_each_args(args) {
+        Ok(s) => s,
+        Err(why) => return mcp_error(req_id, -32602, &why),
+    };
+
+    let VersionedGraph {
+        graph_json,
+        graph_version,
+    } = match fetch_graph_json(state, workflow_id, user_id, &req_id).await {
+        Ok(g) => g,
+        Err(e) => return e,
+    };
+    let mut graph: serde_json::Value = match serde_json::from_str(&graph_json) {
+        Ok(g) => g,
+        Err(_) => return mcp_error(req_id, -32000, "Invalid graph JSON"),
+    };
+    let module_id = match apply_for_each_setting(&mut graph, &node_id, &settings) {
+        Ok(id) => id,
+        Err(why) => return mcp_error(req_id, -32602, &why),
+    };
+    if let Err(e) = save_graph_json(
+        state,
+        workflow_id,
+        user_id,
+        graph_version,
+        &graph.to_string(),
+        &req_id,
+    )
+    .await
+    {
+        return e;
+    }
+    let note = maybe_auto_publish(
+        state,
+        workflow_id,
+        user_id,
+        "Auto-published after for_each_connection change",
+    )
+    .await
+    .message_suffix();
+
+    let Some((provider, bind, max)) = settings else {
+        return mcp_text(
+            req_id,
+            &format!(
+                "Node '{node_id}' in workflow {workflow_id} runs once again, as a plain module node.{note}"
+            ),
+        );
+    };
+
+    // What would run right now, from the same planner the engine uses: the
+    // owner's connections of this service against the module's own grant.
+    // Best-effort — the setting is saved either way.
+    let would_run = for_each_preview(state, user_id, module_id, &provider, &bind, max).await;
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "workflow_id": workflow_id.to_string(),
+            "node_id": node_id,
+            "provider": provider,
+            "bind": bind.iter().map(|(k, f)| (k.clone(), f.as_str())).collect::<std::collections::BTreeMap<_, _>>(),
+            "max_connections": max,
+            "right_now": would_run,
+            "message": format!(
+                "Node '{node_id}' now runs once per connected '{provider}' account. Output: {{items, count, connections}}. An account listed under right_now.skipped as not_granted needs the module's allowed_secrets to admit its credential path (update_module_secrets).{note}"
+            ),
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+/// The engine's own plan for the owner's connections, as of now.
+async fn for_each_preview(
+    state: &McpState,
+    user_id: uuid::Uuid,
+    module_id: uuid::Uuid,
+    provider: &str,
+    bind: &std::collections::BTreeMap<
+        String,
+        talos_workflow_engine_core::connections_reader::ConnectionField,
+    >,
+    max: u32,
+) -> serde_json::Value {
+    let unknown = |why: &str| serde_json::json!({ "checked": false, "reason": why });
+    let resolved = match state.workflow_repo.get_templates_by_ids(&[module_id]).await {
+        Ok(v) if !v.is_empty() => module_id,
+        _ => state
+            .module_repo
+            .find_template_id_via_wasm_module(module_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(module_id),
+    };
+    let Some(template) = state
+        .workflow_repo
+        .get_templates_by_ids(&[resolved])
+        .await
+        .ok()
+        .and_then(|t| t.into_iter().next())
+    else {
+        return unknown("the node's module could not be read");
+    };
+    let listed = match talos_integrations::connections::list_rendered(
+        &state.db_pool,
+        &state.secrets_manager,
+        user_id,
+        Some(provider),
+    )
+    .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "set_for_each_connection: the connections read failed");
+            return unknown("the connections could not be read");
+        }
+    };
+    let listing =
+        serde_json::json!({ "truncated": listed.truncated, "connections": listed.connections });
+    let plan = talos_workflow_engine_core::connections_reader::plan_connection_runs(
+        &listing,
+        provider,
+        bind,
+        max,
+        |path| talos_workflow_job_protocol::vault_path_permitted(&template.allowed_secrets, path),
+    );
+    serde_json::json!({
+        "checked": true,
+        "listed": plan.listed,
+        "would_run": plan.runs.iter().map(|r| r.account.clone()).collect::<Vec<_>>(),
+        "skipped": plan.skipped.iter().map(|s| serde_json::json!({ "account": s.account, "reason": s.reason })).collect::<Vec<_>>(),
+        "not_run": plan.not_run,
+    })
 }
 
 // ── add_action_links_node ────────────────────────────────────────────────────
@@ -7578,6 +7873,89 @@ mod fan_in_posture_tests {
         ] {
             assert!(!kind_is_edge_driven(kind, &json!({})), "{kind}");
         }
+    }
+
+    #[test]
+    fn for_each_settings_are_refused_where_the_parser_would_drop_them() {
+        use super::{apply_for_each_setting, parse_for_each_args};
+        let ok = parse_for_each_args(&json!({
+            "provider": "plaid",
+            "bind": { "ACCESS_TOKEN": "vault_reference", "INSTITUTION": "account" },
+        }))
+        .expect("accepted")
+        .expect("a setting");
+        assert_eq!((ok.0.as_str(), ok.1.len(), ok.2), ("plaid", 2, 8));
+        assert_eq!(parse_for_each_args(&json!({ "provider": null })), Ok(None));
+        for (args, why) in [
+            (json!({}), "Missing 'provider'"),
+            (
+                json!({ "provider": "plad", "bind": { "A": "account" } }),
+                "not a known service",
+            ),
+            (json!({ "provider": "plaid" }), "Missing or invalid 'bind'"),
+            (json!({ "provider": "plaid", "bind": {} }), "1 to 8"),
+            (
+                json!({ "provider": "plaid", "bind": { "__actor_context__": "account" } }),
+                "is not usable",
+            ),
+            (
+                json!({ "provider": "plaid", "bind": { "for_each_connection": "account" } }),
+                "is not usable",
+            ),
+            (
+                json!({ "provider": "plaid", "bind": { "A": "password" } }),
+                "must be one of",
+            ),
+            (
+                json!({ "provider": "plaid", "bind": { "A": "account" }, "max_connections": 17 }),
+                "must be 1 to 16",
+            ),
+        ] {
+            let refusal = parse_for_each_args(&args).unwrap_err();
+            assert!(refusal.contains(why), "{args}: {refusal}");
+        }
+
+        // What is written is what the engine's parser reads back.
+        let module = uuid::Uuid::from_u128(9);
+        let mut graph = json!({ "nodes": [
+            { "id": "banks", "type": module.to_string(), "data": { "PLAID_ENV": "production" } },
+            { "id": "gather", "type": "system:collect", "kind": "collect" },
+            { "id": "judged", "type": module.to_string(), "kind": "verify" },
+        ]});
+        assert_eq!(
+            apply_for_each_setting(&mut graph, "banks", &Some(ok.clone())),
+            Ok(module)
+        );
+        assert_eq!(graph["nodes"][0]["kind"], json!("for_each_connection"));
+        assert_eq!(graph["nodes"][0]["data"]["PLAID_ENV"], json!("production"));
+        let read_back = talos_workflow_engine_core::connections_reader::parse_for_each_connection(
+            &graph["nodes"][0]["data"],
+        );
+        assert_eq!(read_back, Some(ok.clone()));
+        // Not a module node; already another kind; not there.
+        assert!(
+            apply_for_each_setting(&mut graph, "gather", &Some(ok.clone()))
+                .unwrap_err()
+                .contains("not a module node")
+        );
+        assert!(
+            apply_for_each_setting(&mut graph, "judged", &Some(ok.clone()))
+                .unwrap_err()
+                .contains("already a 'verify' node")
+        );
+        assert!(apply_for_each_setting(&mut graph, "nope", &Some(ok))
+            .unwrap_err()
+            .contains("not found"));
+        // Removing leaves a plain module node with its config.
+        assert_eq!(
+            apply_for_each_setting(&mut graph, "banks", &None),
+            Ok(module)
+        );
+        assert!(graph["nodes"][0].get("kind").is_none());
+        assert_eq!(
+            graph["nodes"][0]["data"],
+            json!({ "PLAID_ENV": "production" })
+        );
     }
 
     #[test]

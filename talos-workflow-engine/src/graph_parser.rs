@@ -295,6 +295,18 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
             .and_then(serde_json::Value::as_u64)
             .map_or(10u32, |v| v.clamp(1, 25) as u32);
         Some(SystemNodeKind::PendingApprovals { limit })
+    } else if k == "for_each_connection" {
+        // Unusable settings are no kind at all: the node then runs once, as
+        // the plain module node it also is, with whatever its config names.
+        let (provider, bind, max_connections) =
+            talos_workflow_engine_core::connections_reader::parse_for_each_connection(
+                node.get("data")?,
+            )?;
+        Some(SystemNodeKind::ForEachConnection {
+            provider,
+            bind,
+            max_connections,
+        })
     } else if k == "connections" {
         // A provider id is a short lowercase token; anything else is read as
         // "no filter" rather than carried into the node as written.

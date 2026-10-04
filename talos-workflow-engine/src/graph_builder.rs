@@ -541,6 +541,26 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
         SystemNodeKind::PendingApprovals { limit } => {
             ("pending_approvals", json!({ "limit": limit }))
         }
+        SystemNodeKind::ForEachConnection {
+            provider,
+            bind,
+            max_connections,
+        } => {
+            let bind: serde_json::Map<String, JsonValue> = bind
+                .iter()
+                .map(|(key, field)| (key.clone(), json!(field.as_str())))
+                .collect();
+            (
+                "for_each_connection",
+                json!({
+                    talos_workflow_engine_core::connections_reader::FOR_EACH_CONNECTION_KEY: {
+                        "provider": provider,
+                        "bind": bind,
+                        "max_connections": max_connections,
+                    }
+                }),
+            )
+        }
         SystemNodeKind::Connections { provider } => (
             "connections",
             match provider {
@@ -1440,6 +1460,30 @@ mod tests {
                 Some(SystemNodeKind::Connections { provider: None }),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn system_node_for_each_connection_round_trips() {
+        use talos_workflow_engine_core::connections_reader::ConnectionField;
+        let kind = SystemNodeKind::ForEachConnection {
+            provider: "plaid".to_string(),
+            bind: std::collections::BTreeMap::from([
+                ("ACCESS_TOKEN".to_string(), ConnectionField::VaultReference),
+                ("INSTITUTION".to_string(), ConnectionField::Account),
+            ]),
+            max_connections: 6,
+        };
+        assert_eq!(round_trip_kind("banks", kind.clone()).await, kind);
+        // Settings that bind nothing are not a fan-out.
+        let hand_written = serde_json::json!({
+            "id": "banks",
+            "kind": "for_each_connection",
+            "data": { "for_each_connection": { "provider": "plaid", "bind": {} } },
+        });
+        assert_eq!(
+            crate::graph_parser::parse_system_node_kind("for_each_connection", &hand_written),
+            None
+        );
     }
 
     #[tokio::test]
