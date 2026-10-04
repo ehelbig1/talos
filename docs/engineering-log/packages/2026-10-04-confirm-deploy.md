@@ -117,3 +117,19 @@ when it was written, and are listed so nobody reads their absence as done:
 Seen and untouched: `docs/deployment.md` shows a `/health` body with
 `version` and `checks` fields; the live endpoint returns `{"status":"ok"}`.
 
+## Added the same day: the GitHub API when git cannot ask
+
+First real use: the SSH agent was locked, `git ls-remote` failed, and the two
+commit checks came back UNKNOWN. That was the right answer for a check that
+could not be made, and it still left the question to be answered by hand.
+
+When `git ls-remote` fails and `origin` is a github.com repository, the
+script now asks `https://api.github.com/repos/<owner>/<repo>/commits/main`
+for the commit, unauthenticated, and says on the `origin/main` line that it
+did. A private repository answers 404, which is not a commit, so the checks
+stay UNKNOWN as before. An origin that is not exactly `owner/repo` on
+github.com is not sent anywhere. The test covers: the API answers, names
+another commit, answers without a commit, is unreachable, a non-GitHub
+origin (the API is never asked), a malformed origin, and that the API is not
+consulted when git answers.
+
