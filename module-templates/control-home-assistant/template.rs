@@ -86,6 +86,13 @@ struct CommandResult {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// For a `done` command: how many things the service says changed.
+    /// `done` means the service ACCEPTED the command, and it accepts one for
+    /// an entity that does not exist; `changed: 0` is how that shows. It is
+    /// also what a command that asks for the state a thing is already in
+    /// gets. Absent when the service's answer does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -96,6 +103,8 @@ struct Verdict {
     done: usize,
     refused: usize,
     failed: usize,
+    /// `done` commands the service says changed nothing.
+    unchanged: usize,
     /// Commands past the limit, not looked at.
     not_run: usize,
     results: Vec<CommandResult>,
@@ -151,6 +160,16 @@ fn host_of(base: &str) -> &str {
         .split('/')
         .next()
         .unwrap_or("")
+}
+
+/// How many states a service call changed: Home Assistant answers a service
+/// call with the list of states that changed during it. Counted without
+/// building them — a state carries every attribute of its entity. `None`
+/// when the answer is not a list.
+fn changed_count(body: &[u8]) -> Option<usize> {
+    serde_json::from_slice::<Vec<serde::de::IgnoredAny>>(body)
+        .ok()
+        .map(|states| states.len())
 }
 
 /// The service a neutral action is, for this adapter. `None`: not an action
@@ -232,6 +251,7 @@ pub fn run(input: String) -> Result<String, String> {
         done: 0,
         refused: 0,
         failed: 0,
+        unchanged: 0,
         not_run: 0,
         results: Vec::new(),
     };
@@ -250,6 +270,7 @@ pub fn run(input: String) -> Result<String, String> {
             action: clean_name(command.action.as_deref().unwrap_or("")),
             status: "refused",
             reason: None,
+            changed: None,
         };
         let (service, entity, value) = match plan(&cfg.targets, command) {
             Ok(planned) => planned,
@@ -283,7 +304,11 @@ pub fn run(input: String) -> Result<String, String> {
         match talos::core::http::fetch(&req) {
             Ok(resp) if (200..300).contains(&resp.status) => {
                 result.status = "done";
+                result.changed = changed_count(&resp.body);
                 verdict.done += 1;
+                if result.changed == Some(0) {
+                    verdict.unchanged += 1;
+                }
             }
             Ok(resp) => {
                 result.status = "failed";
@@ -302,8 +327,8 @@ pub fn run(input: String) -> Result<String, String> {
     logging::log(
         Level::Info,
         &format!(
-            "control-home-assistant: {} done, {} refused, {} failed, dry_run={}",
-            verdict.done, verdict.refused, verdict.failed, dry_run
+            "control-home-assistant: {} done ({} changed nothing), {} refused, {} failed, dry_run={}",
+            verdict.done, verdict.unchanged, verdict.refused, verdict.failed, dry_run
         ),
     );
     serde_json::to_string(&verdict).map_err(|e| e.to_string())
@@ -405,6 +430,46 @@ mod tests {
             ]
         );
         assert!(host::http::requests().is_empty());
+    }
+
+    #[test]
+    fn accepted_and_changed_are_told_apart() {
+        // Home Assistant answers a service call with the states it changed:
+        // one for a light that was on, none for an entity that does not
+        // exist or was already off.
+        host::http::respond_with(|req| {
+            Ok(host::http::response(
+                200,
+                if req.url.ends_with("/turn_off") {
+                    r#"[{"entity_id":"light.made_up_office","state":"off","attributes":{"friendly_name":"Made-up office","supported_color_modes":["brightness"]},"last_changed":"2026-10-04T12:00:00+00:00"}]"#
+                } else {
+                    "[]"
+                },
+            ))
+        });
+        let v = act(
+            config(false),
+            json!({ "commands": [
+                { "target": "office_lights", "action": "turn_off" },
+                { "target": "office_lights", "action": "turn_on" },
+            ] }),
+        )
+        .unwrap();
+        assert_eq!((v["done"].clone(), v["unchanged"].clone()), (json!(2), json!(1)));
+        assert_eq!(v["results"][0]["changed"], json!(1));
+        assert_eq!(v["results"][1]["changed"], json!(0), "accepted, and nothing changed");
+        // The state itself never reaches the output.
+        assert!(!v.to_string().contains("friendly_name"), "{v}");
+
+        // An answer that is not a list says nothing about what changed.
+        host::http::respond(200, r#"{"ok":true}"#);
+        let v = act(config(false), json!({ "commands": [{ "target": "office_lights", "action": "turn_on" }] })).unwrap();
+        assert_eq!(v["results"][0]["status"], json!("done"));
+        assert!(v["results"][0].get("changed").is_none(), "{v}");
+        assert_eq!(v["unchanged"], json!(0));
+        // A refused or dry-run command has no count.
+        let v = act(config(true), json!({ "commands": [{ "target": "office_lights", "action": "turn_on" }, { "target": "garage", "action": "turn_on" }] })).unwrap();
+        assert!(v["results"].as_array().unwrap().iter().all(|r| r.get("changed").is_none()), "{v}");
     }
 
     #[test]
