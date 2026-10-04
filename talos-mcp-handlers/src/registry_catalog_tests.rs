@@ -93,3 +93,29 @@ fn the_status_report_names_what_each_surface_reads_in_each_mode() {
         .contains("registry"));
     assert_eq!(disk["list_templates"], registry["list_templates"]);
 }
+
+/// The install tool's description says what an install does in BOTH modes.
+/// It said "Compile and install" after the registry path stopped compiling,
+/// and named `wasm_sha256` as always present when a registry copy has none.
+#[test]
+fn the_install_tool_describes_both_kinds_of_copy() {
+    let schemas = crate::modules::tool_schemas();
+    let description = schemas
+        .iter()
+        .find(|t| t["name"] == "install_module_from_catalog")
+        .and_then(|t| t["description"].as_str())
+        .expect("install_module_from_catalog has a description");
+    assert!(
+        !description.starts_with("Compile"),
+        "the description opens by saying every install compiles"
+    );
+    for stated in [
+        "`compiled`",
+        "`registry`",
+        "nothing is compiled",
+        "null for a registry copy",
+        "hot_update_module is refused",
+    ] {
+        assert!(description.contains(stated), "missing: {stated}");
+    }
+}
