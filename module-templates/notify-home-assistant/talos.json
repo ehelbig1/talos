@@ -1,0 +1,76 @@
+{
+  "name": "notify-home-assistant",
+  "version": "v1.0.0",
+  "display_name": "Notify: Home Assistant",
+  "description": "Send a phone notification through the Home Assistant companion app. INPUT (the same for every notify-* adapter): the node before this one returns `notification: {title?, body, priority?: low|normal|high, tag?, link?, actions?: [{title, link, one_tap?}]}`; `skip: true` sends nothing. Links must be https; anything else is not sent and is counted. At most 3 actions. OUTPUT (the same for every adapter): {provider, sent, skipped, dry_run, status, actions_sent, actions_dropped, one_tap_actions, link_sent, link_dropped, tag_sent}. To change service, swap this module on the send node (swap_node_module) and set the other adapter's config; nothing upstream changes. See docs/notification-contract.md. WHAT HOME ASSISTANT DOES WITH IT: high priority is sent as priority high with ttl 0; `link` is what a tap opens; every action OPENS its link (one_tap is not available through this service without an automation inside Home Assistant, so one_tap_actions is 0 and a Talos action link shows its confirmation page); `tag` is sent, so a later message with the same tag replaces the earlier one. Written from the companion app's documented format and not exercised against a live server. A response that is not 2xx fails the node with the host and the status, never the body. BASE_URL must be an https:// address the worker can reach: a home-network address (192.168.x.x, homeassistant.local) is refused by the worker; use the external address. GRANTS: installs with NO allowed hosts and no secrets, so it can reach nothing until you say what it may reach: set the server's host with update_module_hosts and the token's exact path with update_module_secrets. Use one installed copy per server. CREDENTIALS: the module never holds one; AUTH_HEADER carries a vault:// reference the host replaces when the request is sent.",
+  "category": "Communication",
+  "capability_world": "http-node",
+  "allowed_hosts": [],
+  "allowed_methods": [
+    "POST"
+  ],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 1,
+    "bytes_per_item": 4000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 3.0
+  },
+  "config_schema": {
+    "type": "object",
+    "required": [
+      "BASE_URL",
+      "NOTIFY_SERVICE",
+      "AUTH_HEADER"
+    ],
+    "properties": {
+      "BASE_URL": {
+        "type": "string",
+        "description": "Home Assistant's external https:// address."
+      },
+      "NOTIFY_SERVICE": {
+        "type": "string",
+        "description": "The notify service for the phone, without the 'notify.' prefix: for example mobile_app_<device>."
+      },
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "'Bearer vault://homeassistant/token' — a long-lived access token from your Home Assistant profile, stored in the vault."
+      },
+      "DRY_RUN": {
+        "type": "boolean",
+        "default": false,
+        "description": "true: check the notification and the config, send nothing, and report what would be sent."
+      },
+      "TIMEOUT_MS": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 30000,
+        "default": 10000,
+        "description": "Request timeout in milliseconds."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Find the notify service",
+      "detail": "In Home Assistant, Developer tools > Actions lists notify.mobile_app_<device> once the companion app is signed in."
+    },
+    {
+      "step": 2,
+      "title": "Store a token",
+      "detail": "Create a long-lived access token in your Home Assistant profile and store it in the vault under homeassistant/token. Tokens are not stored through MCP."
+    },
+    {
+      "step": 3,
+      "title": "Grant the installed copy",
+      "detail": "update_module_hosts with Home Assistant's external host; update_module_secrets with homeassistant/token."
+    },
+    {
+      "step": 4,
+      "title": "Rehearse",
+      "detail": "Set DRY_RUN true and read the result: it reports what would be sent, and sends nothing."
+    }
+  ]
+}

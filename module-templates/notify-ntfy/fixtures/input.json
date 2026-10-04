@@ -1,0 +1,25 @@
+{
+  "notification": {
+    "title": "Morning",
+    "body": "Three things today. First: call the dentist before noon. Second: the form is due Friday. Third: nothing is booked after two.",
+    "priority": "normal",
+    "tag": "morning",
+    "link": "https://talos.example.test/today",
+    "actions": [
+      {
+        "title": "Done",
+        "link": "https://talos.example.test/action-links/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "one_tap": true
+      },
+      {
+        "title": "Keep",
+        "link": "https://talos.example.test/action-links/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "one_tap": true
+      },
+      {
+        "title": "Open list",
+        "link": "https://talos.example.test/list"
+      }
+    ]
+  }
+}
