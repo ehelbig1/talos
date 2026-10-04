@@ -100,7 +100,10 @@ platform, and any secret grant that names your own connection.
    picks the template up on its next sync; the shared row's fuel limit is the
    one the manifest declares. `install_module_from_catalog` there makes a copy
    that references the same signed artifact with the installer's own grants;
-   nothing is compiled on that deployment.
+   nothing is compiled on that deployment. A copy keeps the reference it was
+   installed with: publishing a new version (a new tag) leaves existing copies
+   on the old one, and `get_catalog_status` lists them as `behind` until they
+   are reinstalled.
 
 ## The fixtures directory
 

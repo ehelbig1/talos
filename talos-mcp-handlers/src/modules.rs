@@ -3614,6 +3614,7 @@ mod catalog_drift_report_tests {
             in_catalog: true,
             catalog_source_absent: false,
             source_matches: matches,
+            artifact_matches: None,
             schema_matches: true,
             world_matches: true,
             approvals_match: true,
@@ -5862,10 +5863,10 @@ pub(crate) fn installed_copies_json(
             "catalog_updated_at": r.catalog_updated_at.map(|t| t.to_rfc3339()),
         })).collect::<Vec<_>>(),
         "states": {
-            "current": "same source, config schema, capability world and approval list as the catalog",
-            "behind": "the catalog changed since this copy was installed (differs_in says what: source, config_schema, capability_world, requires_approval_for); reinstall to take the change",
+            "current": "same code, config schema, capability world and approval list as the catalog (code is compared by source for a compiled copy, by registry reference for a copy that references a registry artifact)",
+            "behind": "the catalog changed since this copy was installed (differs_in says what: source, artifact, config_schema, capability_world, requires_approval_for; `artifact` = the catalog now names a different registry artifact than the one this copy references); reinstall to take the change",
             "detached": "edited in place (hot_update_module), so differing from the catalog is deliberate",
-            "unknown": "the catalog row carries no source (OCI mode), so drift cannot be determined here",
+            "unknown": "the copy was compiled here and the catalog row carries no source (a registry catalog), so its code cannot be compared",
             "not_in_catalog": "no catalog template maps to this copy any more",
         },
     })
