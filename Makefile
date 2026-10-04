@@ -33,7 +33,7 @@ export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null ||
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
-        check build lint lint-full lint-frontend lint-frontend-full hooks test test-changed test-integration test-clean coverage-html audit check-catalog check-catalog-fuel test-integration-scaffold test-alert-rules ci \
+        check build lint lint-full lint-frontend lint-frontend-full hooks test test-changed test-db test-db-stop test-integration test-clean coverage-html audit check-catalog check-catalog-fuel test-integration-scaffold test-alert-rules ci \
         drill drill-schedule drill-unschedule drill-schedule-status \
         offhost-upload offhost-backfill offhost-plan offhost-probe \
         offhost-schedule offhost-unschedule offhost-status \
@@ -320,6 +320,12 @@ test: ## Run the full test suite with cargo-nextest (fast local)
 
 test-changed: ## Run nextest for ONLY crates changed vs BASE (default origin/main); ARGS=--list to just list. Fast inner loop, NOT a CI substitute
 	@bash scripts/test-changed.sh $(ARGS)
+
+test-db: ## Start the scratch Postgres for the controller's DB tests and bring its template up to this checkout's migrations (then: scripts/dev-test-db.sh run cargo test -p controller --test <name>)
+	@bash scripts/dev-test-db.sh up
+
+test-db-stop: ## Stop the scratch test Postgres (its template is kept)
+	@bash scripts/dev-test-db.sh stop
 
 test-integration: ## Run env-gated integration tests against disposable Redis+Postgres+NATS (needs Docker)
 	@command -v docker >/dev/null 2>&1 \

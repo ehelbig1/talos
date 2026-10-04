@@ -99,6 +99,37 @@ against most of the workspace; the artifact is too large to upload and
 download faster than a warm incremental build. Sharding plus path gating
 remove more wall-clock for less machinery.
 
+## Running one database test locally
+
+The controller's DB tests (`mod common;`) clone a migrated template database
+per test and read its address from `DATABASE_URL`. `make test-integration`
+builds one, runs everything and tears it down. To run ONE test binary, and
+run it again:
+
+```bash
+scripts/dev-test-db.sh run cargo test -p controller --test owner_added_grants_tests
+```
+
+`run` starts a scratch Postgres (created on first use, bound to
+`127.0.0.1:15433`), builds its `talos_ctl` template from the schema baseline
+plus the migrations after it, brings it up to this checkout's migrations when
+they have moved, and runs the command with `DATABASE_URL` set. `make test-db`
+does the same without a command; `scripts/dev-test-db.sh status` says what
+exists; `rebuild` starts the template over; `make test-db-stop` stops the
+container.
+
+The template is rebuilt, not patched, when it holds a migration this checkout
+does not have (you switched to an older branch) or when a test wrote into it
+— a test run against the template itself leaves an encryption key behind, and
+every clone then fails to unwrap it.
+
+**It never touches the stack's own Postgres.** Every statement goes into the
+one scratch container the script creates, and a name or port that is the
+stack's is refused. Do not point `DATABASE_URL` at `talos-postgres` to run
+these tests: each one is `CREATE DATABASE … TEMPLATE` on the only database
+there is. The password is generated with the container, kept in
+`~/.talos/test-db.env` (owner-readable only) and never printed.
+
 ## Local gates are fast; CI is the authority
 
 | Hook | Runs | Full set |
