@@ -202,6 +202,16 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// What a sender must send for each HMAC format [`verify_hmac_signature`]
+/// accepts. Kept beside the verifier, and pinned by a test that signs
+/// exactly as this says, because the copy that used to live in the tool that
+/// creates a webhook described the generic format without its `.` separator
+/// — a sender following it was refused with 401.
+pub const HMAC_SENDER_NOTE: &str = "Send ONE of: \
+(1) X-Hub-Signature-256: sha256=<hex_hmac_sha256(body, signing_secret)>  — GitHub style, simplest; \
+(2) X-Slack-Signature: v0=<hex_hmac_sha256(\"v0:\"+ts+\":\"+body, signing_secret)> + X-Slack-Request-Timestamp: <unix_secs>  — Slack style with timestamp; \
+(3) X-Signature: <hex_hmac_sha256(ts+\".\"+body, signing_secret)> + X-Webhook-Timestamp: <unix_secs>  — generic format with replay protection (the timestamp, a full stop, then the body; a timestamp more than 300 seconds from now is refused).";
+
 /// Verify an HMAC signature from a webhook request, reporting WHICH format
 /// verified. `None` means no format verified (or none was present).
 ///
@@ -368,6 +378,64 @@ mod tests {
     );
 
     const SECRET: &str = "a-signing-secret-of-adequate-length";
+
+    /// A sender who signs exactly as [`HMAC_SENDER_NOTE`] says is accepted,
+    /// for each of the three formats; one who signs the generic format the
+    /// way the note USED to describe it (timestamp and body with nothing
+    /// between) is refused.
+    #[test]
+    fn a_sender_following_the_note_is_accepted_in_every_format() {
+        let body = Bytes::from_static(br#"{"example":"payload"}"#);
+        let ts = now_unix_secs().to_string();
+        let header = |name: &'static str, value: String| {
+            (name, HeaderValue::from_str(&value).expect("header value"))
+        };
+        let verify = |headers: Vec<(&'static str, HeaderValue)>| {
+            let mut map = HeaderMap::new();
+            for (name, value) in headers {
+                map.insert(name, value);
+            }
+            verify_hmac_signature(&map, &body, SECRET)
+        };
+
+        assert!(HMAC_SENDER_NOTE.contains("hex_hmac_sha256(body, signing_secret)"));
+        let github = hmac_sha256_hex(SECRET, &[&body]).unwrap();
+        assert_eq!(
+            verify(vec![header(
+                "x-hub-signature-256",
+                format!("sha256={github}")
+            )]),
+            Some(VerifiedSignatureFormat::GitHub)
+        );
+
+        assert!(HMAC_SENDER_NOTE.contains(r#""v0:"+ts+":"+body"#));
+        let slack = hmac_sha256_hex(SECRET, &[b"v0:", ts.as_bytes(), b":", &body]).unwrap();
+        assert_eq!(
+            verify(vec![
+                header("x-slack-signature", format!("v0={slack}")),
+                header("x-slack-request-timestamp", ts.clone()),
+            ]),
+            Some(VerifiedSignatureFormat::Slack)
+        );
+
+        assert!(HMAC_SENDER_NOTE.contains(r#"ts+"."+body"#));
+        let generic = hmac_sha256_hex(SECRET, &[ts.as_bytes(), b".", &body]).unwrap();
+        assert_eq!(
+            verify(vec![
+                header("x-signature", generic),
+                header("x-webhook-timestamp", ts.clone()),
+            ]),
+            Some(VerifiedSignatureFormat::Generic)
+        );
+        let without_separator = hmac_sha256_hex(SECRET, &[ts.as_bytes(), &body]).unwrap();
+        assert_eq!(
+            verify(vec![
+                header("x-signature", without_separator),
+                header("x-webhook-timestamp", ts),
+            ]),
+            None
+        );
+    }
 
     /// Every outcome the auth gate can produce, so the two tests below are
     /// exhaustive by construction rather than by a list someone maintains.
