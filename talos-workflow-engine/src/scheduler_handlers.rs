@@ -446,6 +446,238 @@ impl ParallelWorkflowEngine {
         Some(output)
     }
 
+    /// [`SystemNodeKind::ForEachConnection`] — run this node's module once
+    /// per connection of one service, and emit the runs' outputs as
+    /// `{items, count, connections}`.
+    ///
+    /// **Each run IS a single-node dispatch** (`run_single_node_dispatch`)
+    /// of this node, so the capability ceiling, the approval gate, the retry
+    /// budget, the actor's tier / egress / write ceilings, the secrets
+    /// pipeline and the `module_executions` row are the ones every module
+    /// node gets — there is no second job builder here. What differs per run
+    /// is the [`RunVariation`]: the config keys the node binds, written from
+    /// the listing. Each run's output then goes through
+    /// `apply_output_protocols`, the same step a node's output does.
+    ///
+    /// **Which credentials a run can receive.** The reference written into a
+    /// run's config comes from the controller's own listing of the running
+    /// user's connections (`self.user_id`; never node config, never a node's
+    /// input), the secret behind it is read owner-scoped, and the run is
+    /// planned only when the MODULE's `allowed_secrets` admits the path — the
+    /// worker checks that grant again. So a run receives nothing an author
+    /// could not have given the same module by writing the reference into a
+    /// node by hand; what the node removes is the hand-writing.
+    ///
+    /// Failure: one run failing is an error item naming its account. The
+    /// node reports an error — routed through the reactor's failure path —
+    /// only when the listing cannot be read, or connections exist and none
+    /// was read.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_dispatch_for_each_connection(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        execution_id: Uuid,
+        dispatcher: &Arc<dyn NodeDispatcher>,
+        worker_shared_key: &Option<WorkerSharedKey>,
+        results: &HashMap<Uuid, JsonValue>,
+        accumulated_snapshot: Option<Arc<JsonValue>>,
+    ) -> Option<JsonValue> {
+        use crate::engine_dispatch_single::RunVariation;
+        use talos_workflow_engine_core::connections_reader::{
+            for_each_error, for_each_output, plan_connection_runs, FAN_OUT_CONCURRENCY,
+        };
+
+        let (
+            module_id,
+            _,
+            Some(SystemNodeKind::ForEachConnection {
+                provider,
+                bind,
+                max_connections,
+            }),
+        ) = self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        let (provider, bind, max_connections) = (provider.clone(), bind.clone(), *max_connections);
+        let fail = |message: &str| {
+            self.emit_node_lifecycle_events(
+                execution_id,
+                node_id,
+                "Completed",
+                format!("for_each_connection: {message}"),
+            );
+            Some(for_each_error(&provider, message))
+        };
+
+        if module_id.is_none() {
+            return fail("the node has no module to run per connection");
+        }
+        let Some(reader) = self.connections_reader.clone() else {
+            tracing::warn!(%node_id, "for_each_connection: no ConnectionsReader wired");
+            return fail("the connections store is not available in this deployment");
+        };
+        let Some(user_id) = self.user_id else {
+            tracing::warn!(%node_id, "for_each_connection: execution has no resolved user identity");
+            return fail("execution has no tenant identity");
+        };
+
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let listing =
+            match tokio::time::timeout(READ_TIMEOUT, reader.connections(user_id, Some(&provider)))
+                .await
+            {
+                Ok(Ok(listing)) => listing,
+                Ok(Err(e)) => {
+                    tracing::warn!(%node_id, error = %e, "for_each_connection: listing failed");
+                    return fail("the connections read failed");
+                }
+                Err(_) => {
+                    tracing::warn!(%node_id, "for_each_connection: listing timed out");
+                    return fail("the connections read timed out");
+                }
+            };
+
+        // The module's own grant decides which connections are run at all.
+        let module = match self.fetch_module(node_id).await {
+            Ok(module) => module,
+            Err(e) => return fail(&format!("the node's module could not be loaded: {e}")),
+        };
+        let plan = plan_connection_runs(&listing, &provider, &bind, max_connections, |path| {
+            talos_workflow_job_protocol::vault_path_permitted(&module.allowed_secrets, path)
+        });
+
+        let inputs = self.gather_inputs(node_idx, results);
+        let trigger_input = self.extract_trigger_input(results);
+        let degraded_inputs = self.degraded_inputs_report(node_idx, results);
+
+        // Bounded batches, in listing order. Each run owns what it needs, so
+        // the futures borrow nothing but the engine.
+        let mut run_results: Vec<Result<JsonValue, String>> = Vec::with_capacity(plan.runs.len());
+        let mut queue = plan
+            .runs
+            .iter()
+            .enumerate()
+            .map(|(position, run)| RunVariation {
+                config_overlay: run.overlay.clone(),
+                iteration_index: i32::try_from(position).unwrap_or(i32::MAX),
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        loop {
+            let batch: Vec<RunVariation> = queue.by_ref().take(FAN_OUT_CONCURRENCY).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let runs: Vec<_> = batch
+                .into_iter()
+                .map(|variation| {
+                    self.run_one_connection(
+                        node_idx,
+                        node_id,
+                        execution_id,
+                        dispatcher.clone(),
+                        worker_shared_key.clone(),
+                        inputs.clone(),
+                        accumulated_snapshot.clone(),
+                        trigger_input.clone(),
+                        degraded_inputs.clone(),
+                        variation,
+                    )
+                })
+                .collect();
+            run_results.extend(futures::future::join_all(runs).await);
+        }
+
+        let output = for_each_output(&provider, &plan, run_results);
+        let read = output["connections"]["read"].as_u64().unwrap_or(0);
+        self.emit_node_lifecycle_events(
+            execution_id,
+            node_id,
+            "Completed",
+            format!(
+                "for_each_connection: {read} of {} {provider} connection(s) read ({} skipped, {} not run)",
+                plan.listed,
+                plan.skipped.len(),
+                plan.not_run
+            ),
+        );
+        // The runs are each within the node output limit; together they may
+        // not be, and this node's output is the next node's input.
+        if crate::engine_completion::oversized_output_error(&output, self.max_node_output_bytes)
+            .is_some()
+        {
+            return Some(for_each_error(
+                &provider,
+                "the connections' outputs together exceed the node output limit",
+            ));
+        }
+        Some(output)
+    }
+
+    /// One run of a [`SystemNodeKind::ForEachConnection`] node: the per-module
+    /// rate limit, the ordinary single-node dispatch with this run's config,
+    /// then the ordinary output handling. `Err` is this run's failure and
+    /// nothing else's.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_one_connection(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        execution_id: Uuid,
+        dispatcher: Arc<dyn NodeDispatcher>,
+        worker_shared_key: Option<WorkerSharedKey>,
+        inputs: JsonValue,
+        accumulated_snapshot: Option<Arc<JsonValue>>,
+        trigger_input: Option<JsonValue>,
+        degraded_inputs: Option<JsonValue>,
+        variation: crate::engine_dispatch_single::RunVariation,
+    ) -> Result<JsonValue, String> {
+        use talos_workflow_engine_core::reserved_keys::error_reason;
+        // The reactor applies this once per node on the ordinary path; here
+        // it is once per run.
+        if let Some(limited) = self.check_rate_limit(node_id).await {
+            return Err(error_reason(&limited).unwrap_or_else(|| "rate limited".to_string()));
+        }
+        let started = std::time::Instant::now();
+        let (_, outcome) = self
+            .run_single_node_dispatch(
+                node_idx,
+                node_id,
+                execution_id,
+                dispatcher,
+                worker_shared_key,
+                inputs,
+                accumulated_snapshot,
+                trigger_input,
+                degraded_inputs,
+                None,
+                Some(variation),
+            )
+            .await;
+        let mut output = outcome?;
+        // A run's own `__error` envelope is that run's failure, exactly as it
+        // would be a node's.
+        if output_reports_error(&output) {
+            return Err(
+                error_reason(&output).unwrap_or_else(|| "the module reported an error".to_string())
+            );
+        }
+        if let Some(too_large) =
+            crate::engine_completion::oversized_output_error(&output, self.max_node_output_bytes)
+        {
+            return Err(too_large);
+        }
+        self.apply_output_protocols(
+            node_id,
+            execution_id,
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            &mut output,
+        );
+        Ok(output)
+    }
+
     /// [`SystemNodeKind::ActionLinks`] — mint the action links the parent's
     /// output asks for and pass that output on with every placeholder
     /// replaced (see [`talos_workflow_engine_core::action_links`]).

@@ -208,6 +208,20 @@ pub enum SystemNodeKind {
         /// `None` keeps all.
         provider: Option<String>,
     },
+    /// Run THIS node's module once per connection of one service (each
+    /// connected bank, each calendar). Unlike every other kind this sits on a
+    /// MODULE node: the module, its config, its grants and its limits are the
+    /// node's own, and each run goes through the ordinary single-node
+    /// dispatch with a few config keys set for that connection by the
+    /// engine. See [`crate::connections_reader::plan_connection_runs`].
+    ForEachConnection {
+        /// The service whose connections are read (a provider id).
+        provider: String,
+        /// Config key → what of the connection it is set to.
+        bind: std::collections::BTreeMap<String, crate::connections_reader::ConnectionField>,
+        /// Most connections run; the rest are counted in the output.
+        max_connections: u32,
+    },
     /// Synthesize a value from prior outputs, optionally via expression.
     Synthesize {
         /// Optional expression building the synthesized value.

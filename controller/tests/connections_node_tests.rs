@@ -9,8 +9,13 @@
 //! * with no reader wired, or no tenant identity, the node degrades instead
 //!   of failing the run.
 //!
-//! No worker is involved: the node runs in the controller, so the dispatcher
-//! here is never called for it.
+//! No worker is involved in the `connections` node: it runs in the
+//! controller, so the dispatcher here is never called for it.
+//!
+//! The `for_each_connection` node is driven against the same real listing:
+//! what the reader emits is what the engine's planner reads, a bank whose
+//! credential the vault does not hold is skipped, and a second user's run
+//! reads none of the owner's banks.
 //!
 //! `common` harness (a template clone per test), so the migrated-database
 //! job runs it.
@@ -208,4 +213,157 @@ async fn the_node_degrades_without_a_reader_or_an_identity() {
         !no_identity.to_string().contains("item-made-up"),
         "{no_identity}"
     );
+}
+
+/// Stands in for the worker on a `for_each_connection` run: keeps each job
+/// and answers with the bank it was configured for.
+#[derive(Default)]
+struct BankReader {
+    jobs: std::sync::Mutex<Vec<DispatchJob>>,
+}
+
+#[async_trait]
+impl NodeDispatcher for BankReader {
+    async fn dispatch(&self, job: DispatchJob) -> Result<DispatchResult, BoxError> {
+        let bank = job.input_payload["INSTITUTION"].clone();
+        self.jobs.lock().unwrap().push(job);
+        Ok(DispatchResult {
+            output: json!({ "bank": bank }),
+        })
+    }
+
+    async fn dispatch_chain(
+        &self,
+        _request: ChainDispatchRequest,
+    ) -> Result<ChainDispatchResult, BoxError> {
+        Ok(ChainDispatchResult {
+            steps: vec![],
+            final_output: Value::Null,
+            overall_status: StepStatus::Failed,
+        })
+    }
+}
+
+/// Run one module node fanned out over `plaid` as `user`, with the real
+/// reader. Returns the node's result (or the run's error) and the jobs.
+async fn run_for_each(
+    pool: &Pool<Postgres>,
+    secrets: &Arc<SecretsManager>,
+    user: Uuid,
+) -> (Result<Value, String>, Vec<DispatchJob>) {
+    let module = Uuid::new_v4();
+    let graph = WorkflowGraphBuilder::new()
+        .add_raw_node(json!({
+            "id": "banks",
+            "type": module.to_string(),
+            "kind": "for_each_connection",
+            "data": { "for_each_connection": {
+                "provider": "plaid",
+                "bind": { "ACCESS_TOKEN": "vault_reference", "INSTITUTION": "account" },
+            }},
+        }))
+        .build()
+        .expect("graph builds");
+    let mut engine = minimal_engine();
+    engine.set_user_id(user);
+    engine.set_module_fetcher(Arc::new(
+        talos_workflow_engine_test_utils::memory::InMemoryModuleFetcher::new().with_module(
+            module,
+            talos_workflow_engine_core::WasmModuleArtifact {
+                module_id: module,
+                content_hash: "stub".into(),
+                wasm_bytes: vec![],
+                oci_url: None,
+                max_fuel: 1_000_000,
+                capability_world: "http-node".into(),
+                allowed_hosts: vec![],
+                allowed_methods: vec!["POST".into()],
+                allowed_secrets: vec!["plaid/access_token/*".into()],
+                requires_approval_for: vec![],
+                integration_name: None,
+                config: None,
+            },
+        ),
+    ));
+    engine.set_connections_reader(Arc::new(
+        talos_engine::connections_reader::PostgresConnectionsReader::new(
+            pool.clone(),
+            secrets.clone(),
+        ),
+    ));
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph).unwrap())
+        .await
+        .expect("load graph");
+    let node = *engine
+        .node_labels()
+        .iter()
+        .find(|(_, label)| label.as_str() == "banks")
+        .expect("node")
+        .0;
+    let dispatcher = Arc::new(BankReader::default());
+    let result = engine
+        .run_with_trigger_input_transport(dispatcher.clone(), None, json!({}), Uuid::new_v4())
+        .await
+        .map(|ctx| ctx.results.get(&node).cloned().expect("a result"))
+        .map_err(|e| e.to_string());
+    let jobs = dispatcher.jobs.lock().unwrap().clone();
+    (result, jobs)
+}
+
+#[tokio::test]
+async fn the_fan_out_reads_the_real_listing_for_the_running_user_only() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let secrets = ctx.secrets_manager.clone();
+    secrets.initialize().await.expect("active DEK");
+    let owner = create_test_user(&ctx.auth_service, "fanout_owner@example.com").await;
+    let stranger = create_test_user(&ctx.auth_service, "fanout_stranger@example.com").await;
+    connect_bank(&pool, owner, "item-made-up-5", "Fifth Example Bank").await;
+    connect_bank(&pool, owner, "item-made-up-6", "Sixth Example Bank").await;
+    // The vault holds the first bank's credential and not the second's.
+    secrets
+        .create_secret(
+            "Plaid access token (Fifth Example Bank)",
+            "plaid/access_token/item-made-up-5",
+            "made-up-token-value",
+            None,
+            owner,
+            vec![],
+            None,
+        )
+        .await
+        .expect("store a credential");
+
+    let (result, jobs) = run_for_each(&pool, &secrets, owner).await;
+    let out = result.expect("one bank was read");
+    assert_eq!(out["connections"]["listed"], json!(2), "{out}");
+    assert_eq!(out["connections"]["read"], json!(1), "{out}");
+    assert_eq!(
+        out["connections"]["skipped"],
+        json!([{ "account": "Sixth Example Bank", "reason": "not_stored" }])
+    );
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].input_payload["ACCESS_TOKEN"],
+        json!("vault://plaid/access_token/item-made-up-5")
+    );
+    assert_eq!(
+        jobs[0].input_payload["INSTITUTION"],
+        json!("Fifth Example Bank")
+    );
+    // A reference is a name; the value never enters a node's input or output.
+    assert!(!jobs[0]
+        .input_payload
+        .to_string()
+        .contains("made-up-token-value"));
+    assert!(!out.to_string().contains("made-up-token-value"), "{out}");
+
+    // The same graph as another user: nothing of the owner's is listed, run
+    // or named.
+    let (result, jobs) = run_for_each(&pool, &secrets, stranger).await;
+    let other = result.expect("an empty read is not a failure");
+    assert_eq!(other["connections"]["listed"], json!(0), "{other}");
+    assert!(jobs.is_empty());
+    assert!(!other.to_string().contains("Example Bank"), "{other}");
 }
