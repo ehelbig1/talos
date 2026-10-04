@@ -1347,6 +1347,39 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "add_connections_node",
+            "description": "Add a connections node to an existing workflow. Controller-side system node: reads which services the workflow's owner has connected (bank items, mail accounts, calendars) and emits {available, count, truncated, stored_checked, connections: [{service, name, account, connected_at, vault_reference, allowed_secrets, stored, module_readable}]} as node output — the same listing list_connections returns. Use it so a workflow can say what is connected, for example a summary that reports a connected bank no node reads. It emits each credential's vault:// REFERENCE, never a credential, and a reference arriving in a node's input is NOT resolved at dispatch: a module can use a credential only when the reference is in its own node's configuration and its allowed_secrets grant covers the path. No worker dispatch, tenancy from the execution's resolved identity. Degrades to {available: false} instead of failing the workflow when the store is unreachable.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "UUID of the workflow to add the node to"
+                    },
+                    "node_id": {
+                        "type": "string",
+                        "description": "Unique string ID for the new node"
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": "Keep one service's connections: a service id as list_connections reports it (for example 'plaid'). Omit for all."
+                    },
+                    "connect_from": {
+                        "description": "Node ID(s) to wire INTO this node (usually the trigger).",
+                        "oneOf": [
+                            { "type": "string" },
+                            { "type": "array", "items": { "type": "string" } }
+                        ]
+                    },
+                    "connect_to": {
+                        "type": "string",
+                        "description": "Optional: ID of an existing node to connect this node TO (e.g. a collect or compose node)."
+                    }
+                },
+                "required": ["workflow_id", "node_id"]
+            }
+        }),
+        serde_json::json!({
             "name": "add_action_links_node",
             "description": "Add an action-links node to an existing workflow, between the node that composes a message and the node that sends it. Controller-side system node: it turns the links a module ASKS for into real ones. The compose module returns its output with `__action_links__: [{id, target, label, payload, fallback?}]` and writes `talos-action:<id>` wherever a link belongs (an href); this node mints one link per request and passes the output on with every placeholder replaced, the request removed, and `__action_links_report__: {available, requested, minted, not_minted: [{id, reason, fell_back}]}` added. A link opens a confirmation page naming the workflow and the label; when its owner confirms, the TARGET workflow starts once with `payload` as its trigger input. WHAT A LINK MAY START is decided here, not by the module: `targets` maps a short name to a workflow you own, and a request naming anything else is refused (`unknown_target`). Links are single-use, expire (`ttl_hours`, default 72, max 336), and are stored only as a hash. If a link cannot be minted its placeholder becomes the request's `fallback` (a mailto: or https: link) or `#`, so the message still sends. The target workflow starts through the same gates as trigger_workflow (pause, liveness, its actor's budget and ceilings, input schema, concurrency limit).",
             "inputSchema": {
@@ -2000,6 +2033,9 @@ pub async fn dispatch(
         }
         "add_pending_approvals_node" => {
             Some(handle_add_pending_approvals_node(req_id, args, state, agent).await)
+        }
+        "add_connections_node" => {
+            Some(handle_add_connections_node(req_id, args, state, agent).await)
         }
         "add_action_links_node" => {
             Some(handle_add_action_links_node(req_id, args, state, agent).await)
@@ -3762,6 +3798,76 @@ async fn handle_add_pending_approvals_node(
             "downstream": connect_to,
             "message": format!(
                 "Pending-approvals node '{}' added to workflow {}. Emits {{available, count, approvals: [{{execution_id, workflow_id, workflow_name, node_id, requested_at, waiting_seconds, required_for, approve_url, reject_url}}]}} for downstream notify-after-pause compose nodes.{}",
+                added.node_id, added.workflow_id, added.auto_publish_note
+            ),
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+// ── add_connections_node ─────────────────────────────────────────────────────
+
+/// Read the optional `provider` argument: absent means every service; a
+/// value must be a service the provider registry knows. Refusing an unknown
+/// one here matters because the graph parser reads an unusable value as "no
+/// filter" — a typo would otherwise widen the listing instead of failing.
+fn parse_connections_provider(args: &serde_json::Value) -> Result<Option<String>, String> {
+    let Some(value) = args.get("provider").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let Some(provider) = value.as_str() else {
+        return Err("'provider' must be a string".to_string());
+    };
+    if talos_integrations::provider_config::PROVIDERS
+        .iter()
+        .any(|p| p.id == provider)
+    {
+        return Ok(Some(provider.to_string()));
+    }
+    let known: Vec<&str> = talos_integrations::provider_config::PROVIDERS
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    Err(format!(
+        "'provider' is not a known service. Known: {}",
+        known.join(", ")
+    ))
+}
+
+async fn handle_add_connections_node(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    agent: Arc<auth::AgentIdentity>,
+) -> JsonRpcResponse {
+    let provider = match parse_connections_provider(args) {
+        Ok(p) => p,
+        Err(why) => return mcp_error(req_id, -32602, &why),
+    };
+    let connect_to = args
+        .get("connect_to")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let data = match provider.as_ref() {
+        Some(p) => serde_json::json!({ "provider": p }),
+        None => serde_json::json!({}),
+    };
+
+    let added = match upsert_system_node(&req_id, args, state, &agent, "connections", data).await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "workflow_id": added.workflow_id.to_string(),
+            "node_id": added.node_id,
+            "node_type": "connections",
+            "provider": provider,
+            "downstream": connect_to,
+            "message": format!(
+                "Connections node '{}' added to workflow {}. Emits {{available, count, truncated, stored_checked, connections: [{{service, name, account, connected_at, vault_reference, allowed_secrets, stored, module_readable}}]}}. The references are strings: a module can use a credential only when its own node configuration names the reference.{}",
                 added.node_id, added.workflow_id, added.auto_publish_note
             ),
         }))
@@ -7428,6 +7534,7 @@ mod fan_in_posture_tests {
             "operator_digest",
             "ops_alerts_digest",
             "pending_approvals",
+            "connections",
         ] {
             assert!(
                 !kind_is_edge_driven(kind, &json!({"days": 7})),
@@ -7470,6 +7577,36 @@ mod fan_in_posture_tests {
             "action_links",
         ] {
             assert!(!kind_is_edge_driven(kind, &json!({})), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_connections_provider_is_a_known_service_or_refused() {
+        use super::parse_connections_provider;
+        assert_eq!(parse_connections_provider(&json!({})), Ok(None));
+        assert_eq!(
+            parse_connections_provider(&json!({ "provider": null })),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_connections_provider(&json!({ "provider": "plaid" })),
+            Ok(Some("plaid".to_string()))
+        );
+        // The graph parser reads an unusable provider as "no filter", so a
+        // misspelling has to be refused here or it widens the listing.
+        for bad in [json!("plad"), json!(""), json!("PLAID"), json!(7)] {
+            assert!(
+                parse_connections_provider(&json!({ "provider": bad })).is_err(),
+                "{bad}"
+            );
+        }
+        // Every registry id survives the parser's own shape rule.
+        for p in talos_integrations::provider_config::PROVIDERS {
+            assert!(
+                talos_workflow_engine_core::connections_reader::provider_id_usable(p.id),
+                "{} would be read as no filter by the graph parser",
+                p.id
+            );
         }
     }
 

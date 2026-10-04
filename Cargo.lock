@@ -8082,6 +8082,7 @@ dependencies = [
  "talos-execution-repository",
  "talos-failure-analysis-service",
  "talos-http-utils",
+ "talos-integrations",
  "talos-measurement",
  "talos-memory",
  "talos-metrics",
@@ -8726,7 +8727,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "talos-oauth",
+ "talos-plaid",
  "talos-secrets-manager",
+ "talos-workflow-job-protocol",
  "tracing",
  "uuid",
 ]

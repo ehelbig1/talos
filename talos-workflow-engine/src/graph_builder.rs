@@ -541,6 +541,13 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
         SystemNodeKind::PendingApprovals { limit } => {
             ("pending_approvals", json!({ "limit": limit }))
         }
+        SystemNodeKind::Connections { provider } => (
+            "connections",
+            match provider {
+                Some(provider) => json!({ "provider": provider }),
+                None => json!({}),
+            },
+        ),
         SystemNodeKind::ActionLinks { targets, ttl_hours } => {
             let targets: serde_json::Map<String, serde_json::Value> = targets
                 .iter()
@@ -1401,6 +1408,38 @@ mod tests {
                 ttl_hours: Some(336),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn system_node_connections_round_trips_and_an_unusable_provider_is_no_filter() {
+        for kind in [
+            SystemNodeKind::Connections {
+                provider: Some("google-calendar".to_string()),
+            },
+            SystemNodeKind::Connections { provider: None },
+        ] {
+            assert_eq!(round_trip_kind("conns", kind.clone()).await, kind);
+        }
+        // A hand-written graph: a value that is not a service id is read as
+        // "no filter", never carried into the node as written.
+        for bad in [
+            serde_json::json!("Plaid"),
+            serde_json::json!("plaid' OR 1=1"),
+            serde_json::json!(""),
+            serde_json::json!(7),
+            serde_json::json!("x".repeat(41)),
+        ] {
+            let hand_written = serde_json::json!({
+                "id": "conns",
+                "type": "system:connections",
+                "kind": "connections",
+                "data": { "provider": bad },
+            });
+            assert_eq!(
+                crate::graph_parser::parse_system_node_kind("connections", &hand_written),
+                Some(SystemNodeKind::Connections { provider: None }),
+            );
+        }
     }
 
     #[tokio::test]

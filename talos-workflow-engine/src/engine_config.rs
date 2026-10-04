@@ -461,6 +461,16 @@ impl ParallelWorkflowEngine {
         self.action_link_minter = Some(minter);
     }
 
+    /// Inject the connections read port (powers the `connections` system
+    /// node). Wired by the controller engine builder; absent in out-of-tree
+    /// consumers, where the node degrades to an unavailable-envelope output.
+    pub fn set_connections_reader(
+        &mut self,
+        reader: Arc<dyn talos_workflow_engine_core::ConnectionsReader>,
+    ) {
+        self.connections_reader = Some(reader);
+    }
+
     /// Inject the assistant-report read port (powers the
     /// `assistant_report` system node). Wired by the controller engine
     /// builder; absent in out-of-tree consumers, where the node degrades

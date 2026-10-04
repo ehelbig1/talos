@@ -88,6 +88,7 @@ Unknown top-level keys are ignored.
   //   "collect"       | "synthesize"      | "verify"         |
   //   "dispatch"      | "capability_dispatch" | "ops_alerts_digest"
   //   "pending_approvals" | "assistant_report" | "action_links"
+  //   "connections"
   //
   // LLM-flavored kinds (gated by the `llm-primitives` feature, on by
   // default):
@@ -354,6 +355,29 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 // entry rather than dropping it; an unreachable store emits
 // { available: false } instead of failing the workflow.
 { "limit": 10 }   // pending approvals included verbatim (1-25, default 10)
+```
+
+### `connections`
+```jsonc
+// Controller-side read of the services the workflow's owner has
+// connected (bank items, mail accounts, calendars). Emits
+// { available, count, truncated, stored_checked, connections: [
+//   {service, name, account, connected_at, vault_reference,
+//    allowed_secrets, stored, module_readable} ] } as the node output —
+// the listing the list_connections tool returns. A workflow uses it to
+// say what is connected, e.g. a summary reporting a connected bank that
+// no node reads.
+//
+// The output carries each credential's vault:// REFERENCE, never a
+// credential, and a reference arriving in a node's INPUT is not resolved
+// at dispatch: the engine ships a secret only for a reference in the
+// node's own configuration, under that module's allowed_secrets grant.
+//
+// Executes in the controller (no worker dispatch); tenancy comes from
+// the execution's resolved identity, never from this data object. An
+// unreachable store emits { available: false } instead of failing the
+// workflow. An unusable `provider` is read as "no filter".
+{ "provider": "plaid" }   // optional: one service id; omit for all
 ```
 
 ### `action_links`

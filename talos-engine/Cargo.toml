@@ -55,6 +55,7 @@ talos-child-run-ledger = { path = "../talos-child-run-ledger" }
 talos-compilation = { path = "../talos-compilation" }
 talos-module-executions = { path = "../talos-module-executions" }
 talos-module-payload-encryption = { path = "../talos-module-payload-encryption" }
+talos-integrations = { path = "../talos-integrations" }
 talos-oauth = { path = "../talos-oauth" }
 talos-registry = { path = "../talos-registry" }
 talos-retry-intelligence = { path = "../talos-retry-intelligence" }

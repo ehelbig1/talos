@@ -254,143 +254,37 @@ async fn handle_list_secret_namespaces(
     }
 }
 
-/// Where one connection's credential is stored, from the builders that store
-/// it: `talos_plaid::link::access_token_path` for a bank item,
-/// `talos_oauth::access_token_vault_path` under the provider namespace the
-/// row's tier selects (`revoke_provider_for`) for everything else.
-///
-/// # Errors
-/// When the row cannot name a credential: no provider key, a tier this build
-/// does not know, or an item id the path builder refuses.
-pub(crate) fn connection_token_path(
-    provider: &talos_integrations::provider_config::IntegrationProviderConfig,
-    user_id: Uuid,
-    provider_key: Option<&str>,
-    tier: Option<&str>,
-) -> Result<String, String> {
-    let key = provider_key
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| "this connection records no credential key".to_string())?;
-    if provider.id == talos_integrations::provider_config::PLAID_PROVIDER_ID {
-        return talos_plaid::link::access_token_path(key);
-    }
-    let namespace = talos_integrations::provider_config::revoke_provider_for(provider, tier)
-        .ok_or_else(|| "this connection's access tier is not recognised".to_string())?;
-    Ok(talos_oauth::credentials::access_token_vault_path(
-        &namespace, user_id, key,
-    ))
-}
-
-/// One connection as `list_connections` renders it. `stored` is the set of
-/// paths found in the vault, or `None` when that read failed — rendered as
-/// `null`, never as `false`.
-pub(crate) fn rendered_connection(
-    row: &talos_integrations::store::ConnectionRow,
-    user_id: Uuid,
-    stored: Option<&std::collections::HashSet<String>>,
-) -> serde_json::Value {
-    use talos_integrations::provider_config::{PLAID_PROVIDER_ID, PROVIDERS};
-    let provider = PROVIDERS.iter().find(|p| p.id == row.provider_id);
-    let mut out = serde_json::json!({
-        "service": row.provider_id,
-        "name": provider.map_or(row.provider_id.as_str(), |p| p.display_name),
-        "account": row.identifier,
-        "connected_at": row.created_at.to_rfc3339(),
-    });
-    let path = provider
-        .ok_or_else(|| "this service is not in the provider registry".to_string())
-        .and_then(|p| {
-            connection_token_path(p, user_id, row.provider_key.as_deref(), row.tier.as_deref())
-        });
-    let path = match path {
-        Ok(path) => path,
-        Err(why) => {
-            out["vault_reference"] = Value::Null;
-            out["note"] = Value::String(format!("No reference: {why}."));
-            return out;
-        }
-    };
-    out["stored"] = stored.map_or(Value::Null, |s| Value::Bool(s.contains(&path)));
-    // Host-reserved credentials (the full Google Cloud consent) are used by
-    // the controller only; the worker refuses them to every module.
-    if talos_workflow_job_protocol::is_controller_internal_vault_path(&path) {
-        out["module_readable"] = Value::Bool(false);
-        out["vault_reference"] = Value::Null;
-        out["note"] = Value::String(
-            "This credential is used by the controller only; no module can read it.".to_string(),
-        );
-        return out;
-    }
-    out["module_readable"] = Value::Bool(true);
-    out["vault_reference"] = Value::String(format!("vault://{path}"));
-    let mut grant = vec![path];
-    if row.provider_id == PLAID_PROVIDER_ID {
-        // A Plaid request carries the application's own two credentials in
-        // its JSON body beside the item's token.
-        let app = [
-            talos_plaid::link::PLAID_CLIENT_ID_PATH,
-            talos_plaid::link::PLAID_SECRET_PATH,
-        ];
-        out["also_required"] = serde_json::json!(app.map(|p| format!("vault://{p}")));
-        grant.extend(app.map(str::to_string));
-    }
-    out["allowed_secrets"] = serde_json::json!(grant);
-    out
-}
+// How a connection's credential path and rendering are derived has one home:
+// `talos_integrations::connections` (also read by the `connections` system node).
+#[cfg(test)]
+use talos_integrations::connections::{connection_token_path, rendered_connection};
 
 async fn handle_list_connections(
     req_id: Option<serde_json::Value>,
     state: &McpState,
     user_id: Uuid,
 ) -> JsonRpcResponse {
-    let rows = match talos_integrations::store::list_user_connections(&state.db_pool, user_id).await
+    // One listing for every caller: this tool and the `connections` system
+    // node read the same rows and render them the same way.
+    let listed = match talos_integrations::connections::list_rendered(
+        &state.db_pool,
+        &state.secrets_manager,
+        user_id,
+        None,
+    )
+    .await
     {
-        Ok(rows) => rows,
+        Ok(listed) => listed,
         Err(e) => {
             tracing::error!("list_connections query failed: {:#}", e);
             return mcp_error(req_id, -32000, "Failed to list connections");
         }
     };
-    // One batched existence read for every path. A failure leaves `stored`
-    // unknown (null) on every row rather than claiming nothing is stored.
-    let paths: Vec<String> = rows
-        .iter()
-        .filter_map(|row| {
-            let provider = talos_integrations::provider_config::PROVIDERS
-                .iter()
-                .find(|p| p.id == row.provider_id)?;
-            connection_token_path(
-                provider,
-                user_id,
-                row.provider_key.as_deref(),
-                row.tier.as_deref(),
-            )
-            .ok()
-        })
-        .collect();
-    let stored = match state
-        .secrets_manager
-        .existing_secret_key_paths(&paths, user_id)
-        .await
-    {
-        Ok(found) => Some(found),
-        Err(e) => {
-            // The paths name accounts; the error is logged without them.
-            tracing::warn!(error = %e, "list_connections: the vault existence read failed");
-            None
-        }
-    };
-    let connections: Vec<Value> = rows
-        .iter()
-        .map(|row| rendered_connection(row, user_id, stored.as_ref()))
-        .collect();
-    let truncated = i64::try_from(rows.len())
-        .is_ok_and(|n| n >= talos_integrations::store::MAX_LISTED_CONNECTIONS);
     let envelope = serde_json::json!({
-        "count": connections.len(),
-        "truncated": truncated,
-        "stored_checked": stored.is_some(),
-        "connections": connections,
+        "count": listed.connections.len(),
+        "truncated": listed.truncated,
+        "stored_checked": listed.stored_checked,
+        "connections": listed.connections,
         "usage": "Put vault_reference in the node's config where the module expects the \
                   credential (a header value or a JSON body field) and grant the module the \
                   paths in allowed_secrets (update_module_secrets). The value is resolved by \

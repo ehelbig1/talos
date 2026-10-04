@@ -152,6 +152,14 @@ pub(super) fn build_controller_engine(
     engine.set_module_execution_store(Arc::new(
         PostgresModuleExecutionStore::new(pool.clone()).with_encryption(secrets_manager.clone()),
     ));
+    // Wired here, not with the other readers: it asks the vault which
+    // credentials are stored, and this is the layer that holds the manager.
+    engine.set_connections_reader(Arc::new(
+        crate::connections_reader::PostgresConnectionsReader::new(
+            pool.clone(),
+            secrets_manager.clone(),
+        ),
+    ));
     maybe_enable_checkpointing(&mut engine, pool, secrets_manager);
     engine
 }
