@@ -2584,7 +2584,7 @@ impl ParallelWorkflowEngine {
         // loop body. Pre-fix every iteration re-ran:
         //   1. `fetch_module(body_uuid)` — 1 SELECT against `modules`
         //      (no in-process cache).
-        //   2. `build_dispatch_secrets(body_module_id, exec, key)` —
+        //   2. `build_dispatch_secrets(body node, body module, …)` —
         //      1 SELECT against `secrets` + per-row AES decrypt +
         //      LLM-keys resolve + AES encrypt of the result.
         // For a 100-iteration loop that's ~300 extra DB round-trips
@@ -2628,8 +2628,17 @@ impl ParallelWorkflowEngine {
         // clone per iteration. Using the shared helper means loop bodies seal
         // exactly like single-node dispatches, so they don't fail the worker
         // downgrade guard under `TALOS_ENVELOPE_SEALING=required`.
+        let body_grant: &[String] = cached_wasm_module
+            .as_ref()
+            .map_or(&[], |m| m.allowed_secrets.as_slice());
         let cached_dispatch_secrets = self
-            .build_dispatch_secrets(body_module_id, execution_id, worker_shared_key)
+            .build_dispatch_secrets(
+                body_uuid,
+                body_module_id,
+                body_grant,
+                execution_id,
+                worker_shared_key,
+            )
             .await;
 
         // Canonical `modules.id` for the per-iteration `module_executions`

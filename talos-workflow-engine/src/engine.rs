@@ -1429,6 +1429,8 @@ impl ParallelWorkflowEngine {
     pub(crate) async fn build_dispatch_secrets(
         &self,
         node_id: Uuid,
+        module_id: Uuid,
+        allowed_secrets: &[String],
         execution_id: Uuid,
         worker_shared_key: &Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> crate::secrets_pipeline::DispatchSecrets {
@@ -1436,6 +1438,11 @@ impl ParallelWorkflowEngine {
         else {
             return crate::secrets_pipeline::DispatchSecrets::default();
         };
+        // Two different ids, and each lookup needs its own. A node's config
+        // is keyed by the NODE; a module's secrets are keyed by the MODULE.
+        // Until 2026-10-04 this took one id and the loop passed the module's,
+        // so the config lookup missed and a loop body's `vault://` references
+        // were never fetched.
         let vault_paths = self
             .node_configs
             .get(&node_id)
@@ -1444,10 +1451,12 @@ impl ParallelWorkflowEngine {
         crate::secrets_pipeline::build_dispatch_secrets_for(
             resolver.as_ref(),
             self.secret_envelope.as_ref(),
-            node_id,
+            module_id,
             self.user_id,
             &vault_paths,
-            &[],
+            // The module's grant, as the single-node path passes it: an
+            // exact-path entry is delivered on the grant alone.
+            allowed_secrets,
             key.as_bytes(),
             self.max_llm_tier,
             execution_id.as_bytes(),
