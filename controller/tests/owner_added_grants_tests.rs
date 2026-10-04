@@ -13,11 +13,20 @@
 //! and unit-tested where it lives (`talos-mcp-handlers`, `grants_for_install`);
 //! here the matcher is a plain "not already held".
 //!
+//! The record is also READ back (2026-10-04): `get_module_info` shows the
+//! three lists beside the grants they describe. Those tests go through the
+//! real tool, so they cover the handler's call site and its ownership scope,
+//! not only the repository read.
+//!
 //! `common` harness (a template clone per test), so the migrated-database
 //! job runs it.
 
+#[path = "common/mod.rs"]
 mod common;
+#[path = "common/mcp.rs"]
+mod mcp_common;
 
+use mcp_common::{agent, error_message, mcp_state, text_json};
 use serde_json::json;
 use sqlx::{Pool, Postgres};
 use talos_module_repository::{ModuleRepository, OwnerAddedGrants};
@@ -251,4 +260,130 @@ async fn a_record_that_names_an_entry_outside_its_list_is_refused() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// Call `get_module_info` through the real tool, as `who`.
+async fn module_info(
+    state: &controller::mcp::McpState,
+    module: Uuid,
+    who: Uuid,
+) -> controller::mcp::types::JsonRpcResponse {
+    controller::mcp::modules::dispatch(
+        "get_module_info",
+        Some(json!(1)),
+        &json!({ "module_id": module.to_string() }),
+        state,
+        agent(who),
+    )
+    .await
+    .expect("get_module_info is dispatched")
+}
+
+/// The record is visible where the grants are read (2026-10-04). Until then
+/// it appeared only in the reply of the three update tools and in a
+/// reinstall's `grants_kept_as_owner_added`, so nothing let an owner look at
+/// a module and see which of its grants a reinstall would keep.
+#[tokio::test]
+async fn module_info_shows_which_grants_the_owner_added() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let state = mcp_state(pool.clone()).await;
+    let repo = ModuleRepository::new(pool.clone());
+    let owner = seed_user(&pool).await;
+    let stranger = seed_user(&pool).await;
+
+    let module = install(&repo, owner, &[], &[], &OwnerAddedGrants::default())
+        .await
+        .expect("first install");
+    repo.update_module_allowed_hosts(module, owner, &v(&["home.example.test"]), &beyond)
+        .await
+        .unwrap()
+        .expect("the owner's module");
+    repo.update_module_allowed_secrets(module, owner, &v(&["svc/token"]), &beyond)
+        .await
+        .unwrap()
+        .expect("the owner's module");
+
+    // The repository read carries the record the writers stored.
+    let stored = repo
+        .get_user_module_grants(owner, NAME)
+        .await
+        .unwrap()
+        .unwrap();
+    let read = repo
+        .get_wasm_module_info(module, owner)
+        .await
+        .unwrap()
+        .expect("the owner reads their module");
+    assert_eq!(read.owner_added, stored.owner_added);
+
+    // The tool shows each list with the grant it describes, and the legend.
+    let body = text_json(&module_info(&state, module, owner).await);
+    assert_eq!(body["allowed_hosts"], json!(["home.example.test"]));
+    assert_eq!(body["owner_added_hosts"], json!(["home.example.test"]));
+    assert_eq!(body["allowed_secrets"], json!(["svc/token"]));
+    assert_eq!(body["owner_added_secrets"], json!(["svc/token"]));
+    // POST came with the install, so it is in the grant and not in the record.
+    assert_eq!(body["allowed_methods"], json!(["POST"]));
+    assert_eq!(body["owner_added_methods"], json!([]));
+    let note = body["owner_added_note"].as_str().expect("the legend");
+    assert!(
+        note.contains("a catalog reinstall keeps such an entry"),
+        "{note}"
+    );
+
+    // Someone else reads neither the module nor its record.
+    assert!(repo
+        .get_wasm_module_info(module, stranger)
+        .await
+        .unwrap()
+        .is_none());
+    let refused = module_info(&state, module, stranger).await;
+    let message = error_message(&refused);
+    assert!(message.contains("not found or access denied"), "{message}");
+    assert!(!message.contains("home.example.test"), "{message}");
+}
+
+/// A copy granted before the record existed holds grants and an empty
+/// record, and a shared catalog row never has one. Both read as three empty
+/// lists — present, not omitted: for the copy that is the answer that says a
+/// reinstall keeps its grants only as far as the template grants them.
+#[tokio::test]
+async fn nothing_recorded_reads_as_three_empty_lists() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let state = mcp_state(pool.clone()).await;
+    let repo = ModuleRepository::new(pool.clone());
+    let owner = seed_user(&pool).await;
+
+    let legacy = install(
+        &repo,
+        owner,
+        &["api.example.test"],
+        &["svc/token"],
+        &OwnerAddedGrants::default(),
+    )
+    .await
+    .expect("a copy with grants and no record");
+    let shared: Uuid = sqlx::query_scalar(
+        "INSERT INTO modules (name, kind, user_id, capability_world, category, \
+                              allowed_hosts, source_code, wasm_bytes) \
+         VALUES ('Shared: Example', 'catalog', NULL, 'http-node', 'test', \
+                 ARRAY['api.example.test'], 'fn run() {}', '\\x00'::bytea) \
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed a shared catalog row");
+
+    for module in [legacy, shared] {
+        let body = text_json(&module_info(&state, module, owner).await);
+        assert_eq!(body["allowed_hosts"], json!(["api.example.test"]), "{body}");
+        for key in [
+            "owner_added_hosts",
+            "owner_added_methods",
+            "owner_added_secrets",
+        ] {
+            assert_eq!(body[key], json!([]), "{key} of {module}: {body}");
+        }
+        assert!(body["owner_added_note"].is_string(), "{body}");
+    }
 }
