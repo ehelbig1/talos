@@ -120,6 +120,8 @@ services:
   # for its GNU coreutils (tar/sha256sum/find) — already pulled, no Vault
   # tooling involved.
   vault-backup:
+    # Opt-in since 2026-10-05: see the controller's depends_on.
+    profiles: ["vault"]
     restart: unless-stopped
     image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
     container_name: talos-vault-backup
@@ -307,6 +309,8 @@ services:
   #   - Non-root token issued via a transit-only policy
   #   - TLS termination
   vault:
+    # Opt-in since 2026-10-05: see the controller's depends_on.
+    profiles: ["vault"]
     image: hashicorp/vault:1.18@sha256:750bb37c1638fa194ab37053a81618c61bb0491ddec6fccac87c07a8e6cd8166
     container_name: talos-vault
     cap_add:
@@ -341,6 +345,8 @@ services:
   # unseal key + root token; in production these would live in distinct
   # operator-held safes, not on the Vault data volume.
   vault-init:
+    # Opt-in since 2026-10-05: see the controller's depends_on.
+    profiles: ["vault"]
     image: hashicorp/vault:1.18@sha256:750bb37c1638fa194ab37053a81618c61bb0491ddec6fccac87c07a8e6cd8166
     container_name: talos-vault-init
     depends_on:
@@ -930,12 +936,19 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_healthy
-      # Vault becomes a hard dependency only when KEK_PROVIDER=vault, but
-      # listing it unconditionally is harmless: in dev compose Vault always
-      # comes up. Production deployments use a real (external) Vault and
-      # remove this stanza.
+      # Vault is OPT-IN in the dev stack (2026-10-05). Its only job in Talos is
+      # to wrap the root encryption key when KEK_PROVIDER=vault; this file
+      # defaults KEK_PROVIDER to env, and with env nothing in Talos calls
+      # Vault. Until then `make up` started vault, vault-init and
+      # vault-backup on every machine anyway. They now carry
+      # `profiles: ["vault"]`; to use Vault, set KEK_PROVIDER=vault and
+      # COMPOSE_PROFILES=vault in .env. `required: false` lets the controller
+      # start when the profile is off; with it on, the wait for vault-init
+      # applies as before. Production (helm) uses a real Vault and does not
+      # read this file.
       vault-init:
         condition: service_completed_successfully
+        required: false
     networks:
       - talos-network
     restart: unless-stopped
