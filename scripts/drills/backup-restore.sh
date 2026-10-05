@@ -247,6 +247,24 @@ die()  {
     exit 1
 }
 
+# A file's mtime as epoch seconds, or nothing. GNU first: on Linux
+# `stat -f` is the FILESYSTEM report and succeeds with text, so trying the
+# BSD form first returned "  File: …" there instead of a number. The result
+# is checked to be digits either way, because the caller does arithmetic.
+file_mtime() {
+    local m
+    m="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true)"
+    [[ "$m" =~ ^[0-9]+$ ]] && printf '%s' "$m"
+    return 0
+}
+
+# Epoch seconds as a UTC timestamp, or "?". BSD `date -r` takes seconds;
+# GNU `date -r` takes a FILE, so GNU gets `-d @…`.
+epoch_utc() {
+    [[ -n "$1" ]] || { printf '?'; return 0; }
+    date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ 2>/dev/null || printf '?'
+}
+
 # The result also goes to Talos as an ops alert, after the metric — see
 # scripts/lib/drill-ops-alert.sh (best effort: it cannot change the metric or
 # the exit status).
@@ -1126,14 +1144,14 @@ if [[ "$SOURCE_MODE" == "artifact" ]]; then
     # --source live path below produces vault/file/... instead. Recorded here
     # so step 5 extracts each into the right place.
     VAULT_TAR_ROOT="contents"
-    # mtime, portably: BSD `stat -f %m`, GNU `stat -c %Y`. A stale artifact
-    # date is the first thing to look at when a drill result is surprising.
-    PG_ARTIFACT_MTIME="$(stat -f %m "$PG_ARTIFACT" 2>/dev/null || stat -c %Y "$PG_ARTIFACT" 2>/dev/null || echo '')"
-    PG_ARTIFACT_AGE="$([[ -n "$PG_ARTIFACT_MTIME" ]] && date -u -r "$PG_ARTIFACT_MTIME" +%FT%TZ 2>/dev/null || echo '?')"
+    # mtime via file_mtime (portable). A stale artifact date is the first
+    # thing to look at when a drill result is surprising.
+    PG_ARTIFACT_MTIME="$(file_mtime "$PG_ARTIFACT")"
+    PG_ARTIFACT_AGE="$(epoch_utc "$PG_ARTIFACT_MTIME")"
     ok "postgres artifact: $(basename "$PG_ARTIFACT") ($(wc -c < "$WORK_DIR/pg.dump") bytes, taken $PG_ARTIFACT_AGE)"
     if [[ "$DRILL_VAULT" == "on" ]]; then
-    VAULT_ARTIFACT_MTIME="$(stat -f %m "$VAULT_ARTIFACT" 2>/dev/null || stat -c %Y "$VAULT_ARTIFACT" 2>/dev/null || echo '')"
-    VAULT_ARTIFACT_AGE="$([[ -n "$VAULT_ARTIFACT_MTIME" ]] && date -u -r "$VAULT_ARTIFACT_MTIME" +%FT%TZ 2>/dev/null || echo '?')"
+    VAULT_ARTIFACT_MTIME="$(file_mtime "$VAULT_ARTIFACT")"
+    VAULT_ARTIFACT_AGE="$(epoch_utc "$VAULT_ARTIFACT_MTIME")"
     ok "vault artifact:    $(basename "$VAULT_ARTIFACT") ($(wc -c < "$WORK_DIR/vault.tgz") bytes, taken $VAULT_ARTIFACT_AGE)"
     fi
 
@@ -1252,8 +1270,8 @@ if [[ "$SOURCE_MODE" == "artifact" ]]; then
             # as such rather than restoring it and calling that a pass.
             warn "no manifest beside $NEO4J_ARTIFACT — integrity unverified AND no counts to assert"
         fi
-        NEO4J_ARTIFACT_MTIME="$(stat -f %m "$NEO4J_ARTIFACT" 2>/dev/null || stat -c %Y "$NEO4J_ARTIFACT" 2>/dev/null || echo '')"
-        NEO4J_ARTIFACT_AGE="$([[ -n "$NEO4J_ARTIFACT_MTIME" ]] && date -u -r "$NEO4J_ARTIFACT_MTIME" +%FT%TZ 2>/dev/null || echo '?')"
+        NEO4J_ARTIFACT_MTIME="$(file_mtime "$NEO4J_ARTIFACT")"
+        NEO4J_ARTIFACT_AGE="$(epoch_utc "$NEO4J_ARTIFACT_MTIME")"
         ok "neo4j artifact:    $(basename "$NEO4J_ARTIFACT") ($(wc -c < "$NEO4J_ARTIFACT" | tr -d ' ') bytes, taken $NEO4J_ARTIFACT_AGE)"
         # Same gate, same knob, same reason as the other two: an artifact that
         # stopped being written must not keep going green off the last good file.

@@ -58,6 +58,10 @@ drill() {
 echo "KEK_PROVIDER=env (the default): Vault is not drilled"
 drill
 check "says Vault is not drilled"                yes "$OUT" "Vault is not drilled: KEK_PROVIDER=env"
+# GNU and BSD `stat`/`date` differ; a wrong one left the date unread ("?") or
+# killed the age check outright on Linux.
+check "reads the artifact's date"                no  "$OUT" "taken ?"
+check "reads the artifact's age"                 yes "$OUT" "is 0h old"
 check "does not ask for a Vault backup"          no  "$OUT" "no vault-*.tar.gz"
 check "gets past Vault to the next artifact"     yes "$OUT" "no neo4j-*.tar.gz"
 check "writes no vault kind line"                no  "$(cat "$T/metrics"/*.prom 2>/dev/null || true)" 'kind="vault"'

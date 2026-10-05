@@ -149,3 +149,13 @@ without a graph. `scripts/tests/drill-vault-gate-test.sh` runs the real drill
 with a fake docker and an empty backup folder through all five cases; making
 `auto` always drill Vault fails three of its checks.
 
+
+**Found by that test in CI: the drill could not read a file date on Linux.**
+It tried BSD `stat -f %m` first; on Linux that is the filesystem report and
+succeeds with text, so the artifact "mtime" was `  File: …` and the age check
+died on `File: unbound variable`. `date -u -r <seconds>` was BSD-only too
+(GNU reads a file there), so dates printed `?`. Pre-existing — the drill has
+only ever run on macOS — and fixed with `file_mtime` (GNU form first, digits
+only) and `epoch_utc` (`-r`, then `-d @`), used at all three artifact sites.
+The test now also checks that the date and age are read; it passes on macOS
+and in a `python:3.12-slim` container, and failed there before the fix.
