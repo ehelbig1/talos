@@ -1,8 +1,9 @@
 # Recorded run
 
-Made-up data with the shape and size of a real reply (about 12 KB): one
-finished run, concluded `failure`, of a made-up repository's `quality.yml`
-on `main`. Every value was replaced; only field names, enumerations and
+Made-up data with the shape and size of a real reply (about 120 KB): the ten
+newest runs of a made-up repository's `quality.yml` on `main` — the two
+newest still running, the newest finished one concluded `failure`, the rest
+`success`. Every value was replaced; only field names, enumerations and
 timestamps' format are GitHub's.
 
 `config.json` is the node config, `input.json` the upstream output (none),

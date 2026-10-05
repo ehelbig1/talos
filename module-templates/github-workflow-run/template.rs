@@ -1,7 +1,8 @@
 // GitHub: the newest finished run of one workflow on one branch.
 //
-// Reads GitHub's "list workflow runs" endpoint for REPO / WORKFLOW / BRANCH,
-// newest finished run only, and says what it found:
+// Reads GitHub's "list workflow runs" endpoint for REPO / WORKFLOW / BRANCH —
+// the newest PAGE runs — picks the newest FINISHED one itself, and says what
+// it found:
 //
 //   { "state": "failing" | "passing" | "other" | "none", "run": { … } }
 //
@@ -14,6 +15,14 @@
 // raises or bumps it, a passing run resolves it, `other` leaves it alone.
 // Whether a person is TOLD is not this node's business: a compose node after
 // it decides that (once per run, not once per poll).
+//
+// It does not ask GitHub to filter or to choose. Measured 2026-10-05:
+// `status=completed&per_page=1` returned a run from nine days earlier (and a
+// different total_count, 568 against 701) on a branch whose newest finished
+// run was minutes old, while the same query with per_page 2 to 10 was right.
+// So the module reads the newest runs unfiltered and chooses the newest
+// finished one by creation time, then run number. If all of them are still
+// running, the state is `none` and nothing changes.
 //
 // Public repositories need no credential (GitHub allows 60 unauthenticated
 // requests an hour per address). AUTH_HEADER takes a vault:// reference for a
@@ -29,6 +38,9 @@ const PROVIDER: &str = "github";
 const SOURCE: &str = "github-actions";
 const API: &str = "https://api.github.com";
 const MAX_TITLE_CHARS: usize = 120;
+/// How many of the newest runs on the branch are read. The newest FINISHED
+/// one is chosen from these by this module, not by GitHub's order.
+const PAGE: usize = 10;
 
 #[derive(Deserialize, Default)]
 struct Cfg {
@@ -201,7 +213,7 @@ pub fn run(input: String) -> Result<String, String> {
     let req = talos::core::http::Request {
         method: talos::core::http::Method::Get,
         url: format!(
-            "{API}/repos/{repo}/actions/workflows/{workflow}/runs?branch={branch_q}&status=completed&per_page=1"
+            "{API}/repos/{repo}/actions/workflows/{workflow}/runs?branch={branch_q}&per_page={PAGE}"
         ),
         headers,
         body: Vec::new(),
@@ -215,11 +227,16 @@ pub fn run(input: String) -> Result<String, String> {
         .map_err(|_| "api.github.com answered with something other than a list of runs".to_string())?;
 
     let dedup_key = format!("{SOURCE}|{repo}|{workflow}|{branch}");
-    // `status=completed` is asked for; a reply is not trusted to honour it.
+    // The newest finished run, chosen here: GitHub's order is not relied on.
+    // RFC 3339 times in one format compare correctly as strings.
     let newest = page
         .workflow_runs
         .into_iter()
-        .find(|r| r.status.as_deref() == Some("completed"));
+        .filter(|r| r.status.as_deref() == Some("completed"))
+        .max_by(|a, b| {
+            (a.created_at.as_deref().unwrap_or(""), a.run_number.unwrap_or(0))
+                .cmp(&(b.created_at.as_deref().unwrap_or(""), b.run_number.unwrap_or(0)))
+        });
     let Some(r) = newest else {
         logging::log(Level::Info, "github-workflow-run: no finished run");
         return serde_json::to_string(&serde_json::json!({
@@ -297,6 +314,7 @@ mod tests {
     fn read(config: Value) -> Result<Value, String> {
         run(json!({ "config": config }).to_string()).map(|s| serde_json::from_str(&s).unwrap())
     }
+    /// One run, finished with `conclusion`, as GitHub lists it.
     fn page(conclusion: &str) -> String {
         json!({ "total_count": 1, "workflow_runs": [{
             "id": 42, "run_number": 7, "event": "push", "status": "completed",
@@ -324,7 +342,7 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(
             sent[0].url,
-            "https://api.github.com/repos/example-owner/example-repo/actions/workflows/quality.yml/runs?branch=main&status=completed&per_page=1"
+            "https://api.github.com/repos/example-owner/example-repo/actions/workflows/quality.yml/runs?branch=main&per_page=10"
         );
         assert!(sent[0].headers.iter().any(|(k, _)| k == "User-Agent"));
         assert!(!sent[0].headers.iter().any(|(k, _)| k == "Authorization"));
@@ -362,6 +380,27 @@ mod tests {
         let v = read(config()).unwrap();
         assert_eq!(v["state"], "none");
         assert!(v.get("__ops_alert__").is_none());
+    }
+
+    /// GitHub's order is not trusted: an old failure listed first, the newest
+    /// run still going, and the newest FINISHED run (a pass) in the middle.
+    #[test]
+    fn the_newest_finished_run_is_chosen_whatever_the_order() {
+        let run = |id: u64, number: u64, created: &str, status: &str, conclusion: Option<&str>| {
+            json!({ "id": id, "run_number": number, "event": "push", "status": status,
+                    "conclusion": conclusion, "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                    "html_url": format!("https://github.com/example-owner/example-repo/actions/runs/{id}"),
+                    "created_at": created, "updated_at": created })
+        };
+        let p = json!({ "total_count": 4, "workflow_runs": [
+            run(1, 10, "2026-01-01T00:00:00Z", "completed", Some("failure")),
+            run(4, 40, "2026-01-04T00:00:00Z", "in_progress", None),
+            run(3, 30, "2026-01-03T00:00:00Z", "completed", Some("success")),
+            run(2, 20, "2026-01-02T00:00:00Z", "completed", Some("failure")),
+        ]});
+        host::http::respond(200, p.to_string());
+        let v = read(config()).unwrap();
+        assert_eq!((v["state"].clone(), v["run"]["id"].clone()), (json!("passing"), json!(3)));
     }
 
     #[test]
