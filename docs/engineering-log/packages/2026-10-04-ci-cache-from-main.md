@@ -88,12 +88,16 @@ them. Minutes per job:
 Inside the unit job: library tests 10.9 → 4.6, DB-free integration binaries
 9.7 → 3.2. The slowest job of a full run went from about 23 minutes to 14.3.
 
-One warm run, so these are a first reading, not an average.
+**A second warm run, the same day, read differently.** Unit job 14.8
+(library tests 6.7, DB-free binaries 4.4), shards 12.5 / 13.5 / 13.4, clippy
+4.2. So the warm unit job is 11.4 to 14.8 on two readings, and the sentence
+first written here — that it is shorter than every integration shard — held
+for one run of two. The slowest job of a full run was 14.3 and then 14.8.
 
-**Splitting the unit job is no longer worth doing.** It was listed above as
-shortening the critical path whatever the cache did. Warm, the unit job
-(11.4) is shorter than every integration shard, so it is not on the critical
-path, and two jobs would each pay the two minutes of setup the one pays now.
+**Splitting the unit job is still not worth doing, for a narrower reason.**
+Warm, the unit job and the shards are level. Splitting it would leave the
+shards as the limit at 12 to 14 minutes, so a run would finish at most about
+a minute sooner, and two jobs would each pay the setup the one pays now.
 
 **A fourth integration shard is left unmeasured.** A warm shard spends 10.4
 of its 12.3 minutes inside `make test-integration`. How that divides between
