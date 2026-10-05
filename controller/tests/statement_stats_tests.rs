@@ -703,52 +703,92 @@ async fn entries_from_a_dropped_database_are_counted_and_disclosed() {
     let admin = seed_user(&pool, true).await;
     let state = mcp_state(pool.clone()).await;
 
-    let before = machine_json(&report(&state, admin, serde_json::json!({})).await)["coverage"]
-        ["entries_for_dropped_databases"]
-        .as_i64()
-        .expect("the field is present");
-
-    // Mint an entry in a database, then drop the database.
+    // The count this test compares is CLUSTER-WIDE, and the cap it lives under
+    // is shared with every other test's database. When the instrument is full
+    // Postgres evicts its least-used entries in a sweep, and a sweep between
+    // the two readings takes more dropped-database entries away than this
+    // test adds: the count goes DOWN. That is what failed in CI three times
+    // (before=2155 after=2069; before=2188 after=2120 — a fall of 68 to 86 in
+    // a window where nothing but an eviction removes entries).
+    //
+    // The report already says when that happened (`entries_evicted`). So the
+    // claim is made exactly: in a window with NO eviction, an entry minted by
+    // a database that is then dropped raises the count. A window that saw an
+    // eviction proves nothing either way and is taken again.
+    let reading = |v: serde_json::Value| {
+        let cov = &v["coverage"];
+        (
+            cov["entries_for_dropped_databases"]
+                .as_i64()
+                .expect("the field is present"),
+            cov["entries_evicted"]
+                .as_i64()
+                .expect("PG 17 measures evictions"),
+        )
+    };
     let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
     let (prefix, _) = base.rsplit_once('/').expect("a database in DATABASE_URL");
-    let victim = format!("p39_victim_{}", Uuid::new_v4().simple());
     let admin_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&format!("{prefix}/postgres"))
         .await
         .expect("maintenance connection");
-    sqlx::query(&format!("CREATE DATABASE \"{victim}\""))
-        .execute(&admin_pool)
-        .await
-        .expect("create the victim database");
-    {
-        let vp = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&format!("{prefix}/{victim}"))
-            .await
-            .expect("connect to the victim");
-        sqlx::query(&format!(
-            "SELECT 1 AS \"p39_victim_marker_{}\"",
-            Uuid::new_v4().simple()
-        ))
-        .fetch_one(&vp)
-        .await
-        .expect("mint an entry");
-        vp.close().await;
-    }
-    sqlx::query(&format!("DROP DATABASE \"{victim}\" WITH (FORCE)"))
-        .execute(&admin_pool)
-        .await
-        .expect("drop the victim database");
 
-    let after = machine_json(&report(&state, admin, serde_json::json!({})).await)["coverage"]
-        ["entries_for_dropped_databases"]
-        .as_i64()
-        .expect("the field is present");
-    assert!(
-        after > before,
-        "an entry minted by a database that was then dropped must be counted \
-         against the shared cap: before={before} after={after}"
+    const WINDOWS: usize = 8;
+    let mut evicted_in_every_window = Vec::new();
+    for _ in 0..WINDOWS {
+        let (before, evictions_before) = reading(machine_json(
+            &report(&state, admin, serde_json::json!({})).await,
+        ));
+
+        // Mint an entry in a database, then drop the database.
+        let victim = format!("p39_victim_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE \"{victim}\""))
+            .execute(&admin_pool)
+            .await
+            .expect("create the victim database");
+        {
+            let vp = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("{prefix}/{victim}"))
+                .await
+                .expect("connect to the victim");
+            sqlx::query(&format!(
+                "SELECT 1 AS \"p39_victim_marker_{}\"",
+                Uuid::new_v4().simple()
+            ))
+            .fetch_one(&vp)
+            .await
+            .expect("mint an entry");
+            vp.close().await;
+        }
+        sqlx::query(&format!("DROP DATABASE \"{victim}\" WITH (FORCE)"))
+            .execute(&admin_pool)
+            .await
+            .expect("drop the victim database");
+
+        let (after, evictions_after) = reading(machine_json(
+            &report(&state, admin, serde_json::json!({})).await,
+        ));
+        if evictions_after != evictions_before {
+            eprintln!(
+                "window not compared: {} eviction sweep(s) between the readings \
+                 (before={before} after={after})",
+                evictions_after - evictions_before
+            );
+            evicted_in_every_window.push((before, after, evictions_after - evictions_before));
+            continue;
+        }
+        assert!(
+            after > before,
+            "with no eviction in the window, an entry minted by a database that was then \
+             dropped must be counted against the shared cap: before={before} after={after}"
+        );
+        return;
+    }
+    panic!(
+        "the instrument evicted entries in each of {WINDOWS} consecutive windows, so no \
+         reading pair could be compared (before, after, evictions): {evicted_in_every_window:?}"
     );
 }
 
