@@ -8,7 +8,16 @@
 //!   * `ModuleExecutionService::complete_execution_from_worker` — the
 //!     completion chokepoint every module-bound push dispatch funnels
 //!     through (GCP Monitoring Pub/Sub, Gmail/GCal watches, inbound
-//!     webhooks, the `talos.results.*` fire-and-forget subscriber).
+//!     webhooks, the `talos.results.*` fire-and-forget subscriber),
+//!   * the MCP `report_ops_alert` tool (2026-10-05) — an operator-side
+//!     reporter (a host script, an agent) raising or resolving an alert
+//!     for the calling user.
+//!
+//! Every surface applies ONE entry through [`apply_entry`]: classify
+//! (reserved-namespace refusal, `status_event` routing) → DLP-redact
+//! ([`redacted_alert`]) → ingest or resolve. A surface owns only how it
+//! finds the tenant and what it does with the outcome; it cannot apply a
+//! different rule to an entry.
 //!
 //! Keeping the whole protocol in the domain crate mirrors `talos-memory`
 //! (domain crate owns service semantics, not just SQL) and guarantees a
@@ -136,6 +145,142 @@ fn bump_failure_metric(reason: &str) {
     }
 }
 
+/// What [`apply_entry`] did with one entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryOutcome {
+    /// Create-or-bump landed (created / bumped / reopened — see
+    /// [`crate::IngestOutcome`]).
+    Ingested(crate::IngestOutcome),
+    /// A `status_event: "resolved"` entry moved an active alert to
+    /// `resolved` (`resolved_source = 'signal'`).
+    Resolved,
+    /// A resolve entry matched no active alert — never seen, or already
+    /// resolved. A normal no-op, not an error.
+    NoActiveAlert,
+}
+
+/// Why [`apply_entry`] did not apply an entry.
+#[derive(Debug, thiserror::Error)]
+pub enum EntryRefusal {
+    /// The entry claims the platform-reserved namespace (see
+    /// [`EntryAction::SkipReservedNamespace`]). Nothing was written.
+    #[error(
+        "source '{}' and dedup keys starting '{}' are reserved for the platform's own alerts",
+        crate::self_monitor::SELF_ALERT_SOURCE,
+        crate::self_monitor::RESERVED_DEDUP_PREFIX
+    )]
+    ReservedNamespace { dedup_key: String },
+    /// `status_event` was present but not `"resolved"`. Nothing was
+    /// written: a typo must not turn a recovery into a bump.
+    #[error("unknown status_event '{status_event}' (only \"resolved\" is recognised)")]
+    UnknownStatusEvent { status_event: String },
+    /// The create-or-bump was refused (validation) or failed (db).
+    #[error(transparent)]
+    Ingest(crate::OpsAlertIngestError),
+    /// The resolve write failed.
+    #[error("ops-alert resolve failed")]
+    Resolve(#[source] anyhow::Error),
+}
+
+impl EntryRefusal {
+    /// The `ops_alert_ingest_failures_total{reason}` label this refusal
+    /// counts under, or `None` for one that is not counted (an unknown
+    /// `status_event` never was).
+    #[must_use]
+    pub fn metric_label(&self) -> Option<&'static str> {
+        match self {
+            Self::ReservedNamespace { .. } => Some("namespace"),
+            Self::UnknownStatusEvent { .. } => None,
+            Self::Ingest(e) => Some(e.metric_label()),
+            Self::Resolve(_) => Some("db"),
+        }
+    }
+}
+
+/// The [`crate::NewOpsAlert`] an ingest entry describes, with every
+/// free-text field DLP-redacted. `ops_alerts` stores plaintext, so this
+/// runs BEFORE persistence on every surface. `dedup_key` is NOT redacted:
+/// it is an identity, and a redacted key would stop matching its own
+/// resolve signal. Pure.
+#[must_use]
+pub fn redacted_alert(entry: &JsonValue) -> crate::NewOpsAlert {
+    let get = |k: &str| entry.get(k).and_then(JsonValue::as_str).map(str::to_string);
+    let redacted = |k: &str| get(k).map(|s| talos_dlp_provider::redact_str(&s));
+    crate::NewOpsAlert {
+        source: redacted("source").unwrap_or_default(),
+        external_id: redacted("external_id"),
+        dedup_key: get("dedup_key").unwrap_or_default(),
+        title: redacted("title").unwrap_or_default(),
+        resource: redacted("resource"),
+        severity_raw: get("severity_raw"),
+        severity_hint: get("severity_hint"),
+        // `redact_json_bounded` returns None for oversized payloads — the
+        // store additionally bounds bytes (`MAX_RAW_BYTES`).
+        raw: entry
+            .get("raw")
+            .and_then(talos_dlp_provider::redact_json_bounded),
+    }
+}
+
+/// Apply ONE entry for `user_id`: classify → redact → ingest or resolve.
+///
+/// The single home of the per-entry rules, shared by the `__ops_alert__`
+/// envelope and the MCP `report_ops_alert` tool:
+///   * the reserved `talos` source / `talos/` dedup prefix is REFUSED
+///     before anything is read or written ([`classify_entry`]);
+///   * `status_event: "resolved"` resolves, any other value is refused,
+///     absence ingests;
+///   * every free-text field is DLP-redacted before persistence
+///     ([`redacted_alert`]) and `raw` is bounded.
+///
+/// Counts the outcome on `ops_alert_ingest_failures_total{reason}` /
+/// `ops_alert_auto_resolved_total`, so every surface is counted alike.
+/// The caller owns tenancy (`user_id`, `org_id`) and what it reports.
+pub async fn apply_entry(
+    repo: &crate::OpsAlertRepository,
+    user_id: Uuid,
+    org_id: Option<Uuid>,
+    entry: &JsonValue,
+) -> Result<EntryOutcome, EntryRefusal> {
+    let result = match classify_entry(entry) {
+        EntryAction::SkipReservedNamespace { dedup_key } => {
+            Err(EntryRefusal::ReservedNamespace { dedup_key })
+        }
+        EntryAction::SkipUnknownStatusEvent { status_event } => {
+            Err(EntryRefusal::UnknownStatusEvent { status_event })
+        }
+        // A recovery signal must RESOLVE the rolling alert, never ingest
+        // it: a plain ingest would bump the row (and reopen an
+        // operator-resolved one) — the exact wrong reading.
+        EntryAction::Resolve { dedup_key } => {
+            match repo.resolve_by_dedup_key(user_id, &dedup_key).await {
+                Ok(true) => Ok(EntryOutcome::Resolved),
+                Ok(false) => Ok(EntryOutcome::NoActiveAlert),
+                Err(e) => Err(EntryRefusal::Resolve(e)),
+            }
+        }
+        EntryAction::Ingest => repo
+            .ingest(user_id, org_id, redacted_alert(entry))
+            .await
+            .map(EntryOutcome::Ingested)
+            .map_err(EntryRefusal::Ingest),
+    };
+    match &result {
+        Ok(EntryOutcome::Resolved) => {
+            if let Some(m) = talos_metrics::global() {
+                m.ops_alert_auto_resolved_total.inc();
+            }
+        }
+        Ok(_) => {}
+        Err(refusal) => {
+            if let Some(reason) = refusal.metric_label() {
+                bump_failure_metric(reason);
+            }
+        }
+    }
+    result
+}
+
 /// Parse the `__ops_alert__` envelope out of `output` and spawn the
 /// batch ingest. Best-effort, fire-on-completion semantics: the caller's
 /// latency is bounded by the parse + clone; the tenancy lookup and DB
@@ -198,80 +343,45 @@ pub fn spawn_ingest_from_output(
 
         let repo = crate::OpsAlertRepository::new(pool);
         for a in alerts.into_iter().take(MAX_OPS_ALERTS_PER_OUTPUT) {
-            let get = |k: &str| a.get(k).and_then(JsonValue::as_str).map(str::to_string);
-
-            // ── `status_event` routing — see [`classify_entry`] ──────
-            // A recovery signal must RESOLVE the rolling alert, never
-            // ingest it: a plain ingest would bump the row (and reopen
-            // an operator-resolved one) — the exact wrong reading.
-            match classify_entry(&a) {
-                EntryAction::Ingest => {} // fall through to ingest below
-                EntryAction::Resolve { dedup_key } => {
-                    match repo.resolve_by_dedup_key(user_id, &dedup_key).await {
-                        Ok(true) => {
-                            if let Some(m) = talos_metrics::global() {
-                                m.ops_alert_auto_resolved_total.inc();
-                            }
-                            tracing::info!(
-                                %actor_id, context, dedup_key,
-                                "__ops_alert__: alert auto-resolved by source recovery signal"
-                            );
-                        }
-                        Ok(false) => {
-                            // Never-seen or already-resolved — normal.
-                            tracing::debug!(
-                                %actor_id, context, dedup_key,
-                                "__ops_alert__: resolve signal matched no active alert"
-                            );
-                        }
-                        Err(e) => {
-                            bump_failure_metric("db");
-                            tracing::warn!(%actor_id, context, error = %e, "__ops_alert__ auto-resolve failed");
-                        }
-                    }
-                    continue;
+            // Classify → redact → ingest/resolve, and its counters, are
+            // [`apply_entry`]'s; this loop only logs the outcome.
+            match apply_entry(&repo, user_id, org_id, &a).await {
+                Ok(EntryOutcome::Ingested(outcome)) => {
+                    tracing::debug!(%actor_id, context, ?outcome, "__ops_alert__ ingested");
                 }
-                EntryAction::SkipReservedNamespace { dedup_key } => {
-                    bump_failure_metric("namespace");
+                Ok(EntryOutcome::Resolved) => {
+                    tracing::info!(
+                        %actor_id, context,
+                        dedup_key = a.get("dedup_key").and_then(JsonValue::as_str).unwrap_or_default(),
+                        "__ops_alert__: alert auto-resolved by source recovery signal"
+                    );
+                }
+                Ok(EntryOutcome::NoActiveAlert) => {
+                    // Never-seen or already-resolved — normal.
+                    tracing::debug!(
+                        %actor_id, context,
+                        dedup_key = a.get("dedup_key").and_then(JsonValue::as_str).unwrap_or_default(),
+                        "__ops_alert__: resolve signal matched no active alert"
+                    );
+                }
+                Err(EntryRefusal::ReservedNamespace { dedup_key }) => {
                     tracing::warn!(
                         %actor_id, context, dedup_key,
                         "__ops_alert__: entry claims the reserved 'talos' namespace — dropped \
                          (module-emitted alerts cannot touch self-monitoring rows)"
                     );
-                    continue;
                 }
-                EntryAction::SkipUnknownStatusEvent { status_event } => {
+                Err(EntryRefusal::UnknownStatusEvent { status_event }) => {
                     tracing::warn!(
                         %actor_id, context, status_event,
                         "__ops_alert__: unknown status_event — entry skipped"
                     );
-                    continue;
                 }
-            }
-
-            // DLP-redact BEFORE persistence (stored plaintext; see module doc).
-            let redacted = |k: &str| get(k).map(|s| talos_dlp_provider::redact_str(&s));
-            let alert = crate::NewOpsAlert {
-                source: redacted("source").unwrap_or_default(),
-                external_id: redacted("external_id"),
-                dedup_key: get("dedup_key").unwrap_or_default(),
-                title: redacted("title").unwrap_or_default(),
-                resource: redacted("resource"),
-                severity_raw: get("severity_raw"),
-                severity_hint: get("severity_hint"),
-                // `redact_json_bounded` returns None for oversized
-                // payloads — the repository additionally bounds bytes.
-                raw: a
-                    .get("raw")
-                    .and_then(talos_dlp_provider::redact_json_bounded),
-            };
-            match repo.ingest(user_id, org_id, alert).await {
-                Ok(outcome) => {
-                    tracing::debug!(%actor_id, context, ?outcome, "__ops_alert__ ingested");
+                Err(EntryRefusal::Resolve(e)) => {
+                    tracing::warn!(%actor_id, context, error = %e, "__ops_alert__ auto-resolve failed");
                 }
-                Err(e) => {
+                Err(EntryRefusal::Ingest(e)) => {
                     let reason = e.metric_label();
-                    bump_failure_metric(reason);
                     tracing::warn!(%actor_id, context, error = %e, reason, "__ops_alert__ ingest failed");
                 }
             }
@@ -384,6 +494,102 @@ mod tests {
             classify_entry(&json!({"dedup_key": "k", "status_event": 7})),
             EntryAction::Ingest
         );
+    }
+
+    /// A repository whose pool can never connect: `connect_lazy` opens
+    /// nothing until a statement runs, and the address refuses at once. A
+    /// refusal that returns BEFORE any statement is reported as itself; one
+    /// that reached the database would come back as a db error instead.
+    fn unreachable_repo() -> crate::OpsAlertRepository {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+            .expect("lazy pool");
+        crate::OpsAlertRepository::new(pool)
+    }
+
+    #[tokio::test]
+    async fn apply_entry_refuses_the_reserved_namespace_before_any_statement() {
+        let repo = unreachable_repo();
+        let user = Uuid::new_v4();
+        for entry in [
+            // Raise under a reserved dedup key.
+            json!({"source": "backup-drill", "dedup_key": "talos/wf/x/auth", "title": "spoof"}),
+            // Raise under the reserved source.
+            json!({"source": "talos", "dedup_key": "backup-drill|artifact", "title": "spoof"}),
+            // Resolve a reserved key — would silence self-monitoring.
+            json!({"source": "backup-drill", "dedup_key": "talos/wf/x/auth",
+                   "status_event": "resolved"}),
+        ] {
+            match apply_entry(&repo, user, None, &entry).await {
+                Err(EntryRefusal::ReservedNamespace { .. }) => {}
+                other => panic!("{entry}: expected a reserved-namespace refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_entry_refuses_an_unknown_status_event_before_any_statement() {
+        let entry = json!({"source": "s", "dedup_key": "k", "title": "t",
+                           "status_event": "closed"});
+        match apply_entry(&unreachable_repo(), Uuid::new_v4(), None, &entry).await {
+            Err(EntryRefusal::UnknownStatusEvent { status_event }) => {
+                assert_eq!(status_event, "closed");
+            }
+            other => panic!("expected an unknown-status_event refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refusal_metric_labels_keep_the_envelope_vocabulary() {
+        assert_eq!(
+            EntryRefusal::ReservedNamespace {
+                dedup_key: "talos/x".into()
+            }
+            .metric_label(),
+            Some("namespace")
+        );
+        assert_eq!(
+            EntryRefusal::UnknownStatusEvent {
+                status_event: "closed".into()
+            }
+            .metric_label(),
+            None
+        );
+        assert_eq!(
+            EntryRefusal::Resolve(anyhow::anyhow!("x")).metric_label(),
+            Some("db")
+        );
+        assert_eq!(
+            EntryRefusal::Ingest(crate::OpsAlertIngestError::Validation("x".into())).metric_label(),
+            Some("validation")
+        );
+    }
+
+    #[test]
+    fn redacted_alert_redacts_free_text_and_keeps_the_dedup_key() {
+        let entry = json!({
+            "source": "backup-drill",
+            "dedup_key": "backup-drill|artifact",
+            "title": "drill failed for SSN: 123-45-6789",
+            "resource": "SSN: 123-45-6789",
+            "external_id": "SSN: 123-45-6789",
+            "severity_hint": "high",
+            "raw": {"reason": "SSN: 123-45-6789"},
+        });
+        let a = redacted_alert(&entry);
+        assert_eq!(a.dedup_key, "backup-drill|artifact");
+        for (field, value) in [
+            ("title", a.title.as_str()),
+            ("resource", a.resource.as_deref().unwrap_or_default()),
+            ("external_id", a.external_id.as_deref().unwrap_or_default()),
+        ] {
+            assert!(!value.contains("123-45-6789"), "{field}: {value}");
+            assert!(value.contains("[REDACTED:SSN]"), "{field}: {value}");
+        }
+        let raw = a.raw.expect("raw kept").to_string();
+        assert!(!raw.contains("123-45-6789"), "{raw}");
+        assert_eq!(a.severity_hint.as_deref(), Some("high"));
     }
 
     #[test]

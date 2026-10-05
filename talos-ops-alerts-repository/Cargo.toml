@@ -44,4 +44,6 @@ workspace = true
 [dev-dependencies]
 # Pins UNATTENDED/ATTENDED trigger lists to the ingress vocabulary.
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+# `apply_entry`'s refusal tests run the async fn against a pool that never connects.
+tokio = { version = "1", features = ["macros", "rt"] }
 

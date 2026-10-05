@@ -190,6 +190,21 @@ jobs:
         # most: no call outside a read-only list was made in any scenario.
         run: bash scripts/tests/confirm-deploy-test.sh
 
+      - name: Backup drill reports its result as an ops alert
+        # scripts/lib/drill-ops-alert.sh sends the drill's result to the MCP
+        # tool report_ops_alert after the textfile metric. A fake curl on PATH
+        # drives success (resolve), failure (raise naming the step), the key
+        # file (header from a private file, key in no argv) and every failed
+        # delivery (one WARN, no body); the real drill, failing at its first
+        # pre-flight check, keeps its exit status and metric with the
+        # report endpoint down.
+        run: bash scripts/tests/drill-ops-alert-test.sh
+      - name: Backup drill drills Vault only when it holds the key
+        # TALOS_DRILL_VAULT: the real drill, a fake docker, an empty backup
+        # folder. With KEK_PROVIDER=env it must not ask for a Vault backup;
+        # with vault it must; off+vault is refused.
+        run: bash scripts/tests/drill-vault-gate-test.sh
+
       - name: Chart Vault init Job + unsealer sidecar against a real Vault
         # deploy/helm/talos/files/vault-init.sh and vault-unseal-loop.sh, driven
         # against the chart's pinned hashicorp/vault image with a fake kubectl:
