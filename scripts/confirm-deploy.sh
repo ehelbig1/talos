@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # `make confirm-deploy` — after `git pull && make up`: is the commit on
-# origin/main the commit that is running, and is the stack healthy?
+# origin/main the commit that is running, is the stack healthy, and did that
+# commit pass its checks?
 #
 # Until this script that was answered by hand and by INFERENCE ("the
 # controller container started after the merge"). A start time says when a
@@ -16,6 +17,10 @@
 #   docker exec <postgres> psql … one SELECT, in a read-only session
 #   GET  https://api.github.com/repos/<owner>/<repo>/commits/main — only when
 #        `git ls-remote` fails and origin is on github.com; no credential
+#   GET  https://api.github.com/repos/<owner>/<repo>/actions/workflows/
+#        quality.yml/runs?head_sha=<origin/main> — when origin is on
+#        github.com; no credential. And, only when that run did not pass,
+#        GET …/actions/runs/<id>/jobs to name the jobs that failed
 #   GET  <controller>/health
 #   POST <controller>/mcp/local   tools/call get_platform_info, and tools/list
 # It restarts nothing, writes nothing, migrates nothing, triggers nothing.
@@ -351,6 +356,91 @@ else:
     print("FAIL\tMCP tools/list\t%s listed 0 tools" % url)
 PY
 
+# stdin: the GitHub reply listing quality.yml runs for one commit.
+# argv: <origin/main sha>
+# Prints the verdict; for a run that did not pass it also prints
+# "@<TAB><run id>", which the caller uses to ask which jobs failed.
+read -r -d '' PY_CHECKS <<'PY' || true
+import json, sys
+
+sha = sys.argv[1]
+short = sha[:7]
+NAME = "checks on main"
+
+
+def clean(s, limit=160):
+    s = "".join(ch if ch.isprintable() else " " for ch in str(s))
+    return s[:limit]
+
+
+raw = sys.stdin.read()
+if not raw.strip():
+    print("UNKNOWN\t%s\tthe GitHub API gave no answer, so the result of quality.yml for %s was not read" % (NAME, short))
+    sys.exit(0)
+try:
+    reply = json.loads(raw)
+    runs = reply["workflow_runs"]
+    if not isinstance(runs, list):
+        raise ValueError
+except Exception:
+    why = ""
+    try:
+        why = ": %s" % clean(json.loads(raw).get("message", ""), 100)
+    except Exception:
+        pass
+    print("UNKNOWN\t%s\tthe GitHub API did not list runs for %s%s" % (NAME, short, why))
+    sys.exit(0)
+
+# Only runs of exactly this commit count. The API was asked for them; a reply
+# is not trusted to have honoured the filter.
+runs = [r for r in runs if isinstance(r, dict) and r.get("head_sha") == sha]
+if not runs:
+    print("UNKNOWN\t%s\tno quality.yml run exists for %s (it has not started, or this commit "
+          "reached main without one)" % (NAME, short))
+    sys.exit(0)
+
+runs.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
+latest = runs[0]
+event = clean(latest.get("event", "?"), 30)
+earlier = ""
+done = [r for r in runs[1:] if r.get("status") == "completed"]
+if done:
+    earlier = "; an earlier run of this commit concluded %s" % clean(done[0].get("conclusion"), 30)
+
+if latest.get("status") != "completed":
+    print("UNKNOWN\t%s\tquality.yml is %s for %s (%s run, started %s)%s"
+          % (NAME, clean(latest.get("status"), 30), short, event, clean(latest.get("created_at"), 30), earlier))
+elif latest.get("conclusion") == "success":
+    print("PASS\t%s\tquality.yml passed for %s (%s run, finished %s)"
+          % (NAME, short, event, clean(latest.get("updated_at"), 30)))
+else:
+    print("FAIL\t%s\tquality.yml concluded %s for %s (%s run, finished %s)%s"
+          % (NAME, clean(latest.get("conclusion"), 30), short, event, clean(latest.get("updated_at"), 30), earlier))
+    url = clean(latest.get("html_url", ""), 200)
+    if url.startswith("https://github.com/"):
+        print(">\t%s" % url)
+    run_id = latest.get("id")
+    if isinstance(run_id, int) and not isinstance(run_id, bool):
+        print("@\t%d" % run_id)
+PY
+
+# stdin: the GitHub reply listing one run's jobs. Prints the jobs that did
+# not pass, or nothing when the reply cannot be read.
+read -r -d '' PY_JOBS <<'PY' || true
+import json, sys
+
+try:
+    jobs = json.loads(sys.stdin.read())["jobs"]
+    bad = [str(j.get("name", "?")) for j in jobs
+           if isinstance(j, dict) and j.get("conclusion") not in ("success", "skipped", None)]
+except Exception:
+    sys.exit(0)
+bad = ["".join(ch if ch.isprintable() else " " for ch in n)[:60] for n in bad]
+if bad:
+    more = "" if len(bad) <= 4 else " (+%d more)" % (len(bad) - 4)
+    print(">\tdid not pass: %s%s" % ("; ".join(bad[:4]), more))
+PY
+
 # run_helper <fallback check name> <python source> <stdin text> [args…]
 # A helper that crashes is an UNKNOWN for its check, never a silent pass.
 run_helper() {
@@ -382,6 +472,14 @@ if ls_out=$(GIT_TERMINAL_PROMPT=0 git ls-remote origin refs/heads/main 2>/dev/nu
     EXPECTED=$(printf '%s\n' "$ls_out" | awk 'NR == 1 { print $1 }')
 fi
 EXPECTED_VIA=""
+# <owner>/<repo> when origin is on github.com, else empty. Only a string of
+# exactly that shape is ever put into a URL.
+SLUG=""
+if origin_url=$(git remote get-url origin 2>/dev/null); then
+    SLUG=$(printf '%s\n' "$origin_url" \
+        | sed -nE 's#^(git@github\.com:|ssh://git@github\.com/|https://github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$#\2#p' \
+        | sed -E 's#\.git$##')
+fi
 if ! is_hex "$EXPECTED"; then
     EXPECTED=""
     # git could not ask: an SSH agent that is locked, or no route to the
@@ -389,12 +487,7 @@ if ! is_hex "$EXPECTED"; then
     # unauthenticated GET away — the commit `main` points at is public for a
     # public repository, and a private one answers 404, which is not a commit
     # and leaves this UNKNOWN exactly as before. No credential is sent.
-    slug=""
-    if origin_url=$(git remote get-url origin 2>/dev/null); then
-        slug=$(printf '%s\n' "$origin_url" \
-            | sed -nE 's#^(git@github\.com:|ssh://git@github\.com/|https://github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$#\2#p' \
-            | sed -E 's#\.git$##')
-    fi
+    slug="$SLUG"
     if [ -n "$slug" ]; then
         api_out=$(curl -s -m "$TIMEOUT" -H 'Accept: application/vnd.github.sha' \
             "https://api.github.com/repos/$slug/commits/main" 2>/dev/null || true)
@@ -508,6 +601,39 @@ if reply=$(mcp_post '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'); then
     TOOLS_REPLY="$reply"
 fi
 run_helper "MCP tools/list" "$PY_TOOLS" "$TOOLS_REPLY" "$MCP_URL"
+
+# ── 9. Did the commit on main pass its checks ───────────────────────────
+# quality.yml runs once for every commit that lands on main. A commit can be
+# running and healthy and still be one whose tests failed.
+if [ -z "$EXPECTED" ]; then
+    report UNKNOWN "checks on main" "origin/main could not be read, so there is no commit to ask about"
+elif [ -z "$SLUG" ]; then
+    report UNKNOWN "checks on main" "origin is not a github.com repository, so its workflow runs were not read"
+else
+    runs_reply=$(curl -s -m "$TIMEOUT" -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$SLUG/actions/workflows/quality.yml/runs?head_sha=$EXPECTED&per_page=20" 2>/dev/null || true)
+    if checks_out=$(printf '%s' "$runs_reply" | python3 -c "$PY_CHECKS" "$EXPECTED" 2>/dev/null); then
+        failed_run=$(printf '%s\n' "$checks_out" | awk -F '\t' '$1 == "@" { print $2; exit }')
+        checks_out=$(printf '%s\n' "$checks_out" | awk -F '\t' '$1 != "@"')
+        emit <<EOF
+$checks_out
+EOF
+        case "$failed_run" in
+            ''|*[!0-9]*) ;;
+            *)
+                jobs_reply=$(curl -s -m "$TIMEOUT" -H 'Accept: application/vnd.github+json' \
+                    "https://api.github.com/repos/$SLUG/actions/runs/$failed_run/jobs?per_page=100" 2>/dev/null || true)
+                if jobs_out=$(printf '%s' "$jobs_reply" | python3 -c "$PY_JOBS" 2>/dev/null) && [ -n "$jobs_out" ]; then
+                    emit <<EOF
+$jobs_out
+EOF
+                fi
+                ;;
+        esac
+    else
+        report UNKNOWN "checks on main" "the helper that reads this answer failed"
+    fi
+fi
 
 # ── Summary ─────────────────────────────────────────────────────────────
 TOTAL=$((PASS_N + FAIL_N + UNKNOWN_N))

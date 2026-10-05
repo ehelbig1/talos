@@ -28,8 +28,8 @@
 # touches files it can possibly have an opinion about.
 #
 # This does not weaken CI: `quality.yml` runs every suite a change can affect
-# on every PR and in the merge queue, so anything skipped here is still gated
-# before merge. What changes is only WHERE you find out.
+# on every PR, so anything skipped here is still gated before merge (and the
+# commit gets a full run again when it lands on main). What changes is only WHERE you find out.
 #
 # THE ONE REAL COUPLING, stated rather than buried: the frontend consumes
 # TypeScript types generated from the Rust GraphQL schema, so a Rust-only
