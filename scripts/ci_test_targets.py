@@ -34,6 +34,7 @@ Usage:
   ci_test_targets.py grouped dbfree    crate<TAB>bin1 bin2 … (one line per crate)
   ci_test_targets.py check             validate every marker; non-zero on error
 """
+import os
 import re
 import sys
 from pathlib import Path
@@ -61,8 +62,31 @@ def crate_name(crate_dir: Path) -> str:
     return crate_dir.name
 
 
+def tests_dirs():
+    """Every directory named `tests` with no path component below ROOT in
+    SKIP_DIRS, sorted.
+
+    The walk does not enter a SKIP_DIRS directory. Until 2026-10-05 this was
+    `ROOT.rglob("tests")` with SKIP_DIRS filtered out afterwards, which walked
+    every file under target/ (about 150,000 in a developer checkout) and, run
+    from the main checkout, every agent worktree under .claude/ — 1.4 s per
+    call, and structural check 64 calls this script 12 times. The set is the
+    same: a `tests` directory was kept exactly when no directory above it is
+    in SKIP_DIRS, which is exactly what a pruned walk reaches. Symlinked
+    directories are not descended into (rglob did not recurse through them
+    either), and a symlink named `tests` pointing at a directory is still
+    listed, as rglob listed it and `is_dir()` accepted it.
+    """
+    found = []
+    for dirpath, dirnames, _files in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        if "tests" in dirnames:
+            found.append(Path(dirpath) / "tests")
+    return sorted(found)
+
+
 def test_files():
-    for tests_dir in sorted(ROOT.rglob("tests")):
+    for tests_dir in tests_dirs():
         if not tests_dir.is_dir():
             continue
         rel = tests_dir.relative_to(ROOT)
