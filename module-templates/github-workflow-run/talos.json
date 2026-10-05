@@ -1,8 +1,8 @@
 {
   "name": "github-workflow-run",
-  "version": "v1.1.0",
+  "version": "v1.2.0",
   "display_name": "GitHub: newest workflow run",
-  "description": "Read the newest FINISHED run of one GitHub Actions workflow on one branch and say whether it passed. It reads the ten newest runs and chooses the newest finished one itself (GitHub's own filter-and-limit answer was measured returning a nine-day-old run). OUTPUT: {provider, repo, workflow, branch, state, run: {id, number, event, conclusion, head_sha, branch, url, title, created_at, finished_at}}. state is failing (failure, timed_out, startup_failure), passing (success), other (cancelled, skipped, neutral and anything newer) or none (no finished run on that branch; `run` is absent). OPS ALERT: with ALERT true (the default) a failing run raises or bumps ONE rolling ops alert per repo/workflow/branch (source github-actions, severity hint from SEVERITY, default high) and a passing run resolves it; other leaves it alone. The alert records the state; it does not tell anyone — put a compose node after this one to decide when to notify (for example once per run). A run still in progress is never read as finished. CREDENTIALS: none for a public repository (GitHub allows 60 unauthenticated requests an hour per address, so poll no more often than every few minutes); for a private repository or a higher limit set AUTH_HEADER to a vault:// reference. A non-2xx answer fails the node with the status only. GRANTS: installs with api.github.com and GET.",
+  "description": "Read the newest FINISHED run of one GitHub Actions workflow on one branch and say whether it passed. It sends GitHub no filter: it reads the workflow's 30 newest runs on every branch and itself chooses the newest finished run on BRANCH that a pull request did not trigger (GitHub's branch and status filters were measured answering from a list nine days stale). If none of the 30 is one, the state is none. OUTPUT: {provider, repo, workflow, branch, state, run: {id, number, event, conclusion, head_sha, branch, url, title, created_at, finished_at}}. state is failing (failure, timed_out, startup_failure), passing (success), other (cancelled, skipped, neutral and anything newer) or none (no finished run on that branch; `run` is absent). OPS ALERT: with ALERT true (the default) a failing run raises or bumps ONE rolling ops alert per repo/workflow/branch (source github-actions, severity hint from SEVERITY, default high) and a passing run resolves it; other leaves it alone. The alert records the state; it does not tell anyone — put a compose node after this one to decide when to notify (for example once per run). A run still in progress is never read as finished. CREDENTIALS: none for a public repository (GitHub allows 60 unauthenticated requests an hour per address, so poll no more often than every few minutes); for a private repository or a higher limit set AUTH_HEADER to a vault:// reference. A non-2xx answer fails the node with the status only. GRANTS: installs with api.github.com and GET.",
   "category": "Integration",
   "capability_world": "http-node",
   "allowed_hosts": [
@@ -14,10 +14,10 @@
   "requires_secrets": [],
   "requires_approval_for": [],
   "recommended_fuel": {
-    "expected_items": 10,
+    "expected_items": 30,
     "bytes_per_item": 13000,
     "llm_output_bytes": 0,
-    "safety_multiplier": 2.0,
+    "safety_multiplier": 1.5,
     "fuel_per_byte": 20
   },
   "config_schema": {

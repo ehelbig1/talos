@@ -77,3 +77,33 @@ in dry run, so nothing was sent. It raised the rolling alert for the old
 failure and stored that run as reported. The next run on a fixed reader reads
 `main` passing, which resolves the alert by itself and stores "passing"; that
 run's "green again" notification goes to the same dry-run send.
+
+## Corrected again: GitHub's branch filter is stale too (v1.2.0)
+
+v1.1.0 still read the 2026-09-26 run on the live stack. Measured again from
+the host with the module's exact headers, three rounds:
+
+| query | total_count | newest finished `main` run it yields |
+|---|---|---|
+| `branch=main&per_page=10` | 103, 338, 338 | #1639, 2026-09-26 |
+| `per_page=10` (no filter) | 1866 ×3 | #1864, 2026-10-05 |
+| `per_page=20` (no filter) | 1866 ×3 | #1864, 2026-10-05 |
+
+Half an hour earlier `branch=main&per_page=10` had been right. GitHub's
+filtered listings answer from an index that is, at times, nine days behind;
+the unfiltered listing was current every time. (`head_sha=<sha>`, which
+`make confirm-deploy` uses, was consistent across three requests.)
+
+So the template now sends no filter at all: it reads the workflow's 30 newest
+runs on every branch and keeps BRANCH's runs that a pull request did not
+trigger (a fork's branch can be named `main`), then the newest finished one.
+If none of the 30 is such a run the state is `none` — no alert is raised or
+resolved and nothing is notified. New test: a newer failure on another branch
+and a pull-request run on a branch named `main` are both left out.
+
+Fuel on a made-up 30-run, multi-branch recording (356 KB): 6,748,189 of a
+declared 14,475,000 (46.6%).
+
+**The limit, stated:** a failed run on `main` is missed only if 30 newer runs
+of the workflow start before the next poll; at a 10-minute poll that has not
+happened on this repository.
