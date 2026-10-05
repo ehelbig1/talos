@@ -37,7 +37,7 @@ export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/n
         drill drill-schedule drill-unschedule drill-schedule-status \
         offhost-upload offhost-backfill offhost-plan offhost-probe \
         offhost-schedule offhost-unschedule offhost-status \
-        clean nuke smoke check-route-extensions rls-preflight sqlx-prepare sqlx-check _wait-healthy \
+        clean nuke smoke confirm-deploy check-route-extensions rls-preflight sqlx-prepare sqlx-check _wait-healthy \
         observability-reload observability-verify
 
 ## ──── Dev ──────────────────────────────────────────────────────────

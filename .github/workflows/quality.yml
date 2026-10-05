@@ -154,6 +154,15 @@ jobs:
         # 95% refusal and the opt-out; plus make clean's prune line.
         run: bash scripts/tests/preflight-disk-test.sh
 
+      - name: make confirm-deploy against a fake stack
+        # scripts/confirm-deploy.sh answers "is origin/main what is running,
+        # and is it healthy". Fake git / docker / curl on PATH drive every
+        # verdict (PASS, FAIL and UNKNOWN for each check), the GitHub API
+        # fallback when git cannot reach origin, and runs under `bash -e` and
+        # `bash -u -o pipefail`. The last assertion is the one that matters
+        # most: no call outside a read-only list was made in any scenario.
+        run: bash scripts/tests/confirm-deploy-test.sh
+
       - name: Chart Vault init Job + unsealer sidecar against a real Vault
         # deploy/helm/talos/files/vault-init.sh and vault-unseal-loop.sh, driven
         # against the chart's pinned hashicorp/vault image with a fake kubectl:

@@ -144,32 +144,64 @@ Key migration files are located in `/migrations/`.
 GET /health
 ```
 
-Returns JSON with subsystem status:
+Returns one field:
 
 ```json
-{
-    "status": "ok",
-    "version": "0.1.0",
-    "checks": {
-        "database": "ok",
-        "redis": "ok",
-        "nats": "ok"
-    }
-}
+{ "status": "ok" }
 ```
 
-- Returns **200** when database is reachable (even if Redis/NATS are down -- status will be "degraded")
-- Returns **503** when database is unreachable
-- Each sub-check has a 2-second timeout
+- **200, `"ok"`**: Postgres, Redis and NATS all answered.
+- **200, `"degraded"`**: Postgres answered; Redis or NATS did not.
+- **503, `"degraded"`**: Postgres did not answer.
+- Each sub-check has a 2-second timeout, and the result is cached for 2 seconds.
 
-### Individual Checks
+The body deliberately names no subsystem and no version: the endpoint is
+unauthenticated. Which subsystem is down is in the controller's log, and in
+`/ready` (below), which nginx does not route.
+
+### Probes and individual checks
 
 ```
+GET /live          200 "OK" while the process runs; touches no dependency
+GET /ready         {"ready": true, "subsystems": {"database": true, "redis": true, "nats": true}}
 GET /health/redis
 GET /health/nats
 ```
 
-The `/health` endpoint is unauthenticated and suitable for load balancer health probes. It returns aggregate status across Postgres, Redis, and NATS. A response of `"status": "ok"` indicates all subsystems are reachable. A response of `"status": "degraded"` means the database is reachable but one or more ancillary services (Redis, NATS) are down. A `503` response means the database is unreachable.
+`/ready` answers **503** with `{"ready": false, "reason": "database_unavailable"}`
+only when Postgres is down; Redis and NATS are reported and do not fail it.
+The chart's probes use `/live` and `/ready`, never `/health`, so a Postgres
+hiccup cannot restart the pod.
+
+### Confirming a deploy
+
+After `git pull && make up`, one read-only command answers "is the commit on
+`main` the one that is running, and is the stack healthy?":
+
+```bash
+make confirm-deploy
+```
+
+It prints one line per check — PASS, FAIL or UNKNOWN — and exits non-zero
+only when a check FAILS:
+
+| Check | What it compares |
+|---|---|
+| controller commit, worker commit | the commit `origin/main` points at, against the build each process reports (`get_platform_info.build_version`). A `-dirty` build of the right commit is UNKNOWN, not PASS. |
+| controller container, worker container | running, with the start time and restart count |
+| controller health | `GET /health` answers 200 with `"ok"` |
+| migrations | every migration file of the LOCAL checkout has a successful row |
+| controller log | no ERROR line since the controller started |
+| MCP tools/list | the tool list answers, with a count |
+
+UNKNOWN means the check could not be made (the script says why) and is not
+a pass. When `git ls-remote` cannot reach the remote — a locked SSH agent —
+the commit is read from the GitHub API instead, and the `origin/main` line
+says so.
+
+A commit mismatch is a FAIL even when the commits in between change nothing
+that runs (documentation, CI, tests): the check compares commits, not their
+effect.
 
 ## Graceful Degradation
 

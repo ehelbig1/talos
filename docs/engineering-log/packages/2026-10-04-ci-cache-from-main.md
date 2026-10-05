@@ -70,3 +70,33 @@ anyway), so the saving is some fraction of each job, not all of it.
 
 `gh workflow run quality.yml --ref main`, or wait for the nightly run at
 07:00 UTC. Until one of those has run, pull requests still start cold.
+
+## Measured, 2026-10-05
+
+Main was seeded with `gh workflow run quality.yml --ref main` (five Rust
+caches, 6.4 GB together). The next pull request to run every job restored
+them. Minutes per job:
+
+| Job | Cold, pull requests before | Cold, the seeding run | Warm, first pull request after |
+|---|---|---|---|
+| Unit / lib | 22.8 (average) | 18.6 | 11.4 |
+| Integration shard 1 / 2 / 3 | about 19 each | 19.7 / 14.5 / 16.7 | 12.3 / 14.3 / 12.5 |
+| Clippy | about 10 | 8.6 | 4.6 |
+| sqlx offline cache | — | 8.3 | 5.3 |
+| Catalog templates | — | 5.5 | 2.4 |
+
+Inside the unit job: library tests 10.9 → 4.6, DB-free integration binaries
+9.7 → 3.2. The slowest job of a full run went from about 23 minutes to 14.3.
+
+One warm run, so these are a first reading, not an average.
+
+**Splitting the unit job is no longer worth doing.** It was listed above as
+shortening the critical path whatever the cache did. Warm, the unit job
+(11.4) is shorter than every integration shard, so it is not on the critical
+path, and two jobs would each pay the two minutes of setup the one pays now.
+
+**A fourth integration shard is left unmeasured.** A warm shard spends 10.4
+of its 12.3 minutes inside `make test-integration`. How that divides between
+building the test binaries (which a fourth shard would not shorten much) and
+running them (which it would) has not been read.
+
