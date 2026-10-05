@@ -14,6 +14,8 @@
 #   git rev-parse HEAD
 #   docker info / docker inspect / docker logs
 #   docker exec <postgres> psql … one SELECT, in a read-only session
+#   GET  https://api.github.com/repos/<owner>/<repo>/commits/main — only when
+#        `git ls-remote` fails and origin is on github.com; no credential
 #   GET  <controller>/health
 #   POST <controller>/mcp/local   tools/call get_platform_info, and tools/list
 # It restarts nothing, writes nothing, migrates nothing, triggers nothing.
@@ -172,7 +174,7 @@ if sha is None:
         "(a TALOS_VERSION override, or an image built without GIT_SHA_OVERRIDE)" % clean(build))
 elif not expected:
     out("UNKNOWN", "controller commit",
-        "running %s%s; origin/main could not be read (git ls-remote failed)"
+        "running %s%s; origin/main could not be read (git ls-remote failed, and the GitHub API gave no commit)"
         % (sha, "-dirty" if dirty else ""))
 elif not same_commit(sha, expected):
     out("FAIL", "controller commit",
@@ -379,8 +381,28 @@ EXPECTED=""
 if ls_out=$(GIT_TERMINAL_PROMPT=0 git ls-remote origin refs/heads/main 2>/dev/null); then
     EXPECTED=$(printf '%s\n' "$ls_out" | awk 'NR == 1 { print $1 }')
 fi
+EXPECTED_VIA=""
 if ! is_hex "$EXPECTED"; then
     EXPECTED=""
+    # git could not ask: an SSH agent that is locked, or no route to the
+    # remote. For a repository on github.com the same fact is one
+    # unauthenticated GET away — the commit `main` points at is public for a
+    # public repository, and a private one answers 404, which is not a commit
+    # and leaves this UNKNOWN exactly as before. No credential is sent.
+    slug=""
+    if origin_url=$(git remote get-url origin 2>/dev/null); then
+        slug=$(printf '%s\n' "$origin_url" \
+            | sed -nE 's#^(git@github\.com:|ssh://git@github\.com/|https://github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$#\2#p' \
+            | sed -E 's#\.git$##')
+    fi
+    if [ -n "$slug" ]; then
+        api_out=$(curl -s -m "$TIMEOUT" -H 'Accept: application/vnd.github.sha' \
+            "https://api.github.com/repos/$slug/commits/main" 2>/dev/null || true)
+        if [ "${#api_out}" -eq 40 ] && is_hex "$api_out"; then
+            EXPECTED="$api_out"
+            EXPECTED_VIA="  (from the GitHub API; git ls-remote origin failed)"
+        fi
+    fi
 fi
 
 HEAD_SHA=""
@@ -392,7 +414,7 @@ if ! is_hex "$HEAD_SHA"; then
 fi
 
 printf 'confirm-deploy (read-only)  controller %s\n' "$CONTROLLER_URL"
-printf '  origin/main     %s\n' "${EXPECTED:-unreadable (git ls-remote origin refs/heads/main failed)}"
+printf '  origin/main     %s%s\n' "${EXPECTED:-unreadable (git ls-remote origin refs/heads/main failed, and the GitHub API gave no commit)}" "$EXPECTED_VIA"
 printf '  local checkout  %s\n\n' "${HEAD_SHA:-unreadable}"
 
 # ── 1+2. The commit the controller and the workers report ───────────────

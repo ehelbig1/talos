@@ -60,6 +60,9 @@ case "$*" in
   "rev-parse HEAD")
     [ -n "${SHIM_HEAD:-}" ] || exit 128
     printf '%s\n' "$SHIM_HEAD" ;;
+  "remote get-url origin")
+    [ -n "${SHIM_ORIGIN:-}" ] || exit 2
+    printf '%s\n' "$SHIM_ORIGIN" ;;
   *) exit 1 ;;
 esac
 SHIM
@@ -102,6 +105,11 @@ method=GET
 [ -n "$body" ] && method=POST
 echo "curl $method $url $body" >> "$SHIM_LOG"
 case "$url" in
+  https://api.github.com/*)
+    # The body the `application/vnd.github.sha` media type answers with: the
+    # commit and nothing else. Anything else (a 404's JSON) is not a commit.
+    [ -n "${SHIM_API:-}" ] || exit 7
+    printf '%s' "$SHIM_API" ;;
   */health)
     if [ "${SHIM_HEALTH_CODE:-200}" = 000 ]; then printf '\n000'; exit 7; fi
     printf '%s\n%s' "${SHIM_HEALTH_BODY:-{\"status\":\"ok\"\}}" "${SHIM_HEALTH_CODE:-200}" ;;
@@ -232,6 +240,33 @@ run no-main SHIM_MAIN=""
 check "origin/main unreadable: UNKNOWN" yes "$(has "$(line_for "$OUT" "controller commit")" "UNKNOWN")"
 check "origin/main unreadable: exit 0"  0   "$RC"
 check "origin/main unreadable: said"    yes "$(has "$OUT" "origin/main     unreadable")"
+
+echo "git cannot ask (a locked SSH agent): the GitHub API is asked instead"
+GH='git@github.com:example-owner/example-repo.git'
+run api-ssh SHIM_MAIN="" SHIM_ORIGIN="$GH" SHIM_API="$MAIN"
+check "api answers: commit check PASSES" yes "$(has "$(line_for "$OUT" "controller commit")" "PASS")"
+check "api answers: 8 PASS, exit 0"     "8 0" "$(count PASS) $RC"
+check "api answers: says where it read it" yes "$(has "$OUT" "(from the GitHub API; git ls-remote origin failed)")"
+run api-https SHIM_MAIN="" SHIM_ORIGIN="https://github.com/example-owner/example-repo" SHIM_API="$MAIN"
+check "https origin: commit check PASSES" yes "$(has "$(line_for "$OUT" "controller commit")" "PASS")"
+run api-other SHIM_MAIN="" SHIM_ORIGIN="$GH" SHIM_API="$OTHER" SHIM_INFO="$T/info-good.json"
+check "api names another commit: FAIL"  "yes 1" "$(has "$(line_for "$OUT" "controller commit")" "FAIL") $RC"
+run api-404 SHIM_MAIN="" SHIM_ORIGIN="$GH" SHIM_API='{"message":"Not Found","status":"404"}'
+check "api answers without a commit: UNKNOWN" yes "$(has "$(line_for "$OUT" "controller commit")" "UNKNOWN")"
+check "api answers without a commit: said" yes "$(has "$OUT" "the GitHub API gave no commit")"
+run api-short SHIM_MAIN="" SHIM_ORIGIN="$GH" SHIM_API="aaaaaaa"
+check "a short hash is not a commit: UNKNOWN" yes "$(has "$(line_for "$OUT" "controller commit")" "UNKNOWN")"
+run api-down SHIM_MAIN="" SHIM_ORIGIN="$GH" SHIM_API=""
+check "api unreachable: UNKNOWN, exit 0" "yes 0" "$(has "$(line_for "$OUT" "controller commit")" "UNKNOWN") $RC"
+: > "$T/before-elsewhere.log"; cp "$T/shim.log" "$T/before-elsewhere.log"
+run api-elsewhere SHIM_MAIN="" SHIM_ORIGIN="git@git.example.test:example-owner/example-repo.git" SHIM_API="$MAIN"
+check "origin not on github.com: UNKNOWN" yes "$(has "$(line_for "$OUT" "controller commit")" "UNKNOWN")"
+asked_api="$(tail -n +"$(( $(grep -c . "$T/before-elsewhere.log") + 1 ))" "$T/shim.log" | grep -c 'api.github.com' || true)"
+check "origin not on github.com: the API is never asked" 0 "$asked_api"
+run api-injected SHIM_MAIN="" SHIM_ORIGIN='https://github.com/example-owner/example-repo/../../other?x=1' SHIM_API="$MAIN"
+check "an origin that is not owner/repo is not sent anywhere" yes "$(has "$(line_for "$OUT" "controller commit")" "UNKNOWN")"
+run git-works SHIM_ORIGIN="$GH" SHIM_API="$OTHER"
+check "git answers: the API is not consulted" yes "$(has "$(line_for "$OUT" "controller commit")" "PASS")"
 run moved SHIM_MAIN="$OTHER"
 check "main moved on: FAIL"             yes "$(has "$OUT" "running aaaaaaa, but origin/main bbbbbbb22222")"
 check "main moved on: migrations line says the checkout is not main" yes "$(has "$OUT" "local checkout aaaaaaa, which is NOT origin/main bbbbbbb")"
@@ -298,6 +333,8 @@ echo "read-only: every call any scenario made"
 unexpected="$(grep -v \
     -e '^git ls-remote origin refs/heads/main$' \
     -e '^git rev-parse HEAD$' \
+    -e '^git remote get-url origin$' \
+    -e '^curl GET https://api.github.com/repos/example-owner/example-repo/commits/main $' \
     -e '^docker info$' \
     -e '^docker inspect -f [^ ]* talos-[a-z0-9-]*$' \
     -e '^docker logs --since [^ ]* talos-controller$' \
