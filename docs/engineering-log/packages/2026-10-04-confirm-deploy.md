@@ -133,3 +133,16 @@ another commit, answers without a commit, is unreachable, a non-GitHub
 origin (the API is never asked), a malformed origin, and that the API is not
 consulted when git answers.
 
+## The three edits left out, added 2026-10-05
+
+`confirm-deploy` is in `.PHONY`; `docs/deployment.md` has a "Confirming a
+deploy" section; and `quality.yml`'s lint job runs
+`scripts/tests/confirm-deploy-test.sh`, so a change to the script is now
+checked on every pull request.
+
+Writing the document section found the neighbouring one wrong, and it is
+corrected in the same change: "Unified Health Check" showed a `/health` body
+with `version` and a `checks` object, and described `/health` as the detailed
+view. Measured on the live controller: `/health` answers `{"status":"ok"}`
+and nothing else; the per-subsystem view is `/ready`.
+
