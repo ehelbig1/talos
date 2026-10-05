@@ -176,7 +176,8 @@ hiccup cannot restart the pod.
 ### Confirming a deploy
 
 After `git pull && make up`, one read-only command answers "is the commit on
-`main` the one that is running, and is the stack healthy?":
+`main` the one that is running, is the stack healthy, and did that commit
+pass its checks?":
 
 ```bash
 make confirm-deploy
@@ -193,6 +194,7 @@ only when a check FAILS:
 | migrations | every migration file of the LOCAL checkout has a successful row |
 | controller log | no ERROR line since the controller started |
 | MCP tools/list | the tool list answers, with a count |
+| checks on main | the newest `quality.yml` run of the commit `origin/main` points at: PASS when it passed, FAIL (with the jobs that did not pass and a link) when it did not, UNKNOWN while it is running or when the commit has no run. Read from the GitHub API without a credential. |
 
 UNKNOWN means the check could not be made (the script says why) and is not
 a pass. When `git ls-remote` cannot reach the remote — a locked SSH agent —
@@ -202,6 +204,12 @@ says so.
 A commit mismatch is a FAIL even when the commits in between change nothing
 that runs (documentation, CI, tests): the check compares commits, not their
 effect.
+
+`checks on main` is worth reading BEFORE `git pull && make up` as well: every
+commit that lands on `main` gets one full `quality.yml` run, a few minutes
+after the merge, and nothing else puts its result in front of you. A FAIL
+there means `main` holds a commit whose tests, lints or advisory scans did
+not pass — two pull requests that each passed alone can do that.
 
 ## Graceful Degradation
 

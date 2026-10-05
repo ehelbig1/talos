@@ -24,17 +24,45 @@ appended to `CLAUDE.md` by nearly every change.
 | Event | When | What it proves |
 |---|---|---|
 | `pull_request` | every push to a PR against `main` | the change, on its branch |
-| `merge_group` | a PR enters the merge queue | the change on top of everything queued ahead of it — the exact commit that lands on `main` |
+| `push` to `main` | a pull request merges | the commit that landed, as it stands on `main` — every job, whatever the diff |
 | `schedule` | nightly | the tree against a moving world (advisories, upstream images) |
 | `workflow_dispatch` | by hand | anything |
+| `merge_group` | never: no merge queue is configured | — |
 
-There is no `push: main` run. The commit the merge queue tests is the commit
-that lands, so `main-publish.yml`'s gate and `scripts/publish-images.sh`
-(`gh run list --commit <sha>`) still find a green run for every `main` SHA.
+### Every commit on `main` gets one full run
+
+A pull-request run tests the change merged into `main` as `main` was when the
+run started. `main` does not require a branch to be up to date, so two pull
+requests that each pass can break `main` together. The `push` run is where
+that shows: one full run per commit, started by the merge.
+
+It runs every job, not only the ones the commit's diff reaches. "The run for
+this commit passed" has to mean the tree passed; a path-gated run of a
+documentation commit would be green on top of a broken Rust tree. That run is
+also what `main-publish.yml`'s gate and `scripts/publish-images.sh`
+(`gh run list --commit <sha>`) look up, and it keeps `main`'s build caches
+current without waiting for the nightly run.
+
+**It does not block anything.** The merge has happened by the time it runs.
+It is seen in two places: GitHub mails the person who merged when it fails,
+and `make confirm-deploy` prints it as `checks on main` — PASS, FAIL with the
+jobs that did not pass, or UNKNOWN while it is still running. Look at that
+line before deploying `main` or starting work on top of it.
+
+**Why this is not a merge queue.** On 2026-09-25 the `push` trigger was
+removed and a merge queue was to test the commit that lands. The queue was
+never configured. Measured 2026-10-05: zero `merge_group` runs in the
+workflow's history; of the last 30 commits on `main`, 2 had any run (both
+nightly); and the nightly run on `main` had failed on 6 of its last 9 nights
+(4 on a frontend advisory, 2 on a test) with nothing showing it. The
+`merge_group` trigger is kept so that enabling a queue needs no workflow
+change; if one is enabled, remove `push`.
 
 `cancel-in-progress` applies to `pull_request` runs only: a new push to a PR
-supersedes its old run, but a queue or nightly run is never cancelled
-underneath the thing waiting on it.
+supersedes its old run. A run on `main` is never cancelled, and each `push`
+run has its own concurrency group (its commit): with one group per branch,
+GitHub keeps one run going and one pending, and a third merge would drop the
+pending one — the defect this trigger had before 2026-09-25.
 
 ## One required check: `Quality gate`
 
@@ -95,7 +123,8 @@ same pull request, and counts against the repository's 10 GB limit.
 Every `Swatinem/rust-cache` step carries `save-if` with the workflow's
 `CACHE_SAVE` value, which is true only when the run's ref is
 `refs/heads/main` — the nightly `schedule` run, or a `workflow_dispatch` on
-main. Pull-request and merge-queue runs restore that cache and save nothing.
+main, and the run each merge gets. Pull-request runs restore that cache and
+save nothing.
 
 * **A new job that caches must carry the same `save-if`.** One job saving on
   pull-request refs is enough to evict main's caches again.
@@ -209,19 +238,17 @@ changes only for a rule every future session must follow.
 
 These live in GitHub, not in the tree:
 
-1. **Settings → Rules → Rulesets** (or Branches → branch protection) for
-   `main`: enable **Require merge queue**. Merge method: squash. The defaults
-   for build concurrency and group size are fine to start.
-2. Under **Require status checks to pass**, require exactly one check:
-   **`Quality gate`**. Remove the individual job names if they are listed — a
-   path-gated job that is skipped would otherwise block every PR it does not
-   apply to.
-3. Turn **off** "Require branches to be up to date before merging". The merge
-   queue is what guarantees a PR is tested on top of the current `main`; the
-   up-to-date rule is what made every open PR rebase and re-run after each
-   merge.
+As they stand (read 2026-10-05):
 
-Until the merge queue is on, PRs still get their `pull_request` run and
-`Quality gate`, but no run is bound to the squash commit on `main`, so the
-publish gate needs `--skip-ci-check` / `skip_ci_check` for a SHA merged
-without the queue.
+1. Branch protection for `main` requires exactly one check, **`Quality
+   gate`**. Do not list the individual job names — a path-gated job that is
+   skipped would block every PR it does not apply to.
+2. "Require branches to be up to date before merging" is **off**. On, it made
+   every open PR rebase and re-run after each merge (one PR needed six runs).
+   Off, a PR can merge on a run made against an older `main`; the `push` run
+   above is what catches the result.
+3. No merge queue. If one is enabled later (squash; `Quality gate` required),
+   remove the `push` trigger from `quality.yml` — the queue's run is already
+   on the commit that lands.
+4. "Allow auto-merge" is **on** (2026-10-05): a pull request can be set to
+   merge by itself once `Quality gate` passes.

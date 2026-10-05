@@ -8,22 +8,42 @@ name: Quality (heavy gates)
 # How a change moves through it (docs/ci.md has the full picture):
 #   * pull_request — every push to a PR branch; a newer push cancels the older
 #     run. Job groups the diff cannot affect are skipped (`changes`).
-#   * merge_group  — the merge queue runs it ONCE on the merge commit that will
-#     land on main; that run is the per-SHA green run the publish gate reads.
+#   * push to main  — every commit that lands on main, everything,
+#     unconditionally; that run is the per-SHA run the publish gate and
+#     `make confirm-deploy` read.
 #   * schedule / workflow_dispatch — everything, unconditionally.
+#   * merge_group   — inert: no merge queue is configured for `main`.
 # Branch protection requires ONE check: "Quality gate" (the `gate` job).
 on:
   pull_request:
     branches: [main]
-  # The merge queue is the ONE run a change gets on the tree it will become
-  # (2026-09-25). The queue builds the merge commit that lands on main, so its
-  # run is bound to main's SHA — which is what the publish gate
-  # (`gh run list --commit <sha>`) looks up. That replaces `push: main`, which
-  # re-ran the full suite on a tree the PR run had just tested and, with
-  # cancel-in-progress, cancelled itself when merges landed close together
-  # (2 of 5 main runs on 2026-09-25, leaving those SHAs with no green run).
-  # Requires the repository's merge queue to be enabled for `main` with
-  # "Quality gate" as the required check — see docs/ci.md.
+  # EVERY COMMIT ON MAIN GETS ONE RUN, ON THE TREE IT IS (2026-10-05).
+  #
+  # On 2026-09-25 this trigger was removed in favour of the merge queue, which
+  # was to test the commit that lands. No merge queue was ever configured:
+  # measured 2026-10-05, zero `merge_group` runs in this workflow's history,
+  # and of the last 30 commits on main 2 had any run of this workflow (both
+  # from the nightly). So nothing tested a commit as it stands on main until
+  # up to a day later, and the publish gate (`gh run list --commit <sha>`) had
+  # no run to find.
+  #
+  # A pull-request run tests the change merged into main AS MAIN WAS when the
+  # run started. Two pull requests that each pass can still break main
+  # together; this run is where that shows, within one run of the merge.
+  #
+  # It runs EVERYTHING (the `changes` job's default arm), not only what the
+  # commit's diff touches: "the run for this commit passed" must mean the tree
+  # passed. A path-gated run on a documentation commit would be green on top
+  # of a broken Rust tree.
+  #
+  # What went wrong with this trigger before is handled in `concurrency`
+  # below: each push run has its own group, so a later merge can neither
+  # cancel it nor push it out of the queue.
+  push:
+    branches: [main]
+  # Kept so that enabling a merge queue for `main` needs no workflow change.
+  # Inert until then. If a queue is ever enabled, remove `push` above: the
+  # queue's run is already on the commit that lands.
   merge_group:
   schedule:
     - cron: "0 7 * * *" # nightly 07:00 UTC — catches new RUSTSEC advisories within 24h
@@ -46,9 +66,10 @@ env:
   # request refs, and "No cache found" in the first run of a new pull request
   # — every job compiled every dependency from nothing.
   #
-  # Now only `main` saves (the nightly `schedule` run, or a `workflow_dispatch`
-  # on main), and every pull request restores from it. A pull request also
-  # cannot write a cache that another run would restore.
+  # Now only `main` saves (the run each merge gets, the nightly `schedule`
+  # run, or a `workflow_dispatch` on main), and every pull request restores
+  # from it. A pull request also cannot write a cache that another run would
+  # restore.
   #
   # Every `Swatinem/rust-cache` step below carries `save-if` with this value.
   # A new job that caches must carry it too, or it reintroduces the eviction.
@@ -59,17 +80,23 @@ env:
 
 concurrency:
   # Only PR runs cancel each other (a newer push to the branch supersedes the
-  # older run). A merge-queue, nightly or dispatched run is never cancelled:
-  # each is the only run its commit will get.
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # older run). A run on main, nightly or dispatched, is never cancelled: each
+  # is the only run its commit will get.
+  #
+  # A push run's group is its own COMMIT, not the branch. With one group per
+  # branch and no cancelling, GitHub keeps one run in progress and ONE pending:
+  # a third merge arriving while two are queued drops the pending one, and its
+  # commit never gets a run.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ── Which job groups can this change affect? ───────────────────────────────
-  # PR and merge-queue runs skip job groups a change cannot reach (a CLAUDE.md
-  # or frontend-only change does not rebuild the Rust workspace). Skipped jobs
-  # count as passing in the "Quality gate" job below. Nightly and dispatched
-  # runs, and any change to the CI plumbing itself, run everything
+  # PR runs skip job groups a change cannot reach (a CLAUDE.md or
+  # frontend-only change does not rebuild the Rust workspace). Skipped jobs
+  # count as passing in the "Quality gate" job below. Runs on main (each
+  # merge, nightly, dispatched), and any change to the CI plumbing itself, run
+  # everything
   # (scripts/ci-changed-areas.sh).
   changes:
     name: Changed areas
@@ -956,7 +983,7 @@ jobs:
         run: python3 scripts/new-integration.py --self-test
 
   # ── The one required check ──────────────────────────────────────────────────
-  # Branch protection and the merge queue require THIS job only. It passes
+  # Branch protection requires THIS job only. It passes
   # when every job above passed or was skipped as unaffected by the change
   # (see `changes`), and fails on any failure or cancellation — so adding a
   # job above needs no settings change, just an entry in `needs`.
