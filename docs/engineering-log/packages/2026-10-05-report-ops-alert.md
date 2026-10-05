@@ -159,3 +159,18 @@ only ever run on macOS — and fixed with `file_mtime` (GNU form first, digits
 only) and `epoch_utc` (`-r`, then `-d @`), used at all three artifact sites.
 The test now also checks that the date and age are read; it passes on macOS
 and in a `python:3.12-slim` container, and failed there before the fix.
+
+**Follow-up (2026-10-05, after the first escrowed run): step 7 died on
+`VAULT_TOKEN: unbound variable`.** With Vault not drilled, step 5 is skipped,
+and only that step sets `VAULT_TOKEN`; `run_verifier` passed it to both
+verifiers unconditionally. Measured on the live scheduled run
+`drill-20261005T200721Z`: key from escrow, Postgres restore clean, Neo4j
+restore 1922/3091 against a manifest of 1922/3091, then the abort — reported
+to Talos as `bumped (backup-drill|artifact)`. Both verifiers read the Vault
+settings only under `KEK_PROVIDER=vault`, which always drills Vault, so they
+are now passed only when Vault was drilled, and the skip branch no longer
+invents a `VAULT_ADDR`. Checked under the job's own `/bin/bash` 3.2 (an empty
+array under `set -u`). **Stated limit:** `drill-vault-gate-test.sh` stops in
+step 1, so it could not see this and still cannot; reaching step 7 needs the
+scratch containers and the verifier build. The proof is a real drill run,
+which this change has not yet had.
