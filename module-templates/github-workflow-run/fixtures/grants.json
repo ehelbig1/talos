@@ -1,0 +1,5 @@
+{
+  "allowed_hosts": [
+    "api.github.com"
+  ]
+}

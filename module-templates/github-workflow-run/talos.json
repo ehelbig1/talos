@@ -1,0 +1,86 @@
+{
+  "name": "github-workflow-run",
+  "version": "v1.0.0",
+  "display_name": "GitHub: newest workflow run",
+  "description": "Read the newest FINISHED run of one GitHub Actions workflow on one branch and say whether it passed. OUTPUT: {provider, repo, workflow, branch, state, run: {id, number, event, conclusion, head_sha, branch, url, title, created_at, finished_at}}. state is failing (failure, timed_out, startup_failure), passing (success), other (cancelled, skipped, neutral and anything newer) or none (no finished run on that branch; `run` is absent). OPS ALERT: with ALERT true (the default) a failing run raises or bumps ONE rolling ops alert per repo/workflow/branch (source github-actions, severity hint from SEVERITY, default high) and a passing run resolves it; other leaves it alone. The alert records the state; it does not tell anyone — put a compose node after this one to decide when to notify (for example once per run). A run still in progress is never read as finished. CREDENTIALS: none for a public repository (GitHub allows 60 unauthenticated requests an hour per address, so poll no more often than every few minutes); for a private repository or a higher limit set AUTH_HEADER to a vault:// reference. A non-2xx answer fails the node with the status only. GRANTS: installs with api.github.com and GET.",
+  "category": "Integration",
+  "capability_world": "http-node",
+  "allowed_hosts": [
+    "api.github.com"
+  ],
+  "allowed_methods": [
+    "GET"
+  ],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 1,
+    "bytes_per_item": 13000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 3.0
+  },
+  "config_schema": {
+    "type": "object",
+    "required": [
+      "REPO",
+      "WORKFLOW"
+    ],
+    "properties": {
+      "REPO": {
+        "type": "string",
+        "description": "owner/name of the repository."
+      },
+      "WORKFLOW": {
+        "type": "string",
+        "description": "The workflow's file name (quality.yml) or its numeric id."
+      },
+      "BRANCH": {
+        "type": "string",
+        "default": "main"
+      },
+      "ALERT": {
+        "type": "boolean",
+        "default": true,
+        "description": "Raise and resolve the rolling ops alert."
+      },
+      "SEVERITY": {
+        "type": "string",
+        "enum": [
+          "critical",
+          "high",
+          "medium",
+          "low"
+        ],
+        "default": "high",
+        "description": "Severity hint for the ops alert when a run fails."
+      },
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "Optional. 'Bearer vault://<path>' for a private repository or a higher rate limit. Grant the path with update_module_secrets."
+      },
+      "TIMEOUT_MS": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 30000,
+        "default": 10000
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Name the workflow",
+      "detail": "Set REPO and WORKFLOW (and BRANCH if it is not main)."
+    },
+    {
+      "step": 2,
+      "title": "Decide who is told",
+      "detail": "This node only records the state as an ops alert. To be notified once per failed run, follow it with a compose node that remembers the last run it reported, and a notify-* adapter (docs/notification-contract.md)."
+    },
+    {
+      "step": 3,
+      "title": "Schedule it",
+      "detail": "Every 5 to 15 minutes is enough; unauthenticated requests are limited to 60 an hour per address."
+    }
+  ]
+}

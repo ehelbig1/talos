@@ -1,0 +1,5 @@
+{
+  "REPO": "example-owner/example-repo",
+  "WORKFLOW": "quality.yml",
+  "BRANCH": "main"
+}
