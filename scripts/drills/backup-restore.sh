@@ -1497,7 +1497,8 @@ record_kind postgres 1
 # ── 5. Restore Vault into scratch and unseal it ───────────────────
 if [[ "$DRILL_VAULT" == "off" ]]; then
     log "[5/8] vault: not drilled (KEK_PROVIDER=$KEK_PROVIDER_MODE does not use it)"
-    VAULT_ADDR="http://127.0.0.1:8200"
+    # No Vault address or token exists to hand on: the verifiers read them
+    # only under KEK_PROVIDER=vault, which always drills Vault.
 else
 log "[5/8] restoring vault + unsealing"
 docker volume create "$SCRATCH_VAULT_VOLUME" >/dev/null
@@ -1889,12 +1890,17 @@ EXPECT_MIGRATION="${MIGRATION_VERSIONS##*,}"
 
 run_verifier() {
     local bin="$1"; local label="$2"
+    # The Vault settings exist only when step 5 drilled Vault; the verifiers
+    # read them only under KEK_PROVIDER=vault, which always does.
+    local vault_env=()
+    if [[ "$DRILL_VAULT" == "on" ]]; then
+        vault_env=(VAULT_ADDR="$VAULT_ADDR" VAULT_TOKEN="$VAULT_TOKEN"
+                   VAULT_TRANSIT_KEY_NAME="${VAULT_TRANSIT_KEY_NAME:-talos-kek}")
+    fi
+    env ${vault_env[@]+"${vault_env[@]}"} \
     DATABASE_URL="$DATABASE_URL" \
     TALOS_MASTER_KEY="$TALOS_MASTER_KEY" \
     KEK_PROVIDER="$KEK_PROVIDER_MODE" \
-    VAULT_ADDR="$VAULT_ADDR" \
-    VAULT_TOKEN="$VAULT_TOKEN" \
-    VAULT_TRANSIT_KEY_NAME="${VAULT_TRANSIT_KEY_NAME:-talos-kek}" \
     TALOS_DRILL_MIGRATION_VERSIONS="$MIGRATION_VERSIONS" \
         "$bin" || die "$label against the restored stack FAILED — backups not restorable"
     ok "$label passed against the restored stack"
