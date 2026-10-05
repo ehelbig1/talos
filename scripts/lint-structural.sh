@@ -3998,12 +3998,28 @@ if [ "$REPO_SILENT_READ_COUNT" -ne 0 ]; then
 else
     green "✓ no silent try_get().unwrap_or reads workspace-wide (single-line)"
 fi
+# 2026-10-05: 52b and 52c/d take about 1 second instead of 7. Two changes, and
+# neither can change a verdict:
+#   * the walk PRUNES ./target and ./node_modules instead of filtering them.
+#     `-not -path './target/*'` dropped those files from the list but still
+#     walked every directory under them — on a developer checkout a build tree
+#     of ~150,000 files, twice per run. `-prune` on exactly those two paths
+#     lists the same .rs files. (`frontend/node_modules` was never excluded
+#     and still is not. TREE_PRUNE_FIND stays as it is, a filter, as check 75
+#     requires; making the shared list prune would speed every whole-tree
+#     walk from the main checkout and is a change to all of them, not this.)
+#   * each perl pass skips a file that does not contain `try_get`. Both
+#     patterns contain `.try_get` literally, and 52c/d's comment stripping only
+#     deletes text, so such a file cannot produce a hit. 52c/d's per-character
+#     comment scan also skips a line with no `//`, the only thing it looks for.
+# Measured with a developer's build tree present: the check took 7.8 s and
+# takes about 1 s; the old and new passes report identical sets on the real
+# tree and on altered copies (docs/engineering-log/packages/2026-10-05-lint-checks-70-52-64.md).
 # 52b: the same read split across two lines. Line-based grep cannot see it;
 # this per-file perl pass can. Must also be 0 — same rule, same fix.
-REPO_SILENT_READ_ML="$(find . -name '*.rs' \
-        -not -path './target/*' -not -path './node_modules/*' \
+REPO_SILENT_READ_ML="$(find . \( -path ./target -o -path ./node_modules \) -prune -o -name '*.rs' \
         "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
-    | xargs -0 perl -ne 'BEGIN{$/=undef} my @l=split/\n/,$_; for my $i (0..$#l-1){ next if $l[$i]=~/\?/; if ($l[$i]=~/\.try_get(?:::<[^(]*>)?\([^)]*\)\s*$/ && $l[$i+1]=~/^\s*\.unwrap_or/){ print "$ARGV:".($i+1)."\n" } }' 2>/dev/null)"
+    | xargs -0 perl -ne 'BEGIN{$/=undef} next if index($_, "try_get") < 0; my @l=split/\n/,$_; for my $i (0..$#l-1){ next if $l[$i]=~/\?/; if ($l[$i]=~/\.try_get(?:::<[^(]*>)?\([^)]*\)\s*$/ && $l[$i+1]=~/^\s*\.unwrap_or/){ print "$ARGV:".($i+1)."\n" } }' 2>/dev/null)"
 REPO_SILENT_READ_ML_COUNT="$(printf '%s' "$REPO_SILENT_READ_ML" | grep -c . || true)"
 if [ "$REPO_SILENT_READ_ML_COUNT" -ne 0 ]; then
     red "✗ ${REPO_SILENT_READ_ML_COUNT} MULTI-LINE silent try_get().unwrap_or read(s) (must be 0):"
@@ -4051,8 +4067,10 @@ fi
 # `.try_get::<Option<_>, _>("col")?` (NULL still yields None, drift errors), or
 # for a NOT NULL column the plain `.try_get("col")?`. Do NOT re-add a baseline.
 TRYGET_OK_PERL='BEGIN{$/=undef}
+next if index($_, "try_get") < 0;
 my @lines = split /\n/, $_, -1;
 for my $l (@lines) {
+    next if index($l, "//") < 0;
     my $q = 0; my $i = 0; my $cut = -1;
     while ($i < length($l)) {
         my $c = substr($l,$i,1);
@@ -4072,8 +4090,7 @@ while ($code =~ /\.try_get(?:::<(?:[^<>()]|<[^<>()]*>)*>)?\s*\((?:[^()]|\([^()]*
     while ($lo < $hi) { my $m = int(($lo+$hi+1)/2); if ($nl[$m] <= $p) { $lo = $m } else { $hi = $m-1 } }
     print "$ARGV:" . ($lo+1) . "\n";
 }'
-TRYGET_OK_HITS="$(find . -name '*.rs' \
-        -not -path './target/*' -not -path './node_modules/*' \
+TRYGET_OK_HITS="$(find . \( -path ./target -o -path ./node_modules \) -prune -o -name '*.rs' \
         "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
     | xargs -0 perl -ne "$TRYGET_OK_PERL" 2>/dev/null || true)"
 TRYGET_OK_COUNT="$(printf '%s' "$TRYGET_OK_HITS" | grep -c . || true)"
@@ -5194,6 +5211,18 @@ bold "▶ check 64: every tests/*.rs binary is run by a CI runner"
 #       entry names a target that does not exist (cargo's `no test target
 #       named X` — the #567 lesson). 64b's harness partition is now the
 #       classifier's own rule, so it cannot disagree with a list.
+#
+# 2026-10-05: this check calls the classifier 12 times, and each call walked
+# the whole checkout — `rglob("tests")` entered target/ (about 150,000 files
+# in a developer checkout) and, from the main checkout, every agent worktree
+# under .claude/, and only then dropped what it found there. The classifier
+# now prunes those directories during the walk (`tests_dirs()`; its docstring
+# says why the set is the same). With a developer's build tree present the
+# check took 9.5 s and takes 1.6 s; every subcommand's output was compared
+# byte for byte, old against new, on the real tree and on altered copies
+# (docs/engineering-log/packages/2026-10-05-lint-checks-70-52-64.md). Calling
+# the classifier once instead of 12 times would save about another second and
+# was not done.
 CI_GATE_FAIL=0
 QUALITY_YML=".github/workflows/quality.yml"
 INTEGRATION_SH="scripts/test-integration.sh"
@@ -6343,6 +6372,22 @@ echo
 #      talos-registry and it is correct.
 # Opt-out: `// allow-untenanted-natural-key: <reason>` on or within 8 lines
 # above the write.
+#
+# 2026-10-05: the per-table file search runs over a candidate list. It was one
+# `grep -rlE` per mapped table (24 today) across every .rs file in talos-*,
+# controller and worker, about 0.6 s each and 14 of this check's 15 seconds.
+# Now one `grep -rlE 'UPDATE|DELETE|INTO'` over the same tree picks the files
+# that can hold a write at all, one perl read of those files lists which table
+# names each contains (a plain substring test, what `grep -lF <table>` would
+# answer), and the unchanged per-table pattern runs only on a table's own
+# list. This cannot change a verdict: every match of that pattern contains the
+# table name and one of UPDATE / DELETE / INTO literally, and the walk is the
+# same `grep -r` over the same paths, so the files reached and the order they
+# are listed in are the ones the old search produced. If that perl read fails,
+# the check fails and prints no verdict. Measured with a developer's build
+# tree present: 14.6 s before, about 2 s after; the old and new searches
+# report identical violation sets on the real tree and on altered copies (see
+# docs/engineering-log/packages/2026-10-05-lint-checks-70-52-64.md).
 bold "▶ check 70: writes keyed on a per-tenant-unique natural key must constrain the tenant column"
 
 NATKEY_VIOLATIONS=0
@@ -6392,11 +6437,40 @@ for my $t (sort keys %uniq) {
 ')"
 
 natkey_tables="$(echo "$NATKEY_MAP" | cut -d'|' -f1 | sort -u)"
+NATKEY_CANDIDATES=()
+while IFS= read -r f; do
+    [ -n "$f" ] && NATKEY_CANDIDATES+=("$f")
+done < <(grep -rlE 'UPDATE|DELETE|INTO' --include='*.rs' talos-* controller worker 2>/dev/null || true)
+# `<table>\t<file>` for every candidate file that contains the table name, in
+# candidate order: what `grep -lF <table>` would list, for every table in one
+# read of each file. A failure here fails the check and prints no verdict.
+NATKEY_BROKEN=0
+NATKEY_PAIRS=""
+if [ "${#NATKEY_CANDIDATES[@]}" -gt 0 ]; then
+    if ! NATKEY_PAIRS="$(NATKEY_TABLES="$natkey_tables" perl -e '
+        my @t = grep { length } split /\s+/, $ENV{NATKEY_TABLES};
+        for my $f (@ARGV) {
+            open(my $fh, "<", $f) or die "cannot read $f: $!\n";
+            local $/; my $s = <$fh>; close $fh;
+            for my $t (@t) { print "$t\t$f\n" if index($s, $t) >= 0 }
+        }' "${NATKEY_CANDIDATES[@]}")"; then
+        red "✗ check 70 could not read its candidate files — no verdict"
+        NATKEY_BROKEN=1
+        EXIT_CODE=1
+    fi
+fi
 for tbl in $natkey_tables; do
     [ -n "$tbl" ] || continue
-    files=$(grep -rlE "(UPDATE[[:space:]]+${tbl}\b|DELETE[[:space:]]+FROM[[:space:]]+${tbl}\b|INTO[[:space:]]+${tbl}\b)" \
-        --include='*.rs' talos-* controller worker 2>/dev/null \
-        | grep -vE '/tests/|_tests\.rs|/test_support\.rs' || true)
+    files=""
+    NATKEY_TBL_FILES=()
+    while IFS=$'\t' read -r ptbl pfile; do
+        [ "$ptbl" = "$tbl" ] && NATKEY_TBL_FILES+=("$pfile")
+    done <<< "$NATKEY_PAIRS"
+    if [ "${#NATKEY_TBL_FILES[@]}" -gt 0 ]; then
+        files=$(grep -lE "(UPDATE[[:space:]]+${tbl}\b|DELETE[[:space:]]+FROM[[:space:]]+${tbl}\b|INTO[[:space:]]+${tbl}\b)" \
+            "${NATKEY_TBL_FILES[@]}" 2>/dev/null \
+            | grep -vE '/tests/|_tests\.rs|/test_support\.rs' || true)
+    fi
     for file in $files; do
         [ -f "$file" ] || continue
         while IFS='|' read -r maptbl tencols natcols; do
@@ -6443,7 +6517,9 @@ for tbl in $natkey_tables; do
     done
 done
 
-if [ "$NATKEY_VIOLATIONS" -gt 0 ]; then
+if [ "$NATKEY_BROKEN" -eq 1 ]; then
+    : # reported above; no verdict either way
+elif [ "$NATKEY_VIOLATIONS" -gt 0 ]; then
     red "✗ ${NATKEY_VIOLATIONS} write(s) key on a per-tenant-unique natural key with no tenant predicate"
     yellow "  → add the tenant column to the WHERE (or to the ON CONFLICT arbiter)"
     yellow "  → or mark '// allow-untenanted-natural-key: <reason>' for a deliberate system-wide write"
