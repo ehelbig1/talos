@@ -106,10 +106,11 @@ main. Pull-request and merge-queue runs restore that cache and save nothing.
 * The cache holds dependencies, not this workspace's own crates
   (`rust-cache`'s default): cargo decides whether a workspace crate is fresh
   by file time, and a fresh checkout makes every file new.
-* Measured 2026-10-05, first full pull-request run after main was seeded: the
-  unit job 22.8 → 11.4 minutes, the integration shards about 19 → 12–14,
-  clippy about 10 → 4.6. The slowest job of a full run is now an integration
-  shard at about 14 minutes.
+* Measured 2026-10-05 on the first two full pull-request runs after main was
+  seeded: the unit job 22.8 → 11.4 and 14.8 minutes, the integration shards
+  about 19 → 12–14, clippy about 10 → 4.6 and 4.2. The slowest job of a full
+  run went from about 23 minutes to 14–15; the unit job and the shards are
+  now level.
 
 ## The integration job runs as three shards
 
