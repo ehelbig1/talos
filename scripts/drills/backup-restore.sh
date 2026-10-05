@@ -228,10 +228,30 @@ case "$SOURCE_MODE" in
 esac
 
 # ── Output helpers. No ansi codes go to the textfile. ─────────────
-log()  { printf '\033[1;34m▶ [%s] %s\033[0m\n' "$(date -u +%H:%M:%S)" "$*"; }
+# DRILL_STEP is the step the run is in, for the failure alert's title: `log`
+# records the N of every "[N/8] …" line, and step 0b sets it by hand.
+# DRILL_FAIL_REASON is the first `die` message (or how the run ended).
+DRILL_STEP=0
+DRILL_FAIL_REASON=""
+log()  {
+    local m="$*"
+    case "$m" in \[[0-9]/8\]*) DRILL_STEP="${m:1:1}" ;; esac
+    printf '\033[1;34m▶ [%s] %s\033[0m\n' "$(date -u +%H:%M:%S)" "$m"
+}
 ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m⚠ %s\033[0m\n' "$*"; }
-die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; emit_metric failure; exit 1; }
+die()  {
+    printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2
+    [[ -n "$DRILL_FAIL_REASON" ]] || DRILL_FAIL_REASON="$*"
+    emit_metric failure
+    exit 1
+}
+
+# The result also goes to Talos as an ops alert, after the metric — see
+# scripts/lib/drill-ops-alert.sh (best effort: it cannot change the metric or
+# the exit status).
+# shellcheck source=../lib/drill-ops-alert.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/drill-ops-alert.sh"
 
 # ── Textfile metric for Prometheus scrape. ────────────────────────
 # Atomic write via rename. The temp file is created INSIDE the target
@@ -331,12 +351,22 @@ $line"
 }
 
 METRIC_EMITTED=0
+# The run's result, published ONCE: the textfile metric, then the ops alert.
 emit_metric() {
-    local status="$1"; local ts; ts=$(date +%s)
+    local status="$1"
     # `die` emits, then the EXIT trap's incomplete-run check would emit the
     # same failure again. Once is enough and twice reads like two runs.
     (( METRIC_EMITTED == 1 )) && return 0
     METRIC_EMITTED=1
+    write_metric_file "$status"
+    # After the metric, and unable to change it or the exit status: the
+    # function guards every command and always returns 0.
+    drill_report_ops_alert "$status" "$SOURCE_MODE" "$DRILL_STEP" \
+        "${DRILL_FAIL_REASON:-unknown}" "$DRILL_ID"
+}
+
+write_metric_file() {
+    local status="$1"; local ts; ts=$(date +%s)
     if [[ ! -d "$TEXTFILE_DIR" ]] || [[ ! -w "$TEXTFILE_DIR" ]]; then
         # Reachable only when metric emission was explicitly waived (the
         # pre-flight makes it fatal otherwise), or when the directory
@@ -546,6 +576,8 @@ cleanup_scratch() {
     # previous run left behind and `last_run`/`last_status` would describe a
     # run that did not happen.
     if (( DRILL_COMPLETE == 0 )); then
+        [[ -n "$DRILL_FAIL_REASON" ]] \
+            || DRILL_FAIL_REASON="aborted before completing (shell status $code)"
         emit_metric failure
         # Only rewrite the status when the shell is claiming success. On the
         # signal path the caller re-raises the signal itself, so forcing an
@@ -566,6 +598,7 @@ IN_SIGNAL=0
 on_signal() {
     local sig="$1"
     IN_SIGNAL=1
+    [[ -n "$DRILL_FAIL_REASON" ]] || DRILL_FAIL_REASON="interrupted by $sig"
     printf '\033[1;33m⚠ caught %s — tearing down scratch stack\033[0m\n' "$sig" >&2
     cleanup_scratch
     trap - "$sig"
@@ -636,6 +669,7 @@ if ! mkdir -p "$TEXTFILE_DIR" 2>/dev/null || [[ ! -w "$TEXTFILE_DIR" ]]; then
 fi
 
 # ── 0b. Obtain the KEK from ESCROW — never from the live host ─────
+DRILL_STEP=0b
 #
 # THIS IS THE POINT OF THE DRILL, and until 2026-08-13 it was inverted.
 # The line that stood here was:
@@ -967,6 +1001,29 @@ case "$KEK_PROVIDER_MODE" in
     env|vault) ;;
     *) die "TALOS_DRILL_KEK_PROVIDER must be 'env' or 'vault', got '$KEK_PROVIDER_MODE'" ;;
 esac
+
+# Is Vault drilled at all? (2026-10-05) Vault is on the recovery path only
+# when it wraps the root key (KEK_PROVIDER=vault). With `env` nothing in Talos
+# reads Vault — measured: the only reader of VAULT_ADDR is the Vault KEK
+# provider — and the dev compose stack no longer starts Vault unless asked
+# (COMPOSE_PROFILES=vault). Requiring a fresh Vault backup there failed the
+# drill for a component the restore does not need.
+#   auto (default)  drill Vault exactly when KEK_PROVIDER=vault
+#   on              drill it anyway (a deployment that still backs Vault up)
+#   off             skip it — refused with KEK_PROVIDER=vault, where Vault
+#                   holds the key and skipping it would certify nothing
+# A skipped Vault emits NO kind_verified line (that series' own meaning of
+# "not attempted") and the banner reads 2/3 with the reason printed.
+DRILL_VAULT="${TALOS_DRILL_VAULT:-auto}"
+case "$DRILL_VAULT" in
+    auto) if [[ "$KEK_PROVIDER_MODE" == "vault" ]]; then DRILL_VAULT=on; else DRILL_VAULT=off; fi ;;
+    on|off) ;;
+    *) die "TALOS_DRILL_VAULT must be 'auto', 'on' or 'off', got '$DRILL_VAULT'" ;;
+esac
+if [[ "$KEK_PROVIDER_MODE" == "vault" && "$DRILL_VAULT" == "off" ]]; then
+    die "TALOS_DRILL_VAULT=off with KEK_PROVIDER=vault: Vault wraps the root key, so the drill cannot skip it"
+fi
+[[ "$DRILL_VAULT" == "off" ]] && warn "Vault is not drilled: KEK_PROVIDER=$KEK_PROVIDER_MODE does not use it (TALOS_DRILL_VAULT=on to drill it anyway)"
 # Length only. The key itself must never reach a terminal, a log or an issue.
 ok "KEK read from $KEK_SOURCE (${#TALOS_MASTER_KEY} chars; provider '$KEK_PROVIDER_MODE')"
 
@@ -1046,6 +1103,7 @@ if [[ "$SOURCE_MODE" == "artifact" ]]; then
     PG_ARTIFACT=$(ls -1t "$BACKUP_DIR"/talos-*.dump 2>/dev/null | head -1 || true)
     [[ -n "$PG_ARTIFACT" ]] || die "no talos-*.dump in $BACKUP_DIR — nothing to restore
    (the postgres-backup sidecar writes these; check 'docker logs talos-postgres-backup')"
+    if [[ "$DRILL_VAULT" == "on" ]]; then
     VAULT_ARTIFACT=$(ls -1t "$BACKUP_DIR"/vault/vault-*.tar.gz 2>/dev/null | head -1 || true)
     [[ -n "$VAULT_ARTIFACT" ]] || die "no vault-*.tar.gz in $BACKUP_DIR/vault — nothing to restore"
 
@@ -1060,9 +1118,10 @@ if [[ "$SOURCE_MODE" == "artifact" ]]; then
     else
         warn "no manifest beside $VAULT_ARTIFACT — integrity unverified"
     fi
+    cp "$VAULT_ARTIFACT" "$WORK_DIR/vault.tgz"
+    fi
 
     cp "$PG_ARTIFACT" "$WORK_DIR/pg.dump"
-    cp "$VAULT_ARTIFACT" "$WORK_DIR/vault.tgz"
     # Sidecar tarballs are rooted at ./ (the contents of /vault/file); the
     # --source live path below produces vault/file/... instead. Recorded here
     # so step 5 extracts each into the right place.
@@ -1071,10 +1130,12 @@ if [[ "$SOURCE_MODE" == "artifact" ]]; then
     # date is the first thing to look at when a drill result is surprising.
     PG_ARTIFACT_MTIME="$(stat -f %m "$PG_ARTIFACT" 2>/dev/null || stat -c %Y "$PG_ARTIFACT" 2>/dev/null || echo '')"
     PG_ARTIFACT_AGE="$([[ -n "$PG_ARTIFACT_MTIME" ]] && date -u -r "$PG_ARTIFACT_MTIME" +%FT%TZ 2>/dev/null || echo '?')"
+    ok "postgres artifact: $(basename "$PG_ARTIFACT") ($(wc -c < "$WORK_DIR/pg.dump") bytes, taken $PG_ARTIFACT_AGE)"
+    if [[ "$DRILL_VAULT" == "on" ]]; then
     VAULT_ARTIFACT_MTIME="$(stat -f %m "$VAULT_ARTIFACT" 2>/dev/null || stat -c %Y "$VAULT_ARTIFACT" 2>/dev/null || echo '')"
     VAULT_ARTIFACT_AGE="$([[ -n "$VAULT_ARTIFACT_MTIME" ]] && date -u -r "$VAULT_ARTIFACT_MTIME" +%FT%TZ 2>/dev/null || echo '?')"
-    ok "postgres artifact: $(basename "$PG_ARTIFACT") ($(wc -c < "$WORK_DIR/pg.dump") bytes, taken $PG_ARTIFACT_AGE)"
     ok "vault artifact:    $(basename "$VAULT_ARTIFACT") ($(wc -c < "$WORK_DIR/vault.tgz") bytes, taken $VAULT_ARTIFACT_AGE)"
+    fi
 
     # ARTIFACT AGE IS ASSERTED, NOT MERELY PRINTED.
     #
@@ -1128,7 +1189,9 @@ if [[ "$SOURCE_MODE" == "artifact" ]]; then
         ok "$label age ${age_h}h (limit ${MAX_ARTIFACT_AGE_HOURS}h)"
     }
     assert_artifact_fresh "$PG_ARTIFACT_MTIME"    "postgres artifact" "$PG_ARTIFACT"
-    assert_artifact_fresh "$VAULT_ARTIFACT_MTIME" "vault artifact"    "$VAULT_ARTIFACT"
+    if [[ "$DRILL_VAULT" == "on" ]]; then
+        assert_artifact_fresh "$VAULT_ARTIFACT_MTIME" "vault artifact"    "$VAULT_ARTIFACT"
+    fi
 
     # ── The THIRD artifact kind. ──────────────────────────────────
     #
@@ -1278,17 +1341,17 @@ elif [[ "$SOURCE_MODE" == "b2" ]]; then
    This is the whole point of --source b2: there is no usable off-host copy of
    the database right now. Check scripts/offhost-backup/upload.sh, its log at
    ~/.talos/logs/offhost-backup.log, and talos_offhost_backup_failures_total."
-    VAULT_OBJECT="$("$OFFHOST_BIN" fetch --kind vault --dest "$WORK_DIR/vault.tgz")" \
+    [[ "$DRILL_VAULT" == "on" ]] && { VAULT_OBJECT="$("$OFFHOST_BIN" fetch --kind vault --dest "$WORK_DIR/vault.tgz")" \
         || die "could not fetch + decrypt the off-host VAULT archive.
    Without Vault the restored database is ciphertext nobody can read: it holds
-   every OAuth token, and the transit key when KEK_PROVIDER=vault."
+   every OAuth token, and the transit key when KEK_PROVIDER=vault."; }
     # Uploaded artifacts ARE the sidecar tarballs, which are rooted at the
     # CONTENTS of /vault/file — not the vault/file/ prefix a --source live
     # tar carries. Extracting the wrong one yields an empty file backend and
     # a vault that "starts" uninitialised.
     VAULT_TAR_ROOT="contents"
     ok "postgres object: $PG_OBJECT ($(wc -c < "$WORK_DIR/pg.dump") bytes decrypted)"
-    ok "vault object:    $VAULT_OBJECT ($(wc -c < "$WORK_DIR/vault.tgz") bytes decrypted)"
+    [[ "$DRILL_VAULT" == "on" ]] && ok "vault object:    $VAULT_OBJECT ($(wc -c < "$WORK_DIR/vault.tgz") bytes decrypted)"
     # Age was asserted inside the helper against
     # TALOS_OFFHOST_MAX_AGE_HOURS (set above from the drill's own knob), so a
     # stale bucket has already failed the run by this point rather than being
@@ -1308,7 +1371,9 @@ elif [[ "$SOURCE_MODE" == "b2" ]]; then
 else
     log "[1/8] dumping LIVE postgres + vault (--source live)"
     docker inspect "$LIVE_PG_CONTAINER" >/dev/null 2>&1 || die "live postgres container '$LIVE_PG_CONTAINER' not running"
-    docker inspect "$LIVE_VAULT_CONTAINER" >/dev/null 2>&1 || die "live vault container '$LIVE_VAULT_CONTAINER' not running"
+    if [[ "$DRILL_VAULT" == "on" ]]; then
+        docker inspect "$LIVE_VAULT_CONTAINER" >/dev/null 2>&1 || die "live vault container '$LIVE_VAULT_CONTAINER' not running"
+    fi
     LIVE_PG_USER=$(docker exec "$LIVE_PG_CONTAINER" printenv POSTGRES_USER 2>/dev/null || true)
     LIVE_PG_DB=$(docker exec "$LIVE_PG_CONTAINER" printenv POSTGRES_DB 2>/dev/null || true)
     LIVE_PG_PASSWORD=$(docker exec "$LIVE_PG_CONTAINER" printenv POSTGRES_PASSWORD 2>/dev/null || true)
@@ -1319,10 +1384,14 @@ else
             --format=custom --compress=9 --no-owner --no-privileges \
         > "$WORK_DIR/pg.dump" \
         || die "pg_dump failed"
-    docker exec "$LIVE_VAULT_CONTAINER" tar -czf - -C / vault/file > "$WORK_DIR/vault.tgz" \
-        || die "vault tar failed"
-    VAULT_TAR_ROOT="prefixed"
-    ok "live pg.dump ($(wc -c < "$WORK_DIR/pg.dump") bytes) + vault.tgz ($(wc -c < "$WORK_DIR/vault.tgz") bytes)"
+    if [[ "$DRILL_VAULT" == "on" ]]; then
+        docker exec "$LIVE_VAULT_CONTAINER" tar -czf - -C / vault/file > "$WORK_DIR/vault.tgz" \
+            || die "vault tar failed"
+        VAULT_TAR_ROOT="prefixed"
+        ok "live pg.dump ($(wc -c < "$WORK_DIR/pg.dump") bytes) + vault.tgz ($(wc -c < "$WORK_DIR/vault.tgz") bytes)"
+    else
+        ok "live pg.dump ($(wc -c < "$WORK_DIR/pg.dump") bytes)"
+    fi
 fi
 
 # Both other kinds are now PRESENT (step 1 hard-fails if either is missing on
@@ -1330,7 +1399,7 @@ fi
 # dies in step 4 or step 5 the metric says which kind it died on, instead of
 # omitting the line and reading like the artifact was never there.
 record_kind postgres 0
-record_kind vault 0
+[[ "$DRILL_VAULT" == "on" ]] && record_kind vault 0
 
 # ── 2. Build the verifiers BEFORE anything holds real data ────────
 # `cargo run` at verify time was the original shape and it is a trap: the
@@ -1408,6 +1477,10 @@ ok "restore complete with --exit-on-error (no object failed)"
 record_kind postgres 1
 
 # ── 5. Restore Vault into scratch and unseal it ───────────────────
+if [[ "$DRILL_VAULT" == "off" ]]; then
+    log "[5/8] vault: not drilled (KEK_PROVIDER=$KEK_PROVIDER_MODE does not use it)"
+    VAULT_ADDR="http://127.0.0.1:8200"
+else
 log "[5/8] restoring vault + unsealing"
 docker volume create "$SCRATCH_VAULT_VOLUME" >/dev/null
 docker volume create "$SCRATCH_VAULT_LOGS" >/dev/null
@@ -1529,6 +1602,7 @@ else
     VAULT_ADDR="http://127.0.0.1:8200"
     warn "KEK_PROVIDER=$KEK_PROVIDER_MODE — the restored Vault is not on the KEK path here"
 fi
+fi  # DRILL_VAULT
 
 # ── 6. Restore Neo4j into scratch and probe the RESTORED graph ────
 #
@@ -1845,7 +1919,11 @@ printf '\033[%sm║ %-60s ║\033[0m\n' "$BANNER_COLOUR" \
 printf '\033[%sm╚══════════════════════════════════════════════════════════════╝\033[0m\n' "$BANNER_COLOUR"
 printf '  Source:          %s\n' "$SOURCE_MODE"
 [[ "$SOURCE_MODE" == "artifact" ]] && printf '  Postgres backup: %s\n' "$(basename "${PG_ARTIFACT:-?}")"
-[[ "$SOURCE_MODE" == "artifact" ]] && printf '  Vault backup:    %s\n' "$(basename "${VAULT_ARTIFACT:-?}")"
+if [[ "$DRILL_VAULT" == "off" ]]; then
+    printf '  Vault:           not drilled (KEK_PROVIDER=%s does not use it)\n' "$KEK_PROVIDER_MODE"
+elif [[ "$SOURCE_MODE" == "artifact" ]]; then
+    printf '  Vault backup:    %s\n' "$(basename "${VAULT_ARTIFACT:-?}")"
+fi
 # THE THIRD KIND, ALWAYS NAMED. The banner is where an operator decides whether
 # to stop reading, so the state that used to be invisible is printed here rather
 # than only in the caveat block: "verified", "not present" and "present but

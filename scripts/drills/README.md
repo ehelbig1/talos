@@ -53,7 +53,9 @@ What it does:
    migration landed.
 7. Removes every scratch container, volume and network — and asserts
    afterwards that none survived.
-8. Emits the Prometheus textfile metric.
+8. Emits the Prometheus textfile metric, then reports the result to
+   Talos as an **ops alert** — raised on failure, resolved on success
+   (see [The result as an ops alert](#the-result-as-an-ops-alert)).
 
 Exit code:
 - `0` — restore works, verify passes, backups are actually restorable.
@@ -136,6 +138,7 @@ Tunables (all env vars):
 | `TALOS_DRILL_TEXTFILE_DIR` | `~/.talos/metrics/textfile_collector` | Where to write the drill metric. Must be a directory a collector reads. **Not writable ⇒ the drill fails**, unless `TALOS_DRILL_ALLOW_NO_METRIC=1`. |
 | `TALOS_DRILL_LIVE_PG` | `talos-postgres` | Live Postgres container (`--source live` only). |
 | `TALOS_DRILL_LIVE_VAULT` | `talos-vault` | Live Vault container (`--source live` only). |
+| `TALOS_DRILL_VAULT` | `auto` | Whether Vault is drilled. `auto` drills it exactly when `TALOS_DRILL_KEK_PROVIDER=vault` — with `env` nothing in Talos reads Vault, and the dev stack no longer starts it unless `COMPOSE_PROFILES=vault`. `on` drills it anyway; `off` skips it, and is refused with `vault`, where Vault holds the key. A skipped Vault writes no `kind_verified` line and the banner reads 2/3, saying why. |
 | `TALOS_DRILL_LIVE_CONTROLLER` | `talos-controller` | Live controller. Used **only** for the production-environment guard. The KEK is no longer read from it — see below. |
 | `TALOS_DRILL_ESCROW_KEY_CMD` | unset | Command whose stdout is the escrowed `TALOS_MASTER_KEY`. Preferred: the key never lands on disk (it is captured through a pipe, never spooled to a file). Its stderr really does stay attached — it carried a `2>/dev/null` until 2026-08-13, which contradicted the line above it and swallowed both a password-manager prompt and a failing helper's diagnostic. Refused if it names `docker exec`/`docker inspect`/`printenv TALOS_MASTER_KEY`, or if a path-shaped argument resolves inside a checkout or `$BACKUP_DIR`. Setting this **and** `_FILE` is refused. |
 | `TALOS_DRILL_ESCROW_KEY_FILE` | unset | File whose first line is the escrowed `TALOS_MASTER_KEY`. **Refused if it resolves inside a checkout (this one *or* the main clone when you are in a worktree) or inside `$TALOS_DRILL_BACKUP_DIR`** — a key stored beside the ciphertext it unlocks is not encryption. Symlinks are resolved before the check; hard links are not, and cannot be. Setting this **and** `_CMD` is refused rather than resolved by precedence. |
@@ -150,6 +153,10 @@ Tunables (all env vars):
 | `TALOS_DRILL_ALLOW_NO_NEO4J` | unset | Required on a host with **no** `~/.talos/backups/neo4j/` artifacts; without it their absence is fatal. Deliberate: a silent skip would let a dead `neo4j-backup` sidecar produce a green drill that certified two kinds of three. A waived run reports neo4j as NOT VERIFIED and emits no `talos_backup_drill_kind_verified{kind="neo4j"}` series. |
 | `TALOS_DRILL_ALLOW_PRODUCTION` | unset | Required to run when a production environment is detected. Don't. |
 | `TALOS_DRILL_ALLOW_NO_METRIC` | unset | Waive the "metric must be publishable" precondition. Accepts a permanently-firing alert. |
+| `TALOS_DRILL_REPORT_KEY_FILE` | unset | File whose first line is an MCP agent token. Set → the result is reported to `${TALOS_URL}/mcp` with that token; unset → to the dev-only `/mcp/local`. See [The result as an ops alert](#the-result-as-an-ops-alert). |
+| `TALOS_URL` | `http://localhost:8000` | Controller the result is reported to. |
+| `TALOS_DRILL_REPORT_TIMEOUT_SECS` | `10` | Bound on the whole report request. |
+| `TALOS_DRILL_REPORT` | on | `off` sends no report. The metric and exit status never depend on it either way. |
 | `TALOS_OFFHOST_AGE_PASSPHRASE_CMD` | unset | **`--source b2` only.** Command whose stdout is the escrowed `age` passphrase. Same containment as the KEK's `_CMD`: a path-shaped argument resolving inside a checkout or `$BACKUP_DIR` is refused, and setting this **and** `_FILE` is refused rather than resolved by precedence. Bounded by `TALOS_OFFHOST_ESCROW_TIMEOUT_SECS` (default 120), whose expiry kills the whole process group. |
 | `TALOS_OFFHOST_AGE_PASSPHRASE_FILE` | unset | **`--source b2` only.** File whose first line is the escrowed `age` passphrase. Refused if it resolves inside a checkout (this one *or* the main clone from a worktree) or inside `$BACKUP_DIR`. Symlinks resolved first; hard links are not, and cannot be. |
 | `TALOS_OFFHOST_B2_BUCKET` / `_ENDPOINT` / `_REGION` | unset | **`--source b2` only.** The destination. All three or none — a bucket with no endpoint would silently address real AWS S3. |
@@ -407,6 +414,52 @@ read the safety properties above and accept them.
 docker daemon, which K8s pods can't do by default. Port it to
 `kubectl exec` + in-cluster scratch Job patterns. Left as a follow-up
 when Phase 2 onboards — file an RFC before reaching for it.
+
+### The result as an ops alert
+
+From 2026-09-14 the scheduled drill failed every week and nobody was told:
+its result reached only the textfile metric, and the alert on that metric
+goes to an Alertmanager that delivers nowhere. So the drill now also
+reports its result to Talos, through the MCP tool `report_ops_alert`, as an
+ops alert (the `ops_alerts` triage store — `list_ops_alerts`,
+`get_ops_alerts_digest`). Forwarding it to a phone is a separate workflow's
+job.
+
+| Drill result | Call |
+|---|---|
+| failure | raise `source: "backup-drill"`, `dedup_key: "backup-drill\|<--source>"`, `severity_hint: "high"`, title naming the step, e.g. *Backup restore drill failed (source artifact) at step 4/8: restore postgres*. `raw` carries the drill id, the step and the first line of the failure message (DLP-redacted by the controller). |
+| success | the same `dedup_key` with `status_event: "resolved"` |
+
+One alert per restored copy, so a failing `b2` drill and a green `artifact`
+drill do not resolve each other. A repeat failure bumps the one alert, and a
+failure after a green run reopens it.
+
+**Where it is sent:**
+
+| Setting | Endpoint | Auth |
+|---|---|---|
+| `TALOS_DRILL_REPORT_KEY_FILE` set | `${TALOS_URL:-http://localhost:8000}/mcp` | `Authorization: Bearer <first line of the file>` — an MCP agent token. The header is handed to `curl` from a `0600` temp file (`-H @file`), so the token is never on a command line `ps` can show, and the file is removed after the call. A file whose first line is not one header-safe word is refused, not sent. |
+| unset | `${TALOS_URL:-http://localhost:8000}/mcp/local` | none — the dev-only endpoint `make confirm-deploy` also uses; it is disabled in production, so a production host must set the key file. |
+
+The alert belongs to the user the token is bound to (on `/mcp/local`, the
+dev stack's first user).
+
+**Best effort, by construction.** The report runs after the metric file is
+written and can change neither the metric nor the exit status. A report
+that fails — endpoint down, HTTP error, the tool refusing — prints one WARN
+line naming the endpoint and the HTTP status (and `curl`'s exit code when
+there was no response), never a response body and never the key. The whole
+request is bounded by `TALOS_DRILL_REPORT_TIMEOUT_SECS` (default 10).
+`TALOS_DRILL_REPORT=off` turns it off.
+
+**Scheduled runs.** `make drill-schedule` writes `TALOS_DRILL_REPORT_KEY_FILE`
+(the path, never the token) and `TALOS_URL` into the plist when they are set
+in your shell, as it does the escrow source.
+
+Tested by `scripts/tests/drill-ops-alert-test.sh` (fake `curl` on PATH; the
+real drill, failing at its first pre-flight check, keeps its exit status and
+metric with the report endpoint down). The reporter is
+`scripts/lib/drill-ops-alert.sh`.
 
 ### Wiring the metric into Prometheus
 

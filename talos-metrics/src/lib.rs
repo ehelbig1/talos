@@ -2192,12 +2192,14 @@ pub struct TalosMetrics {
     /// named workflow, so there is no per-request refusal to count — see
     /// `DispatchPath`'s own doc, and CLAUDE.md's stated limit.
     pub dispatch_refused_total: CounterVec,
-    /// `ops_alerts` ingest failures from the `__ops_alert__` hook.
-    /// Labels: reason=validation|db|tenancy. Sustained bump means alert
-    /// envelopes emitted by parser modules are being lost.
+    /// `ops_alerts` ingest failures from the `__ops_alert__` hook and the
+    /// `report_ops_alert` MCP tool (both count through
+    /// `envelope::apply_entry`). Labels: reason=validation|db|tenancy|namespace.
+    /// Sustained bump means alert entries are being lost.
     pub ops_alert_ingest_failures_total: CounterVec,
     /// Alerts auto-resolved by a source-signaled recovery
-    /// (`status_event: "resolved"` in the __ops_alert__ envelope).
+    /// (`status_event: "resolved"` in the __ops_alert__ envelope or a
+    /// `report_ops_alert` call).
     pub ops_alert_auto_resolved_total: Counter,
     pub module_payload_encryption_failures_total: CounterVec,
     /// Per-row secret-decrypt failures from `SecretsManager::get_module_secrets`.
@@ -4165,8 +4167,9 @@ impl TalosMetrics {
             prometheus::Opts::new(
                 "talos_ops_alert_ingest_failures_total",
                 "ops_alerts persistence failures from the __ops_alert__ \
-                 hook. Labels: reason=validation|db|tenancy. Sustained bump \
-                 means parser-module alert envelopes are being lost.",
+                 hook and the report_ops_alert MCP tool. Labels: \
+                 reason=validation|db|tenancy|namespace. Sustained bump \
+                 means alert entries are being lost.",
             ),
             &["reason"],
         )?;
@@ -4175,8 +4178,9 @@ impl TalosMetrics {
         let ops_alert_auto_resolved_total = Counter::new(
             "talos_ops_alert_auto_resolved_total",
             "ops_alerts rows resolved by a status_event: 'resolved' signal \
-             from the ingest pipeline (source-reported recovery, e.g. a \
-             Cloud Monitoring incident closing).",
+             from the ingest pipeline or the report_ops_alert MCP tool \
+             (source-reported recovery, e.g. a Cloud Monitoring incident \
+             closing).",
         )?;
         registry.register(Box::new(ops_alert_auto_resolved_total.clone()))?;
 

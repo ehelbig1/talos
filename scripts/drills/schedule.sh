@@ -151,6 +151,19 @@ render_escrow_env() {
         printf '    <key>TALOS_DRILL_ESCROW_TIMEOUT_SECS</key><string>%s</string>\n' \
             "$(xml_escape "$TALOS_DRILL_ESCROW_TIMEOUT_SECS")"
     fi
+    # Where the drill reports its result as an ops alert (README § "The
+    # result as an ops alert"). The PATH of the MCP key file, never the key —
+    # same rule as the escrow source above — and the controller URL. Without
+    # them the unattended run reports to the dev-only /mcp/local endpoint on
+    # localhost:8000, which is right for the dev stack and nothing else.
+    if [[ -n "${TALOS_DRILL_REPORT_KEY_FILE:-}" ]]; then
+        printf '    <key>TALOS_DRILL_REPORT_KEY_FILE</key><string>%s</string>\n' \
+            "$(xml_escape "$TALOS_DRILL_REPORT_KEY_FILE")"
+    fi
+    if [[ -n "${TALOS_URL:-}" ]]; then
+        printf '    <key>TALOS_URL</key><string>%s</string>\n' \
+            "$(xml_escape "$TALOS_URL")"
+    fi
 
     # ── The off-host job's environment. ───────────────────────────────
     #

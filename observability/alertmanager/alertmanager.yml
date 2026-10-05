@@ -94,6 +94,11 @@
 #      `source`, and nothing in the catalog can mint them — JSON_Transform
 #      only navigates and wraps. This needs an "alertmanager-normalize"
 #      module mapping `alerts[].labels/annotations` → `__ops_alert__`.
+#      UPDATE 2026-10-05: the "no other surface" above is no longer true —
+#      the MCP tool `report_ops_alert` is a second door, applying the same
+#      per-entry rules (`envelope::apply_entry`). It does not close B for
+#      Alertmanager: a webhook receiver's body is fixed, and it is not a
+#      JSON-RPC `tools/call`, so the normalizing step is still needed.
 #
 #   C. REPEATS WOULD BE SILENTLY SWALLOWED — the worst of the three, because
 #      it fails while looking healthy. Alertmanager re-notifies on
