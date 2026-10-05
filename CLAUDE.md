@@ -103,230 +103,48 @@ Accepted `__memory_write__` fields:
   run with this flag rather than writing only on change — otherwise a quiet
   day reads as stale. A non-boolean is refused (the write is dropped).
 
-**The envelope obeys the actor's WRITE CEILING (#750).** `actors.max_write_ceiling`
-is ONE control with TWO enforcement surfaces, and until #750 only the worker's
-existed. A module reaches `actor_memory` either by calling `agent_memory::set`
-(refused in the worker by `TalosContext::write_ceiling_refuses`) or by RETURNING
-this envelope, which the CONTROLLER persists on node completion — a route that
-needs **no capability at all**: a `minimal-node` module — whose
-`get_module_info.mutation_profile` is EMPTY, because `write_gated_ops` profiles
-HOST OPS and the envelope is not one — wrote durable memory for a `readonly`
-actor simply by returning a JSON object, and the execution reported success.
-The profile was not wrong so much as SILENT about a real write route, which an
-operator reading "this module mutates nothing" cannot tell apart; both
-`write_gated_ops` and the tool's `note` now say so explicitly.
-Now: the engine applies `talos_workflow_engine::write_ceiling_gate::apply_memory_write_ceiling`
-at node completion AND per pipeline step, using the ENGINE's `max_write_ceiling`
-(already narrowed for a sub-workflow by `bind_subengine_actor_and_ceilings`, so a
-sub-workflow bound to a stricter actor is gated at the stricter ceiling). On
-refusal the envelope is REMOVED (never merely flagged — a flagged envelope is one
-`unwrap_or(false)` away from being honoured) and the engine-authored
-`__memory_write_refused__` `{key, reason, ceiling}` is written in its place; the
-node COMPLETES rather than fails (see the fn's docs for why — the worker path
-returns an error to the GUEST and does not itself guarantee node failure either).
-Like every engine-authored key it is **set-or-REMOVE, never set-or-inherit** — a
-module cannot fabricate a refusal record. The DECISION is
-`talos_workflow_engine_core::write_ceiling_denies(enforced, ceiling)`, shared with
-the worker (whose copy is now a re-export) — do NOT hand-copy it; two paths
-answering one question differently IS the bug. **`TALOS_WRITE_CEILING_ENFORCED`
-must be set on BOTH processes** (the controller cannot read the worker's env);
-`docker-compose.yml` and `values.yaml` now set both, and the chart's old
-"controller side needs no change … Worker-only env" comment was false.
-Defence in depth: `ControllerNodeHook::persist_memory_write_if_present` takes the
-ceiling as a REQUIRED parameter, which is the only gate on `test_module` (that
-tool now resolves the actor's real ceiling instead of hardcoding `Write`).
-Audit parity is in the VOCABULARY (`op = "agent-memory-set"`,
-`policy = "write-ceiling"` — the worker's exact tokens) but NOT the transport:
-the worker's refusals also enter the hash-chained WORM ledger and the controller
-has no `ExecutionLedger` producer, so its refusals reach the `talos_audit`
-tracing target and `talos_memory_write_failures_total{reason="write_ceiling"}`
-only. **Both instruments live on `ControllerNodeHook`; the ENGINE gate reaches
-them by NOTIFYING it.** `NodeLifecycleHook::on_memory_write_refused` is called
-from both engine gate sites and delegates to the single
-`record_memory_write_refusal` that the hook's own in-method gate also calls —
-one recording routine, two gates, no vocabulary drift. That notification is
-load-bearing and was the one part of #750 nothing tested (even
-`CaptureNodeLifecycleHook::MemoryWriteRefused`, added for it, had zero
-consumers): delete it and the gate still gates perfectly while every instrument
-goes permanently silent — a refusal indistinguishable from a write that never
-happened, which is the exact reading the gate exists to remove.
-`controller/tests/write_ceiling_memory_write_tests` now asserts the counter
-moved EXACTLY once and the `talos_audit` event carried the right
-`op`/`policy`/`ceiling`/`key`/`actor_id`/`node_id`, and that a PERMITTED write
-moves neither. Both were verified firing on the live dev controller 2026-09-05
-(`{reason="write_ceiling"} 1`; the WARN in the container log), so those
-assertions are a REGRESSION GUARD proven by mutation, not a reproducer — saying
-so matters more than implying they caught something.
-**And "the `talos_audit` target" is exactly one thing: a target string on an
-ordinary log line.** The controller installs
-`registry().with(EnvFilter).with(fmt::layer()).with(otel_layer)` and no
-per-target layer, so nothing subscribes to, routes, persists or alerts on
-`talos_audit` — ~60 emitters share it as a grep convention that reaches stdout
-and thence container logs. A reader who takes "audit target" to mean a durable
-audit channel over-trusts it in exactly the sentence that contrasts it with a
-WORM ledger. The METRIC is the only machine-readable half, and it is now
-**pre-seeded at 0**: until 2026-09-05 the four `MemoryWriteError::metric_label`
-reasons were seeded and this fifth, literal one was not, so on any controller
-that had not yet refused anything (i.e. after every restart)
-`{reason="write_ceiling"}` was ABSENT — "policy has never declined a write" and
-"the gate is not wired" rendered identically. Deliberately NO alert on it: a
-refusal is the policy working as designed, and the two live rules on this
-counter select `reason="crypto"`/`"db"`, so a refusal cannot page anyone.
-The pipeline-step gate site (`engine_dispatch_pipeline`) is dormant by CONFIG,
-not by omission — every production entry point passes `ChainDispatch::Disabled`
-(see `talos-workflow-engine/tests/chain_dispatch_gate.rs`), so that gate and its
-notification fire only under `run_with_transport`, which no production caller in
-this workspace uses. Routes deliberately NOT gated, for the record: the memory-RPC
-`MemoryOp::Set` handler (`talos-rpc-subscribers`) still TRUSTS the worker's gate
-— an asymmetry that only bites a mixed-config fleet; and operator-invoked writes
-only. Routes deliberately NOT gated, for the record: operator-invoked writes
-(`actor_remember`, `clone_memories`, `scaffold_actor` seeds, the GraphQL memory
-mutations) plus platform-authored ones (`ml_digest`, consolidation/reflection,
-the `upsert_scratchpad_trace` execution trace) are the OPERATOR's or the
-PLATFORM's writes, not the actor's, and the ceiling does not speak to them.
+**The actor's write ceiling covers every route to its data, and each route has ONE gate.**
+`actors.max_write_ceiling` is enforced in three places. All three ask the one
+predicate `talos_workflow_engine_core::write_ceiling_denies` — never hand-copy it.
+* **Host calls, in the worker** — `TalosContext::write_ceiling_refuses`.
+* **A returned `__memory_write__` envelope, in the engine** —
+  `write_ceiling_gate::apply_memory_write_ceiling`, at node completion and per
+  pipeline step, with the engine's ceiling (already narrowed for a sub-workflow).
+  On refusal the envelope is REMOVED and the engine-authored
+  `__memory_write_refused__` `{key, reason, ceiling}` is written in its place
+  (set-or-remove, never inherited from module output); the node completes.
+  `ControllerNodeHook::persist_memory_write_if_present` takes the ceiling as a
+  required argument.
+* **A mutation the controller performs for a worker over signed RPC** —
+  `talos_rpc_subscribers::write_ceiling::gate`: `MemoryOp::Set`/`Delete`,
+  `IntegrationOp::Set`/`Delete` and a mutating `talos.database.query`. The
+  signature proves the sender holds the fleet key, not that it ran a gate. A new
+  controller-served write op goes through this gate (lint check 82). The ceiling
+  read fails CLOSED: no such actor and an unreadable rule both refuse, and the
+  caller is given one reason for both.
 
-**The signed-RPC routes are now gated too (#754).** #750 recorded that the
-memory-RPC `MemoryOp::Set` handler "still TRUSTS the worker's gate". That trust
-rests on an assumption the transport does not support: these requests are
-HMAC-signed under `WORKER_SHARED_KEY`, which is FLEET-SHARED, so the signature
-proves the sender holds a key — not that the sender ran a gate. Measured on
-pristine main with enforcement ON at the controller: a signed `Set` naming a
-`readonly` actor landed a row and the reply said `Ok`. The gate is
-`talos_rpc_subscribers::write_ceiling::gate`, applied at every actor-attributed
-mutation the CONTROLLER performs on a worker's behalf —
-`MemoryOp::Set`/`Delete` (`talos.memory.op`), `IntegrationOp::Set`/`Delete`
-(`talos.integration_state.op`) and a MUTATING `talos.database.query`. It uses
-the SAME `write_ceiling_denies` predicate and the SAME `TALOS_WRITE_CEILING_ENFORCED`
-reader (`write_ceiling_gate::controller_write_ceiling_enforced`) as the #750
-envelope gate; the actor's ceiling comes from
-`talos_actor_repository::read_actor_write_ceiling`, resolved by the SIGNED
-`actor_id` only. **The read is three-valued and fails CLOSED**: `Ok(None)` (no
-such actor) and `Err` (the rule could not be read) both REFUSE, with a
-`write_ceiling_unreadable` reason distinct from the `write_ceiling` policy
-reason — distinct for the OPERATOR (`talos_audit` field + `talos_rpc` outcome
-tag), collapsed for the CALLER, because a reason-split reply would hand a
-holder of the fleet key an actor-EXISTENCE oracle (the same argument
-`caller_facing_unauthorized` makes). **Cost is zero when the flag is off**: the
-`OnceLock` short-circuits before the query, so a default deployment is
-byte-identical. With it on, one PK read of `actors` — measured 1.1 µs
-server-side, 0.43 ms including the host round trip. A per-actor cache was
-considered and REJECTED: a TTL on a security rule is a window in which a
-revoked grant is still honoured, and the measured volume on this path is ~1
-write/week. Enforcement is lint-enforced by **check 82** and pinned equal to
-the worker's op list by
-`write_ceiling::write_ceiling_tests::complement_is_worker_local` — every
-ceiling-gated WORKER op must be classified as controller-served (and gated
-here) or worker-local egress. `talos.state.write` is deliberately NOT gated:
-the worker does not ceiling-gate execution `state` either (it is engine-internal
-durability, not the actor's data), and a controller stricter than the worker is
-the same defect in the other direction. **One finding worth carrying**: the
-controller's `database.query` gate classifies read-vs-mutation from its OWN
-AST, and the first version — `matches!(stmt, Insert|Update|Delete|Merge)` —
-was WRONG. sqlparser 0.53 parses a data-modifying CTE
-(`WITH ins AS (INSERT …) SELECT * FROM ins`) into `Statement::Query`, which
-`controller_permits_data_statement` ADMITS, so a `readonly` actor could have
-smuggled an INSERT past a gate that called it a read. The classifier now walks
-the AST and breaks on any nested non-`Query` statement. The WORKER's twin
-(`sql_stmt_type_is_read_only` over its validator's `stmt_type`) very likely has
-the same hole and is NOT fixed here — the controller is currently the stricter
-of the two for that shape.
-**And the class is wider than this key.** The SAME hook, on the SAME
-module-returned output and the SAME actor binding, also drives
-`__ops_alert__` (→ `ops_alerts`) and `__ml_distill__` (→ ML dataset rows). Both
-take the actor id, both refuse only when it is ABSENT, and neither consults the
-ceiling — i.e. "a module bypasses the ceiling by returning a value" is true of
-three output protocols and #750 gated one.
+What follows from that:
+- `TALOS_WRITE_CEILING_ENFORCED` must be set on BOTH the controller and the
+  worker. `security_audit.write_ceiling_enforcement` exercises both controller
+  gates on every run and reports a deployment that set only one side.
+- A refusal is recorded in one place per gate: the engine notifies
+  `NodeLifecycleHook::on_memory_write_refused` → `record_memory_write_refusal`;
+  the RPC gate counts `talos_rpc_write_ceiling_refusals_total{subject,reason}`
+  (alert `TalosRPCWriteCeilingRefusals`). Do not alert on
+  `talos_memory_write_failures_total{reason="write_ceiling"}` — a refusal there
+  is the policy working.
+- `talos_audit` is a target string on an ordinary log line, not a durable audit
+  channel. Only the worker's refusals reach the hash-chained ledger.
+- Outside the ceiling by decision (2026-09-06): the `__ops_alert__` and
+  `__ml_distill__` output protocols (`talos_security_audit::UNGATED_OUTPUT_PROTOCOLS`),
+  `talos.state.write`, and writes the operator or the platform makes
+  (`actor_remember`, `clone_memories`, consolidation, the execution trace). Do
+  not gate these without new facts.
+- A classifier that decides whether SQL is a read walks the whole statement: a
+  data-modifying CTE (`WITH ins AS (INSERT …) SELECT …`) parses as a query.
 
-**DECIDED 2026-09-06: those two stay OUTSIDE the ceiling, and the reports
-now say so.** #750 left it as "an operator policy call"; the call is that
-`actors.max_write_ceiling` governs the ACTOR's own DATA PLANE — actor_memory,
-integration state, sandbox SQL — and these two are PLATFORM ingestion that takes
-the actor id for TENANCY, not because the rows are the actor's data: one is a
-diagnostic, the other a training-example append. The live evidence is the
-decisive part rather than the argument: of 5 `readonly` actors on this fleet
-exactly ONE is `active`, it is bound to exactly ONE enabled workflow, and that
-workflow's whole purpose is to emit `__ops_alert__` through this hook. Gating
-the protocol would take the only live readonly actor's alert pipeline off the
-air — the intended shape is `readonly` PLUS these protocols, not either-or. The
-refusal that stays is the ABSENT-actor one: no actor is no tenancy principal.
-What changed is the REPORTING, because "enforced" with no scope is read as
-"nothing this actor emits reaches the database": `get_module_info`'s
-`write_gated_ops` note, `set_actor_write_ceiling`'s description and
-`security_audit.write_ceiling_enforcement` (detail + a
-`parts.controller_gate.probe.ungated_output_protocols` array, from the single
-`talos_security_audit::UNGATED_OUTPUT_PROTOCOLS`) all name both protocols.
-`controller/tests/write_ceiling_hook_gate_tests` is a POSITIVE CONTROL: a real
-`readonly` actor's `__ops_alert__` must still land a row, so a future "fix"
-fails loudly (mutation-proved — early-returning from
-`persist_ops_alert_if_present` gives `left: 0, right: 1`). `__ml_distill__` gets
-NO equivalent test and the reason is measured, not asserted:
-`spawn_distill_from_output` short-circuits on the process-global
-`DISTILL_CONTEXT` `OnceLock` that sibling tests in one binary race (check 82's
-own objection), and past it the flow needs an ML MAC key, an embedding provider,
-a model and a dataset. Its half of the decision is pinned at the call site in
-`talos-engine/src/node_hook.rs` and in the shared constant only.
-
-**The control's own REPORTING was two defects behind the control (#760).**
-Two, measured 2026-09-05, and they are the same shape one level up — a
-misleading report about the thing being reported on.
-**(a) `security_audit.write_ceiling_enforcement` described a controller that no
-longer exists.** Its detail said, verbatim, "the enforcing gate lives in the
-worker process, so the controller cannot exercise it from here", and graded
-itself `config_presence`. True when #752 wrote it; false from #750 (the
-`__memory_write__` envelope gate) and #757 (the signed-RPC mutation gate), both
-of which run IN the controller and are PURE functions. So the audit's own
-legend — `round_trip` = "a probe value was pushed through the real primitive and
-the result inspected" — was reachable and unclaimed. `ControllerGateProbe::run()`
-now drives both real chokepoints every run (`probe_envelope_gate` /
-`probe_rpc_gate`, each owned by its gate's crate): a readonly probe must be
-REFUSED and its envelope REMOVED, a write-capable one permitted, an unreadable
-rule refused (fail closed), and an unenforcing deployment must permit
-everything. A broken arm is `Status::Fail` + `RoundTrip` + `CRITICAL`, which
-outranks every fleet finding. **The two halves are now rendered separately**
-(`parts.controller_gate` at `round_trip`, `parts.worker_fleet` at
-`config_presence`) because they are known to different standards and one word
-must misstate one of them; the check's TOP-level `verification` stays **the
-weakest of the facts its `status` rests on**, so `verification_counts` cannot
-over-claim — promoting the whole check because half of it was exercised would be
-the same overstatement in the other direction. Weight stays **0** (#752's three
-reasons stand). New finding it can now make: fleet `all` + controller flag unset
-is a **SPLIT CONTROL** `Warn`, not a `Pass` — the `some`-shaped state in the
-OTHER direction from #757's, where every worker refuses a readonly actor's host
-calls while the controller honours the same actor's returned envelope and its
-signed-RPC mutations. `TALOS_WRITE_CEILING_ENFORCED` must be set on BOTH
-processes and this is the check that can now say whether you did.
-**(b) An RPC refusal was indistinguishable from a routine envelope refusal.**
-#757 correctly said a refusal at the controller "means a worker sent a mutation
-its own gate should have refused — a fleet-config signal worth alerting on,
-unlike #750's envelope refusal", and routed it to `event_kind =
-"rpc_write_ceiling_refused"` plus the per-subject `talos_rpc` outcome tag.
-Measured live: **`talos_rpc` is a TRACING TARGET ONLY** — `curl
-/metrics/prometheus | grep '^talos_rpc'` returns nothing and no RPC counter was
-registered — and the three MEMORY routes folded into
-`talos_memory_write_failures_total{reason="write_ceiling"}`, **the same counter
-and label the routine envelope refusal uses, whose own HELP text says "do not
-alert on it"**, while the integration-state and database routes incremented
-NOTHING. So the fleet-config signal existed as prose and not as a series, and
-the one counter carrying part of it actively instructed operators to ignore it —
-check 58/65's class. Now: `talos_rpc_write_ceiling_refusals_total{subject,
-reason}` (`subject` = the NATS subject, `reason` = `policy` | `unreadable`), all
-six combinations PRE-SEEDED at 0 (absent ≠ zero: `increase(...) > 0` over an
-absent series matches nothing), incremented at the ONE chokepoint
-`write_ceiling::gate` so a new controller-served write op cannot forget it, and
-alerted at `warning`/never-paging by `TalosRPCWriteCeilingRefusals`. The
-`memory_write_failures` increment is KEPT — it answers a different question
-("which actor-memory writes did not land") — and the double count is now stated
-in its HELP text rather than silent. The log keeps the worker's tokens
-(`RefusalReason::as_str`); the metric uses the short pair
-(`RefusalReason::metric_label`), paired by an exhaustive match and pinned by
-`refusal_reason_spellings_stay_paired`.
-**No lint check was added, and that is a measurement, not an omission.** The
-obvious guard — "a refusal chokepoint that logs an `event_kind` must also
-increment a counter" — was measured before it was written: the workspace holds
-**22** `event_kind = "…refus|denied|reject|blocked…"` emitters and **21** have no
-counter within ±20 lines. A check cannot ship at 21, this repo does not re-add
-baselines (check 52's own rule), and the adjacency proxy has known false
-positives besides. So the count stays **84**.
+Before changing any of this, read "The actor write ceiling" in
+`docs/engineering-log/DECISIONS.md`.
 
 Writes that omit `metadata` produce rows with `metadata IS NULL`, which
 pass every filter — the right default for engine-trace style writes that
@@ -388,6 +206,9 @@ here and every session paid, at start-up, for the whole record.
 * **The package record, 2026-09-10 to 2026-09-25** — one title line per package C..EV (signing, tenancy, RLS, DEKs, audit records, budgets, replicas, ceilings, egress, engine routing); the full bullets are in `2026-10-03-package-record.md`
 * **The lint checks' regression narratives** — why checks 74 / 88 / 83 / 65 are specified as they are; compressing the lint entries further was measured and closed
 * **Structural lint checks** — the one-line index of checks 1..97 (check 54 reads it there)
+* **The actor write ceiling** — `actors.max_write_ceiling` on the returned `__memory_write__` envelope and the signed-RPC mutations, the output protocols and routes decided to stay outside it, the `security_audit` probe, the refusal counters
+* **The attempt window** — `attempt_window`, the dispatcher's clamp against the validator's retry envelope, `AttemptFit`, the fleet numbers, what the clamp does not cover
+* **Completed extractions and the May-2026 crate decomposition** — which service, repository or crate each handler and controller module became
 
 ## Sub-workflow dispatch (engine)
 
@@ -578,12 +399,7 @@ introduced per-org v4 per table).
 - **Correction to the line above, 2026-09-24 (package EJ): an empty `allowed_methods` now DENIES every verb.** The base line is left byte-identical for `scripts/check-engineering-log.py`'s losslessness leg, which is why this is a separate line. Two clauses of it are now false: the enforcement points are **FIVE**, not three (`host/http.rs` fetch + fetch_all, `host/graphql.rs`, `host/webhook.rs`, and `host/http_stream.rs`, the last added by EJ because an ungated SSE connect would have left an undeclared module able to egress); and they no longer "read empty as 'allow every verb'" — `talos_workflow_job_protocol::method_permitted` denies on empty, so `allowed_methods` is no longer the odd one out and the stated asymmetry with `allowed_hosts`/`allowed_secrets` is CLOSED. What is UNCHANGED is the retry verdict: `methods_are_read_only` still returns `false` on empty and an undeclared module still earns 0 retries — for the opposite reason, that it makes no HTTP call at all, so there is nothing for a transient retry to re-send.
 - **Pipeline steps retry too.** `execute_pipeline`'s per-step loop honors per-step `max_retries` gated by the transient classifier — do not re-hardcode step `max_retries: 0`. The transient classifier must match BOTH `"timeout"` AND `"timed out"` (the worker's own step-timeout message uses the latter).
 - **A controller-dispatched job is NOT retried in-process by the worker (2026-09-25).** `RetryPolicy` (`talos-worker-runtime`) has no `Default`: an in-process retry re-runs the WHOLE module on guest-influenced error text ("timeout", "503") and looks at nothing else, and it multiplied the controller's method-aware re-dispatch. The NATS path passes `RetryPolicy::controller_dispatched()` (zero), pinned at its call site by `worker/src/retry_policy_pin.rs`; `talos_workflow_engine_nats::execute_job_with_retry` is the ONLY retry loop for a dispatched job. The embedded rehearsal surfaces (`run_sandbox`, `test_module`, scratch sessions, module replay, GraphQL `testModule`) still pass `RetryPolicy::in_process_transient()`, which is NOT method-aware — recorded, not changed.
-- **The attempt-window arithmetic has ONE home: `talos_workflow_engine_core::attempt_window` (2026-09-06).** How much of a workflow's wall-clock budget one dispatch attempt may occupy is asked on two surfaces — the DISPATCHER (`talos_workflow_engine_nats::execute_job_with_retry`, where a wrong answer is a real cancellation) and the VALIDATOR (`talos_workflow_validation::retry_envelope_overrun`, where a wrong answer is advice an operator acts on). They had two implementations. The dispatcher's: `min(allowance, remaining − BUDGET_RESERVE_SECS(2))`, where `allowance = timeout_secs + TOKIO_WRAP_GRACE_SECS(5)`. The validator's: `envelope_secs <= budget_secs`. **They disagree by 7 s at the boundary**, so a node configured at 120 s inside a 120 s budget was reported as fitting and clamped to 117 s (`as_secs()` truncation) on attempt 1 of every run — measured live on the dev fleet: **9 such nodes across 3 ACTIVE workflows, 2 326 clamped attempts per 48 h** (`pa-ask-email` 1848, `pa-followup-approval-notifier` 382, `ops-critical-notifier` 96), every one on `attempt=1` of a run that then completed in under a second. `clamp_attempt_timeout`, `AttemptWindow` and the three constants MOVED to core (they are not copies — the dispatcher re-imports, `dispatch_allowance_secs` states the `+ 5` once), and the validator now SIMULATES the configured attempt sequence through the same `attempt_window_for_remaining`. Do not re-derive either half.
-  - **Three outcomes, and the middle one was unsayable before.** `AttemptFit::Full` (silent) / `Clamped` (every attempt starts, at least one is cut short — a real finding, lower severity, category `attempt-window-clamped`) / `Truncated` (an attempt is never dispatched — the historical `retry-envelope` category). Fleet effect, measured: the old check reported **7** nodes; the new one reports **16** — 4 truncated (a strict SUBSET of the old 7) and 12 clamped, of which 3 were previously reported as the SEVERE finding (correctly downgraded: one 4 x 120 s node in a 450 s budget gets all four of its attempts, the fourth cut to 38 s) and 9 were reported as nothing at all. `ValidationSeverity` has only `Error`/`Warning`, so "lower severity" is expressed in the category and the wording; adding an `Info` variant would move every counter and response shape that reads a `ValidationResult` and was deliberately NOT done. `max_retries_within_budget` searches the same simulation, so it stays the exact inverse — and it MOVED by one retry on shapes the old formula's slack fitted an extra attempt into (`(120, 500, 240)`: 1 → 0).
-  - **The prose in BOTH crates was one release behind the code.** `describe_retry_envelope_overrun` and `talos-mcp-handlers`' `describe_retry_bound` both said *"the retry loop has no view of the workflow deadline … the whole execution is dropped — discarding every sibling node that had already finished"*. False since #686 (2026-08-27, the same day that text was written): a clamped attempt that times out, and an attempt refused for want of budget, are both ORDINARY NODE FAILURES the engine routes (error edges, `continue_on_error`, DLQ) with sibling results kept. A single-string grep finds only ONE of the two — the handler's copy is reworded — so a fix to one crate really is a drift.
-  - **The residual, stated rather than dropped.** The budget is still an OUTER `tokio::time::timeout` that drops the reactor future, and `BUDGET_RESERVE_SECS` makes the failure RECORDING likely, not certain: `handle_node_failure` awaits a `node_failed` INSERT, the DLQ write and a sibling reap, and a slower failure path still loses the race. The clamp covers module dispatch ONLY — `sub_workflow`/judge/ensemble nodes awaited inline are unclamped (the validator skips `system:*` nodes, so it claims nothing about them), and **`engine_dispatch_pipeline.rs` passes `deadline: None`**, so the chain path is unclamped too — dormant by config (`ChainDispatch::Disabled` at every production entry point) and RECORDED, not fixed.
-  - **The clamp WARN is now attributed by cause.** `DispatchJob::budget_secs` (stamped beside `deadline` from the same `secs` on `ExecutionProgress`) feeds `clamp_cause`: `Configuration` (the allowance could never have fitted, even at t=0 — a graph problem `validate_workflow` now reports) logs at **debug**; `Consumption` and `Unknown` stay **warn**. `budget_secs` is ATTRIBUTION ONLY — it never enters the clamp, so `None` changes no timing, and `Unknown` is never demoted. **No metric was added**, and that is a measurement: `talos-workflow-engine-nats` has no `talos-metrics` dependency (it is reachable only transitively through `talos-workflow-engine`, which Rust does not permit), so a series would cost a new direct dependency edge — recorded and declined, which means the consumption clamp remains prose-only and cannot be alerted on.
-  - **No lint was added, and here are the numbers so nobody re-measures.** "Clamp constants or `clamp_attempt_timeout` defined outside core" reports **1 file** on pristine main and 0 after — population ONE, which is the bar this repo does not ship at; the structural answer (one `pub` home, the constants deleted from the dispatcher) is already stronger. "An `envelope_secs <= budget` comparison outside core" reports 2 lines on main of which 1 is a legitimate test assertion (50% precision) and **3 on the FIXED tree, all of them the new comments explaining the fix** — check 73's self-report trap. `--count` stays **86**. Two mutations are open and measured SURVIVORS, both in the loud direction: re-inlining `job.timeout.as_secs() + 5` at the dispatch site is behaviourally identical and no test can see it (the guard is that the constant no longer exists in that crate), and passing `None` for `budget_secs` merely restores the WARN.
+- **The attempt-window arithmetic has ONE home: `talos_workflow_engine_core::attempt_window`.** How much of a workflow's wall-clock budget one dispatch attempt may occupy is asked by the dispatcher (`talos_workflow_engine_nats::execute_job_with_retry`, where a wrong answer is a real cancellation) and by the validator (`talos_workflow_validation::retry_envelope_overrun`, where it is advice an operator acts on). Both call `attempt_window_for_remaining` / `clamp_attempt_timeout`; do not re-derive either half. The validator reports `AttemptFit::Full` (silent), `Clamped` (every attempt starts, one is cut short — category `attempt-window-clamped`) or `Truncated` (an attempt is never dispatched — category `retry-envelope`). A clamped attempt that times out, and an attempt refused for want of budget, are ordinary node failures the engine routes. `DispatchJob::budget_secs` only attributes the clamp log line and never enters the clamp. The clamp covers module dispatch only — not `system:*` nodes awaited inline, not the chain path. The numbers, the residual and the lints measured and not written: "The attempt window" in `docs/engineering-log/DECISIONS.md`.
 
 - **Fuel accounting reads the signed result, never the output (2026-09-29).** `module_executions.fuel_consumed` and `execution_cost_rollup` (the hourly fuel budget's table) have ONE writer, `talos_cost_attribution`, fed per VERIFIED attempt by the NATS dispatcher's `FuelSink` and, for module-bound dispatch, by the webhook router and result observer; each reads `talos_workflow_job_protocol::spent_fuel`. Do not read `__fuel_consumed__` out of a node output for accounting: the worker can stamp it only into a JSON object, and a failed attempt has no output. A learner over the rollup reads `outcome = 'completed'` only; a budget reads every row.
 - **New signed wire fields use the conditional-append idiom.** When adding a field to `JobRequest` / `PipelineJobRequest` / `PipelineStep` that must be HMAC-bound, append it to `signing_payload` ONLY when non-default, guarded so an all-default message is **byte-identical** to the pre-field wire format (the deploy-compat invariant). Follow the existing `:egress=` / `:retries=` / `:idem=` / `:attempt=` segments (appended at the END, `#[serde(default, skip_serializing_if=…)]` on the struct field). Add the field to the wire-format snapshot + security test constructors in the same change — and add a NON-default snapshot too, with its own expected JSON and MAC hex: the all-default snapshot proves the field ships inert and says nothing about the bytes the field actually adds.
@@ -725,33 +541,9 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
   remaining content is graph-mutation orchestration that already
   uses helpers — not a structural target.
 
-**Completed extractions (follow the pattern):**
-- `AdvancedRepository`, `AnalyticsRepository`, `ExecutionRepository` — repository-per-domain.
-- `WorkflowRepository` — 45+ methods. `mcp/graph.rs` handlers use `fetch_graph_json` / `save_graph_json` helpers that delegate here. Tag/embedding methods added 2026-04-16.
-- `ActorRepository` — `get_actor_full_summary` (LATERAL join consolidation), approval policies, action log, budget, secret grants, status transitions. `resolve_actor_via_repo` used by all 20+ handlers. `spawn_log_action` + `spawn_log_admin_event` lifted here in May-2026.
-- `ModuleRepository` — ref counting, delete/batch-delete, rename, org sharing. Created 2026-04-16.
-- `ParallelWorkflowEngine` — dispatcher unification + `build_encrypted_secrets()` helper (consolidates 5-step secret pre-fetch; fixed loop-node dispatch gap 2026-04-16).
-- `SubworkflowContractService` — handler extraction model. Use as the template for future thin-handler extractions.
-- `LlmClient::with_vault` — vault-first key resolution with env fallback.
-- `WorkflowCreationService` (May-2026) — pulled out of `handle_create_workflow_from_description` (1,104 → 173 LoC). Cross-protocol consumer: same service backs MCP and the GraphQL `createWorkflowFromDescription` mutation.
-- `HotUpdateService` (May-2026) — pulled out of `handle_hot_update_module` (530 → 78 LoC). Pure-helper-tested transformation logic (`resolve_source`, `wrap_source_with_module_macro`, fuel cascade, world-short mapping); typed `HotUpdateError` enum maps cleanly to JSON-RPC codes.
-- `ExecutionOrchestrationService` (r295, May-2026) — pulled out of `handle_trigger_workflow` (493 LoC), `handle_retry_execution` (137 LoC), `handle_replay_execution` (190 LoC), `handle_replay_execution_with_input` (197 LoC) — ~1020 LoC of orchestration across `executions.rs` + `workflows.rs` collapsed into one cross-protocol service. Same `Arc` is consumed by the MCP handlers AND the GraphQL `triggerWorkflow` mutation; one engine builder, one NATS dispatch path, one auth gate. Includes a TOCTOU fix in r296 (`WorkflowRepository::create_execution_under_concurrency_limit` — `SELECT ... FOR UPDATE` + COUNT + INSERT in one transaction). The canonical reference for the cross-protocol service pattern.
-- `WorkflowManifestService` (r302, May-2026) — pulled out of `handle_export_platform_state` (87 LoC) + `handle_import_platform_state` (290 LoC). Both handlers became thin wrappers (~9 LoC, ~41 LoC). `ManifestError::user_facing_message()` security invariant: `Internal` collapses to `"Database error"` so the protocol response never leaks schema/query details (locked in by a unit test). Cross-protocol-ready; same Arc can back a future GraphQL mutation. `platform.rs` 1739 → 1429 LoC.
-- `ReplayService` (r303, May-2026) — pulled out of two ~340 LoC handlers in `sandbox.rs` (`handle_replay_module_regression` and `handle_replay_workflow_mode`). Both paths share one private `run_replays()` kernel — load-with-template-fallback, secret prefetch, governance/unknown world rejection, and per-row execute-and-diff loop run from one place. Pure-helper `plan_workflow_replay` walks the graph for fan-in detection; testable without runtime. `sandbox.rs` 3822 → 3354 LoC. 18 unit tests cover the fan-in path, capability-world rejection, error code stability, internal-error message redaction, and counter aggregation. Output shape preserved byte-for-byte.
-- `InlineCompileService` (r304, May-2026) — pulled out of `handle_add_node_to_workflow`'s `rust_code` branch (~340 LoC of capability check + lint + compile + shared-module guard + permission-drift guard + persistence). Handler 766 → 516 LoC. Pre-compile actor capability check inside the service (saves 30–60 s of compile budget on a doomed request); post-compile defense-in-depth check stays in the handler since it covers BOTH the inline-Rust path AND the `module_id` path. Every operator-recognised error string copied verbatim from the pre-extraction handler — `"Compiled successfully but no WASM bytes were generated"` and friends are locked in by unit tests. 12 unit tests; cross-protocol-ready.
-
-**May-2026 workspace decomposition** (controller bin ~95k → ~7.3k LoC). New crates that own former controller modules whole-cloth:
-- `talos-templates`, `talos-llm`, `talos-atlassian`, `talos-slack`, `talos-compilation`, `talos-wit-inspector` — leaf services.
-- `talos-integration-helpers` — shared `RenewalFailure` + `looks_like_oauth_failure` for push-notification integrations (breaks the gmail↔gcal coupling).
-- `talos-google-calendar`, `talos-gmail` — push-notification stacks per `docs/integration-pattern.md`.
-- `talos-continuation-trigger` — approval-gate / suspension dispatch (was `pub(crate)` in mcp::advanced; lifted so webhooks can call it without depending on mcp).
-- `talos-webhooks` — inbound webhook router + dispatch chain.
-- `talos-api` — entire GraphQL surface (QueryRoot/MutationRoot/SubscriptionRoot, 40 handler files, dataloaders, validation, `TalosSchema` alias).
-- `talos-api-docs` — GraphQL Playground + REST docs.
-- `talos-ws-auth` — GraphQL-over-WebSocket handshake + auth.
-- `talos-mcp-handlers` — entire MCP handler tree (27 source files, ~65k LoC, ~280 tool handlers across 21 handler-domain modules, McpState).
-- `talos-audit-event` — shared cryptographic audit-event primitives (the hash-chained, HMAC-signed `AuditEvent` + `ExecutionLedger` + offline `verify_chain`). SINGLE SOURCE OF TRUTH for audit hashing/signing: the worker producer AND the `talos-audit-ledger` WORM consumer both depend on it so the verifier can never drift from the producer. `worker/src/audit.rs` is now a re-export shim.
-- `talos-envelope-seal` — RFC 0010 P3 (D3b) controller-side per-execution secret-envelope sealing: `InFlightSeals` (atomic-`take` single-claim), `handle_secret_claim`, `RedisLease` (Lua-CAS), `run_claim_responder` (the single primary `verify()` caller for `SecretClaim`). The crypto (`seal_secrets`/`WorkerEphemeral::open`: ephemeral-ephemeral X25519 → HKDF → AES-GCM) + the `SecretClaim`/`SealedSecrets`/`ClaimResponse` wire types live in `talos-workflow-job-protocol::envelope_seal`; the worker client is `worker::secret_claim`. **Default-OFF** (`TALOS_ENVELOPE_SEALING` unset) is byte-identical to the legacy inline WSK envelope — the `sealing`/`secret_paths`/`claim_inbox` `JobRequest` fields bind into `signing_payload` only when `sealing != 0` and `skip_serializing_if`-omit when default. The dispatch-loop wiring is LANDED + compile-verified: engine (`engine_dispatch_single`) resolves plaintext under the flag → `DispatchJob.plaintext_secrets` → dispatcher registers `InFlightSeals[job_id]` + stamps `sealing=1`/`claim_inbox` → `talos-engine::build_nats_dispatcher` spawns `run_claim_responder` once (OnceLock; NO controller-main change) → worker `execute_job` calls `secret_claim::claim_secrets`. Requires P1 Ed25519 (`TALOS_CONTROLLER_SIGNING_KEY`) to sign SealedSecrets. ALL workflow shapes seal under the flag: single-node + loop-body share `secrets_pipeline::build_dispatch_secrets_for`; **pipelines** seal per step in ONE claim (`dispatch_chain` collects a per-step `Vec<HashMap>` into a single `SealContext::from_bytes` entry; the worker's `execute_pipeline_job` does one `claim_secrets_raw` and feeds step `i` its own map). The worker downgrade guard under `required` is PRECISE — it refuses a `sealing=0` dispatch only when it carries a non-empty WSK envelope (a no-secret node/step decrypts nothing and is allowed). Validated end-to-end over live NATS (`full_claim_loop_over_live_nats` + `full_pipeline_claim_loop_over_live_nats`, both asserting no plaintext on the wire). Canary COMPLETE (2026-07-06): dev stack runs `required` permanently with Ed25519 keys (`TALOS_DISPATCH_SCHEME=ed25519`, static `TALOS_WORKER_PUBLIC_KEYS` fleet identity); the sealed-secret round-trip was proven black-box in `audit` AND `required` by parking a dummy `anthropic/api_key` in the vault so the LLM prefetch made every dispatch secret-carrying — the worker resolved the key from the CLAIMED map (Anthropic returned 401 on the dummy, proving delivery), no-secret nodes still ran under `required`, zero downgrade refusals. Chart enablement runbook lives at values.yaml `controller.env` § TALOS_ENVELOPE_SEALING; both signing keys render as optional bootstrap-Secret refs.
+**Completed extractions** and the **May-2026 workspace decomposition** — which service or crate each handler and controller module became — are in `docs/engineering-log/2026-10-05-extraction-history.md` (moved 2026-10-05). The shape to copy is the cross-protocol service described above; its reference implementations are `ExecutionOrchestrationService`, `WorkflowManifestService`, `ReplayService`, `InlineCompileService`, `HotUpdateService` and `WorkflowCreationService`. Two rules that list carried:
+- `talos-audit-event` is the ONE home of audit hashing and signing (`AuditEvent`, `ExecutionLedger`, the offline `verify_chain`). The worker producer and the `talos-audit-ledger` consumer both depend on it, so the verifier cannot drift from the producer.
+- `talos-envelope-seal` (`TALOS_ENVELOPE_SEALING`; unset is byte-identical to the inline envelope): `run_claim_responder` is the single primary `verify()` caller for `SecretClaim`; sealing needs the Ed25519 `TALOS_CONTROLLER_SIGNING_KEY`; every dispatch shape seals through `secrets_pipeline::build_dispatch_secrets_for`, a pipeline in ONE claim; under `required` a worker refuses a `sealing=0` dispatch only when it carries a non-empty envelope.
 
 **Good examples to follow:** `ModuleExecutionService`, `AuthService`, `SecretsManager`, `CompilationService`, `SubworkflowContractService`, `ParallelWorkflowEngine`, `ActorRepository::get_actor_full_summary` (LATERAL join pattern), `graph.rs::fetch_graph_json` (helper delegation pattern).
 **Anti-pattern to avoid:** Raw `sqlx::query(...)` calls directly inside MCP handler functions. **Down to 0** in `talos-mcp-handlers/src/*.rs` as of 2026-05-04 and held at 0 through r303/r304 (down from 371 → 276 → 0). The lint-equivalent invariant is now: any new handler PR adding raw `sqlx::query` to a `talos-mcp-handlers` file is a regression — push the SQL into the relevant repository crate first. `encrypted_secrets: Default::default()` in any dispatch path is the other regression class.

@@ -101,6 +101,8 @@ BASES = [
      "2026-10-03: the package record bullets -> 2026-10-03-package-record.md (title index kept)"),
     ("78675f441dcdfcfa9f19ffea14ef677370a7fb81", "9bb69072f47ac67455fba1390966d25902ba9bbc",
      "2026-10-03: the class digests -> DECISIONS.md (one index line each kept in CLAUDE.md)"),
+    ("84110d45c9027f5a8f94d4f4716ea455d72566f0", None,
+     "2026-10-05: write ceiling, attempt window, extraction history -> three archive files"),
 ]
 ARCHIVE = Path("docs/engineering-log")
 CLAUDE = Path("CLAUDE.md")

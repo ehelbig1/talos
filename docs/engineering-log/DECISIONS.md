@@ -1695,6 +1695,141 @@ enforced by `clippy.toml`.
   96. the CLAUDE.md engineering-log split lost nothing
   97. a documented env var with NO default must be TRANSPORTED
 
+### The actor write ceiling → [`2026-10-05-actor-write-ceiling.md`](docs/engineering-log/2026-10-05-actor-write-ceiling.md)
+
+**The class.** `actors.max_write_ceiling` is one control with several routes to
+the data it protects, and for a long time only the worker's host-call gate
+existed. A module reaches actor data by calling a host op, by RETURNING a
+`__memory_write__` envelope the controller persists (a route that needs no
+capability — a `minimal-node` module with an empty `mutation_profile` wrote
+durable memory for a `readonly` actor), or through a signed RPC whose signature
+is made with the fleet-shared `WORKER_SHARED_KEY` and so proves a key holder,
+not a gate. The rules are in `CLAUDE.md`; these are the decisions behind them.
+
+**The envelope gate (#750).**
+* On refusal the node COMPLETES and the envelope is REMOVED, not flagged: a
+  flagged envelope is one `unwrap_or(false)` from being honoured, and the worker
+  path returns an error to the guest without guaranteeing node failure either.
+* Audit parity with the worker is in the VOCABULARY (`op = "agent-memory-set"`,
+  `policy = "write-ceiling"`), not the transport: the controller has no
+  `ExecutionLedger` producer, so its refusals reach the `talos_audit` tracing
+  target and `talos_memory_write_failures_total{reason="write_ceiling"}` only.
+* That counter is pre-seeded at 0 and deliberately has NO alert: a refusal is
+  the policy working, and the two live rules on the counter select
+  `reason="crypto"` / `"db"`.
+* The engine reaches both instruments by NOTIFYING the hook
+  (`on_memory_write_refused`); delete the notification and the gate still gates
+  while every instrument goes silent. `controller/tests/write_ceiling_memory_write_tests`
+  pins it — a regression guard proven by mutation, not a reproducer.
+* The pipeline-step gate site (`engine_dispatch_pipeline`) is dormant by config:
+  every production entry point passes `ChainDispatch::Disabled`.
+* Routes deliberately NOT gated: operator-invoked writes (`actor_remember`,
+  `clone_memories`, `scaffold_actor` seeds, the GraphQL memory mutations) and
+  platform-authored ones (`ml_digest`, consolidation and reflection, the
+  `upsert_scratchpad_trace` execution trace). The ceiling speaks to the actor's
+  writes, not the operator's or the platform's.
+
+**The signed-RPC gate (#754).**
+* Measured on main with enforcement on at the controller: a signed `Set` naming
+  a `readonly` actor landed a row and the reply said `Ok`.
+* The ceiling read is three-valued and fails CLOSED. `write_ceiling_unreadable`
+  is distinct from the policy reason for the OPERATOR and collapsed for the
+  CALLER, because a split reply is an actor-existence oracle for a holder of the
+  fleet key.
+* Cost: zero with the flag off (the `OnceLock` short-circuits before the
+  query); with it on, one primary-key read of `actors` — 1.1 µs server-side,
+  0.43 ms with the round trip.
+* A per-actor cache was considered and REJECTED: a TTL on a security rule is a
+  window in which a revoked grant is still honoured, and the path carried about
+  one write a week.
+* `talos.state.write` is deliberately NOT gated: the worker does not
+  ceiling-gate execution state either, and a controller stricter than the
+  worker is the same defect in the other direction. Pinned by
+  `write_ceiling_tests::complement_is_worker_local`.
+* The first read-vs-mutation classifier was WRONG: sqlparser 0.53 parses a
+  data-modifying CTE as `Statement::Query`. The controller's now walks the AST.
+  The worker's twin (`sql_stmt_type_is_read_only`) was recorded as very likely
+  having the same hole and NOT fixed in that change.
+
+**DECIDED 2026-09-06: `__ops_alert__` and `__ml_distill__` stay OUTSIDE the
+ceiling.** The ceiling governs the actor's own data plane; these two are
+platform ingestion that takes the actor id for tenancy. The evidence was the
+fleet, not the argument: of 5 `readonly` actors exactly one was active, bound to
+one enabled workflow whose whole purpose is to emit `__ops_alert__`. The
+absent-actor refusal stays. The reports name both protocols
+(`UNGATED_OUTPUT_PROTOCOLS`). `controller/tests/write_ceiling_hook_gate_tests`
+is the positive control for `__ops_alert__`; `__ml_distill__` has NO test, for
+a measured reason (the process-global `DISTILL_CONTEXT` `OnceLock` that sibling
+tests race, and everything the flow needs past it).
+
+**The reporting (#760).**
+* `security_audit.write_ceiling_enforcement` said the gate lived only in the
+  worker. `ControllerGateProbe::run()` now drives both controller gates each
+  run; the two halves render separately (`parts.controller_gate` at
+  `round_trip`, `parts.worker_fleet` at `config_presence`), the top-level
+  `verification` is the WEAKEST of the facts its status rests on, and the
+  weight stays 0. Fleet `all` with the controller flag unset is a SPLIT CONTROL
+  warning.
+* `talos_rpc` was a tracing target only. The RPC gate now counts
+  `talos_rpc_write_ceiling_refusals_total{subject, reason}` — all six
+  combinations pre-seeded — at the one chokepoint, alerted at warning, never
+  paging. The `memory_write_failures` increment is KEPT and the double count is
+  stated in its HELP text. `refusal_reason_spellings_stay_paired` pairs the log
+  tokens with the metric labels.
+* **No lint check was added.** "A refusal that logs an `event_kind` must
+  increment a counter" was measured first: 22 emitters, 21 with no counter
+  within ±20 lines. A check cannot ship at 21 and baselines are not re-added,
+  so the count stays where it was (84 at the time).
+
+### The attempt window → [`2026-10-05-attempt-window.md`](docs/engineering-log/2026-10-05-attempt-window.md)
+
+**The class.** One question — how much of a workflow's wall-clock budget may a
+single dispatch attempt occupy — had two implementations, the dispatcher's
+(`min(allowance, remaining − BUDGET_RESERVE_SECS)`, allowance =
+`timeout_secs + TOKIO_WRAP_GRACE_SECS`) and the validator's
+(`envelope_secs <= budget_secs`). They disagreed by 7 s at the boundary.
+
+* **Measured on the fleet:** 9 nodes across 3 active workflows were reported as
+  fitting and clamped on attempt 1 of every run — 2,326 clamped attempts per
+  48 h.
+* **Three outcomes.** The old check reported 7 nodes; the simulation reports 16
+  — 4 `Truncated` (a strict subset of the 7) and 12 `Clamped`, of which 3 had
+  been reported as the severe finding and 9 as nothing.
+* `ValidationSeverity` has `Error` and `Warning` only. An `Info` variant was
+  deliberately NOT added: it would move every counter and response shape that
+  reads a `ValidationResult`. "Lower severity" is the category and the wording.
+* `max_retries_within_budget` searches the same simulation and moved by one
+  retry on some shapes (`(120, 500, 240)`: 1 → 0).
+* The prose in BOTH crates (`describe_retry_envelope_overrun`, and
+  `describe_retry_bound` in `talos-mcp-handlers`) said the whole execution was
+  dropped. False since #686; a one-string grep finds only one of the two.
+* **The residual.** The budget is still an outer `tokio::time::timeout`, and
+  `BUDGET_RESERVE_SECS` makes recording the failure likely, not certain. The
+  clamp covers module dispatch only; `engine_dispatch_pipeline.rs` passes
+  `deadline: None` — dormant by config, recorded, not fixed.
+* **The clamp log is attributed by cause** (`clamp_cause`): `Configuration` at
+  debug, `Consumption` and `Unknown` at warn. **No metric was added**:
+  `talos-workflow-engine-nats` has no `talos-metrics` dependency and a series
+  would cost a new direct edge — declined, so a consumption clamp cannot be
+  alerted on.
+* **No lint was added.** "Clamp constants defined outside core": 1 file on
+  main, population one. "An `envelope_secs <= budget` comparison outside core":
+  2 lines on main (1 a legitimate test), 3 on the fixed tree — all of them the
+  comments explaining the fix. `--count` stayed 86. Two mutations survive, both
+  in the loud direction: re-inlining `timeout + 5` at the dispatch site, and
+  passing `None` for `budget_secs`.
+
+### Completed extractions and the May-2026 crate decomposition → [`2026-10-05-extraction-history.md`](docs/engineering-log/2026-10-05-extraction-history.md)
+
+History, not decisions: which repository or service each MCP handler's logic
+moved to (`AdvancedRepository` … `InlineCompileService`, r295–r304), how many
+lines each handler lost, and which crates the May-2026 decomposition created
+when the controller bin went from about 95k lines to about 7k. Read it when you
+need to know where a `controller/src/*` path's code lives now, or want a worked
+example of the cross-protocol service shape. The two rules the lists carried —
+`talos-audit-event` as the one home of audit hashing, and the
+`talos-envelope-seal` invariants — stayed in `CLAUDE.md`.
+
 ## CLAUDE.md lines this move reworded, kept verbatim
 
 The losslessness check compares lines, so a line reworded in the same change
