@@ -5074,10 +5074,19 @@ if [ "$RHAI_FAIL" != "2" ]; then
         RHAI_FAIL=1
     fi
     RAW_RHAI_HITS=""
-    RHAI_SCANNED=0
+    RHAI_FILES="$(find . -name '*.rs' -type f \
+                    -not -path '*/target/*' \
+                    "${TREE_PRUNE_FIND[@]}")"
+    RHAI_SCANNED="$(printf '%s\n' "$RHAI_FILES" | grep -c . || true)"
+    # Only a file containing the literal `Engine::default` can match the
+    # pattern below (stripping `//` comments only removes text), so one grep
+    # picks the candidates and the per-file pipeline runs on those alone.
+    # Until 2026-10-05 it ran sed + grep + grep on every .rs file in the
+    # workspace: about 14 of the lint's seconds for a handful of candidates.
+    RHAI_CANDIDATES="$(printf '%s\n' "$RHAI_FILES" | grep . | tr '\n' '\0' \
+                    | xargs -0 grep -lF -- 'Engine::default' 2>/dev/null || true)"
     while IFS= read -r f; do
         [ -n "$f" ] || continue
-        RHAI_SCANNED=$((RHAI_SCANNED + 1))
         case "$f" in "./$RHAI_SANDBOX_REL") continue ;; esac
         grep -q 'allow-raw-rhai-engine' "$f" && continue
         if hit="$(sed 's|//.*||' "$f" \
@@ -5089,9 +5098,7 @@ $(echo "$hit" | sed 's/^/    /')
 "
             fi
         fi
-    done <<< "$(find . -name '*.rs' -type f \
-                    -not -path '*/target/*' \
-                    "${TREE_PRUNE_FIND[@]}")"
+    done <<< "$RHAI_CANDIDATES"
 
     if [ "$RHAI_SCANNED" -lt 100 ]; then
         red "✗ check 63 part B scanned only $RHAI_SCANNED .rs files — the walk is broken"
