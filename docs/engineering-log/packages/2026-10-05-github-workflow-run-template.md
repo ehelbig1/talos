@@ -52,3 +52,28 @@ memory, send with network). The owner's workflow puts a compose node and a
 The owner's workflow (reader → compose that remembers the last reported run →
 `notify-home-assistant`) is in the private workflows repository and is wired
 on the platform once this template can be installed.
+
+## Corrected the same day: GitHub chose the wrong run (v1.1.0)
+
+The first live run reported a run from 2026-09-26 as the newest finished run
+on `main`, whose newest finished run was minutes old. Measured with the same
+unauthenticated query: `status=completed&per_page=1` returned run #1639 and
+`total_count` 568 three times in a row; the same query with `per_page` 2, 3,
+5 or 10 returned run #1860 first and `total_count` 701. GitHub's
+documentation does not describe the difference.
+
+So the template no longer asks GitHub to filter or to choose: it reads the
+ten newest runs on the branch, unfiltered, and picks the newest FINISHED one
+itself (by creation time, then run number). A new test lists an old failure
+first, the newest run still in progress and the newest finished run in the
+middle. If all ten are still running the state is `none` and nothing changes.
+
+Fuel, re-measured on a made-up ten-run recording (120 KB): 2,406,860, which
+is 20 fuel per byte for parsing whole run objects. The manifest now declares
+`fuel_per_byte: 20`; the declared limit is 6,500,000 and the run uses 37.0%.
+
+What the wrong reading did before it was caught: the workflow's send node was
+in dry run, so nothing was sent. It raised the rolling alert for the old
+failure and stored that run as reported. The next run on a fixed reader reads
+`main` passing, which resolves the alert by itself and stores "passing"; that
+run's "green again" notification goes to the same dry-run send.
