@@ -63,6 +63,35 @@ case "$*" in
   "remote get-url origin")
     [ -n "${SHIM_ORIGIN:-}" ] || exit 2
     printf '%s\n' "$SHIM_ORIGIN" ;;
+  # The local objects the gap check reads. SHIM_OBJECTS lists the full commits
+  # this checkout holds; with it unset, nothing past origin/main is local.
+  "cat-file -e "*)
+    want="${3%%^*}"
+    for o in ${SHIM_OBJECTS:-}; do [ "$o" = "$want" ] && exit 0; done
+    exit 1 ;;
+  "rev-parse --verify -q "*)
+    want="${4%%^*}"
+    for o in ${SHIM_OBJECTS:-}; do case "$o" in "$want"*) printf '%s\n' "$o"; exit 0 ;; esac; done
+    exit 1 ;;
+  "merge-base --is-ancestor "*) exit "${SHIM_ANCESTOR:-0}" ;;
+  "rev-list --count "*) printf '%s\n' "${SHIM_COMMITS:-3}" ;;
+  "diff --name-only --no-renames "*)
+    [ -n "${SHIM_DIFF:-}" ] || exit 1
+    cat "$SHIM_DIFF" ;;
+  "ls-tree -r --name-only "*)
+    printf 'talos-example/Cargo.toml\ntalos-example/src/lib.rs\nCargo.toml\n' ;;
+  "grep -F -h "*)
+    # One answer per search, so each rule can be tested alone:
+    # SHIM_GREP_RS (Rust source), SHIM_GREP_BUILD (build.rs),
+    # SHIM_GREP_IMAGES (Dockerfiles and compose files).
+    case "$*" in
+      *"-- *.rs")        f="${SHIM_GREP_RS:-}" ;;
+      *"-- *build.rs")   f="${SHIM_GREP_BUILD:-}" ;;
+      *"*Dockerfile*"*)  f="${SHIM_GREP_IMAGES:-}" ;;
+      *)                 exit 2 ;;
+    esac
+    [ -n "$f" ] && [ -s "$f" ] || exit 1
+    cat "$f" ;;
   *) exit 1 ;;
 esac
 SHIM
@@ -425,11 +454,72 @@ check "hostile reply: a link off github.com is not printed" no "$(has "$OUT" "ev
 asked_jobs="$(tail -n +"$(( $(grep -c . "$T/before-hostile.log") + 1 ))" "$T/shim.log" | grep -c '/jobs' || true)"
 check "hostile reply: a run id that is not a number is put in no URL" 0 "$asked_jobs"
 
+echo "does the gap between the running commit and main matter"
+OBJ="$MAIN $OTHER"
+printf 'docs/notes.md\n.github/workflows/quality.yml\ntalos-example/tests/case.rs\nscripts/lint-example.py\nREADME.md\n' > "$T/diff-docs"
+printf 'docs/notes.md\ntalos-example/src/lib.rs\n' > "$T/diff-code"
+printf 'docs/embedded.md\n' > "$T/diff-embedded"
+printf 'frontend/README.md\n' > "$T/diff-frontend"
+printf 'scripts/preflight-disk.sh\n' > "$T/diff-upscript"
+printf '    let s = include_str!("../../docs/embedded.md");\n' > "$T/grep-embedded"
+printf '      # see docs/notes.md for why\n' > "$T/grep-comment"
+run gap-none SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-docs" SHIM_COMMITS=4
+check "docs, CI, crate tests, lint script, .md only: PASS, exit 0" "yes 0" "$(has "$(line_for "$OUT" "controller commit")" "PASS") $RC"
+check "…and says no rebuild is needed"   yes "$(has "$OUT" "the 4 commit(s) between them change 5 file(s), none of them built into the stack or mounted (documentation, CI, tests): no rebuild needed")"
+run gap-code SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-code"
+check "a source file changed: FAIL, exit 1" "yes 1" "$(has "$(line_for "$OUT" "controller commit")" "FAIL") $RC"
+check "…names it, not the doc"           "yes no" "$(has "$OUT" "(talos-example/src/lib.rs)") $(has "$OUT" "docs/notes.md)")"
+run gap-embedded SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-embedded" SHIM_GREP_RS="$T/grep-embedded"
+check "a document a Rust file includes: FAIL" yes "$(has "$OUT" "(docs/embedded.md)")"
+printf '    std::fs::read_to_string("docs/embedded.md")\n' > "$T/grep-buildrs"
+run gap-buildrs SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-embedded" SHIM_GREP_BUILD="$T/grep-buildrs"
+check "a build.rs that names it: FAIL"   yes "$(has "$OUT" "(docs/embedded.md)")"
+printf '    // docs/embedded.md explains this\n' > "$T/grep-buildrs-comment"
+run gap-buildrs-comment SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-embedded" SHIM_GREP_BUILD="$T/grep-buildrs-comment"
+check "a build.rs comment naming it does not count: PASS" yes "$(has "$(line_for "$OUT" "controller commit")" "PASS")"
+run gap-comment SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-docs" SHIM_GREP_IMAGES="$T/grep-comment"
+check "a compose-file mention after # does not count: PASS" yes "$(has "$(line_for "$OUT" "controller commit")" "PASS")"
+printf '      - ./docs/notes.md:/etc/notes.md:ro\n' > "$T/grep-mount"
+run gap-mount SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-docs" SHIM_GREP_IMAGES="$T/grep-mount"
+check "a compose file that mounts it: FAIL" yes "$(has "$OUT" "(docs/notes.md)")"
+printf '/// Rendered from docs/notes.md.\n' > "$T/grep-prose"
+run gap-prose SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-docs" SHIM_GREP_RS="$T/grep-prose"
+check "Rust prose naming it without a leading slash: PASS" yes "$(has "$(line_for "$OUT" "controller commit")" "PASS")"
+run gap-frontend SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-frontend"
+check "a .md under a built or mounted directory counts: FAIL" yes "$(has "$OUT" "(frontend/README.md)")"
+run gap-upscript SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-upscript"
+check "a script make up runs counts: FAIL" yes "$(has "$OUT" "(scripts/preflight-disk.sh)")"
+run gap-diverged SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-docs" SHIM_ANCESTOR=1
+check "running commit not an ancestor of main: FAIL" "yes 1" "$(has "$OUT" "bbbbbbb is not an ancestor of origin/main") $RC"
+run gap-unpulled SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OTHER" SHIM_DIFF="$T/diff-docs"
+check "main not in the checkout: FAIL, says to pull" "yes yes" "$(has "$(line_for "$OUT" "controller commit")" "FAIL") $(has "$OUT" "is not in this checkout; git pull first")"
+run gap-unknown-run SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$MAIN" SHIM_DIFF="$T/diff-docs"
+check "running commit not in the checkout: FAIL, unknown" yes "$(has "$OUT" "whether a deploy would change anything is unknown: the running commit bbbbbbb is not in this checkout")"
+run gap-nodiff SHIM_INFO="$T/info-other.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF=""
+check "git diff fails: FAIL, unknown"    yes "$(has "$OUT" "unknown: git diff failed")"
+run gap-dirty SHIM_INFO="$T/info-dirty.json" SHIM_MAIN="$OTHER" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-docs"
+check "a dirty build behind main is never excused: FAIL" yes "$(has "$(line_for "$OUT" "controller commit")" "FAIL")"
+mk_info "$T/info-workerbehind.json" "0.1.0+aaaaaaa" "0.1.0+bbbbbbb"
+run gap-worker SHIM_INFO="$T/info-workerbehind.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-docs"
+check "a worker behind by docs only: PASS, says so" "yes yes" "$(has "$(line_for "$OUT" "worker commit")" "PASS") $(has "$OUT" "bbbbbbb is behind it by commits that change nothing that runs")"
+run gap-worker-code SHIM_INFO="$T/info-workerbehind.json" SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-code"
+check "a worker behind by code: FAIL"    yes "$(has "$(line_for "$OUT" "worker commit")" "FAIL")"
+before_same="$(grep -c 'diff --name-only' "$T/shim.log" || true)"
+run gap-same SHIM_OBJECTS="$OBJ" SHIM_DIFF="$T/diff-code"
+check "running = main: the gap is never computed" "$before_same" "$(grep -c 'diff --name-only' "$T/shim.log" || true)"
+
 echo "read-only: every call any scenario made"
 unexpected="$(grep -v \
     -e '^git ls-remote origin refs/heads/main$' \
     -e '^git rev-parse HEAD$' \
     -e '^git remote get-url origin$' \
+    -e '^git cat-file -e [0-9a-f]\{40\}^{commit}$' \
+    -e '^git rev-parse --verify -q [0-9a-f]\{7,40\}^{commit}$' \
+    -e '^git merge-base --is-ancestor [0-9a-f]\{40\} [0-9a-f]\{40\}$' \
+    -e '^git rev-list --count [0-9a-f]\{40\}\.\.[0-9a-f]\{40\}$' \
+    -e '^git diff --name-only --no-renames [0-9a-f]\{40\} [0-9a-f]\{40\}$' \
+    -e '^git ls-tree -r --name-only [0-9a-f]\{40\}$' \
+    -e '^git grep -F -h .* [0-9a-f]\{40\} -- ' \
     -e '^curl GET https://api.github.com/repos/example-owner/example-repo/commits/main $' \
     -e '^curl GET https://api.github.com/repos/example-owner/example-repo/actions/workflows/quality.yml/runs?head_sha=[0-9a-f]\{40\}&per_page=20 $' \
     -e '^curl GET https://api.github.com/repos/example-owner/example-repo/actions/runs/[0-9]*/jobs?per_page=100 $' \
