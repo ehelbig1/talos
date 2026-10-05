@@ -1,12 +1,17 @@
 # Talos
 
+[![Quality](https://github.com/ehelbig1/talos/actions/workflows/quality.yml/badge.svg)](https://github.com/ehelbig1/talos/actions/workflows/quality.yml)
+[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+
 **A verifiable agent execution runtime: credential-free workers, signed cross-process data plane, per-actor data-egress policy.**
+
+In one sentence: agent code — including AI-generated code — cannot see your credentials, cannot exceed its capability grant, and cannot reach hosts you didn't allow, and every cross-process message is cryptographically signed.
 
 Talos is a Rust runtime for executing AI agent code inside WebAssembly sandboxes with capability gating, AES-256-GCM-encrypted per-job secrets, and HMAC-signed inter-process boundaries. It was built around the architectural bet that **the worker process should not be able to decrypt its own secrets, and should not be able to forge requests back to the controller** — and that those two properties are the foundation for safely running untrusted agent code in regulated environments.
 
 It's also a complete reference implementation: a workflow engine, visual editor, and ~60 module templates are built on top of the runtime as one consumer. They are not the product. The runtime is.
 
-> **Status: pre-1.0.** Wire formats and APIs are still stabilizing. The codebase has ~2,900 unit + integration tests, a 20-check structural-lint script, and incident-driven CHANGELOG entries — but it has not yet been deployed in anger against an SLA, and you should treat it as such.
+> **Status: pre-1.0.** Wire formats and APIs are still stabilizing. The codebase has about 8,800 Rust and 400 frontend tests, a structural lint of nearly a hundred checks each tied to a past regression, and incident-driven CHANGELOG entries — but it has not yet been deployed in anger against an SLA, and you should treat it as such.
 
 ---
 
@@ -62,7 +67,7 @@ The repo ships a complete reference stack so you can see the runtime in producti
 - **Visual editor** (`frontend/`) — React Flow drag-and-drop graph editor with real-time execution monitoring, per-node timing visualization, and approval-gate UI for human-in-the-loop steps.
 - **Module SDKs** — `#[talos_module(world = "http-node")]` proc macro for Rust, `@talos_module(world="http-node")` decorator for Python (via componentize-py), `talosModule({ world: "http-node" })` wrapper for TypeScript (via ComponentizeJS).
 - **~60 module templates** (`module-templates/`) — RAG pipeline, multi-agent router, human-review gate, PII scrubber, OAuth-aware Gmail / Google Calendar / Slack / Atlassian integrations, data validators, HTTP retry, and more. Compiled, signed, and OCI-distributed.
-- **MCP surface** (`talos-mcp-handlers/`) — ~280 tools across 21 handler-domain modules (actor, advanced, alerts, analytics, auth, capability-worlds, configuration, executions, graph, knowledge-graph, modules, ollama, platform, resources, sandbox, schedules, search, secrets, versions, webhooks, workflows) so the entire platform is drivable from an MCP client.
+- **MCP surface** (`talos-mcp-handlers/`) — about 360 tools across 21 handler-domain modules (actor, advanced, alerts, analytics, auth, capability-worlds, configuration, executions, graph, knowledge-graph, modules, ollama, platform, resources, sandbox, schedules, search, secrets, versions, webhooks, workflows) so the entire platform is drivable from an MCP client.
 
 These are useful examples, not the differentiator. The runtime primitives are what make running them safely interesting.
 
@@ -134,28 +139,22 @@ talos/
 
 ## Quick start
 
+All you need is Docker (with Compose v2), git and make — no host Rust toolchain. [QUICKSTART.md](QUICKSTART.md) lists the disk and memory to plan for.
+
 ```bash
-# Generate dev secrets
-cat > .env <<EOF
-POSTGRES_PASSWORD=$(openssl rand -hex 32)
-TALOS_MASTER_KEY=$(openssl rand -hex 32)   # dev only; production: KEK_PROVIDER=vault
-KEK_PROVIDER=env
-JWT_SECRET=$(openssl rand -hex 32)
-DATABASE_URL=postgres://talos:\${POSTGRES_PASSWORD}@localhost:5432/talos
-RUST_LOG=info,controller=debug
-BASE_URL=http://localhost:8000
-FRONTEND_URL=http://localhost:3000
-ALLOWED_ORIGIN=http://localhost:3000
-TRUSTED_IPS=127.0.0.1,::1
-EOF
-
-# Bring up infra and run migrations
-docker-compose up -d postgres
-sleep 5 && sqlx migrate run
-
-# Start the stack
-docker-compose up -d
+git clone https://github.com/ehelbig1/talos.git
+cd talos
+make setup        # writes .env with random secrets, builds, migrates, waits for healthy
+make quickstart   # signs up, mints an API key, installs a module, runs a workflow — every step printed
 ```
+
+The first build compiles the whole Rust workspace inside Docker, so it takes a while; later builds are cached. Then:
+
+- **Visual editor** — http://localhost:3002 (`docker compose up -d frontend` if it isn't running)
+- **API + GraphiQL** — http://localhost:8000/graphql
+- **Health** — http://localhost:8000/health
+
+[docs/examples/ai-pr-review.md](docs/examples/ai-pr-review.md) walks a complete AI pull-request reviewer end to end. Day-to-day commands and troubleshooting are in [QUICKSTART.md](QUICKSTART.md).
 
 Production deployments use the Helm chart in `deploy/helm/talos/` and HashiCorp Vault for the KEK. See `deploy/k3s/README.md` for the single-VM runbook (Hetzner CPX31 + k3s + Sigstore enforcement enabled).
 
@@ -164,11 +163,11 @@ Production deployments use the Helm chart in `deploy/helm/talos/` and HashiCorp 
 ## Development
 
 ```bash
-make up-dev                # Start all services
+make up                    # Build and start all services, wait for healthy
 make lint                  # rustfmt + structural lints + cargo-deny (make lint-full adds clippy)
 make coverage              # Tests with coverage
 cargo check --workspace    # Quick Rust compile check
-cargo test --workspace     # Full test suite (~2,900 tests)
+cargo test --workspace     # The Rust test suite
 ```
 
 The `make lint` step runs `scripts/lint-structural.sh`, which enforces the repository's architectural invariants (`bash scripts/lint-structural.sh --count` prints how many), each tied to a specific past regression — among them raw `actor_memory` SQL outside `talos-memory/`, controller route ↔ nginx ConfigMap drift, the legacy `__agent_context__` key, per-call `SecretsManager::new(...)` outside canonical wiring, helm chart clean-render with toggles, raw sqlx in MCP handlers, clippy parity, `trigger_type` / boolean column drift against schema, silent `let _ = sqlx::query(...).await` swallows outside tests, misleading-success Err-only webhook fires, caller-supplied limit clamp drift, chart-wide labels under NetworkPolicy selectors, async-graphql `Error::new` missing `.extend_safe()`, graph-JSON writes via canonical chokepoint, WIT-file drift between `wit/` and `module-templates/wit/`, `encrypted_secrets: Default::default()` outside tests, JobResult `.sign()` not using `sign_with_worker_id`, worker dual-publishing of JobResult, and wasmtime WASM proposal opt-in/out drift.
@@ -180,7 +179,7 @@ The `make lint` step runs `scripts/lint-structural.sh`, which enforces the repos
 | Property | Talos | LangGraph / CrewAI | Temporal | Microsoft Wassette | HiddenLayer agentic runtime |
 |---|---|---|---|---|---|
 | WASM sandbox | yes | no | no | yes | runtime monitoring, not sandboxing |
-| Capability gating | yes (lattice, 11 worlds) | no | no | yes (deny-by-default) | no |
+| Capability gating | yes (lattice, 12 worlds) | no | no | yes (deny-by-default) | no |
 | Credential-free worker | yes | no | partial | no | no |
 | Signed cross-process RPC | HMAC + nonce cache | no | yes (built-in) | no | no |
 | Per-actor data-egress policy | yes (HMAC-bound tier ceiling) | no | no | no | no |

@@ -3,9 +3,23 @@
 Run the whole stack locally in Docker. No host Rust toolchain is required just
 to run it — everything builds inside containers.
 
+## Prerequisites
+
+- **Docker** with Compose v2 (Docker Desktop on macOS, or Docker Engine and
+  the compose plugin on Linux), **git** and **make**.
+- **Disk:** plan for 30 GB or more. Measured on a working development
+  machine: about 9 GB of images in use, 8 GB of volumes, and a build cache
+  that grows past 20 GB as the Rust workspace is rebuilt
+  (`docker builder prune` reclaims it; `make up` warns before the disk fills).
+- **Memory:** give Docker at least 8 GB. The running stack used 4.4 GB
+  across its containers when measured; compiling the Rust workspace inside
+  Docker needs more on top of that.
+
 ## 🚀 One command
 
 ```bash
+git clone https://github.com/ehelbig1/talos.git
+cd talos
 make setup
 ```
 
@@ -21,6 +35,27 @@ the ~100-crate Rust workspace, so it takes a while; later runs are cached.
 - Health: http://localhost:8000/health
 
 That's it. 🎉
+
+## Next: a running workflow
+
+```bash
+make quickstart
+```
+
+Walks the golden path against your local stack and prints every step as a
+plain `curl` you can copy: sign up (or reuse an account), mint an API key,
+browse the module templates with what each needs, install one, build a
+one-node workflow, run it, and read the output back.
+
+Then:
+
+- [docs/examples/ai-pr-review.md](docs/examples/ai-pr-review.md) — an AI
+  pull-request reviewer end to end: modules, capability worlds, secrets and
+  an approval gate in one worked example.
+- The whole platform is drivable from an MCP client (Claude Code or any
+  other) at `http://localhost:8000/mcp`, with the API key `make quickstart`
+  minted.
+- `make ps` shows every service's health.
 
 ---
 
