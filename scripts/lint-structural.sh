@@ -97,7 +97,21 @@ EXIT_CODE=0
 # about second checkouts. Check 75 enforces the rule; it exists because
 # eleven scans got this right by hand and the ten added after them did
 # not, the newest of them two days old.
-TREE_PRUNE_FIND=( -not -path '*/.claude/*' -not -path '*/.git/*' )
+#
+# 2026-10-05: TREE_PRUNE_FIND PRUNES — `find` no longer enters these
+# directories. Until then it was `-not -path '*/.claude/*' -not -path
+# '*/.git/*'`, a FILTER: every file under them was still walked and then
+# dropped. Measured from a main checkout holding 23 worktrees (326,101
+# files under .claude/): one walk took 9.4 s filtered against 0.9 s pruned,
+# for the same 1,193 files, and ten walks in this script use the list.
+# A prune has a shape the old filter did not, which every find must follow:
+#   find . "${TREE_PRUNE_FIND[@]}" [site prunes … -prune -o] <tests> -print0
+#     * the array comes FIRST, straight after the root (it ends in `-o`);
+#     * the walk names its action (-print / -print0 / -exec). Without one,
+#       find prints the pruned directories themselves.
+# Check 75 enforces both. `-name` matches the directory at any depth, as the
+# old `*/.claude/*` pattern did.
+TREE_PRUNE_FIND=( \( -name .claude -o -name .git \) -prune -o )
 TREE_PRUNE_GREP=( --exclude-dir=.claude --exclude-dir=.git )
 
 # ── clippy `disallowed-methods` rules (checks 29, 53, 63, 78) ─────────
@@ -213,7 +227,26 @@ bold "▶ check 2: top-level controller routes vs nginx locations"
 
 ROUTES_FILE="$(mktemp)"
 NGINX_FILE="$(mktemp)"
-trap 'rm -f "$ROUTES_FILE" "$NGINX_FILE"' EXIT
+HELM_LOG=""
+# One EXIT trap for the whole run (2026-10-05). Besides removing the temp
+# files, it says when the lint STOPPED EARLY: under `set -e` a failing
+# command in a check ends the script there, and until this trap that printed
+# nothing more — the checks after it and the summary simply never appeared,
+# so a run could stop at check 64 and look like a short list of findings.
+# (Check 64 did exactly that when the test-target classifier refused the
+# tree.) The script sets LINT_REACHED_END just before its final exit.
+LINT_REACHED_END=0
+on_lint_exit() {
+    local rc=$?
+    rm -f "$ROUTES_FILE" "$NGINX_FILE" ${HELM_LOG:+"$HELM_LOG"}
+    if [ "$LINT_REACHED_END" -ne 1 ]; then
+        red "✗ the lint STOPPED inside check ${CURRENT_CHECK} (exit status ${rc}); the checks after it did not run"
+        yellow "  → a command in that check failed under 'set -e'; make it report and carry on"
+        [ "$rc" -eq 0 ] && rc=1
+    fi
+    exit "$rc"
+}
+trap on_lint_exit EXIT
 
 # Extract the path arg from .route("/X", …) AND .nest("/X", …) calls in
 # main.rs AND bootstrap/router.rs (build_router moved there in the 2026-07
@@ -501,7 +534,6 @@ elif [ ! -d "$CHART_DIR" ]; then
     yellow "⚠ chart directory not found at $CHART_DIR — skipping"
 else
     HELM_LOG="$(mktemp)"
-    trap 'rm -f "$ROUTES_FILE" "$NGINX_FILE" "$HELM_LOG"' EXIT
 
     # (a) Default render.
     if helm template "$CHART_DIR" >/dev/null 2>"$HELM_LOG"; then
@@ -781,7 +813,7 @@ while IFS= read -r match; do
     printf '  %s\n' "$match"
     TRIGGER_TYPE_VIOLATIONS=$((TRIGGER_TYPE_VIOLATIONS + 1))
 done < <(
-    find . -name '*.rs' -not -path '*/target/*' "${TREE_PRUNE_FIND[@]}" \
+    find . "${TREE_PRUNE_FIND[@]}" -name target -prune -o -name '*.rs' \
         -print0 2>/dev/null \
     | xargs -0 -I{} awk -v F='{}' '
         /trigger_type/ { interesting[NR] = $0 }
@@ -848,7 +880,7 @@ while IFS= read -r match; do
     printf '  %s\n' "$match"
     IS_ACTIVE_VIOLATIONS=$((IS_ACTIVE_VIOLATIONS + 1))
 done < <(
-    find . -name '*.rs' -not -path '*/target/*' "${TREE_PRUNE_FIND[@]}" \
+    find . "${TREE_PRUNE_FIND[@]}" -name target -prune -o -name '*.rs' \
         -print0 2>/dev/null \
     | xargs -0 -I{} awk -v F='{}' '
         /is_active|\benabled[[:space:]]*=/ {
@@ -4017,8 +4049,8 @@ fi
 # tree and on altered copies (docs/engineering-log/packages/2026-10-05-lint-checks-70-52-64.md).
 # 52b: the same read split across two lines. Line-based grep cannot see it;
 # this per-file perl pass can. Must also be 0 — same rule, same fix.
-REPO_SILENT_READ_ML="$(find . \( -path ./target -o -path ./node_modules \) -prune -o -name '*.rs' \
-        "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
+REPO_SILENT_READ_ML="$(find . "${TREE_PRUNE_FIND[@]}" \( -path ./target -o -path ./node_modules \) -prune -o -name '*.rs' \
+        -print0 2>/dev/null \
     | xargs -0 perl -ne 'BEGIN{$/=undef} next if index($_, "try_get") < 0; my @l=split/\n/,$_; for my $i (0..$#l-1){ next if $l[$i]=~/\?/; if ($l[$i]=~/\.try_get(?:::<[^(]*>)?\([^)]*\)\s*$/ && $l[$i+1]=~/^\s*\.unwrap_or/){ print "$ARGV:".($i+1)."\n" } }' 2>/dev/null)"
 REPO_SILENT_READ_ML_COUNT="$(printf '%s' "$REPO_SILENT_READ_ML" | grep -c . || true)"
 if [ "$REPO_SILENT_READ_ML_COUNT" -ne 0 ]; then
@@ -4090,8 +4122,8 @@ while ($code =~ /\.try_get(?:::<(?:[^<>()]|<[^<>()]*>)*>)?\s*\((?:[^()]|\([^()]*
     while ($lo < $hi) { my $m = int(($lo+$hi+1)/2); if ($nl[$m] <= $p) { $lo = $m } else { $hi = $m-1 } }
     print "$ARGV:" . ($lo+1) . "\n";
 }'
-TRYGET_OK_HITS="$(find . \( -path ./target -o -path ./node_modules \) -prune -o -name '*.rs' \
-        "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
+TRYGET_OK_HITS="$(find . "${TREE_PRUNE_FIND[@]}" \( -path ./target -o -path ./node_modules \) -prune -o -name '*.rs' \
+        -print0 2>/dev/null \
     | xargs -0 perl -ne "$TRYGET_OK_PERL" 2>/dev/null || true)"
 TRYGET_OK_COUNT="$(printf '%s' "$TRYGET_OK_HITS" | grep -c . || true)"
 if [ "$TRYGET_OK_COUNT" -ne 0 ]; then
@@ -5091,9 +5123,8 @@ if [ "$RHAI_FAIL" != "2" ]; then
         RHAI_FAIL=1
     fi
     RAW_RHAI_HITS=""
-    RHAI_FILES="$(find . -name '*.rs' -type f \
-                    -not -path '*/target/*' \
-                    "${TREE_PRUNE_FIND[@]}")"
+    RHAI_FILES="$(find . "${TREE_PRUNE_FIND[@]}" -name target -prune -o \
+                    -name '*.rs' -type f -print)"
     RHAI_SCANNED="$(printf '%s\n' "$RHAI_FILES" | grep -c . || true)"
     # Only a file containing the literal `Engine::default` can match the
     # pattern below (stripping `//` comments only removes text), so one grep
@@ -5282,10 +5313,23 @@ if [ "$CI_GATE_FAIL" -eq 0 ]; then
 
     # (c) literal `cargo … --test X` entries: must exist, must not duplicate
     # a discovered binary.
-    ALL64="$(python3 "$CLASSIFIER" list dbfree 2>/dev/null; python3 "$CLASSIFIER" list store 2>/dev/null | cut -f1,2
-             for c64 in ctrl ctrl-serial tc ungated; do python3 "$CLASSIFIER" list "$c64" 2>/dev/null; done)"
-    RUN64="$(python3 "$CLASSIFIER" list dbfree 2>/dev/null; python3 "$CLASSIFIER" list store 2>/dev/null | cut -f1,2
-             for c64 in ctrl ctrl-serial tc; do python3 "$CLASSIFIER" list "$c64" 2>/dev/null; done)"
+    # Each list is asked for on its own and a failure is recorded. Until
+    # 2026-10-05 these were two `X="$(…; …)"` assignments: the substitution
+    # takes the LAST command's status, so under `set -e` a classifier that
+    # refused the tree ended the whole lint here (checks 65 onward and the
+    # summary never ran), and an earlier list failing was not seen at all.
+    LIST64_FAIL=0
+    ALL64=""
+    RUN64=""
+    for c64 in dbfree store ctrl ctrl-serial tc ungated; do
+        if out64="$(python3 "$CLASSIFIER" list "$c64" 2>/dev/null)"; then
+            [ "$c64" = store ] && out64="$(printf '%s\n' "$out64" | cut -f1,2)"
+            ALL64="${ALL64}${out64}"$'\n'
+            [ "$c64" = ungated ] || RUN64="${RUN64}${out64}"$'\n'
+        else
+            LIST64_FAIL=1
+        fi
+    done
     LITERAL64="$(for rf in "$Q64" "$I64"; do
         printf '%s\n' "$rf" \
           | awk '{ l=$0; while (l ~ /\\$/) { sub(/\\$/,"",l); if ((getline n) > 0) l = l " " n; else break } print l }' \
@@ -5296,6 +5340,12 @@ if [ "$CI_GATE_FAIL" -eq 0 ]; then
               { printf '%s\n' "$line" | grep -oE '\--test [A-Za-z0-9_]+' || true; } | awk -v c="$crate" '{print c "\t" $2}'
             done
       done)"
+    if [ "$LIST64_FAIL" -eq 1 ]; then
+        red "✗ the classifier could not list every category of test target, so the"
+        yellow "    literal-entry leg (a runner naming a target by hand) did not run"
+        CI_GATE_FAIL=1
+        LITERAL64=""
+    fi
     while IFS=$'\t' read -r lc lb; do
         [ -n "$lc" ] || continue
         if ! printf '%s\n' "$ALL64" | grep -qxF "$(printf '%s\t%s' "$lc" "$lb")"; then
@@ -6896,8 +6946,8 @@ while IFS= read -r hit; do
     red "✗ $file:$lineno env-var presence test accepts an empty value as configured"
     printf '    %s\n' "$(printf '%s' "${rest#*:}" | cut -c1-120)"
     EMPTY_ENV_FAIL=1
-done < <(cd "$ROOT" && find . -name '*.rs' -not -path './target/*' -not -path '*/target/*' \
-         "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
+done < <(cd "$ROOT" && find . "${TREE_PRUNE_FIND[@]}" -name target -prune -o -name '*.rs' \
+         -print0 2>/dev/null \
          | xargs -0 -n 40 awk -f "$EMPTY_ENV_AWK" 2>/dev/null \
          | sed 's|^\./||' || true)
 rm -f "$EMPTY_ENV_AWK"
@@ -7343,8 +7393,7 @@ while IFS= read -r hit; do
     red "✗ $file:$lineno $fname() defaults a read beside a Readings ledger"
     printf '    %s\n' "$(printf '%s' "${rest2#*:}" | cut -c1-110)"
     READINGS_FAIL=1
-done < <(cd "$ROOT" && find . -path ./target -prune -o -name '*.rs' \
-             "${TREE_PRUNE_FIND[@]}" \
+done < <(cd "$ROOT" && find . "${TREE_PRUNE_FIND[@]}" -path ./target -prune -o -name '*.rs' \
              -not -name '*_tests.rs' -not -path '*/tests/*' -print0 2>/dev/null \
          | xargs -0 -n 40 awk -f "$READINGS_AWK" 2>/dev/null \
          | sed 's|^\./||' || true)
@@ -7432,10 +7481,14 @@ echo
 #     (`find "$dir"`, `grep -r "$SCOPE"`) is invisible — deliberately,
 #     since a scoped `$dir` is the common and correct case; so is a scan
 #     built with `eval` or assembled across a pipeline.
-#   * It proves the array is REFERENCED, never that the reference is in
-#     an effective position — `"${TREE_PRUNE_FIND[@]}"` placed after a
-#     `-print0` would satisfy it. What it buys is that a NEW scan cannot
-#     be added without the author meeting the rule.
+#   * For a recursive GREP it proves the array is REFERENCED, never that
+#     the reference is in an effective position. For a FIND it proves the
+#     position since 2026-10-05, when TREE_PRUNE_FIND became a prune (see
+#     its definition): the array must come straight after `find .` and the
+#     statement must name an explicit action, because a prune anywhere else
+#     changes the expression rather than just costing time. What it buys
+#     either way is that a NEW scan cannot be added without the author
+#     meeting the rule.
 #   * `rg`, `fd` and `git grep` are out of range. `git grep` needs no
 #     prune (it reads tracked files, and a worktree checkout is not
 #     tracked here) — that is why check 72 is not on this list.
@@ -7480,8 +7533,20 @@ SCAN_SCOPE_REPORT="$(perl -0777 -ne '
                 && $stmt =~ /(?: \x2E 2>| \x2E \)| \x2E $|"\$ROOT" 2>)/);
         next unless $rooted;
         $seen++;
-        next if $stmt =~ /TREE_PRUNE_(?:FIND|GREP)/;
         next if $l[$i] =~ /allow-unpruned-tree-scan/;
+        if ($stmt =~ /find \x2E /) {
+            # A find must PRUNE with the shared list: the array straight
+            # after the root, and an explicit action (without one, find
+            # prints the pruned directories themselves).
+            my $first = ($stmt =~ /find \x2E "\x24\{TREE_PRUNE_FIND\[\x40\]\}" /);
+            my $action = ($stmt =~ /-print0?\b|-exec(?:dir)?\b|-delete\b/);
+            next if $first && $action;
+            my $why = !$first ? "TREE_PRUNE_FIND is not the first thing after `find .`"
+                              : "no explicit -print/-print0/-exec";
+            printf("BAD %d (%s) %.90s\n", $i + 1, $why, $stmt);
+            next;
+        }
+        next if $stmt =~ /TREE_PRUNE_GREP/;
         printf("BAD %d %.110s\n", $i + 1, $stmt);
     }
     printf("SEEN %d\n", $seen);
@@ -7508,10 +7573,10 @@ if [ "$SCAN_SCOPE_FAIL" -eq 1 ]; then
     yellow "    under that prefix, so identical code is reported as a violation and"
     yellow "    any count this check prints is inflated by whatever is checked out"
     yellow "    beside you."
-    yellow "  → append \"\${TREE_PRUNE_FIND[@]}\" (walks) or \"\${TREE_PRUNE_GREP[@]}\""
-    yellow "    (recursive greps) to the statement. They are defined once at the top"
-    yellow "    of this file; per-check prunes (target, vendor, node_modules) stay"
-    yellow "    where they are."
+    yellow "  → walks: put \"\${TREE_PRUNE_FIND[@]}\" straight after the walk's root and end"
+    yellow "    with an explicit -print0 / -print; recursive greps: append \"\${TREE_PRUNE_GREP[@]}\"."
+    yellow "    Both are defined once at the top of this file; per-check prunes"
+    yellow "    (target, vendor, node_modules) stay at the site."
     EXIT_CODE=1
 else
     green "✓ all ${SCAN_SCOPE_SEEN} repo-root scans prune second checkouts"
@@ -7892,8 +7957,8 @@ while IFS= read -r hit; do
     [ -n "$hit" ] || continue
     red "✗ $hit collapses a failed integration read into the absent branch"
     INTEG_READ_FAIL=$((INTEG_READ_FAIL + 1))
-done < <(find . -name '*.rs' -not -path './target/*' -not -path './vendor/*' \
-              -not -path './node_modules/*' "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
+done < <(find . "${TREE_PRUNE_FIND[@]}" \( -path ./target -o -path ./vendor -o -path ./node_modules \) -prune -o \
+              -name '*.rs' -print0 2>/dev/null \
          | xargs -0 perl -e '
 # (read-method regex, Ok-arm regex). Leg (a): the Result<Option<_>>
 # integration read — its Ok arm is necessarily Ok(Some(..). Leg (b): the
@@ -7995,9 +8060,8 @@ while IFS= read -r hit; do
     [ -n "$hit" ] || continue
     red "✗ $hit collapses a failed workflow-graph read into a benign answer"
     GRAPH_READ_FAIL=$((GRAPH_READ_FAIL + 1))
-done < <(find . -name '*.rs' -not -path './target/*' -not -path './vendor/*' \
-              -not -path './node_modules/*' -not -path '*/tests/*' \
-              -not -name '*_tests.rs' "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
+done < <(find . "${TREE_PRUNE_FIND[@]}" \( -path ./target -o -path ./vendor -o -path ./node_modules \) -prune -o \
+              -name '*.rs' -not -path '*/tests/*' -not -name '*_tests.rs' -print0 2>/dev/null \
          | xargs -0 perl -e '
 for my $f (@ARGV) {
   open(my $fh, "<", $f) or next; my @l = <$fh>; close $fh; chomp @l;
@@ -8458,7 +8522,7 @@ bold "▶ check 83: explicit updated_at = NOW() in an upsert on a trigger-mainta
 # precision — the reason this check is scoped to `ON CONFLICT` upserts, where an
 # unchanged re-write is the normal case rather than the exception.
 # Opt-out `// allow-explicit-updated-at: <reason>`.
-UPSERT_STAMP_HITS="$(find . -name '*.rs' "${TREE_PRUNE_FIND[@]}" -not -path '*/target/*' -print0 2>/dev/null \
+UPSERT_STAMP_HITS="$(find . "${TREE_PRUNE_FIND[@]}" -name target -prune -o -name '*.rs' -print0 2>/dev/null \
   | xargs -0 perl -0777 -ne '
     my $TBL = qr/workflows|secrets|users|webhook_triggers|mcp_agents|agent_roles|user_audit_settings|modules/;
     my $src = $_;
@@ -9519,4 +9583,5 @@ if [ "$EXIT_CODE" -eq 0 ]; then
 else
     red "✗ structural lints failed"
 fi
+LINT_REACHED_END=1
 exit "$EXIT_CODE"
