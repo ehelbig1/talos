@@ -13,6 +13,9 @@
 # READ-ONLY. Everything this script sends:
 #   git ls-remote origin refs/heads/main   (no fetch, checkout untouched)
 #   git rev-parse HEAD
+#   git rev-parse / merge-base / rev-list / diff / ls-tree / grep over LOCAL
+#        objects, only when a process runs another commit than origin/main —
+#        to tell whether the commits in between change anything that runs
 #   docker info / docker inspect / docker logs
 #   docker exec <postgres> psql … one SELECT, in a read-only session
 #   GET  https://api.github.com/repos/<owner>/<repo>/commits/main — only when
@@ -119,6 +122,10 @@ read -r -d '' PY_BUILD <<'PY' || true
 import json, re, sys
 
 expected, url = sys.argv[1], sys.argv[2]
+try:
+    GAP = json.loads(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else {}
+except Exception:
+    GAP = {}
 
 
 def clean(s, limit=120):
@@ -147,6 +154,29 @@ def same_commit(a, b):
     # The build carries 7 characters and git ls-remote prints 40: equal means
     # the shorter is a prefix of the longer.
     return a.startswith(b) or b.startswith(a)
+
+
+def gap_none(sha):
+    g = GAP.get(sha)
+    return isinstance(g, list) and g and g[0] == "none"
+
+
+def describe_gap(sha):
+    """The phrase for a running commit that is not origin/main."""
+    g = GAP.get(sha)
+    if not isinstance(g, list) or not g:
+        return ""
+    if g[0] == "none":
+        return ("; the %s commit(s) between them change %s file(s), none of them built into "
+                "the stack or mounted (documentation, CI, tests): no rebuild needed"
+                % (g[1], g[2]))
+    if g[0] == "some":
+        files = clean(", ".join(g[3]) if len(g) > 3 else "", 200)
+        if g[1] == 0:
+            return "; deploy: %s" % files
+        return ("; deploy: the %s commit(s) between them change files the stack is built "
+                "or started from, or that this check cannot rule out (%s)" % (g[1], files))
+    return "; whether a deploy would change anything is unknown: %s" % clean(g[1] if len(g) > 1 else "", 120)
 
 
 raw = sys.stdin.read()
@@ -181,9 +211,12 @@ elif not expected:
     out("UNKNOWN", "controller commit",
         "running %s%s; origin/main could not be read (git ls-remote failed, and the GitHub API gave no commit)"
         % (sha, "-dirty" if dirty else ""))
+elif not same_commit(sha, expected) and not dirty and gap_none(sha):
+    out("PASS", "controller commit",
+        "running %s, %s%s" % (sha, main, describe_gap(sha)))
 elif not same_commit(sha, expected):
     out("FAIL", "controller commit",
-        "running %s%s, but %s" % (sha, "-dirty" if dirty else "", main))
+        "running %s%s, but %s%s" % (sha, "-dirty" if dirty else "", main, describe_gap(sha)))
 elif dirty:
     out("UNKNOWN", "controller commit",
         "running %s-dirty: the commit is %s, but the image was built from a tree "
@@ -208,7 +241,7 @@ for w in rows:
     label = "%s=%s" % (clean(w.get("worker_id"), 40), clean(w.get("build_version"), 40))
     if wsha is None:
         unreadable.append(label)
-    elif expected and not same_commit(wsha, expected):
+    elif expected and not same_commit(wsha, expected) and not (not wdirty and gap_none(wsha)):
         wrong.append(label)
     elif wdirty:
         dirty_rows.append(label)
@@ -216,9 +249,14 @@ for w in rows:
         good.append(label)
 
 basis = "self-reported at registration"
+behind = sorted({split_build(w.get("build_version"))[0] for w in rows
+                 if split_build(w.get("build_version"))[0]
+                 and expected and not same_commit(split_build(w.get("build_version"))[0], expected)
+                 and gap_none(split_build(w.get("build_version"))[0])})
 if wrong:
-    out("FAIL", "worker commit", "%d of %d registered worker row(s) report another commit than %s: %s (%s)"
-        % (len(wrong), len(rows), main, ", ".join(wrong[:3]), basis))
+    first = split_build(wrong[0].split("=", 1)[1])[0] if "=" in wrong[0] else None
+    out("FAIL", "worker commit", "%d of %d registered worker row(s) report another commit than %s: %s (%s)%s"
+        % (len(wrong), len(rows), main, ", ".join(wrong[:3]), basis, describe_gap(first) if first else ""))
 elif not expected:
     out("UNKNOWN", "worker commit", "%d registered worker row(s) report %s; origin/main could not be read"
         % (len(rows), ", ".join((good + dirty_rows + unreadable)[:3])))
@@ -226,8 +264,11 @@ elif unreadable or dirty_rows:
     out("UNKNOWN", "worker commit", "%d of %d registered worker row(s) name no clean commit: %s (%s)"
         % (len(unreadable) + len(dirty_rows), len(rows), ", ".join((unreadable + dirty_rows)[:3]), basis))
 else:
-    out("PASS", "worker commit", "%d registered worker row(s) report %s (%s)%s"
-        % (len(good), main, basis, "; the report was truncated" if fleet.get("truncated") else ""))
+    note = ""
+    if behind:
+        note = "; %s is behind it by commits that change nothing that runs" % ", ".join(behind)
+    out("PASS", "worker commit", "%d registered worker row(s) report %s (%s)%s%s"
+        % (len(good), main, basis, note, "; the report was truncated" if fleet.get("truncated") else ""))
 PY
 
 # stdin: `version|t` rows from _sqlx_migrations.
@@ -441,6 +482,137 @@ if bad:
     print(">\tdid not pass: %s%s" % ("; ".join(bad[:4]), more))
 PY
 
+# DOES THE GAP MATTER? argv: <origin/main sha> <running sha>…
+# For each running commit that is not origin/main, says whether the commits
+# between them change anything the running stack is built from or mounts.
+# Prints one JSON object {running: [kind, …]}:
+#   ["none", commits, files]           nothing that runs changed: no rebuild
+#   ["some", commits, files, [paths]]  a built or mounted file changed
+#   ["unknown", reason]                could not tell — treated as "some"
+# Reads LOCAL git objects only (run after `git pull`); never fetches.
+#
+# A changed file is WITHOUT EFFECT only when all three hold:
+#   1. it is under docs/, .github/, .githooks/ or scripts/tests/, under a
+#      crate's tests/ directory, a lint or CI script (scripts/lint-*,
+#      check-*, ci-*, ci_*, confirm-deploy.sh, dev-test-db.sh), or a .md
+#      file. (`make up` runs scripts/preflight-disk.sh and
+#      scripts/verify-observability.sh, which are not in this list, and any
+#      change to the Makefile itself counts as changing what runs);
+#   2. it is not under a directory an image copies or the compose file mounts
+#      (RUNTIME_DIRS below — read from controller/Dockerfile, worker/Dockerfile
+#      and docker-compose.yml on 2026-10-05);
+#   3. nothing on origin/main can embed it: no Rust source names it as an
+#      include would, and no build.rs, Dockerfile or compose file names it
+#      outside a comment. Six documents under docs/ are compiled into the binaries with
+#      include_str! (docs/workflow-engine/graph-json-schema.md, for one), so
+#      "it is documentation" is not enough. An include always climbs out of
+#      its crate, so its path names the file after a slash —
+#      "../../docs/x.md" — and in Rust source the search is for "/docs/x.md"
+#      (for a file inside a crate, "/" and its path within the crate). That
+#      finds all six and not a prose mention such as "see CLAUDE.md".
+# Anything else counts as changing what runs. A wrong "none" would hide a
+# needed deploy, so every doubt falls on the other side.
+read -r -d '' PY_GAP <<'PY' || true
+import json, re, subprocess, sys
+
+main, running = sys.argv[1], sys.argv[2:]
+RUNTIME_DIRS = ("frontend/", "module-templates/", "workflow-templates/", "deploy/",
+                "observability/", "docker/", "migrations/", "wit/", "talos_sdk_macros/",
+                "scripts/dev-backup")
+TOOLING = ("scripts/confirm-deploy.sh", "scripts/dev-test-db.sh")
+
+
+def git(*args):
+    r = subprocess.run(["git"] + list(args), capture_output=True, text=True)
+    return r.returncode, r.stdout
+
+
+def candidate(path):
+    if path.startswith(RUNTIME_DIRS):
+        return False
+    return (path.startswith((".github/", ".githooks/", "docs/", "scripts/tests/"))
+            or path.endswith(".md")
+            or path in TOOLING
+            or re.match(r"^scripts/(lint-|check-|ci-|ci_)", path) is not None
+            or re.match(r"^[^/]+/tests/", path) is not None)
+
+
+def named(main, needles, pathspecs, comment=None):
+    """The needles that occur in `pathspecs` on `main`, or None on error.
+    With `comment`, text from that marker to the end of a line is ignored."""
+    if not needles:
+        return set()
+    args = ["grep", "-F", "-h"]
+    for n in sorted(needles):
+        args += ["-e", n]
+    rc, out = git(*(args + [main, "--"] + pathspecs))
+    if rc not in (0, 1):
+        return None
+    found = set()
+    for line in out.split("\n"):
+        if comment and comment in line:
+            line = line[: line.index(comment)]
+        found.update(n for n in needles if n in line)
+    return found
+
+
+result = {}
+crates = None
+rc, out = git("cat-file", "-e", main + "^{commit}")
+main_ok = rc == 0
+for run in running:
+    if not main_ok:
+        result[run] = ["unknown", "origin/main %s is not in this checkout; git pull first" % main[:7]]
+        continue
+    rc, out = git("rev-parse", "--verify", "-q", run + "^{commit}")
+    full = out.strip()
+    if rc != 0 or not re.fullmatch(r"[0-9a-f]{40}", full):
+        result[run] = ["unknown", "the running commit %s is not in this checkout" % run]
+        continue
+    if full == main:
+        result[run] = ["none", 0, 0]
+        continue
+    rc, _ = git("merge-base", "--is-ancestor", full, main)
+    if rc != 0:
+        result[run] = ["some", 0, 0, ["%s is not an ancestor of origin/main" % run]]
+        continue
+    rc, out = git("rev-list", "--count", "%s..%s" % (full, main))
+    commits = int(out.strip()) if rc == 0 and out.strip().isdigit() else 0
+    rc, out = git("diff", "--name-only", "--no-renames", full, main)
+    if rc != 0:
+        result[run] = ["unknown", "git diff failed"]
+        continue
+    files = [f for f in out.split("\n") if f]
+    effect = [f for f in files if not candidate(f)]
+    rest = [f for f in files if candidate(f)]
+    if rest:
+        if crates is None:
+            rc, out = git("ls-tree", "-r", "--name-only", main)
+            crates = {f.split("/")[0] for f in out.split("\n") if f.count("/") == 1 and f.endswith("/Cargo.toml")} if rc == 0 else None
+        if crates is None:
+            result[run] = ["unknown", "git ls-tree failed"]
+            continue
+        needle = {}
+        for f in rest:
+            first, _, inner = f.partition("/")
+            needle[f] = inner if first in crates and inner else f
+        in_rust = named(main, {"/" + n for n in needle.values()}, ["*.rs"])
+        plain = set(needle.values()) | set(rest)
+        in_build = named(main, plain, ["*build.rs"], "//")
+        in_images = named(main, plain, ["*Dockerfile*", "*docker-compose*.yml"], "#")
+        if in_rust is None or in_build is None or in_images is None:
+            result[run] = ["unknown", "git grep failed"]
+            continue
+        in_build = in_build | in_images
+        effect += [f for f in rest
+                   if "/" + needle[f] in in_rust or needle[f] in in_build or f in in_build]
+    if effect:
+        result[run] = ["some", commits, len(files), sorted(effect)[:3] + (["…"] if len(effect) > 3 else [])]
+    else:
+        result[run] = ["none", commits, len(files)]
+print(json.dumps(result))
+PY
+
 # run_helper <fallback check name> <python source> <stdin text> [args…]
 # A helper that crashes is an UNKNOWN for its check, never a silent pass.
 run_helper() {
@@ -515,7 +687,34 @@ INFO_REPLY=""
 if reply=$(mcp_post '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_platform_info","arguments":{}}}'); then
     INFO_REPLY="$reply"
 fi
-run_helper "controller commit" "$PY_BUILD" "$INFO_REPLY" "$EXPECTED" "$MCP_URL"
+# The builds the controller and its registered workers report that are not
+# origin/main, and whether the commits between matter (PY_GAP).
+GAP_JSON=""
+if [ -n "$EXPECTED" ] && [ -n "$INFO_REPLY" ]; then
+    behind_shas=$(printf '%s' "$INFO_REPLY" | python3 -c '
+import json, re, sys
+main = sys.argv[1]
+try:
+    info = json.loads(json.loads(sys.stdin.read())["result"]["content"][0]["text"])
+except Exception:
+    sys.exit(0)
+builds = [info.get("build_version")]
+fleet = info.get("fleet") if isinstance(info.get("fleet"), dict) else {}
+builds += [w.get("build_version") for w in fleet.get("workers") or []
+           if isinstance(w, dict) and w.get("source") == "registered"]
+seen = set()
+for b in builds:
+    m = re.fullmatch(r".*\+([0-9a-f]{7,40})", b) if isinstance(b, str) else None
+    if m and not main.startswith(m.group(1)) and m.group(1) not in seen:
+        seen.add(m.group(1))
+        print(m.group(1))
+' "$EXPECTED" 2>/dev/null || true)
+    if [ -n "$behind_shas" ]; then
+        # shellcheck disable=SC2086 # one short hex commit per word, by construction
+        GAP_JSON=$(python3 -c "$PY_GAP" "$EXPECTED" $behind_shas 2>/dev/null || true)
+    fi
+fi
+run_helper "controller commit" "$PY_BUILD" "$INFO_REPLY" "$EXPECTED" "$MCP_URL" "$GAP_JSON"
 
 # ── 3+4. Containers ─────────────────────────────────────────────────────
 DOCKER_OK=0

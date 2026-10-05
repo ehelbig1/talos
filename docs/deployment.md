@@ -201,9 +201,17 @@ a pass. When `git ls-remote` cannot reach the remote — a locked SSH agent —
 the commit is read from the GitHub API instead, and the `origin/main` line
 says so.
 
-A commit mismatch is a FAIL even when the commits in between change nothing
-that runs (documentation, CI, tests): the check compares commits, not their
-effect.
+When the running commit is behind `origin/main`, the commit lines say whether
+that matters. If every file the commits in between change is documentation,
+CI, a test, a git hook or a lint script — outside every directory an image
+copies or the compose file mounts, and not embedded in a binary by an
+`include_str!` or named by a `build.rs`, Dockerfile or compose file — the
+line is a PASS that says "no rebuild needed". Anything else is a FAIL that
+names up to three of the files. When it cannot tell (the commits are not in
+the local checkout — `git pull` first), it is a FAIL that says so. The rules
+are in the `PY_GAP` comment in `scripts/confirm-deploy.sh`; they err towards
+"deploy": a `Makefile` or `scripts/publish-images.sh` change counts, though
+neither alters a running container.
 
 `checks on main` is worth reading BEFORE `git pull && make up` as well: every
 commit that lands on `main` gets one full `quality.yml` run, a few minutes
