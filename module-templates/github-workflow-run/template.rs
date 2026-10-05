@@ -1,7 +1,8 @@
 // GitHub: the newest finished run of one workflow on one branch.
 //
-// Reads GitHub's "list workflow runs" endpoint for REPO / WORKFLOW / BRANCH —
-// the newest PAGE runs — picks the newest FINISHED one itself, and says what
+// Reads GitHub's "list workflow runs" endpoint for REPO / WORKFLOW — the
+// workflow's newest PAGE runs on every branch — keeps BRANCH's runs that are
+// not pull-request runs, picks the newest FINISHED one itself, and says what
 // it found:
 //
 //   { "state": "failing" | "passing" | "other" | "none", "run": { … } }
@@ -16,13 +17,15 @@
 // Whether a person is TOLD is not this node's business: a compose node after
 // it decides that (once per run, not once per poll).
 //
-// It does not ask GitHub to filter or to choose. Measured 2026-10-05:
-// `status=completed&per_page=1` returned a run from nine days earlier (and a
-// different total_count, 568 against 701) on a branch whose newest finished
-// run was minutes old, while the same query with per_page 2 to 10 was right.
-// So the module reads the newest runs unfiltered and chooses the newest
-// finished one by creation time, then run number. If all of them are still
-// running, the state is `none` and nothing changes.
+// It sends GitHub NO filter. Measured 2026-10-05 on a public repository:
+// `branch=main` answered with a list stuck nine days in the past, its
+// total_count changing between requests (103, 338, 568, 701), and
+// `status=completed&per_page=1` likewise — while the unfiltered listing was
+// current and stable (total_count 1866, three requests in a row). So the
+// module reads the unfiltered listing and does the choosing: runs on BRANCH,
+// not triggered by a pull request (a fork's branch can be named `main` too),
+// finished, newest by creation time then run number. If no such run is among
+// the newest PAGE, the state is `none` and nothing changes.
 //
 // Public repositories need no credential (GitHub allows 60 unauthenticated
 // requests an hour per address). AUTH_HEADER takes a vault:// reference for a
@@ -38,9 +41,9 @@ const PROVIDER: &str = "github";
 const SOURCE: &str = "github-actions";
 const API: &str = "https://api.github.com";
 const MAX_TITLE_CHARS: usize = 120;
-/// How many of the newest runs on the branch are read. The newest FINISHED
-/// one is chosen from these by this module, not by GitHub's order.
-const PAGE: usize = 10;
+/// How many of the workflow's newest runs (all branches) are read. The
+/// newest FINISHED run on BRANCH is chosen from these by this module.
+const PAGE: usize = 30;
 
 #[derive(Deserialize, Default)]
 struct Cfg {
@@ -197,7 +200,9 @@ pub fn run(input: String) -> Result<String, String> {
         .filter(|w| usable_workflow(w))
         .ok_or("Missing or unusable WORKFLOW config (expected a file name such as quality.yml, or a workflow id)")?;
     let branch = cfg.branch.as_deref().map(str::trim).unwrap_or("main");
-    let branch_q = encoded_branch(branch).ok_or("BRANCH is not a usable branch name")?;
+    // BRANCH is no longer sent to GitHub, but it names the alert and a
+    // downstream memory key, so it is held to the same rule.
+    encoded_branch(branch).ok_or("BRANCH is not a usable branch name")?;
     let alert = cfg.alert.unwrap_or(true);
     let severity = severity_hint(cfg.severity.as_deref())?;
 
@@ -213,7 +218,7 @@ pub fn run(input: String) -> Result<String, String> {
     let req = talos::core::http::Request {
         method: talos::core::http::Method::Get,
         url: format!(
-            "{API}/repos/{repo}/actions/workflows/{workflow}/runs?branch={branch_q}&per_page={PAGE}"
+            "{API}/repos/{repo}/actions/workflows/{workflow}/runs?per_page={PAGE}"
         ),
         headers,
         body: Vec::new(),
@@ -227,12 +232,15 @@ pub fn run(input: String) -> Result<String, String> {
         .map_err(|_| "api.github.com answered with something other than a list of runs".to_string())?;
 
     let dedup_key = format!("{SOURCE}|{repo}|{workflow}|{branch}");
-    // The newest finished run, chosen here: GitHub's order is not relied on.
-    // RFC 3339 times in one format compare correctly as strings.
+    // The newest finished run on the branch, chosen here: GitHub is asked to
+    // filter nothing and its order is not relied on. RFC 3339 times in one
+    // format compare correctly as strings.
     let newest = page
         .workflow_runs
         .into_iter()
         .filter(|r| r.status.as_deref() == Some("completed"))
+        .filter(|r| r.head_branch.as_deref() == Some(branch))
+        .filter(|r| !r.event.as_deref().unwrap_or("").starts_with("pull_request"))
         .max_by(|a, b| {
             (a.created_at.as_deref().unwrap_or(""), a.run_number.unwrap_or(0))
                 .cmp(&(b.created_at.as_deref().unwrap_or(""), b.run_number.unwrap_or(0)))
@@ -342,7 +350,7 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(
             sent[0].url,
-            "https://api.github.com/repos/example-owner/example-repo/actions/workflows/quality.yml/runs?branch=main&per_page=10"
+            "https://api.github.com/repos/example-owner/example-repo/actions/workflows/quality.yml/runs?per_page=30"
         );
         assert!(sent[0].headers.iter().any(|(k, _)| k == "User-Agent"));
         assert!(!sent[0].headers.iter().any(|(k, _)| k == "Authorization"));
@@ -388,7 +396,8 @@ mod tests {
     fn the_newest_finished_run_is_chosen_whatever_the_order() {
         let run = |id: u64, number: u64, created: &str, status: &str, conclusion: Option<&str>| {
             json!({ "id": id, "run_number": number, "event": "push", "status": status,
-                    "conclusion": conclusion, "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                    "conclusion": conclusion, "head_branch": "main",
+                    "head_sha": "0123456789abcdef0123456789abcdef01234567",
                     "html_url": format!("https://github.com/example-owner/example-repo/actions/runs/{id}"),
                     "created_at": created, "updated_at": created })
         };
@@ -401,6 +410,32 @@ mod tests {
         host::http::respond(200, p.to_string());
         let v = read(config()).unwrap();
         assert_eq!((v["state"].clone(), v["run"]["id"].clone()), (json!("passing"), json!(3)));
+    }
+
+    /// Only BRANCH's own runs count: a newer failure on another branch, and a
+    /// pull-request run whose head branch is also called `main` (a fork's),
+    /// are left out.
+    #[test]
+    fn only_the_branchs_own_runs_count() {
+        let run = |id: u64, branch: &str, event: &str, conclusion: &str, created: &str| {
+            json!({ "id": id, "run_number": id, "event": event, "status": "completed",
+                    "conclusion": conclusion, "head_branch": branch,
+                    "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                    "created_at": created, "updated_at": created })
+        };
+        let p = json!({ "workflow_runs": [
+            run(5, "feature-x", "pull_request", "failure", "2026-01-05T00:00:00Z"),
+            run(4, "main", "pull_request", "failure", "2026-01-04T00:00:00Z"),
+            run(3, "main", "push", "success", "2026-01-03T00:00:00Z"),
+            run(2, "main", "schedule", "failure", "2026-01-02T00:00:00Z"),
+        ]});
+        host::http::respond(200, p.to_string());
+        let v = read(config()).unwrap();
+        assert_eq!((v["state"].clone(), v["run"]["id"].clone()), (json!("passing"), json!(3)));
+        let mut c = config();
+        c["BRANCH"] = json!("feature-x");
+        host::http::respond(200, p.to_string());
+        assert_eq!(read(c).unwrap()["state"], "none");
     }
 
     #[test]
@@ -427,11 +462,10 @@ mod tests {
         let mut c = config();
         c["SEVERITY"] = json!("critical");
         c["AUTH_HEADER"] = json!("Bearer vault://github/token");
-        c["BRANCH"] = json!("release/v1");
         let v = read(c).unwrap();
         assert_eq!(v["__ops_alert__"]["alerts"][0]["severity_hint"], "critical");
         let sent = &host::http::requests()[0];
-        assert!(sent.url.contains("branch=release%2Fv1&"), "{}", sent.url);
+        assert!(!sent.url.contains("branch="), "{}", sent.url);
         assert!(sent.headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer vault://github/token"));
     }
 
