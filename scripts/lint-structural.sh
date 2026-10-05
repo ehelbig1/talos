@@ -1265,114 +1265,56 @@ bold "▶ check 14: talos-api Err(async_graphql::Error::new) missing .extend_saf
 # Scoped to talos-api/src/ — other crates don't go through the
 # scrubber and follow different error-discipline conventions.
 EXTEND_SAFE_VIOLATIONS=0
-while IFS= read -r line; do
-    file="$(echo "$line" | cut -d: -f1)"
-    lineno="$(echo "$line" | cut -d: -f2)"
-    # MCP-1200 (2026-05-17): between-pair semantics. Pre-fix the lint
-    # scanned an 8-line lookahead from each Error::new and treated ANY
-    # .extend_safe() in that window as covering the match. Two
-    # Error::new calls in the same if/else block (or any close-paired
-    # pattern) → the first one's lookahead saw the SECOND's
-    # .extend_safe() and silently passed both, even when the first
-    # was bare. register_mcp_agent.rs:150 was a live instance of this
-    # blind spot (duplicate-name message replaced with "Internal
-    # server error" in production).
-    #
-    # New logic: scan forward up to 20 lines, and look for
-    # .extend_safe() BEFORE the next async_graphql::Error::new(
-    # appears. The first .extend_safe() encountered before a new
-    # Error::new is unambiguously the current call's marker. If a
-    # new Error::new appears first, the current call is missing
-    # its .extend_safe().
-    end_line=$((lineno + 20))
-    found_extend_safe=0
-    next_lineno=$((lineno + 1))
-    while [ "$next_lineno" -le "$end_line" ]; do
-        next_line="$(sed -n "${next_lineno}p" "$file" 2>/dev/null)"
-        # Skip if blank/empty
-        if [ -z "$next_line" ]; then
-            next_lineno=$((next_lineno + 1))
-            continue
-        fi
-        if echo "$next_line" | grep -q '\.extend_safe()'; then
-            found_extend_safe=1
-            break
-        fi
-        if echo "$next_line" | grep -q 'async_graphql::Error::new('; then
-            # New call begins before current call closed — current is bare.
-            break
-        fi
-        next_lineno=$((next_lineno + 1))
-    done
-    # Also accept .extend_safe() on the SAME line as the match
-    # (single-line patterns like Error::new("foo").extend_safe()).
-    same_line="$(sed -n "${lineno}p" "$file" 2>/dev/null)"
-    if echo "$same_line" | grep -q '\.extend_safe()'; then
-        found_extend_safe=1
-    fi
-    if [ "$found_extend_safe" -eq 1 ]; then
-        continue
-    fi
-    # Skip if opt-out marker is within 8 lines above
-    es_start=$((lineno > 8 ? lineno - 8 : 1))
-    if sed -n "${es_start},${lineno}p" "$file" 2>/dev/null \
-            | grep -q 'allow-unsafe-error'; then
-        continue
-    fi
-    # Skip if any whitelist-substring is present in the FIRST 5 lines of
-    # the call (the message body). Pre-MCP-1200 the check used the full
-    # 8-line block — could match a whitelist substring belonging to a
-    # SIBLING Error::new call. Scoping to the message-body lines stops
-    # that false-cover. MCP-1051 (2026-05-15): the substring list MUST
-    # match the canonical `talos_api::schema::SAFE_ERROR_SUBSTRINGS` const
-    # used by the production scrubber (talos-api/src/schema/mod.rs). If
-    # the const changes, update this regex too — same substrings,
-    # case-sensitive.
-    msg_block="$(sed -n "${lineno},$((lineno + 5))p" "$file" 2>/dev/null)"
-    if echo "$msg_block" | grep -qE 'Authentication|Access denied|Not found|Invalid|Validation|Unauthorized'; then
-        continue
-    fi
-    printf '  %s\n' "$line"
-    EXTEND_SAFE_VIOLATIONS=$((EXTEND_SAFE_VIOLATIONS + 1))
-# MCP-963 (2026-05-15): widen the lint pattern to also catch
-# `.map_err(|_| async_graphql::Error::new(...))` and
-# `.map_err(|e| async_graphql::Error::new(...))` sites — same
-# scrubber discipline applies, but the original pattern only
-# matched `Err(...)`. The map_err sites were missed entirely.
-# Pre-fix: 1 site in talos-api echoed `e.to_string()` without
-# extend_safe AND without a whitelist-substring match → operator
-# saw "Internal server error" on real DB errors AND on
-# permission-denied; "Template not found or access denied"
-# context-message had "not found" lowercase which DOES NOT match
-# the case-sensitive "Not found" whitelist. Fixed in MCP-963 by
-# adding extend_safe + tracing::error log of the underlying e.
+# THE SEED: every `async_graphql::Error::new(` call site in talos-api/src.
+# MCP-963 (2026-05-15) widened it from `Err(...)` to `.map_err(|_| ...)` /
+# `.map_err(|e| ...)`; MCP-1048 (2026-05-15) widened it to ALL call sites,
+# because grep -E does not span newlines (multi-line `.map_err(|e| { ... })`
+# closures) and `.ok_or_else(|| ...)` was missed — 3 sites in
+# subscriptions.rs ("Failed to fetch events" / "Streaming not available" /
+# "Failed to subscribe") had bypassed both the lint and the whitelist and were
+# scrubbed to "Internal server error" in production.
 #
-# MCP-1048 (2026-05-15): widen further to ALL `async_graphql::Error::new(`
-# call sites. The MCP-963 pattern still missed two shapes:
-#   (a) multi-line `.map_err(|e| { ... async_graphql::Error::new(...)
-#       })` where the closure body spans more than one line. grep -E
-#       doesn't span newlines, so the seed only matched same-line
-#       constructions.
-#   (b) `.ok_or_else(|| async_graphql::Error::new(...))` — the
-#       MCP-963 widening covered `\.map_err\(\|[a-z_]+\|` but NOT
-#       `\.ok_or_else\(\|\|`.
-# Pre-fix MCP-1048 audit found 3 sites in talos-api/src/schema/
-# subscriptions.rs (Failed to fetch events / Streaming not available
-# / Failed to subscribe) that bypassed both the lint AND the
-# substring whitelist → scrubbed to "Internal server error" in
-# production.
-# The seed pattern now matches every call site; the lookahead block
-# below applies the same .extend_safe() / whitelist / opt-out checks
-# uniformly, so a future violation in any shape is caught.
-done < <(grep -rEna 'async_graphql::Error::new\(' \
+# THE DECISION per site is scripts/lint-extend-safe.py (2026-10-05): the same
+# rules this loop applied, in one pass. The bash loop spawned sed/echo/grep for
+# every line it looked at and took about 67 of the lint's 194 seconds; the
+# helper takes well under one. Its rules, documented in its header:
+#   * MCP-1200 (2026-05-17) between-pair semantics: scan up to 20 lines on for
+#     `.extend_safe()` BEFORE the next `async_graphql::Error::new(`, so a bare
+#     call is not covered by a sibling's marker (register_mcp_agent.rs:150 was
+#     a live instance). Same-line `.extend_safe()` counts.
+#   * opt-out `// allow-unsafe-error: <reason>` within 8 lines above.
+#   * MCP-1051 (2026-05-15): a whitelisted substring in the call's first 5
+#     message lines. The list MUST match `talos_api::schema::SAFE_ERROR_SUBSTRINGS`
+#     (talos-api/src/schema/mod.rs) — the regex is in the helper.
+# Equivalence with the loop it replaced was measured on the real tree (0 and 0)
+# and on two altered copies (448 and 29 violations, identical sets).
+ES_BROKEN=0
+if ! python3 "$ROOT/scripts/lint-extend-safe.py" --self-test >/dev/null; then
+    red "✗ scripts/lint-extend-safe.py --self-test failed — its rules are not the ones documented"
+    ES_BROKEN=1
+    EXIT_CODE=1
+fi
+ES_SEED="$(grep -rEna 'async_graphql::Error::new\(' \
             --include='*.rs' \
             talos-api/src 2>/dev/null \
         | grep -v '_test\.\|/tests/\|/validation.rs:' \
         | grep -vE ':[[:space:]]*///' \
         | grep -vE ':[[:space:]]*//[^/]' \
-        || true)
+        || true)"
+if ES_OUT="$(printf '%s\n' "$ES_SEED" | python3 "$ROOT/scripts/lint-extend-safe.py")"; then
+    if [ -n "$ES_OUT" ]; then
+        printf '%s\n' "$ES_OUT"
+        EXTEND_SAFE_VIOLATIONS="$(printf '%s\n' "$ES_OUT" | grep -c .)"
+    fi
+else
+    red "✗ scripts/lint-extend-safe.py failed — check 14 did not run"
+    ES_BROKEN=1
+    EXIT_CODE=1
+fi
 
-if [ "$EXTEND_SAFE_VIOLATIONS" -gt 0 ]; then
+if [ "$ES_BROKEN" -eq 1 ]; then
+    : # reported above; no verdict either way
+elif [ "$EXTEND_SAFE_VIOLATIONS" -gt 0 ]; then
     red "✗ found $EXTEND_SAFE_VIOLATIONS Err(async_graphql::Error::new) site(s) missing .extend_safe()"
     yellow "  → mark with .extend_safe() so production scrubber doesn't"
     yellow "    replace the message with 'Internal server error'."
