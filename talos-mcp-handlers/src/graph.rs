@@ -1298,6 +1298,11 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "type": "number",
                         "description": "How many active alerts to include verbatim in top_active (1-25, default 10)"
                     },
+                    "sources": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional: only alerts from these sources go into top_active (e.g. [\"talos\"] for the platform's own failure alerts). Omit for every source. The digest counts stay over all active alerts. Up to 16 names of letters, digits, '.', '_' and '-'."
+                    },
                     "connect_from": {
                         "description": "Node ID(s) to wire INTO this node (usually the trigger).",
                         "oneOf": [
@@ -3741,10 +3746,49 @@ async fn handle_add_ops_alerts_digest_node(
         .get("top_limit")
         .and_then(serde_json::Value::as_u64)
         .map_or(10u64, |v| v.clamp(1, 25));
+    // `sources` is refused here when it holds anything unusable: an author
+    // asking to narrow the feed must hear about a typo, not get a filter
+    // that silently matches nothing (which is what the graph parser makes
+    // of a hand-edited graph, so it can never widen to every alert).
+    let sources: Option<Vec<String>> = match args.get("sources").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => {
+            let list = v.as_array().map(|a| {
+                a.iter()
+                    .map(|x| x.as_str().map(str::to_string))
+                    .collect::<Option<Vec<String>>>()
+            });
+            match list.flatten() {
+                Some(list)
+                    if !list.is_empty()
+                        && list.len() <= talos_workflow_engine_core::MAX_ALERT_SOURCES
+                        && list
+                            .iter()
+                            .all(|s| talos_workflow_engine_core::usable_alert_source(s)) =>
+                {
+                    Some(list)
+                }
+                _ => {
+                    return mcp_error(
+                        req_id,
+                        -32602,
+                        &format!(
+                            "sources must be a non-empty list of at most {} names of letters, digits, '.', '_' and '-'",
+                            talos_workflow_engine_core::MAX_ALERT_SOURCES
+                        ),
+                    );
+                }
+            }
+        }
+    };
     let connect_to = args
         .get("connect_to")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let mut node_data = serde_json::json!({ "top_limit": top_limit });
+    if let Some(list) = &sources {
+        node_data["sources"] = serde_json::json!(list);
+    }
 
     let added = match upsert_system_node(
         &req_id,
@@ -3752,7 +3796,7 @@ async fn handle_add_ops_alerts_digest_node(
         state,
         &agent,
         "ops_alerts_digest",
-        serde_json::json!({ "top_limit": top_limit }),
+        node_data,
     )
     .await
     {
@@ -3767,6 +3811,7 @@ async fn handle_add_ops_alerts_digest_node(
             "node_id": added.node_id,
             "node_type": "ops_alerts_digest",
             "top_limit": top_limit,
+            "sources": sources,
             "downstream": connect_to,
             "message": format!(
                 "Ops-alerts digest node '{}' added to workflow {}. Emits {{available, digest: {{active_by_severity, active_by_source, new_last_24h, reopened_active}}, top_active: [...]}} for downstream compose nodes.{}",

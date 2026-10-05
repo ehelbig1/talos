@@ -535,9 +535,15 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 json!({})
             },
         ),
-        SystemNodeKind::OpsAlertsDigest { top_limit } => {
-            ("ops_alerts_digest", json!({ "top_limit": top_limit }))
-        }
+        // `sources` is written only when set, so a node without a filter
+        // serialises exactly as it did before the field existed.
+        SystemNodeKind::OpsAlertsDigest { top_limit, sources } => (
+            "ops_alerts_digest",
+            match sources {
+                Some(s) => json!({ "top_limit": top_limit, "sources": s }),
+                None => json!({ "top_limit": top_limit }),
+            },
+        ),
         SystemNodeKind::PendingApprovals { limit } => {
             ("pending_approvals", json!({ "limit": limit }))
         }
@@ -1368,12 +1374,18 @@ mod tests {
     async fn system_node_ops_alerts_digest_round_trips() {
         let decoded = round_trip_kind(
             "ops_digest",
-            SystemNodeKind::OpsAlertsDigest { top_limit: 7 },
+            SystemNodeKind::OpsAlertsDigest {
+                top_limit: 7,
+                sources: None,
+            },
         )
         .await;
         assert!(matches!(
             decoded,
-            SystemNodeKind::OpsAlertsDigest { top_limit: 7 }
+            SystemNodeKind::OpsAlertsDigest {
+                top_limit: 7,
+                sources: None
+            }
         ));
 
         // The parser clamps hand-authored out-of-range values (the
@@ -1388,8 +1400,45 @@ mod tests {
         let parsed = crate::graph_parser::parse_system_node_kind("ops_alerts_digest", &oversized);
         assert!(matches!(
             parsed,
-            Some(SystemNodeKind::OpsAlertsDigest { top_limit: 25 })
+            Some(SystemNodeKind::OpsAlertsDigest {
+                top_limit: 25,
+                sources: None
+            })
         ));
+    }
+
+    /// A `sources` filter survives a save and load; no filter writes no key
+    /// (a graph saved before the field existed is byte-identical); and a
+    /// hand-edited filter whose entries are all unusable matches NOTHING
+    /// rather than widening to every source.
+    #[tokio::test]
+    async fn system_node_ops_alerts_digest_sources_round_trip_and_fail_closed() {
+        let filtered = SystemNodeKind::OpsAlertsDigest {
+            top_limit: 5,
+            sources: Some(vec!["talos".into(), "backup-drill".into()]),
+        };
+        let decoded = round_trip_kind("ops_digest_sources", filtered.clone()).await;
+        assert_eq!(decoded, filtered);
+
+        let (_, data) = serialize_system_node_kind(&SystemNodeKind::OpsAlertsDigest {
+            top_limit: 5,
+            sources: None,
+        });
+        assert!(data.get("sources").is_none(), "{data}");
+
+        for bad in [serde_json::json!("talos"), serde_json::json!(["", "a b"])] {
+            let node = serde_json::json!({
+                "id": "d", "type": "system:ops_alerts_digest", "kind": "ops_alerts_digest",
+                "data": { "top_limit": 5, "sources": bad },
+            });
+            assert_eq!(
+                crate::graph_parser::parse_system_node_kind("ops_alerts_digest", &node),
+                Some(SystemNodeKind::OpsAlertsDigest {
+                    top_limit: 5,
+                    sources: Some(vec![])
+                }),
+            );
+        }
     }
 
     #[tokio::test]

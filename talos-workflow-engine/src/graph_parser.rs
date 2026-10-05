@@ -285,7 +285,11 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
             .and_then(|d| d.get("top_limit"))
             .and_then(serde_json::Value::as_u64)
             .map_or(10u32, |v| v.clamp(1, 25) as u32);
-        Some(SystemNodeKind::OpsAlertsDigest { top_limit })
+        // Absent → no filter; present but unusable → matches nothing.
+        let sources = talos_workflow_engine_core::parse_alert_sources(
+            node.get("data").and_then(|d| d.get("sources")),
+        );
+        Some(SystemNodeKind::OpsAlertsDigest { top_limit, sources })
     } else if k == "pending_approvals" {
         // Clamp defensively at parse time so a hand-authored graph can't
         // request an unbounded pending-approval list (default 10, cap 25).
