@@ -11,9 +11,21 @@
 // `passing` is success; `other` is cancelled, skipped, neutral or anything
 // newer GitHub adds; `none` is no finished run on that branch.
 //
+// `not_run` is a run GitHub marks failed although nothing in it failed: some
+// of its jobs never started (GitHub had no runner for them and cancelled
+// them), and the only job that failed is GATE_JOB — the job that fails
+// because others did not succeed. Measured 2026-10-05 during a GitHub Actions
+// incident: two runs on main concluded `failure` with every job that ran
+// green, and each paged as a broken main. To tell the two apart the module
+// reads the run's jobs, ONLY when the run concluded `failure`. A job that
+// never started is `cancelled` with no steps; one cancelled after it started
+// still counts as a failure. If the jobs cannot be read the run stays
+// `failing` (`jobs_read: false`): a false alarm is better than a hidden one.
+//
 // With ALERT (the default) the result also rides out as an ops alert under
 // `__ops_alert__` — one rolling alert per repo/workflow/branch: a failing run
-// raises or bumps it, a passing run resolves it, `other` leaves it alone.
+// raises or bumps it, a passing run resolves it, `other` and `not_run`
+// leave it alone.
 // Whether a person is TOLD is not this node's business: a compose node after
 // it decides that (once per run, not once per poll).
 //
@@ -44,6 +56,11 @@ const MAX_TITLE_CHARS: usize = 120;
 /// How many of the workflow's newest runs (all branches) are read. The
 /// newest FINISHED run on BRANCH is chosen from these by this module.
 const PAGE: usize = 30;
+/// A run's jobs are read in one page; a listing longer than this is not
+/// judged (the run stays `failing`).
+const JOBS_PAGE: usize = 100;
+/// How many never-started job names the output carries.
+const MAX_NOT_RUN_NAMES: usize = 20;
 
 #[derive(Deserialize, Default)]
 struct Cfg {
@@ -61,6 +78,8 @@ struct Cfg {
     severity: Option<String>,
     #[serde(rename = "TIMEOUT_MS", default)]
     timeout_ms: Option<u32>,
+    #[serde(rename = "GATE_JOB", default)]
+    gate_job: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -98,6 +117,60 @@ struct ApiRun {
     created_at: Option<String>,
     #[serde(default)]
     updated_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JobsPage {
+    #[serde(default)]
+    total_count: Option<u64>,
+    #[serde(default)]
+    jobs: Vec<ApiJob>,
+}
+
+#[derive(Deserialize)]
+struct ApiJob {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    /// Only whether there are any: a job GitHub never started has none.
+    #[serde(default)]
+    steps: Option<Vec<serde::de::IgnoredAny>>,
+}
+
+/// What a failed run's jobs say about it.
+#[derive(Debug, PartialEq)]
+enum Jobs {
+    /// Something that ran failed (or nothing failed to start): the run failed.
+    Failed,
+    /// Nothing that ran failed except the gate, and these jobs never started.
+    NotRun(Vec<String>),
+}
+
+/// Judge a failed run by its jobs. `None` when the listing is incomplete or
+/// empty, so the caller keeps the run `failing`.
+fn judge_jobs(page: &JobsPage, gate: Option<&str>) -> Option<Jobs> {
+    if page.jobs.is_empty() || page.total_count.is_some_and(|t| t > page.jobs.len() as u64) {
+        return None;
+    }
+    let started = |j: &ApiJob| j.steps.as_ref().is_some_and(|s| !s.is_empty());
+    let mut never_started = Vec::new();
+    for j in &page.jobs {
+        let name = j.name.as_deref().unwrap_or("");
+        match j.conclusion.as_deref() {
+            Some("success" | "skipped" | "neutral") => {}
+            Some("cancelled") if !started(j) => never_started.push(clean(name, 100)),
+            // The gate fails BECAUSE others did not succeed; it says nothing
+            // the other jobs do not.
+            _ if gate.is_some_and(|g| g == name) => {}
+            _ => return Some(Jobs::Failed),
+        }
+    }
+    if never_started.is_empty() {
+        return Some(Jobs::Failed);
+    }
+    never_started.truncate(MAX_NOT_RUN_NAMES);
+    Some(Jobs::NotRun(never_started))
 }
 
 #[derive(Serialize)]
@@ -205,6 +278,12 @@ pub fn run(input: String) -> Result<String, String> {
     encoded_branch(branch).ok_or("BRANCH is not a usable branch name")?;
     let alert = cfg.alert.unwrap_or(true);
     let severity = severity_hint(cfg.severity.as_deref())?;
+    let gate = match cfg.gate_job.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+        None => None,
+        Some(g) if g.chars().count() <= 100 && !g.chars().any(char::is_control) => Some(g),
+        Some(_) => return Err("GATE_JOB must be a job name of at most 100 characters".to_string()),
+    };
+    let timeout_ms = Some(cfg.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000));
 
     let mut headers = vec![
         ("Accept".to_string(), "application/vnd.github+json".to_string()),
@@ -220,9 +299,9 @@ pub fn run(input: String) -> Result<String, String> {
         url: format!(
             "{API}/repos/{repo}/actions/workflows/{workflow}/runs?per_page={PAGE}"
         ),
-        headers,
+        headers: headers.clone(),
         body: Vec::new(),
-        timeout_ms: Some(cfg.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000)),
+        timeout_ms,
     };
     let resp = talos::core::http::fetch(&req).map_err(|_| "api.github.com could not be reached".to_string())?;
     if !(200..300).contains(&resp.status) {
@@ -254,7 +333,39 @@ pub fn run(input: String) -> Result<String, String> {
         .map_err(|e| e.to_string());
     };
     let conclusion = clean(r.conclusion.as_deref().unwrap_or("unknown"), 30);
-    let state = state_of(&conclusion);
+    let mut state = state_of(&conclusion);
+    // A failed run is checked for jobs that never started (see the header).
+    let mut jobs_read = None;
+    let mut not_run = Vec::new();
+    if conclusion == "failure" {
+        let req = talos::core::http::Request {
+            method: talos::core::http::Method::Get,
+            url: format!(
+                "{API}/repos/{repo}/actions/runs/{}/jobs?filter=latest&per_page={JOBS_PAGE}",
+                r.id
+            ),
+            headers,
+            body: Vec::new(),
+            timeout_ms,
+        };
+        let verdict = talos::core::http::fetch(&req)
+            .ok()
+            .filter(|resp| (200..300).contains(&resp.status))
+            .and_then(|resp| serde_json::from_slice::<JobsPage>(&resp.body).ok())
+            .and_then(|page| judge_jobs(&page, gate));
+        jobs_read = Some(verdict.is_some());
+        match verdict {
+            Some(Jobs::NotRun(names)) => {
+                state = "not_run";
+                not_run = names;
+            }
+            Some(Jobs::Failed) => {}
+            None => logging::log(
+                Level::Warn,
+                "github-workflow-run: the failed run's jobs could not be read; it stays failing",
+            ),
+        }
+    }
     let sha = clean(r.head_sha.as_deref().unwrap_or(""), 40);
     let short = sha.chars().take(7).collect::<String>();
     let url = r
@@ -280,6 +391,12 @@ pub fn run(input: String) -> Result<String, String> {
         "provider": PROVIDER, "repo": repo, "workflow": workflow, "branch": branch,
         "state": state, "run": run,
     });
+    if let Some(read) = jobs_read {
+        out["jobs_read"] = serde_json::json!(read);
+    }
+    if !not_run.is_empty() {
+        out["jobs_not_run"] = serde_json::json!(not_run);
+    }
     if alert {
         let entry = match state {
             "failing" => Some(serde_json::json!({
@@ -334,11 +451,33 @@ mod tests {
         .to_string()
     }
 
+    /// A job as GitHub lists it: `steps` steps run (0 = never started).
+    fn job(name: &str, conclusion: &str, steps: usize) -> Value {
+        let steps: Vec<Value> = (0..steps).map(|i| json!({ "name": format!("step {i}"), "conclusion": conclusion })).collect();
+        json!({ "name": name, "status": "completed", "conclusion": conclusion, "steps": steps })
+    }
+    /// Answer the runs listing with `runs` and the jobs listing with `jobs`.
+    fn respond_runs_and_jobs(runs: String, jobs: Value) {
+        host::http::respond_with(move |req| {
+            let body = if req.url.contains("/jobs") { jobs.to_string() } else { runs.clone() };
+            Ok(host::http::response(200, body))
+        });
+    }
+    fn jobs(list: Vec<Value>) -> Value {
+        json!({ "total_count": list.len(), "jobs": list })
+    }
+    fn gated(gate: &str) -> Value {
+        let mut c = config();
+        c["GATE_JOB"] = json!(gate);
+        c
+    }
+
     #[test]
     fn a_failed_run_raises_the_rolling_alert() {
-        host::http::respond(200, page("failure"));
+        respond_runs_and_jobs(page("failure"), jobs(vec![job("build", "success", 4), job("test", "failure", 6)]));
         let v = read(config()).unwrap();
         assert_eq!(v["state"], "failing");
+        assert_eq!(v["jobs_read"], true);
         assert_eq!(v["run"]["id"], 42);
         assert_eq!(v["run"]["url"], "https://github.com/example-owner/example-repo/actions/runs/42");
         let a = &v["__ops_alert__"]["alerts"][0];
@@ -347,13 +486,113 @@ mod tests {
         assert_eq!(a["title"], "quality.yml failure on main (example-owner/example-repo 0123456)");
         assert!(a.get("status_event").is_none());
         let sent = host::http::requests();
-        assert_eq!(sent.len(), 1);
+        assert_eq!(sent.len(), 2);
         assert_eq!(
             sent[0].url,
             "https://api.github.com/repos/example-owner/example-repo/actions/workflows/quality.yml/runs?per_page=30"
         );
-        assert!(sent[0].headers.iter().any(|(k, _)| k == "User-Agent"));
-        assert!(!sent[0].headers.iter().any(|(k, _)| k == "Authorization"));
+        assert_eq!(
+            sent[1].url,
+            "https://api.github.com/repos/example-owner/example-repo/actions/runs/42/jobs?filter=latest&per_page=100"
+        );
+        for s in &sent {
+            assert!(s.headers.iter().any(|(k, _)| k == "User-Agent"));
+            assert!(!s.headers.iter().any(|(k, _)| k == "Authorization"));
+        }
+    }
+
+    /// The 2026-10-05 shape: two jobs never got a runner, the gate ran and
+    /// failed because of them, everything that ran passed.
+    #[test]
+    fn a_failure_from_jobs_that_never_started_is_not_run() {
+        let listing = jobs(vec![
+            job("changes", "cancelled", 0),
+            job("supply-chain", "cancelled", 0),
+            job("lint", "success", 8),
+            job("gate", "failure", 3),
+            job("tests", "skipped", 0),
+        ]);
+        respond_runs_and_jobs(page("failure"), listing.clone());
+        let v = read(gated("gate")).unwrap();
+        assert_eq!(v["state"], "not_run");
+        assert_eq!(v["run"]["conclusion"], "failure");
+        assert_eq!(v["jobs_not_run"], json!(["changes", "supply-chain"]));
+        assert!(v.get("__ops_alert__").is_none(), "not_run leaves the alert alone");
+        // Without naming the gate, its failure is a failure.
+        respond_runs_and_jobs(page("failure"), listing);
+        let v = read(config()).unwrap();
+        assert_eq!(v["state"], "failing");
+        assert!(v.get("jobs_not_run").is_none());
+    }
+
+    /// The other shape: everything ran and passed; only the gate never got a
+    /// runner. No gate name is needed — nothing that ran failed.
+    #[test]
+    fn a_gate_that_never_started_over_green_jobs_is_not_run() {
+        respond_runs_and_jobs(
+            page("failure"),
+            jobs(vec![job("lint", "success", 8), job("tests", "success", 11), job("gate", "cancelled", 0)]),
+        );
+        let v = read(config()).unwrap();
+        assert_eq!(v["state"], "not_run");
+        assert_eq!(v["jobs_not_run"], json!(["gate"]));
+    }
+
+    #[test]
+    fn a_real_failure_beside_jobs_that_never_started_is_failing() {
+        for failed in [job("tests", "failure", 11), job("tests", "timed_out", 11), job("tests", "cancelled", 5)] {
+            respond_runs_and_jobs(
+                page("failure"),
+                jobs(vec![job("changes", "cancelled", 0), failed.clone(), job("gate", "failure", 3)]),
+            );
+            let v = read(gated("gate")).unwrap();
+            assert_eq!(v["state"], "failing", "{failed}");
+            assert!(v["__ops_alert__"]["alerts"][0]["title"].is_string());
+        }
+    }
+
+    /// A jobs listing that cannot be trusted keeps the run failing.
+    #[test]
+    fn unreadable_jobs_keep_the_run_failing() {
+        let never_started = jobs(vec![job("changes", "cancelled", 0), job("gate", "failure", 3)]);
+        let mut incomplete = never_started.clone();
+        incomplete["total_count"] = json!(40);
+        for (status, body) in [
+            (200, incomplete.to_string()),
+            (200, json!({ "total_count": 0, "jobs": [] }).to_string()),
+            (200, "not json".to_string()),
+            (403, never_started.to_string()),
+        ] {
+            let runs = page("failure");
+            host::http::respond_with(move |req| {
+                Ok(if req.url.contains("/jobs") { host::http::response(status, body.clone()) } else { host::http::response(200, runs.clone()) })
+            });
+            let v = read(gated("gate")).unwrap();
+            assert_eq!((v["state"].clone(), v["jobs_read"].clone()), (json!("failing"), json!(false)), "{status}");
+            assert!(v["__ops_alert__"]["alerts"][0]["title"].is_string());
+        }
+        host::http::respond_with(|req| {
+            if req.url.contains("/jobs") {
+                Err(wit_http_error())
+            } else {
+                Ok(host::http::response(200, page("failure")))
+            }
+        });
+        assert_eq!(read(gated("gate")).unwrap()["state"], "failing");
+    }
+
+    fn wit_http_error() -> talos::core::http::Error {
+        talos::core::http::Error::Networkerror
+    }
+
+    #[test]
+    fn only_a_failed_run_has_its_jobs_read() {
+        for c in ["success", "cancelled", "timed_out", "startup_failure"] {
+            respond_runs_and_jobs(page(c), jobs(vec![job("gate", "cancelled", 0)]));
+            let v = read(gated("gate")).unwrap();
+            assert!(v.get("jobs_read").is_none(), "{c}");
+            assert!(!host::http::requests().iter().any(|r| r.url.contains("/jobs")), "{c}");
+        }
     }
 
     #[test]
@@ -479,6 +718,8 @@ mod tests {
             ("BRANCH", json!("main&per_page=100")),
             ("BRANCH", json!("a..b")),
             ("SEVERITY", json!("urgent")),
+            ("GATE_JOB", json!("x".repeat(101))),
+            ("GATE_JOB", json!("gate\nother")),
         ] {
             let mut c = config();
             c[key] = value.clone();
