@@ -205,6 +205,9 @@ jobs:
         # with vault it must; off+vault is refused.
         run: bash scripts/tests/drill-vault-gate-test.sh
 
+      - name: CI disk-freeing script renames, then deletes in the background
+        run: bash scripts/tests/ci-free-disk-test.sh
+
       - name: Chart Vault init Job + unsealer sidecar against a real Vault
         # deploy/helm/talos/files/vault-init.sh and vault-unseal-loop.sh, driven
         # against the chart's pinned hashicorp/vault image with a fake kubectl:
@@ -253,15 +256,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Free runner disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
-          df -h /
+      - name: Free runner disk space (in the background)
+        # Renames the unused toolchains away and deletes them without waiting:
+        # in the foreground this cost 1.5-6 minutes per job (scripts/ci-free-disk.sh).
+        run: bash scripts/ci-free-disk.sh
 
       - name: Install mold linker
         # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
@@ -329,6 +327,12 @@ jobs:
         # the workspace, all DB-free. Confirmed green before re-adding (the last
         # item from the never-in-CI sweep's docs/backlog.md note).
         run: cargo test --workspace --doc
+
+      - name: Disk at the end of the job
+        # What the job needed: the evidence for whether the toolchains above
+        # have to be deleted at all.
+        if: always()
+        run: df -h /
 
   # ── Catalog templates: compile every module-templates/* against the ────────
   # current WIT (DX #13). This gate previously lived only in the
@@ -464,15 +468,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Free runner disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
-          df -h /
+      - name: Free runner disk space (in the background)
+        # Renames the unused toolchains away and deletes them without waiting:
+        # in the foreground this cost 1.5-6 minutes per job (scripts/ci-free-disk.sh).
+        run: bash scripts/ci-free-disk.sh
 
       - name: Install mold linker
         # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
@@ -529,6 +528,12 @@ jobs:
         # runs the TALOS_TEST_*_URL-gated tests, tears down. Single source of
         # truth with the local target.
         run: make test-integration
+
+      - name: Disk at the end of the job
+        # What the job needed: the evidence for whether the toolchains above
+        # have to be deleted at all.
+        if: always()
+        run: df -h /
 
   # ── Frontend: lint + typecheck + tests (backstop for non-`make hooks` devs) ─
   frontend:
@@ -811,11 +816,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Free runner disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+      - name: Free runner disk space (in the background)
+        # Renames the unused toolchains away and deletes them without waiting:
+        # in the foreground this cost 1.5-6 minutes per job (scripts/ci-free-disk.sh).
+        run: bash scripts/ci-free-disk.sh
 
       - name: Install mold linker
         # .cargo/config.toml pins `-fuse-ld=mold` for the Linux target.
@@ -867,6 +871,12 @@ jobs:
         # Compiles every query! against the live schema and fails if the checked-in
         # `.sqlx/` would change.
         run: make sqlx-check
+
+      - name: Disk at the end of the job
+        # What the job needed: the evidence for whether the toolchains above
+        # have to be deleted at all.
+        if: always()
+        run: df -h /
 
   # ── Fast lints: rustfmt + the 90 structural checks + WIT drift ─────────────
   # Moved here from ci.yml on 2026-09-12 (one home; ci.yml is dispatch-only and
@@ -926,14 +936,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Free runner disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+      - name: Free runner disk space (in the background)
+        # Renames the unused toolchains away and deletes them without waiting:
+        # in the foreground this cost 1.5-6 minutes per job (scripts/ci-free-disk.sh).
+        run: bash scripts/ci-free-disk.sh
 
       - name: Install mold linker
         # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
@@ -996,6 +1002,12 @@ jobs:
       # job because every dependency of the probe is already built here.
       - name: Integration scaffold still generates a clean crate
         run: python3 scripts/new-integration.py --self-test
+
+      - name: Disk at the end of the job
+        # What the job needed: the evidence for whether the toolchains above
+        # have to be deleted at all.
+        if: always()
+        run: df -h /
 
   # ── The one required check ──────────────────────────────────────────────────
   # Branch protection requires THIS job only. It passes
