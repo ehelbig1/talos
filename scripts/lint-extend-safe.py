@@ -16,7 +16,9 @@ is none. A site is NOT a violation when any of these holds:
 
   1. `.extend_safe()` appears on the site's line, or on a later line before
      the next `async_graphql::Error::new(` — scanning at most 20 lines on,
-     and skipping empty lines;
+     and skipping empty lines. On a line holding both, whichever comes first
+     decides: a new call before the marker means the marker is the new
+     call's, and the site is bare;
   2. `allow-unsafe-error` appears on the site's line or the 8 lines above it;
   3. one of the scrubber's whitelisted substrings appears on the site's line
      or the 5 lines after it (case-sensitive; must match
@@ -75,10 +77,11 @@ def violations(seed_lines, read_file):
             text = at(k)
             if not text:
                 continue
-            if EXTEND_SAFE in text:
-                found = True
+            i_new, i_safe = text.find(NEW_CALL), text.find(EXTEND_SAFE)
+            if i_new != -1 and (i_safe == -1 or i_new < i_safe):
                 break
-            if NEW_CALL in text:
+            if i_safe != -1:
+                found = True
                 break
         if found:
             continue
@@ -108,9 +111,13 @@ def self_test():
         ("later line, blank between", [b"    Err(async_graphql::Error::new(", b"", b'        "y",',
                                        b"    ).extend_safe())"], 1, False),
         ("next call first", [call, b'    Err(async_graphql::Error::new("second"))', b".extend_safe()"], 1, True),
-        # The rule the bash loop applied, kept: a later line holding BOTH a new
-        # call and `.extend_safe()` counts as covering the current call.
-        ("next line holds both", [call, b'    Err(async_graphql::Error::new("b").extend_safe())'], 1, False),
+        # Until 2026-10-05 a later line holding BOTH a new call and
+        # `.extend_safe()` covered the current call: the MCP-1200 blind spot
+        # (a sibling's marker covering a bare call), on one line.
+        ("next line holds both, call first", [call, b'    Err(async_graphql::Error::new("b").extend_safe())'], 1, True),
+        ("next line holds both, marker first",
+         [b"    Err(async_graphql::Error::new(", b'        "a",', b'    ).extend_safe()) } else { Err(async_graphql::Error::new("b").extend_safe()) }'],
+         1, False),
         ("marker 21 lines on", [call] + [b"x"] * 20 + [b".extend_safe()"], 1, True),
         ("marker 20 lines on", [call] + [b"x"] * 19 + [b".extend_safe()"], 1, False),
         ("runs past the end of the file", [call], 1, True),

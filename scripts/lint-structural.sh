@@ -1288,6 +1288,10 @@ EXTEND_SAFE_VIOLATIONS=0
 #     (talos-api/src/schema/mod.rs) — the regex is in the helper.
 # Equivalence with the loop it replaced was measured on the real tree (0 and 0)
 # and on two altered copies (448 and 29 violations, identical sets).
+# One rule was then tightened: on a later line holding both a new call and a
+# marker, the one that comes FIRST decides (the loop let the new call's own
+# marker cover the current call — the MCP-1200 blind spot on one line).
+# Measured over the 598 real sites: 0 change verdict.
 ES_BROKEN=0
 if ! python3 "$ROOT/scripts/lint-extend-safe.py" --self-test >/dev/null; then
     red "✗ scripts/lint-extend-safe.py --self-test failed — its rules are not the ones documented"
