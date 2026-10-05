@@ -1965,7 +1965,7 @@ case "$NEO4J_STATE" in
         printf '  Neo4j content:   NOT VERIFIED — not attempted for --source %s\n' "$SOURCE_MODE" ;;
 esac
 [[ "$SOURCE_MODE" == "b2" ]] && printf '  Postgres object: %s\n' "${PG_OBJECT:-?}"
-[[ "$SOURCE_MODE" == "b2" ]] && printf '  Vault object:    %s\n' "${VAULT_OBJECT:-?}"
+[[ "$SOURCE_MODE" == "b2" && "$DRILL_VAULT" == "on" ]] && printf '  Vault object:    %s\n' "${VAULT_OBJECT:-?}"
 # The RESTORED schema version is reported by verify_restore (which is the only
 # thing that has read it); this line is the checkout's, labelled as such so the
 # two are never confused.
@@ -2027,7 +2027,10 @@ else
     printf '\033[1;33m      `make drill ARGS="--source b2"` for that — it is a strictly harder\033[0m\n'
     printf '\033[1;33m      question and it is the one a recovery actually asks.\033[0m\n'
 fi
-if [[ "$KEK_PROVIDER_MODE" != "vault" ]]; then
+if [[ "$DRILL_VAULT" == "off" ]]; then
+    printf '\033[1;33m    Vault: not restored. KEK_PROVIDER=%s does not use it, so its backup\033[0m\n' "$KEK_PROVIDER_MODE"
+    printf '\033[1;33m      was not read; TALOS_DRILL_VAULT=on drills it anyway.\033[0m\n'
+elif [[ "$KEK_PROVIDER_MODE" != "vault" ]]; then
     printf '\033[1;33m    KEK_PROVIDER=%s: the restored Vault is NOT on the decryption path here.\033[0m\n' "$KEK_PROVIDER_MODE"
     printf '\033[1;33m      Its file backend restored, unsealed, authenticated and mounted —\033[0m\n'
     printf '\033[1;33m      but no transit-wrapped DEK was unwrapped, because this deployment\033[0m\n'

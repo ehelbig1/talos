@@ -174,3 +174,11 @@ array under `set -u`). **Stated limit:** `drill-vault-gate-test.sh` stops in
 step 1, so it could not see this and still cannot; reaching step 7 needs the
 scratch containers and the verifier build. The proof is a real drill run,
 which this change has not yet had.
+
+**First passing drill since 2026-09-14** — `drill-20261005T205919Z`, the
+scheduled job started by hand after #1106: escrowed key, 32 pre-existing
+ciphertext rows decrypted, Phase B round trip, Neo4j 1922/3091, ops alert
+`resolved`. Its summary still said the restored Vault "restored, unsealed,
+authenticated and mounted", which that run did not do; with Vault not drilled
+the summary now says so, and a `--source b2` run no longer prints a Vault
+object line for an object it did not fetch.
