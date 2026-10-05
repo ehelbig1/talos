@@ -258,7 +258,10 @@ mod tests {
                 condition: "true".into(),
             },
             SystemNodeKind::Collect { label_items: false },
-            SystemNodeKind::OpsAlertsDigest { top_limit: 10 },
+            SystemNodeKind::OpsAlertsDigest {
+                top_limit: 10,
+                sources: None,
+            },
             SystemNodeKind::PendingApprovals { limit: 10 },
             SystemNodeKind::ActionLinks {
                 targets: std::collections::BTreeMap::new(),

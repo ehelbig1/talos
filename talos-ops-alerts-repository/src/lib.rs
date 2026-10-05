@@ -415,6 +415,19 @@ impl OpsAlertRepository {
     /// clamps to [1, 25] (a briefing slice, not a pagination surface —
     /// use [`Self::list`] for the full triage view).
     pub async fn list_active_ranked(&self, user_id: Uuid, limit: i64) -> Result<Vec<OpsAlertRow>> {
+        self.list_active_ranked_from(user_id, limit, None).await
+    }
+
+    /// [`Self::list_active_ranked`], restricted to the given alert sources
+    /// when `sources` is `Some` — an EMPTY slice matches no alert (the
+    /// `ops_alerts_digest` node's `sources` filter; see
+    /// `talos_workflow_engine_core::parse_alert_sources`).
+    pub async fn list_active_ranked_from(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        sources: Option<&[String]>,
+    ) -> Result<Vec<OpsAlertRow>> {
         let limit = limit.clamp(1, 25);
         let rows = sqlx::query(
             r#"
@@ -424,6 +437,7 @@ impl OpsAlertRepository {
                    first_seen, last_seen, reopened_at, resolved_source
             FROM ops_alerts
             WHERE user_id = $1 AND status <> 'resolved'
+              AND ($3::text[] IS NULL OR source = ANY($3))
             ORDER BY CASE severity
                        WHEN 'critical' THEN 0
                        WHEN 'high' THEN 1
@@ -439,6 +453,7 @@ impl OpsAlertRepository {
         )
         .bind(user_id)
         .bind(limit)
+        .bind(sources)
         .fetch_all(&self.db_pool)
         .await?;
         rows.into_iter().map(Self::row_to_alert).collect()

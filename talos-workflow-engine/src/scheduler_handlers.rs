@@ -132,12 +132,13 @@ impl ParallelWorkflowEngine {
         node_id: Uuid,
         execution_id: Uuid,
     ) -> Option<JsonValue> {
-        let (_, _, Some(SystemNodeKind::OpsAlertsDigest { top_limit })) =
+        let (_, _, Some(SystemNodeKind::OpsAlertsDigest { top_limit, sources })) =
             self.node_meta.get(&node_id)?
         else {
             return None;
         };
         let top_limit = *top_limit;
+        let sources = sources.clone();
 
         let unavailable = |reason: &str| {
             serde_json::json!({
@@ -180,41 +181,45 @@ impl ParallelWorkflowEngine {
         // (the injected impl's pool has its own timeouts; this is the
         // engine-side backstop).
         const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let output =
-            match tokio::time::timeout(READ_TIMEOUT, reader.snapshot(user_id, top_limit)).await {
-                Ok(Ok(mut snapshot)) => {
-                    if let Some(obj) = snapshot.as_object_mut() {
-                        obj.insert("available".to_string(), serde_json::json!(true));
-                    }
-                    self.emit_node_lifecycle_events(
-                        execution_id,
-                        node_id,
-                        "Completed",
-                        format!("ops-alerts digest fetched (top_limit {top_limit})"),
-                    );
-                    snapshot
+        let output = match tokio::time::timeout(
+            READ_TIMEOUT,
+            reader.snapshot(user_id, top_limit, sources.as_deref()),
+        )
+        .await
+        {
+            Ok(Ok(mut snapshot)) => {
+                if let Some(obj) = snapshot.as_object_mut() {
+                    obj.insert("available".to_string(), serde_json::json!(true));
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!(%node_id, error = %e, "ops_alerts_digest: snapshot failed");
-                    self.emit_node_lifecycle_events(
-                        execution_id,
-                        node_id,
-                        "Completed",
-                        "ops-alerts digest unavailable (storage error)".to_string(),
-                    );
-                    unavailable("ops-alerts read failed")
-                }
-                Err(_) => {
-                    tracing::warn!(%node_id, "ops_alerts_digest: snapshot timed out");
-                    self.emit_node_lifecycle_events(
-                        execution_id,
-                        node_id,
-                        "Completed",
-                        "ops-alerts digest unavailable (timeout)".to_string(),
-                    );
-                    unavailable("ops-alerts read timed out")
-                }
-            };
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    format!("ops-alerts digest fetched (top_limit {top_limit})"),
+                );
+                snapshot
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%node_id, error = %e, "ops_alerts_digest: snapshot failed");
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    "ops-alerts digest unavailable (storage error)".to_string(),
+                );
+                unavailable("ops-alerts read failed")
+            }
+            Err(_) => {
+                tracing::warn!(%node_id, "ops_alerts_digest: snapshot timed out");
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    "ops-alerts digest unavailable (timeout)".to_string(),
+                );
+                unavailable("ops-alerts read timed out")
+            }
+        };
         Some(output)
     }
 

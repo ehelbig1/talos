@@ -31,11 +31,12 @@ impl talos_workflow_engine_core::OpsAlertsReader for PostgresOpsAlertsReader {
         &self,
         user_id: Uuid,
         top_limit: u32,
+        sources: Option<&[String]>,
     ) -> Result<JsonValue, talos_workflow_engine_core::BoxError> {
         let digest = self.repo.digest(user_id).await?;
         let top = self
             .repo
-            .list_active_ranked(user_id, i64::from(top_limit))
+            .list_active_ranked_from(user_id, i64::from(top_limit), sources)
             .await?;
 
         // One-click correction links: one capability token per listed
@@ -75,6 +76,9 @@ impl talos_workflow_engine_core::OpsAlertsReader for PostgresOpsAlertsReader {
                 "occurrence_count": a.occurrence_count,
                 "corrected": a.corrected_severity.is_some(),
                 "reopened": a.reopened_at.is_some(),
+                // When it last reopened: a reader that remembers what it has
+                // already reported can tell a reopen from the same alert.
+                "reopened_at": a.reopened_at.map(|t| t.to_rfc3339()),
                 "first_seen": a.first_seen.to_rfc3339(),
                 "last_seen": a.last_seen.to_rfc3339(),
             })).collect::<Vec<_>>(),

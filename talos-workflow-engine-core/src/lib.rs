@@ -194,7 +194,9 @@ pub use module_fetcher::ModuleFetcher;
 pub use node_hook::{NodeCompletionContext, NodeLifecycleHook};
 pub use node_identity::{engine_node_uuid, node_module_id};
 pub use operator_digest_reader::OperatorDigestReader;
-pub use ops_alerts_reader::OpsAlertsReader;
+pub use ops_alerts_reader::{
+    parse_alert_sources, usable_alert_source, OpsAlertsReader, MAX_ALERT_SOURCES,
+};
 pub use pending_approvals_reader::PendingApprovalsReader;
 pub use rate_limit::RateLimitStore;
 pub use retry::{

@@ -147,6 +147,12 @@ pub enum SystemNodeKind {
     OpsAlertsDigest {
         /// How many active alerts to include verbatim (clamped 1..=25).
         top_limit: u32,
+        /// `None`: every source (the node as it was before 2026-10-05).
+        /// `Some(list)`: `top_active` holds only alerts whose source is in
+        /// the list — and an EMPTY list matches nothing, so a filter whose
+        /// entries were all unusable never widens to every alert. Parsed by
+        /// [`crate::ops_alerts_reader::parse_alert_sources`].
+        sources: Option<Vec<String>>,
     },
     /// Controller-side weekly assistant-activity + learning-health
     /// snapshot (executions, fuel, ops-alerts week stats, ML loop
