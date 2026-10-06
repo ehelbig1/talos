@@ -70,9 +70,7 @@ interface TeacherAuditComplete {
 }
 
 type TeacherAudit =
-  | TeacherAuditRunning
-  | TeacherAuditFailed
-  | TeacherAuditComplete;
+  TeacherAuditRunning | TeacherAuditFailed | TeacherAuditComplete;
 
 function isTeacherAudit(value: unknown): value is TeacherAudit {
   return (

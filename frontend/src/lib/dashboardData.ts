@@ -55,7 +55,7 @@ export async function fetchDashboardWorkflows(
   request: Request = graphqlRequest,
 ): Promise<DashboardWorkflows> {
   const workflows: DashboardWorkflow[] = [];
-  for (let offset = 0; offset < DASHBOARD_WORKFLOW_CAP; ) {
+  for (let offset = 0; offset < DASHBOARD_WORKFLOW_CAP;) {
     const limit = Math.min(WORKFLOW_PAGE_SIZE, DASHBOARD_WORKFLOW_CAP - offset);
     const page = await request<{
       workflows: Array<{
