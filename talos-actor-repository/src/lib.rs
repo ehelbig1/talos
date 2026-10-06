@@ -1197,6 +1197,26 @@ impl ActorRepository {
         Ok(result.rows_affected())
     }
 
+    /// Suspend an ACTIVE actor, and say whether THIS call suspended it.
+    ///
+    /// [`Self::suspend_actor`] also matches an actor that is already
+    /// suspended (its guard is "not terminal"), so its row count cannot tell
+    /// a suspension from a rewrite of the same state. The budget pre-check
+    /// needs that distinction: it raises the suspension alert exactly once,
+    /// when the actor goes `active` → `suspended`.
+    pub async fn suspend_active_actor(&self, actor_id: Uuid, user_id: Uuid) -> Result<bool> {
+        let row = sqlx::query(
+            "UPDATE actors SET status = 'suspended', updated_at = now() \
+             WHERE id = $1 AND user_id = $2 AND status = 'active' \
+             RETURNING id",
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
     /// Permanently delete one of the caller's actors, RECORDED (2026-09-30).
     ///
     /// Until this method no path deleted an actor; `archive_actor` deferred to
@@ -1412,6 +1432,9 @@ impl ActorRepository {
         .bind(user_id)
         .execute(&self.db_pool)
         .await?;
+        if result.rows_affected() > 0 && new_status == "active" {
+            close_suspension_alert(&self.db_pool, user_id, actor_id).await;
+        }
         Ok(result.rows_affected())
     }
 
@@ -2234,8 +2257,25 @@ impl ActorRepository {
         .bind(status)
         .bind(actor_id)
         .bind(user_id)
-        .execute(conn)
+        .execute(&mut *conn)
         .await?;
+        if result.rows_affected() > 0 && status == "active" {
+            // Same connection, so the alert closes or stays open with the
+            // status change. Under a SAVEPOINT: a statement that fails inside
+            // the caller's transaction aborts all of it, and a resume must
+            // not be lost to its own bookkeeping.
+            match sqlx::Acquire::begin(&mut *conn).await {
+                Ok(mut savepoint) => {
+                    if close_suspension_alert(&mut *savepoint, user_id, actor_id).await {
+                        if let Err(e) = savepoint.commit().await {
+                            warn_suspension_alert_not_resolved(actor_id, &e);
+                        }
+                    }
+                    // On failure the savepoint drops, which rolls back to it.
+                }
+                Err(e) => warn_suspension_alert_not_resolved(actor_id, &e),
+            }
+        }
         Ok(result.rows_affected())
     }
 
@@ -4877,6 +4917,37 @@ pub async fn read_actor_write_ceiling(
     Ok(row
         .as_deref()
         .map(talos_workflow_job_protocol::WriteCeiling::from_db_str))
+}
+
+/// An actor that is active again is no longer "suspended by its budget":
+/// close that alert where the status changes, so no surface that resumes an
+/// actor (the MCP tool, the GraphQL mutation) can forget to. Best effort — a
+/// failure is logged, `false` is returned and the resume stands; the alert
+/// then stays open until an operator resolves it, which over-reports and
+/// never hides anything.
+async fn close_suspension_alert<'e, E>(executor: E, user_id: Uuid, actor_id: Uuid) -> bool
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    match talos_actor_budget_refusal::resolve_actor_suspension_alert(executor, user_id, actor_id)
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            warn_suspension_alert_not_resolved(actor_id, &e);
+            false
+        }
+    }
+}
+
+fn warn_suspension_alert_not_resolved(actor_id: Uuid, error: &sqlx::Error) {
+    tracing::warn!(
+        target: "talos_audit",
+        event_kind = "actor_suspension_alert_not_resolved",
+        %actor_id,
+        error = %error,
+        "the actor was resumed but its suspension alert could not be closed"
+    );
 }
 
 #[cfg(test)]

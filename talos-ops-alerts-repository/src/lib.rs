@@ -256,20 +256,9 @@ impl OpsAlertRepository {
     /// whether a row actually transitioned; a close event for an alert
     /// we never saw open is a normal no-op, not an error.
     pub async fn resolve_by_dedup_key(&self, user_id: Uuid, dedup_key: &str) -> Result<bool> {
-        let dedup_key = truncate_chars(dedup_key, MAX_KEY_CHARS);
-        if dedup_key.is_empty() {
-            return Ok(false);
-        }
-        let res = sqlx::query(
-            "UPDATE ops_alerts \
-             SET status = 'resolved', resolved_at = NOW(), resolved_source = 'signal' \
-             WHERE user_id = $1 AND dedup_key = $2 AND status IN ('new','acked')",
-        )
-        .bind(user_id)
-        .bind(&dedup_key)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
+        // The statement lives in the leaf store (one home; the actor
+        // repository closes a resumed actor's suspension alert through it too).
+        Ok(talos_ops_alert_store::resolve_by_dedup_key(&self.db_pool, user_id, dedup_key).await?)
     }
 
     /// Resolve EVERY active alert whose dedup key starts with `prefix`

@@ -260,6 +260,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "update_actor_status",
             "description": "Update an actor's status. Allowed transitions: active ↔ suspended. \
+                Setting an actor that its budget suspended back to active also closes its \
+                suspension alert; if it is still at its hourly cap the next start suspends it again. \
                 Note: 'archived' and 'terminated' are terminal states — use archive_actor or \
                 terminate_actor respectively. Those transitions are IRREVERSIBLE and cannot be \
                 undone via update_actor_status.",
@@ -299,8 +301,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 returned but no enforcement path consumes them): max_compilations_per_hour (stored \
                 default 20), max_outbound_requests_per_hour, max_fuel_per_execution. \
                 on_budget_exceeded: 'suspend' (default), 'alert', or 'block' — every mode refuses the \
-                start; 'suspend' also suspends the actor on the hourly cap, 'alert' also raises an ops \
-                alert (one per actor and cap), 'block' does nothing else. \
+                start; 'suspend' also suspends the actor on the hourly cap and raises a high-severity ops \
+                alert that closes when the actor is set back to active (update_actor_status), 'alert' \
+                also raises an ops alert (one per actor and cap), 'block' does nothing else. \
                 The response includes defaults_applied listing which fields used their stored defaults.",
             "inputSchema": {
                 "type": "object",
@@ -315,7 +318,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "max_workflows_per_minute": { "type": "number", "description": "ENFORCED per-actor trigger-rate cap (atomic at trigger time). Stored default 10 if omitted." },
                     "max_compilations_per_hour": { "type": "number", "description": "RESERVED — not enforceable as a per-actor cap today: compiles (compile_custom_sandbox / run_sandbox / inline rust_code) are agent/user actions and carry actor_id only optionally (for memory scoping), so most have no actor_budget_policies row to gate on; there is also no per-actor compile-event record to count. Enforcing it needs compile-event tracking AND actor attribution of compiles (or reframing as a per-user/per-agent cap). Stored default 20 if omitted." },
                     "max_llm_tokens_per_day": { "type": "number", "description": "ENFORCED (at trigger time). Daily LLM token ceiling: refuses a new run once the actor's trailing-24h SUM(prompt+completion tokens) from the llm_usage ledger reaches this cap. Omit for unlimited." },
-                    "on_budget_exceeded": { "type": "string", "description": "suspend (default) | alert | block. All refuse the start; suspend also suspends the actor (hourly cap), alert also raises an ops alert per actor and cap, block does nothing else." }
+                    "on_budget_exceeded": { "type": "string", "description": "suspend (default) | alert | block. All refuse the start; suspend also suspends the actor (hourly cap) and raises an ops alert that closes when the actor is resumed, alert also raises an ops alert per actor and cap, block does nothing else." }
                 },
                 "required": ["actor_id"]
             }

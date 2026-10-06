@@ -186,14 +186,33 @@ pub async fn check_actor_hour_budget_for_batch(
                 // 'active' despite the policy stamp and the budget hit
                 // — confusing audit-trail review. WARN with
                 // `target: "talos_audit"`.
-                if let Err(ue) = repo.suspend_actor(actor_id, uid).await {
-                    tracing::warn!(
-                        target: "talos_audit",
-                        actor_id = %actor_id,
-                        user_id = %uid,
-                        error = %ue,
-                        "check_actor_hour_budget_for_batch: auto-suspend UPDATE failed — actor stays 'active' despite on_budget_exceeded=suspend policy; rejecting this execution proceeds normally"
-                    );
+                match repo.suspend_active_actor(actor_id, uid).await {
+                    // This call suspended it: say so where a person will see
+                    // it. Until 2026-10-06 a budget suspension was a status
+                    // column and a WARN per refused start — an actor's whole
+                    // set of workflows stopped for 1 h 45 min unannounced.
+                    Ok(true) => {
+                        talos_actor_budget_refusal::record_actor_budget_suspension(
+                            pool,
+                            actor_id,
+                            talos_actor_budget_refusal::BudgetCap::PerHour,
+                            i64::from(max_per_hour),
+                            count,
+                        )
+                        .await;
+                    }
+                    // Already suspended (a concurrent start got there first):
+                    // that call raised the alert.
+                    Ok(false) => {}
+                    Err(ue) => {
+                        tracing::warn!(
+                            target: "talos_audit",
+                            actor_id = %actor_id,
+                            user_id = %uid,
+                            error = %ue,
+                            "check_actor_hour_budget_for_batch: auto-suspend UPDATE failed — actor stays 'active' despite on_budget_exceeded=suspend policy; rejecting this execution proceeds normally"
+                        );
+                    }
                 }
             }
         }
