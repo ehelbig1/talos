@@ -10,7 +10,7 @@ publish.workspace = true
 async-nats = "0.47"
 opentelemetry = "0.32"
 tracing = "0.1"
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 
 [dev-dependencies]
 # Provides the concrete W3C `TraceContextPropagator` used to exercise the

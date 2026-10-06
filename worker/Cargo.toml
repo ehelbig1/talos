@@ -64,7 +64,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Observability (OTLP trace-context propagation + Prometheus metrics endpoint)
 opentelemetry = { version = "0.32", features = ["metrics", "trace"] }
 prometheus = "0.14"
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 
 bytes = "1.11.1"
 
