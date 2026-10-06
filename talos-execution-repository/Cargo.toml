@@ -13,7 +13,6 @@ anyhow.workspace = true
 chrono.workspace = true
 hex = "0.4"
 rand = { version = "0.8", default-features = true, features = ["std"] }
-serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 subtle = "2.4"

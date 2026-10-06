@@ -13,7 +13,6 @@ axum = { version = "0.8", features = ["json"] }
 chrono.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
-serde_json.workspace = true
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "chrono"] }
 talos-config = { path = "../talos-config" }

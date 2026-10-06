@@ -102,6 +102,10 @@ Smallest reach first, so the method is settled before the wide ones.
 
 ## Found while working the list: declared and never named
 
+Done the same day: `2026-10-06-unused-declarations.md` (136 declarations,
+47 crates, and a check in `make lint`). The paragraph below is the finding
+as first written.
+
 Three times in the first five items a crate declared a dependency it never
 calls (`constant_time_eq` in two crates, `cap-std` and `petgraph` in
 `controller`). A sweep of every workspace crate for a declared dependency

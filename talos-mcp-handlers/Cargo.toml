@@ -10,24 +10,14 @@ publish.workspace = true
 talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
 talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
-arc-swap = "1.7"
 async-nats = "0.47"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["json"] }
-base64 = "0.22"
 bcrypt = "0.18"
 chrono.workspace = true
-chrono-tz = "0.10"
-croner = "2.0"
 dashmap = "6.1"
 futures = "0.3"
-governor = "0.6"
-handlebars = "6.4"
 hex = "0.4"
-hmac = "0.12"
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
-neo4rs = "0.8"
-oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 petgraph = "0.6"
 rand = { version = "0.8", default-features = true, features = ["std"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
@@ -36,7 +26,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rhai = { version = "1.19", features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = "0.9"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
@@ -70,14 +59,12 @@ talos-oauth = { path = "../talos-oauth" }
 # the Plaid vault-path builder, so the tool derives a connection's reference
 # from the code that stores it.
 talos-integrations = { path = "../talos-integrations" }
-talos-plaid = { path = "../talos-plaid" }
 # The push-channel inventory TRAIT. LEAF (types + one pure classification):
 # this crate must NOT depend on talos-gmail / talos-google-calendar /
 # talos-google-cloud, which sit above it.
 talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
 talos-registry = { path = "../talos-registry" }
 talos-rate-limit = { path = "../talos-rate-limit" }
-talos-replay-diff = { path = "../talos-replay-diff" }
 talos-replay-service = { path = "../talos-replay-service" }
 talos-inline-compile-service = { path = "../talos-inline-compile-service" }
 talos-search-service = { path = "../talos-search-service" }
@@ -140,11 +127,9 @@ talos-workflow-types = { path = "../talos-workflow-types" }
 talos-workflow-validation = { path = "../talos-workflow-validation" }
 talos-workflow-versions = { path = "../talos-workflow-versions" }
 talos-yaml-workflows = { path = "../talos-yaml-workflows" }
-thiserror = "2.0"
 tokio = { version = "1", features = ["sync", "rt", "macros", "time", "process", "io-util", "fs", "net"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing.workspace = true
-urlencoding = "2.1"
 uuid = { version = "1.20", features = ["serde", "v4", "v5"] }
 talos-worker-runtime = { path = "../talos-worker-runtime" }
 

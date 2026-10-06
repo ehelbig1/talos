@@ -11,7 +11,6 @@ anyhow.workspace = true
 async-nats = "0.47"
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 thiserror.workspace = true

@@ -18,7 +18,6 @@ talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 anyhow.workspace = true
 chrono.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 # The child-workflow reference scan — `session_start`'s auto-archive is a

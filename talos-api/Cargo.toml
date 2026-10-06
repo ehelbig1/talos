@@ -10,7 +10,6 @@ publish.workspace = true
 talos-execution-pause = { path = "../talos-execution-pause" }
 anyhow.workspace = true
 async-graphql = { version = "7.2", features = ["uuid", "chrono", "dataloader"] }
-async-graphql-axum = "7.2"
 async-nats = "0.47"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["json", "ws"] }
@@ -20,12 +19,9 @@ futures = "0.3"
 hex = "0.4"
 rand = { version = "0.8", default-features = true, features = ["std"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-regex = "1.12"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rhai = { version = "1.19", features = ["serde"] }
 # The ONE Rhai sandbox builder — the `testRhaiExpression` authoring preview.
 talos-rhai-sandbox = { path = "../talos-rhai-sandbox" }
-serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }

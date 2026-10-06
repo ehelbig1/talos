@@ -33,7 +33,6 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 # become a second reader of a security column.
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
-talos-graph-rag = { path = "../talos-graph-rag" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-db = { path = "../talos-db" }
 talos-memory = { path = "../talos-memory" }

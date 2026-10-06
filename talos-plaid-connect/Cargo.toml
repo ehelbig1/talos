@@ -11,7 +11,6 @@ publish.workspace = true
 anyhow.workspace = true
 axum = { version = "0.8", features = ["json"] }
 serde.workspace = true
-serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "chrono"] }
 talos-organizations = { path = "../talos-organizations" }
 talos-plaid = { path = "../talos-plaid" }

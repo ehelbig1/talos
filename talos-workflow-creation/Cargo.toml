@@ -8,8 +8,6 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-regex = "1.12"
-serde.workspace = true
 serde_json.workspace = true
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 # 2026-09-25: create_from_spec compiles inline nodes through the same service

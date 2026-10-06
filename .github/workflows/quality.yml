@@ -233,6 +233,13 @@ jobs:
         # of each one, a missing pin and an undigested base image.
         run: python3 scripts/check-rust-pins.py --self-test
 
+      - name: Unused-dependency check
+        # scripts/check-unused-deps.py (run by `make lint`): a crate declares
+        # only the dependencies its own code names. Its self-test drives every
+        # way code names a crate, mentions that are not code, the tests-only
+        # case, build and target tables, and the opt-out marker.
+        run: python3 scripts/check-unused-deps.py --self-test
+
       - name: CI disk-freeing script acts only when space is short
         run: bash scripts/tests/ci-free-disk-test.sh
 
@@ -1113,6 +1120,11 @@ jobs:
       # structural copies are the ones kept: they name the offending files.
       - name: Structural lints (incl. rustfmt = check 35, WIT drift = check 16)
         run: bash scripts/lint-structural.sh
+
+      - name: Declared dependencies are used
+        # `make lint` runs this locally; this job runs the structural script
+        # directly, so the check is named here too or CI never runs it.
+        run: python3 scripts/check-unused-deps.py
 
       - name: Changelog fragments are well-formed
         run: |

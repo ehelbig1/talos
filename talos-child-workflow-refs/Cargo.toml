@@ -17,7 +17,6 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 uuid.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -16,9 +16,13 @@ doctest = false
 # build.rs refuses a template whose crate is missing here.
 [dependencies]
 talos-module-testkit = { path = "../talos-module-testkit" }
-serde = { workspace = true }
+# The crates the catalog templates themselves declare (`talos.json`). The
+# templates' source is pulled in by build.rs from module-templates/, outside
+# this crate, and build.rs refuses to run when one a template declares is
+# missing here.
+serde = { workspace = true }  # used-indirectly: named by included template source
 serde_json = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true }  # used-indirectly: named by included template source
 
 # The recorded-run fuel gate (tests/fuel_fixtures.rs): the production compile
 # path and the worker runtime that executes the result.
