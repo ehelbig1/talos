@@ -338,13 +338,18 @@ docker exec talos-postgres pg_dump -U talos -d talos -F c \
 Three automations run without operator intervention; the monthly
 review is just "look at the output, approve/investigate":
 
-- **Dependabot** (`.github/dependabot.yml`) — SECURITY updates only,
-  for cargo and the frontend's npm lockfile (alerts and security
-  updates were turned on 2026-10-06): when an advisory has a patched
-  release GitHub opens a PR that moves to it. There are no weekly
-  version-bump PRs. (Until that date this entry described weekly PRs
-  for cargo / Docker / docker-compose / GitHub Actions; Dependabot had
-  run once, on 2026-09-16, and no such PR ever existed.)
+- **Dependabot** (`.github/dependabot.yml`) — two things:
+  - *Security updates* for cargo and the frontend's npm lockfile (on
+    since 2026-10-06): when an advisory has a patched release GitHub
+    opens a PR that moves to it.
+  - *Version updates*: ONE grouped PR a week (Monday) per ecosystem
+    that CI exercises — cargo, npm, GitHub Actions — minor and patch
+    only, at most one open at a time, nothing younger than 7 days.
+  Not automated, by decision: major versions, Docker base images and
+  compose services (nothing in CI runs the last two, and a compose
+  bump lands on a running stack). They are on the quarterly list below.
+  (Until 2026-10-06 this entry described weekly PRs for seven
+  ecosystems; Dependabot's features were off and no such PR existed.)
 - **`cargo audit`** + **`cargo deny check`** — both run on every CI
   push, both block merge on failure. Justified exemptions live in
   `deny.toml`; silent suppressions forbidden.
@@ -378,6 +383,9 @@ review is just "look at the output, approve/investigate":
 
 **Quarterly review checklist (in addition to monthly):**
 
+- [ ] Major versions Dependabot is told to ignore: `cargo update --dry-run`
+      and `npm outdated` in `frontend/` show what is a major behind.
+      Each major is a change of its own.
 - [ ] Re-resolve the digest-pinned Docker images in `docker-compose.yml`
       and compare to the pinned values. A new upstream publish is bumped
       by hand (nothing opens a PR for it); an unexplained digest drift =
