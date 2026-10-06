@@ -3,7 +3,7 @@
 # reproducible and a floating-tag repoint / upstream tag compromise can't land in
 # the image without a lockstep review — matching the digest-pinned backend
 # Dockerfiles. Bump the digest deliberately alongside the tag when updating.
-FROM node:22.23.3-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS builder
+FROM node:26.10.0-alpine@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2eee500cfd9e80 AS builder
 
 WORKDIR /app
 
