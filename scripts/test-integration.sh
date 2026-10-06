@@ -317,6 +317,29 @@ export TALOS_TEST_NATS_PERM_WORKER_USER=it-worker
 export TALOS_TEST_NATS_PERM_WORKER_PASSWORD=it-worker-pw
 CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
 
+# ── Build this shard's controller test binaries in ONE cargo call ───────────
+# Each controller item below is its own `cargo test --test <name>`, so until
+# 2026-10-06 each binary was compiled and linked on its own, one after another.
+# Measured on run 37403154166: 138 controller binaries spent 7.0 minutes
+# between their "▶" line and their first test — 3.0 s each — against 10.1
+# minutes running tests. One `--no-run` call for all of them lets cargo build
+# them side by side; the loop below then finds every binary fresh and only
+# runs it. A failure here is not the verdict: each item still builds its own
+# binary below, where a compile error is attributed to the test it belongs to.
+PREBUILD=()
+for idx in "${!WORK[@]}"; do
+    [ $(( idx % SHARD_N + 1 )) -eq "$SHARD_I" ] || continue
+    IFS='|' read -r kind crate what extra <<< "${WORK[$idx]}"
+    case "$kind" in ctrl|ctrl-serial|tc) PREBUILD+=(--test "$what") ;; esac
+done
+if [ "${#PREBUILD[@]}" -gt 0 ]; then
+    echo
+    echo "▶ building $(( ${#PREBUILD[@]} / 2 )) controller test binaries in one cargo call…"
+    DATABASE_URL="$CTL_URL" TALOS_MASTER_KEY="$CTRL_MASTER_KEY" \
+        cargo test -p controller --no-run "${PREBUILD[@]}" \
+        || echo "⚠ the combined build failed — each binary is built again below, where the failure is attributed"
+fi
+
 rc=0
 ran=0
 for idx in "${!WORK[@]}"; do
