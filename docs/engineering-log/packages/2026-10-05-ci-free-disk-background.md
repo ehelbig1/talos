@@ -13,27 +13,37 @@ foreground. It left 108 GB free of 145 GB.
 ## Changed
 
 `scripts/ci-free-disk.sh` replaces the four copies of that step (unit,
-integration, sqlx-cache, clippy). It renames each directory beside itself —
-instant, never across a filesystem — and deletes the renamed copies in the
-background with its output closed, so the step returns at once.
+integration, sqlx-cache, clippy), and each of those jobs now ends with
+`df -h /` (`if: always()`).
 
-The rename is what makes the background delete safe: a later step sees what
-it saw before (the paths are gone), and one that recreates a path —
-`setup-node` in the integration job rebuilds the tool cache — writes a new
-directory, not the one being removed. `scripts/tests/ci-free-disk-test.sh`
-covers that on made-up directories (also under `/bin/bash` 3.2 and Linux).
+**It deletes nothing unless less than 40 GB is free.** The first version of
+this package deleted in the background every time; its own run (37388069851)
+supplied the figure that was missing: `df` first and last in each job showed
+86 GB free of 145 GB at the start, and 59–62 GB in use at the end with the
+~22 GB of toolchains gone — a test job adds about 25 GB. So on these runners
+the deletion buys nothing. In that run the step took 0 s, the unit job went
+14.7 → 10.6 minutes, clippy 5.6 → 3.1 and sqlx 5.1 → 3.3, but all three
+integration shards' `make test-integration` ran slower than their medians
+(+0.5 to +1.8 minutes) — one run, so not separable from variance, and
+consistent with a 22 GB delete competing for the disk. Not deleting removes
+the question.
 
-Each of the four jobs now ends with `df -h /` (`if: always()`).
+The step stays as a guard for a smaller runner: GitHub promises far less disk
+than it gives today. Below the threshold it renames each directory beside
+itself — instant, never across a filesystem — and deletes the renamed copies
+in the background with its output closed. The rename is what makes that safe:
+a later step sees what it saw before (the paths are gone), and one that
+recreates a path — `setup-node` rebuilds the tool cache — writes a new
+directory, not the one being removed. An unreadable free-space figure counts
+as short. `scripts/tests/ci-free-disk-test.sh` covers both sides of the
+threshold on made-up directories (also under `/bin/bash` 3.2 and Linux).
 
 ## Not decided here
 
-* **Whether to delete at all.** 108 GB free after deleting suggests the jobs
-  may fit without it, but nothing recorded what a job uses at its end. The
-  new last step records it; read a week of them before removing the step.
 * **Measured and declined:** `shellcheck` as a lint gate — 13 findings at
   warning level across 62 scripts, none in the drill script, so it would have
   caught neither drill defect of 2026-10-05; and a lint for BSD-only shell
   idioms — 4 lines, 3 of them in macOS-only scripts.
 * **Next, not in this package:** the unit job runs two builds in sequence
-  (6.7 + 4.4 minutes) and the integration shards are uneven (9.0 / 10.9 /
-  12.5); both are larger than this change and need their own measurement.
+  and the integration shards are uneven (9.0 / 10.9 / 12.5 minutes of
+  `make test-integration`); the slowest shard now sets the run's wall time.

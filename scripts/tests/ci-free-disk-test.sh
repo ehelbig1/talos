@@ -28,7 +28,8 @@ seed() {
     : > "$T/w/a/deep/file"; : > "$T/w/b/inner/file"; : > "$T/w/b/file"; : > "$T/w/keep/file"
 }
 leftovers() { find "$T/w" -name '*.ci-doomed-*' | wc -l | tr -d ' '; }
-run() { TALOS_CI_FREE_DISK_SUDO="" TALOS_CI_FREE_DISK_PATHS="$1" "${@:2}" bash "$SCRIPT" 2>&1; }
+# run <paths> [env VAR=value …] — a runner SHORT of disk unless a case says otherwise.
+run() { TALOS_CI_FREE_DISK_SUDO="" TALOS_CI_FREE_DISK_AVAIL_GB="${AVAIL:-5}" TALOS_CI_FREE_DISK_PATHS="$1" "${@:2}" bash "$SCRIPT" 2>&1; }
 
 echo "foreground: every listed path is removed, nothing else"
 seed
@@ -56,6 +57,30 @@ seed
 OUT="$(run "$T/w/missing")"
 check "says so" 'grep -qF "nothing to free" <<< "$OUT"'
 check "keeps everything" '[[ -f "$T/w/a/deep/file" && -f "$T/w/keep/file" ]]'
+
+echo "enough free disk: nothing is touched"
+seed
+OUT="$(AVAIL=86 run "$T/w/a:$T/w/b")"
+check "says nothing was deleted"   'grep -qF "86 GB free (threshold 40 GB): nothing deleted" <<< "$OUT"'
+check "keeps every directory"      '[[ -f "$T/w/a/deep/file" && -f "$T/w/b/inner/file" ]]'
+check "renames nothing"            '[[ "$(leftovers)" == 0 ]]'
+OUT="$(AVAIL=40 run "$T/w/a")"
+check "exactly the threshold is enough" '[[ -f "$T/w/a/deep/file" ]]'
+OUT="$(AVAIL=39 run "$T/w/a" env TALOS_CI_FREE_DISK_WAIT=1)"
+check "one GB under it frees"      '[[ ! -e "$T/w/a" ]]'
+
+echo "an unreadable free-space figure frees the disk"
+seed
+OUT="$(AVAIL=unknown run "$T/w/a" env TALOS_CI_FREE_DISK_WAIT=1)"
+check "treated as short"           '[[ ! -e "$T/w/a" ]]'
+seed
+OUT="$(run "$T/w/a" env TALOS_CI_FREE_DISK_MIN_GB=lots || true)"
+check "a threshold that is not a number is refused" 'grep -qF "must be a whole number" <<< "$OUT" && [[ -f "$T/w/a/deep/file" ]]'
+
+echo "the real reading of free space is a number"
+seed
+OUT="$(TALOS_CI_FREE_DISK_SUDO="" TALOS_CI_FREE_DISK_PATHS="$T/w/a" TALOS_CI_FREE_DISK_MIN_GB=0 bash "$SCRIPT" 2>&1)"
+check "reads df and reports GB"    'grep -qE "^[0-9]+ GB free \\(threshold 0 GB\\): nothing deleted" <<< "$OUT"'
 
 completed=1
 if [ "$fails" -gt 0 ]; then
