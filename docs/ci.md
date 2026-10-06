@@ -162,8 +162,18 @@ alone, so the shards still partition the list exactly
   name is dealt as a 3-second one; a deleted test's entry is ignored.
 * **Refresh the table when the shards drift apart** (a full run's shard times
   differ by more than a couple of minutes):
-  `python3 scripts/ci_shard.py weights --run <a green run's id> > scripts/ci-test-weights.tsv`.
-  It reads that run's shard logs and lists the items of 5 seconds or more.
+  `python3 scripts/ci_shard.py weights --run <a green run> --run <another> > scripts/ci-test-weights.tsv`.
+  It reads those runs' shard logs, takes each item's FASTEST time, and lists
+  the items of 5 seconds or more. Give at least two runs: a stall or a slow
+  runner adds time to whichever item it lands on, and one run would record
+  that as the item's cost.
+
+Each shard ends with **what Postgres waited on**: statements of 3 seconds or
+more, any refusal to clone the template database, and sessions that stayed
+on the template for 3 seconds or more. It is there to explain an
+intermittent stall measured on 2026-10-06 — a controller test binary that
+takes 1–3 seconds takes 60–62, every test in it blocked for a minute and
+then passing; different binaries each run, about two per run.
 
 A shard builds its controller test binaries in ONE `cargo test --no-run` call
 before it runs them one by one. Built one at a time they cost 3.0 seconds
