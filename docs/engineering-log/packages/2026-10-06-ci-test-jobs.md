@@ -148,6 +148,35 @@ backend logged — shows it ending with "canceling authentication due to
 timeout". If it is wrong the stall stays 60 s and the report says what the
 backend was instead.
 
+## Fourth measurement: the experiment's result
+
+With `authentication_timeout=5s` (run 37470470739): **9.8 minutes**, shards
+8.3 / 8.1 / 9.4 / 8.5, no binary of a minute anywhere. The stall happened
+once, on shard 4 — and its two `DROP DATABASE … WITH (FORCE)` statements took
+**4.94 and 5.04 s**, where they had taken 60.03–60.29. The stall lasts
+exactly as long as Postgres waits on a login, which is what the reading
+predicted.
+
+What that does and does not establish: the backend that holds up the drop is
+one Postgres is waiting on to finish logging in. That it is a connection of
+the test's own pool, frozen because `TestDb::drop` blocks the runtime, is
+still the reading and not an observation — at 5 s the wait ends before
+Postgres's first "still waiting" message, so that run's report named no
+backend. The report now also keeps every "canceling authentication due to
+timeout" line, which is the trace such a backend leaves.
+
+| | wall time | slowest shard |
+|---|---:|---:|
+| before this package | 15.6 | 15.2 |
+| one build per shard, four shards, unit job in two (#1111) | 12.4 | 12.1 |
+| dealt by one run's durations (#1112) | 12.3 | 11.9 |
+| fastest-of-two table, wait report (#1113) | 11.3 | 11.0 |
+| login timeout 5 s (#1114) | 9.8 | 9.4 |
+
+One run each, and each differs from the last by more than one change's
+worth of noise (a cold cache job in the third row, three stalls in the
+fourth).
+
 ## Deliberately not done
 
 * **Running binaries in parallel inside a shard.** The `tc` binaries are
@@ -155,14 +184,17 @@ backend was instead.
   binaries each clone the template database.
 * **A lint that the weights table is fresh.** A stale table only costs
   balance, never correctness; `docs/ci.md` says when to refresh it.
-* **Changing `TestDb::drop`** (dropping the database without blocking the
-  runtime, or closing the pool first). It is the real fix if the reading
-  holds, and it touches every controller DB test; not before the experiment
-  above confirms the cause.
+* **Changing `TestDb::drop`** (a bounded wait for the drop, or closing the
+  pool first). The experiment supports the reading, so that is where the
+  deadlock is — but with the timeout the stall is 5 s about once a run, and
+  the change touches every controller DB test's teardown. Worth it only for
+  a Postgres this repository does not start (the default there is 60 s); a
+  scratch container made by `scripts/dev-test-db.sh` before 2026-10-06 keeps
+  60 s until it is recreated.
 
 ## Not yet known
 
-Whether the reading of the stall is right (the next run says), and the
-DB-free job's dependence on the unit job's runner image for its cache.
+Which connection the frozen login belongs to, and the DB-free job's
+dependence on the unit job's runner image for its cache.
 `make test-integration` locally (one shard) now builds all 155 controller
 binaries in one call first; that was not timed here.
