@@ -1,9 +1,10 @@
 [package]
 name = "talos-memory"
-version = "0.1.0"
-edition = "2021"
-publish = false
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
 
 [dependencies]
 talos-config = { path = "../talos-config" }
