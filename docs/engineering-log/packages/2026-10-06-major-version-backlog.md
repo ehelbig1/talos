@@ -52,9 +52,8 @@ Smallest reach first, so the method is settled before the wide ones.
 1. **Done here:** `constant_time_eq` — removed as a direct dependency
    (`2026-10-06-csrf-compare-uses-subtle.md`).
 2. **One or few users:** `md5` (#1161), `quick-xml` (#1162), `criterion`
-   (#1165), `cap-std` (#1166), `croner`. `croner` parses schedule
-   expressions: compare the next-run times of every schedule on the fleet
-   before and after. (`petgraph` was in this group; it is held, below.)
+   (#1165), `cap-std` (#1166). (`petgraph` and `croner` were in this group;
+   both are held, below.)
 3. **One family:** `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`,
    `opentelemetry-prometheus` with `tracing-opentelemetry`.
 4. **Authentication:** `bcrypt`, `totp-rs`, `jsonwebtoken`. Each guards a
@@ -81,6 +80,11 @@ Smallest reach first, so the method is settled before the wide ones.
   (`2026-10-06-rust-1.99.md`). That makes the hold temporary, not wrong
   today.
 * **`testcontainers` 0.28.** `testcontainers-modules` has no release for it.
+* **`croner` 3 and 4** (measured 2026-10-06; `2026-10-06-croner-held.md`).
+  Both fire a daily job twice on the spring-forward day when it is scheduled
+  in the hour before the gap. 2.2 does not. Held until that is fixed
+  upstream; `dst_behaviour_tests` in `talos-scheduler` is what a future bump
+  has to pass or consciously change.
 * **`petgraph` 0.8** (measured 2026-10-06). `wasmtime` 49 depends on
   `wasm-compose`, which requires `petgraph ^0.6.2` — and so does the newest
   `wasm-compose` (0.261.0). Moving the five workspace crates to 0.8 would
