@@ -237,14 +237,193 @@ pub fn calculate_next_trigger(
     // `parse_validated_timezone`.
     let cron = parse_validated_cron(cron_expression)?;
 
-    let now_utc = Utc::now();
-    let now_tz = now_utc.with_timezone(&tz);
+    next_trigger_after(&cron, tz, Utc::now())
+}
 
-    let next = cron
-        .find_next_occurrence(&now_tz, false)
-        .map_err(|e| format!("Failed to calculate next occurrence: {}", e))?;
+/// The first occurrence of `cron`, read in `tz`, strictly after `after`.
+///
+/// The one place the scheduler asks the cron library "when next?", with the
+/// instant passed in so the answer can be tested: until 2026-10-06 every
+/// caller read `Utc::now()` inside, and the only tests asserted `is_ok()`.
+/// `dst_behaviour_tests` pins what this returns across both daylight-saving
+/// transitions — read it before changing the `croner` version.
+fn next_trigger_after(
+    cron: &croner::Cron,
+    tz: chrono_tz::Tz,
+    after: DateTime<Utc>,
+) -> Result<DateTime<Utc>, String> {
+    cron.find_next_occurrence(&after.with_timezone(&tz), false)
+        .map(|next| next.with_timezone(&Utc))
+        .map_err(|e| format!("Failed to calculate next occurrence: {}", e))
+}
 
-    Ok(next.with_timezone(&Utc))
+/// Up to `n` consecutive occurrences after `after`; stops at the first the
+/// library cannot produce.
+fn next_n_triggers_after(
+    cron: &croner::Cron,
+    tz: chrono_tz::Tz,
+    after: DateTime<Utc>,
+    n: usize,
+) -> Vec<DateTime<Utc>> {
+    let mut out = Vec::with_capacity(n);
+    let mut cursor = after;
+    for _ in 0..n {
+        match next_trigger_after(cron, tz, cursor) {
+            Ok(next) => {
+                out.push(next);
+                cursor = next;
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod dst_behaviour_tests {
+    use super::*;
+
+    fn fires(expr: &str, tz: &str, after: &str, n: usize) -> Vec<String> {
+        let cron = parse_validated_cron(expr).expect("expression parses");
+        let tz = parse_validated_timezone(tz).expect("timezone parses");
+        let after: DateTime<Utc> = after.parse().expect("an RFC 3339 instant");
+        next_n_triggers_after(&cron, tz, after, n)
+            .iter()
+            .map(|t| t.format("%m-%dT%H:%MZ").to_string())
+            .collect()
+    }
+
+    const NY: &str = "America/New_York";
+
+    // Spring forward, New York, 2027-03-14: 02:00 EST becomes 03:00 EDT
+    // (07:00Z). The hour 02:00–02:59 does not exist that day.
+
+    /// A daily job in the hour BEFORE the gap fires once. croner 3.0.1 and
+    /// 4.0.1 both fire it a second time at the end of the gap (measured
+    /// 2026-10-06: `0 1 * * *` also at 03:00 EDT; in London, `0 0 * * *` also
+    /// at 02:00 BST) — a duplicate run of whatever the schedule starts. This
+    /// is the test that holds the dependency at 2.x.
+    #[test]
+    fn a_daily_job_in_the_hour_before_the_spring_gap_fires_once() {
+        assert_eq!(
+            fires("0 1 * * *", NY, "2027-03-13T12:00:00Z", 3),
+            ["03-14T06:00Z", "03-15T05:00Z", "03-16T05:00Z"]
+        );
+        assert_eq!(
+            fires("45 1 * * *", NY, "2027-03-13T12:00:00Z", 3),
+            ["03-14T06:45Z", "03-15T05:45Z", "03-16T05:45Z"]
+        );
+        // London's gap is 01:00–02:00 on 2027-03-28, so its hour before is 00.
+        assert_eq!(
+            fires("0 0 * * *", "Europe/London", "2027-03-27T12:00:00Z", 3),
+            ["03-28T00:00Z", "03-28T23:00Z", "03-29T23:00Z"]
+        );
+    }
+
+    /// A daily job INSIDE the gap fires once, at the gap's end, and is back
+    /// at its own time the next day.
+    #[test]
+    fn a_daily_job_inside_the_spring_gap_fires_once_at_its_end() {
+        assert_eq!(
+            fires("30 2 * * *", NY, "2027-03-13T12:00:00Z", 3),
+            ["03-14T07:00Z", "03-15T06:30Z", "03-16T06:30Z"]
+        );
+    }
+
+    /// A sub-hourly job runs every real half hour straight across the gap.
+    #[test]
+    fn a_sub_hourly_job_crosses_the_spring_gap_without_a_hole() {
+        assert_eq!(
+            fires("*/30 * * * *", NY, "2027-03-14T06:10:00Z", 4),
+            [
+                "03-14T06:30Z",
+                "03-14T07:00Z",
+                "03-14T07:30Z",
+                "03-14T08:00Z"
+            ]
+        );
+        assert_eq!(
+            fires("25,55 6-22 * * *", NY, "2027-03-14T03:00:00Z", 3),
+            ["03-14T03:25Z", "03-14T03:55Z", "03-14T10:25Z"]
+        );
+    }
+
+    /// A wall-clock job keeps its local time across both changes: 08:00 is
+    /// 13:00Z in winter and 12:00Z in summer.
+    #[test]
+    fn a_wall_clock_job_keeps_its_local_time_across_both_changes() {
+        assert_eq!(
+            fires("0 8 * * 1-5", NY, "2027-03-12T14:00:00Z", 2),
+            ["03-15T12:00Z", "03-16T12:00Z"]
+        );
+        assert_eq!(
+            fires("0 8 * * 1-5", NY, "2026-10-30T13:30:00Z", 3),
+            ["11-02T13:00Z", "11-03T13:00Z", "11-04T13:00Z"]
+        );
+    }
+
+    // Fall back, New York, 2026-11-01: 02:00 EDT becomes 01:00 EST (06:00Z).
+    // The hour 01:00–01:59 happens twice (05:00Z–06:59Z).
+
+    /// A daily job in the repeated hour fires once, on its first pass.
+    #[test]
+    fn a_daily_job_in_the_repeated_autumn_hour_fires_once() {
+        assert_eq!(
+            fires("30 1 * * *", NY, "2026-10-31T12:00:00Z", 3),
+            ["11-01T05:30Z", "11-02T06:30Z", "11-03T06:30Z"]
+        );
+    }
+
+    /// RECORDED, NOT ENDORSED. croner 2.2 does not fire a sub-daily job
+    /// during the second pass of the repeated hour: a half-hourly job goes
+    /// from 05:30Z to 07:00Z, and an hourly one from 05:00Z to 07:00Z. croner
+    /// 4.0.1 fires through it (06:00Z, 06:30Z), which is the better answer —
+    /// when the duplicate in the first test above is fixed upstream and the
+    /// dependency moves, this test is the one that should change.
+    #[test]
+    fn a_sub_daily_job_pauses_for_the_repeated_autumn_hour() {
+        assert_eq!(
+            fires("*/30 * * * *", NY, "2026-11-01T04:40:00Z", 6),
+            [
+                "11-01T05:00Z",
+                "11-01T05:30Z",
+                "11-01T07:00Z",
+                "11-01T07:30Z",
+                "11-01T08:00Z",
+                "11-01T08:30Z"
+            ]
+        );
+        assert_eq!(
+            fires("0 * * * *", NY, "2026-11-01T03:40:00Z", 5),
+            [
+                "11-01T04:00Z",
+                "11-01T05:00Z",
+                "11-01T07:00Z",
+                "11-01T08:00Z",
+                "11-01T09:00Z"
+            ]
+        );
+    }
+
+    /// The syntax the scheduler accepts: five fields. croner 4 by default
+    /// also accepts a leading seconds field and a trailing year, and refuses
+    /// the `5/5` step shorthand that 2.x accepts — either would change which
+    /// stored schedules parse.
+    #[test]
+    fn the_accepted_syntax_is_five_fields() {
+        for accepted in ["5/5 * * * *", "@daily", "0 9 * * MON-FRI", "0 0 * * 7"] {
+            assert!(validate_cron(accepted).is_ok(), "{accepted}");
+        }
+        for refused in [
+            "0 0 * * * *",
+            "0 0 0 1 1 * 2030",
+            "/10 * * * *",
+            "60 * * * *",
+            "",
+        ] {
+            assert!(validate_cron(refused).is_err(), "{refused:?}");
+        }
+    }
 }
 
 /// Validate that a cron expression is parseable.
@@ -275,18 +454,7 @@ pub fn calculate_next_n_triggers(
     // MCP-1020 (2026-05-15): sibling cron-parse helper.
     let cron = parse_validated_cron(cron_expression)?;
 
-    let mut out = Vec::with_capacity(n);
-    let mut cursor = Utc::now().with_timezone(&tz);
-    for _ in 0..n {
-        match cron.find_next_occurrence(&cursor, false) {
-            Ok(next) => {
-                out.push(next.with_timezone(&Utc));
-                cursor = next;
-            }
-            Err(_) => break,
-        }
-    }
-    Ok(out)
+    Ok(next_n_triggers_after(&cron, tz, Utc::now(), n))
 }
 
 /// Validate that a cron expression fires no more frequently than `min_secs` apart.
