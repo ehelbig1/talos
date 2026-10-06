@@ -223,7 +223,7 @@ services:
 
   # NATS Message Queue
   nats:
-    image: nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
+    image: nats:2.15-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4
     container_name: talos-nats
     # SECURITY: username/password on every connection, TWO credentials
     # (2026-09-10): the controller's NATS_USER pair (unrestricted) and the
