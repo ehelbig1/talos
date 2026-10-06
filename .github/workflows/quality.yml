@@ -262,6 +262,11 @@ jobs:
         # leg 7, the installer); CI proves the route derivation it relies on.
         run: python3 scripts/check-route-extensions.py --self-test
 
+      - name: Re-run decision for jobs GitHub never started
+        # scripts/ci-rerun-not-run.py, used by rerun-not-run.yml: the two real
+        # shapes from 2026-10-05 are re-run, a real failure never is.
+        run: python3 scripts/ci-rerun-not-run.py --self-test
+
   # ── Rust unit tests: library unit tests (this job) and the DB-free ─────────
   # integration binaries + doctests (`test-dbfree`, the job after it) ─────────
   # The bulk is `--lib` (~1.3k DB-free unit tests). On top of that we explicitly
