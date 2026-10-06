@@ -174,6 +174,60 @@ async fn test_crypto_hash_limits() {
     );
 }
 
+/// The three digests a module can ask for, against published test vectors
+/// (RFC 1321 A.5 for MD5; FIPS 180 "abc" for SHA-256 and SHA-512). The MD5
+/// arm had no test at all: a new release of the `md5` crate could have
+/// changed what a module is given and nothing would have noticed.
+#[tokio::test]
+async fn test_crypto_hash_known_answers() {
+    let mut ctx = TalosContext::new(
+        CapabilityWorld::Minimal,
+        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    for (algorithm, input, expected) in [
+        (
+            wit_crypto::HashAlgorithm::Md5,
+            &b"abc"[..],
+            "900150983cd24fb0d6963f7d28e17f72",
+        ),
+        (
+            wit_crypto::HashAlgorithm::Md5,
+            &b"message digest"[..],
+            "f96b697d7cb7938d525a2f31aaf161d0",
+        ),
+        (
+            wit_crypto::HashAlgorithm::Sha256,
+            &b"abc"[..],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            wit_crypto::HashAlgorithm::Sha512,
+            &b"abc"[..],
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+        ),
+    ] {
+        let digest =
+            <TalosContext as wit_crypto::Host>::hash(&mut ctx, algorithm, input.to_vec()).await;
+        assert_eq!(hex::encode(digest), expected);
+    }
+}
+
 #[tokio::test]
 async fn test_crypto_random_bytes_limits() {
     let mut ctx = TalosContext::new(
