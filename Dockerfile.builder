@@ -9,7 +9,7 @@
 #   (or use scripts/build-compiler-image.sh)
 
 # ---------- stage 1: install toolchain + cargo extensions ----------
-FROM rust:1.96-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3 AS builder-base
+FROM rust:1.98-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS builder-base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -59,7 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
     chmod -R a+rX /opt/talos-advisory-db
 
 # ---------- stage 2: slim runtime image ----------
-FROM rust:1.96-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3
+FROM rust:1.98-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730
 
 ENV DEBIAN_FRONTEND=noninteractive
 
