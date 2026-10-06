@@ -174,6 +174,24 @@ advisory and main has it too:
    `frontend/audit-exceptions.json` (or `deny.toml`'s ignore list, with the
    reason).
 3. Bring the blocked pull request up to date with main; its run then passes.
+## The lockfile is what gets built
+
+The lint job runs `cargo update --workspace --locked` first: it re-resolves
+only the workspace's own entries and fails if `Cargo.lock` would change. A
+manifest committed without its lockfile change therefore fails every pull
+request, once, instead of building on versions cargo picked during the run.
+The controller and worker image builds pass `--locked` to `cargo build` for
+the same reason; CI builds neither image, so that flag is what guards a
+deploy.
+
+When it fails: run any cargo command locally (`cargo check`), and commit the
+`Cargo.lock` it rewrites.
+
+The lint job runs `scripts/lint-structural.sh` directly, not `make lint`. A
+check added to the Makefile's `lint` target (the toolchain pins, the
+unused-dependency check) needs its own step in that job, or it runs on a
+developer's machine and never in CI.
+
 ## Measuring a run
 
 `python3 scripts/ci-run-report.py --pr <number> --wait` (or `--sha <commit>`,
