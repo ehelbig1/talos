@@ -34,6 +34,8 @@ export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/n
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
         check build lint lint-full lint-frontend lint-frontend-full hooks test test-changed test-db test-db-stop test-integration test-clean coverage-html audit check-catalog check-catalog-fuel test-integration-scaffold test-alert-rules ci \
+        check-lockfile check-changelog-fragments clippy test-unit test-dbfree test-doc test-benches test-scripts \
+        check-frontend-codegen typecheck-frontend test-frontend audit-frontend \
         drill drill-schedule drill-unschedule drill-schedule-status \
         offhost-upload offhost-backfill offhost-plan offhost-probe \
         offhost-schedule offhost-unschedule offhost-status \
@@ -270,6 +272,8 @@ lint: ## Fast gate: rustfmt + WIT drift + structural lints (no clippy) + offline
 	@python3 scripts/check-rust-pins.py
 	@printf '▶ declared dependencies are used\n'
 	@python3 scripts/check-unused-deps.py
+	@printf '▶ CI gates are make targets\n'
+	@python3 scripts/check-ci-uses-make.py
 # NOTE: no `cargo fmt --all -- --check` here. It ran TWICE per `make lint` —
 # once from this target and again as structural check 35 — which is pure
 # duplicated wall-clock for identical coverage. Check 35 is the copy that was
@@ -290,12 +294,67 @@ lint: ## Fast gate: rustfmt + WIT drift + structural lints (no clippy) + offline
 lint-full: LINT_CLIPPY = 1
 lint-full: lint ## Everything `make lint` runs, plus workspace clippy (-D warnings) — what CI runs
 
+# ── The gates CI runs, one target each ───────────────────────────────────
+#
+# The rule (2026-10-06): a command that DECIDES whether a change is good is a
+# target in this file, and quality.yml runs `make <target>`. Until then about
+# two thirds of CI's gates were commands written only in the workflow — the
+# lint job ran the structural script directly, so two checks added to `make
+# lint` ran on a developer's machine and never in CI. What stays in the
+# workflow is the runner's own setup (installing tools, freeing disk,
+# creating databases, classifying the diff) and the annotations it adds
+# around a failure. `scripts/check-ci-uses-make.py`, run by `make lint`,
+# refuses a workflow step that runs cargo, npm, or a repository script
+# directly unless it is on that short setup list.
+
+check-lockfile: ## Cargo.lock matches the manifests — fails if it would change (needs the crates.io index)
+	@printf '▶ Cargo.lock matches the manifests\n'
+	@cargo update --workspace --locked
+
+check-changelog-fragments: ## changelog.d fragments are well-formed (and the tool's own self-test)
+	@python3 scripts/changelog-fragments.py self-test
+	@python3 scripts/changelog-fragments.py check
+
+# The same command line as structural check 7 (`make lint-full`), which
+# captures its output; this one streams it, for a CI log. The guard above
+# holds the two copies identical.
+clippy: ## Workspace clippy on every target, warnings are errors, and every clippy.toml disallowed path still resolves
+	@log="$${RUNNER_TEMP:-$${TMPDIR:-/tmp}}/talos-clippy.log"; \
+	cargo clippy --workspace --all-targets --no-deps -- -D warnings 2>&1 | tee "$$log"; \
+	if grep -q 'does not refer to a reachable function' "$$log"; then \
+	    if [ -n "$${GITHUB_ACTIONS:-}" ]; then echo "::error::a clippy.toml disallowed-methods path no longer resolves — that rule is off"; fi; \
+	    printf '\033[1;31m✗ a clippy.toml disallowed-methods path no longer resolves — that rule is off\033[0m\n'; \
+	    grep -A3 'does not refer to a reachable function' "$$log"; \
+	    exit 1; \
+	fi
+
+test-unit: ## Library and binary unit tests of the whole workspace (nextest) — CI's unit job
+	@command -v cargo-nextest >/dev/null 2>&1 \
+	    || { printf '\033[1;31m✗ cargo-nextest missing\033[0m — install: cargo install cargo-nextest --locked\n'; exit 1; }
+	@cargo nextest run --workspace --lib --bins --no-fail-fast
+
+test-dbfree: ## Integration-test binaries that need no service (found by scripts/ci_test_targets.py)
+	@bash scripts/ci-run-dbfree-tests.sh
+
+test-doc: ## Doctests of the whole workspace (nextest does not run them)
+	@cargo test --workspace --doc
+
+# A new benchmark target is added here by name: `--benches` would also build
+# and run every crate's unit tests a second time.
+test-benches: ## Run each benchmark case once, measuring nothing — proves the benchmarks still run
+	@cargo test -p talos-workflow-engine --bench scheduler
+
+test-scripts: ## Every scripts/tests/*.sh and every scripts/*.py --self-test (found, not listed)
+	@bash scripts/run-script-tests.sh
+
 # Same split for the frontend: eslint + prettier are seconds, vitest is the
 # slow half and runs in CI's frontend job on every frontend change.
-lint-frontend: ## Frontend fast gate — eslint + prettier (skips if frontend/node_modules absent)
+lint-frontend: ## Frontend fast gate — eslint + prettier (skips if frontend/node_modules absent; under CI that is a failure)
 	@if [ -d frontend/node_modules ]; then \
 	    printf '▶ frontend: eslint + prettier (vitest: make lint-frontend-full)\n'; \
 	    cd frontend && npm run lint; \
+	elif [ -n "$${CI:-}" ]; then \
+	    printf '\033[1;31m✗ frontend/node_modules absent under CI — a gate that skips is not a gate (run npm ci first)\033[0m\n'; exit 1; \
 	else \
 	    printf '\033[1;33m⊘ frontend/node_modules absent — skipping frontend gate (run: cd frontend && npm ci)\033[0m\n'; \
 	fi
@@ -307,6 +366,22 @@ lint-frontend-full: ## Frontend full gate — eslint + prettier + vitest
 	else \
 	    printf '\033[1;33m⊘ frontend/node_modules absent — skipping frontend gate (run: cd frontend && npm ci)\033[0m\n'; \
 	fi
+
+check-frontend-codegen: ## The committed GraphQL codegen output is what the schema generates
+	@cd frontend && npm run codegen
+	@git diff --exit-code -- frontend/src/generated || { \
+	    if [ -n "$${GITHUB_ACTIONS:-}" ]; then echo "::error::frontend/src/generated is stale. Run: (cd frontend && npm run codegen) and commit the result."; fi; \
+	    printf '\033[1;31m✗ frontend/src/generated is stale\033[0m — run: (cd frontend && npm run codegen) and commit the result\n'; \
+	    exit 1; }
+
+typecheck-frontend: ## Frontend type check (tsc --noEmit)
+	@cd frontend && npx tsc --noEmit
+
+test-frontend: ## Frontend unit tests (vitest)
+	@cd frontend && npx vitest run
+
+audit-frontend: ## Frontend dependency advisories, against frontend/audit-exceptions.json
+	@bash scripts/frontend-audit.sh
 
 hooks: ## Install git hooks (.githooks) — activates pre-commit + pre-push gates
 	@git config core.hooksPath .githooks
@@ -450,8 +525,15 @@ check-catalog-fuel: ## Build each template that has a recorded run and check its
 test-integration-scaffold: ## Generate a throwaway integration from the scaffold, clippy + test it, remove it (also run by CI)
 	@python3 scripts/new-integration.py --self-test
 
-ci: lint-full lint-frontend-full audit test check-catalog check-catalog-fuel ## Full local gate matching GitHub Actions CI
-	@printf '\033[1;32m✓ CI checks passed — safe to push\033[0m\n'
+# Every CI gate that needs nothing but this checkout and its toolchains.
+# NOT included, because each needs a service CI provisions: `test-integration`
+# (Docker: Postgres, Redis, NATS), `sqlx-check` and `verify-schema-baseline`
+# (a migrated Postgres), `test-alert-rules` (Docker). Run those by name.
+ci: check-lockfile lint clippy check-changelog-fragments test-scripts audit \
+    test-unit test-dbfree test-doc test-benches \
+    check-catalog check-catalog-fuel test-integration-scaffold \
+    lint-frontend check-frontend-codegen typecheck-frontend test-frontend audit-frontend ## Every CI gate that needs no service (see the comment above for the four that do)
+	@printf '\033[1;32m✓ every service-free CI gate passed\033[0m (not run: test-integration, sqlx-check, verify-schema-baseline, test-alert-rules)\n'
 
 ## ──── Ops ──────────────────────────────────────────────────────────
 

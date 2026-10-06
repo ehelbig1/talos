@@ -175,110 +175,20 @@ jobs:
           esac
           exit 1
 
-      - name: Installer worker-trust state machine + Ed25519 derivation
-        # deploy/k3s/lib/worker-trust.sh is pure bash the k3s installer sources;
-        # its test pins the four-phase order (each phase distributes a key the
-        # next one signs with) and checks the OpenSSL seed→public-key derivation
-        # against RFC 8032 vector 1. Ubuntu's OpenSSL 3 runs the derivation
-        # part that a LibreSSL laptop skips.
-        run: bash deploy/k3s/tests/worker-trust-test.sh
-
-      - name: LaunchAgent PATH helper (drill + off-host schedulers)
-        # scripts/lib/launchd-path.sh derives a scheduled job's PATH from where
-        # the installing shell finds cargo/docker/aws. Both schedulers used to
-        # hardcode a PATH without ~/.cargo/bin, so the first scheduled drill
-        # died at `cargo: No such file or directory`. The helper half runs
-        # here; the plist render/status half needs macOS plutil and skips loudly.
-        run: bash scripts/tests/launchd-path-test.sh
-
-      - name: make up disk preflight + make clean prune flags
-        # scripts/preflight-disk.sh refuses `make up` at >=95% Docker disk and
-        # prints reclaim commands. On 2026-09-15 its first command reclaimed 0 B
-        # at 95% with nothing on screen to say so. A fake `docker` on PATH
-        # drives every branch: figures shown (or omitted when unreadable),
-        # image prune first, the builder-prune flag this client knows, the
-        # 95% refusal and the opt-out; plus make clean's prune line.
-        run: bash scripts/tests/preflight-disk-test.sh
-
-      - name: make confirm-deploy against a fake stack
-        # scripts/confirm-deploy.sh answers "is origin/main what is running,
-        # and is it healthy". Fake git / docker / curl on PATH drive every
-        # verdict (PASS, FAIL and UNKNOWN for each check), the GitHub API
-        # fallback when git cannot reach origin, and runs under `bash -e` and
-        # `bash -u -o pipefail`. The last assertion is the one that matters
-        # most: no call outside a read-only list was made in any scenario.
-        run: bash scripts/tests/confirm-deploy-test.sh
-
-      - name: Backup drill reports its result as an ops alert
-        # scripts/lib/drill-ops-alert.sh sends the drill's result to the MCP
-        # tool report_ops_alert after the textfile metric. A fake curl on PATH
-        # drives success (resolve), failure (raise naming the step), the key
-        # file (header from a private file, key in no argv) and every failed
-        # delivery (one WARN, no body); the real drill, failing at its first
-        # pre-flight check, keeps its exit status and metric with the
-        # report endpoint down.
-        run: bash scripts/tests/drill-ops-alert-test.sh
-      - name: Backup drill drills Vault only when it holds the key
-        # TALOS_DRILL_VAULT: the real drill, a fake docker, an empty backup
-        # folder. With KEK_PROVIDER=env it must not ask for a Vault backup;
-        # with vault it must; off+vault is refused.
-        run: bash scripts/tests/drill-vault-gate-test.sh
-
-      - name: Changed-areas classifier (job groups, dependency files)
-        run: bash scripts/tests/ci-changed-areas-test.sh
-
-      - name: Rust toolchain pin check
-        # scripts/check-rust-pins.py (run by `make lint`) compares the seven
-        # places the toolchain is pinned; its self-test drives a drifted copy
-        # of each one, a missing pin and an undigested base image.
-        run: python3 scripts/check-rust-pins.py --self-test
-
-      - name: Unused-dependency check
-        # scripts/check-unused-deps.py (run by `make lint`): a crate declares
-        # only the dependencies its own code names. Its self-test drives every
-        # way code names a crate, mentions that are not code, the tests-only
-        # case, build and target tables, and the opt-out marker.
-        run: python3 scripts/check-unused-deps.py --self-test
-
-      - name: CI disk-freeing script acts only when space is short
-        run: bash scripts/tests/ci-free-disk-test.sh
-
-      - name: Pre-push guard refuses a follow-up to a merged pull request
-        # scripts/check-push-target.sh against a throwaway repository and a
-        # fake gh: the one refused case, and everything that must go through.
-        run: bash scripts/tests/check-push-target-test.sh
-
-      - name: Integration shards partition the work list
-        # scripts/ci_shard.py deals the suite to shards by measured duration;
-        # every item must land on exactly one shard, whatever the count.
-        run: bash scripts/tests/ci-shard-test.sh
-
-      - name: CI run report reads a job log
-        run: python3 scripts/ci-run-report.py --self-test
-
-      - name: Toolchain pruning keeps the pinned Rust and nothing else
-        run: bash scripts/tests/ci-only-pinned-rust-test.sh
-
-      - name: Chart Vault init Job + unsealer sidecar against a real Vault
-        # deploy/helm/talos/files/vault-init.sh and vault-unseal-loop.sh, driven
-        # against the chart's pinned hashicorp/vault image with a fake kubectl:
-        # fresh init, a re-run that mints nothing, a legacy bootstrap.json whose
-        # root token is revoked and removed, a failed Secret patch that revokes
-        # the token it minted, and a restarted (sealed) Vault the sidecar
-        # unseals. TALOS_REQUIRE_DOCKER makes a missing daemon a FAILURE here —
-        # the test skips without docker locally, and a skip is not a gate.
+      - name: make test-scripts
+        # Every test of the repository's own scripts — each scripts/tests/*.sh,
+        # deploy/k3s/tests/*.sh, and the --self-test of each scripts/*.py that
+        # has one. Found by scripts/run-script-tests.sh, not listed: until
+        # 2026-10-06 each had its own step here, a new one ran only if someone
+        # also edited this file, and none could be run as a set locally. Each
+        # test's own header says what it pins and why.
+        #
+        # TALOS_REQUIRE_DOCKER makes a missing Docker daemon a FAILURE for the
+        # chart's Vault test: it skips without docker on a laptop, and a skip
+        # is not a gate.
         env:
           TALOS_REQUIRE_DOCKER: "1"
-        run: bash scripts/tests/vault-chart-init-test.sh
-      - name: Route crawl parser self-test
-        # Package BZ. The crawl itself needs a running controller (smoke.sh
-        # leg 7, the installer); CI proves the route derivation it relies on.
-        run: python3 scripts/check-route-extensions.py --self-test
-
-      - name: Re-run decision for jobs GitHub never started
-        # scripts/ci-rerun-not-run.py, used by rerun-not-run.yml: the two real
-        # shapes from 2026-10-05 are re-run, a real failure never is.
-        run: python3 scripts/ci-rerun-not-run.py --self-test
+        run: make test-scripts
 
   # ── Rust unit tests: library unit tests (this job) and the DB-free ─────────
   # integration binaries + doctests (`test-dbfree`, the job after it) ─────────
@@ -378,7 +288,7 @@ jobs:
         # `oauth_auth_metric_tests` and would have excluded the detector-metric
         # pins added alongside this line. Exactly the class those PRs are about:
         # a guard that exists and is never consulted.
-        run: cargo nextest run --workspace --lib --bins --no-fail-fast
+        run: make test-unit
 
       - name: Disk at the end of the job
         # What the job needed, kept in every log: the figure the 40 GB
@@ -475,7 +385,7 @@ jobs:
       # scripts/ci_test_targets.py (`dbfree`), so a new test file registers
       # itself — no hand-kept `--test` list for parallel PRs to collide on.
       - name: Run DB-free integration-test binaries
-        run: bash scripts/ci-run-dbfree-tests.sh
+        run: make test-dbfree
 
       - name: Run doctests
         # nextest does NOT run doctests (a documented limitation), so the
@@ -483,7 +393,7 @@ jobs:
         # `cargo test --doc` is the only runner for them. ~218 doctests across
         # the workspace, all DB-free. Confirmed green before re-adding (the last
         # item from the never-in-CI sweep's docs/backlog.md note).
-        run: cargo test --workspace --doc
+        run: make test-doc
 
       - name: Benchmarks still run (each case once)
         # A `harness = false` benchmark is compiled by clippy and run by
@@ -494,7 +404,7 @@ jobs:
         # the test profile this job has already built. A new benchmark target
         # is added here by name (`--benches` would also re-run every crate's
         # unit tests).
-        run: cargo test -p talos-workflow-engine --bench scheduler
+        run: make test-benches
 
       - name: Disk at the end of the job
         # What the job needed, kept in every log: the figure the 40 GB
@@ -609,12 +519,9 @@ jobs:
       - name: make check-catalog-fuel
         run: make check-catalog-fuel
 
-      # The promotion script copies a privately authored module into this
-      # PUBLIC tree. Its refusals (a per-user secret path, an identifier in a
-      # fixture) are the only thing between that copy and a leak, so they are
-      # exercised here.
-      - name: Promotion script still refuses what it must
-        run: python3 scripts/promote-module.py --self-test
+      # The promotion script's own refusals (a per-user secret path, an
+      # identifier in a fixture) are exercised by `make test-scripts`, in the
+      # supply-chain job, with every other script self-test.
 
   # ── Integration tests: the env-gated DB suite (RLS isolation, crash ────────
   # recovery, memory, …). `make test-integration` provisions its own disposable
@@ -764,22 +671,26 @@ jobs:
         # if some file references a type the stale output is MISSING — a
         # snapshot that merely lacks new types typechecks perfectly.
         #
-        # Deliberately here and NOT in `make lint-frontend`: that target skips
-        # itself when `frontend/node_modules` is absent, and a gate that skips
-        # is not a gate (checks 64/65). This job has already run `npm ci`.
-        run: |
-          npm run codegen
-          git diff --exit-code -- src/generated \
-            || { echo "::error::frontend/src/generated is stale. Run: (cd frontend && npm run codegen) and commit the result."; exit 1; }
+        # Its own target and NOT part of `make lint-frontend`: that target
+        # skips itself on a developer's machine when `frontend/node_modules` is
+        # absent, and a gate that skips is not a gate (checks 64/65). This one
+        # fails without them, and this job has already run `npm ci`.
+        working-directory: .
+        run: make check-frontend-codegen
 
-      - name: Lint (eslint + prettier)
-        run: npm run lint
+      - name: make lint-frontend (eslint + prettier)
+        # Under CI a missing node_modules is a failure in this target, not
+        # the skip a developer's machine gets.
+        working-directory: .
+        run: make lint-frontend
 
-      - name: Type check
-        run: npx tsc --noEmit
+      - name: make typecheck-frontend
+        working-directory: .
+        run: make typecheck-frontend
 
-      - name: Unit tests
-        run: npx vitest run
+      - name: make test-frontend
+        working-directory: .
+        run: make test-frontend
 
       - name: Dependency audit (blocking)
         # Blocks the job on any moderate+ frontend advisory, so dependency
@@ -858,44 +769,10 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -uo pipefail
-          set +e
-          out="$(timeout 300 npm audit --json --audit-level=moderate 2>/dev/null)"
-          rc=$?
-          set -e
-
-          if [ "$rc" -eq 124 ]; then
-            echo "::warning title=Frontend advisory state UNKNOWN::npm audit did not answer within 300s and was stopped. This is NOT a clean result — the advisory state was not read. The nightly run re-checks."
-            exit 0
-          fi
-
-          if [ -z "$out" ] || ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
-            echo "::warning title=Frontend advisory state UNKNOWN::npm audit produced no parseable JSON (exit $rc). This is NOT a clean result — the advisory state was not read."
-            exit 0
-          fi
-
-          if printf '%s' "$out" | jq -e '.error' >/dev/null 2>&1; then
-            detail="$(printf '%s' "$out" | jq -r '.error.summary // .error.detail // .error | tostring' | head -c 400)"
-            echo "::warning title=Frontend advisory state UNKNOWN::npm audit could not reach the advisory service, so no claim is made about frontend CVEs: $detail"
-            exit 0
-          fi
-
-          # The decision: every moderate+ ADVISORY must be fixed or covered by
-          # an unexpired, reviewed exception in frontend/audit-exceptions.json
-          # (one advisory each, with a reason and an expiry date). Excepted
-          # advisories are printed as warnings on every run.
-          python3 ../scripts/frontend_audit_gate.py --self-test >/dev/null
-          # Whether this change touches the frontend's dependency files, so a
-          # failure can say whether it can be this change's doing.
-          deps=unknown
-          if [ "$EVENT" = "pull_request" ]; then
-            case "$(bash ../scripts/ci-changed-areas.sh "$PR_BASE" "$(git rev-parse HEAD)" 2>/dev/null | sed -n 's/^frontend_deps=//p' || true)" in
-              true) deps=yes ;;
-              false) deps=no ;;
-            esac
-          fi
-          printf '%s' "$out" | python3 ../scripts/frontend_audit_gate.py --deps-changed "$deps" --exceptions audit-exceptions.json
+        # The decision itself is scripts/frontend-audit.sh (`make
+        # audit-frontend`), moved out of this file unchanged on 2026-10-06.
+        working-directory: .
+        run: make audit-frontend
 
   # ── Migration baseline verifier (RFC 0009 phase 1) ─────────────────────────
   # Proves the committed migrations/.baseline/ artifacts (schema snapshot +
@@ -974,7 +851,7 @@ jobs:
         env:
           CHAIN_DATABASE_URL: postgres://postgres:verify@localhost:5432/verify_chain
           BASELINE_DATABASE_URL: postgres://postgres:verify@localhost:5432/verify_baseline
-        run: bash scripts/verify-schema-baseline.sh
+        run: make verify-schema-baseline
 
   sqlx-cache:
     name: sqlx offline cache (compile-checked queries)
@@ -1112,38 +989,30 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
 
-      - name: Cargo.lock matches the manifests
+      - name: make check-lockfile
         # No cargo command in CI or in the image builds passed --locked until
         # 2026-10-06, so a manifest committed without its lockfile change
         # built anyway, on versions cargo chose at that moment and nobody
         # reviewed. This refuses it once, for every job: it re-resolves only
         # the workspace's own entries and fails if the lockfile would change.
         # (The image builds pass --locked themselves; CI does not build them.)
-        run: cargo update --workspace --locked
-
-      - name: Rust toolchain pins agree
-        # `make lint` runs this locally; this job runs the structural script
-        # directly, so the check is named here too or CI never runs it.
-        run: python3 scripts/check-rust-pins.py
+        run: make check-lockfile
 
       - name: helm must be present (check 5 skips without it)
         run: helm version
 
-      # rustfmt and the WIT drift diff used to be separate steps here AND
-      # structural checks 35 and 16 — every PR ran each of them twice. The
-      # structural copies are the ones kept: they name the offending files.
-      - name: Structural lints (incl. rustfmt = check 35, WIT drift = check 16)
-        run: bash scripts/lint-structural.sh
+      # `make lint`, the same command the pre-push hook runs: the WIT drift
+      # diff, the toolchain pins, the unused-dependency check, the
+      # CI-uses-make check and the structural lints (rustfmt is check 35).
+      # Until 2026-10-06 this step ran scripts/lint-structural.sh directly, so
+      # a check added to the Makefile's target ran locally and never here.
+      # (cargo-deny is not installed in this job; `make lint` says so and the
+      # supply-chain job runs the full `cargo deny check`.)
+      - name: make lint
+        run: make lint
 
-      - name: Declared dependencies are used
-        # `make lint` runs this locally; this job runs the structural script
-        # directly, so the check is named here too or CI never runs it.
-        run: python3 scripts/check-unused-deps.py
-
-      - name: Changelog fragments are well-formed
-        run: |
-          python3 scripts/changelog-fragments.py self-test
-          python3 scripts/changelog-fragments.py check
+      - name: make check-changelog-fragments
+        run: make check-changelog-fragments
 
   # ── Clippy: workspace lint with -D warnings ────────────────────────────────
   # Separate from `test` so the two run in parallel; cargo cannot share
@@ -1216,19 +1085,14 @@ jobs:
       # --all-targets` was the pre-push discipline and no gate. The cost is
       # compiling the test targets, which the cache below already holds for
       # the test job.
-      - name: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+      - name: make clippy
+        # `cargo clippy --workspace --all-targets --no-deps -- -D warnings`.
         # clippy.toml's disallowed-methods rules (checks 29/53/63/78) fail
         # this step at any unsanctioned call. A rule whose path stopped
         # resolving is only a WARNING that -D warnings does not fail, so the
-        # log is checked for it: that rule would otherwise be silently off.
-        run: |
-          set -o pipefail
-          cargo clippy --workspace --all-targets --no-deps -- -D warnings 2>&1 | tee "$RUNNER_TEMP/clippy.log"
-          if grep -q 'does not refer to a reachable function' "$RUNNER_TEMP/clippy.log"; then
-            echo "::error::a clippy.toml disallowed-methods path no longer resolves — that rule is off"
-            grep -A3 'does not refer to a reachable function' "$RUNNER_TEMP/clippy.log"
-            exit 1
-          fi
+        # target checks the log for it: that rule would otherwise be silently
+        # off.
+        run: make clippy
 
       # The integration scaffold (`scripts/new-integration.py`) is templates,
       # and a template nothing builds rots with the first change to a crate
@@ -1236,7 +1100,7 @@ jobs:
       # to clippy `-D warnings` and its unit tests, and removes it. In THIS
       # job because every dependency of the probe is already built here.
       - name: Integration scaffold still generates a clean crate
-        run: python3 scripts/new-integration.py --self-test
+        run: make test-integration-scaffold
 
       - name: Disk at the end of the job
         # What the job needed, kept in every log: the figure the 40 GB
