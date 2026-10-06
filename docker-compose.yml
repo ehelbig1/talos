@@ -19,7 +19,7 @@ services:
     # On pg16 that baseline cannot be applied at all — it emits
     # `SET transaction_timeout = 0`, a PG17-only GUC, so under ON_ERROR_STOP=1
     # `migrate_db()` fails and `make test-integration` is unrunnable locally.
-    image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+    image: pgvector/pgvector:pg17@sha256:ac08538c6f8b9904c33c8224c5e5706dbe760aca29db1d096972b4052c22a75d
     container_name: talos-postgres
     # `pg_stat_statements` needs the library PRELOADED at postmaster start —
     # it cannot be turned on by a `SET` or by `CREATE EXTENSION` alone. Added
@@ -87,7 +87,7 @@ services:
   # rather than the untestable "artifacts + the live host ⇒ readable".
   postgres-backup:
     restart: unless-stopped
-    image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+    image: pgvector/pgvector:pg17@sha256:ac08538c6f8b9904c33c8224c5e5706dbe760aca29db1d096972b4052c22a75d
     container_name: talos-postgres-backup
     depends_on:
       postgres:
@@ -123,7 +123,7 @@ services:
     # Opt-in since 2026-10-05: see the controller's depends_on.
     profiles: ["vault"]
     restart: unless-stopped
-    image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+    image: pgvector/pgvector:pg17@sha256:ac08538c6f8b9904c33c8224c5e5706dbe760aca29db1d096972b4052c22a75d
     container_name: talos-vault-backup
     depends_on:
       vault:
