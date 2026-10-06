@@ -9234,6 +9234,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "subtle",
  "talos-config",
  "talos-dlp-provider",
  "talos-http-body",
