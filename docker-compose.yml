@@ -1481,7 +1481,7 @@ services:
     # Alertmanager can present the `X-Verification-Token` header that
     # `POST /webhooks/{id}` requires, reading it from a FILE rather than from
     # config. Without it the Talos-bound route could never be authenticated.
-    image: quay.io/prometheus/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
+    image: quay.io/prometheus/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
     container_name: talos-alertmanager
     command:
       - '--config.file=/etc/alertmanager/conf/alertmanager.yml'
