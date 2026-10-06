@@ -65,9 +65,17 @@ fn stub_artifact(id: Uuid) -> WasmModuleArtifact {
     }
 }
 
+/// Room for the largest graph a benchmark builds (the 1000-leaf fan-out).
+const MAX_BENCH_NODES: usize = 2_048;
+
 fn build_engine(modules: &[Uuid]) -> ParallelWorkflowEngine {
     let mut engine = minimal_engine();
     engine.set_user_id(Uuid::new_v4());
+    // The engine refuses a graph above its node cap (500 by default), and the
+    // largest graph here is 1 root + 1000 leaves plus the trigger root. Until
+    // 2026-10-06 this benchmark predated the cap and panicked at "graph
+    // loads" on its 1000 case; nothing runs benchmarks in CI.
+    engine.set_max_workflow_nodes(MAX_BENCH_NODES);
     let mut fetcher = InMemoryModuleFetcher::new();
     for &m in modules {
         fetcher = fetcher.with_module(m, stub_artifact(m));

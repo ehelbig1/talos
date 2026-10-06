@@ -478,6 +478,17 @@ jobs:
         # item from the never-in-CI sweep's docs/backlog.md note).
         run: cargo test --workspace --doc
 
+      - name: Benchmarks still run (each case once)
+        # A `harness = false` benchmark is compiled by clippy and run by
+        # nothing. `benches/scheduler.rs` sat broken from the day the engine
+        # got its 500-node cap: its 1000-node case panicked at load, found on
+        # 2026-10-06 only because a criterion bump was being checked. Under
+        # `cargo test` criterion runs each case once and measures nothing, in
+        # the test profile this job has already built. A new benchmark target
+        # is added here by name (`--benches` would also re-run every crate's
+        # unit tests).
+        run: cargo test -p talos-workflow-engine --bench scheduler
+
       - name: Disk at the end of the job
         # What the job needed, kept in every log: the figure the 40 GB
         # threshold above rests on.
