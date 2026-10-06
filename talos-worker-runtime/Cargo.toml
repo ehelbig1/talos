@@ -33,9 +33,11 @@ async-nats.workspace = true
 #   release; 44.0.2 is the first fixed version in the next major. Drop-in: no
 #   API changes (verified — worker compiles + full lib suite green).
 # Also brings: per-operator fuel costs, Store::try_new (OOM-safe), WASIp3 preview.
-# Pinning to the exact version ensures reproducible builds.
+# Pinning to the exact version ensures reproducible builds. The version
+# itself is in the root Cargo.toml's [workspace.dependencies], with
+# wasmtime-wasi and wasmtime-wasi-http (2026-10-06).
 wasmtime = { workspace = true, features = ["async", "component-model", "parallel-compilation", "memory-protection-keys"] }
-wasmtime-wasi = "49.0.2"
+wasmtime-wasi.workspace = true
 
 # Core utilities
 anyhow.workspace = true
@@ -116,7 +118,7 @@ prometheus = { workspace = true, features = ["process"] } # opentelemetry-promet
                     # is removed. worker's metrics_server.rs still enforces 4KB max request size, auth
                     # tokens, and rate limiting as defence-in-depth.
 tracing-opentelemetry.workspace = true
-wasmtime-wasi-http = "49.0.2"
+wasmtime-wasi-http.workspace = true
 oci-distribution = { workspace = true, features = ["default"] }
 bytes.workspace = true
 # `host::wasi_http` (2026-09-25): the gated wasi:http send path converts the

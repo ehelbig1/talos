@@ -17,7 +17,7 @@ than one requirement for the same locked version (`uuid`: `1`, `1.11`,
 ## Changed
 
 * `[workspace.dependencies]` lists all 66 dependencies that two or more
-  crates use. Each version is the most specific requirement any crate had
+  crates use, plus the two other crates of the wasmtime family (68 entries). Each version is the most specific requirement any crate had
   written, so no crate's minimum is lowered.
 * 711 declarations in 137 manifests now read `name.workspace = true` or
   `{ workspace = true, features = [...] }`. Each crate keeps exactly the
@@ -66,6 +66,36 @@ and was not moved.
 
 Found by `make lint` failing on the root manifest — the silent half was
 found by reading the pattern, not by a failure.
+
+## A test read a manifest too, and the first push failed on it
+
+`fingerprint_wasmtime_version_matches_cargo_toml` (`talos-worker-runtime`)
+ties the runtime's wasmtime version constant, the boot log and the
+CVE-response document to the version the manifests declare. It read
+`talos-worker-runtime/Cargo.toml` and `worker/Cargo.toml` by text, found
+`wasmtime = { workspace = true, … }`, and could not find a version. It
+failed in CI: the first push had been checked with `cargo check`, the lint
+gate and the feature comparison, and no test run — on the reasoning that a
+manifest-only change cannot change behaviour. It cannot; it can change what
+a test READS.
+
+* The test's reader now follows an inherited line to the workspace table
+  (`declared_crate_version`), with its own test over every spelling and the
+  near-miss names.
+* `wasmtime-wasi` and `wasmtime-wasi-http` join `wasmtime` in the table, so
+  the family is pinned in one place; `docs/wasmtime-version-tracking.md`
+  says so. The test's second assertion (the two manifests agree) still
+  holds, now by construction.
+* Every other place Rust code reads a `Cargo.toml` was read: two layering
+  pins (substring checks on path dependencies, unaffected) and the catalog
+  build script (already strips `.workspace`).
+* The whole unit suite (7,407 tests) and the DB-free test binaries then ran
+  locally before the second push.
+
+The sweep that should have come first, and is the rule for the next change
+of this kind: when the SPELLING of a manifest changes, find everything that
+reads manifests as text — scripts, structural checks, AND tests — before
+relying on a build.
 
 ## Not done
 

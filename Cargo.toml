@@ -274,7 +274,11 @@ tracing-subscriber = { version = "0.3", default-features = false }
 url = "2.5"
 urlencoding = "2.1"
 uuid = { version = "1.20", features = ["v4", "serde"] }
+# The wasmtime family, pinned to the exact patch and moved together. See
+# docs/wasmtime-version-tracking.md before changing any of the three.
 wasmtime = "49.0.2"
+wasmtime-wasi = "49.0.2"
+wasmtime-wasi-http = "49.0.2"
 zeroize = "1.8"
 
 # Workspace-level clippy policy.

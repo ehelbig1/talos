@@ -979,30 +979,103 @@ mod aot_hmac_input_tests {
         );
     }
 
-    /// Extract the pin `manifest` declares for EXACTLY `crate_name`, in
-    /// either spelling cargo allows: `foo = "X.Y.Z"` or
-    /// `foo = { version = "X.Y.Z", … }`.
+    /// The workspace manifest. Since 2026-10-06 the wasmtime family's
+    /// versions are declared there, once, and the two crates that link
+    /// wasmtime inherit them (`wasmtime.workspace = true`).
+    const WORKSPACE_MANIFEST: &str = include_str!("../../Cargo.toml");
+
+    /// What `manifest` says about EXACTLY `crate_name`: the text after the
+    /// name on its declaration line, in any spelling cargo allows —
+    /// `foo = "X.Y.Z"`, `foo = { version = "X.Y.Z", … }`,
+    /// `foo.workspace = true`, `foo = { workspace = true, … }`.
     ///
-    /// The match is exact because the prefix is consumed and the next
-    /// non-space character must be `=`: looking up `wasmtime` will not match
-    /// the `wasmtime-wasi` line (`-wasi = …` has no leading `=` left), and
-    /// looking up `wasmtime-wasi` will not match `wasmtime-wasi-http`. That
-    /// exactness is what lets the doc-table check resolve each family
-    /// member against its OWN pin instead of assuming they are equal.
-    fn declared_crate_version(manifest: &str, crate_name: &str) -> Option<String> {
+    /// The match is exact because the name is consumed and what follows must
+    /// be `=` or `.workspace`: looking up `wasmtime` will not match the
+    /// `wasmtime-wasi` line (`-wasi…` is neither), and looking up
+    /// `wasmtime-wasi` will not match `wasmtime-wasi-http`. That exactness is
+    /// what lets the doc-table check resolve each family member against its
+    /// OWN pin instead of assuming they are equal.
+    fn declaration_of<'a>(manifest: &'a str, crate_name: &str) -> Option<&'a str> {
         manifest.lines().find_map(|line| {
-            let rest = line.trim_start().strip_prefix(crate_name)?.trim_start();
-            let rest = rest.strip_prefix('=')?.trim_start();
-            // Bare-string form: `wasmtime-wasi = "47.0.3"`.
-            if let Some(after_quote) = rest.strip_prefix('"') {
-                let end = after_quote.find('"')?;
-                return Some(after_quote[..end].to_string());
-            }
-            // Inline-table form: `wasmtime = { version = "47.0.3", … }`.
-            let vstart = rest.find("version = \"")? + "version = \"".len();
-            let vend = rest[vstart..].find('"')? + vstart;
-            Some(rest[vstart..vend].to_string())
+            let rest = line.trim_start().strip_prefix(crate_name)?;
+            let rest = rest.trim_start();
+            (rest.starts_with('=') || rest.starts_with(".workspace")).then_some(rest)
         })
+    }
+
+    /// A version written on a declaration line, if it has one.
+    fn version_on(declaration: &str) -> Option<String> {
+        let rest = declaration.strip_prefix('=')?.trim_start();
+        // Bare-string form: `wasmtime-wasi = "47.0.3"`.
+        if let Some(after_quote) = rest.strip_prefix('"') {
+            let end = after_quote.find('"')?;
+            return Some(after_quote[..end].to_string());
+        }
+        // Inline-table form: `wasmtime = { version = "47.0.3", … }`.
+        let vstart = rest.find("version = \"")? + "version = \"".len();
+        let vend = rest[vstart..].find('"')? + vstart;
+        Some(rest[vstart..vend].to_string())
+    }
+
+    /// The pin in force for EXACTLY `crate_name` in a member's `manifest`:
+    /// its own version if it writes one, otherwise — when the line inherits —
+    /// the entry in the workspace manifest's `[workspace.dependencies]`.
+    ///
+    /// `None` when the member does not declare the crate at all, or inherits
+    /// an entry the workspace table does not have (cargo refuses that
+    /// manifest, so it cannot be built either).
+    fn declared_crate_version(manifest: &str, crate_name: &str) -> Option<String> {
+        let declaration = declaration_of(manifest, crate_name)?;
+        if let Some(own) = version_on(declaration) {
+            return Some(own);
+        }
+        let inherits =
+            declaration.starts_with(".workspace") || declaration.contains("workspace = true");
+        if !inherits {
+            return None;
+        }
+        let table = WORKSPACE_MANIFEST
+            .split("[workspace.dependencies]")
+            .nth(1)?
+            .split("\n[")
+            .next()?;
+        version_on(declaration_of(table, crate_name)?)
+    }
+
+    /// The parser above, on every spelling and on the near-miss names. It
+    /// reads manifests by text, and a text reader that stops matching says
+    /// nothing: when the workspace table took over the versions it returned
+    /// `None` for an inherited line, which is how this was found.
+    #[test]
+    fn a_declared_version_is_read_in_every_spelling() {
+        let member = "made-up-one-two = \"1.2.3\"\n\
+                      made-up-one = { version = \"4.5.6\", features = [\"x\"] }\n\
+                      serde.workspace = true\n\
+                      tokio = { workspace = true, features = [\"rt\"] }\n\
+                      other = { path = \"../other\" }\n";
+        assert_eq!(
+            declared_crate_version(member, "made-up-one-two").as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            declared_crate_version(member, "made-up-one").as_deref(),
+            Some("4.5.6")
+        );
+        // A prefix of a declared name is not that name.
+        assert_eq!(declared_crate_version(member, "made-up"), None);
+        // Inherited, in both spellings: the workspace table answers, and it
+        // answers with a real version.
+        for inherited in ["serde", "tokio"] {
+            let version = declared_crate_version(member, inherited)
+                .unwrap_or_else(|| panic!("{inherited} inherits from the workspace table"));
+            assert!(
+                version.chars().next().is_some_and(|c| c.is_ascii_digit()),
+                "{inherited}: {version}"
+            );
+        }
+        // A path dependency has no version, and an absent crate has no line.
+        assert_eq!(declared_crate_version(member, "other"), None);
+        assert_eq!(declared_crate_version(member, "absent"), None);
     }
 
     /// [`declared_crate_version`] for the base `wasmtime` crate, which every
@@ -1019,8 +1092,11 @@ mod aot_hmac_input_tests {
     /// … `// 5.` markers in the body:
     ///
     ///   1. `wasmtime_version!` (the single source) == the version declared
-    ///      in `talos-worker-runtime/Cargo.toml`, which is the manifest that
-    ///      actually determines which wasmtime this runtime links.
+    ///      for `talos-worker-runtime`, the crate that actually determines
+    ///      which wasmtime this runtime links. Since 2026-10-06 that crate
+    ///      inherits the version from the workspace table, so the number read
+    ///      is the table's; a crate that went back to its own version would
+    ///      be read from its own line.
     ///   2. `worker/Cargo.toml` declares the same version. Note what that
     ///      manifest's wasmtime entry actually is: a DEV-dependency, so
     ///      `worker/tests/` can build guest fixtures and poke the engine
@@ -1214,6 +1290,7 @@ mod aot_hmac_input_tests {
                     return None;
                 }
                 let name = l.split('=').next()?.trim();
+                let name = name.strip_suffix(".workspace").unwrap_or(name);
                 name.starts_with("wasmtime").then_some(name)
             })
             .collect();
