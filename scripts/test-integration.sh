@@ -157,7 +157,13 @@ export TALOS_TEST_RUN_ID
 # Printed once, before the container is removed; never fails the run:
 # statements of 3 s or more, refusals to clone the template, sessions of 3 s
 # or more on the template (talos_ctl), each backend a barrier waited on — and
-# everything that backend logged.
+# everything that backend logged — and every login Postgres gave up on (at
+# 5 s the wait ends before its first "still waiting" message, so the timed-out
+# login is the only trace the blocking backend leaves).
+#
+# RESULT (run 37470470739): with the 5 s timeout the stall occurred once and
+# its two drops took 4.94 and 5.04 s, where they had taken 60. The stall lasts
+# as long as Postgres waits on a login.
 PG_REPORT_ARMED=""
 report_postgres_waits() {
     [ -n "$PG_REPORT_ARMED" ] || return 0
@@ -184,7 +190,7 @@ for pid, (count, first, last, waiters) in blockers.items():
 for l in lines:
     if wait.search(l):
         continue
-    keep = bool(re.search(r"duration: \d+|being accessed by other users|other sessions? using|acquired \w+Lock", l))
+    keep = bool(re.search(r"duration: \d+|being accessed by other users|other sessions? using|acquired \w+Lock|canceling authentication due to timeout", l))
     pid = re.search(r" \[(\d+)\] ", l)
     if pid and pid.group(1) in blockers:
         keep = True
