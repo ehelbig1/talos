@@ -69,7 +69,7 @@ talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils
 proptest = "1.5"
 # Microbenchmarks for the scheduler — see `benches/scheduler.rs`. Kept
 # in default features (no html_reports) so cargo bench stays minimal.
-criterion = { version = "0.5", default-features = false }
+criterion = { version = "0.8", default-features = false }
 # `tokio_util::sync::CancellationToken` re-exported here so the
 # integration tests can construct one without re-declaring the dep.
 tokio-util = { version = "0.7", default-features = false }
