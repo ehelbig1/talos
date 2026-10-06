@@ -99,9 +99,18 @@ fn get_grace_cache() -> &'static DashMap<String, (String, Instant)> {
 /// token equals the presented `cookie` (constant-time)? This is the binding the
 /// bare "header in cache" check used to skip.
 fn grace_admits(cookie: &str, header: &str) -> bool {
-    get_grace_cache().get(header).is_some_and(|entry| {
-        constant_time_eq::constant_time_eq(cookie.as_bytes(), entry.0.as_bytes())
-    })
+    get_grace_cache()
+        .get(header)
+        .is_some_and(|entry| tokens_match(cookie, &entry.0))
+}
+
+/// Whether two CSRF token strings are equal, compared in constant time
+/// (`subtle`, the comparison every other token and MAC check in the workspace
+/// uses). Tokens of different lengths are unequal; the lengths are not secret.
+/// The one comparison all three checks in this file go through.
+fn tokens_match(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 /// MCP-1145: gated insert into the rotation grace cache. When at-cap,
@@ -311,8 +320,7 @@ async fn double_submit(
                     "CSRF token validation failed".to_string(),
                 ));
             }
-            let matches_current =
-                constant_time_eq::constant_time_eq(cookie.as_bytes(), header.as_bytes());
+            let matches_current = tokens_match(&cookie, &header);
             let matches_grace = !matches_current && grace_admits(&cookie, &header);
 
             if matches_current || matches_grace {
@@ -485,8 +493,7 @@ pub async fn csrf_protection_graphql(
                     "CSRF token validation failed".to_string(),
                 ));
             }
-            let matches_current =
-                constant_time_eq::constant_time_eq(cookie.as_bytes(), header.as_bytes());
+            let matches_current = tokens_match(&cookie, &header);
             let matches_grace = !matches_current && grace_admits(&cookie, &header);
 
             if matches_current || matches_grace {
@@ -661,6 +668,20 @@ mod tests {
             ApiKeyExemption::Honoured,
             &HeaderMap::new()
         ));
+    }
+
+    #[test]
+    fn tokens_match_only_when_every_byte_matches() {
+        assert!(tokens_match("abcdef0123456789", "abcdef0123456789"));
+        // One byte, at either end and in the middle.
+        assert!(!tokens_match("abcdef0123456789", "abcdef0123456788"));
+        assert!(!tokens_match("abcdef0123456789", "bbcdef0123456789"));
+        assert!(!tokens_match("abcdef0123456789", "abcdef0x23456789"));
+        // A prefix, an extension, and nothing at all.
+        assert!(!tokens_match("abcdef0123456789", "abcdef01"));
+        assert!(!tokens_match("abcdef01", "abcdef0123456789"));
+        assert!(!tokens_match("abcdef0123456789", ""));
+        assert!(!tokens_match("", "abcdef0123456789"));
     }
 
     #[test]

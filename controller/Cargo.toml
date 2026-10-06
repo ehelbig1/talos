@@ -170,7 +170,6 @@ aes-gcm = "0.10"
 hex = "0.4"
 hmac = "0.12"
 base64 = "0.22"
-constant_time_eq = "0.3"  # Constant-time comparison for cryptographic tokens
 subtle = "2.4"  # Constant‑time equality (used for HMAC verification)
 
 # Authentication
