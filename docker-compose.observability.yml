@@ -131,7 +131,7 @@ services:
   # JAEGER - Distributed Tracing
   # ========================================================================
   jaeger:
-    image: jaegertracing/all-in-one:1.52@sha256:7885400a153ac908d8bfbf72c27e3389dbab1942a35dd0ce3228611dc48cbf9f
+    image: jaegertracing/all-in-one:1.60@sha256:4fd2d70fa347d6a47e79fcb06b1c177e6079f92cba88b083153d56263082135e
     container_name: talos-jaeger
     restart: unless-stopped
     ports:

@@ -1577,7 +1577,7 @@ services:
 
   # Jaeger - Distributed Tracing
   jaeger:
-    image: jaegertracing/all-in-one:1.50@sha256:d589499a01e1e2f9d302db8e210af09688076fd8a93278fa024824a755c1a0f1
+    image: jaegertracing/all-in-one:1.60@sha256:4fd2d70fa347d6a47e79fcb06b1c177e6079f92cba88b083153d56263082135e
     container_name: talos-jaeger
     # Storage is bounded AHEAD of use, not because of it. Nothing in this stack
     # sends traces here today (see the `JAEGER_ENDPOINT` prohibition on the
