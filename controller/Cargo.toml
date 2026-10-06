@@ -1,11 +1,14 @@
 [package]
 name = "controller"
+# not-inherited: the controller's release number, part of the build version it
+# reports. scripts/release.sh reads the next line; keep it a bare assignment.
 version = "1.0.0-r306"
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
 # Internal workspace crate — not published to crates.io. License set so
 # cargo-deny's unlicensed-crate check passes; no third-party distribution.
-publish = false
-license = "MIT OR Apache-2.0"
+publish.workspace = true
+license.workspace = true
 
 [dependencies]
 talos-local-inference = { path = "../talos-local-inference" }

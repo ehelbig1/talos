@@ -330,8 +330,10 @@ fi
 say "Pre-flight checks"
 
 # 1. Cargo.toml version matches.
+# Only the quoted value: the old pattern kept anything after the closing quote
+# (a trailing comment) and reported it as part of the version.
 cargo_version=$(grep -E '^version = ' "$REPO_ROOT/controller/Cargo.toml" \
-    | head -1 | sed -E 's/version = "(.+)"/\1/')
+    | head -1 | sed -E 's/^version = "([^"]+)".*$/\1/')
 if [ "$cargo_version" != "$VERSION" ]; then
     err "controller/Cargo.toml version is '$cargo_version' but you asked for '$VERSION'"
     err "  Bump Cargo.toml first (or pass the matching VERSION)."

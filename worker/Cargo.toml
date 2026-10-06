@@ -1,12 +1,13 @@
 [package]
 name = "worker"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 # Internal workspace crate — not published to crates.io. Set `publish = false`
 # + a license string so cargo-deny's unlicensed-crate check passes without
 # requiring legal review for code that never leaves this repo.
-publish = false
-license = "MIT OR Apache-2.0"
+publish.workspace = true
+license.workspace = true
 
 # The deployable worker BINARY. The library half (wasmtime WASM host:
 # TalosRuntime, TalosContext, host/ modules, module_fetcher, sql_validator,

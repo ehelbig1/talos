@@ -28,3 +28,6 @@ uuid.workspace = true
 [dev-dependencies]
 # `connect_lazy` needs a runtime; the tests touch no database.
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

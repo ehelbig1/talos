@@ -1,3 +1,7 @@
+// This crate cannot inherit the workspace's lint table (its Cargo.toml says
+// why), so the one workspace rule that is a safety rule is stated here.
+#![forbid(unsafe_code)]
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, FnArg, ItemFn, PatType};

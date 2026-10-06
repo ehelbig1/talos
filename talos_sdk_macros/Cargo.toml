@@ -13,6 +13,10 @@ syn = { version = "2.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"
 
+# lints-not-inherited: see below; `src/lib.rs` forbids unsafe code itself.
+# package-not-inherited: the same reason — outside the workspace there is no
+# [workspace.package] to inherit from.
+#
 # Intentionally NOT inheriting [lints] from workspace.
 # This crate is shipped to production as a standalone path-dep at
 # /app/talos_sdk_macros (see controller/Dockerfile, line 121). When the

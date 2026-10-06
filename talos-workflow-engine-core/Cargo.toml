@@ -1,3 +1,8 @@
+# package-not-inherited: one of the five engine crates, written to be published
+# on their own (see `repository` below): its version, minimum Rust, edition
+# and licence are its own statements, not the workspace's.
+# lints-not-inherited: its own, stricter table ([lints.rust] forbids unsafe
+# code; [lints.clippy] turns on pedantic).
 [package]
 name = "talos-workflow-engine-core"
 version = "0.3.0"
