@@ -59,6 +59,10 @@ mod local_egress_literal_tests;
 #[cfg(test)]
 mod sse_connect_failure_tests;
 
+/// The dev-only private-target opt-in at each host-function pre-check, stated
+/// on the context instead of set in the process environment (2026-10-06).
+#[cfg(test)]
+mod dev_egress_gate_tests;
 /// `fetch` / `fetch_all` admission, pinned per refusal across the extraction
 /// into `egress_admission`.
 #[cfg(test)]

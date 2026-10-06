@@ -1,6 +1,6 @@
 use crate::bindings::talos::core::crypto::{self as wit_crypto};
 use crate::bindings::talos::core::http::{self as wit_http, Host};
-use crate::context::TalosContext;
+use crate::context::{DevEgressOptIns, TalosContext};
 use crate::wit_inspector::CapabilityWorld;
 use std::collections::HashMap;
 use talos_workflow_job_protocol::LlmTier;
@@ -427,10 +427,8 @@ async fn spawn_loopback_capture_server() -> (u16, tokio::task::JoinHandle<String
 /// header value and body stand in for resolved secrets here.
 #[tokio::test]
 async fn a_real_response_is_captured_and_the_request_is_not() {
-    // Same dev-only loopback setup as the test below; nextest runs each test
-    // in its own process, so the variables are this test's alone.
-    std::env::set_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS", "1");
-    std::env::set_var("WASM_ALLOW_INSECURE_HTTP", "1");
+    // Same dev-only loopback setup as the test below, stated on this context
+    // alone (`with_dev_egress`) rather than set in the process environment.
     let (port, server) = spawn_loopback_capture_server().await;
 
     let mut ctx = TalosContext::new(
@@ -447,7 +445,8 @@ async fn a_real_response_is_captured_and_the_request_is_not() {
         LlmTier::default(),
         None,
     )
-    .unwrap();
+    .unwrap()
+    .with_dev_egress(DevEgressOptIns::LOOPBACK);
     let capture = std::sync::Arc::new(crate::http_replay::HttpCapture::new());
     ctx.http_capture = Some(capture.clone());
 
@@ -520,13 +519,12 @@ async fn a_real_response_is_captured_and_the_request_is_not() {
 /// and asserts the wire header is exactly `Bearer <token>` (single prefix).
 #[tokio::test]
 async fn fetch_with_bearer_sends_single_bearer_prefix() {
-    // The loopback target is a private IP; the per-execution SSRF resolver
-    // would block it without this dev-only bypass. nextest runs each test in
-    // its own process, so the env var is isolated to this test.
-    std::env::set_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS", "1");
-    // The loopback server speaks plaintext HTTP; opt into insecure outbound
-    // so the scheme gate doesn't reject it before we reach fetch_with_bearer.
-    std::env::set_var("WASM_ALLOW_INSECURE_HTTP", "1");
+    // The loopback target is a private IP, which the per-execution SSRF
+    // resolver blocks without the dev-only private-target opt-in, and the
+    // loopback server speaks plaintext HTTP, which the scheme gate rejects
+    // without the insecure-HTTP opt-in. Both are stated on THIS context
+    // (`with_dev_egress` below). They used to be set in the process
+    // environment, where under plain `cargo test` every other test saw them.
 
     let (port, server) = spawn_loopback_capture_server().await;
 
@@ -539,7 +537,7 @@ async fn fetch_with_bearer_sends_single_bearer_prefix() {
         // host-entry `denied_ip_literal` gate unconditionally blocks private
         // IP literals, but a hostname is checked at connect time by the
         // per-execution SSRF resolver — which DOES honour the
-        // WORKER_ALLOW_PRIVATE_HOST_TARGETS bypass when the host is in this
+        // private-target opt-in when the host is in this
         // explicit allowlist (no `*`). So `localhost` reaches the loopback
         // server while still exercising the real fetch_with_bearer path.
         vec!["localhost".to_string()],
@@ -557,7 +555,8 @@ async fn fetch_with_bearer_sends_single_bearer_prefix() {
         LlmTier::default(),
         None,
     )
-    .unwrap();
+    .unwrap()
+    .with_dev_egress(DevEgressOptIns::LOOPBACK);
 
     // Grant the secret path — an empty allowlist is deny-all, so without
     // this grant get_secret returns Unauthorized. `test/token` is NOT a
@@ -609,9 +608,6 @@ async fn fetch_with_bearer_sends_single_bearer_prefix() {
         !captured.contains("Bearer Bearer"),
         "request must NOT contain a doubled `Bearer Bearer` prefix (the 401 bug)"
     );
-
-    std::env::remove_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS");
-    std::env::remove_var("WASM_ALLOW_INSECURE_HTTP");
 }
 
 /// Regression for the local-LLM SSRF-bypass fix: the dedicated
@@ -712,11 +708,12 @@ async fn denied_fetch_lands_in_the_in_process_diagnostic_sink() {
 /// the two were conflated in a prior diagnosis: the SSRF guard sits BELOW
 /// the scheme gate in `wit_http::fetch`, so a plaintext loopback URL is
 /// refused for its scheme and its IP is never classified at all. Asserted
-/// at the classifier rather than through `fetch` deliberately —
-/// `WASM_ALLOW_INSECURE_HTTP` is process-global and a sibling test in this
-/// binary sets it, so a fetch-level assertion here would be order-dependent
-/// under plain `cargo test` (CI's nextest isolates by process; contributors'
-/// `cargo test` does not).
+/// at the classifier rather than through `fetch`: when this was written
+/// `WASM_ALLOW_INSECURE_HTTP` was read from the process environment per call
+/// and a sibling test in this binary set it, so a fetch-level assertion was
+/// order-dependent under plain `cargo test`. No test sets it any more (the
+/// opt-in is stated per context, `with_dev_egress`); the classifier-level
+/// assertion stays because it is the narrower statement of the same fact.
 #[test]
 fn loopback_http_probe_is_refused_by_the_scheme_gate_not_the_ssrf_guard() {
     use crate::host::egress::{classify_url_scheme, UrlSchemeVerdict};
@@ -803,10 +800,8 @@ async fn spawn_loopback_bulk_server(body_len: usize, conns: usize) -> u16 {
 /// and at least one full-size entry still gets through.
 #[tokio::test]
 async fn fetch_all_holds_at_most_one_call_budget_of_response_bytes() {
-    // Same dev-only loopback bypass as `fetch_with_bearer_sends_single_bearer_prefix`
-    // (nextest isolates each test in its own process).
-    std::env::set_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS", "1");
-    std::env::set_var("WASM_ALLOW_INSECURE_HTTP", "1");
+    // Same dev-only loopback opt-ins as `fetch_with_bearer_sends_single_bearer_prefix`,
+    // stated on this context.
     const BODY: usize = 8 * 1024 * 1024;
     const ENTRIES: usize = 8;
     let port = spawn_loopback_bulk_server(BODY, ENTRIES).await;
@@ -825,7 +820,8 @@ async fn fetch_all_holds_at_most_one_call_budget_of_response_bytes() {
         LlmTier::default(),
         None,
     )
-    .unwrap();
+    .unwrap()
+    .with_dev_egress(DevEgressOptIns::LOOPBACK);
     let reqs = (0..ENTRIES)
         .map(|i| wit_http::Request {
             method: wit_http::Method::Get,

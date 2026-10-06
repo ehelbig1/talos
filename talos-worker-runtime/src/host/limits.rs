@@ -491,9 +491,11 @@ pub(crate) const MAX_INBOUND_HEADER_VALUE_BYTES: usize = 16 * 1024;
 ///    point it at internal IPs. This flag trusts that explicitly-listed
 ///    hostnames have stable, operator-controlled DNS.
 ///
-/// Read per call (an env lookup), and read by BOTH the host-fn pre-checks
-/// and the connect-time `SsrfFilteringResolver` through this one function,
-/// so the two layers cannot disagree. Warns once per process.
+/// Read ONCE per execution, by `TalosContext::new` (through
+/// `DevEgressOptIns::from_env`), which hands the answer to the connect-time
+/// `SsrfFilteringResolver` and keeps it on the context for the host-fn
+/// pre-checks — one value per execution, so the two layers cannot disagree.
+/// Nothing else calls this. Warns once per process.
 // MCP-1060 (2026-05-15): routed through the canonical
 // `bool_env_or_default` helper rather than an inline `matches!` copy.
 // This site originally accepted `1 | true | yes | on` — the canonical
@@ -545,16 +547,34 @@ pub(crate) fn host_explicitly_allowed(allowed_hosts: &[String], host: &str) -> b
         .any(|p| p.trim_end_matches('.').eq_ignore_ascii_case(host))
 }
 
-/// The ONE reader of the private-host bypass for the host-function
-/// pre-checks: the env toggle (already refused in production by
+/// The ONE decision of the private-host bypass for the host-function
+/// pre-checks: the dev toggle as this execution's context holds it
+/// (`TalosContext::dev_egress`, already refused in production by
 /// [`allow_private_host_targets`]) AND an explicit allowlist entry.
-pub(crate) fn private_host_bypass_applies(allowed_hosts: &[String], host: &str) -> bool {
-    allow_private_host_targets() && host_explicitly_allowed(allowed_hosts, host)
+pub(crate) fn private_host_bypass_applies(
+    private_host_targets: bool,
+    allowed_hosts: &[String],
+    host: &str,
+) -> bool {
+    private_host_targets && host_explicitly_allowed(allowed_hosts, host)
 }
 
 #[cfg(test)]
 mod private_host_bypass_tests {
-    use super::host_explicitly_allowed;
+    use super::{host_explicitly_allowed, private_host_bypass_applies};
+
+    /// Both halves are required, and the toggle is an argument: nothing here
+    /// reads the environment.
+    #[test]
+    fn the_bypass_needs_the_toggle_and_an_explicit_entry() {
+        let explicit = vec!["localhost".to_string()];
+        let wildcard = vec!["*".to_string()];
+        assert!(private_host_bypass_applies(true, &explicit, "localhost"));
+        assert!(!private_host_bypass_applies(false, &explicit, "localhost"));
+        assert!(!private_host_bypass_applies(true, &explicit, "other.test"));
+        assert!(!private_host_bypass_applies(true, &wildcard, "localhost"));
+        assert!(!private_host_bypass_applies(true, &[], "localhost"));
+    }
 
     #[test]
     fn explicit_match_is_case_and_trailing_dot_insensitive() {

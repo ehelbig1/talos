@@ -340,6 +340,16 @@ pub struct TalosContext {
     ///   connect failures ARE the egress gate and must not be retried.
     pub(crate) local_egress_only: bool,
 
+    /// The two dev-only egress opt-ins this execution runs under, read from
+    /// the process environment ONCE, in [`Self::new`], and held here. Every
+    /// gate that consults either one reads this field, and the
+    /// [`crate::ssrf_resolver::SsrfFilteringResolver`] inside `http_client`
+    /// was built from the same value, so the pre-checks and the connect-time
+    /// filter cannot disagree about one execution. Read-only outside the
+    /// crate ([`Self::dev_egress`]): no caller can widen an execution's
+    /// egress by assigning to it.
+    pub(crate) dev_egress: DevEgressOptIns,
+
     /// Per-actor write ceiling — the mutation-permission gate. `ReadOnly`
     /// refuses every data-mutating host op (agent-memory writes, non-GET
     /// HTTP, DB execute, webhook/email/messaging sends, object-storage
@@ -962,6 +972,75 @@ impl Drop for StreamRegistry {
     }
 }
 
+/// The two dev-only egress opt-ins, as ONE execution sees them.
+///
+/// Both are process-wide operator settings (environment variables). They are
+/// read once per execution, when [`TalosContext::new`] builds the context, and
+/// carried on it from there: the host-function pre-checks read
+/// `TalosContext::dev_egress`, and the connect-time
+/// [`crate::ssrf_resolver::SsrfFilteringResolver`] is constructed with the
+/// same `private_host_targets` value. Until 2026-10-06 each gate read the
+/// environment itself, per call, which left a unit test no way to choose the
+/// setting except by mutating the process environment — and under plain
+/// `cargo test` (one process, many threads) a test that opted in changed the
+/// verdict of an egress-refusal test running beside it.
+///
+/// `Default` is both opt-ins off: the production posture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DevEgressOptIns {
+    /// `WORKER_ALLOW_PRIVATE_HOST_TARGETS`, with the production refusal
+    /// already applied ([`crate::host::allow_private_host_targets`]): a
+    /// hostname named EXPLICITLY in `allowed_hosts` may resolve to a private
+    /// address. Never widens a `*` allowlist or an IP literal.
+    pub private_host_targets: bool,
+    /// `WASM_ALLOW_INSECURE_HTTP`: plaintext `http://` is admitted by the
+    /// scheme gate (and logged as a deviation).
+    pub insecure_http: bool,
+}
+
+impl DevEgressOptIns {
+    /// Test posture for a plaintext loopback listener reached by the
+    /// `localhost` NAME: both opt-ins on.
+    #[cfg(test)]
+    pub(crate) const LOOPBACK: Self = Self {
+        private_host_targets: true,
+        insecure_http: true,
+    };
+
+    /// The process environment's answer. The ONE call site outside tests is
+    /// [`TalosContext::new`].
+    pub(crate) fn from_env() -> Self {
+        Self {
+            private_host_targets: crate::host::allow_private_host_targets(),
+            insecure_http: crate::host::insecure_http_opt_in(),
+        }
+    }
+}
+
+/// The two egress clients one execution owns: the hardened reqwest client and
+/// the `wasi:http` send hooks that share it. Built here for
+/// [`TalosContext::new`] and for the test-only
+/// [`TalosContext::with_dev_egress`], so a test that states its opt-ins runs
+/// the same construction a job does.
+fn build_egress_clients(
+    allowed_hosts: &[String],
+    local_egress_only: bool,
+    dev_egress: DevEgressOptIns,
+) -> (
+    reqwest::Client,
+    crate::host::wasi_http::HardenedWasiHttpHooks,
+) {
+    let http_client = build_per_execution_http_client(
+        allowed_hosts,
+        local_egress_only,
+        dev_egress.private_host_targets,
+    );
+    // The `wasi:http` send path shares THIS client, so a raw `wasi:http`
+    // request is filtered at connect exactly like `talos:core/http`.
+    let wasi_http_hooks = crate::host::wasi_http::HardenedWasiHttpHooks::new(http_client.clone());
+    (http_client, wasi_http_hooks)
+}
+
 /// Per-execution hardened reqwest client.
 ///
 /// Pulled into a free helper (rather than left inline in
@@ -992,6 +1071,7 @@ impl Drop for StreamRegistry {
 fn build_per_execution_http_client(
     allowed_hosts: &[String],
     local_egress_only: bool,
+    private_host_targets: bool,
 ) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("Talos-Worker/1.0")
@@ -1009,6 +1089,7 @@ fn build_per_execution_http_client(
             crate::ssrf_resolver::SsrfFilteringResolver::for_allowed_hosts(
                 allowed_hosts,
                 local_egress_only,
+                private_host_targets,
             ),
         ))
         .build()
@@ -1572,11 +1653,12 @@ impl TalosContext {
         // `egress_scope = Public` — reaching declared `allowed_hosts` like
         // Gmail while its LLM stays on-host. Fail-closed: an unset scope on a
         // Tier1 actor stays air-gapped exactly as before (byte-identical).
-        let http_client = build_per_execution_http_client(&allowed_hosts, local_egress_only);
-        // The `wasi:http` send path shares THIS client, so a raw `wasi:http`
-        // request is filtered at connect exactly like `talos:core/http`.
-        let wasi_http_hooks =
-            crate::host::wasi_http::HardenedWasiHttpHooks::new(http_client.clone());
+        //
+        // The dev-only opt-ins are read from the environment HERE, once, and
+        // the same value goes to the resolver and onto the context.
+        let dev_egress = DevEgressOptIns::from_env();
+        let (http_client, wasi_http_hooks) =
+            build_egress_clients(&allowed_hosts, local_egress_only, dev_egress);
 
         Ok(Self {
             wasi,
@@ -1725,6 +1807,8 @@ impl TalosContext {
             // `max_llm_tier` after `new()` with the identical value, so this
             // stays in agreement.
             local_egress_only,
+            // The value the resolver above was built with.
+            dev_egress,
             // Default `Write` (permissive) at construction; live dispatch
             // paths re-stamp this from the signed `JobRequest.max_write_ceiling`
             // right after `new()`, mirroring `max_llm_tier`. Tests / legacy
@@ -1733,6 +1817,27 @@ impl TalosContext {
             // `None` = inherit the ceiling above; see the field's docs.
             http_verb_ceiling: None,
         })
+    }
+
+    /// The dev-only egress opt-ins this execution was built with.
+    pub fn dev_egress(&self) -> DevEgressOptIns {
+        self.dev_egress
+    }
+
+    /// Test-only: run this context under STATED dev-only opt-ins instead of
+    /// the process environment's, rebuilding the two egress clients through
+    /// the function [`Self::new`] uses. A test that needs a loopback target
+    /// opts in here; a test whose verdict is a refusal can pin both off. No
+    /// test in this binary sets either environment variable — the one test
+    /// that does (`tests/dev_egress_env.rs`) is a process of its own.
+    #[cfg(test)]
+    pub(crate) fn with_dev_egress(mut self, dev_egress: DevEgressOptIns) -> Self {
+        let (http_client, wasi_http_hooks) =
+            build_egress_clients(&self.allowed_hosts, self.local_egress_only, dev_egress);
+        self.http_client = http_client;
+        self.wasi_http_hooks = wasi_http_hooks;
+        self.dev_egress = dev_egress;
+        self
     }
 
     /// Read the bytes written to WASI stderr during this execution.

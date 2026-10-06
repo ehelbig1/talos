@@ -97,7 +97,7 @@ impl crate::context::TalosContext {
             allowed_hosts: &self.allowed_hosts,
             max_llm_tier: self.max_llm_tier,
             local_egress_only: self.local_egress_only,
-            insecure_http_opt_in: super::egress::insecure_http_opt_in(),
+            insecure_http_opt_in: self.dev_egress.insecure_http,
         }
     }
 }

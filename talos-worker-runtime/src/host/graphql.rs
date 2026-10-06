@@ -1000,7 +1000,7 @@ impl TalosContext {
             // dedicated insecure-scheme variant; `Networkerror` is the
             // mapping used for every URL-validation failure on this
             // path (matches the empty-allowlist arm below).
-            match classify_url_scheme(parsed.scheme(), insecure_http_opt_in()) {
+            match classify_url_scheme(parsed.scheme(), self.dev_egress.insecure_http) {
                 UrlSchemeVerdict::Https => {}
                 UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
                     tracing::warn!(

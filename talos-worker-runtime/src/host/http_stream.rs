@@ -312,7 +312,7 @@ impl wit_http_stream::Host for TalosContext {
         // wins ANY secret rotated through `vault://` headers for the
         // life of the connection — strictly worse than a one-shot
         // fetch. Operator opt-in via `WASM_ALLOW_INSECURE_HTTP=1`.
-        match classify_url_scheme(parsed.scheme(), insecure_http_opt_in()) {
+        match classify_url_scheme(parsed.scheme(), self.dev_egress.insecure_http) {
             UrlSchemeVerdict::Https => {}
             UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
                 tracing::warn!(

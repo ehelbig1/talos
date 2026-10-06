@@ -362,17 +362,20 @@ async fn a_tier1_graphql_egress_refusal_is_non_transient() {
 /// to be free to repeat against a host the module could not even reach). So
 /// the request must clear every one of them to reach the refusal under test:
 /// POST granted, the host named explicitly, and DNS validation passed through
-/// the dev-only private-target bypass (nextest runs each test in its own
-/// process, as `fetch_with_bearer_sends_single_bearer_prefix` relies on too).
+/// the dev-only private-target bypass — stated on this context, not set in the
+/// process environment, where every other test in the binary would see it.
 #[tokio::test]
 async fn a_blocked_graphql_introspection_gets_its_own_class() {
-    std::env::set_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS", "1");
     let mut ctx = ctx_full(
         CapabilityWorld::Http,
         vec!["ex.test".to_string()],
         vec!["POST".to_string()],
         LlmTier::Tier1,
-    );
+    )
+    .with_dev_egress(crate::context::DevEgressOptIns {
+        private_host_targets: true,
+        insecure_http: false,
+    });
     let mut req = gql("https://ex.test/g");
     req.query = "{ __schema { types { name } } }".to_string();
     let out = <TalosContext as wit_graphql::Host>::execute(&mut ctx, req).await;

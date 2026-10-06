@@ -207,8 +207,8 @@ fn cancelled_is_declared_non_transient() {
 //
 // Historically `fetch_all` read a process-global `LazyLock` over
 // `WORKER_ALLOW_PRIVATE_HOST_TARGETS` that froze on first read and could break
-// the bearer test under plain `cargo test`. The toggle is now read per call
-// (`host::allow_private_host_targets`), but the cancelled direction — where the
+// the bearer test under plain `cargo test`. The toggle is now read once per
+// context (`TalosContext::dev_egress`), but the cancelled direction — where the
 // guard returns BEFORE any egress — remains the only one taken here, so these
 // tests stay network-free.
 // ---------------------------------------------------------------------------
