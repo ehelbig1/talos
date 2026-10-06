@@ -309,3 +309,68 @@ async fn test_csrf_missing_cookie_is_rejected() {
         "missing cookie should be rejected"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The comparison itself, at both middlewares. The mismatch test above uses
+// tokens of different lengths, which a comparison of lengths alone would also
+// refuse; these differ in one byte, the last.
+// ---------------------------------------------------------------------------
+
+const TOKEN: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+const TOKEN_LAST_BYTE_DIFFERS: &str =
+    "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f91";
+
+async fn post_with_tokens(app: Router, uri: &str, cookie: &str, header_token: &str) -> StatusCode {
+    app.oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::COOKIE, format!("talos_csrf_token={cookie}"))
+            .header("X-CSRF-Token", header_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(AxumBody::from(
+                r#"{"query": "mutation { doSomething { id } }"}"#,
+            ))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .status()
+}
+
+fn graphql_app() -> Router {
+    Router::new()
+        .route("/graphql", post(|| async { "GRAPHQL OK" }))
+        .layer(from_fn(csrf_protection_graphql))
+        .layer(CookieManagerLayer::new())
+}
+
+#[tokio::test]
+async fn a_token_differing_in_its_last_byte_is_rejected_by_both_middlewares() {
+    assert_eq!(TOKEN.len(), TOKEN_LAST_BYTE_DIFFERS.len());
+    assert_eq!(
+        post_with_tokens(setup_app().await, "/mutate", TOKEN, TOKEN_LAST_BYTE_DIFFERS).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_with_tokens(graphql_app(), "/graphql", TOKEN, TOKEN_LAST_BYTE_DIFFERS).await,
+        StatusCode::FORBIDDEN
+    );
+    // A proper prefix of the token is not the token.
+    assert_eq!(
+        post_with_tokens(graphql_app(), "/graphql", TOKEN, &TOKEN[..32]).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn equal_tokens_pass_both_middlewares() {
+    assert_eq!(
+        post_with_tokens(setup_app().await, "/mutate", TOKEN, TOKEN).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_with_tokens(graphql_app(), "/graphql", TOKEN, TOKEN).await,
+        StatusCode::OK
+    );
+}

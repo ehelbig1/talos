@@ -8,11 +8,11 @@ publish.workspace = true
 
 [dependencies]
 axum = { version = "0.8", features = ["json"] }
-constant_time_eq = "0.3"
 dashmap = "6.1"
 hex = "0.4"
 rand = { version = "0.8", default-features = true, features = ["std"] }
 serde_json.workspace = true
+subtle = "2.4"
 talos-config = { path = "../talos-config" }
 talos-auth-types = { path = "../talos-auth-types" }
 tower-cookies = "0.11"

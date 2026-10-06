@@ -16,7 +16,6 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 chrono.workspace = true
-constant_time_eq = "0.3"
 dashmap = "6.1"
 hmac = "0.12"
 sha2 = "0.10"
