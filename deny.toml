@@ -48,6 +48,15 @@ exclude-dev = true
 # `db-path` and `db-urls` left defaults (~/.cargo/advisory-dbs).
 version = 2
 yanked = "deny"
+# Unsoundness advisories are reported for EVERY crate in the tree, not only
+# the workspace's direct dependencies (cargo-deny's default). Measured
+# 2026-10-06: once our own `lru` declaration moved to a patched release, the
+# default scope stopped reporting the affected copy `async-graphql` still
+# links — the gate went quiet about a crate that is still there. With "all"
+# it stays visible (and excepted, with its reachability argument, below), and
+# the one further finding — `event-listener` 5.4.1, RUSTSEC-2026-0221 — was a
+# patch release away.
+unsound = "all"
 ignore = [
     # --- Transitive vulnerabilities in unused / unreachable code paths ---
     #
@@ -159,33 +168,28 @@ stays linked in the internal list, so a later eviction writes to freed
 memory (CWE-416 / CWE-415).
 
 Reachability — the trigger is specifically a panicking `Drop` ON THE
-KEY, so the key TYPE decides it. Every path in this tree stores keys
-that cannot panic on drop:
-  * talos-audit-ledger/src/lib.rs:293 — our ONLY direct use —
-    `LruCache<Uuid, SdkTracerProvider>`. `Uuid` is `Copy` with a
-    trivial drop.
+KEY, so the key TYPE decides it. ONE path in this tree still links an
+affected version (lru 0.16.4), and its keys cannot panic on drop:
   * async-graphql 7.2.1 — `LruCache<String, ExecutableDocument>`
     (persisted queries) and a generic dataloader cache whose keys in
     Talos are `Uuid`/`String`. `String`'s drop frees a buffer; it does
     not panic.
-  * aws-sdk-s3 1.119 (via lru 0.12.5) — internal endpoint cache,
-    string-keyed.
 A panicking `Drop` on a key is not something Talos can introduce
 accidentally: it would require writing a custom key type with a
 panicking `Drop` impl. If a future cache does that, this exemption is
 void — that is the condition to re-check, not the version number.
 
-Why not simply upgrade: the fix is lru >=0.18.2, but the affected
-versions are pinned by two INDEPENDENT upstreams we do not control —
-`async-graphql` 7.2.1 requires `^0.16.2` and `aws-sdk-s3` 1.119 pulls
-0.12.5. Bumping our own declarations cannot remove either, so it would
-add a THIRD lru version to the tree without clearing the advisory.
+Why not simply upgrade: the fix is lru >=0.18.2, and `async-graphql`
+7.2.1 requires `^0.16.2`, which we do not control.
 
-Done anyway as defence in depth: `controller`'s `lru` declaration was
-removed outright — it had ZERO usages (vestigial after the workspace
-decomposition), so the crate no longer links lru at all.
+What changed 2026-10-06: the other two paths are gone. `aws-sdk-s3`
+moved 1.119 -> 1.152 (it pulled lru 0.12.5; it now pulls 0.18.5), and
+`talos-audit-ledger` — our only direct use,
+`LruCache<Uuid, SdkTracerProvider>` — declares `lru = "0.18"` and
+shares that copy. `controller`'s own `lru` declaration had already been
+removed (zero usages).
 
-Re-review 2026-Q4, or when async-graphql/aws-sdk-s3 ship releases on
+Re-review 2026-Q4, or when async-graphql ships a release on
 lru >=0.18.2 — at which point this entry should be DELETED, not bumped.
 """ },
 
