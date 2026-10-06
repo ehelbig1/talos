@@ -135,15 +135,29 @@ TALOS_TEST_RUN_ID="it-$$-$(date +%s)"
 export TALOS_TEST_RUN_ID
 
 # ── What Postgres waited on ────────────────────────────────────────────────
-# Measured 2026-10-06 on two runs: four controller test binaries that take
-# 1–3 seconds took 60.6–62.0 in one run and not the other — every test in the
-# binary blocked from its first line for a minute, then passed. Different
-# binaries each time, two per run, so about two minutes land on shards at
-# random. Nothing on the client side accounts for it, so the server is asked:
-# it logs statements of 3 s or more, lock waits, and every session, and this
-# prints the slow statements, any refusal to clone the template, and the
-# sessions that stayed on the template (talos_ctl) for 3 s or more. Printed
-# once, before the container is removed; never fails the run.
+# Measured 2026-10-06: a controller test binary that takes 1–3 seconds took
+# 60–62, every test in it blocked for a minute and then passing; different
+# binaries each run, two or three per run, on shards at random. This report
+# found it on its first run (37468293253, three shards): the harness's
+# `DROP DATABASE … WITH (FORCE)` took 60.0–60.3 s, Postgres logging every 5 s
+# that it was "still waiting for backend with PID N to accept
+# ProcSignalBarrier".
+#
+# 60 s is Postgres's default `authentication_timeout`, and the reading that
+# fits is a deadlock: the harness drops the database from `Drop`, blocking the
+# test's only runtime thread until the drop returns; a connection the test's
+# pool was still opening is then frozen mid-login; the drop needs every
+# backend to accept a barrier, and a backend waiting on its client's login
+# does not. Only the login timeout ends it. That reading is NOT yet proven —
+# so the server above runs with `authentication_timeout=5s`, which both tests
+# it (the stall should become about 5 s, and the backend named below should
+# end with "canceling authentication due to timeout") and takes most of the
+# cost away if it is right.
+#
+# Printed once, before the container is removed; never fails the run:
+# statements of 3 s or more, refusals to clone the template, sessions of 3 s
+# or more on the template (talos_ctl), each backend a barrier waited on — and
+# everything that backend logged.
 PG_REPORT_ARMED=""
 report_postgres_waits() {
     [ -n "$PG_REPORT_ARMED" ] || return 0
@@ -151,20 +165,36 @@ report_postgres_waits() {
     local log
     log="$(docker logs "$PG_NAME" 2>&1)" || return 0
     echo
-    echo "▶ postgres: statements of 3 s or more, template contention, long sessions on the template"
+    echo "▶ postgres: statements of 3 s or more, template contention, barrier waits"
     printf '%s\n' "$log" | python3 -c '
 import re, sys
+lines = [l.rstrip("\n") for l in sys.stdin]
+wait = re.compile(r"\[(\d+)\] .*still waiting for backend with PID (\d+) to accept ProcSignalBarrier")
+blockers = {}
+for l in lines:
+    m = wait.search(l)
+    if m:
+        b = blockers.setdefault(m.group(2), [0, l[:23], l[:23], set()])
+        b[0] += 1
+        b[2] = l[:23]
+        b[3].add(m.group(1))
 shown = 0
-for line in sys.stdin:
-    line = line.rstrip("\n")
-    keep = bool(re.search(r"duration: \d+|being accessed by other users|other sessions? using|still waiting for|acquired \w+Lock", line))
-    m = re.search(r"db=talos_ctl .*disconnection: session time: (\d+):(\d+):([\d.]+)", line)
+for pid, (count, first, last, waiters) in blockers.items():
+    print(f"  backend {pid} did not accept a ProcSignalBarrier from {first} to {last}: {count} wait message(s) from {len(waiters)} session(s)")
+for l in lines:
+    if wait.search(l):
+        continue
+    keep = bool(re.search(r"duration: \d+|being accessed by other users|other sessions? using|acquired \w+Lock", l))
+    pid = re.search(r" \[(\d+)\] ", l)
+    if pid and pid.group(1) in blockers:
+        keep = True
+    m = re.search(r"db=talos_ctl .*disconnection: session time: (\d+):(\d+):([\d.]+)", l)
     if m and int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) >= 3:
         keep = True
     if keep and shown < 200:
-        print("  " + line[:300])
+        print("  " + l[:300])
         shown += 1
-print(f"  ({shown} line(s))")
+print(f"  ({len(blockers)} blocking backend(s), {shown} line(s))")
 ' || true
 }
 
@@ -209,7 +239,8 @@ docker run -d --rm --name "$PG_NAME" \
     -c shared_preload_libraries=pg_stat_statements \
     -c log_min_duration_statement=3000 -c log_lock_waits=on \
     -c log_connections=on -c log_disconnections=on \
-    -c "log_line_prefix=%m [%p] db=%d app=%a " >/dev/null
+    -c "log_line_prefix=%m [%p] db=%d app=%a " \
+    -c authentication_timeout=5s >/dev/null
 # NATS for the RFC 0010 P3 (D3b) claim-protocol integration tests (envelope-seal
 # responder↔worker handshake + the engine-nats full dispatch→claim→open loop).
 # `-js`: the audit-ledger stream-bound test (below) needs JetStream; the claim

@@ -169,21 +169,17 @@ alone, so the shards still partition the list exactly
   that as the item's cost.
 
 Each shard ends with **what Postgres waited on**: statements of 3 seconds or
-more, any refusal to clone the template database, and sessions that stayed
-on the template for 3 seconds or more. It is there to explain an
-intermittent stall measured on 2026-10-06 — a controller test binary that
-takes 1–3 seconds takes 60–62, every test in it blocked for a minute and
-then passing; different binaries each run, about two per run.
+more, any refusal to clone the template database, sessions of 3 seconds or
+more on the template, and each backend that held up a `ProcSignalBarrier`
+with everything it logged.
 
-A shard builds its controller test binaries in ONE `cargo test --no-run` call
-before it runs them one by one. Built one at a time they cost 3.0 seconds
-each — 7.0 minutes across 138 binaries, against 10.1 minutes of running
-their tests (run 37403154166).
-
-The unit tests are two jobs side by side: `Rust tests (unit / lib)` runs the
-library and binary unit tests, `Rust tests (DB-free binaries + doctests)` the
-`tests/` binaries that need no service, and the doctests. They were one job
-that did the two builds back to back.
+It exists for a stall measured on 2026-10-06: a controller test binary that
+takes 1–3 seconds takes 60–62, two or three per run on shards at random. The
+report showed the harness's `DROP DATABASE … WITH (FORCE)` waiting 60 seconds
+for one backend to accept a barrier. The disposable Postgres therefore runs
+with `authentication_timeout=5s` (60 s is the default): the reading is that
+the backend is a half-opened connection the blocked test runtime can never
+finish opening. See `docs/engineering-log/packages/2026-10-06-ci-test-jobs.md`.
 
 **Build once was measured and not done.** A `cargo nextest archive` shared
 between shards would carry ~150 integration binaries, each statically linked
