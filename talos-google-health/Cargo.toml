@@ -8,13 +8,13 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait = "0.1"
-axum = { version = "0.8", features = ["json"] }
+async-trait.workspace = true
+axum = { workspace = true, features = ["json"] }
 chrono.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde.workspace = true
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "chrono"] }
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }
@@ -22,9 +22,9 @@ talos-http-utils = { path = "../talos-http-utils" }
 talos-oauth = { path = "../talos-oauth" }
 talos-text-util = { path = "../talos-text-util" }
 tracing.workspace = true
-urlencoding = "2.1"
+urlencoding.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 # `connect_lazy` needs a runtime; the tests touch no database.
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt"] }

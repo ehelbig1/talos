@@ -8,12 +8,17 @@ why, and when the operator should bump.
 
 ## Current pin
 
-| Crate                | Version  | Pinned in                          |
-|----------------------|----------|------------------------------------|
-| `wasmtime`           | 49.0.2   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime-wasi`      | 49.0.2   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime-wasi-http` | 49.0.2   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime`           | 49.0.2   | `worker/Cargo.toml` (dev-dep)      |
+| Crate                | Version  | Pinned in                                  |
+|----------------------|----------|--------------------------------------------|
+| `wasmtime`           | 49.0.2   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime-wasi`      | 49.0.2   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime-wasi-http` | 49.0.2   | `Cargo.toml`, `[workspace.dependencies]`   |
+
+Since 2026-10-06 the three versions are declared once, in the workspace
+manifest. `talos-worker-runtime` (which links all three) and `worker` (whose
+tests use `wasmtime` as a dev-dependency) inherit them with
+`workspace = true`, so the two manifests can no longer name different
+versions.
 
 The runtime library (`TalosRuntime`, the engine config, the AOT cache) was
 extracted from `worker/` to `talos-worker-runtime/` in July 2026, so that
@@ -70,10 +75,10 @@ column is the version bumped *to*.
 
 ## Upgrade cadence
 
-* **Monthly.** Bump the version in `talos-worker-runtime/Cargo.toml` AND
-  `worker/Cargo.toml` together with the RustSec advisory DB snapshot in the
-  builder image. Both ride the monthly image rebuild that operators are
-  already doing.
+* **Monthly.** Bump the three versions in the root `Cargo.toml`'s
+  `[workspace.dependencies]` together with the RustSec advisory DB snapshot
+  in the builder image. Both ride the monthly image rebuild that operators
+  are already doing.
 
 * **Out-of-band.** Bump immediately on any wasmtime release that lists
   a CVE in the sandbox-escape, codegen (Cranelift), or component-model

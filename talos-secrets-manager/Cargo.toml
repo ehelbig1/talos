@@ -7,21 +7,21 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-async-trait = "0.1"
+async-trait.workspace = true
 talos-integration-state = { path = "../talos-integration-state" }
-aes-gcm = "0.10"
+aes-gcm.workspace = true
 anyhow.workspace = true
-base64 = "0.22"
+base64.workspace = true
 chrono.workspace = true
-dashmap = "6.1"
-hex = "0.4"
-hkdf = "0.12"
-rand = { version = "0.8", default-features = true, features = ["std"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dashmap.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+rand = { workspace = true, features = ["default", "std"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-db = { path = "../talos-db" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
@@ -32,15 +32,15 @@ talos-metrics = { path = "../talos-metrics" }
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 thiserror.workspace = true
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
-zeroize = "1.8"
+zeroize.workspace = true
 
 [dev-dependencies]
 # Mock Vault for the token-renewal tests (vault_token_renewal_tests.rs).
-axum = { version = "0.8", features = ["json"] }
-tokio = { version = "1", features = ["full"] }
+axum = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["full"] }
 
 [lints]
 workspace = true

@@ -8,8 +8,8 @@ publish.workspace = true
 
 [dependencies]
 # Kept in lockstep with talos-metrics / talos-task-supervision (prometheus 0.14).
-prometheus = "0.14"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+prometheus.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"] }
 tracing.workspace = true
 # The lease key is a `BackgroundTask`: a closed compile-time set, so neither the
 # table key nor the metric label can be a caller-authored string.

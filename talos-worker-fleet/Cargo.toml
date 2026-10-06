@@ -8,13 +8,13 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-nats = "0.47"
-dashmap = "6.1"
+async-nats.workspace = true
+dashmap.workspace = true
 serde_json.workspace = true
-futures = "0.3"
+futures.workspace = true
 talos-task-supervision = { path = "../talos-task-supervision" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 # NOTE: `uuid` was dropped in 2026-08 with the Uuid -> String change to
 # `WorkerHeartbeat.worker_id`. Nothing in this crate constructs an id any

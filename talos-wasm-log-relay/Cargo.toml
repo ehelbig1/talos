@@ -7,10 +7,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-async-nats = "0.47"
-futures = "0.3"
+async-nats.workspace = true
+futures.workspace = true
 serde_json.workspace = true
-tokio = { version = "1", features = ["sync", "time", "rt"] }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
 tracing.workspace = true
 uuid.workspace = true
 talos-dlp-provider = { path = "../talos-dlp-provider" }
@@ -23,7 +23,7 @@ talos-task-supervision = { path = "../talos-task-supervision" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

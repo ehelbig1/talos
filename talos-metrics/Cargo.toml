@@ -17,7 +17,7 @@ anyhow.workspace = true
 # feature is inert. Until this landed NEITHER Talos process exported a single
 # `process_*` series, so a controller leaking memory or file descriptors was
 # invisible to Prometheus and `docker stats` was the only view.
-prometheus = { version = "0.14", features = ["process"] }
+prometheus = { workspace = true, features = ["process"] }
 # The closed set of `path` label values on `talos_dispatch_refused_total` is
 # `talos_workflow_liveness::dispatch::DispatchPath::ALL`. Imported rather than
 # duplicated: that crate has NO dependencies, so unlike

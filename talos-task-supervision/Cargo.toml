@@ -8,13 +8,13 @@ publish.workspace = true
 
 [dependencies]
 # Kept in lockstep with talos-metrics / controller / worker (prometheus 0.14).
-prometheus = "0.14"
+prometheus.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+tracing-subscriber = { workspace = true, features = ["default", "fmt"] }
 
 [lints]
 workspace = true

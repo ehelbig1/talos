@@ -7,11 +7,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-regex = "1.12"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+regex.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls", "blocking"] }
 serde_json.workspace = true
 talos-config = { path = "../talos-config" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
 tracing.workspace = true
 
 [lints]

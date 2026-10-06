@@ -268,6 +268,8 @@ lint: ## Fast gate: rustfmt + WIT drift + structural lints (no clippy) + offline
 	@diff -q wit/talos.wit module-templates/wit/talos.wit >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ wit/talos.wit and module-templates/wit/talos.wit have drifted\033[0m\n'; \
 	         printf '  fix: cp wit/talos.wit module-templates/wit/talos.wit\n'; exit 1; }
+	@printf '▶ shared dependencies are declared once\n'
+	@python3 scripts/check-workspace-deps.py
 	@printf '▶ rust toolchain pins\n'
 	@python3 scripts/check-rust-pins.py
 	@printf '▶ declared dependencies are used\n'

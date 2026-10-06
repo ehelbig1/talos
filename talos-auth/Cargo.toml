@@ -20,20 +20,20 @@ anyhow.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
-bcrypt = "0.18"
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+bcrypt.workspace = true
 talos-unusable-password = { path = "../talos-unusable-password" }
 # One writer for admin_event_log (check 94): the first-user grant is recorded.
 talos-admin-event-log = { path = "../talos-admin-event-log" }
 serde_json.workspace = true
-zeroize = "1.8"
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
-regex = "1.12"
-sha2 = "0.10"
-hex = "0.4"
-rand = { version = "0.8", default-features = true, features = ["std"] }
-tokio = { version = "1", features = ["rt", "sync", "macros"] }
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+zeroize.workspace = true
+jsonwebtoken = { workspace = true, features = ["rust_crypto", "use_pem"] }
+regex.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand = { workspace = true, features = ["default", "std"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
 
 [lints]
 workspace = true

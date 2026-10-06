@@ -8,16 +8,16 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-arc-swap = "1.7"
-governor = "0.6"
-regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+arc-swap.workspace = true
+governor.workspace = true
+regex.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "uuid"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "uuid"] }
 thiserror.workspace = true
 tracing.workspace = true
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
 
 # Talos crates
 talos-dlp-provider = { path = "../talos-dlp-provider" }

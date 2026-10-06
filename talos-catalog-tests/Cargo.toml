@@ -31,7 +31,7 @@ talos-compilation = { path = "../talos-compilation" }
 talos-worker-runtime = { path = "../talos-worker-runtime" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
-tempfile = "3"
+tempfile.workspace = true
 uuid = { workspace = true }
 
 [build-dependencies]

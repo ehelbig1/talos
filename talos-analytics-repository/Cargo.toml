@@ -10,9 +10,9 @@ publish.workspace = true
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 anyhow.workspace = true
 chrono.workspace = true
-regex = "1.12"
+regex.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-child-workflow-refs = { path = "../talos-child-workflow-refs" }
 # RFC 0012 P2. The child-run ledger is the only table that can measure a
 # sub-workflow's reliability and freshness, and this crate owns the readiness
@@ -32,14 +32,14 @@ talos-secrets-manager = { path = "../talos-secrets-manager" }
 # NOT forbidden, and it is a leaf (serde/uuid/sha2/async-trait only).
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 # `fuel_headroom` is an async integration binary against a migrated Postgres:
 # which rollup rows the detector counts is a property of its SQL.
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

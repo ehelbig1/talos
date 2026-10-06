@@ -10,14 +10,14 @@ publish.workspace = true
 talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
 lru = "0.18"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 # Only the gRPC/tonic exporter is used. `default-features = false` drops otlp's
 # default http-proto + reqwest-blocking-client (opentelemetry-http + reqwest 0.13,
 # a duplicate of the workspace's reqwest 0.12) for an HTTP path we never take.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "trace"] }
 tonic = "0.14"
-async-nats = "0.47"
+async-nats.workspace = true
 # `default-features = false` drops aws-sdk-s3's legacy `rustls` feature
 # (rustls 0.21 / rustls-webpki 0.101); the retained `default-https-client`
 # keeps the modern rustls-aws-lc (rustls 0.23) stack, and with it rustls 0.21 /
@@ -42,9 +42,9 @@ aws-sdk-s3 = { version = "1.30", default-features = false, features = [
 aws-smithy-runtime-api = "1.12"
 aws-smithy-types = "1.4"
 chrono.workspace = true
-futures = "0.3"
+futures.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-audit-event = { path = "../talos-audit-event" }
 # Prometheus counter for the two verification-failure detectors (event-level at
@@ -62,10 +62,10 @@ talos-http-utils = { path = "../talos-http-utils" }
 # truncate-then-redact block (see the `talos.payload` site in src/lib.rs), which
 # is why `talos-text-util` is no longer needed here.
 talos-trace = { path = "../talos-trace" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
-zeroize = "1.8"
+zeroize.workspace = true
 
 [lints]
 workspace = true

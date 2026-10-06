@@ -6,25 +6,25 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-zeroize = { version = "1.8", features = ["derive"] }
-dashmap = "6"
-uuid = { version = "1", features = ["v4"] }
-async-trait = "0.1"
-anyhow = "1"
-tracing = "0.1"
-tokio = { version = "1", features = ["sync", "rt", "macros"] }
-hmac = "0.12"
-sha2 = "0.10"
-serde = { version = "1", features = ["derive"] }
+zeroize = { workspace = true, features = ["derive"] }
+dashmap.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+hmac.workspace = true
+sha2.workspace = true
+serde = { workspace = true, features = ["derive"] }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 # L-13 (2026-05-22): random slot-handle allocation. Defense-in-depth
 # against guest enumeration of adjacent slot IDs; see
 # `fresh_slot_handle` in `talos_vault.rs`.
-rand = { version = "0.8", default-features = false, features = ["std", "getrandom"] }
+rand = { workspace = true, features = ["std", "getrandom"] }
 
 [dev-dependencies]
 # capture test over the real AuditingProvider log lines (check 91's behavioural half)
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-subscriber = { workspace = true, features = ["default", "fmt"] }
 
 [lints]
 workspace = true

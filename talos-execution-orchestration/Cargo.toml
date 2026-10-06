@@ -8,15 +8,15 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-nats = "0.47"
-chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-nats.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
 
 # Talos crates — utility
 talos-dlp-provider = { path = "../talos-dlp-provider" }

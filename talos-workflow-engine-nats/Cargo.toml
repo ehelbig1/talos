@@ -15,11 +15,11 @@ homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 talos-config = { path = "../talos-config", version = "0.1.0" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
 talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.3", default-features = false }
-async-nats = "0.47"
-async-trait = "0.1"
+async-nats.workspace = true
+async-trait.workspace = true
 # H-1: `Subscriber::next` (StreamExt::next) for the reply-inbox
 # pre-allocation path in `transport.rs`.
-futures = "0.3"
+futures.workspace = true
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.3" }
 # RFC 0010 P3 (D3b): register per-dispatch plaintext secrets in InFlightSeals for
 # on-claim ephemeral sealing when TALOS_ENVELOPE_SEALING is on.
@@ -28,14 +28,14 @@ talos-envelope-seal = { path = "../talos-envelope-seal", version = "0.1" }
 # job/pipeline spans link to the controller's `workflow` span. No talos-* deps
 # of its own, so no dependency cycle.
 talos-trace-nats = { path = "../talos-trace-nats", version = "0.1" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-tracing = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
 # Wipes the serialized per-step plaintext the pipeline seal re-arm closure holds
 # for the retry lifetime (same crate/version the job-protocol crate uses).
-zeroize = "1"
+zeroize.workspace = true
 
 [features]
 default = ["llm-primitives"]
@@ -102,5 +102,5 @@ unused_self = "allow"
 unused_async = "allow"
 
 [dev-dependencies]
-rand = "0.8"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
+rand = { workspace = true, features = ["default"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }

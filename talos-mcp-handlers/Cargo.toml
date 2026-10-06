@@ -10,24 +10,24 @@ publish.workspace = true
 talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
 talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
-async-nats = "0.47"
-async-stream = "0.3"
-axum = { version = "0.8", features = ["json"] }
-bcrypt = "0.18"
+async-nats.workspace = true
+async-stream.workspace = true
+axum = { workspace = true, features = ["json"] }
+bcrypt.workspace = true
 chrono.workspace = true
-dashmap = "6.1"
-futures = "0.3"
-hex = "0.4"
-petgraph = "0.6"
-rand = { version = "0.8", default-features = true, features = ["std"] }
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-regex = "1.12"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rhai = { version = "1.19", features = ["serde"] }
+dashmap.workspace = true
+futures.workspace = true
+hex.workspace = true
+petgraph.workspace = true
+rand = { workspace = true, features = ["default", "std"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+regex.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+rhai = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-actor-policies = { path = "../talos-actor-policies" }
 talos-actor-repository = { path = "../talos-actor-repository" }
@@ -127,10 +127,10 @@ talos-workflow-types = { path = "../talos-workflow-types" }
 talos-workflow-validation = { path = "../talos-workflow-validation" }
 talos-workflow-versions = { path = "../talos-workflow-versions" }
 talos-yaml-workflows = { path = "../talos-yaml-workflows" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time", "process", "io-util", "fs", "net"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "process", "io-util", "fs", "net"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing.workspace = true
-uuid = { version = "1.20", features = ["serde", "v4", "v5"] }
+uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 talos-worker-runtime = { path = "../talos-worker-runtime" }
 
 [lints]

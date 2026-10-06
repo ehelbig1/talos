@@ -12,7 +12,7 @@ publish.workspace = true
 # never enforce a different identity-pinning strength. Kept light (regex
 # only) so both the WASM-host worker and the controller pull it cheaply.
 [dependencies]
-regex = "1.11"
+regex.workspace = true
 
 [lints]
 workspace = true

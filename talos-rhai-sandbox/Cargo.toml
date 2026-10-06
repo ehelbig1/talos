@@ -12,7 +12,7 @@ publish.workspace = true
 # see the module docs in src/lib.rs for why it is not folded into
 # `talos-workflow-engine-core` (which `worker/` depends on, and which
 # therefore must not grow a scripting-engine dependency).
-rhai = { version = "1.19", features = ["serde"] }
+rhai = { workspace = true, features = ["serde"] }
 
 [lints]
 workspace = true

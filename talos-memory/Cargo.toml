@@ -7,27 +7,27 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 talos-config = { path = "../talos-config" }
-anyhow = "1"
-arc-swap = "1.7"
-dashmap = "6.1"
+anyhow.workspace = true
+arc-swap.workspace = true
+dashmap.workspace = true
 # RFC 0010 P2 inc.3: per-worker Ed25519 RPC signing. Same major as
 # talos-workflow-job-protocol so the re-exported key types unify.
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-chrono = { version = "0.4", features = ["serde"] }
-hmac = "0.12"
-pgvector = { version = "0.4", features = ["sqlx"] }
-rand = { version = "0.8", default-features = true, features = ["std"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+chrono = { workspace = true, features = ["serde"] }
+hmac.workspace = true
+pgvector = { workspace = true, features = ["sqlx"] }
+rand = { workspace = true, features = ["default", "std"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+serde = { workspace = true, features = ["derive"] }
 # `raw_value` powers `rpc_auth::RawSigned<T>`: signed bodies cover the EXACT
 # wire text (Box<RawValue>) so serde_json's non-idempotent f64 round trip
 # can't make signer and verifier disagree (#598). Declared here because this
 # crate USES the feature directly — do not rely on transitive unification via
 # talos-workflow-job-protocol, which could vanish under a future dep change.
-serde_json = { version = "1", features = ["raw_value"] }
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
-subtle = "2"
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+subtle.workspace = true
 thiserror.workspace = true
 talos-http-body = { path = "../talos-http-body" }
 # MCP-1050: canonical truncate_at_char_boundary for embedding input.
@@ -37,10 +37,10 @@ talos-text-util = { path = "../talos-text-util" }
 # registry — so RPC signing shares the same keypair the worker uses for result
 # signing. No cycle: job-protocol does not depend on talos-memory.
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
-tracing = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
-zeroize = "1.8"
+tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+zeroize.workspace = true
 
 [dev-dependencies]
 # The SHARED wire-invariant property harness (seeded `arbitrary_json`, the
@@ -56,11 +56,11 @@ talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", feature
     "test-support",
 ] }
 # Hex encoding for the literal MAC digests in tests/wire_format_snapshots.rs.
-hex = "0.4"
+hex.workspace = true
 # Real AES-256-GCM for the integration-test MemoryCryptoHook — lets the
 # live-Postgres suite exercise the genuine encrypt→store→read→decrypt round
 # trip AND the MCP-S2 AAD-binding property, instead of stubbing crypto out.
-aes-gcm = "0.10"
+aes-gcm.workspace = true
 # Pins `MemoryWriteError::METRIC_LABELS` against the pre-seed loop of
 # `talos_memory_write_failures_total` (write_error.rs tests): talos-metrics
 # cannot depend on this crate, so the two lists meet in a test here. Light:

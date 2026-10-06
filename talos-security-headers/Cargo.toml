@@ -7,13 +7,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-axum = { version = "0.8", features = ["json"] }
+axum = { workspace = true, features = ["json"] }
 talos-config = { path = "../talos-config" }
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
-tower = { version = "0.5", features = ["util"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true

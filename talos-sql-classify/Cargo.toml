@@ -12,7 +12,7 @@ publish.workspace = true
 # (talos-rpc-subscribers), so it must stay light enough to pull into the worker
 # without dragging in sqlx, tokio, or a web framework.
 [dependencies]
-sqlparser = { version = "0.53", features = ["visitor"] }
+sqlparser = { workspace = true, features = ["visitor"] }
 
 [lints]
 workspace = true
