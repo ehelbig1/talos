@@ -154,7 +154,26 @@ jobs:
         # check. Single source of truth with the local `make audit`. The scan's
         # earlier false-positive on DLP test fixtures (sk-AAAA…) is fixed via the
         # `// secret-scan-allow:` opt-out marker, so the full gate now runs here.
-        run: make audit
+        #
+        # When it fails, the last line says whether the change under test
+        # touches a Cargo manifest, lockfile or deny/audit config. Four of the
+        # nine failed runs of 2026-10-01..06 were an advisory published since
+        # the last run, on a pull request that had changed no dependency.
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if make audit; then exit 0; fi
+          deps=unknown
+          if [ "$EVENT" = "pull_request" ]; then
+            deps="$(bash scripts/ci-changed-areas.sh "$PR_BASE" "$(git rev-parse HEAD)" 2>/dev/null | sed -n 's/^rust_deps=//p' || true)"
+          fi
+          case "$deps" in
+            false) echo "::error title=make audit failed::If the failure above is an advisory (RUSTSEC-…): this change touches no Cargo manifest, lockfile or deny/audit config, so it did not introduce it — the advisory database changed, and main fails the same way. Fix it in a pull request of its own (docs/ci.md, 'A new advisory'); this one stays red until that merges." ;;
+            true)  echo "::error title=make audit failed::This change touches a Cargo manifest, lockfile or deny/audit config: if the failure above is an advisory, check whether this change introduced it." ;;
+            *)     echo "::error title=make audit failed::If the failure above is an advisory (RUSTSEC-…), either the advisory database changed or a dependency change introduced it." ;;
+          esac
+          exit 1
 
       - name: Installer worker-trust state machine + Ed25519 derivation
         # deploy/k3s/lib/worker-trust.sh is pure bash the k3s installer sources;
@@ -204,6 +223,9 @@ jobs:
         # folder. With KEK_PROVIDER=env it must not ask for a Vault backup;
         # with vault it must; off+vault is refused.
         run: bash scripts/tests/drill-vault-gate-test.sh
+
+      - name: Changed-areas classifier (job groups, dependency files)
+        run: bash scripts/tests/ci-changed-areas-test.sh
 
       - name: CI disk-freeing script acts only when space is short
         run: bash scripts/tests/ci-free-disk-test.sh
@@ -765,6 +787,9 @@ jobs:
         # which does not model `-e`, and every real run until now happened
         # to be the clean case where npm audit exits 0. A verification
         # harness has to reproduce the ENVIRONMENT, not just the logic.
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           set -uo pipefail
           set +e
@@ -793,7 +818,16 @@ jobs:
           # (one advisory each, with a reason and an expiry date). Excepted
           # advisories are printed as warnings on every run.
           python3 ../scripts/frontend_audit_gate.py --self-test >/dev/null
-          printf '%s' "$out" | python3 ../scripts/frontend_audit_gate.py --exceptions audit-exceptions.json
+          # Whether this change touches the frontend's dependency files, so a
+          # failure can say whether it can be this change's doing.
+          deps=unknown
+          if [ "$EVENT" = "pull_request" ]; then
+            case "$(bash ../scripts/ci-changed-areas.sh "$PR_BASE" "$(git rev-parse HEAD)" 2>/dev/null | sed -n 's/^frontend_deps=//p' || true)" in
+              true) deps=yes ;;
+              false) deps=no ;;
+            esac
+          fi
+          printf '%s' "$out" | python3 ../scripts/frontend_audit_gate.py --deps-changed "$deps" --exceptions audit-exceptions.json
 
   # ── Migration baseline verifier (RFC 0009 phase 1) ─────────────────────────
   # Proves the committed migrations/.baseline/ artifacts (schema snapshot +

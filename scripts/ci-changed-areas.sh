@@ -11,6 +11,12 @@
 #   observability alert rules and their promtool fixtures
 #   migrations    migrations/ (the baseline verifier)
 #
+# Two more lines say whether the change touches the files a dependency
+# advisory can come from — `rust_deps` and `frontend_deps`, each `true`,
+# `false`, or `unknown` when there is no diff to read (a push, the nightly).
+# They gate nothing: the advisory steps use them to say whether a failure can
+# be this change's doing (scripts/frontend_audit_gate.py --deps-changed).
+#
 # A change to the CI plumbing itself (.github/workflows/, this script, the
 # test-target classifier, the Makefile) turns EVERY area on: a workflow edit
 # must prove itself on the whole suite. So does a diff that cannot be
@@ -18,8 +24,11 @@
 # never an extra run.
 set -euo pipefail
 
+# emit_all <rust_deps> <frontend_deps>
 emit_all() {
     for a in rust frontend observability migrations; do echo "${a}=true"; done
+    echo "rust_deps=${1:-unknown}"
+    echo "frontend_deps=${2:-unknown}"
 }
 
 if [ "${1:-}" = "--all" ] || [ $# -lt 2 ] || [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
@@ -42,8 +51,12 @@ fi
 
 has() { printf '%s\n' "$files" | grep -qE "$1"; }
 
+rust_deps=false; frontend_deps=false
+has '(^|/)Cargo\.(toml|lock)$|^deny\.toml$|^audit\.toml$' && rust_deps=true
+has '^frontend/(package\.json|package-lock\.json|audit-exceptions\.json)$' && frontend_deps=true
+
 if has '^\.github/workflows/|^scripts/ci-changed-areas\.sh$|^scripts/ci_test_targets\.py$|^scripts/ci_shard\.py$|^scripts/ci-test-weights\.tsv$|^scripts/ci-run-dbfree-tests\.sh$|^Makefile$'; then
-    emit_all
+    emit_all "$rust_deps" "$frontend_deps"
     exit 0
 fi
 
@@ -57,3 +70,5 @@ echo "rust=$rust"
 echo "frontend=$frontend"
 echo "observability=$observability"
 echo "migrations=$migrations"
+echo "rust_deps=$rust_deps"
+echo "frontend_deps=$frontend_deps"
