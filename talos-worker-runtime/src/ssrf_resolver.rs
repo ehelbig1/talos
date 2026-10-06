@@ -46,10 +46,16 @@
 //!   2. The queried hostname is in the per-execution explicit list
 //!      (the module's `allowed_hosts`, minus any `*` wildcard entries).
 //! Hostnames NOT in the explicit list are always filtered, even when
-//! the env var is set. Both halves have ONE reader shared with the
-//! host-function pre-checks: `host::allow_private_host_targets` (env +
-//! production refusal) and a case-insensitive explicit-host match
-//! (`host::private_host_bypass_applies`).
+//! the env var is set.
+//!
+//! The resolver does not read the environment. Half 1 is a constructor
+//! argument (`private_host_targets`): `TalosContext::new` reads the toggle
+//! once per execution through `host::allow_private_host_targets` (env +
+//! production refusal), builds the resolver with the answer and keeps the
+//! same answer on the context for the host-function pre-checks
+//! (`host::private_host_bypass_applies`). Half 2 is the case-insensitive
+//! explicit-host match both layers share. A test states half 1 the same way,
+//! as an argument, so no test has to set the variable.
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::collections::HashSet;
@@ -64,7 +70,8 @@ use std::sync::Arc;
 ///
 /// `explicit_private_host_allowed`: hostnames for which the resolver
 /// MAY return private IPs when the operator-level env var
-/// `WORKER_ALLOW_PRIVATE_HOST_TARGETS=1` is set. Constructed from the
+/// `WORKER_ALLOW_PRIVATE_HOST_TARGETS=1` is set (`private_host_targets`,
+/// handed in at construction). Constructed from the
 /// caller's `allowed_hosts` with `*` wildcards stripped so a module
 /// declaring `["*"]` cannot also opt into the private-IP bypass. An
 /// empty set means "always filter every private IP regardless of env".
@@ -86,6 +93,10 @@ pub struct SsrfFilteringResolver {
     /// Tier-1 local-only egress: deny every non-private/non-loopback
     /// resolved address regardless of hostname. See struct doc.
     local_egress_only: bool,
+    /// The dev-only private-target toggle for the execution this resolver
+    /// belongs to, production refusal already applied. `false` (the
+    /// `Default`) filters every private address for every hostname.
+    private_host_targets: bool,
 }
 
 impl SsrfFilteringResolver {
@@ -98,7 +109,15 @@ impl SsrfFilteringResolver {
     /// `local_egress_only` mirrors the Tier-1 data-egress ceiling — set it
     /// from `max_llm_tier == Tier1` at the call site so the resolver can
     /// refuse public egress for privacy-ceiled actors.
-    pub fn for_allowed_hosts(allowed_hosts: &[String], local_egress_only: bool) -> Self {
+    ///
+    /// `private_host_targets` is the dev-only toggle as this execution sees
+    /// it (`DevEgressOptIns::private_host_targets`). It unlocks nothing by
+    /// itself: only a hostname in the explicit set may then resolve private.
+    pub fn for_allowed_hosts(
+        allowed_hosts: &[String],
+        local_egress_only: bool,
+        private_host_targets: bool,
+    ) -> Self {
         let explicit = allowed_hosts
             .iter()
             .filter(|h| h.as_str() != "*")
@@ -107,25 +126,28 @@ impl SsrfFilteringResolver {
         Self {
             explicit_private_host_allowed: Arc::new(explicit),
             local_egress_only,
+            private_host_targets,
         }
     }
 
-    /// Test helper: build a resolver with the bypass available for the
-    /// given hostnames regardless of the env var (Tier-2 / public-allow
-    /// posture).
+    /// Test helper: a resolver whose explicit set is the given hostnames
+    /// (Tier-2 / public-allow posture) with the toggle OFF. The tests that
+    /// use it pass the toggle to `bypass_allowed` themselves.
     #[cfg(test)]
     pub fn with_explicit_hosts(hosts: &[&str]) -> Self {
         Self::for_allowed_hosts(
             &hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>(),
             false,
+            false,
         )
     }
 
     /// Pure bypass decision — the per-execution half of the dev-only
-    /// private-host bypass. `env_enabled` is
-    /// [`crate::host::allow_private_host_targets`] at runtime, which
-    /// already folds in the production refusal, so the resolver and the
-    /// host-function pre-checks read the toggle from ONE place.
+    /// private-host bypass. `env_enabled` is `self.private_host_targets` at
+    /// runtime: the value `TalosContext::new` read through
+    /// [`crate::host::allow_private_host_targets`], which already folds in
+    /// the production refusal, and the same value the host-function
+    /// pre-checks read from the context.
     fn bypass_allowed(&self, host_lower: &str, env_enabled: bool) -> bool {
         env_enabled && self.explicit_private_host_allowed.contains(host_lower)
     }
@@ -166,9 +188,9 @@ impl Resolve for SsrfFilteringResolver {
         let host = name.as_str().to_string();
         let host_lower = host.trim_end_matches('.').to_ascii_lowercase();
         let local_egress_only = self.local_egress_only;
-        // One reader for the toggle, shared with the host-fn pre-checks (it
-        // folds in the production refusal and logs once).
-        let bypass = self.bypass_allowed(&host_lower, crate::host::allow_private_host_targets());
+        // The toggle as this execution's context read it — the host-fn
+        // pre-checks hold the same value.
+        let bypass = self.bypass_allowed(&host_lower, self.private_host_targets);
         Box::pin(async move {
             // `lookup_host` needs a port to return SocketAddrs; this `:80` is a
             // throwaway placeholder. The real port is selected by the connector
@@ -258,7 +280,7 @@ mod tests {
         // unlock the private-IP bypass. The resolver's per-host set
         // is empty after wildcard filtering, so the bypass decision
         // returns false even with the env toggle on.
-        let r = SsrfFilteringResolver::for_allowed_hosts(&["*".to_string()], false);
+        let r = SsrfFilteringResolver::for_allowed_hosts(&["*".to_string()], false, false);
         assert!(!r.bypass_allowed("any-host.example.com", true));
         assert!(!r.bypass_allowed("any-host.example.com", false));
     }
@@ -297,7 +319,7 @@ mod tests {
     /// so this drives the real `resolve()` filter deterministically.
     #[tokio::test]
     async fn local_egress_only_denies_public_and_private() {
-        let r = SsrfFilteringResolver::for_allowed_hosts(&["*".to_string()], true);
+        let r = SsrfFilteringResolver::for_allowed_hosts(&["*".to_string()], true, false);
         for host in [
             "8.8.8.8",
             "127.0.0.1",
@@ -345,12 +367,18 @@ mod tests {
     }
 
     /// The Tier-1 inversion must NOT be re-opened by the dev env-var
-    /// bypass: `local_egress_only` forces `bypass = false` even with the
-    /// toggle on and the hostname explicitly listed.
+    /// bypass: a public address stays denied under `local_egress_only` even
+    /// with the toggle on and the hostname explicitly listed. The toggle is
+    /// the constructor argument — this test used to set the environment
+    /// variable, which every other test in the binary could then see.
     #[tokio::test]
     async fn local_egress_only_ignores_private_host_bypass() {
-        std::env::set_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS", "1");
-        let r = SsrfFilteringResolver::for_allowed_hosts(&["8.8.8.8".to_string()], true);
+        let r = SsrfFilteringResolver::for_allowed_hosts(&["8.8.8.8".to_string()], true, true);
+        assert!(
+            r.bypass_allowed("8.8.8.8", r.private_host_targets),
+            "precondition: the bypass IS on for this host, so the empty \
+             result below is the local-only rule and not the toggle being off"
+        );
         let public = r
             .resolve(Name::from_str("8.8.8.8").expect("name"))
             .await
@@ -359,14 +387,13 @@ mod tests {
             public.collect::<Vec<SocketAddr>>().is_empty(),
             "local_egress_only must not be unlocked by the dev bypass toggle"
         );
-        std::env::remove_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS");
     }
 
     /// Tier-2 (default) posture is unchanged by the S3 change: public IPs
     /// pass, private IPs are filtered.
     #[tokio::test]
     async fn tier2_default_permits_public_filters_private() {
-        let r = SsrfFilteringResolver::for_allowed_hosts(&[], false);
+        let r = SsrfFilteringResolver::for_allowed_hosts(&[], false, false);
         let public = r
             .resolve(Name::from_str("8.8.8.8").expect("name"))
             .await
@@ -401,7 +428,7 @@ mod tests {
     /// fully deterministic; mirrors `tier2_default_permits_public_filters_private`.)
     #[tokio::test]
     async fn resolve_returns_zero_port_so_connector_picks_scheme_port() {
-        let r = SsrfFilteringResolver::for_allowed_hosts(&[], false);
+        let r = SsrfFilteringResolver::for_allowed_hosts(&[], false, false);
         let addrs: Vec<SocketAddr> = r
             .resolve(Name::from_str("1.1.1.1").expect("name"))
             .await

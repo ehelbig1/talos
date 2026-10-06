@@ -68,7 +68,6 @@ use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, HostOutgoingRequ
 use wasmtime_wasi_http::p2::HttpResult;
 use wasmtime_wasi_http::{RequestOptions, WasiBody, WasiHttpHooks, WasiHttpView};
 
-use super::egress::insecure_http_opt_in;
 use super::limits::{MAX_HTTP_CALLS_PER_EXECUTION, MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION};
 use crate::context::TalosContext;
 
@@ -358,7 +357,7 @@ pub(crate) fn gated_handle(
             http_verb_ceiling: ctx.http_verb_ceiling,
             write_ceiling_enforced: crate::context::write_ceiling_enforced(),
             strict_egress: crate::context::write_ceiling_strict_egress(),
-            insecure_http_opt_in: insecure_http_opt_in(),
+            insecure_http_opt_in: ctx.dev_egress.insecure_http,
         };
         wasi_http_admission(&target, &policy)
     };
@@ -958,6 +957,51 @@ mod tests {
         );
     }
 
+    /// The gate reads the insecure-HTTP opt-in from ITS context: a plaintext
+    /// request is refused as `insecure-scheme` unless this context opted in,
+    /// whatever any other context in the process was built with. CONTROL: the
+    /// same request under the stated opt-ins is handed to the send path (a
+    /// loopback listener, so nothing leaves the host).
+    #[tokio::test]
+    async fn a_plaintext_request_is_refused_unless_this_context_opted_in() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = format!("localhost:{}", listener.local_addr().unwrap().port());
+        let push_plaintext = |ctx: &mut TalosContext| {
+            ctx.table
+                .push(HostOutgoingRequest {
+                    method: wt::Method::Get,
+                    scheme: Some(wt::Scheme::Http),
+                    authority: Some(authority.clone()),
+                    path_with_query: Some("/x".to_string()),
+                    headers: Default::default(),
+                    body: None,
+                })
+                .expect("push request")
+        };
+
+        let mut ctx = trusted_ctx(&["localhost"], &["GET"])
+            .with_dev_egress(crate::context::DevEgressOptIns::default());
+        let sink: crate::context::HostDiagSink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        ctx.host_diag_sink = Some(sink.clone());
+        let req = push_plaintext(&mut ctx);
+        assert!(
+            gated_handle(&mut ctx, req, None).is_err(),
+            "no opt-in: plaintext refused"
+        );
+        let lines = sink.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|l| l.contains("insecure-scheme")),
+            "refused BY the scheme gate: {lines:?}"
+        );
+
+        let mut opted = trusted_ctx(&["localhost"], &["GET"])
+            .with_dev_egress(crate::context::DevEgressOptIns::LOOPBACK);
+        let req = push_plaintext(&mut opted);
+        let fut = gated_handle(&mut opted, req, None).expect("control: admitted under the opt-in");
+        let fut = opted.table.delete(fut).unwrap();
+        assert!(matches!(fut, HostFutureIncomingResponse::Pending(_)));
+    }
+
     // ── The send path: connect-time SSRF ──────────────────────────────────
 
     fn get_localhost(port: u16) -> http::Request<WasiBody> {
@@ -983,6 +1027,13 @@ mod tests {
     /// hardened send path — the case the gate cannot see (it runs before DNS).
     /// CONTROL: upstream's default send path, which this replaced, reaches the
     /// same listener. Both directions run against one live socket.
+    ///
+    /// The refusing context runs with both dev opt-ins OFF, stated on it
+    /// rather than inherited: until 2026-10-06 the toggle was read from the
+    /// process environment, sibling tests set it, and under plain `cargo test`
+    /// this assertion saw `Ok(200)`. SECOND CONTROL: the same hardened path
+    /// under the stated private-target opt-in reaches the listener, so the
+    /// refusal is the private-address rule and not a path that cannot connect.
     #[tokio::test]
     async fn the_send_path_refuses_a_name_that_resolves_private_where_upstream_connected() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1007,7 +1058,8 @@ mod tests {
         assert_eq!(reached.status(), 200);
         driver.abort();
 
-        let ctx = trusted_ctx(&["localhost"], &["GET"]);
+        let ctx = trusted_ctx(&["localhost"], &["GET"])
+            .with_dev_egress(crate::context::DevEgressOptIns::default());
         let mut hooks = HardenedWasiHttpHooks::new(ctx.http_client.clone());
         let refused = Pin::from(hooks.send_request(
             get_localhost(port),
@@ -1019,6 +1071,27 @@ mod tests {
             matches!(refused, Err(wasmtime_wasi_http::Error::ConnectionRefused)),
             "the hardened path refuses the resolved loopback address: {:?}",
             refused.map(|(r, _)| r.status())
+        );
+
+        // Second control: what flips the verdict is the opt-in, and it is an
+        // argument to this context alone.
+        let opted = trusted_ctx(&["localhost"], &["GET"]).with_dev_egress(
+            crate::context::DevEgressOptIns {
+                private_host_targets: true,
+                insecure_http: false,
+            },
+        );
+        let mut hooks = HardenedWasiHttpHooks::new(opted.http_client.clone());
+        let reached = Pin::from(hooks.send_request(
+            get_localhost(port),
+            options(),
+            Box::new(std::future::ready(Ok(()))),
+        ))
+        .await
+        .map(|(r, _)| r.status());
+        assert!(
+            matches!(reached, Ok(status) if status == 200),
+            "control: the hardened path reaches the listener under the stated opt-in: {reached:?}"
         );
     }
 

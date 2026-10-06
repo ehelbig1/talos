@@ -621,7 +621,11 @@ impl wit_http::Host for TalosContext {
         // a sibling service (e.g. nova on host.docker.internal:3030) while
         // keeping the wildcard-allowlist case fully protected. IP literals
         // are still rejected unconditionally above.
-        let bypass_dns_ssrf = private_host_bypass_applies(&self.allowed_hosts, host);
+        let bypass_dns_ssrf = private_host_bypass_applies(
+            self.dev_egress.private_host_targets,
+            &self.allowed_hosts,
+            host,
+        );
         if url
             .host()
             .is_some_and(|h| matches!(h, url::Host::Domain(_)))
@@ -1472,7 +1476,11 @@ impl wit_http::Host for TalosContext {
             //    common entries, so the wall-clock cost is dominated by
             //    the actual HTTP request, not the lookup.
             let is_hostname = matches!(url.host(), Some(url::Host::Domain(_)));
-            let bypass_dns = private_host_bypass_applies(&self.allowed_hosts, &host);
+            let bypass_dns = private_host_bypass_applies(
+                self.dev_egress.private_host_targets,
+                &self.allowed_hosts,
+                &host,
+            );
             if is_hostname && !bypass_dns {
                 match tokio::net::lookup_host(format!("{}:80", host)).await {
                     Ok(addrs) => {

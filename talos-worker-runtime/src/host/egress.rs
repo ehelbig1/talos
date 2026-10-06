@@ -587,6 +587,10 @@ pub(crate) fn classify_url_scheme(scheme: &str, insecure_opt_in: bool) -> UrlSch
 /// `true`, `yes` (case-insensitive). Anything else is treated as off.
 /// Empty / unset → off — same fail-closed default as
 /// `TALOS_ALLOW_UNATTESTED_WASM`.
+///
+/// Read once per execution, by `TalosContext::new` (through
+/// `DevEgressOptIns::from_env`); every scheme gate reads
+/// `TalosContext::dev_egress` and nothing else calls this.
 pub(crate) fn insecure_http_opt_in() -> bool {
     talos_config::bool_env_or_default("WASM_ALLOW_INSECURE_HTTP", false)
 }

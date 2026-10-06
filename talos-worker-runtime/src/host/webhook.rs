@@ -158,7 +158,7 @@ impl wit_webhook::Host for TalosContext {
         // value plaintext target since they carry a signed payload
         // bound to a guest secret; intercepting the wire is enough to
         // replay it. Operator opt-in only.
-        match classify_url_scheme(parsed_url.scheme(), insecure_http_opt_in()) {
+        match classify_url_scheme(parsed_url.scheme(), self.dev_egress.insecure_http) {
             UrlSchemeVerdict::Https => {}
             UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
                 tracing::warn!(
