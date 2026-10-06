@@ -156,6 +156,25 @@ It finds the run by COMMIT, and says so when a commit has none: a commit
 pushed to a branch whose pull request has already merged gets no run, and
 "the branch's newest run" is then an older commit's.
 
+## A job GitHub never started
+
+During a GitHub Actions incident a job can wait for a runner, get none, and
+be cancelled after 15 minutes; the gate then fails although nothing that ran
+failed (two of the nine failed runs of 2026-10-01..06).
+
+`.github/workflows/rerun-not-run.yml` re-runs the failed jobs of such a run,
+at most twice. The decision is `scripts/ci-rerun-not-run.py`: a job that
+never started is `cancelled` with no steps, and the run is re-run only when
+at least one job never started and nothing else failed but `Quality gate`.
+A job that failed, timed out or was cancelled after it started is never
+re-run from there. `python3 scripts/ci-rerun-not-run.py --run <id>` prints
+the decision for any run without acting.
+
+That workflow needs a runner itself, so in a long outage it can be cancelled
+too; then re-run by hand: `gh run rerun <id> --failed`. The phone is not
+paged for these runs either way (the `github-workflow-run` reader reports
+them as `not_run`).
+
 ## The integration job runs in shards
 
 `TALOS_IT_SHARD=i/n make test-integration` runs shard i of n, each shard on

@@ -1,0 +1,66 @@
+name: Re-run jobs GitHub never started
+
+# When a run of "Quality (heavy gates)" fails ONLY because GitHub never gave
+# some of its jobs a runner, re-run those jobs — at most twice.
+#
+# Measured 2026-10-01..06: two of the nine failed runs of quality.yml were
+# this (a GitHub Actions incident; "The job was not acquired by Runner of type
+# hosted even after multiple attempts"). Each needed `gh run rerun --failed`
+# by hand, three times that day, and until then a pull request sat blocked
+# and main read as red.
+#
+# The decision is scripts/ci-rerun-not-run.py: a job that never started is
+# `cancelled` with no steps; the run is re-run only when at least one job
+# never started and nothing else failed but the gate. A job that failed,
+# timed out, or was cancelled after it started is never re-run from here.
+#
+# WHAT THIS WORKFLOW MAY DO, and why that is safe:
+#   * `actions: write` — the one permission, used for one call: re-run the
+#     failed jobs of the run that triggered it. It cannot push, merge, publish
+#     or read secrets (none are passed to it).
+#   * `workflow_run` runs from the DEFAULT branch, with the default branch's
+#     copy of this file and of the script. It checks out the default branch,
+#     never the pull request's code, so a pull request cannot change what
+#     runs here.
+#   * Its only input is the triggering run's id, a number GitHub supplies.
+#   * It ends by itself: the script refuses a third attempt, and the `if`
+#     below does not start the job for one.
+#
+# It is not one of the publish workflows (those stay manual): it publishes
+# nothing and changes no code.
+#
+# ITS OWN LIMIT: this job needs a runner too. While GitHub is handing none
+# out it waits like any other, and if it is cancelled nothing retries it —
+# a person re-runs, as before. A failed run only completes after its jobs
+# have waited 15 minutes, so most outages are over by the time this starts.
+
+on:
+  workflow_run:
+    workflows: ["Quality (heavy gates)"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  rerun:
+    name: Re-run if nothing that ran failed
+    if: >-
+      github.event.workflow_run.conclusion == 'failure'
+      && github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout the default branch
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Decide, and re-run the jobs that never started
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+        run: python3 scripts/ci-rerun-not-run.py --run "$RUN_ID" --repo "$REPO" --apply
