@@ -35,13 +35,24 @@ drives it with a fake `rustup`.
 on its own; it mentions the image only for a job that also missed its cache —
 which, after this change, would mean the key depends on the image again.
 
-## Expected, and not yet seen
+## Verified on its own run (37480261228)
 
-* **This change's own run misses every cache**: the key changes once, and a
-  pull request never saves a cache. The first run on main after the merge
-  saves the new ones; runs after that should hit on either image.
-* The cost of the removal itself (deleting one toolchain directory per job)
-  is not measured yet; the run's step times will show it.
+Nine cached jobs, five on image `20261004.327.1` and four on
+`20260927.320.1`:
+
+* each removed `stable-x86_64-unknown-linux-gnu`, in 0–3 seconds;
+* each one's "Rust Versions" was `1.96.1 31fca3ad` and nothing else;
+* **the four integration shards — two on each image — computed one key**
+  (`v0-rust-quality-integration-Linux-x64-e6de0650-8ed95a7d`), and the unit
+  and DB-free jobs one key between them.
+
+Every job missed, as expected: the key changed once and a pull request
+never saves a cache. That run took 15.2 minutes.
+
+## Not yet seen
+
+A cache HIT on the new key from either image: it needs a run that starts
+after main's run for this change has saved the caches.
 
 ## Considered and not done
 
