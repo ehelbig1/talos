@@ -53,8 +53,29 @@ def decide(audit: dict, exceptions: list, today: dt.date):
     return blocking, excepted, sorted(u for u in expired if u in found), found
 
 
+def whose(deps_changed: str) -> str:
+    """What a blocking advisory has to do with the change under test.
+
+    Measured over 150 runs of quality.yml (2026-10-01..06): four of nine
+    failures were an advisory published since the last run, on a pull request
+    that touched no dependency. The message used to end "so these are newly
+    introduced", which reads as "introduced by this change".
+    """
+    if deps_changed == "no":
+        return ("This change touches no dependency file, so it did not introduce them: the advisory "
+                "database changed, and main has the same advisories. Fix them in a pull request of "
+                "their own (docs/ci.md, 'A new advisory'); this one stays red until that merges.")
+    if deps_changed == "yes":
+        return ("This change touches dependency files: check whether it introduced them. If it did "
+                "not, the advisory database changed and main has them too.")
+    return ("Either the advisory database changed or a dependency change introduced them; main is "
+            "kept at zero, so they are new since its last green run.")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--deps-changed", choices=("yes", "no", "unknown"), default="unknown",
+                    help="whether the change under test touches frontend dependency files")
     ap.add_argument("--exceptions", required=False)
     ap.add_argument("--today", help="ISO date; default is today (UTC)")
     ap.add_argument("--self-test", action="store_true")
@@ -79,7 +100,7 @@ def main(argv=None) -> int:
         for u in blocking:
             sev, title, pkg = found[u]
             print(f"  {sev}\t{pkg}\t{title}\t{u}")
-        print(f"::error title=Frontend dependency advisories::{len(blocking)} moderate+ advisory(ies) not covered by an unexpired, reviewed exception. The backlog is kept at ZERO on main, so these are newly introduced.")
+        print(f"::error title=Frontend dependency advisories::{len(blocking)} moderate+ advisory(ies) not covered by an unexpired, reviewed exception. {whose(a.deps_changed)}")
         return 1
     return 0
 
@@ -109,6 +130,15 @@ def self_test() -> int:
         ok = (blocking, excepted) == (want_block, want_exc)
         failed += not ok
         print(("ok  " if ok else "FAIL"), name, "" if ok else f"got {blocking} {excepted}")
+    for flag, must, must_not in (
+        ("no", "did not introduce them", "check whether it introduced"),
+        ("yes", "check whether it introduced them", "did not introduce them"),
+        ("unknown", "Either the advisory database changed", "This change touches"),
+    ):
+        text = whose(flag)
+        ok = must in text and must_not not in text
+        failed += not ok
+        print(("ok  " if ok else "FAIL"), f"--deps-changed {flag} says whose the advisories are")
     try:
         decide(audit(("braces", adv(A))), [{"advisory": A}], day)
         print("FAIL an exception without an expiry is refused"); failed += 1

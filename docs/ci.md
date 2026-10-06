@@ -149,6 +149,27 @@ save nothing.
   run went from about 23 minutes to 14–15; the unit job and the shards are
   now level.
 
+## A new advisory
+
+The two advisory gates — `make audit` (cargo-deny, the supply-chain job) and
+the frontend's `npm audit` step — read a database that changes on its own.
+Over 150 runs (2026-10-01..06) four of the nine failures were an advisory
+published since the last run, on a pull request that had changed no
+dependency; on main the same failure pages as "CI failed".
+
+When one fails, its last line says whether the change under test touches the
+files an advisory can come from (`Cargo.toml`/`Cargo.lock`/`deny.toml`/
+`audit.toml`, or `frontend/package.json`/`package-lock.json`/
+`audit-exceptions.json`). If it does not, the change did not introduce the
+advisory and main has it too:
+
+1. Fix it in a pull request of its own — update the dependency; for the
+   frontend, an `overrides` entry when the patched release is outside what a
+   dependent asks for (run `npm run codegen` and compare `src/generated`).
+2. Only when no patched release exists: a reviewed, expiring entry in
+   `frontend/audit-exceptions.json` (or `deny.toml`'s ignore list, with the
+   reason).
+3. Bring the blocked pull request up to date with main; its run then passes.
 ## Measuring a run
 
 `python3 scripts/ci-run-report.py --pr <number> --wait` (or `--sha <commit>`,
