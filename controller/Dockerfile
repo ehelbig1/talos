@@ -3,7 +3,7 @@
 # ════════════════════════════════════════════════════════════════════════════
 # Stage 1: Runtime tools (cached — only rebuilds when this block changes)
 # ════════════════════════════════════════════════════════════════════════════
-FROM rust:1.96@sha256:1f0dbad1df66647807e6952d1db85d0b2bda7606cb2139d82517e4f009967376 AS runtime-base
+FROM rust:1.99@sha256:15ad267e7a4cb2dce5905c90c76765adb6714945c5ea6d7c82673897a5e4067b AS runtime-base
 
 RUN apt-get update && apt-get install -y ca-certificates git && rm -rf /var/lib/apt/lists/*
 # The base image's toolchain IS the pin (rust-toolchain.toml's channel) — no
@@ -91,7 +91,7 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
 # ════════════════════════════════════════════════════════════════════════════
 # Stage 2: Build the controller binary
 # ════════════════════════════════════════════════════════════════════════════
-FROM rust:1.96@sha256:1f0dbad1df66647807e6952d1db85d0b2bda7606cb2139d82517e4f009967376 AS builder
+FROM rust:1.99@sha256:15ad267e7a4cb2dce5905c90c76765adb6714945c5ea6d7c82673897a5e4067b AS builder
 
 # All Talos crates — including the engine + protocol crates folded
 # back from the sibling repo in May-2026 — live in this single

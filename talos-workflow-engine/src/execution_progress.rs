@@ -508,7 +508,10 @@ mod tests {
         let out = render_attribution(vec![(label, 1_000)], 0);
         assert!(out.contains('…'), "expected ellipsis, got: {out}");
         // Char-count cap, not byte-count — a byte slice would panic here.
-        assert!(out.chars().filter(|c| *c == 'é').count() == MAX_RENDERED_LABEL_CHARS);
+        assert_eq!(
+            out.chars().filter(|c| *c == 'é').count(),
+            MAX_RENDERED_LABEL_CHARS
+        );
     }
 
     #[test]

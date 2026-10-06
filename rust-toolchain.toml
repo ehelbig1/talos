@@ -5,10 +5,16 @@
 # releases (every 6 weeks) and drift causes CI-only failures the
 # moment a new lint lands.
 #
-# Bump strategy: when a new stable shipa nd we want to pick up
+# Bump strategy: when a new stable ships and we want to pick up
 # language features / lint improvements, run `rustup install <new>`
 # locally, run `cargo clippy --workspace -- -D warnings`, fix anything
 # that breaks, then bump this pin in the same PR. Always pin to a
 # specific minor version; never use `stable`.
-channel = "1.96"
+#
+# The same release is pinned in six more places, bumped together:
+# `rust-version` in Cargo.toml, RUST_TOOLCHAIN in quality.yml and ci.yml,
+# and the rust base image (by digest) in controller/Dockerfile,
+# worker/Dockerfile and Dockerfile.builder. `make lint` runs
+# scripts/check-rust-pins.py, which refuses a bump that missed one.
+channel = "1.99"
 components = ["rustfmt", "clippy"]

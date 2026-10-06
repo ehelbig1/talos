@@ -5536,7 +5536,7 @@ async fn handle_clone_actor(
             "memories_copied": outcome.memories_copied,
             "memory_note": "Semantic and episodic memories were copied. Working and scratchpad memories were excluded (ephemeral, run-specific).",
             "next_steps": [
-                format!("Define this actor's persona with actor_remember if it should differ from the source"),
+                "Define this actor's persona with actor_remember if it should differ from the source".to_string(),
                 format!("Create workflows for this actor by passing actor_id: '{}' to create_workflow", new_actor_id),
                 format!("Review the cloned budget with get_actor_budget(actor_id: '{}')", new_actor_id),
                 format!("Review the cloned approval policies with list_actor_approval_policies(actor_id: '{}')", new_actor_id),

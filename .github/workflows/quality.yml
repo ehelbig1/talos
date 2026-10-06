@@ -76,7 +76,7 @@ env:
   CACHE_SAVE: ${{ github.ref == 'refs/heads/main' }}
   # Single source of truth for the toolchain — keep in lockstep with ci.yml
   # and rust-toolchain.toml.
-  RUST_TOOLCHAIN: "1.96"
+  RUST_TOOLCHAIN: "1.99"
 
 concurrency:
   # Only PR runs cancel each other (a newer push to the branch supersedes the
@@ -226,6 +226,12 @@ jobs:
 
       - name: Changed-areas classifier (job groups, dependency files)
         run: bash scripts/tests/ci-changed-areas-test.sh
+
+      - name: Rust toolchain pin check
+        # scripts/check-rust-pins.py (run by `make lint`) compares the seven
+        # places the toolchain is pinned; its self-test drives a drifted copy
+        # of each one, a missing pin and an undigested base image.
+        run: python3 scripts/check-rust-pins.py --self-test
 
       - name: CI disk-freeing script acts only when space is short
         run: bash scripts/tests/ci-free-disk-test.sh

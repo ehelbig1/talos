@@ -956,7 +956,7 @@ impl Drop for StreamRegistry {
             Ok(t) => t,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for (_, h) in tasks.iter() {
+        for h in tasks.values() {
             h.abort();
         }
     }

@@ -29,7 +29,7 @@ env:
   # Single source of truth — bumping the toolchain only here keeps every
   # job in lockstep. rust-toolchain.toml has the same value; both must
   # be bumped together.
-  RUST_TOOLCHAIN: "1.96"
+  RUST_TOOLCHAIN: "1.99"
 
 # Cancel in-flight runs of the same workflow + ref when a new push lands.
 # Frees runner minutes on rapid-fire commits.

@@ -103,6 +103,12 @@ unreachable_pub = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+# New in the 1.99 toolchain's pedantic set: it asks for
+# `assert_eq!(v, [] as [T; 0])` in place of `assert!(v.is_empty())`, so a
+# failure prints the value. Allowed when the toolchain moved (2026-10-06)
+# rather than rewriting 47 test assertions in that change; an assertion
+# whose value matters on failure can say so with a message.
+assert_is_empty = "allow"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
