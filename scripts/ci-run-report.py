@@ -147,7 +147,13 @@ def shard_facts(log: str) -> dict:
 def find_run(repo: str, sha: str, wait: bool) -> dict | None:
     deadline = time.time() + (600 if wait else 0)
     while True:
-        runs = json.loads(gh("api", f"repos/{repo}/actions/runs?head_sha={sha}&per_page=50"))["workflow_runs"]
+        try:
+            runs = json.loads(gh("api", f"repos/{repo}/actions/runs?head_sha={sha}&per_page=50"))["workflow_runs"]
+        except subprocess.CalledProcessError:
+            if not wait or time.time() >= deadline:
+                raise
+            time.sleep(10)
+            continue
         mine = [r for r in runs if r["path"].endswith(WORKFLOW)]
         if mine:
             return max(mine, key=lambda r: (r["run_attempt"], r["created_at"]))
@@ -310,9 +316,18 @@ def main() -> int:
                 print(f"no {WORKFLOW} run exists for commit {sha[:8]}."
                       " (A commit pushed to a branch whose pull request has merged gets none.)", file=sys.stderr)
                 return 2
+        failures = 0
         while a.wait and run["status"] != "completed":
             time.sleep(30)
-            run = json.loads(gh("api", f"repos/{a.repo}/actions/runs/{run['id']}"))
+            # A wait is long and the network is not: one unanswered poll
+            # (seen 2026-10-06, "dial tcp …: i/o timeout") must not end it.
+            try:
+                run = json.loads(gh("api", f"repos/{a.repo}/actions/runs/{run['id']}"))
+                failures = 0
+            except subprocess.CalledProcessError:
+                failures += 1
+                if failures >= 10:
+                    raise
         return report(a.repo, run)
     except subprocess.CalledProcessError as e:
         print(f"gh failed: {(e.stderr or '').strip()[:300]}", file=sys.stderr)
