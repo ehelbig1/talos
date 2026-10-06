@@ -141,13 +141,25 @@ save nothing.
   run went from about 23 minutes to 14–15; the unit job and the shards are
   now level.
 
-## The integration job runs as three shards
+## The integration job runs in shards
 
 `TALOS_IT_SHARD=i/n make test-integration` runs every n-th work item
 (round-robin), each shard on its own runner with its own Postgres/Redis/NATS.
-`TALOS_IT_LIST_ONLY=1` prints a shard's items without Docker. Check 88's
-PREPARE probe runs on shard 1 only. `Swatinem/rust-cache` saves from shard 1
-only, so three shards do not race one cache key.
+`quality.yml` runs four (three until 2026-10-06, when the slowest shard, at
+15.2 minutes, was the whole run's wall time). `TALOS_IT_LIST_ONLY=1` prints a
+shard's items without Docker. Check 88's PREPARE probe runs on shard 1 only.
+`Swatinem/rust-cache` saves from shard 1 only, so the shards do not race one
+cache key.
+
+A shard builds its controller test binaries in ONE `cargo test --no-run` call
+before it runs them one by one. Built one at a time they cost 3.0 seconds
+each — 7.0 minutes across 138 binaries, against 10.1 minutes of running
+their tests (run 37403154166).
+
+The unit tests are two jobs side by side: `Rust tests (unit / lib)` runs the
+library and binary unit tests, `Rust tests (DB-free binaries + doctests)` the
+`tests/` binaries that need no service, and the doctests. They were one job
+that did the two builds back to back.
 
 **Build once was measured and not done.** A `cargo nextest archive` shared
 between shards would carry ~150 integration binaries, each statically linked

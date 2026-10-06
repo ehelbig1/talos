@@ -224,7 +224,8 @@ jobs:
         # leg 7, the installer); CI proves the route derivation it relies on.
         run: python3 scripts/check-route-extensions.py --self-test
 
-  # ── Rust unit tests: library unit tests + the DB-free integration binaries ──
+  # ── Rust unit tests: library unit tests (this job) and the DB-free ─────────
+  # integration binaries + doctests (`test-dbfree`, the job after it) ─────────
   # The bulk is `--lib` (~1.3k DB-free unit tests). On top of that we explicitly
   # run the two `tests/`-dir integration binaries that are DB-free once their
   # never-in-CI bugs were fixed: `module_template_tests` (disk template
@@ -316,6 +317,90 @@ jobs:
         # a guard that exists and is never consulted.
         run: cargo nextest run --workspace --lib --bins --no-fail-fast
 
+      - name: Disk at the end of the job
+        # What the job needed, kept in every log: the figure the 40 GB
+        # threshold above rests on.
+        if: always()
+        run: df -h /
+
+  # ── The DB-free test binaries and the doctests, beside the unit job ────────
+  # These ran as the unit job's second and third steps until 2026-10-06, so
+  # the job was two builds back to back (6.8 + 4.4 + 0.8 minutes) and, with the
+  # slowest integration shard, set the whole run's wall time. They need
+  # nothing the unit tests produce, so they are a job of their own.
+  test-dbfree:
+    name: Rust tests (DB-free binaries + doctests)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # `--lib` tests are DB-free (no Postgres service needed). Keep a non-zero
+      # master key + JWT secret as defensive env in case a lib test constructs
+      # SecretsManager/AuthService (all-zero is rejected). 64 hex = 32 bytes.
+      TALOS_MASTER_KEY: "00000000000000000000000000000000000000000000000000000000deadbeef"
+      JWT_SECRET: "ci-jwt-secret-32-bytes-of-padding-zzzzz"
+      # Trim debuginfo so the workspace debug build doesn't exhaust runner disk.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space if it is short
+        # Does nothing on a runner with 40 GB free (they start with 86 GB and a
+        # job adds about 25 GB); below that it deletes the unused toolchains in
+        # the background. Deleting them every time, in the foreground, cost
+        # 1.5-6 minutes per job (scripts/ci-free-disk.sh).
+        run: bash scripts/ci-free-disk.sh
+
+      - name: Install mold linker
+        # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
+        # so a Linux host can't link the workspace without mold installed.
+        # 2026-08-19: apt stalls on the hosted runners cancelled four jobs
+        # across #646 and #658 — the integration job burned its FULL 40-minute
+        # cap twice in a row on this exact line, and the migration job its
+        # 15-minute cap twice on the pgdg install. A stall with no step timeout
+        # costs the whole job budget and reports as a code failure, so this
+        # retries and fails fast instead.
+        timeout-minutes: 6
+        run: |
+          # 2026-08-19 (#659 follow-up): the retry alone did NOT help, because
+          # apt HANGS rather than failing — the first attempt consumed the whole
+          # 6-minute step budget and attempts 2/3 never ran. A retry only helps
+          # against a FAST failure; a hang needs a per-ATTEMPT timeout. Budget:
+          # 3 x 90s + 10s + 20s = 300s, inside the 6-minute step cap.
+          for attempt in 1 2 3; do
+            if sudo timeout 90 apt-get update -qq \
+               && sudo timeout 90 apt-get install -y -qq mold; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt}/3 failed or timed out; retrying" >&2
+            sleep $((attempt * 10))
+          done
+          echo "::error::apt-get failed to install mold after 3 attempts" >&2
+          exit 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # The unit job's cache: the same dependencies in the same profile.
+          # Only that job saves it, so the two do not race one key.
+          shared-key: quality-test
+          save-if: false
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@59012be0884e296ca2da49b530610e72c49039ad # v2.81.6
+        with:
+          tool: cargo-nextest
+
       # Every tests/ binary that needs no service: discovered by
       # scripts/ci_test_targets.py (`dbfree`), so a new test file registers
       # itself — no hand-kept `--test` list for parallel PRs to collide on.
@@ -323,8 +408,8 @@ jobs:
         run: bash scripts/ci-run-dbfree-tests.sh
 
       - name: Run doctests
-        # nextest does NOT run doctests (a documented limitation), so the steps
-        # above skip them entirely — they were dropped from CI and went unrun.
+        # nextest does NOT run doctests (a documented limitation), so the
+        # nextest steps skip them entirely — they were dropped from CI and went unrun.
         # `cargo test --doc` is the only runner for them. ~218 doctests across
         # the workspace, all DB-free. Confirmed green before re-adding (the last
         # item from the never-in-CI sweep's docs/backlog.md note).
@@ -450,20 +535,21 @@ jobs:
   # This is the gate that catches what `cargo nextest` SKIPS — e.g. the RLS
   # write-isolation regression in PR #181/#182.
   integration:
-    name: Rust tests (integration / DB) ${{ matrix.shard }}/3
+    name: Rust tests (integration / DB) ${{ matrix.shard }}/4
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     # One ~23-minute serial job was the whole run's critical path. The work
     # list partitions exactly (scripts/test-integration.sh, TALOS_IT_SHARD),
-    # so three runners each compile and run a third of it.
+    # so four runners each compile and run a quarter of it (three until
+    # 2026-10-06: the slowest shard, 15.2 minutes, was the run's wall time).
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     env:
-      TALOS_IT_SHARD: "${{ matrix.shard }}/3"
+      TALOS_IT_SHARD: "${{ matrix.shard }}/4"
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -513,7 +599,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: quality-integration
-          # Three shards share one key; letting all three save races for the
+          # The shards share one key; letting all of them save races for the
           # same cache entry. Shard 1 saves; the dependency graph it caches is
           # what the other two reuse. And only on `main` — see CACHE_SAVE.
           save-if: ${{ env.CACHE_SAVE == 'true' && matrix.shard == 1 }}
@@ -1025,7 +1111,7 @@ jobs:
   gate:
     name: Quality gate
     if: always()
-    needs: [changes, audit, test, alert-rules, catalog, integration, frontend, schema-baseline, sqlx-cache, lint, clippy]
+    needs: [changes, audit, test, test-dbfree, alert-rules, catalog, integration, frontend, schema-baseline, sqlx-cache, lint, clippy]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
