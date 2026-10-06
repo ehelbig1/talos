@@ -78,9 +78,21 @@ def runner_image(lines: list[str]) -> str | None:
 
 
 def cache_state(lines: list[str]) -> str | None:
+    """`hit`, `hit (older lockfile)`, or `MISS` — plus `, saved` on main.
+
+    The action's wording moved with its version: "Cache hit for: <key>"
+    (v2.9.1), then "Cache hit for restore-key: <key>" / "Cache restored
+    successfully" (the release the 2026-10-06 actions bump brought in). A
+    restore-key hit is the cache of an OLDER lockfile: the changed
+    dependencies are compiled, the rest are not.
+    """
     state = None
     for line in lines:
-        if "Cache hit for:" in line or "Cache restored from key" in line:
+        if "Cache hit for restore-key" in line:
+            state = "hit (older lockfile)"
+        elif "Cache hit for" in line or "Cache restored from key" in line:
+            state = "hit"
+        elif "Cache restored successfully" in line and state is None:
             state = "hit"
         elif "No cache found" in line:
             state = "MISS"
@@ -213,7 +225,8 @@ def report(repo: str, run: dict) -> int:
                 if f["slow_drops"] and max(f["slow_drops"]) >= 10:
                     notes.append(
                         f"{job['name']}: {len(f['slow_drops'])} DROP DATABASE of up to {max(f['slow_drops']):.1f} s"
-                        " — the login-timeout stall (docs/ci.md)"
+                        " — longer than the 5 s the login-timeout stall is bounded at (docs/ci.md):"
+                        " a Postgres without that timeout, or something else"
                     )
                 if f["postgres"]:
                     last = f["postgres"][-1]
@@ -275,6 +288,8 @@ def self_test() -> int:
     assert runner_image(lines) == "20260101.1.1", runner_image(lines)
     assert cache_state(lines) == "hit", cache_state(lines)
     assert cache_state(["No cache found.", "... Saving cache ..."]) == "MISS, saved"
+    assert cache_state(["... Restoring cache ...", "Cache hit for restore-key: v0-rust-made-up", "Cache restored successfully"]) == "hit (older lockfile)"
+    assert cache_state(["Cache restored successfully"]) == "hit"
     assert cache_state(["nothing about a cache"]) is None
     f = shard_facts(log)
     assert f["items"] == 2 and abs(f["build_minutes"] - 2.5) < 1e-6, f

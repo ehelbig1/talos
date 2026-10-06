@@ -177,6 +177,25 @@ One run each, and each differs from the last by more than one change's
 worth of noise (a cold cache job in the third row, three stalls in the
 fourth).
 
+## Observed later the same day: whose login it is
+
+Run 37500050166, shard 2/4, with the report keeping timed-out logins:
+
+```
+17:11:45.744 [290] db=test_1f98b3b646a7469e885ee575c6d0a853 FATAL:  canceling authentication due to timeout
+17:11:45.804 [291] db=postgres LOG:  duration: 5024.747 ms  … DROP DATABASE IF EXISTS "test_1f98b3b646a7469e885ee575c6d0a853" WITH (FORCE)
+```
+
+The login Postgres gave up on was a connection to the SAME test database the
+harness was dropping, 60 ms before that drop completed after 5.02 s. That
+is the reading, observed: a connection the test's own pool was opening is
+frozen while `TestDb::drop` blocks the runtime, and the drop waits for it.
+
+The same report shows three `DROP DATABASE` of 15.9–17.5 s finishing in the
+same 5 ms with NO timed-out login and no barrier wait logged. That is not
+this stall; one occurrence, on a run whose other steps were slow too. Cause
+unknown.
+
 ## Deliberately not done
 
 * **Running binaries in parallel inside a shard.** The `tc` binaries are
