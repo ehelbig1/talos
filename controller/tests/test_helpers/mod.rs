@@ -9,8 +9,9 @@ use tokio::sync::OnceCell;
 // ─────────────────────────────────────────────────────────────────────────
 // Reaping the shared container.
 //
-// testcontainers 0.23.3 has NO reaper: default features are `[]` (no `ryuk`,
-// no `watchdog`), and `core/ports.rs` hardcodes `"AutoRemove": false`. The one
+// testcontainers has NO reaper by default (checked again at 0.27.3: the default
+// feature is `ring` alone — the `watchdog` feature is off — and `core/ports.rs`
+// still hardcodes `"AutoRemove": false`). The one
 // and only remover is `ContainerAsync::drop`, which issues `docker rm` — and
 // `PG_CONTAINER` below is a `static`, which Rust never drops at process exit.
 // Result, measured: `cargo test -p controller --test <any of the 14 binaries>`

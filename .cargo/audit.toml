@@ -22,10 +22,4 @@ ignore = [
     "RUSTSEC-2026-0249",  # smartstring unmaintained (rhai)
     "RUSTSEC-2026-0253",  # lru pop() unsound — keys cannot panic on drop
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained (build-time, age)
-
-    # audit-only: tokio-tar is a DEV dependency (testcontainers). cargo-deny
-    # filters dev deps (`exclude-dev = true`); cargo-audit reads Cargo.lock
-    # and cannot, so it needs the explicit ignore. No production binary
-    # links tokio-tar.
-    "RUSTSEC-2025-0111",
 ]
