@@ -208,6 +208,11 @@ jobs:
       - name: CI disk-freeing script acts only when space is short
         run: bash scripts/tests/ci-free-disk-test.sh
 
+      - name: Integration shards partition the work list
+        # scripts/ci_shard.py deals the suite to shards by measured duration;
+        # every item must land on exactly one shard, whatever the count.
+        run: bash scripts/tests/ci-shard-test.sh
+
       - name: Chart Vault init Job + unsealer sidecar against a real Vault
         # deploy/helm/talos/files/vault-init.sh and vault-unseal-loop.sh, driven
         # against the chart's pinned hashicorp/vault image with a fake kubectl:
@@ -542,8 +547,9 @@ jobs:
     timeout-minutes: 40
     # One ~23-minute serial job was the whole run's critical path. The work
     # list partitions exactly (scripts/test-integration.sh, TALOS_IT_SHARD),
-    # so four runners each compile and run a quarter of it (three until
+    # so four runners each compile and run a share of it (three until
     # 2026-10-06: the slowest shard, 15.2 minutes, was the run's wall time).
+    # The shares are dealt by measured duration (scripts/ci_shard.py).
     strategy:
       fail-fast: false
       matrix:

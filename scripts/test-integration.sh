@@ -21,11 +21,13 @@
 set -euo pipefail
 
 # ── Sharding ────────────────────────────────────────────────────────────────
-# TALOS_IT_SHARD=i/n runs every n-th work item starting at item i (1-based),
-# so quality.yml can split this suite across n runners. The work list below is
-# built in a fixed order, so the shards partition it exactly: every item runs on
-# exactly one shard, and `1/1` (the default, `make test-integration` locally) is
-# the whole suite. The services and databases above are cheap next to the
+# TALOS_IT_SHARD=i/n runs shard i (1-based) of n, so quality.yml can split
+# this suite across n runners. scripts/ci_shard.py deals the work list below
+# to the shards by measured duration (scripts/ci-test-weights.tsv; an item the
+# table does not name is dealt as a small one), from the list and the table
+# alone — so every shard computes the same deal and the shards partition the
+# list exactly: every item runs on exactly one shard, and `1/1` (the default,
+# `make test-integration` locally) is the whole suite. The services and databases above are cheap next to the
 # compile, so every shard builds its own; check 88's PREPARE probe is a
 # property of the tree, not of a shard, so only shard 1 runs it.
 SHARD="${TALOS_IT_SHARD:-1/1}"
@@ -68,14 +70,26 @@ for cat in ctrl ctrl-serial tc; do
 done
 [ "${#WORK[@]}" -gt 0 ] || { echo "✗ empty work list — discovery is broken" >&2; exit 1; }
 
+# This shard's items, in list order. Captured, not streamed: a failed deal must
+# stop the run here — an empty selection would otherwise "pass" having run
+# nothing.
+selected="$(printf '%s\n' "${WORK[@]}" \
+    | python3 scripts/ci_shard.py select "$SHARD_I" "$SHARD_N" --weights scripts/ci-test-weights.tsv)"
+SELECTED=()
+while IFS= read -r line; do
+    [ -n "$line" ] && SELECTED+=("$line")
+done <<< "$selected"
+if [ "${#SELECTED[@]}" -eq 0 ] && [ "${#WORK[@]}" -ge "$SHARD_N" ]; then
+    echo "✗ shard ${SHARD_I}/${SHARD_N} was dealt nothing from ${#WORK[@]} work items" >&2
+    exit 1
+fi
+
 if [ "${TALOS_IT_LIST_ONLY:-0}" = "1" ]; then
-    for idx in "${!WORK[@]}"; do
-        [ $(( idx % SHARD_N + 1 )) -eq "$SHARD_I" ] && printf '%s\n' "${WORK[$idx]}"
-    done
+    printf '%s\n' ${SELECTED[@]+"${SELECTED[@]}"}
     exit 0
 fi
 
-echo "▶ shard ${SHARD_I}/${SHARD_N}: $(( (${#WORK[@]} - SHARD_I) / SHARD_N + 1 )) of ${#WORK[@]} work items"
+echo "▶ shard ${SHARD_I}/${SHARD_N}: ${#SELECTED[@]} of ${#WORK[@]} work items"
 
 REDIS_PORT="${TALOS_IT_REDIS_PORT:-16399}"
 PG_PORT="${TALOS_IT_PG_PORT:-15435}"
@@ -327,9 +341,8 @@ CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbee
 # runs it. A failure here is not the verdict: each item still builds its own
 # binary below, where a compile error is attributed to the test it belongs to.
 PREBUILD=()
-for idx in "${!WORK[@]}"; do
-    [ $(( idx % SHARD_N + 1 )) -eq "$SHARD_I" ] || continue
-    IFS='|' read -r kind crate what extra <<< "${WORK[$idx]}"
+for item in ${SELECTED[@]+"${SELECTED[@]}"}; do
+    IFS='|' read -r kind crate what extra <<< "$item"
     case "$kind" in ctrl|ctrl-serial|tc) PREBUILD+=(--test "$what") ;; esac
 done
 if [ "${#PREBUILD[@]}" -gt 0 ]; then
@@ -342,10 +355,9 @@ fi
 
 rc=0
 ran=0
-for idx in "${!WORK[@]}"; do
-    [ $(( idx % SHARD_N + 1 )) -eq "$SHARD_I" ] || continue
+for item in ${SELECTED[@]+"${SELECTED[@]}"}; do
     ran=$((ran + 1))
-    IFS='|' read -r kind crate what extra <<< "${WORK[$idx]}"
+    IFS='|' read -r kind crate what extra <<< "$item"
     echo
     case "$kind" in
         store)

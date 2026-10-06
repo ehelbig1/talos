@@ -143,13 +143,27 @@ save nothing.
 
 ## The integration job runs in shards
 
-`TALOS_IT_SHARD=i/n make test-integration` runs every n-th work item
-(round-robin), each shard on its own runner with its own Postgres/Redis/NATS.
-`quality.yml` runs four (three until 2026-10-06, when the slowest shard, at
-15.2 minutes, was the whole run's wall time). `TALOS_IT_LIST_ONLY=1` prints a
-shard's items without Docker. Check 88's PREPARE probe runs on shard 1 only.
-`Swatinem/rust-cache` saves from shard 1 only, so the shards do not race one
-cache key.
+`TALOS_IT_SHARD=i/n make test-integration` runs shard i of n, each shard on
+its own runner with its own Postgres/Redis/NATS. `quality.yml` runs four
+(three until 2026-10-06, when the slowest shard, at 15.2 minutes, was the
+whole run's wall time). `TALOS_IT_LIST_ONLY=1` prints a shard's items without
+Docker. Check 88's PREPARE probe runs on shard 1 only. `Swatinem/rust-cache`
+saves from shard 1 only, so the shards do not race one cache key.
+
+**The work is dealt by measured duration**, not every n-th item
+(`scripts/ci_shard.py`, table `scripts/ci-test-weights.tsv`). Ten of the 182
+items are 46% of the test time, and round-robin put five of them on one
+shard: 7.6 minutes of tests against 3.0–4.7 on the others (run 37461915856).
+The deal is longest-first greedy, computed from the list and the table
+alone, so the shards still partition the list exactly
+(`scripts/tests/ci-shard-test.sh`).
+
+* **Adding a test file still needs no CI edit.** An item the table does not
+  name is dealt as a 3-second one; a deleted test's entry is ignored.
+* **Refresh the table when the shards drift apart** (a full run's shard times
+  differ by more than a couple of minutes):
+  `python3 scripts/ci_shard.py weights --run <a green run's id> > scripts/ci-test-weights.tsv`.
+  It reads that run's shard logs and lists the items of 5 seconds or more.
 
 A shard builds its controller test binaries in ONE `cargo test --no-run` call
 before it runs them one by one. Built one at a time they cost 3.0 seconds

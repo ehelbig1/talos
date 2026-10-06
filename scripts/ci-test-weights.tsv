@@ -1,0 +1,45 @@
+# Seconds each integration work item took, for scripts/ci_shard.py.
+# Measured from run 37461915856 of ehelbig1/talos: 182 items, 19.2 minutes;
+# the 40 of 5 s or more are listed (14.4 minutes).
+# An item not listed weighs 3 s. Refresh:
+#   python3 scripts/ci_shard.py weights --run <a green run's id> > scripts/ci-test-weights.tsv
+71	talos-worker-runtime|--lib expose_limit_absence_tests
+63	talos-audit-ledger|audit_ledger_stream_bounds
+63	controller|approval_policy_trigger_refusal_tests
+62	controller|actor_clone_parity_tests
+60	talos-rpc-subscribers|--lib guest_session::db_tests
+51	controller|password_change_tests
+48	controller|auth_tests
+40	talos-workflow-engine-nats|nats_worker_permissions
+36	talos-rpc-subscribers|--lib kernel_two_replica
+32	controller|claim_read_disclosure_tier4_tests
+32	talos-advanced-repository|scratch_rls
+24	talos-workflow-engine-nats|--lib full_claim_loop
+22	controller|two_factor_session_tests
+19	controller|auth_concurrency_tests
+16	controller|credential_audit_record_tests
+16	controller|privileged_second_factor_tests
+13	talos-idempotency|middleware_integration
+12	talos-local-inference|fleet_redis
+12	talos-execution-repository|crash_recovery
+11	controller|execution_retention_tests
+10	controller|actor_memory_dek_tests
+10	talos-integration-helpers|absence_vs_failure
+10	controller|actor_memory_sweep_dek_tests
+10	talos-actor-repository|write_ceiling_guard_integration
+10	talos-totp-2fa|--lib redis_lockout_tests
+9	talos-actor-repository|budget_guard_integration
+9	talos-memory|integration
+9	controller|github_connect_flow_tests
+9	controller|api_key_tests
+8	controller|registry_catalog_install_tests
+8	controller|privilege_audit_record_tests
+8	talos-idempotency|redis_integration
+8	talos-analytics-repository|fuel_headroom
+8	talos-execution-repository|stale_execution_sweep
+7	controller|workflow_version_tests
+7	talos-tenancy|rls_integration
+7	controller|registry_tests
+6	controller|oauth_tests
+5	controller|module_payload_dek_tests
+5	controller|secrets_tests
