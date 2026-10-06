@@ -65,7 +65,7 @@ sqlparser = { version = "0.53", features = ["visitor"] }  # AST-based SQL valida
 talos-sql-classify = { path = "../talos-sql-classify" }  # THE read-only/mutation classifier, shared with the controller
 
 # Security & sandboxing
-cap-std = "3.4"  # Capability-based filesystem security
+cap-std = "4.0"  # Capability-based filesystem security
 tempfile = "3"  # Ephemeral per-execution sandbox directories (auto-shredded on Drop)
 
 # HTTP client

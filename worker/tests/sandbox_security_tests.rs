@@ -596,6 +596,89 @@ async fn json_path_depth_at_boundary_accepted() {
 }
 
 // ===========================================================================
+// 4b. A symlink out of the sandbox is not followed
+//
+// Every test in section 4 is refused by `sanitize_path`, a check on the
+// path's text, before the capability library is asked anything. A symlink is
+// the case text cannot see: `link` is a perfectly ordinary relative name. What
+// refuses it is cap-std resolving the path beneath the sandbox directory —
+// the property a new release of that library must keep (added with the move
+// to cap-std 4, 2026-10-06).
+// ===========================================================================
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlink_out_of_the_sandbox_is_not_followed() {
+    use worker::bindings::talos::core::files::Host;
+    let mut ctx = make_fs_context();
+
+    // A file OUTSIDE the sandbox, beside it in the temp directory.
+    let outside_name = format!("talos-outside-{}", uuid::Uuid::new_v4());
+    let outside = std::env::temp_dir().join(&outside_name);
+    std::fs::write(&outside, b"outside-the-sandbox").expect("write the outside file");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(outside.clone());
+
+    // Control: an ordinary file inside the sandbox reads back.
+    let marker = format!("marker-{}", uuid::Uuid::new_v4());
+    ctx.write(marker.clone(), b"inside".to_vec())
+        .await
+        .expect("write inside the sandbox");
+    assert_eq!(
+        ctx.read(marker.clone()).await.expect("read inside"),
+        b"inside"
+    );
+
+    // The sandbox's own host path, found by its marker, so the links below
+    // can be planted and checked with ambient authority.
+    let sandbox = std::fs::read_dir(std::env::temp_dir())
+        .expect("list the temp directory")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.join(&marker).is_file())
+        .expect("the sandbox is a directory in the temp directory");
+
+    std::os::unix::fs::symlink(format!("../{outside_name}"), sandbox.join("link"))
+        .expect("plant a file symlink");
+    std::os::unix::fs::symlink("..", sandbox.join("up")).expect("plant a directory symlink");
+
+    // Control: followed with ambient authority, both links DO lead outside.
+    assert_eq!(
+        std::fs::read(sandbox.join("link")).expect("ambient read through the link"),
+        b"outside-the-sandbox"
+    );
+    assert_eq!(
+        std::fs::read(sandbox.join("up").join(&outside_name)).expect("ambient read via up/"),
+        b"outside-the-sandbox"
+    );
+
+    // Through the host functions a module calls, neither is followed.
+    for path in ["link".to_string(), format!("up/{outside_name}")] {
+        assert!(
+            ctx.read(path.clone()).await.is_err(),
+            "read of {path} must not leave the sandbox"
+        );
+        assert!(
+            ctx.write(path.clone(), b"overwritten".to_vec())
+                .await
+                .is_err(),
+            "write to {path} must not leave the sandbox"
+        );
+        let _ = ctx.delete(path.clone()).await;
+    }
+    assert_eq!(
+        std::fs::read(&outside).expect("the outside file is still there"),
+        b"outside-the-sandbox",
+        "the outside file must be untouched"
+    );
+}
+
+// ===========================================================================
 // 6. XML depth limit (>256 nesting levels rejected)
 // ===========================================================================
 

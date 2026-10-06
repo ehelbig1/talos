@@ -30,7 +30,7 @@ talos-capability-world = { path = "../talos-capability-world", version = "0.1" }
 talos-config = { path = "../talos-config", version = "0.1.0" }
 anyhow = "1.0"
 async-trait = "0.1"
-cap-std = "3.4"
+cap-std = "4.0"
 dashmap = "6.1.0"
 futures = "0.3"
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.3" }
