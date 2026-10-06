@@ -42,7 +42,7 @@ fi
 
 has() { printf '%s\n' "$files" | grep -qE "$1"; }
 
-if has '^\.github/workflows/|^scripts/ci-changed-areas\.sh$|^scripts/ci_test_targets\.py$|^scripts/ci-run-dbfree-tests\.sh$|^Makefile$'; then
+if has '^\.github/workflows/|^scripts/ci-changed-areas\.sh$|^scripts/ci_test_targets\.py$|^scripts/ci_shard\.py$|^scripts/ci-test-weights\.tsv$|^scripts/ci-run-dbfree-tests\.sh$|^Makefile$'; then
     emit_all
     exit 0
 fi
