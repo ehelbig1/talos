@@ -1121,6 +1121,11 @@ jobs:
       - name: Structural lints (incl. rustfmt = check 35, WIT drift = check 16)
         run: bash scripts/lint-structural.sh
 
+      - name: Declared dependencies are used
+        # `make lint` runs this locally; this job runs the structural script
+        # directly, so the check is named here too or CI never runs it.
+        run: python3 scripts/check-unused-deps.py
+
       - name: Changelog fragments are well-formed
         run: |
           python3 scripts/changelog-fragments.py self-test
