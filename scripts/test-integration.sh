@@ -113,7 +113,7 @@ PG_PASS="test"
 # The `tc` binaries (scripts/ci_test_targets.py — formerly the TC_TESTS array)
 # self-provision their own Postgres through controller/tests/test_helpers,
 # which holds the handle in a `static`. Statics are never dropped,
-# testcontainers 0.23.3 has no reaper, and
+# testcontainers (0.27.3) has no reaper by default, and
 # `AutoRemove` is hardcoded false — so before this each binary left one live
 # Postgres behind and one run of this script leaked >= 14 of them.
 #
