@@ -49,10 +49,14 @@ Nine cached jobs, five on image `20261004.327.1` and four on
 Every job missed, as expected: the key changed once and a pull request
 never saves a cache. That run took 15.2 minutes.
 
-## Not yet seen
+## Seen: a hit from both runner images
 
-A cache HIT on the new key from either image: it needs a run that starts
-after main's run for this change has saved the caches.
+Run 37500050166 (2026-10-06, #1154): the cached jobs were split across
+images `20261004.327.1` (clippy, integration 1/4 and 2/4) and
+`20260927.320.1` (the rest), and **every one restored the cache** — the
+shards under one key family whichever image they were on. (As
+"restore-key" hits: that pull request changes `Cargo.lock`, so each job
+restored the previous lockfile's cache and compiled what had changed.)
 
 ## Considered and not done
 
