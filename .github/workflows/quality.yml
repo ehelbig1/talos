@@ -218,6 +218,9 @@ jobs:
         # every item must land on exactly one shard, whatever the count.
         run: bash scripts/tests/ci-shard-test.sh
 
+      - name: CI run report reads a job log
+        run: python3 scripts/ci-run-report.py --self-test
+
       - name: Chart Vault init Job + unsealer sidecar against a real Vault
         # deploy/helm/talos/files/vault-init.sh and vault-unseal-loop.sh, driven
         # against the chart's pinned hashicorp/vault image with a fake kubectl:
