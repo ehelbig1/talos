@@ -85,6 +85,125 @@ pub fn budget_alert(actor_id: Uuid, cap: BudgetCap, limit: i64, count: i64) -> N
     }
 }
 
+/// The ops-alert dedup key for "this actor was suspended by its budget" —
+/// one per actor, under the reserved `talos/` prefix, and NOT under
+/// `…/budget/`: it is a state the actor is in, not one more refusal.
+#[must_use]
+pub fn suspension_alert_dedup_key(actor_id: Uuid) -> String {
+    format!("talos/actor/{actor_id}/suspended")
+}
+
+/// The ops alert raised when a budget SUSPENDS an actor. Identifiers and
+/// counts only. `high`: from this moment every start on the actor is refused
+/// until a person resumes it.
+#[must_use]
+pub fn suspension_alert(actor_id: Uuid, cap: BudgetCap, limit: i64, count: i64) -> NewOpsAlert {
+    NewOpsAlert {
+        source: "talos".to_string(),
+        external_id: None,
+        dedup_key: suspension_alert_dedup_key(actor_id),
+        title: format!(
+            "Actor suspended by its budget ({}): {count} against a limit of {limit}. \
+             Every start on it is refused until it is resumed",
+            cap.as_str()
+        ),
+        resource: Some(format!("actor:{actor_id}")),
+        severity_raw: None,
+        severity_hint: Some("high".to_string()),
+        raw: Some(serde_json::json!({
+            "actor_id": actor_id,
+            "cap": cap.as_str(),
+            "limit": limit,
+            "count": count,
+            "on_budget_exceeded": "suspend",
+            "resume_with": "update_actor_status(actor_id, \"active\")",
+        })),
+    }
+}
+
+/// Record that a budget has just SUSPENDED `actor_id` — call it only when the
+/// suspension is this call's doing (the row went `active` → `suspended`).
+///
+/// Measured 2026-10-05: an actor reached its hourly cap under
+/// `on_budget_exceeded = suspend`, was suspended, and every workflow bound to
+/// it was refused for 1 h 45 min. Nothing said so — a suspension was a status
+/// column and, on each refused start, a WARN in the controller log. The
+/// refusals were counted (`talos_actor_budget_refusals_total`), but a refusal
+/// counter cannot tell "one start too many" from "nothing runs any more".
+///
+/// Not throttled: a suspended actor is refused by its status before any
+/// budget is read, so this is reached once per suspension. Like the refusal
+/// recorder it never fails — an unreadable actor or a failed write logs a
+/// WARN and the suspension stands.
+pub async fn record_actor_budget_suspension(
+    pool: &PgPool,
+    actor_id: Uuid,
+    cap: BudgetCap,
+    limit: i64,
+    count: i64,
+) {
+    let (user_id, org_id) = match talos_ops_alert_store::actor_tenancy(pool, actor_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "actor_suspension_alert_not_raised",
+                %actor_id,
+                reason = "no_such_actor",
+                "suspension alert not raised: the actor row is gone"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "actor_suspension_alert_not_raised",
+                %actor_id,
+                reason = "tenancy_unreadable",
+                error = %e,
+                "suspension alert not raised: the actor's tenancy could not be read"
+            );
+            return;
+        }
+    };
+    if let Err(e) = talos_ops_alert_store::ingest(
+        pool,
+        user_id,
+        org_id,
+        suspension_alert(actor_id, cap, limit, count),
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "talos_audit",
+            event_kind = "actor_suspension_alert_not_raised",
+            %actor_id,
+            reason = e.metric_label(),
+            error = %e,
+            "suspension alert not raised: the ops_alerts write failed"
+        );
+    }
+}
+
+/// Close the suspension alert of an actor that has just been RESUMED. Takes
+/// the caller's executor so it can run inside the same tenant-scoped
+/// transaction as the status change. Returns whether an alert was open.
+pub async fn resolve_actor_suspension_alert<'e, E>(
+    executor: E,
+    user_id: Uuid,
+    actor_id: Uuid,
+) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    talos_ops_alert_store::resolve_by_dedup_key(
+        executor,
+        user_id,
+        &suspension_alert_dedup_key(actor_id),
+    )
+    .await
+}
+
 /// Whether an alert write for `key` is admitted at `now`, recording it if so.
 /// Pure over the map so the window and the bound are unit-tested.
 fn throttle_admits(
@@ -202,6 +321,47 @@ pub async fn record_actor_budget_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_suspension_alert_is_one_reserved_key_per_actor_outside_the_refusal_keys() {
+        let actor = Uuid::new_v4();
+        let alert = suspension_alert(actor, BudgetCap::PerHour, 40, 41);
+        assert_eq!(alert.source, "talos");
+        assert_eq!(alert.dedup_key, format!("talos/actor/{actor}/suspended"));
+        assert_eq!(alert.dedup_key, suspension_alert_dedup_key(actor));
+        // A refusal alert of the same actor is a different row.
+        assert_ne!(
+            alert.dedup_key,
+            budget_alert(actor, BudgetCap::PerHour, 40, 41).dedup_key
+        );
+        assert_ne!(
+            suspension_alert_dedup_key(actor),
+            suspension_alert_dedup_key(Uuid::new_v4())
+        );
+        assert_eq!(alert.severity_hint.as_deref(), Some("high"));
+        assert_eq!(alert.resource.as_deref(), Some(&*format!("actor:{actor}")));
+        assert!(
+            alert.title.contains("41 against a limit of 40"),
+            "{}",
+            alert.title
+        );
+        assert!(alert.title.contains("per_hour"), "{}", alert.title);
+        // Identifiers and counts only.
+        let raw = alert.raw.expect("raw");
+        let mut keys: Vec<_> = raw.as_object().expect("object").keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "actor_id",
+                "cap",
+                "count",
+                "limit",
+                "on_budget_exceeded",
+                "resume_with"
+            ]
+        );
+    }
 
     #[test]
     fn throttle_admits_once_per_window_per_actor_and_cap() {

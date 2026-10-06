@@ -213,6 +213,40 @@ pub async fn ingest(
     })
 }
 
+/// Resolve the ACTIVE alert `user_id` holds under `dedup_key`
+/// (`resolved_source = 'signal'`). Only `new`/`acked` rows move, so a later
+/// re-fire still reopens through [`ingest`]. Returns whether a row moved; an
+/// alert that was never open is a normal no-op.
+///
+/// The one home for this statement (2026-10-06):
+/// `OpsAlertRepository::resolve_by_dedup_key` delegates here, and so does the
+/// actor repository when a resumed actor's suspension alert is closed — which
+/// is why it takes any executor: that call runs inside the caller's
+/// tenant-scoped transaction.
+pub async fn resolve_by_dedup_key<'e, E>(
+    executor: E,
+    user_id: Uuid,
+    dedup_key: &str,
+) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let dedup_key = truncate_chars(dedup_key, MAX_KEY_CHARS);
+    if dedup_key.is_empty() {
+        return Ok(false);
+    }
+    let res = sqlx::query(
+        "UPDATE ops_alerts \
+         SET status = 'resolved', resolved_at = NOW(), resolved_source = 'signal' \
+         WHERE user_id = $1 AND dedup_key = $2 AND status IN ('new','acked')",
+    )
+    .bind(user_id)
+    .bind(&dedup_key)
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// The `(user_id, org_id)` an actor's rows are scoped to, or `None` when no
 /// such actor exists. The one home for this read (package CD):
 /// `ActorRepository::get_actor_tenancy` delegates here.
