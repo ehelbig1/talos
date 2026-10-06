@@ -51,9 +51,10 @@ Smallest reach first, so the method is settled before the wide ones.
 
 1. **Done here:** `constant_time_eq` — removed as a direct dependency
    (`2026-10-06-csrf-compare-uses-subtle.md`).
-2. **One or few users:** `md5`, `quick-xml`, `criterion`, `cap-std`,
-   `petgraph`, `croner`. `croner` parses schedule expressions: compare the
-   next-run times of every schedule on the fleet before and after.
+2. **One or few users:** `md5` (#1161), `quick-xml` (#1162), `criterion`
+   (#1165), `cap-std` (#1166), `croner`. `croner` parses schedule
+   expressions: compare the next-run times of every schedule on the fleet
+   before and after. (`petgraph` was in this group; it is held, below.)
 3. **One family:** `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`,
    `opentelemetry-prometheus` with `tracing-opentelemetry`.
 4. **Authentication:** `bcrypt`, `totp-rs`, `jsonwebtoken`. Each guards a
@@ -80,11 +81,34 @@ Smallest reach first, so the method is settled before the wide ones.
   (`2026-10-06-rust-1.99.md`). That makes the hold temporary, not wrong
   today.
 * **`testcontainers` 0.28.** `testcontainers-modules` has no release for it.
+* **`petgraph` 0.8** (measured 2026-10-06). `wasmtime` 49 depends on
+  `wasm-compose`, which requires `petgraph ^0.6.2` — and so does the newest
+  `wasm-compose` (0.261.0). Moving the five workspace crates to 0.8 would
+  therefore ship two copies (0.6.5 and 0.8.3, with `fixedbitset` 0.4 and 0.5)
+  in the controller and the worker, for an API the workspace uses only the
+  stable core of (`DiGraph`, `NodeIndex`, `neighbors_directed`,
+  `edges_directed`, `is_cyclic_directed`, `Dfs`). Move when `wasm-compose`
+  does. `controller` declares `petgraph` and calls it nowhere; that goes
+  with the unused-declaration sweep below.
 * **`wasmparser` / `wit-component` / `wit-parser`.** One crate declares
   them. The lockfile already carries three other versions of each (0.244,
   0.258, 0.259 of `wasmparser`) as transitive dependencies, not looked into
   here. Move the direct pin with the next `wasmtime` bump, to a version the
   tree already carries, rather than adding a fifth.
+
+## Found while working the list: declared and never named
+
+Three times in the first five items a crate declared a dependency it never
+calls (`constant_time_eq` in two crates, `cap-std` and `petgraph` in
+`controller`). A sweep of every workspace crate for a declared dependency
+whose name appears nowhere in that crate's code lists 117 candidates, 45 of
+them in `controller` (left over from the May-2026 split, when its modules
+became crates and its manifest kept their dependencies). It is a heuristic:
+a declaration can exist only to switch on a feature of a crate another
+dependency uses, and removing that one changes what is compiled without
+failing a build. So the sweep is its own package, verified by comparing the
+resolved feature set of every package in the shipped binaries before and
+after, not by a green build alone.
 
 ## How the table was made
 
