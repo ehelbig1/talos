@@ -105,7 +105,8 @@ start_container() {
             docker run -d --name "$NAME" \
                 -e "POSTGRES_USER=$PG_USER" -e "POSTGRES_PASSWORD=$pw" -e POSTGRES_DB=postgres \
                 -p "127.0.0.1:${PORT}:5432" "$(image)" \
-                -c shared_preload_libraries=pg_stat_statements >/dev/null
+                -c shared_preload_libraries=pg_stat_statements \
+                -c authentication_timeout=5s >/dev/null
             ;;
         *)
             say "▶ starting scratch Postgres '$NAME'"

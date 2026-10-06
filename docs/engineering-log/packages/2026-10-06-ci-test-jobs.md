@@ -113,6 +113,41 @@ Changed in response:
   next stall names its own cause; until then the stall is unexplained and
   costs about two minutes a run.
 
+## Third measurement: the stall has a name
+
+The run with the fastest-of-two table and the Postgres report (37468293253):
+**11.3 minutes**, shards 10.7 / 10.8 / 8.9 / 11.0. Three of the four shards
+had one stalled binary each (`enqueue_drain_tests` 61 s,
+`approval_policy_trigger_refusal_tests` 63 s,
+`create_workflow_node_controls_tests` 62 s); the one without ran 8.9. Take
+the stalled minute off each and the shards are 9.7 / 9.8 / 8.9 / 10.0 — the
+deal balances; the stall is what is left.
+
+The report named it in all three:
+
+* the harness's `DROP DATABASE IF EXISTS "test_…" WITH (FORCE)` took
+  60.03–60.29 s (two to four of them at once — the binary's tests ending
+  together);
+* throughout, every 5 s, each waiting session logged `still waiting for
+  backend with PID N to accept ProcSignalBarrier` — one backend, N, adjacent
+  in number to the waiting ones.
+
+60 s is Postgres's default `authentication_timeout`. The reading that fits —
+**not proven** — is a deadlock in `controller/tests/common`: `TestDb::drop`
+runs the drop on another thread and JOINS it, which blocks the test's
+current-thread runtime; a connection the test's pool (or a task a handler
+spawned) was still opening is frozen mid-login; `DROP DATABASE` must have
+every backend accept a barrier, and a backend waiting on its client's login
+does not; only the login timeout ends it.
+
+So the disposable Postgres (CI's, and `scripts/dev-test-db.sh`'s when it
+creates one) now runs with `authentication_timeout=5s`. That is the
+experiment and the mitigation at once: if the reading is right the stall
+becomes about 5 s and the report — which now prints everything the blocking
+backend logged — shows it ending with "canceling authentication due to
+timeout". If it is wrong the stall stays 60 s and the report says what the
+backend was instead.
+
 ## Deliberately not done
 
 * **Running binaries in parallel inside a shard.** The `tc` binaries are
@@ -120,11 +155,14 @@ Changed in response:
   binaries each clone the template database.
 * **A lint that the weights table is fresh.** A stale table only costs
   balance, never correctness; `docs/ci.md` says when to refresh it.
-* **A fix for the stall.** Not without its cause.
+* **Changing `TestDb::drop`** (dropping the database without blocking the
+  runtime, or closing the pool first). It is the real fix if the reading
+  holds, and it touches every controller DB test; not before the experiment
+  above confirms the cause.
 
 ## Not yet known
 
-Whether the deal shortens the run once the stall is out of the table: one
-run, with two stalls and a cold job in it, says nothing either way.
+Whether the reading of the stall is right (the next run says), and the
+DB-free job's dependence on the unit job's runner image for its cache.
 `make test-integration` locally (one shard) now builds all 155 controller
 binaries in one call first; that was not timed here.
