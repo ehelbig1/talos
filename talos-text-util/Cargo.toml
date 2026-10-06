@@ -8,8 +8,8 @@ publish.workspace = true
 
 [dependencies]
 serde_json.workspace = true
-sha2 = "0.10"
-hex = "0.4"
+sha2.workspace = true
+hex.workspace = true
 
 [lints]
 workspace = true

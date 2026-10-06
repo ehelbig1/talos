@@ -18,13 +18,13 @@ talos-local-inference = { path = "../talos-local-inference" }
 # worker binaries are identical before and after). See
 # docs/engineering-log/packages/2026-10-06-unused-declarations.md.
 # Use Axum 0.8 (required by async-graphql‑axum 7.x)
-axum = { version = "0.8", features = ["json", "ws"] }
-async-graphql = { version = "7.2", features = ["uuid", "chrono", "dataloader"] }
+axum = { workspace = true, features = ["json", "ws"] }
+async-graphql = { workspace = true, features = ["uuid", "chrono", "dataloader"] }
 async-graphql-axum = "7.2"
-tokio = { version = "1.49", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-uuid = { version = "1.20", features = ["serde", "v4", "v5"] }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-memory = { path = "../talos-memory" }
 talos-auth-types = { path = "../talos-auth-types" }
@@ -131,46 +131,46 @@ talos-ws-auth = { path = "../talos-ws-auth" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-engine-nats = { path = "../talos-workflow-engine-nats" }
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono", "migrate"] } # `migrate` enables sqlx::migrate! macro for auto-applying migrations at controller startup. RUSTSEC-2024-0363 fix already in 0.8.
-dotenvy = "0.15"
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono", "migrate"] } # `migrate` enables sqlx::migrate! macro for auto-applying migrations at controller startup. RUSTSEC-2024-0363 fix already in 0.8.
+dotenvy.workspace = true
 talos-worker-runtime = { path = "../talos-worker-runtime" }
-rand = { version = "0.8", default-features = true, features = ["std"] }
-anyhow = "1.0"
+rand = { workspace = true, features = ["default", "std"] }
+anyhow.workspace = true
 # Logging dependencies
-tracing = "0.1"
+tracing.workspace = true
 # env-filter (RUST_LOG) + fmt + registry: the registry composes the fmt layer
 # with the tracing_opentelemetry bridge layer. Declared explicitly rather than
 # relying on feature-unification from the `worker` dep.
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { workspace = true, features = ["default", "env-filter", "fmt"] }
 
 # Node creation dependencies
-sha2 = "0.10"
-chrono = { version = "0.4", features = ["serde"] }
+sha2.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 
 # Secrets management and webhook security
-hex = "0.4"
-subtle = "2.4"  # Constant‑time equality (used for HMAC verification)
+hex.workspace = true
+subtle.workspace = true  # Constant‑time equality (used for HMAC verification)
 
 # Cookie handling
-tower-cookies = "0.11"
+tower-cookies.workspace = true
 
 # Rate limiting
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true, features = ["util"] }
 
 # External services for WASM capabilities
 # Updated to match worker versions for type compatibility
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 # rustls is pulled in transitively by redis/sqlx/reqwest. We add it as a
 # direct dep so main.rs can call rustls::crypto::ring::default_provider()
 # .install_default() at startup — required since rustls 0.23 stopped
 # auto-selecting a CryptoProvider when more than one is in the dep graph.
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-async-nats = "0.47"
+rustls = { workspace = true, features = ["ring"] }
+async-nats.workspace = true
 talos-nats-tls = { path = "../talos-nats-tls" }
 
-urlencoding = "2.1"
-tower_governor = "0.8.0"
-prometheus = "0.14" # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, which drops the
+urlencoding.workspace = true
+tower_governor.workspace = true
+prometheus.workspace = true # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, which drops the
                     # vulnerable protobuf 2.x dependency (prometheus 0.14 uses protobuf 3.x, optional),
                     # clearing RUSTSEC-2024-0437 (protobuf recursion crash) — deny.toml exemption removed.
 
@@ -188,13 +188,13 @@ testcontainers-modules = { version = "0.15", features = ["postgres"] }
 # held in a `static`, which is never dropped, so the crate's Drop-based
 # `docker rm` never runs and every test-binary invocation leaked a live
 # Postgres. Already in Cargo.lock as a transitive dep, so this adds no crate.
-libc = "0.2"
+libc.workspace = true
 # github_app_tenancy_tests: exercise the per-user installation lookup directly.
 talos-github-repository = { path = "../talos-github-repository" }
 # Used by gmail::pubsub_jwt tests to mint RSA keypairs that back
 # locally-signed test JWTs. Production verifier fetches JWKs from
 # Google and never calls rsa::* directly.
-rsa = { version = "0.9", features = ["pem"] }
+rsa = { workspace = true, features = ["pem"] }
 # write_ceiling_memory_write_tests: builds a REAL `ParallelWorkflowEngine`
 # wired to the REAL `ControllerNodeHook` and a stub dispatcher, so the
 # `__memory_write__` write-ceiling gate (#750) is proven on the production
@@ -233,22 +233,22 @@ talos-statement-stats = { path = "../talos-statement-stats" }
 # this crate's dev graph.
 talos-judge-probe = { path = "../talos-judge-probe" }
 # Used by tests only (moved from [dependencies] 2026-10-06).
-async-stream = "0.3"
-async-trait = "0.1"
-dashmap = "6.1.0"
-futures = "0.3"
-hmac = "0.12"
-ipnetwork = "0.21"
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+async-stream.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+hmac.workspace = true
+ipnetwork.workspace = true
+jsonwebtoken = { workspace = true, features = ["rust_crypto", "use_pem"] }
 talos-admin-event-log = { path = "../talos-admin-event-log" }
 talos-capability-world = { path = "../talos-capability-world" }
 talos-engine-events = { path = "../talos-engine-events" }
 talos-execution-pause = { path = "../talos-execution-pause" }
 talos-mcp = { path = "../talos-mcp" }
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
-totp-rs = "5.7"
-base64 = "0.22"
-bcrypt = "0.18"
+totp-rs.workspace = true
+base64.workspace = true
+bcrypt.workspace = true
 
 [features]
 default = []

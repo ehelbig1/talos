@@ -9,9 +9,9 @@ publish.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
-chrono-tz = "0.10"
-hmac = "0.12"
-sha2 = "0.10"
+chrono-tz.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

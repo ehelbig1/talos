@@ -10,11 +10,11 @@ publish.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "uuid"] }
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "uuid"] }
 thiserror.workspace = true
 tracing.workspace = true
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
 
 # Talos crates — repositories
 talos-actor-repository = { path = "../talos-actor-repository" }

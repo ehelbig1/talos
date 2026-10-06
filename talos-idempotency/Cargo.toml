@@ -8,22 +8,22 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum = { version = "0.8", features = ["json"] }
+axum = { workspace = true, features = ["json"] }
 chrono.workspace = true
-hex = "0.4"
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+hex.workspace = true
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-tokio = { version = "1", features = ["sync"] }
+sha2.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
-tower = { version = "0.5", features = ["util"] }
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
-uuid = { version = "1", features = ["v4"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tower = { workspace = true, features = ["util"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [lints]
 workspace = true

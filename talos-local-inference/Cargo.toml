@@ -12,20 +12,20 @@ publish.workspace = true
 # take in Redis (P3b). A leaf: nothing Talos-specific above the HTTP body cap,
 # the DLP redactor and the shared env vocabulary.
 [dependencies]
-futures-util = "0.3"
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "script", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util.workspace = true
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "script", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+reqwest = { workspace = true, features = ["json", "stream", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }
-tokio = { version = "1", features = ["sync", "time", "rt"] }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["sync", "time", "rt", "macros", "test-util"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "test-util"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [lints]

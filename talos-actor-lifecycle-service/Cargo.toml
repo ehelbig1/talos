@@ -10,13 +10,13 @@ publish.workspace = true
 talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
 anyhow.workspace = true
 talos-execution-pause = { path = "../talos-execution-pause" }
-async-nats = "0.47"
+async-nats.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
 
 # Talos crates — utility
 talos-dlp-provider = { path = "../talos-dlp-provider" }

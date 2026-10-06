@@ -45,7 +45,7 @@ thiserror.workspace = true
 # inherits the capture pipe, so TERMing only the child leaves the read blocked
 # forever on an EOF that never comes — measured in #639, where a `sleep 300`
 # survived as a PID-1 orphan and wedged a run past a 3 s limit.
-libc = "0.2"
+libc.workspace = true
 
 [lints]
 workspace = true

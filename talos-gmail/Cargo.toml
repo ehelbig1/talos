@@ -14,16 +14,16 @@ anyhow.workspace = true
 # RS256 verifier they backed were lifted into
 # talos-integration-helpers::google_jwt. jsonwebtoken is now test-only
 # (see [dev-dependencies]).
-async-nats = "0.47"
-async-trait = "0.1"
-axum = { version = "0.8", features = ["json"] }
-base64 = "0.22"
+async-nats.workspace = true
+async-trait.workspace = true
+axum = { workspace = true, features = ["json"] }
+base64.workspace = true
 chrono.workspace = true
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 # `subtle` removed 2026-07: the admin ct_eq gate (MCP-983) moved to
 # talos-integration-helpers::admin.
 # MCP-1021: canonical FRONTEND_URL validation (rejects ? and # in addition
@@ -48,21 +48,21 @@ talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
 talos-registry = { path = "../talos-registry" }
 # Re-added 2026-09-08 (the comment above records it leaving in 2026-07): the
 # typed `CreateWatchError` that renders the module-binding refusal.
-thiserror = "2.0"
+thiserror.workspace = true
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
 talos-trace-nats = { path = "../talos-trace-nats" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
-urlencoding = "2.1"
+urlencoding.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 # api::tests captures the request users.stop puts on the wire with a loopback
 # listener (TcpListener + async read/write).
-tokio = { version = "1", features = ["net", "io-util", "rt", "macros"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros"] }
 # pubsub_jwt::tests reads talos_google_push_accepted_total back from the
 # global registry.
 talos-metrics = { path = "../talos-metrics" }
@@ -70,9 +70,9 @@ talos-metrics = { path = "../talos-metrics" }
 # test JWTs. Production verifier fetches JWKs from Google and never calls
 # rsa::* directly. jsonwebtoken is test-only now that the verifier kernel
 # lives in talos-integration-helpers.
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
-rand = "0.8"
-rsa = { version = "0.9", features = ["pem"] }
+jsonwebtoken = { workspace = true, features = ["rust_crypto", "use_pem"] }
+rand = { workspace = true, features = ["default"] }
+rsa = { workspace = true, features = ["pem"] }
 # Enable the helpers `test-util` feature so pubsub_jwt's wrapper tests can
 # call GoogleOidcVerifier::with_keys_for_test (gated cross-crate behind
 # that feature).

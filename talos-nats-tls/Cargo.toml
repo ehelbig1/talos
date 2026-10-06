@@ -11,12 +11,12 @@ publish.workspace = true
 # two binaries. The chart's in-cluster NATS terminates TLS with a self-signed
 # cert; both processes connect with a `tls://` URL and must trust it.
 [dependencies]
-async-nats = "0.47"
+async-nats.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-futures = "0.3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+futures.workspace = true
 
 [lints]
 workspace = true

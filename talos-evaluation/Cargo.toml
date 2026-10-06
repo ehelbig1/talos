@@ -11,8 +11,8 @@ anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
-thiserror = "1"
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+thiserror = "1"  # not-inherited: a different major from the workspace (2.0.18)
 talos-execution-orchestration = { path = "../talos-execution-orchestration" }
 talos-execution-repository = { path = "../talos-execution-repository" }
 talos-actor-repository = { path = "../talos-actor-repository" }
@@ -20,11 +20,11 @@ talos-llm = { path = "../talos-llm" }
 talos-measurement = { path = "../talos-measurement" }
 talos-memory = { path = "../talos-memory" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 uuid.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

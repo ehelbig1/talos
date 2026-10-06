@@ -9,12 +9,12 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 dirs-next = "2.0"
-handlebars = "6.4"
-hex = "0.4"
-regex = "1.12"
+handlebars.workspace = true
+hex.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 talos-capability-world = { path = "../talos-capability-world" }
 talos-config = { path = "../talos-config" }
 talos-engine-events = { path = "../talos-engine-events" }
@@ -23,17 +23,17 @@ talos-engine-events = { path = "../talos-engine-events" }
 talos-metrics = { path = "../talos-metrics" }
 talos-text-util = { path = "../talos-text-util" }
 talos-wit-inspector = { path = "../talos-wit-inspector" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "process", "time", "io-util", "fs"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "process", "time", "io-util", "fs"] }
 tracing.workspace = true
 uuid.workspace = true
 
 # `killpg(SIGKILL)` of a timed-out host-mode sandbox child's process group
 # (see `sandbox_run`); tokio exposes `process_group` but no group kill.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 
 [lints]
 workspace = true

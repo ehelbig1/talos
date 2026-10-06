@@ -480,6 +480,7 @@ introduced per-org v4 per table).
 - Frontend: React functional components with hooks. Zustand for state. No `dangerouslySetInnerHTML`.
 - Environment-aware behavior: Check `config::is_production()` or `RUST_ENV=production`.
 - Tests: Don't modify test files unless fixing tests for code you changed.
+- Dependencies: a third-party crate that two or more workspace crates use is declared once, in the root `[workspace.dependencies]`, and inherited with `name.workspace = true` (features stay in the crate that needs them; where the table says `default-features = false`, a crate that wants the defaults lists `"default"`). A crate declares only what its own code names. `make lint` enforces both (`scripts/check-workspace-deps.py`, `scripts/check-unused-deps.py`).
 
 ## Migration Rules
 - Never modify an already-applied migration (changes the checksum, breaks sqlx). If an applied migration is buggy, ship a follow-up migration that corrects it — don't edit the original. See `20260414115200` (buggy envelope-split) + `20260414124348` (the actual fix) as an example.

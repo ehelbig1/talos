@@ -9,22 +9,22 @@ publish.workspace = true
 [dependencies]
 talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
 talos-task-supervision = { path = "../talos-task-supervision" }
-aes-gcm = "0.10"
+aes-gcm.workspace = true
 anyhow.workspace = true
-async-nats = "0.47"
-async-trait = "0.1"
+async-nats.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
-futures = "0.3"
-hkdf = "0.12"
-rand = { version = "0.8", default-features = true, features = ["std"] }
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rhai = { version = "1.19", features = ["serde"] }
+futures.workspace = true
+hkdf.workspace = true
+rand = { workspace = true, features = ["default", "std"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+rhai = { workspace = true, features = ["serde"] }
 talos-dlp = { path = "../talos-dlp" }
-thiserror = "2.0"
+thiserror.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-execution-repository = { path = "../talos-execution-repository" }
@@ -74,13 +74,13 @@ talos-envelope-seal = { path = "../talos-envelope-seal" }
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 # Only the `CancellationToken` (sync) is used — for the crash-recovery fence
 # heartbeat in `fence.rs`. Matches the version the engine crate pins.
-tokio-util = { version = "0.7", default-features = false }
+tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-zeroize = "1.8"
+zeroize.workspace = true
 
 [lints]
 workspace = true

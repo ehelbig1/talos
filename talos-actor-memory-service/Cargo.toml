@@ -10,14 +10,14 @@ publish.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-memory = { path = "../talos-memory" }
 talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
-tokio = { version = "1", features = ["sync", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing.workspace = true
 uuid.workspace = true
 

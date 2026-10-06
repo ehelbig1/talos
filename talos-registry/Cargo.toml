@@ -9,17 +9,17 @@ publish.workspace = true
 [dependencies]
 talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
-axum = { version = "0.8", features = ["json"] }
+axum = { workspace = true, features = ["json"] }
 chrono.workspace = true
-oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+oci-distribution = { workspace = true, features = ["rustls-tls"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
-async-trait = "0.1"
-subtle = "2.6"
-sha2 = "0.10"
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+async-trait.workspace = true
+subtle.workspace = true
+sha2.workspace = true
 talos-capability-world = { path = "../talos-capability-world" }
 # The two pure readers of a catalog manifest that the compile crate owns:
 # `recommended_max_fuel` and `manifest_dependencies` (check 68 keeps the
@@ -31,7 +31,7 @@ talos-sigstore-policy = { path = "../talos-sigstore-policy" }
 # MCP-1036: bounded_preview for caller-supplied reflection in error messages.
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time", "process"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "process"] }
 tracing.workspace = true
 uuid.workspace = true
 

@@ -12,7 +12,7 @@ talos-capability-world = { path = "../talos-capability-world" }
 wasmparser = "0.224"
 
 [dev-dependencies]
-proptest = "1.5"
+proptest.workspace = true
 
 [lints]
 workspace = true

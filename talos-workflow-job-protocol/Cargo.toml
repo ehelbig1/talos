@@ -16,32 +16,32 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version =
 # RFC 0010 P2 inc.4: lock-free swap of the worker-verifying-key snapshot so the
 # controller can merge the DB-backed dynamic registry over the env base without
 # blocking the verify hot path.
-arc-swap = "1.7"
-async-trait = "0.1"
-serde = { version = "1.0", features = ["derive"] }
+arc-swap.workspace = true
+async-trait.workspace = true
+serde = { workspace = true, features = ["derive"] }
 # `raw_value` powers `SignedJson`: signatures cover the exact wire text, so the
 # protocol must be able to carry JSON verbatim rather than re-serialising a
 # parsed `Value` (which is not idempotent for floats). Feature flag on an
 # existing dependency — no new crate enters the tree.
-serde_json = { version = "1.0", features = ["raw_value"] }
-uuid = { version = "1", features = ["serde", "v4"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+uuid = { workspace = true, features = ["serde", "v4"] }
 
 # Encryption and signing (for secure secret transport and job authentication)
-aes-gcm = "0.10"
-rand = { version = "0.8", default-features = true, features = ["std"] }
-hex = "0.4"
-hmac = "0.12"
-sha2 = "0.10"
-hkdf = "0.12"
+aes-gcm.workspace = true
+rand = { workspace = true, features = ["default", "std"] }
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
 # RFC 0010 P1: Ed25519 for the controller→worker dispatch signature scheme
 # (asymmetric worker-trust boundary — the worker holds only the public key).
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
 # RFC 0010 P3 (D3b): ephemeral-ephemeral X25519 ECDH for per-execution secret
 # envelope sealing (forward secrecy). Same dalek family as ed25519-dalek above.
 # `zeroize` (already transitively present) clears the ephemeral secret + derived
 # key material after each open.
 x25519-dalek = "2"
-zeroize = "1"
+zeroize.workspace = true
 
 [features]
 default = []
@@ -54,7 +54,7 @@ default = []
 test-support = []
 
 [dev-dependencies]
-tempfile = "3"  # `_FILE` precedence tests need a real on-disk key file
+tempfile.workspace = true  # `_FILE` precedence tests need a real on-disk key file
 
 [lints.rust]
 unsafe_code = "forbid"

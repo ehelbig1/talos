@@ -11,20 +11,20 @@ talos-execution-pause = { path = "../talos-execution-pause" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-public-url = { path = "../talos-public-url" }
 anyhow.workspace = true
-async-nats = "0.47"
-async-trait = "0.1"
-axum = { version = "0.8", features = ["json"] }
-base64 = "0.22"
+async-nats.workspace = true
+async-trait.workspace = true
+axum = { workspace = true, features = ["json"] }
+base64.workspace = true
 chrono.workspace = true
-dashmap = "6.1"
-hmac = "0.12"
-sha2 = "0.10"
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dashmap.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
-subtle = "2.4"
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+subtle.workspace = true
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 # talos-text-util removed 2026-07: the truncate-then-redact scrub
@@ -45,7 +45,7 @@ talos-trace-nats = { path = "../talos-trace-nats" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 talos-worker-runtime = { path = "../talos-worker-runtime" }

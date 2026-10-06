@@ -8,12 +8,12 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-nats = "0.47"
+async-nats.workspace = true
 chrono.workspace = true
-chrono-tz = "0.10"
+chrono-tz.workspace = true
 croner = "2.0"
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
@@ -35,12 +35,12 @@ talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-subscriber = { workspace = true, features = ["default", "fmt"] }
 
 [lints]
 workspace = true

@@ -11,12 +11,12 @@ talos-config = { path = "../talos-config" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 anyhow.workspace = true
 chrono.workspace = true
-hex = "0.4"
-rand = { version = "0.8", default-features = true, features = ["std"] }
-subtle = "2.4"
+hex.workspace = true
+rand = { workspace = true, features = ["default", "std"] }
+subtle.workspace = true
 talos-text-util = { path = "../talos-text-util" }
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 # envelope.rs — the shared `__ops_alert__` ingest core (parse → cap →
 # DLP → tenancy → ingest) consumed by the engine node hook AND the
 # module-result completion chokepoint. Domain crate owns the protocol
@@ -33,8 +33,8 @@ talos-reason-class = { path = "../talos-reason-class" }
 # The one ops_alerts INSERT (package CD).
 talos-ops-alert-store = { path = "../talos-ops-alert-store" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
-thiserror = "2.0"
-tokio = { version = "1", features = ["rt", "time"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 
@@ -45,5 +45,5 @@ workspace = true
 # Pins UNATTENDED/ATTENDED trigger lists to the ingress vocabulary.
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 # `apply_entry`'s refusal tests run the async fn against a pool that never connects.
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 

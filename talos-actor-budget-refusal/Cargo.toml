@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "uuid", "json", "chrono"] }
 talos-metrics = { path = "../talos-metrics" }
 talos-ops-alert-store = { path = "../talos-ops-alert-store" }
 tracing.workspace = true

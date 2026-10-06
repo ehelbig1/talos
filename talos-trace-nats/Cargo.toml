@@ -7,16 +7,16 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-async-nats = "0.47"
-opentelemetry = "0.32"
-tracing = "0.1"
-tracing-opentelemetry = "0.33"
+async-nats.workspace = true
+opentelemetry.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
 # Provides the concrete W3C `TraceContextPropagator` used to exercise the
 # inject/extract round-trip in tests (in production `talos_trace::init_tracing`
 # installs it as the global propagator).
-opentelemetry_sdk = "0.32"
+opentelemetry_sdk.workspace = true
 
 [lints]
 workspace = true

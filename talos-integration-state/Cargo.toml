@@ -10,9 +10,9 @@ publish.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-async-trait = "0.1"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sha2.workspace = true
+async-trait.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-memory = { path = "../talos-memory" }
 tracing.workspace = true
 uuid.workspace = true

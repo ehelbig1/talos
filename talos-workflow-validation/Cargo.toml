@@ -8,8 +8,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-petgraph = "0.6"
-regex = "1.12"
+petgraph.workspace = true
+regex.workspace = true
 serde_json.workspace = true
 # MCP-1032: bounded_preview for caller-supplied reflection in schema validation errors.
 # Fuel-sizing check: the `__actor_context__` injection budget
@@ -28,7 +28,7 @@ talos-text-util = { path = "../talos-text-util" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
-tokio = { version = "1", features = ["sync", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing.workspace = true
 uuid.workspace = true
 

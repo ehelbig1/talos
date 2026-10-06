@@ -9,22 +9,22 @@ publish.workspace = true
 [dependencies]
 talos-execution-pause = { path = "../talos-execution-pause" }
 anyhow.workspace = true
-async-graphql = { version = "7.2", features = ["uuid", "chrono", "dataloader"] }
-async-nats = "0.47"
-async-stream = "0.3"
-axum = { version = "0.8", features = ["json", "ws"] }
-bcrypt = "0.18"
+async-graphql = { workspace = true, features = ["uuid", "chrono", "dataloader"] }
+async-nats.workspace = true
+async-stream.workspace = true
+axum = { workspace = true, features = ["json", "ws"] }
+bcrypt.workspace = true
 chrono.workspace = true
-futures = "0.3"
-hex = "0.4"
-rand = { version = "0.8", default-features = true, features = ["std"] }
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-rhai = { version = "1.19", features = ["serde"] }
+futures.workspace = true
+hex.workspace = true
+rand = { workspace = true, features = ["default", "std"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+rhai = { workspace = true, features = ["serde"] }
 # The ONE Rhai sandbox builder — the `testRhaiExpression` authoring preview.
 talos-rhai-sandbox = { path = "../talos-rhai-sandbox" }
 serde_json.workspace = true
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-actor-lifecycle-service = { path = "../talos-actor-lifecycle-service" }
 # Package DY: the privileged and platform-admin gates record their outcomes.
@@ -54,7 +54,7 @@ talos-ml = { path = "../talos-ml" }
 talos-execution-repository = { path = "../talos-execution-repository" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-tower-cookies = "0.11"
+tower-cookies.workspace = true
 # The extracted WASM host runtime (was `worker = { path = "../worker" }`, the
 # deployable bin). Schema files reference it as `talos_worker_runtime::…`.
 talos-worker-runtime = { path = "../talos-worker-runtime" }
@@ -89,7 +89,7 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-types = { path = "../talos-workflow-types" }
 talos-workflow-versions = { path = "../talos-workflow-versions" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 

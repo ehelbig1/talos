@@ -16,12 +16,12 @@ publish.workspace = true
 # land all of that in the hygiene service).
 [dependencies]
 anyhow.workspace = true
-async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
+async-trait.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
 
 [lints]
 workspace = true

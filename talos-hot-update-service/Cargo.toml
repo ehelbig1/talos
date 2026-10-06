@@ -7,9 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 serde_json.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-capability-world = { path = "../talos-capability-world" }
 talos-capability-downgrade = { path = "../talos-capability-downgrade" }
@@ -18,10 +18,10 @@ talos-module-repository = { path = "../talos-module-repository" }
 talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-validation = { path = "../talos-workflow-validation" }
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"] }
 thiserror.workspace = true
 tracing.workspace = true
-uuid = { version = "1", features = ["v4", "v5", "serde"] }
+uuid = { workspace = true, features = ["v4", "v5", "serde"] }
 
 [dev-dependencies]
 

@@ -8,11 +8,11 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
 
 # Talos crates — repositories
 talos-advanced-repository = { path = "../talos-advanced-repository" }
@@ -33,7 +33,7 @@ talos-search-service = { path = "../talos-search-service" }
 # `unreadable_platform_tests` drives `build` against a pool whose every read
 # fails (a closed port), so the null-not-zero rendering is tested without a
 # database.
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

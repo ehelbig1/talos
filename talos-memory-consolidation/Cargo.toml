@@ -13,19 +13,19 @@ talos-background-lease = { path = "../talos-background-lease" }
 anyhow.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-llm = { path = "../talos-llm" }
 talos-memory = { path = "../talos-memory" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

@@ -10,24 +10,24 @@ publish.workspace = true
 talos-cost-attribution = { path = "../talos-cost-attribution" }
 talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
-async-nats = "0.47"
+async-nats.workspace = true
 # 2026-09-10: `StreamExt::next` on the signed reply-inbox subscription in
 # `handle_webhook` (the last request/reply dispatcher to stop relying on the
 # unsigned NATS wire reply header).
-futures = "0.3"
-axum = { version = "0.8", features = ["json"] }
+futures.workspace = true
+axum = { workspace = true, features = ["json"] }
 chrono.workspace = true
-dashmap = "6.1"
-hex = "0.4"
-hmac = "0.12"
-http = "1"
-ipnetwork = "0.21"
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+dashmap.workspace = true
+hex.workspace = true
+hmac.workspace = true
+http.workspace = true
+ipnetwork.workspace = true
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
-subtle = "2.4"
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+subtle.workspace = true
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-config = { path = "../talos-config" }
 talos-continuation-trigger = { path = "../talos-continuation-trigger" }
@@ -59,9 +59,9 @@ talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
-zeroize = "1.8"
+zeroize.workspace = true
 uuid.workspace = true
 
 [lints]

@@ -193,22 +193,89 @@ rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Shared third-party deps. Crates opt in via `serde.workspace = true`.
-# Versions pinned here are the source of truth — crate-level overrides
-# should be rare and require justification (e.g. a crate temporarily
-# pinned to an older minor for a downstream-compat reason). Existing
-# crates were not migrated to these wholesale during the spike that
-# introduced this section; they continue to specify their own versions
-# until touched. New crates should prefer `*.workspace = true`.
+# Every third-party dependency that two or more crates use is declared here,
+# once, and inherited (`serde.workspace = true`, or
+# `{ workspace = true, features = [...] }`). A version bump is one line.
+# `scripts/check-workspace-deps.py` (in `make lint`) refuses a second
+# declaration of anything listed here, a dependency two crates share that is
+# not listed, and an entry nobody inherits.
+#
+# * Features stay with the crate that needs them. The four entries that
+#   carried features before 2026-10-06 (chrono, serde, tokio, uuid) keep
+#   them; none of the 58 added that day has any.
+# * `default-features = false` here means at least one crate needs the
+#   defaults off; a crate that wants them lists `"default"` among its
+#   features. Inheritance can add features, it cannot take defaults away.
+# * A dependency only one crate uses stays in that crate's manifest.
+# * A crate on a different major keeps its own line, marked
+#   `# not-inherited: <reason>` (one today: talos-evaluation, thiserror 1).
 [workspace.dependencies]
-anyhow = "1"
+aes-gcm = "0.10"
+anyhow = "1.0"
+arc-swap = "1.7"
+async-graphql = "7.2"
+async-nats = "0.47"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+bcrypt = "0.18"
+bytes = "1.11.1"
+cap-std = "4.0"
 chrono = { version = "0.4", features = ["serde"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["sync", "rt", "macros"] }
+chrono-tz = "0.10"
+dashmap = "6.1.0"
+dotenvy = "0.15"
+ed25519-dalek = "2"
+futures = "0.3"
+futures-util = "0.3"
+governor = "0.6"
+handlebars = "6.4"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+http = "1"
+ipnetwork = "0.21"
+jsonwebtoken = { version = "10.3", default-features = false }
+libc = "0.2"
+oci-distribution = { version = "0.11.0", default-features = false }
+opentelemetry = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false }
+opentelemetry_sdk = "0.32"
+petgraph = "0.6"
+pgvector = "0.4"
+prometheus = "0.14"
+proptest = "1.5"
+rand = { version = "0.8", default-features = false }
+redis = { version = "0.27", default-features = false }
+regex = "1.12"
+reqwest = { version = "0.12", default-features = false }
+rhai = "1.19"
+rsa = "0.9"
+rustls = { version = "0.23", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+sqlparser = "0.53"
+sqlx = { version = "0.8", default-features = false }
+subtle = "2.6"
+tempfile = "3"
+thiserror = "2.0.18"
+tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
+tokio-util = "0.7"
+totp-rs = "5.7"
+tower = "0.5"
+tower-cookies = "0.11"
+tower_governor = "0.8.0"
 tracing = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
+tracing-opentelemetry = "0.33"
+tracing-subscriber = { version = "0.3", default-features = false }
+url = "2.5"
+urlencoding = "2.1"
+uuid = { version = "1.20", features = ["v4", "serde"] }
+wasmtime = "49.0.2"
+zeroize = "1.8"
 
 # Workspace-level clippy policy.
 #

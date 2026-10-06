@@ -11,11 +11,11 @@ publish.workspace = true
 talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 anyhow.workspace = true
-async-trait = "0.1"
+async-trait.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 # The child-workflow reference scan. `delete_workflows` is the LAST line of
 # defence in front of an irreversible write — every other guard in this class
 # lives in a report that recommends calling it (#758/#759).
@@ -31,7 +31,7 @@ talos-metrics = { path = "../talos-metrics" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
-tokio = { version = "1", features = ["sync", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing.workspace = true
 uuid.workspace = true
 

@@ -28,18 +28,18 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version =
 talos-workflow-liveness = { path = "../talos-workflow-liveness", version = "0.1.0" }
 talos-capability-world = { path = "../talos-capability-world", version = "0.1" }
 talos-config = { path = "../talos-config", version = "0.1.0" }
-anyhow = "1.0"
-async-trait = "0.1"
-cap-std = "4.0"
-dashmap = "6.1.0"
-futures = "0.3"
+anyhow.workspace = true
+async-trait.workspace = true
+cap-std.workspace = true
+dashmap.workspace = true
+futures.workspace = true
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.3" }
 # Process-global counter for `talos_condition_eval_failures_total` (see
 # `condition_eval.rs`). A true leaf (prometheus + anyhow) — no cycle risk.
 talos-metrics = { path = "../talos-metrics", version = "0.1" }
-petgraph = "0.6"
-regex = "1.12"
-rhai = { version = "1.19", features = ["serde"] }
+petgraph.workspace = true
+regex.workspace = true
+rhai = { workspace = true, features = ["serde"] }
 # The ONE Rhai sandbox builder — `evaluate_dispatch_expression`.
 # `version` is load-bearing, not decoration: this crate has no `publish`
 # key, so it defaults to PUBLISHABLE, and cargo-deny's `wildcard` rule
@@ -47,16 +47,16 @@ rhai = { version = "1.19", features = ["serde"] }
 # versionless path dep on a public crate because crates.io disallows path
 # deps. Declared exactly like `talos-workflow-engine-core` above.
 talos-rhai-sandbox = { path = "../talos-rhai-sandbox", version = "0.1" }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "2.0"
-tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 # Cancellation primitive for `run_with_transport_cancellable`. The
 # engine doesn't take any other piece of `tokio-util`; keep the
 # default-features off and the surface narrow.
-tokio-util = { version = "0.7", default-features = false }
-tracing = "0.1"
-uuid = { version = "1.20", features = ["v4", "serde"] }
+tokio-util.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
 
 [dev-dependencies]
 # `examples/` use the test-utils crate to wire the engine with
@@ -65,20 +65,20 @@ talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils
 # Property-based tests for the chain detector (graph topology
 # invariants that hand-rolled tests can't realistically cover). Held
 # to dev-deps only — the engine itself is property-test-free.
-proptest = "1.5"
+proptest.workspace = true
 # Microbenchmarks for the scheduler — see `benches/scheduler.rs`. Kept
 # in default features (no html_reports) so cargo bench stays minimal.
 criterion = { version = "0.8", default-features = false }
 # `tokio_util::sync::CancellationToken` re-exported here so the
 # integration tests can construct one without re-declaring the dep.
-tokio-util = { version = "0.7", default-features = false }
+tokio-util.workspace = true
 # Captures the `target: "talos_workflow_engine"` quality-gate events in
 # tests, so the structured telemetry operators build pass-rate dashboards
 # on is asserted against rather than assumed. Dev-only — the engine never
 # installs a subscriber itself.
-tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+tracing-subscriber = { workspace = true, features = ["registry"] }
 # `tokio::time::pause`/`advance` for the RFC 0014 P2b run-budget tests.
-tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util"] }
 
 [[bench]]
 name = "scheduler"

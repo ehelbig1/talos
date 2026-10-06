@@ -9,13 +9,13 @@ publish.workspace = true
 [dependencies]
 talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
-arc-swap = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+arc-swap.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde_json.workspace = true
 talos-config = { path = "../talos-config" }
 talos-http-body = { path = "../talos-http-body" }
 talos-http-utils = { path = "../talos-http-utils" }
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
 
 [lints]

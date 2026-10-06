@@ -25,7 +25,7 @@ talos-workflow-types = { path = "../talos-workflow-types" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tracing.workspace = true
-uuid = { version = "1", features = ["v4", "v5", "serde"] }
+uuid = { workspace = true, features = ["v4", "v5", "serde"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

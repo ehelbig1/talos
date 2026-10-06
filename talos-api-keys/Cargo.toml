@@ -8,23 +8,23 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bcrypt = "0.18"
+bcrypt.workspace = true
 chrono.workspace = true
-hex = "0.4"
-rand = { version = "0.8", default-features = true, features = ["std"] }
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
-subtle = "2.4"
+hex.workspace = true
+rand = { workspace = true, features = ["default", "std"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
+subtle.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-auth-types = { path = "../talos-auth-types" }
 talos-config = { path = "../talos-config" }
 talos-metrics = { path = "../talos-metrics" }
 talos-admin-event-log = { path = "../talos-admin-event-log" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
-zeroize = "1.8"
+zeroize.workspace = true
 
 [lints]
 workspace = true

@@ -9,14 +9,14 @@ publish.workspace = true
 [dependencies]
 talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
-async-trait = "0.1"
+async-trait.workspace = true
 chrono.workspace = true
-dashmap = "6.1"
-hex = "0.4"
-rand = { version = "0.8", default-features = true, features = ["std"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dashmap.workspace = true
+hex.workspace = true
+rand = { workspace = true, features = ["default", "std"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-actor-policy-hook = { path = "../talos-actor-policy-hook" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-actor-types = { path = "../talos-actor-types" }
@@ -24,7 +24,7 @@ talos-advanced-repository = { path = "../talos-advanced-repository" }
 talos-config = { path = "../talos-config" }
 talos-engine = { path = "../talos-engine" }
 talos-http-utils = { path = "../talos-http-utils" }
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 

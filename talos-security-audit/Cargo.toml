@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+redis = { workspace = true, features = ["tokio-comp", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 serde_json.workspace = true
 talos-audit-event = { path = "../talos-audit-event" }
 talos-auth = { path = "../talos-auth" }
@@ -40,9 +40,9 @@ talos-audit-ledger = { path = "../talos-audit-ledger" }
 talos-rpc-subscribers = { path = "../talos-rpc-subscribers" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-tokio = { version = "1", features = ["time"] }
+tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
-hex = "0.4"
+hex.workspace = true
 
 [dev-dependencies]
 # Only to build `WorkerBuildRow` fixtures in the write-ceiling check tests.

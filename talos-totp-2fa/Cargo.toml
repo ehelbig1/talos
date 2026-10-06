@@ -10,27 +10,27 @@ publish.workspace = true
 # One writer for admin_event_log (check 94): enrolment and disable record in-transaction.
 talos-admin-event-log = { path = "../talos-admin-event-log" }
 anyhow.workspace = true
-base64 = "0.22"
-bcrypt = "0.18"
+base64.workspace = true
+bcrypt.workspace = true
 chrono.workspace = true
-dashmap = "6.1"
-hex = "0.4"
+dashmap.workspace = true
+hex.workspace = true
 image = "0.25"
 qrcode = "0.14"
-rand = { version = "0.8", default-features = true, features = ["std"] }
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+rand = { workspace = true, features = ["default", "std"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-metrics = { path = "../talos-metrics" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
-subtle = "2.4"
+subtle.workspace = true
 # `spawn_blocking` for the bcrypt backup-code hashes and verifies.
 tokio.workspace = true
-totp-rs = "5.7"
+totp-rs.workspace = true
 tracing.workspace = true
-urlencoding = "2.1"
+urlencoding.workspace = true
 uuid.workspace = true
-zeroize = "1.8"
+zeroize.workspace = true
 
 [lints]
 workspace = true

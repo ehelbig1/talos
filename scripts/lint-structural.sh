@@ -3915,7 +3915,7 @@ bold "▶ check 51: no talos-workflow-engine dependency in talos-*-repository cr
 REPO_ENGINE_DEP_VIOLATIONS=0
 for repo_toml in talos-*-repository/Cargo.toml; do
     [ -f "$repo_toml" ] || continue
-    dep_matches=$(grep -nE '^[[:space:]]*talos-workflow-engine[[:space:]]*=' "$repo_toml" || true)
+    dep_matches=$(grep -nE '^[[:space:]]*talos-workflow-engine([[:space:]]*=|\.workspace[[:space:]]*=)' "$repo_toml" || true)
     [ -n "$dep_matches" ] || continue
     while IFS= read -r line; do
         lineno=$(echo "$line" | cut -d: -f1)
@@ -8764,6 +8764,10 @@ done <<< "$(grep -rl --include='*.rs' -E 'write_ceiling_refuses\("database-query
 
 # (c) sqlparser is a direct dependency of exactly the three crates that parse
 #     SQL. A fourth is where a fourth classifier would be written.
+# Both spellings of a declaration are matched: `sqlparser = …` and, since the
+# workspace table took over the version (2026-10-06), `sqlparser.workspace =
+# true`. The root manifest is skipped: its entry declares a version and
+# parses nothing.
 SQLCLS_ALLOWED_CRATES="talos-sql-classify talos-rpc-subscribers talos-worker-runtime"
 while IFS= read -r m; do
     [ -z "$m" ] && continue
@@ -8778,9 +8782,9 @@ while IFS= read -r m; do
             SQLCLS_FAIL=1
             ;;
     esac
-done <<< "$(grep -rl --include='Cargo.toml' -E '^sqlparser[[:space:]]*=' . \
+done <<< "$(grep -rl --include='Cargo.toml' -E '^sqlparser([[:space:]]*=|\.workspace[[:space:]]*=)' . \
     --exclude-dir=target --exclude-dir=vendor --exclude-dir=node_modules \
-    "${TREE_PRUNE_GREP[@]}" 2>/dev/null || true)"
+    "${TREE_PRUNE_GREP[@]}" 2>/dev/null | grep -vx './Cargo.toml' || true)"
 
 # (d) the deleted PREDICATE itself, in any spelling that pairs the two
 #     literals, on a non-comment line.
