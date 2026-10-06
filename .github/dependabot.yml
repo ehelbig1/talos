@@ -1,27 +1,31 @@
-# Dependabot: SECURITY updates only.
+# Dependabot: security updates, plus ONE grouped version-update pull request a
+# week per ecosystem that CI exercises.
 #
-# What runs (turned on 2026-10-06, repository settings → Code security):
-#   * Dependabot alerts — GitHub lists advisories against the lockfiles below;
-#   * Dependabot security updates — when an advisory has a patched release,
-#     GitHub opens a pull request that moves to it.
-# Those pull requests go through quality.yml like any other and are merged by
-# a person. They do not cover every case: an advisory whose patched release
-# is outside what a dependent asks for needs a hand-made change (the npm
-# `overrides` entry of 2026-10-06) — see docs/ci.md, "A new advisory".
+# SECURITY UPDATES (repository settings → Code security, on since 2026-10-06):
+# GitHub lists advisories against the lockfiles below and, when one has a
+# patched release, opens a pull request that moves to it. Not limited by
+# anything in this file. They do not cover every case — see docs/ci.md,
+# "A new advisory".
 #
-# What does NOT run: weekly version bumps. `open-pull-requests-limit: 0`
-# turns version updates off for an ecosystem and leaves security updates on.
+# VERSION UPDATES, and why they are shaped like this:
+#   * Only where quality.yml builds and tests the result: Rust crates, the
+#     frontend's npm packages, GitHub Actions. Docker images and compose
+#     services are NOT listed — nothing in CI runs them, and a compose bump
+#     lands on a running stack. They are bumped by hand.
+#   * Minor and patch only, in ONE grouped pull request per ecosystem. Major
+#     versions are ignored here and done by hand, as a change of their own.
+#   * At most one open at a time per ecosystem: an unmerged one is updated,
+#     not joined by another.
+#   * Nothing younger than 7 days is proposed (`cooldown`): a release that
+#     turns out to be broken or malicious is usually withdrawn within days.
 #
-# Until 2026-10-06 this file asked for weekly, grouped version-update pull
-# requests for cargo, four Docker images, docker-compose and GitHub Actions.
-# Dependabot ran once (2026-09-16), its log reported 56 pull requests
-# "created" for cargo alone, and none exists in the repository; it never ran
-# again, and alerts and security updates were off. The frontend — the source
-# of three of that week's four advisory failures — was not listed at all.
-# The file described a system that did not run, so it now describes this one.
-#
-# Docker images and GitHub Actions are not listed: both are pinned by digest
-# or commit and are bumped by hand, with the change that needs the bump.
+# What the old shape cost, measured 2026-10-06: the previous file asked for
+# ungrouped weekly bumps of seven ecosystems. Dependabot had been dormant
+# (its features were off); switched on, it opened about 25 pull requests in
+# ten minutes, each starting a CI run, and one proposed moving the Rust
+# image past the pinned toolchain. The fix that week that needed an npm
+# `overrides` entry was needed because a dependency was a major version
+# behind its patched release — which is the case FOR small regular bumps.
 
 version: 2
 
@@ -31,15 +35,66 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 0
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 1
+    cooldown:
+      default-days: 7
+    groups:
+      rust-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     commit-message:
-      prefix: "fix(deps)"
+      prefix: "chore(deps)"
 
   # Frontend.
   - package-ecosystem: "npm"
     directory: "/frontend"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 0
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 1
+    cooldown:
+      default-days: 7
+    groups:
+      frontend-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     commit-message:
-      prefix: "fix(deps)"
+      prefix: "chore(deps)"
+
+  # GitHub Actions: pinned by commit; a bump moves the commit and its comment.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 1
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    commit-message:
+      prefix: "chore(ci)"
