@@ -102,10 +102,7 @@ pub fn parse_scaffold_request(args: &Value) -> Result<ScaffoldRequest, String> {
     };
 
     let llm_tier = match args.get("llm_tier").and_then(|v| v.as_str()) {
-        Some(s) => match LlmTier::from_arg(s) {
-            Ok(t) => Some(t),
-            Err(m) => return Err(m),
-        },
+        Some(s) => Some(LlmTier::from_arg(s)?),
         None => None,
     };
 

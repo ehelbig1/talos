@@ -100,7 +100,7 @@ pub(crate) fn effective_cache_ttl(ttl: Option<u32>) -> u64 {
 /// Atomically charge `n` bytes against a per-execution write budget; `false`
 /// (nothing charged) once `cap` would be exceeded.
 pub(crate) fn reserve_cache_bytes(used: &std::sync::atomic::AtomicU64, n: u64, cap: u64) -> bool {
-    used.fetch_update(
+    used.try_update(
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
         |cur| cur.checked_add(n).filter(|next| *next <= cap),

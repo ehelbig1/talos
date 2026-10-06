@@ -266,6 +266,8 @@ lint: ## Fast gate: rustfmt + WIT drift + structural lints (no clippy) + offline
 	@diff -q wit/talos.wit module-templates/wit/talos.wit >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ wit/talos.wit and module-templates/wit/talos.wit have drifted\033[0m\n'; \
 	         printf '  fix: cp wit/talos.wit module-templates/wit/talos.wit\n'; exit 1; }
+	@printf '▶ rust toolchain pins\n'
+	@python3 scripts/check-rust-pins.py
 # NOTE: no `cargo fmt --all -- --check` here. It ran TWICE per `make lint` —
 # once from this target and again as structural check 35 — which is pure
 # duplicated wall-clock for identical coverage. Check 35 is the copy that was

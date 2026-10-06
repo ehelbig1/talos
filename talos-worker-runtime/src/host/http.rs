@@ -207,7 +207,7 @@ impl BatchByteBudget {
     fn try_reserve(&self, n: usize) -> bool {
         use std::sync::atomic::Ordering;
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 let next = cur.checked_add(n)?;
                 (next <= self.cap).then_some(next)
             })

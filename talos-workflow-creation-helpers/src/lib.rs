@@ -196,7 +196,7 @@ pub fn validate_node_ids(nodes: &[Value]) -> Result<(), String> {
             if nid.len() > 200 {
                 return Err(format!(
                     "node id '{}...' exceeds 200 characters",
-                    &nid.chars().take(20).collect::<String>()
+                    nid.chars().take(20).collect::<String>()
                 ));
             }
             if !nid
@@ -3703,7 +3703,7 @@ mod tests {
         // Items past 5 are summarised, not listed.
         assert!(msg.contains("… and 5 more"));
         assert!(!msg.contains("wf-7")); // sanity: any one of 5..10 should NOT appear inline
-        other.truncate(0);
+        other.clear();
     }
 
     // ─── compute_permission_drift ───
