@@ -1,4 +1,4 @@
-FROM ollama/ollama:0.5.1@sha256:722ce8caba5f8b8bd2ee654b2e29466415be3071a704e3f4db1702b83c885f76
+FROM ollama/ollama:0.35.1@sha256:292ee7945dfc3d5840a181f3ab86fedb1e66703e02c8af98b50f4da56b7e278c
 
 # Models baked into the image at build time.
 #
