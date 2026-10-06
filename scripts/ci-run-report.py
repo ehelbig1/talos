@@ -22,7 +22,8 @@ each of these was a real cause of a slow run that day:
     whether it was on a different runner image from the rest;
   * shards whose test minutes differ by more than two (the weights table,
     scripts/ci-test-weights.tsv, is stale);
-  * a `DROP DATABASE` Postgres spent 3 s or more on (the login-timeout stall).
+  * a `DROP DATABASE` Postgres spent 10 s or more on (the login-timeout
+    stall on a Postgres started without the 5 s timeout).
 
 Needs `gh`. `--self-test` checks the log readers against made-up log text.
 """
@@ -194,14 +195,16 @@ def report(repo: str, run: dict) -> int:
             line += f"  [image {image or '?'}; cache {cache or '?'}]"
             if cache and cache.startswith("MISS"):
                 missed.add(job["name"])
-                notes.append(f"{job['name']}: no build cache — it compiled every dependency")
             if "(integration" in job["name"] and log:
                 f = shard_facts(log)
                 shard_tests[job["name"]] = f["test_minutes"]
                 line += f"\n             build {f['build_minutes']:.1f}  tests {f['test_minutes']:.1f} ({f['items']} items)"
                 if f["slow_controller"]:
                     line += "  controller binaries ≥ 20 s: " + ", ".join(f"{n} {s}s" for n, s in f["slow_controller"][:6])
-                if f["slow_drops"]:
+                # Bounded at 5 s by the test Postgres's login timeout, the
+                # stall is expected about once a run; 10 s or more means a
+                # Postgres started without that timeout.
+                if f["slow_drops"] and max(f["slow_drops"]) >= 10:
                     notes.append(
                         f"{job['name']}: {len(f['slow_drops'])} DROP DATABASE of up to {max(f['slow_drops']):.1f} s"
                         " — the login-timeout stall (docs/ci.md)"
@@ -212,16 +215,28 @@ def report(repo: str, run: dict) -> int:
         print(line)
         if steps:
             print("             " + " | ".join(steps))
+    if missed and len(missed) < len(images):
+        for name in sorted(missed):
+            notes.append(f"{name}: no build cache — it compiled every dependency")
     if images:
         # A different image is only worth a line when the job also missed its
         # cache: since 2026-10-06 the key no longer depends on the image's own
         # toolchain (scripts/ci-only-pinned-rust.sh), so a miss on the odd
         # image out means that has regressed.
+        # …and only when some cached job HIT: when every job missed, the key
+        # itself changed (a toolchain or lockfile change) and the image says
+        # nothing.
         common, _ = Counter(images.values()).most_common(1)[0]
-        for name, image in images.items():
-            if image != common and name in missed:
-                notes.append(f"{name}: it is on runner image {image}, the others on {common} — the cache key should not depend on the image")
-    if len(shard_tests) >= 2 and max(shard_tests.values()) - min(shard_tests.values()) > 2:
+        if len(missed) < len(images):
+            for name, image in images.items():
+                if image != common and name in missed:
+                    notes.append(f"{name}: it is on runner image {image}, the others on {common} — the cache key should not depend on the image")
+        elif len(images) > 1:
+            notes.append("every cached job missed: the cache key changed (toolchain, lockfile or the action), or main has not saved one yet")
+    # Not when every job missed its cache: the lib items then include their
+    # own compile, and the spread says nothing about the table.
+    all_missed = bool(images) and len(missed) == len(images)
+    if not all_missed and len(shard_tests) >= 2 and max(shard_tests.values()) - min(shard_tests.values()) > 2:
         notes.append(
             f"shard test minutes differ by {max(shard_tests.values()) - min(shard_tests.values()):.1f} — refresh the table: "
             "python3 scripts/ci_shard.py weights --run <this run> --run <another> > scripts/ci-test-weights.tsv"
@@ -267,6 +282,9 @@ def self_test() -> int:
 
 
 def main() -> int:
+    # Line by line even into a pipe: with --wait the first line is the only
+    # sign of life for ten minutes.
+    sys.stdout.reconfigure(line_buffering=True)
     if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
         return self_test()
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
