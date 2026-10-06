@@ -21,7 +21,6 @@ talos-measurement = { path = "../talos-measurement" }
 talos-memory = { path = "../talos-memory" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
-tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

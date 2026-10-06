@@ -24,7 +24,6 @@ talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
 
 [lints]
 workspace = true

@@ -11,7 +11,6 @@ talos-execution-pause = { path = "../talos-execution-pause" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-public-url = { path = "../talos-public-url" }
 anyhow.workspace = true
-arc-swap = "1.7"
 async-nats = "0.47"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
@@ -33,7 +32,6 @@ talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }
 talos-integration-helpers = { path = "../talos-integration-helpers" }
-talos-integration-state = { path = "../talos-integration-state" }
 talos-memory = { path = "../talos-memory" }
 talos-module-executions = { path = "../talos-module-executions" }
 talos-actor-repository = { path = "../talos-actor-repository" }

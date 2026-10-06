@@ -12,7 +12,6 @@ async-nats = "0.47"
 chrono.workspace = true
 chrono-tz = "0.10"
 croner = "2.0"
-serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-actor-repository = { path = "../talos-actor-repository" }

@@ -1718,54 +1718,31 @@ checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 name = "controller"
 version = "1.0.0-r306"
 dependencies = [
- "aes-gcm",
- "ammonia",
  "anyhow",
- "arc-swap",
  "async-graphql",
  "async-graphql-axum",
  "async-nats",
  "async-stream",
  "async-trait",
- "aws-config",
- "aws-sdk-s3",
  "axum",
  "base64 0.22.1",
  "bcrypt",
  "chrono",
- "chrono-tz 0.10.4",
- "croner",
  "dashmap 6.2.1",
- "dirs-next",
  "dotenvy",
  "futures",
- "governor 0.6.3",
- "handlebars",
  "hex",
  "hmac 0.12.1",
- "image",
  "ipnetwork",
  "jsonwebtoken",
  "libc",
- "neo4rs",
- "oci-distribution",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "petgraph",
- "pgvector",
  "prometheus",
- "qrcode",
  "rand 0.8.8",
  "redis",
- "regex",
- "reqwest",
- "rhai",
  "rsa",
  "rustls",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.10.9",
  "sqlx",
  "subtle",
@@ -1773,10 +1750,8 @@ dependencies = [
  "talos-actor-lifecycle-service",
  "talos-actor-memory-service",
  "talos-actor-policies",
- "talos-actor-policy-hook",
  "talos-actor-repository",
  "talos-actor-scaffold",
- "talos-actor-types",
  "talos-admin-event-log",
  "talos-advanced-repository",
  "talos-analytics-repository",
@@ -1795,11 +1770,9 @@ dependencies = [
  "talos-compilation",
  "talos-config",
  "talos-config-validator",
- "talos-continuation-trigger",
  "talos-cost-attribution",
  "talos-csrf",
  "talos-db",
- "talos-dlp",
  "talos-dlp-provider",
  "talos-draft-heuristics",
  "talos-engine",
@@ -1860,7 +1833,6 @@ dependencies = [
  "talos-schedule-repo",
  "talos-scheduler",
  "talos-search-service",
- "talos-secrets",
  "talos-secrets-manager",
  "talos-security-headers",
  "talos-session-brief-service",
@@ -1894,27 +1866,21 @@ dependencies = [
  "talos-workflow-liveness",
  "talos-workflow-manifest",
  "talos-workflow-repository",
- "talos-workflow-types",
  "talos-workflow-validation",
  "talos-workflow-versions",
  "talos-ws-auth",
  "talos-yaml-workflows",
  "testcontainers",
  "testcontainers-modules",
- "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
- "tonic",
  "totp-rs",
  "tower",
  "tower-cookies",
  "tower_governor",
  "tracing",
- "tracing-opentelemetry",
  "tracing-subscriber",
  "urlencoding",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -7481,8 +7447,6 @@ dependencies = [
  "hex",
  "rand 0.8.8",
  "reqwest",
- "rhai",
- "serde",
  "serde_json",
  "sqlx",
  "talos-actor-policy-hook",
@@ -7540,8 +7504,6 @@ dependencies = [
 name = "talos-actor-scaffold"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "serde",
  "serde_json",
  "sqlx",
  "talos-actor-repository",
@@ -7584,7 +7546,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "serde",
  "serde_json",
  "sqlx",
  "talos-actor-budget-refusal",
@@ -7613,7 +7574,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "regex",
- "serde",
  "serde_json",
  "sqlx",
  "talos-child-run-ledger",
@@ -7636,7 +7596,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-graphql",
- "async-graphql-axum",
  "async-nats",
  "async-stream",
  "axum",
@@ -7646,10 +7605,7 @@ dependencies = [
  "hex",
  "rand 0.8.8",
  "redis",
- "regex",
- "reqwest",
  "rhai",
- "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
@@ -7735,7 +7691,6 @@ dependencies = [
  "hex",
  "rand 0.8.8",
  "redis",
- "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
@@ -7743,7 +7698,6 @@ dependencies = [
  "talos-admin-event-log",
  "talos-auth-types",
  "talos-config",
- "talos-dlp-provider",
  "talos-metrics",
  "tokio",
  "tracing",
@@ -7803,12 +7757,10 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "serde",
  "serde_json",
  "sqlx",
  "talos-audit-event",
  "talos-config",
- "talos-dlp-provider",
  "talos-http-utils",
  "talos-metrics",
  "talos-secrets-manager",
@@ -7827,7 +7779,6 @@ name = "talos-auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "bcrypt",
  "chrono",
  "hex",
@@ -7835,7 +7786,6 @@ dependencies = [
  "rand 0.8.8",
  "redis",
  "regex",
- "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
@@ -7917,7 +7867,6 @@ dependencies = [
 name = "talos-child-workflow-refs"
 version = "0.1.0"
 dependencies = [
- "serde_json",
  "sqlx",
  "talos-workflow-engine-core",
  "talos-workflow-liveness",
@@ -8000,8 +7949,6 @@ dependencies = [
 name = "talos-cost-attribution"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "serde",
  "sqlx",
  "tokio",
  "tracing",
@@ -8029,10 +7976,7 @@ name = "talos-db"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "dotenvy",
- "serde",
- "serde_json",
  "sqlx",
  "talos-config",
  "talos-tenancy",
@@ -8079,13 +8023,10 @@ dependencies = [
  "chrono",
  "futures",
  "hkdf",
- "opentelemetry",
- "opentelemetry_sdk",
  "rand 0.8.8",
  "redis",
  "reqwest",
  "rhai",
- "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
@@ -8176,7 +8117,6 @@ dependencies = [
  "jsonwebtoken",
  "serde_json",
  "sqlx",
- "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -8198,7 +8138,6 @@ dependencies = [
  "talos-secrets-manager",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -8221,7 +8160,6 @@ dependencies = [
  "async-nats",
  "chrono",
  "reqwest",
- "serde",
  "serde_json",
  "sqlx",
  "talos-actor-memory-service",
@@ -8271,7 +8209,6 @@ dependencies = [
  "chrono",
  "hex",
  "rand 0.8.8",
- "serde",
  "serde_json",
  "sqlx",
  "subtle",
@@ -8391,7 +8328,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "dashmap 6.2.1",
  "jsonwebtoken",
  "rand 0.8.8",
  "redis",
@@ -8471,7 +8407,6 @@ dependencies = [
  "talos-workflow-job-protocol",
  "tokio",
  "tracing",
- "urlencoding",
  "uuid",
 ]
 
@@ -8480,7 +8415,6 @@ name = "talos-google-cloud"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "async-nats",
  "async-trait",
  "axum",
@@ -8503,7 +8437,6 @@ dependencies = [
  "talos-http-body",
  "talos-http-utils",
  "talos-integration-helpers",
- "talos-integration-state",
  "talos-memory",
  "talos-metrics",
  "talos-module-executions",
@@ -8533,7 +8466,6 @@ dependencies = [
  "chrono",
  "reqwest",
  "serde",
- "serde_json",
  "sha2 0.10.9",
  "sqlx",
  "talos-config",
@@ -8555,8 +8487,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "neo4rs",
- "reqwest",
- "serde",
  "serde_json",
  "sqlx",
  "talos-actor-repository",
@@ -8575,10 +8505,7 @@ dependencies = [
 name = "talos-hot-update-service"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "redis",
- "regex",
- "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
@@ -8591,7 +8518,6 @@ dependencies = [
  "talos-workflow-repository",
  "talos-workflow-validation",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "uuid",
 ]
@@ -8639,7 +8565,6 @@ dependencies = [
  "talos-measurement",
  "talos-module-repository",
  "talos-push-channel-inventory",
- "talos-workflow-liveness",
  "talos-workflow-repository",
  "thiserror 2.0.18",
  "tracing",
@@ -8839,24 +8764,14 @@ name = "talos-mcp-handlers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "async-nats",
  "async-stream",
  "axum",
- "base64 0.22.1",
  "bcrypt",
  "chrono",
- "chrono-tz 0.10.4",
- "croner",
  "dashmap 6.2.1",
  "futures",
- "governor 0.6.3",
- "handlebars",
  "hex",
- "hmac 0.12.1",
- "jsonwebtoken",
- "neo4rs",
- "oci-distribution",
  "petgraph",
  "rand 0.8.8",
  "redis",
@@ -8865,7 +8780,6 @@ dependencies = [
  "rhai",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.10.9",
  "sqlx",
  "talos-actor-budget-refusal",
@@ -8910,12 +8824,10 @@ dependencies = [
  "talos-oauth",
  "talos-operator-digest",
  "talos-ops-alerts-repository",
- "talos-plaid",
  "talos-public-url",
  "talos-push-channel-inventory",
  "talos-rate-limit",
  "talos-registry",
- "talos-replay-diff",
  "talos-replay-service",
  "talos-rpc-subscribers",
  "talos-schedule-repo",
@@ -8948,11 +8860,9 @@ dependencies = [
  "talos-workflow-validation",
  "talos-workflow-versions",
  "talos-yaml-workflows",
- "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tracing",
- "urlencoding",
  "uuid",
 ]
 
@@ -9012,7 +8922,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "serde",
  "serde_json",
  "sqlx",
  "talos-actor-repository",
@@ -9023,7 +8932,6 @@ dependencies = [
  "talos-memory",
  "talos-secrets-manager",
  "talos-task-supervision",
- "talos-workflow-job-protocol",
  "tokio",
  "tracing",
  "uuid",
@@ -9104,7 +9012,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "serde",
  "serde_json",
  "sqlx",
  "talos-cost-attribution",
@@ -9137,7 +9044,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "serde",
  "serde_json",
  "sqlx",
  "talos-admin-event-log",
@@ -9147,7 +9053,6 @@ dependencies = [
  "talos-secrets-manager",
  "talos-workflow-liveness",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -9156,10 +9061,8 @@ name = "talos-module-templates"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "serde",
  "serde_json",
  "talos-registry",
- "tracing",
  "uuid",
 ]
 
@@ -9295,8 +9198,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "serde",
- "serde_json",
  "sqlx",
  "talos-auth-types",
  "tokio",
@@ -9309,13 +9210,11 @@ name = "talos-plaid"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "reqwest",
  "serde",
  "serde_json",
  "talos-http-body",
  "talos-http-utils",
- "tokio",
  "tracing",
 ]
 
@@ -9326,7 +9225,6 @@ dependencies = [
  "anyhow",
  "axum",
  "serde",
- "serde_json",
  "sqlx",
  "talos-organizations",
  "talos-plaid",
@@ -9419,7 +9317,6 @@ dependencies = [
 name = "talos-replay-diff"
 version = "0.1.0"
 dependencies = [
- "serde",
  "serde_json",
 ]
 
@@ -9492,7 +9389,6 @@ dependencies = [
  "talos-capability-world",
  "talos-config",
  "talos-db",
- "talos-graph-rag",
  "talos-integration-state",
  "talos-memory",
  "talos-memory-ranking",
@@ -9518,9 +9414,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "serde_json",
  "sqlx",
- "tracing",
  "uuid",
 ]
 
@@ -9533,7 +9427,6 @@ dependencies = [
  "chrono",
  "chrono-tz 0.10.4",
  "croner",
- "serde",
  "serde_json",
  "sqlx",
  "talos-actor-memory-service",
@@ -9693,7 +9586,6 @@ dependencies = [
 name = "talos-shutdown"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "tokio",
  "tokio-util",
  "tracing",
@@ -9753,7 +9645,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "tokio",
  "tracing",
 ]
 
@@ -9787,7 +9678,6 @@ dependencies = [
  "sqlx",
  "talos-unusable-password",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -9904,7 +9794,6 @@ dependencies = [
  "async-nats",
  "futures",
  "serde_json",
- "sqlx",
  "talos-dlp-provider",
  "talos-engine-events",
  "talos-execution-repository",
@@ -10095,7 +9984,6 @@ dependencies = [
  "talos-actor-repository",
  "talos-capability-world",
  "talos-text-util",
- "talos-workflow-creation-helpers",
  "talos-workflow-engine-core",
  "talos-workflow-repository",
  "tracing",
@@ -10107,8 +9995,6 @@ name = "talos-workflow-creation"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "regex",
- "serde",
  "serde_json",
  "talos-dlp-provider",
  "talos-inline-compile-service",
@@ -10151,7 +10037,6 @@ dependencies = [
  "rhai",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "talos-capability-world",
  "talos-config",
  "talos-metrics",
@@ -10271,7 +10156,6 @@ dependencies = [
  "talos-actor-budget-refusal",
  "talos-admin-event-log",
  "talos-child-workflow-refs",
- "talos-config",
  "talos-db",
  "talos-dlp-provider",
  "talos-engine-events",
@@ -10304,9 +10188,7 @@ dependencies = [
  "anyhow",
  "petgraph",
  "regex",
- "serde",
  "serde_json",
- "sqlx",
  "talos-capability-world",
  "talos-config",
  "talos-retry-intelligence",
@@ -10326,7 +10208,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "serde",
  "serde_json",
  "sqlx",
  "talos-actor-policy-hook",
@@ -10344,7 +10225,6 @@ dependencies = [
  "async-graphql",
  "axum",
  "futures",
- "serde",
  "serde_json",
  "talos-api",
  "talos-auth",

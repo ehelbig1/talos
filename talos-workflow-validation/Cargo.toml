@@ -10,9 +10,7 @@ publish.workspace = true
 anyhow.workspace = true
 petgraph = "0.6"
 regex = "1.12"
-serde.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 # MCP-1032: bounded_preview for caller-supplied reflection in schema validation errors.
 # Fuel-sizing check: the `__actor_context__` injection budget
 # (SMART_MEMORY_CONTEXT_BYTE_BUDGET) and the memory-eligibility gate on a

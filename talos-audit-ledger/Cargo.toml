@@ -20,9 +20,11 @@ tonic = "0.14"
 async-nats = "0.47"
 # `default-features = false` drops aws-sdk-s3's legacy `rustls` feature
 # (rustls 0.21 / rustls-webpki 0.101); the retained `default-https-client`
-# keeps the modern rustls-aws-lc (rustls 0.23) stack. Must stay in lockstep
-# with controller/Cargo.toml — both pull aws-sdk-s3, so a divergence would
-# re-introduce the legacy feature via feature unification.
+# keeps the modern rustls-aws-lc (rustls 0.23) stack, and with it rustls 0.21 /
+# rustls-webpki 0.101 (RUSTSEC-2026-0098/0099/0104) out of the tree. This is
+# the only crate that declares aws-sdk-s3 (the controller's unused copy was
+# removed 2026-10-06); a second declaration must use the same features, or
+# feature unification brings the legacy stack back.
 aws-config = "1.5"
 aws-sdk-s3 = { version = "1.30", default-features = false, features = [
     "sigv4a",
@@ -41,7 +43,6 @@ aws-smithy-runtime-api = "1.12"
 aws-smithy-types = "1.4"
 chrono.workspace = true
 futures = "0.3"
-serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
@@ -55,7 +56,6 @@ talos-metrics = { path = "../talos-metrics" }
 # worker producer — the ledger is the consumer of this subject.
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
-talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-utils = { path = "../talos-http-utils" }
 # `redact_span_text` — the single redact-then-bound-then-failsafe helper for
 # every string this crate writes to a span attribute. Replaced a local

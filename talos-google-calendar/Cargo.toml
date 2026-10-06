@@ -47,7 +47,6 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
-urlencoding = "2.1"
 uuid.workspace = true
 talos-worker-runtime = { path = "../talos-worker-runtime" }
 

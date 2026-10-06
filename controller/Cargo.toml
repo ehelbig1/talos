@@ -9,30 +9,25 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 talos-local-inference = { path = "../talos-local-inference" }
-# HTML sanitisation for user-facing rendered output (briefing endpoint).
-ammonia = "4"
-# Atomic hot-swap for the Pub/Sub JWK cache (gmail::pubsub_jwt).
-# Readers never see a half-built map; refresh writes a new Arc.
-arc-swap = "1.7"
+# 2026-10-06: every dependency this crate declared and never named was
+# removed (34 of them), and the 16 that only its tests name moved to
+# [dev-dependencies]. They were left from the May-2026 split, when this
+# crate's modules became crates and its manifest kept their dependencies. A
+# crate that needs one declares it itself; nothing here was switching on a
+# feature for another crate (the resolved feature sets of the controller and
+# worker binaries are identical before and after). See
+# docs/engineering-log/packages/2026-10-06-unused-declarations.md.
 # Use Axum 0.8 (required by async-graphql‑axum 7.x)
 axum = { version = "0.8", features = ["json", "ws"] }
 async-graphql = { version = "7.2", features = ["uuid", "chrono", "dataloader"] }
 async-graphql-axum = "7.2"
 tokio = { version = "1.49", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
 uuid = { version = "1.20", features = ["serde", "v4", "v5"] }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-talos-dlp = { path = "../talos-dlp" }
-talos-secrets = { path = "../talos-secrets" }
 talos-memory = { path = "../talos-memory" }
-talos-mcp = { path = "../talos-mcp" }
 talos-auth-types = { path = "../talos-auth-types" }
-talos-actor-types = { path = "../talos-actor-types" }
-talos-workflow-types = { path = "../talos-workflow-types" }
 talos-auth = { path = "../talos-auth" }
 talos-rate-limit = { path = "../talos-rate-limit" }
 talos-csrf = { path = "../talos-csrf" }
@@ -56,7 +51,6 @@ talos-api-keys = { path = "../talos-api-keys" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-security-headers = { path = "../talos-security-headers" }
 talos-retry-intelligence = { path = "../talos-retry-intelligence" }
-talos-capability-world = { path = "../talos-capability-world" }
 talos-replay-diff = { path = "../talos-replay-diff" }
 talos-replay-service = { path = "../talos-replay-service" }
 talos-inline-compile-service = { path = "../talos-inline-compile-service" }
@@ -81,7 +75,6 @@ talos-workflow-manifest = { path = "../talos-workflow-manifest" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-module-payload-encryption = { path = "../talos-module-payload-encryption" }
 talos-webhook-repository = { path = "../talos-webhook-repository" }
-talos-admin-event-log = { path = "../talos-admin-event-log" }
 talos-worker-identity-repository = { path = "../talos-worker-identity-repository" }
 talos-totp-2fa = { path = "../talos-totp-2fa" }
 talos-oauth = { path = "../talos-oauth" }
@@ -94,12 +87,10 @@ talos-ml = { path = "../talos-ml" }
 talos-memory-consolidation = { path = "../talos-memory-consolidation" }
 talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
-talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-advanced-repository = { path = "../talos-advanced-repository" }
 talos-analytics-repository = { path = "../talos-analytics-repository" }
 talos-actor-repository = { path = "../talos-actor-repository" }
-talos-engine-events = { path = "../talos-engine-events" }
 talos-job-result-observer = { path = "../talos-job-result-observer" }
 talos-wasm-log-relay = { path = "../talos-wasm-log-relay" }
 talos-background-lease = { path = "../talos-background-lease" }
@@ -107,7 +98,6 @@ talos-execution-repository = { path = "../talos-execution-repository" }
 talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 talos-workflow-validation = { path = "../talos-workflow-validation" }
-talos-actor-policy-hook = { path = "../talos-actor-policy-hook" }
 talos-workflow-versions = { path = "../talos-workflow-versions" }
 talos-module-repository = { path = "../talos-module-repository" }
 talos-registry = { path = "../talos-registry" }
@@ -117,7 +107,6 @@ talos-actor-scaffold = { path = "../talos-actor-scaffold" }
 talos-engine = { path = "../talos-engine" }
 talos-subworkflow-contract = { path = "../talos-subworkflow-contract" }
 talos-scheduler = { path = "../talos-scheduler" }
-talos-execution-pause = { path = "../talos-execution-pause" }
 talos-actor-policies = { path = "../talos-actor-policies" }
 talos-templates = { path = "../talos-templates" }
 talos-llm = { path = "../talos-llm" }
@@ -134,7 +123,6 @@ talos-plaid-connect = { path = "../talos-plaid-connect" }
 talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
 talos-github = { path = "../talos-github" }
 talos-github-connect = { path = "../talos-github-connect" }
-talos-continuation-trigger = { path = "../talos-continuation-trigger" }
 talos-webhooks = { path = "../talos-webhooks" }
 talos-api = { path = "../talos-api" }
 talos-mcp-handlers = { path = "../talos-mcp-handlers" }
@@ -144,12 +132,7 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-engine-nats = { path = "../talos-workflow-engine-nats" }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono", "migrate"] } # `migrate` enables sqlx::migrate! macro for auto-applying migrations at controller startup. RUSTSEC-2024-0363 fix already in 0.8.
-pgvector = { version = "0.4", features = ["sqlx"] }
-neo4rs = "0.8"
 dotenvy = "0.15"
-petgraph = "0.6"
-futures = "0.3"
-async-trait = "0.1"  # Only needed for dyn-compatible async traits (JobHandler)
 talos-worker-runtime = { path = "../talos-worker-runtime" }
 rand = { version = "0.8", default-features = true, features = ["std"] }
 anyhow = "1.0"
@@ -161,30 +144,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Node creation dependencies
-handlebars = "6.4"
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Secrets management and webhook security
-aes-gcm = "0.10"
 hex = "0.4"
-hmac = "0.12"
-base64 = "0.22"
 subtle = "2.4"  # Constant‑time equality (used for HMAC verification)
-
-# Authentication
-bcrypt = "0.18"
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
-regex = "1.12"
 
 # Cookie handling
 tower-cookies = "0.11"
 
 # Rate limiting
-governor = "0.6"
 tower = { version = "0.5", features = ["util"] }
-ipnetwork = "0.21"
-dashmap = "6.1.0"  # Lock-free concurrent HashMap
 
 # External services for WASM capabilities
 # Updated to match worker versions for type compatibility
@@ -197,59 +168,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 async-nats = "0.47"
 talos-nats-tls = { path = "../talos-nats-tls" }
 
-# 2FA/TOTP
-totp-rs = "5.7"
-qrcode = "0.14"
-image = "0.25"
-
-# HTTP client. The `oauth2` crate declaration that used to sit here was
-# removed 2026-08: it had ZERO references in `controller/src`, and it was the
-# sole reason reqwest 0.11 -> hyper 0.14 -> h2 0.3 (RUSTSEC-2026-0258) was in
-# the tree. OAuth lives in `talos-oauth`; see its Cargo.toml.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
-
-# OCI registry client — used by registry::sync to pull template manifests from
-# GHCR / docker registry / harbor / etc. Same crate the worker uses for WASM
-# pulls; pinning the same major version keeps semantics aligned across the
-# two services. Auth flow (anonymous + Bearer challenge) is handled by the
-# crate, so the controller doesn't have to implement OAuth bearer-token
-# negotiation by hand.
-oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 urlencoding = "2.1"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-# Only the gRPC/tonic exporter is used (`SpanExporter::builder().with_tonic()`).
-# `default-features = false` drops otlp 0.32's default `http-proto` +
-# `reqwest-blocking-client`, which pull opentelemetry-http + reqwest 0.13 (a
-# duplicate of the workspace's reqwest 0.12) for an HTTP exporter path we never
-# take. `grpc-tonic` + `trace` are all the tonic SpanExporter needs.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
-tracing-opentelemetry = "0.33"
 tower_governor = "0.8.0"
-
-# S3 client for immutable audit ledger storage (MinIO).
-# `default-features = false` + explicit features DROPS aws-sdk-s3's default
-# `rustls` feature, which selects the LEGACY TLS stack
-# (aws-smithy-http-client/legacy-rustls-ring → rustls 0.21 + rustls-webpki
-# 0.101). The retained `default-https-client` already provides the MODERN TLS
-# stack (aws-smithy-http-client/rustls-aws-lc → rustls 0.23 + aws-lc-rs, which
-# the rest of the workspace already builds). Dropping the legacy feature
-# removes rustls 0.21 / rustls-webpki 0.101 from the tree entirely and with it
-# the RUSTSEC-2026-0098/0099/0104 advisory exemptions. aws-config's default is
-# already modern-only (default-https-client, no `rustls`), so it is unchanged.
-aws-config = "1.5"
-aws-sdk-s3 = { version = "1.30", default-features = false, features = [
-    "sigv4a",
-    "default-https-client",
-    "rt-tokio",
-] }
-tonic = "0.14"
-rhai = { version = "1.19", features = ["serde"] }
-zeroize = "1.8"
-dirs-next = "2.0"  # Locate CARGO_HOME for container registry cache mounts
-thiserror = "2.0"
-croner = "2.0"
-chrono-tz = "0.10"
 prometheus = "0.14" # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, which drops the
                     # vulnerable protobuf 2.x dependency (prometheus 0.14 uses protobuf 3.x, optional),
                     # clearing RUSTSEC-2024-0437 (protobuf recursion crash) — deny.toml exemption removed.
@@ -312,6 +232,23 @@ talos-statement-stats = { path = "../talos-statement-stats" }
 # `talos-judge-probe` is the one `McpState` field with no other route into
 # this crate's dev graph.
 talos-judge-probe = { path = "../talos-judge-probe" }
+# Used by tests only (moved from [dependencies] 2026-10-06).
+async-stream = "0.3"
+async-trait = "0.1"
+dashmap = "6.1.0"
+futures = "0.3"
+hmac = "0.12"
+ipnetwork = "0.21"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+talos-admin-event-log = { path = "../talos-admin-event-log" }
+talos-capability-world = { path = "../talos-capability-world" }
+talos-engine-events = { path = "../talos-engine-events" }
+talos-execution-pause = { path = "../talos-execution-pause" }
+talos-mcp = { path = "../talos-mcp" }
+talos-workflow-liveness = { path = "../talos-workflow-liveness" }
+totp-rs = "5.7"
+base64 = "0.22"
+bcrypt = "0.18"
 
 [features]
 default = []

@@ -9,7 +9,6 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-admin-event-log = { path = "../talos-admin-event-log" }
@@ -22,7 +21,6 @@ talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 # Catalog drift report: counts only workflows that are not retired (check 87).
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
-tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
