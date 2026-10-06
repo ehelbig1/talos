@@ -80,7 +80,7 @@ dashmap = "6.1"  # Lock-free concurrent HashMap for component caches
 
 # Cryptography (for host functions)
 sha2 = "0.10"  # For cache key hashing and crypto interface
-md5 = "0.7"  # MD5 hashing (crypto interface)
+md5 = "0.8"  # MD5 hashing (crypto interface)
 hmac = "0.12"  # HMAC operations (crypto interface)
 base64 = "0.22"  # Base64 encoding/decoding (crypto interface)
 hex = "0.4"  # Hex encoding/decoding (crypto interface)
