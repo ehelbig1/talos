@@ -4,7 +4,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # Base image digest matches controller/Dockerfile so both binaries link
 # against the same glibc/OpenSSL versions. Bump together when rotating.
-FROM rust:1.96@sha256:1f0dbad1df66647807e6952d1db85d0b2bda7606cb2139d82517e4f009967376 AS builder
+FROM rust:1.98@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS builder
 
 # All Talos crates — including the engine + protocol crates folded
 # back from the sibling repo in May-2026 — live in this single
