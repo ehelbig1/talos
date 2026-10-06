@@ -1,191 +1,45 @@
-# Dependabot configuration — weekly auto-bump PRs for every dependency
-# surface in the repo. Grouped updates reduce PR churn; security advisories
-# still ship as individual, higher-priority PRs (Dependabot treats security
-# bumps separately from regular version bumps even inside a group).
+# Dependabot: SECURITY updates only.
 #
-# Verify a PR passes our supply-chain gate before merging:
-#   • cargo deny check           (deny.toml policy)
-#   • cargo audit                (RUSTSEC)
-#   • full test suite
-# Both are already wired in .github/workflows/ci.yml.
+# What runs (turned on 2026-10-06, repository settings → Code security):
+#   * Dependabot alerts — GitHub lists advisories against the lockfiles below;
+#   * Dependabot security updates — when an advisory has a patched release,
+#     GitHub opens a pull request that moves to it.
+# Those pull requests go through quality.yml like any other and are merged by
+# a person. They do not cover every case: an advisory whose patched release
+# is outside what a dependent asks for needs a hand-made change (the npm
+# `overrides` entry of 2026-10-06) — see docs/ci.md, "A new advisory".
 #
-# Schema: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+# What does NOT run: weekly version bumps. `open-pull-requests-limit: 0`
+# turns version updates off for an ecosystem and leaves security updates on.
+#
+# Until 2026-10-06 this file asked for weekly, grouped version-update pull
+# requests for cargo, four Docker images, docker-compose and GitHub Actions.
+# Dependabot ran once (2026-09-16), its log reported 56 pull requests
+# "created" for cargo alone, and none exists in the repository; it never ran
+# again, and alerts and security updates were off. The frontend — the source
+# of three of that week's four advisory failures — was not listed at all.
+# The file described a system that did not run, so it now describes this one.
+#
+# Docker images and GitHub Actions are not listed: both are pinned by digest
+# or commit and are bumped by hand, with the change that needs the bump.
 
 version: 2
 
 updates:
-  # ── Rust crates (all workspace members) ──────────────────────────────────
+  # Rust: every workspace member, one lockfile.
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "America/Los_Angeles"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "rust"
+    open-pull-requests-limit: 0
     commit-message:
-      prefix: "chore(deps)"
-      prefix-development: "chore(deps-dev)"
-      include: "scope"
-    # Group patch + minor bumps into one weekly PR per category so review
-    # load stays manageable. Major bumps and security advisories still come
-    # as individual PRs (Dependabot overrides grouping for those).
-    groups:
-      # Async runtime + transport — tokio/hyper/tonic/reqwest move together
-      async-runtime:
-        patterns:
-          - "tokio*"
-          - "hyper*"
-          - "tonic*"
-          - "reqwest*"
-          - "h2"
-          - "axum*"
-        update-types:
-          - "patch"
-          - "minor"
-      # Serde / JSON — frequent minor bumps, almost always safe to group
-      serde:
-        patterns:
-          - "serde*"
-          - "serde_*"
-        update-types:
-          - "patch"
-          - "minor"
-      # SQLx + Postgres stack
-      database:
-        patterns:
-          - "sqlx*"
-          - "pgvector*"
-        update-types:
-          - "patch"
-          - "minor"
-      # Observability stack
-      observability:
-        patterns:
-          - "opentelemetry*"
-          - "tracing*"
-          - "prometheus*"
-        update-types:
-          - "patch"
-          - "minor"
-      # Wasmtime — security-sensitive, bump as one unit. EXCLUDES major
-      # bumps (43 → 44) which we vet manually because WIT world changes.
-      wasmtime:
-        patterns:
-          - "wasmtime*"
-          - "wasi*"
-        update-types:
-          - "patch"
-          - "minor"
-      # AWS SDK — every crate version-locks the others, so they must move
-      # together or not at all.
-      aws-sdk:
-        patterns:
-          - "aws-*"
-        update-types:
-          - "patch"
-          - "minor"
-      # Crypto primitives — rustls, aes-gcm, hmac, sha2, ring. Bumps here
-      # are high-signal; keep the group small so each PR is auditable.
-      crypto:
-        patterns:
-          - "rustls*"
-          - "aes-gcm"
-          - "aead"
-          - "hmac"
-          - "sha2"
-          - "ring"
-          - "webpki*"
-          - "rcgen"
-        update-types:
-          - "patch"
-          - "minor"
+      prefix: "fix(deps)"
 
-  # ── Docker base images referenced in Dockerfiles ─────────────────────────
-  # Watches controller/Dockerfile + Dockerfile.ollama for digest updates to
-  # their `FROM` lines. Pinned-by-digest images don't get auto-updated by
-  # a "latest" sweep — Dependabot reads the tag alongside the digest and
-  # bumps both together.
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    labels:
-      - "dependencies"
-      - "docker"
-    commit-message:
-      prefix: "chore(docker)"
-    open-pull-requests-limit: 5
-
-  - package-ecosystem: "docker"
-    directory: "/controller"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    labels:
-      - "dependencies"
-      - "docker"
-    commit-message:
-      prefix: "chore(docker)"
-    open-pull-requests-limit: 5
-
-  # worker/ and frontend/ (package BX, 2026-09-16): their base images are
-  # digest-pinned (check 93), and a pin nothing updates freezes security
-  # fixes — the worker's runtime stage executes production WASM.
-  - package-ecosystem: "docker"
-    directory: "/worker"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    labels:
-      - "dependencies"
-      - "docker"
-    commit-message:
-      prefix: "chore(docker)"
-    open-pull-requests-limit: 5
-
-  - package-ecosystem: "docker"
+  # Frontend.
+  - package-ecosystem: "npm"
     directory: "/frontend"
     schedule:
       interval: "weekly"
-      day: "monday"
-    labels:
-      - "dependencies"
-      - "docker"
+    open-pull-requests-limit: 0
     commit-message:
-      prefix: "chore(docker)"
-    open-pull-requests-limit: 5
-
-  # ── docker-compose services (separate ecosystem in Dependabot) ───────────
-  # Scans the `image:` fields in docker-compose.yml. Only bumps the digest
-  # when the tag itself has moved (e.g. new minio/minio:latest push). For
-  # version-tagged images (postgres:pg16, etc.) Dependabot opens a PR when
-  # the upstream releases a fix for the pinned minor/patch series.
-  - package-ecosystem: "docker-compose"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    labels:
-      - "dependencies"
-      - "docker-compose"
-    commit-message:
-      prefix: "chore(compose)"
-    open-pull-requests-limit: 5
-
-  # ── GitHub Actions used in workflows ─────────────────────────────────────
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    labels:
-      - "dependencies"
-      - "github-actions"
-    commit-message:
-      prefix: "chore(ci)"
-    open-pull-requests-limit: 5
+      prefix: "fix(deps)"
