@@ -110,7 +110,7 @@ redis = { workspace = true, features = ["default", "tokio-comp", "connection-man
 # OpenTelemetry for production observability
 opentelemetry = { workspace = true, features = ["metrics", "trace"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "metrics", "trace"] }
-opentelemetry-prometheus = "0.32"
+opentelemetry-prometheus = "0.33"
 # `process`: see talos-metrics/Cargo.toml — the worker registers the same
 # ProcessCollector into the default registry in `metrics::init_telemetry`.
 prometheus = { workspace = true, features = ["process"] } # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, which drops the
