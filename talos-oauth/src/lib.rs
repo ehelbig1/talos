@@ -549,21 +549,18 @@ pub fn hash_oauth_session_binding(nonce: &str) -> String {
 /// The compared values are hashes (not raw secrets), but the comparison
 /// still gates an auth decision, so we avoid the early-return timing
 /// oracle of `==`/`str::eq` per the CLAUDE.md "constant-time compare for
-/// security-sensitive values" rule. `subtle` is not a workspace dep, so
-/// this is the canonical no-dep XOR-accumulate form. A length mismatch
-/// is folded into the accumulator (rather than short-circuited) so the
-/// caller can't distinguish "wrong length" from "wrong value" by timing.
+/// security-sensitive values" rule. The comparison is `subtle`'s, the one
+/// every other token and MAC check in the workspace uses.
+///
+/// Inputs of different lengths are unequal, and `subtle` says so without
+/// reading a byte. That is not a timing leak here: both inputs are SHA-256
+/// hex digests, whose length (64) is public. Until 2026-10-06 this was a
+/// hand-written XOR fold that mixed the two lengths into a single byte, so
+/// lengths differing by a multiple of 256 compared as equal when the extra
+/// bytes were zero.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff: u8 = (a.len() ^ b.len()) as u8;
-    // Walk the longer of the two so the loop count depends only on the
-    // (public) digest length, never on where the first mismatch is.
-    let len = a.len().max(b.len());
-    for i in 0..len {
-        let ab = a.get(i).copied().unwrap_or(0);
-        let bb = b.get(i).copied().unwrap_or(0);
-        diff |= ab ^ bb;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 impl OAuthService {
@@ -1925,6 +1922,25 @@ mod session_binding_tests {
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(!constant_time_eq(b"", b"x"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Lengths that differ by a multiple of 256 are still different lengths.
+    /// The helper this replaced folded `a.len() ^ b.len()` into one byte, so
+    /// such a pair with zero bytes in the extra part compared as equal.
+    #[test]
+    fn a_length_difference_that_is_a_multiple_of_256_is_unequal() {
+        assert!(!constant_time_eq(b"", &[0u8; 256]));
+        assert!(!constant_time_eq(&[0u8; 256], b""));
+        assert!(!constant_time_eq(&[0u8; 256], &[0u8; 512]));
+        assert!(!constant_time_eq(b"", &[0u8; 65_536]));
+
+        // The shape the callers pass: a 64-character hex digest, against the
+        // same digest followed by 256 NUL bytes.
+        let (_nonce, hash) = generate_oauth_session_binding();
+        let mut padded = hash.clone().into_bytes();
+        padded.extend_from_slice(&[0u8; 256]);
+        assert!(!constant_time_eq(hash.as_bytes(), &padded));
+        assert!(!constant_time_eq(&padded, hash.as_bytes()));
     }
 
     #[test]

@@ -25,6 +25,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+# Constant-time equality for the session-binding hash check.
+subtle = "2.4"
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }
