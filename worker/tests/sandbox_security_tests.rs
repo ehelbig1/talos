@@ -696,6 +696,36 @@ async fn xml_external_entity_is_not_resolved_xxe() {
     }
 }
 
+/// Internal-entity freeze ("billion laughs"): an entity the document declares
+/// in its own DTD is never expanded. The converter refuses the document at
+/// the first reference to one, so a few hundred bytes of nested declarations
+/// cannot become gigabytes of text. The XXE test above accepts either outcome;
+/// this one pins the refusal, and that nothing from the declaration reaches
+/// the output of a document that only declares.
+#[tokio::test]
+async fn xml_internal_entities_are_refused_not_expanded() {
+    use worker::bindings::talos::core::data_transform::Host;
+    let mut ctx = make_context();
+
+    let bomb = r#"<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;"><!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">]><r>&c;</r>"#;
+    assert!(
+        ctx.xml_to_json(bomb.to_string()).await.is_err(),
+        "a reference to a document-declared entity must refuse the document"
+    );
+
+    // Declared but never referenced: the document converts, and the
+    // declaration's text is not in it.
+    let declared_only =
+        r#"<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "made-up-secret">]><r>plain</r>"#;
+    let json = ctx
+        .xml_to_json(declared_only.to_string())
+        .await
+        .expect("an unreferenced declaration does not refuse the document");
+    assert!(!json.contains("made-up-secret"), "{json}");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON out");
+    assert_eq!(parsed["r"], serde_json::json!("plain"));
+}
+
 /// Entity-resolution freeze for the quick-xml 0.37 → 0.41 migration
 /// (RUSTSEC-2026-0194/0195). Post-0.38, entity references arrive as
 /// GeneralRef events and a text run splits around them — the converter
@@ -718,4 +748,92 @@ async fn xml_predefined_entities_and_char_refs_resolve_into_one_text() {
         serde_json::json!(r#"a & b <ok> "q" 's' 10"#),
         "entity fragments must reassemble into one unescaped #text value"
     );
+}
+
+/// What `xml_to_json` returns for thirty edge-case documents, recorded under
+/// quick-xml 0.41 before the move to 0.42 (2026-10-06), which changed the
+/// reader's events from bytes to text. Each input is a JSON string (so a
+/// carriage return and the byte-order mark are visible); `None` is a refusal.
+/// A parser release that changes any row changes what modules are given.
+///
+/// What the table records, whether or not it is what one would design: line
+/// endings pass through unchanged, CDATA and attributes are dropped, a
+/// repeated element keeps its last value, a second root replaces the first,
+/// and an unterminated or unknown entity refuses the document.
+#[tokio::test]
+async fn xml_to_json_output_is_unchanged_for_the_recorded_corpus() {
+    use worker::bindings::talos::core::data_transform::Host;
+    let corpus: [(&str, Option<&str>); 30] = [
+        (
+            r##""<r>line1\r\nline2\rline3\nend</r>""##,
+            Some(r##"{"r":"line1\r\nline2\rline3\nend"}"##),
+        ),
+        (r##""<r><![CDATA[x < y]]></r>""##, Some(r##"{"r":{}}"##)),
+        (r##""<r>a<![CDATA[ mid ]]>b</r>""##, Some(r##"{"r":"ab"}"##)),
+        (
+            r##""<r a=\"1\"><e/><e2 b=\"2\">t</e2></r>""##,
+            Some(r##"{"r":{"e":null,"e2":"t"}}"##),
+        ),
+        (
+            r##""<ns:r xmlns:ns=\"u\"><ns:c>v</ns:c></ns:r>""##,
+            Some(r##"{"ns:r":{"ns:c":"v"}}"##),
+        ),
+        (
+            r##""<r>  spaced  <c>x</c> tail </r>""##,
+            Some(r##"{"r":{"#text":"spaced   tail","c":"x"}}"##),
+        ),
+        (
+            r##""<r>caf&#233; &#x1F600; &amp;amp;</r>""##,
+            Some(r##"{"r":"café 😀 &amp;"}"##),
+        ),
+        (r##""<r>é ü 日本</r>""##, Some(r##"{"r":"é ü 日本"}"##)),
+        (r##""<r><c></r>""##, None),
+        (r##""<r>&bogus;</r>""##, None),
+        (r##""""##, None),
+        (r##""<?xml version=\"1.0\"?><!-- c --><r/>""##, None),
+        (
+            r##""<?xml version=\"1.0\" encoding=\"UTF-8\"?><!-- c --><r>x</r>""##,
+            Some(r##"{"r":"x"}"##),
+        ),
+        (r##""<r>a<!-- c -->b</r>""##, Some(r##"{"r":"ab"}"##)),
+        (r##""<r>&#0;</r>""##, None),
+        (r##""<r>&#xD800;</r>""##, None),
+        (r##""<r>a &lt b</r>""##, None),
+        (r##""<r>a & b</r>""##, None),
+        (
+            r##""<r><c>1</c><c>2</c></r>""##,
+            Some(r##"{"r":{"c":"2"}}"##),
+        ),
+        (
+            r##""<r>\ttab&#9;x&#10;y&#13;z</r>""##,
+            Some(r##"{"r":"tab\tx\ny\rz"}"##),
+        ),
+        (r##""﻿<r>x</r>""##, Some(r##"{"r":"x"}"##)),
+        (
+            r##""<r><a>1</a>text<b>2</b></r>""##,
+            Some(r##"{"r":{"#text":"text","a":"1","b":"2"}}"##),
+        ),
+        (r##""<r>x</r><s>y</s>""##, Some(r##"{"s":"y"}"##)),
+        (r##""<r>x</r>trailing""##, Some(r##"{"r":"x"}"##)),
+        (r##""<r><?pi data?>x</r>""##, Some(r##"{"r":"x"}"##)),
+        (r##""<r>x""##, None),
+        (r##""<1bad>x</1bad>""##, Some(r##"{"1bad":"x"}"##)),
+        (
+            r##""<r>&#x41;&#66;&amp;&#x3c;</r>""##,
+            Some(r##"{"r":"AB&<"}"##),
+        ),
+        (
+            r##""<r attr=\"a&amp;b\">&gt;</r>""##,
+            Some(r##"{"r":">"}"##),
+        ),
+        (
+            r##""<r>\r\n  <c>v</c>\r\n</r>""##,
+            Some(r##"{"r":{"c":"v"}}"##),
+        ),
+    ];
+    for (input, expected) in corpus {
+        let xml: String = serde_json::from_str(input).expect("the input is a JSON string");
+        let got = make_context().xml_to_json(xml).await.ok();
+        assert_eq!(got.as_deref(), expected, "input {input}");
+    }
 }

@@ -833,7 +833,7 @@ fn xml_string_to_json(xml: &str) -> Result<serde_json::Value, wit_data_transform
                     tracing::warn!("xml_to_json: nesting depth exceeded {}", MAX_XML_DEPTH);
                     return Err(wit_data_transform::Error::Parseerror);
                 }
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_string();
                 stack.push_back((name, serde_json::Map::new()));
             }
             Ok(Event::Text(e)) => {
@@ -845,10 +845,9 @@ fn xml_string_to_json(xml: &str) -> Result<serde_json::Value, wit_data_transform
                     // Text/GeneralRef/Text. APPEND rather than insert so
                     // "a &amp; b" still assembles into one "#text" value
                     // (the pre-0.38 BytesText::unescape behavior).
-                    let text = e
-                        .decode()
-                        .map_err(|_| wit_data_transform::Error::Parseerror)?;
-                    append_xml_text(obj, &text);
+                    // quick-xml 0.42: the event IS the text as it appeared in
+                    // the source (a `str`); there is no decode step to fail.
+                    append_xml_text(obj, &e);
                 }
             }
             Ok(Event::GeneralRef(e)) => {
@@ -862,12 +861,12 @@ fn xml_string_to_json(xml: &str) -> Result<serde_json::Value, wit_data_transform
                     // previously representable).
                     let resolved: Option<String> = match e.resolve_char_ref() {
                         Ok(Some(ch)) => Some(ch.to_string()),
-                        _ => match e.decode().as_deref() {
-                            Ok("lt") => Some("<".to_string()),
-                            Ok("gt") => Some(">".to_string()),
-                            Ok("amp") => Some("&".to_string()),
-                            Ok("apos") => Some("'".to_string()),
-                            Ok("quot") => Some("\"".to_string()),
+                        _ => match &*e {
+                            "lt" => Some("<".to_string()),
+                            "gt" => Some(">".to_string()),
+                            "amp" => Some("&".to_string()),
+                            "apos" => Some("'".to_string()),
+                            "quot" => Some("\"".to_string()),
                             _ => None,
                         },
                     };
@@ -907,7 +906,7 @@ fn xml_string_to_json(xml: &str) -> Result<serde_json::Value, wit_data_transform
             }
             Ok(Event::Empty(e)) => {
                 if let Some((_, parent)) = stack.back_mut() {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let name = e.name().as_ref().to_string();
                     parent.insert(name, serde_json::Value::Null);
                 }
             }
