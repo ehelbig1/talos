@@ -72,6 +72,47 @@ checks that 2, 3, 4, 5 and 7 shards each partition the real list exactly. The
 selection is captured, not streamed: a failed deal stops the shard, where a
 streamed one would have run nothing and passed.
 
+## Second measurement: the deal alone did not shorten the run
+
+The dealt shards' first run (37464963912): **12.3 minutes — no better than
+round-robin's 12.4.** Shards 11.9 / 9.4 / 8.8 / 7.8; their tests ran
+7.1 / 5.3 / 4.2 / 4.5 minutes, not the 4.8 each the replay predicted. Three
+separate things, read from the logs:
+
+1. **An intermittent 60-second stall, and it had been recorded as weight.**
+   `actor_clone_parity_tests` and `approval_policy_trigger_refusal_tests`
+   took 61 and 62 s in the first run and 2 and 3 s in the second;
+   `create_workflow_node_controls_tests` and `enqueue_drain_tests` took 1 s
+   and then 61. In each case cargo reported the binary fresh in under a
+   second and every test in it sat for a minute from its first line, then
+   passed. Different binaries each run, two per run, on shards at random.
+   The one-run table had listed two of them as minute-long tests.
+   The cause is NOT known. Nothing on the client side waits 60 s; the one
+   arithmetic match is the harness's clone retry (10 retries, Postgres
+   waiting 5 s inside each) — which would mean something holds a session on
+   the template database, and that is a hypothesis.
+2. **Compile-heavy `--lib` items vary by a minute between runs**
+   (`expose_limit_absence_tests` 71 → 119 s, `kernel_two_replica` 36 → 59 s);
+   both fell on shard 1.
+3. **The DB-free job took 12.0 minutes, not 7.7:** it alone landed on a newer
+   runner image (20261004 against 20260927), whose toolchain environment
+   gives `rust-cache` a different key, found no cache and compiled every
+   dependency. GitHub's rollout, and it ends when main saves a cache on the
+   new image — but that job never saves one, so it depends on the unit job
+   having run on the same image.
+
+Changed in response:
+
+* `ci_shard.py weights` takes several `--run`s and keeps each item's
+  **fastest** time: a stall or a slow runner only adds. The table is rebuilt
+  from both runs — 182 items, 16.3 minutes, 37 listed; the four stalled
+  binaries are no longer in it.
+* Each shard's Postgres logs statements of 3 s or more, lock waits and every
+  session, and the shard ends by printing the slow statements, any refusal
+  to clone the template, and sessions of 3 s or more on the template. The
+  next stall names its own cause; until then the stall is unexplained and
+  costs about two minutes a run.
+
 ## Deliberately not done
 
 * **Running binaries in parallel inside a shard.** The `tc` binaries are
@@ -79,10 +120,11 @@ streamed one would have run nothing and passed.
   binaries each clone the template database.
 * **A lint that the weights table is fresh.** A stale table only costs
   balance, never correctness; `docs/ci.md` says when to refresh it.
+* **A fix for the stall.** Not without its cause.
 
 ## Not yet known
 
-The dealt shards have not run in CI: about 9 minutes of wall time is expected
-(4.8 of tests + 2–3 of build + setup), from 12.4. `make test-integration`
-locally (one shard) now builds all 155 controller binaries in one call first;
-that was not timed here.
+Whether the deal shortens the run once the stall is out of the table: one
+run, with two stalls and a cold job in it, says nothing either way.
+`make test-integration` locally (one shard) now builds all 155 controller
+binaries in one call first; that was not timed here.

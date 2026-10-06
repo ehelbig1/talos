@@ -10,8 +10,9 @@ set the whole run's wall time by chance.
 
     ci_shard.py select I N [--weights FILE]   < work items, one per line
         Prints shard I's items, in their original order.
-    ci_shard.py weights --run RUN_ID [--repo OWNER/NAME] [--min-seconds S]
-        Prints a weights table measured from that run's shard logs (needs gh).
+    ci_shard.py weights --run RUN_ID [--run RUN_ID …] [--repo OWNER/NAME]
+        Prints a weights table measured from those runs' shard logs (needs gh).
+        Give two or more runs: an item's weight is its FASTEST time among them.
     ci_shard.py --self-test
 
 A work item is `kind|crate|what|extra`; its weight is looked up under
@@ -134,28 +135,51 @@ def durations_from_log(text: str) -> dict[str, float]:
     return out
 
 
+def fastest(per_run: list[dict[str, float]]) -> dict[str, float]:
+    """Each item's fastest time among the runs.
+
+    A measured time is the test plus whatever else happened to it: on
+    2026-10-06 four controller binaries that take 1–3 s took 60–62 s in one
+    run each (a stall inside the harness, different binaries each run), and a
+    table built from one run recorded two of them as minute-long tests. A
+    stall or a slow runner only ever adds time, so the fastest of several
+    runs is the closest to what the item costs.
+    """
+    out: dict[str, float] = {}
+    for run in per_run:
+        for key, secs in run.items():
+            out[key] = min(secs, out.get(key, secs))
+    return out
+
+
 def cmd_weights(args: argparse.Namespace) -> int:
     def gh(*a: str) -> str:
         return subprocess.run(["gh", *a], check=True, capture_output=True, text=True).stdout
 
-    jobs = json.loads(gh("api", f"repos/{args.repo}/actions/runs/{args.run}/jobs?per_page=100"))["jobs"]
-    shard_jobs = [j for j in jobs if "(integration" in j["name"] and j["conclusion"] == "success"]
-    if not shard_jobs:
-        print(f"run {args.run} has no successful integration shard to measure", file=sys.stderr)
-        return 1
-    measured: dict[str, float] = {}
-    for j in shard_jobs:
-        measured.update(durations_from_log(gh("api", f"repos/{args.repo}/actions/jobs/{j['id']}/logs")))
-    if not measured:
-        print("no work item found in the shard logs — has the '▶' line format changed?", file=sys.stderr)
-        return 1
+    per_run: list[dict[str, float]] = []
+    for run in args.run:
+        jobs = json.loads(gh("api", f"repos/{args.repo}/actions/runs/{run}/jobs?per_page=100"))["jobs"]
+        shard_jobs = [j for j in jobs if "(integration" in j["name"] and j["conclusion"] == "success"]
+        if not shard_jobs:
+            print(f"run {run} has no successful integration shard to measure", file=sys.stderr)
+            return 1
+        one: dict[str, float] = {}
+        for j in shard_jobs:
+            one.update(durations_from_log(gh("api", f"repos/{args.repo}/actions/jobs/{j['id']}/logs")))
+        if not one:
+            print(f"run {run}: no work item in the shard logs — has the '▶' line format changed?", file=sys.stderr)
+            return 1
+        per_run.append(one)
+    measured = fastest(per_run)
     kept = {k: v for k, v in measured.items() if v >= args.min_seconds}
     total = sum(measured.values())
     print(f"# Seconds each integration work item took, for scripts/ci_shard.py.")
-    print(f"# Measured from run {args.run} of {args.repo}: {len(measured)} items, {total / 60:.1f} minutes;")
+    runs = ", ".join(args.run)
+    print(f"# Each item's fastest time among run(s) {runs} of {args.repo}:")
+    print(f"# {len(measured)} items, {total / 60:.1f} minutes;")
     print(f"# the {len(kept)} of {args.min_seconds:g} s or more are listed ({sum(kept.values()) / 60:.1f} minutes).")
     print(f"# An item not listed weighs {DEFAULT_SECONDS:g} s. Refresh:")
-    print(f"#   python3 scripts/ci_shard.py weights --run <a green run's id> > scripts/ci-test-weights.tsv")
+    print(f"#   python3 scripts/ci_shard.py weights --run <a green run> --run <another> > scripts/ci-test-weights.tsv")
     for key, secs in sorted(kept.items(), key=lambda kv: (-kv[1], kv[0])):
         print(f"{secs:.0f}\t{key}")
     return 0
@@ -214,6 +238,8 @@ def self_test() -> int:
     )
     got = durations_from_log(log)
     assert got == {"controller|made_up_tests": 30.5, "made-up-crate|--lib a_filter": 10.0, "made-up-crate|a_bin": 60.0}, got
+    # Several runs: the fastest time wins, and an item seen once still counts.
+    assert fastest([{"a|x": 61.0, "b|y": 4.0}, {"a|x": 2.0, "c|z": 9.0}]) == {"a|x": 2.0, "b|y": 4.0, "c|z": 9.0}
     print("ci_shard self-test: ok")
     return 0
 
@@ -229,7 +255,7 @@ def main() -> int:
     s.add_argument("--weights")
     s.set_defaults(func=cmd_select)
     w = sub.add_parser("weights")
-    w.add_argument("--run", required=True)
+    w.add_argument("--run", required=True, action="append")
     w.add_argument("--repo", default="ehelbig1/talos")
     w.add_argument("--min-seconds", type=float, default=MIN_TABLE_SECONDS)
     w.set_defaults(func=cmd_weights)

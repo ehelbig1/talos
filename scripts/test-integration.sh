@@ -134,7 +134,42 @@ PG_PASS="test"
 TALOS_TEST_RUN_ID="it-$$-$(date +%s)"
 export TALOS_TEST_RUN_ID
 
+# ── What Postgres waited on ────────────────────────────────────────────────
+# Measured 2026-10-06 on two runs: four controller test binaries that take
+# 1–3 seconds took 60.6–62.0 in one run and not the other — every test in the
+# binary blocked from its first line for a minute, then passed. Different
+# binaries each time, two per run, so about two minutes land on shards at
+# random. Nothing on the client side accounts for it, so the server is asked:
+# it logs statements of 3 s or more, lock waits, and every session, and this
+# prints the slow statements, any refusal to clone the template, and the
+# sessions that stayed on the template (talos_ctl) for 3 s or more. Printed
+# once, before the container is removed; never fails the run.
+PG_REPORT_ARMED=""
+report_postgres_waits() {
+    [ -n "$PG_REPORT_ARMED" ] || return 0
+    PG_REPORT_ARMED=""
+    local log
+    log="$(docker logs "$PG_NAME" 2>&1)" || return 0
+    echo
+    echo "▶ postgres: statements of 3 s or more, template contention, long sessions on the template"
+    printf '%s\n' "$log" | python3 -c '
+import re, sys
+shown = 0
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    keep = bool(re.search(r"duration: \d+|being accessed by other users|other sessions? using|still waiting for|acquired \w+Lock", line))
+    m = re.search(r"db=talos_ctl .*disconnection: session time: (\d+):(\d+):([\d.]+)", line)
+    if m and int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) >= 3:
+        keep = True
+    if keep and shown < 200:
+        print("  " + line[:300])
+        shown += 1
+print(f"  ({shown} line(s))")
+' || true
+}
+
 cleanup() {
+    report_postgres_waits
     docker rm -f "$REDIS_NAME" "$PG_NAME" "$NATS_NAME" "$NATS_PERM_NAME" >/dev/null 2>&1 || true
     local ids
     ids=$(docker ps -aq --filter "label=talos.test-run=${TALOS_TEST_RUN_ID}" 2>/dev/null) || return 0
@@ -161,6 +196,7 @@ command -v sqlx >/dev/null 2>&1 \
     || { echo "✗ sqlx-cli missing — install: cargo install sqlx-cli --locked"; exit 1; }
 
 echo "▶ starting disposable Redis + pgvector + NATS…"
+PG_REPORT_ARMED=1
 docker run -d --rm --name "$REDIS_NAME" -p "${REDIS_PORT}:6379" redis:7-alpine@sha256:7aec734b2bb298a1d769fd8729f13b8514a41bf90fcdd1f38ec52267fbaa8ee6 >/dev/null
 # `pg_stat_statements` must be PRELOADED at postmaster start, exactly as
 # docker-compose.yml does: without it migration 20260908120000 no-ops, the
@@ -170,7 +206,10 @@ docker run -d --rm --name "$REDIS_NAME" -p "${REDIS_PORT}:6379" redis:7-alpine@s
 docker run -d --rm --name "$PG_NAME" \
     -e "POSTGRES_USER=${PG_USER}" -e "POSTGRES_PASSWORD=${PG_PASS}" -e POSTGRES_DB=talos \
     -p "${PG_PORT}:5432" pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f \
-    -c shared_preload_libraries=pg_stat_statements >/dev/null
+    -c shared_preload_libraries=pg_stat_statements \
+    -c log_min_duration_statement=3000 -c log_lock_waits=on \
+    -c log_connections=on -c log_disconnections=on \
+    -c "log_line_prefix=%m [%p] db=%d app=%a " >/dev/null
 # NATS for the RFC 0010 P3 (D3b) claim-protocol integration tests (envelope-seal
 # responder↔worker handshake + the engine-nats full dispatch→claim→open loop).
 # `-js`: the audit-ledger stream-bound test (below) needs JetStream; the claim
