@@ -60,7 +60,7 @@ COPY . .
 # actual compilation anyway.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/talos/target,sharing=locked \
-    cargo build --profile "${CARGO_PROFILE}" --bin worker 2>&1 && \
+    cargo build --locked --profile "${CARGO_PROFILE}" --bin worker 2>&1 && \
     cp "target/${CARGO_PROFILE}/worker" /app/worker-bin
 
 # ══════════════════════════════════════════════════════════════════════════════

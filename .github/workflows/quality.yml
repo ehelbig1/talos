@@ -1105,6 +1105,20 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
 
+      - name: Cargo.lock matches the manifests
+        # No cargo command in CI or in the image builds passed --locked until
+        # 2026-10-06, so a manifest committed without its lockfile change
+        # built anyway, on versions cargo chose at that moment and nobody
+        # reviewed. This refuses it once, for every job: it re-resolves only
+        # the workspace's own entries and fails if the lockfile would change.
+        # (The image builds pass --locked themselves; CI does not build them.)
+        run: cargo update --workspace --locked
+
+      - name: Rust toolchain pins agree
+        # `make lint` runs this locally; this job runs the structural script
+        # directly, so the check is named here too or CI never runs it.
+        run: python3 scripts/check-rust-pins.py
+
       - name: helm must be present (check 5 skips without it)
         run: helm version
 

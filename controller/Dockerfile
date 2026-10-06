@@ -142,7 +142,7 @@ ENV SQLX_OFFLINE=1
 # the shared registry cache mount without it (cargo unpack "File exists").
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/talos/target,sharing=locked \
-    cargo build --profile "${CARGO_PROFILE}" --bin controller && \
+    cargo build --locked --profile "${CARGO_PROFILE}" --bin controller && \
     cp "/app/talos/target/${CARGO_PROFILE}/controller" /app/controller-bin
 
 # ════════════════════════════════════════════════════════════════════════════
