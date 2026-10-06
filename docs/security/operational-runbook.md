@@ -338,10 +338,13 @@ docker exec talos-postgres pg_dump -U talos -d talos -F c \
 Three automations run without operator intervention; the monthly
 review is just "look at the output, approve/investigate":
 
-- **Dependabot** (`.github/dependabot.yml`) — weekly PRs for cargo /
-  Docker / docker-compose / GitHub Actions. Grouped by domain to
-  control review load. Security advisories override grouping and
-  ship as dedicated PRs.
+- **Dependabot** (`.github/dependabot.yml`) — SECURITY updates only,
+  for cargo and the frontend's npm lockfile (alerts and security
+  updates were turned on 2026-10-06): when an advisory has a patched
+  release GitHub opens a PR that moves to it. There are no weekly
+  version-bump PRs. (Until that date this entry described weekly PRs
+  for cargo / Docker / docker-compose / GitHub Actions; Dependabot had
+  run once, on 2026-09-16, and no such PR ever existed.)
 - **`cargo audit`** + **`cargo deny check`** — both run on every CI
   push, both block merge on failure. Justified exemptions live in
   `deny.toml`; silent suppressions forbidden.
@@ -376,8 +379,9 @@ review is just "look at the output, approve/investigate":
 **Quarterly review checklist (in addition to monthly):**
 
 - [ ] Re-resolve the digest-pinned Docker images in `docker-compose.yml`
-      and compare to the pinned values. A new upstream publish =
-      dependabot PR incoming; an unexplained digest drift = investigate.
+      and compare to the pinned values. A new upstream publish is bumped
+      by hand (nothing opens a PR for it); an unexplained digest drift =
+      investigate.
 - [ ] Audit `deny.toml` exemptions for upstream fixes. Any advisory
       where an upstream-tracking-link now shows a fix shipped = drop
       the exemption, run `cargo update`, verify.

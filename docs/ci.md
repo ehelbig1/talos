@@ -163,6 +163,10 @@ files an advisory can come from (`Cargo.toml`/`Cargo.lock`/`deny.toml`/
 `audit-exceptions.json`). If it does not, the change did not introduce the
 advisory and main has it too:
 
+0. Look for a pull request from Dependabot first: since 2026-10-06 GitHub
+   opens one when the advisory has a patched release
+   (`.github/dependabot.yml` — security updates only). If it is there and
+   green, merge it and go to step 3.
 1. Fix it in a pull request of its own — update the dependency; for the
    frontend, an `overrides` entry when the patched release is outside what a
    dependent asks for (run `npm run codegen` and compare `src/generated`).
