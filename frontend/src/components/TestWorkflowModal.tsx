@@ -28,12 +28,7 @@ type RunPhase = "idle" | "running" | "completed" | "failed" | "waiting";
 
 /** Per-node display status derived from the `ExecutionStatus` wire enum. */
 type NodeStatus =
-  | "completed"
-  | "failed"
-  | "running"
-  | "skipped"
-  | "waiting"
-  | "pending";
+  "completed" | "failed" | "running" | "skipped" | "waiting" | "pending";
 
 /**
  * A per-node view folded from the live `executionUpdates` stream. The subscription

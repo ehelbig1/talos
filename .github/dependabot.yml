@@ -73,6 +73,13 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # Held at 5.91.3 (2026-10-06, #1153): from 5.92 its query-devtools
+      # depend on solid-js, which pins seroval ~1.5.4 — inside two advisories
+      # (GHSA-p6vx-979v-rg4c critical, GHSA-jp82-f5mq-hwhp high) patched only
+      # from 1.6.3. Dev-only and not in the production bundle, but the audit
+      # gate blocks on it, and it would sink the whole weekly group. Remove
+      # this entry once `npm view solid-js dependencies` shows seroval >=1.6.3.
+      - dependency-name: "@tanstack/react-query-devtools"
     commit-message:
       prefix: "chore(deps)"
 

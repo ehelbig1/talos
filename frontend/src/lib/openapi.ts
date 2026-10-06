@@ -202,8 +202,7 @@ export function endpointToNodeConfig(
     const securitySchemes =
       (spec?.components?.securitySchemes as Record<string, unknown>) || {};
     const firstScheme = Object.values(securitySchemes)[0] as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
 
     if (firstScheme) {
       if (firstScheme.type === "http" && firstScheme.scheme === "bearer") {

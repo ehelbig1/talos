@@ -5,12 +5,7 @@ import { useShallow } from "zustand/react/shallow";
 import type { ExecutionUpdate } from "@/lib/graphqlClient";
 
 export type NodeStatusType =
-  | "idle"
-  | "running"
-  | "success"
-  | "failed"
-  | "skipped"
-  | "awaiting_approval";
+  "idle" | "running" | "success" | "failed" | "skipped" | "awaiting_approval";
 
 export interface NodeStatus {
   status: NodeStatusType;

@@ -63,8 +63,7 @@ export interface RefreshedUser {
  * specific the client could act on.
  */
 export type RefreshOutcome =
-  | { refreshed: true; user: RefreshedUser }
-  | { refreshed: false };
+  { refreshed: true; user: RefreshedUser } | { refreshed: false };
 
 /** ONE copy of the mutation text; selects every field any caller reads. */
 export const REFRESH_TOKEN_MUTATION = `
