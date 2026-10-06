@@ -230,10 +230,18 @@ jobs:
       - name: CI disk-freeing script acts only when space is short
         run: bash scripts/tests/ci-free-disk-test.sh
 
+      - name: Pre-push guard refuses a follow-up to a merged pull request
+        # scripts/check-push-target.sh against a throwaway repository and a
+        # fake gh: the one refused case, and everything that must go through.
+        run: bash scripts/tests/check-push-target-test.sh
+
       - name: Integration shards partition the work list
         # scripts/ci_shard.py deals the suite to shards by measured duration;
         # every item must land on exactly one shard, whatever the count.
         run: bash scripts/tests/ci-shard-test.sh
+
+      - name: CI run report reads a job log
+        run: python3 scripts/ci-run-report.py --self-test
 
       - name: Chart Vault init Job + unsealer sidecar against a real Vault
         # deploy/helm/talos/files/vault-init.sh and vault-unseal-loop.sh, driven

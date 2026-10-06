@@ -162,6 +162,20 @@ advisory and main has it too:
    `frontend/audit-exceptions.json` (or `deny.toml`'s ignore list, with the
    reason).
 3. Bring the blocked pull request up to date with main; its run then passes.
+## Measuring a run
+
+`python3 scripts/ci-run-report.py --pr <number> --wait` (or `--sha <commit>`,
+`--run <id>`) prints what one `quality.yml` run cost and why: each job's
+minutes, the runner image it landed on, whether it found its build cache,
+its steps of a minute or more; for each integration shard the combined
+build, the minutes of tests, any controller test binary of 20 seconds or
+more and Postgres's wait summary; and then what stands out — a job on a
+different runner image, a missed cache, uneven shards, the login-timeout
+stall, a job GitHub never started.
+
+It finds the run by COMMIT, and says so when a commit has none: a commit
+pushed to a branch whose pull request has already merged gets no run, and
+"the branch's newest run" is then an older commit's.
 
 ## The integration job runs in shards
 

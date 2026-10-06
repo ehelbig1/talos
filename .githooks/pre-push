@@ -52,12 +52,25 @@
 # `FORCE_LINT=1 git push`.
 set -euo pipefail
 
+repo_root="$(git rev-parse --show-toplevel)"
+
+# git's pre-push lines, read once: two things below need them. A terminal on
+# stdin means a manual `bash .githooks/pre-push`, which has none.
+if [ -t 0 ]; then push_lines=""; else push_lines="$(cat)"; fi
+
+# ── Is this branch's pull request already merged? ─────────────────────────
+# Before the lint gates (it is one question to GitHub, they are a minute or
+# more) and before SKIP_LINT: it is not a lint. A push that adds commits to a
+# merged pull request's branch is refused — they would never reach main
+# (scripts/check-push-target.sh; TALOS_PUSH_TO_MERGED=1 to push anyway).
+if ! printf '%s\n' "$push_lines" | bash "$repo_root/scripts/check-push-target.sh"; then
+    exit 1
+fi
+
 if [ "${SKIP_LINT:-0}" = "1" ]; then
     echo "pre-push: SKIP_LINT=1 set — skipping the lint gates."
     exit 0
 fi
-
-repo_root="$(git rev-parse --show-toplevel)"
 
 # ── Which files does this push actually contain? ─────────────────────────
 # git feeds pre-push `<local ref> <local sha> <remote ref> <remote sha>` on
@@ -84,7 +97,7 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     fi
     changed_files="$changed_files
 $range_files"
-done
+done <<< "$push_lines"
 
 # Non-interactive callers (or a manual `bash .githooks/pre-push`) give no
 # stdin at all; treat that as "cannot tell" rather than "nothing changed".
