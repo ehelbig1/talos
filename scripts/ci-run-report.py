@@ -18,9 +18,8 @@ shard: the combined build, the minutes of tests, any controller test binary of
 20 s or more, and what Postgres reported waiting on. Then what stands out —
 each of these was a real cause of a slow run that day:
 
-  * a job on a different runner image from the rest (its cache key differs,
-    so it compiles every dependency);
-  * a job that found no build cache;
+  * a job that found no build cache (it compiles every dependency), and
+    whether it was on a different runner image from the rest;
   * shards whose test minutes differ by more than two (the weights table,
     scripts/ci-test-weights.tsv, is stale);
   * a `DROP DATABASE` Postgres spent 3 s or more on (the login-timeout stall).
@@ -164,6 +163,7 @@ def report(repo: str, run: dict) -> int:
           + (f"  wall {wall:.1f} min" if wall is not None and run["status"] == "completed" else ""))
     notes: list[str] = []
     images: dict[str, str] = {}
+    missed: set[str] = set()
     shard_tests: dict[str, float] = {}
     for job in sorted(jobs, key=lambda j: j["name"]):
         if job["conclusion"] in (None, "skipped"):
@@ -193,6 +193,7 @@ def report(repo: str, run: dict) -> int:
                 images[job["name"]] = image
             line += f"  [image {image or '?'}; cache {cache or '?'}]"
             if cache and cache.startswith("MISS"):
+                missed.add(job["name"])
                 notes.append(f"{job['name']}: no build cache — it compiled every dependency")
             if "(integration" in job["name"] and log:
                 f = shard_facts(log)
@@ -212,10 +213,14 @@ def report(repo: str, run: dict) -> int:
         if steps:
             print("             " + " | ".join(steps))
     if images:
+        # A different image is only worth a line when the job also missed its
+        # cache: since 2026-10-06 the key no longer depends on the image's own
+        # toolchain (scripts/ci-only-pinned-rust.sh), so a miss on the odd
+        # image out means that has regressed.
         common, _ = Counter(images.values()).most_common(1)[0]
         for name, image in images.items():
-            if image != common:
-                notes.append(f"{name}: runner image {image}, the others {common} — its cache key differs")
+            if image != common and name in missed:
+                notes.append(f"{name}: it is on runner image {image}, the others on {common} — the cache key should not depend on the image")
     if len(shard_tests) >= 2 and max(shard_tests.values()) - min(shard_tests.values()) > 2:
         notes.append(
             f"shard test minutes differ by {max(shard_tests.values()) - min(shard_tests.values()):.1f} — refresh the table: "

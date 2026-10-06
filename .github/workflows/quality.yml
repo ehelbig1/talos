@@ -221,6 +221,9 @@ jobs:
       - name: CI run report reads a job log
         run: python3 scripts/ci-run-report.py --self-test
 
+      - name: Toolchain pruning keeps the pinned Rust and nothing else
+        run: bash scripts/tests/ci-only-pinned-rust-test.sh
+
       - name: Chart Vault init Job + unsealer sidecar against a real Vault
         # deploy/helm/talos/files/vault-init.sh and vault-unseal-loop.sh, driven
         # against the chart's pinned hashicorp/vault image with a fake kubectl:
@@ -308,6 +311,13 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Keep only the pinned Rust toolchain
+        # The cache key below is built from EVERY installed toolchain, and the
+        # runner image ships its own `stable`: a job on an image with a newer
+        # one missed the cache and compiled every dependency
+        # (scripts/ci-only-pinned-rust.sh).
+        run: bash scripts/ci-only-pinned-rust.sh
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -400,6 +410,13 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Keep only the pinned Rust toolchain
+        # The cache key below is built from EVERY installed toolchain, and the
+        # runner image ships its own `stable`: a job on an image with a newer
+        # one missed the cache and compiled every dependency
+        # (scripts/ci-only-pinned-rust.sh).
+        run: bash scripts/ci-only-pinned-rust.sh
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -513,6 +530,13 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip2
 
+      - name: Keep only the pinned Rust toolchain
+        # The cache key below is built from EVERY installed toolchain, and the
+        # runner image ships its own `stable`: a job on an image with a newer
+        # one missed the cache and compiled every dependency
+        # (scripts/ci-only-pinned-rust.sh).
+        run: bash scripts/ci-only-pinned-rust.sh
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -608,6 +632,13 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Keep only the pinned Rust toolchain
+        # The cache key below is built from EVERY installed toolchain, and the
+        # runner image ships its own `stable`: a job on an image with a newer
+        # one missed the cache and compiled every dependency
+        # (scripts/ci-only-pinned-rust.sh).
+        run: bash scripts/ci-only-pinned-rust.sh
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -958,6 +989,13 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
+      - name: Keep only the pinned Rust toolchain
+        # The cache key below is built from EVERY installed toolchain, and the
+        # runner image ships its own `stable`: a job on an image with a newer
+        # one missed the cache and compiled every dependency
+        # (scripts/ci-only-pinned-rust.sh).
+        run: bash scripts/ci-only-pinned-rust.sh
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -1074,6 +1112,13 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
+
+      - name: Keep only the pinned Rust toolchain
+        # The cache key below is built from EVERY installed toolchain, and the
+        # runner image ships its own `stable`: a job on an image with a newer
+        # one missed the cache and compiled every dependency
+        # (scripts/ci-only-pinned-rust.sh).
+        run: bash scripts/ci-only-pinned-rust.sh
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1

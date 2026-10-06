@@ -132,6 +132,14 @@ save nothing.
   dependency change, say): `gh workflow run quality.yml --ref main`.
 * A pull request whose `Cargo.lock` differs from main's restores main's cache
   by key prefix and compiles only what changed.
+* **The cache key must not depend on the runner image.** `rust-cache` builds
+  its key from every toolchain `rustup` lists, and the image ships its own
+  `stable`: when GitHub rolled out an image with a newer one (1.98.1 →
+  1.99.0, 2026-10-06), each job that landed on it found no cache and compiled
+  every dependency — 12 minutes instead of 8, 14 instead of 9 — for as long
+  as both images were in service. Each cached job therefore runs
+  `scripts/ci-only-pinned-rust.sh` between installing the toolchain and
+  restoring the cache: it removes every toolchain but the pinned one.
 * The cache holds dependencies, not this workspace's own crates
   (`rust-cache`'s default): cargo decides whether a workspace crate is fresh
   by file time, and a fresh checkout makes every file new.
