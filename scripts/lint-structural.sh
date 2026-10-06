@@ -5232,8 +5232,8 @@ bold "▶ check 64: every tests/*.rs binary is run by a CI runner"
 #   (a) the classifier accepts the tree — every marker well-formed, no
 #       service-reading binary left to default into the DB-free job (the
 #       "green over zero assertions" case), the >=50-target floor;
-#   (b) the runners are WIRED to it — quality.yml runs the DB-free script and
-#       `make test-integration`, the Makefile runs test-integration.sh, and
+#   (b) the runners are WIRED to it — quality.yml runs `make test-dbfree` and
+#       `make test-integration`, the Makefile runs the two scripts, and
 #       each script actually calls the classifier for its categories. Without
 #       this, a runner that stopped asking would leave every binary "gated"
 #       while running nowhere — the original defect one level up;
@@ -5292,8 +5292,14 @@ if [ "$CI_GATE_FAIL" -eq 0 ]; then
         red "✗ $QUALITY_YML no longer runs 'make test-integration'"
         CI_GATE_FAIL=1
     fi
-    if ! grep -qE "^[[:space:]]*run:[[:space:]]*bash $DBFREE_SH[[:space:]]*\$" <<< "$Q64"; then
-        red "✗ $QUALITY_YML no longer runs '$DBFREE_SH' (the DB-free test binaries)"
+    # Since 2026-10-06 the workflow reaches the DB-free runner the way it
+    # reaches the integration one: through its make target.
+    if ! grep -qE '^[[:space:]]*run:[[:space:]]*make test-dbfree[[:space:]]*$' <<< "$Q64"; then
+        red "✗ $QUALITY_YML no longer runs 'make test-dbfree' (the DB-free test binaries)"
+        CI_GATE_FAIL=1
+    fi
+    if ! grep -qE 'bash[[:space:]]+scripts/ci-run-dbfree-tests\.sh' Makefile 2>/dev/null; then
+        red "✗ the Makefile 'test-dbfree' target no longer runs $DBFREE_SH"
         CI_GATE_FAIL=1
     fi
     if ! grep -qE 'bash[[:space:]]+scripts/test-integration\.sh' Makefile 2>/dev/null; then

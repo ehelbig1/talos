@@ -187,10 +187,42 @@ deploy.
 When it fails: run any cargo command locally (`cargo check`), and commit the
 `Cargo.lock` it rewrites.
 
-The lint job runs `scripts/lint-structural.sh` directly, not `make lint`. A
-check added to the Makefile's `lint` target (the toolchain pins, the
-unused-dependency check) needs its own step in that job, or it runs on a
-developer's machine and never in CI.
+## A gate is a make target
+
+A command that decides whether a change is good is defined once, in the
+`Makefile`, and `quality.yml` runs `make <target>`. `make lint` is the same
+command in the lint job and in the pre-push hook; `make ci` runs every gate
+that needs no service, in one go.
+
+| Job | Runs |
+|---|---|
+| Lint | `make check-lockfile`, `make lint`, `make check-changelog-fragments` |
+| Supply-chain | `make audit`, `make test-scripts` |
+| Rust tests (unit / lib) | `make test-unit` |
+| Rust tests (DB-free + doctests) | `make test-dbfree`, `make test-doc`, `make test-benches` |
+| Rust tests (integration / DB) | `make test-integration` |
+| Clippy | `make clippy`, `make test-integration-scaffold` |
+| Catalog templates | `make check-catalog`, `make check-catalog-fuel` |
+| sqlx offline cache | `make sqlx-check` |
+| Migration baseline | `make verify-schema-baseline` |
+| Alert rules | `make test-alert-rules` |
+| Frontend | `make check-frontend-codegen`, `make lint-frontend`, `make typecheck-frontend`, `make test-frontend`, `make audit-frontend` |
+
+What stays written in the workflow is the runner's own business: installing
+tools, freeing disk, creating databases, classifying the diff, and the
+annotation a step adds around a failed gate.
+
+`scripts/check-ci-uses-make.py` (part of `make lint`) refuses a step that
+runs cargo, `npm run`, `npx` or a repository script directly, unless the
+script is on its short setup list. To add a gate: give it a target, then a
+step that runs it.
+
+A new test of a script needs neither: `make test-scripts` finds every
+`scripts/tests/*.sh`, `deploy/k3s/tests/*.sh` and every `scripts/*.py` that
+has a `--self-test`.
+
+Until 2026-10-06 six of CI's gate steps called make and 31 did not. The lint job ran `scripts/lint-structural.sh` itself, so two checks added
+to `make lint` that day ran on a developer's machine and never in CI.
 
 ## Measuring a run
 
