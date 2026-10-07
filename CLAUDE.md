@@ -142,6 +142,13 @@ What follows from that:
   not gate these without new facts.
 - A classifier that decides whether SQL is a read walks the whole statement: a
   data-modifying CTE (`WITH ins AS (INSERT …) SELECT …`) parses as a query.
+- What a SQL statement CARRIES is asked of
+  `talos_sql_classify::try_for_each_carried_statement`, never of a hand-written
+  walk over the positions a statement can sit in; `SELECT … INTO` (it creates a
+  table) is refused by both gates. The three SQL gates' verdicts over
+  `talos-sql-classify/corpus/statements.sql` are recorded snapshots: a change
+  to a gate, or a `sqlparser` bump, re-records them and the diff is the review
+  (2026-10-06, `talos-sql-classify/corpus/README.md`).
 
 Before changing any of this, read "The actor write ceiling" in
 `docs/engineering-log/DECISIONS.md`.

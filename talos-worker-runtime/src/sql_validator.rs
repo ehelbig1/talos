@@ -331,73 +331,68 @@ fn always_blocked_label(stmt: &Statement) -> Option<&'static str> {
     }
 }
 
-/// Inspect CTEs within a SELECT query for hidden mutations.
+/// Admit every statement the root CARRIES on the terms a top-level statement
+/// of its kind would be admitted.
 ///
-/// PostgreSQL allows writable CTEs like:
+/// PostgreSQL lets a statement sit inside another:
 /// ```sql
 /// WITH deleted AS (DELETE FROM t RETURNING *) SELECT * FROM deleted
+/// WITH src AS (SELECT 1 AS a) UPDATE t SET a = (SELECT a FROM src) RETURNING a
 /// ```
-/// The top-level statement parses as `Query` (SELECT) but the CTE body is a DELETE.
-fn check_cte_mutations(
-    query: &ast::Query,
+/// sqlparser hands both over as a `Statement::Query`, labelled `"SELECT"`, so
+/// the allowlist check on the root's label never sees the write.
+///
+/// # This is the third version of this function, and the first that is not a list
+///
+/// The first looked at the top-level CTE bodies. MCP-554 added nested CTEs and
+/// derived tables. Both were walks over the positions someone had thought of,
+/// and on 2026-10-06 a corpus of statements found eleven more that the walk
+/// admitted with NO operation granted. One is the second statement above,
+/// which PostgreSQL runs (measured through the controller's handler in
+/// `controller/tests/rpc_write_ceiling_tests.rs`): the body of the query a
+/// `WITH` introduces was never looked at, nor a subquery in `WHERE`, the
+/// select list, `ORDER BY` or `LIMIT`.
+///
+/// It now asks `talos_sql_classify::try_for_each_carried_statement`, the walk
+/// the read/write classifier is built on, which rides sqlparser's own derived
+/// visitor and so reaches every position a statement can occupy — including
+/// ones a later sqlparser adds. A carried statement is put through the same
+/// gates as a root: DDL, the always-blocked list, the unknown-kind refusal,
+/// then the allowlist.
+fn check_carried_statements(
+    stmt: &Statement,
     allowed_operations: &[String],
     empty_policy: EmptyAllowlistPolicy,
 ) -> Result<(), SqlValidationError> {
-    check_query_for_mutations(query, allowed_operations, empty_policy)
-}
-
-/// MCP-554: recursively walk a `Query` AST looking for mutation CTEs.
-/// Pre-fix `check_cte_mutations` only inspected the top-level
-/// `query.with.cte_tables` and matched only `SetExpr::Insert` /
-/// `SetExpr::Update` at the CTE body level. Two bypass classes:
-///
-///   1. **Nested CTE inside a CTE body** — when a CTE body is itself
-///      a Query (`SetExpr::Query`) carrying its own `with` clause, the
-///      inner WITH was never visited:
-///        `WITH outer AS (WITH inner AS (INSERT ...) SELECT ...) ...`
-///
-///   2. **CTE inside a FROM subquery** — when a `SELECT`'s FROM
-///      contained a parenthesized `(WITH x AS (INSERT...) SELECT ...)`,
-///      the subquery's `with` was never visited:
-///        `SELECT * FROM (WITH b AS (INSERT ...) SELECT ...) sub`
-///
-/// Fix: walk every nested `Query` reachable from this one and apply
-/// the same per-CTE-body mutation check. `SetExpr` doesn't expose
-/// every interior `Query` directly, so we walk SELECT FROM clauses
-/// and JOIN relations as well.
-fn check_query_for_mutations(
-    query: &ast::Query,
-    allowed_operations: &[String],
-    empty_policy: EmptyAllowlistPolicy,
-) -> Result<(), SqlValidationError> {
-    // 1. Inspect this query's CTE chain.
-    if let Some(ref with) = query.with {
-        for cte in &with.cte_tables {
-            // Check this CTE body for a direct mutation first.
-            check_cte_body(&cte.query, allowed_operations, empty_policy)?;
-            // Then recurse into nested structure (the body may
-            // itself carry a `with` or contain subqueries).
-            check_query_for_mutations(&cte.query, allowed_operations, empty_policy)?;
+    use std::ops::ControlFlow;
+    let walked = talos_sql_classify::try_for_each_carried_statement(stmt, |carried| {
+        match admit_carried_statement(carried, allowed_operations, empty_policy) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(refusal) => ControlFlow::Break(refusal),
         }
+    });
+    match walked {
+        ControlFlow::Break(refusal) => Err(refusal),
+        ControlFlow::Continue(()) => Ok(()),
     }
-    // 2. Recurse into this query's body.
-    check_set_expr_for_mutations(&query.body, allowed_operations, empty_policy)
 }
 
-/// Classify a CTE's direct body. Returns Ok when the body is not a
-/// direct mutation; the caller must STILL recurse into the body's
-/// nested structure for nested-CTE detection.
-fn check_cte_body(
-    cte_query: &ast::Query,
+fn admit_carried_statement(
+    carried: &Statement,
     allowed_operations: &[String],
     empty_policy: EmptyAllowlistPolicy,
 ) -> Result<(), SqlValidationError> {
-    let cte_stmt_type = match cte_query.body.as_ref() {
-        ast::SetExpr::Insert(_) => "INSERT",
-        ast::SetExpr::Update(_) => "UPDATE",
-        _ => return Ok(()),
-    };
-    enforce_cte_mutation_policy(cte_stmt_type, allowed_operations, empty_policy)
+    let kind = statement_type(carried);
+    if is_ddl(carried) {
+        return Err(SqlValidationError::DdlBlocked(kind.to_string()));
+    }
+    if let Some(label) = always_blocked_label(carried) {
+        return Err(SqlValidationError::AlwaysBlocked(label.to_string()));
+    }
+    if kind == "UNKNOWN" {
+        return Err(SqlValidationError::UnknownStatement);
+    }
+    enforce_cte_mutation_policy(kind, allowed_operations, empty_policy)
 }
 
 /// # An empty allowlist meant "anything, as long as you hide it in a CTE"
@@ -453,67 +448,6 @@ fn enforce_cte_mutation_policy(
         return Err(SqlValidationError::CteMutationBlocked(
             cte_stmt_type.to_string(),
         ));
-    }
-    Ok(())
-}
-
-fn check_set_expr_for_mutations(
-    body: &ast::SetExpr,
-    allowed_operations: &[String],
-    empty_policy: EmptyAllowlistPolicy,
-) -> Result<(), SqlValidationError> {
-    match body {
-        ast::SetExpr::Select(select) => {
-            // FROM clauses can be table factors that are themselves
-            // subqueries with their own WITH.
-            for tbl in &select.from {
-                check_table_with_joins(tbl, allowed_operations, empty_policy)?;
-            }
-        }
-        ast::SetExpr::Query(inner) => {
-            check_query_for_mutations(inner, allowed_operations, empty_policy)?;
-        }
-        ast::SetExpr::SetOperation { left, right, .. } => {
-            check_set_expr_for_mutations(left, allowed_operations, empty_policy)?;
-            check_set_expr_for_mutations(right, allowed_operations, empty_policy)?;
-        }
-        // Direct CTE-body INSERT / UPDATE handled by check_cte_body.
-        // Values / Table / Insert / Update don't carry interior Queries
-        // reachable in any subquery surface that would mask a CTE.
-        _ => {}
-    }
-    Ok(())
-}
-
-fn check_table_with_joins(
-    tbl: &ast::TableWithJoins,
-    allowed_operations: &[String],
-    empty_policy: EmptyAllowlistPolicy,
-) -> Result<(), SqlValidationError> {
-    check_table_factor(&tbl.relation, allowed_operations, empty_policy)?;
-    for join in &tbl.joins {
-        check_table_factor(&join.relation, allowed_operations, empty_policy)?;
-    }
-    Ok(())
-}
-
-fn check_table_factor(
-    relation: &ast::TableFactor,
-    allowed_operations: &[String],
-    empty_policy: EmptyAllowlistPolicy,
-) -> Result<(), SqlValidationError> {
-    match relation {
-        ast::TableFactor::Derived { subquery, .. } => {
-            check_query_for_mutations(subquery, allowed_operations, empty_policy)?;
-        }
-        ast::TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            check_table_with_joins(table_with_joins, allowed_operations, empty_policy)?;
-        }
-        // Table / TableFunction / UNNEST etc. don't carry an interior
-        // Query that could hide a CTE mutation.
-        _ => {}
     }
     Ok(())
 }
@@ -885,6 +819,11 @@ pub fn validate_sql_with_policy(
     if is_ddl(stmt) {
         return Err(SqlValidationError::DdlBlocked(stmt_type.to_string()));
     }
+    // `SELECT … INTO new_table` creates a table and parses as a plain query,
+    // so `is_ddl` (which reads the statement's kind) cannot see it.
+    if talos_sql_classify::selects_into_table(stmt) {
+        return Err(SqlValidationError::DdlBlocked("SELECT INTO".to_string()));
+    }
 
     // MCP-472: deny-list of high-risk statement types that have no
     // legitimate use from a WASM module. Runs BEFORE the allowlist
@@ -919,10 +858,10 @@ pub fn validate_sql_with_policy(
     // schema-qualification handling and trade-off notes.
     check_disallowed_functions(stmt)?;
 
-    // Check for CTE mutations hidden inside SELECT queries
-    if let Statement::Query(query) = stmt {
-        check_cte_mutations(query, allowed_operations, empty_policy)?;
-    }
+    // A statement can carry another (a writable CTE, a `WITH … INSERT`). The
+    // root's kind is checked against the allowlist below; everything it
+    // carries is checked here, whatever the root is.
+    check_carried_statements(stmt, allowed_operations, empty_policy)?;
 
     // M-3 (2026-05-22): empty allowlist no longer means "anything
     // non-DDL goes". Under `DenyMutations`, only SELECT passes when the

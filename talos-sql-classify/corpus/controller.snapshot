@@ -1,0 +1,437 @@
+admit read SELECT                | SELECT 1
+admit read SELECT                | SELECT 1;
+admit read SELECT                | select a, b from t where id = $1
+admit read SELECT                | SELECT * FROM users WHERE id = $1 AND org_id = $2
+admit read SELECT                | SELECT DISTINCT a FROM t
+admit read SELECT                | SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC
+admit read SELECT                | SELECT a AS x, count(*) FROM t GROUP BY a HAVING count(*) > 1
+admit read SELECT                | SELECT a FROM t ORDER BY a NULLS LAST LIMIT 10 OFFSET 5
+admit read SELECT                | SELECT a FROM t FETCH FIRST 5 ROWS ONLY
+admit read SELECT                | SELECT * FROM t JOIN u ON t.id = u.t_id LEFT JOIN v USING (id)
+admit read SELECT                | SELECT * FROM t CROSS JOIN u
+admit read SELECT                | SELECT * FROM t NATURAL JOIN u
+admit read SELECT                | SELECT * FROM t, LATERAL (SELECT * FROM u WHERE u.t_id = t.id) x
+admit read SELECT                | SELECT * FROM (SELECT 1) x
+admit read SELECT                | SELECT * FROM t WHERE id IN (SELECT id FROM u)
+admit read SELECT                | SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)
+admit read SELECT                | SELECT * FROM t WHERE id = ANY($1)
+admit read SELECT                | SELECT (SELECT max(a) FROM u) AS m FROM t
+admit read SELECT                | SELECT * FROM t UNION SELECT * FROM u
+admit read SELECT                | SELECT * FROM t UNION ALL SELECT * FROM u INTERSECT SELECT * FROM v
+admit read SELECT                | SELECT * FROM t EXCEPT SELECT * FROM u
+admit read SELECT                | (SELECT 1) UNION (SELECT 2)
+admit read SELECT                | WITH a AS (SELECT 1) SELECT * FROM a
+admit read SELECT                | WITH a AS (SELECT 1), b AS (SELECT * FROM a) SELECT * FROM b
+admit read SELECT                | WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r
+admit read SELECT                | WITH a AS MATERIALIZED (SELECT 1) SELECT * FROM a
+admit read SELECT                | WITH a AS NOT MATERIALIZED (SELECT 1) SELECT * FROM a
+admit read SELECT                | SELECT * FROM (WITH a AS (SELECT 1) SELECT * FROM a) x
+admit read SELECT                | VALUES (1, 'a'), (2, 'b')
+parse-error                      | TABLE t
+admit read SELECT                | SELECT * FROM t FOR UPDATE
+admit read SELECT                | SELECT * FROM t FOR SHARE SKIP LOCKED
+parse-error                      | SELECT * FROM t FOR NO KEY UPDATE NOWAIT
+admit read SELECT                | SELECT row_number() OVER (PARTITION BY a ORDER BY b) FROM t
+admit read SELECT                | SELECT sum(a) FILTER (WHERE b > 0) FROM t
+admit read SELECT                | SELECT a::text, CAST(b AS integer) FROM t
+admit read SELECT                | SELECT CASE WHEN a > 0 THEN 'p' ELSE 'n' END FROM t
+admit read SELECT                | SELECT data->>'k', data->'a'->0, data @> '{"k":1}' FROM t
+admit read SELECT                | SELECT data #>> '{a,b}' FROM t
+admit read SELECT                | SELECT ARRAY[1,2,3], a[1] FROM t
+admit read SELECT                | SELECT * FROM t WHERE name ILIKE $1
+admit read SELECT                | SELECT * FROM t WHERE name ~* 'x'
+admit read SELECT                | SELECT * FROM t WHERE created_at > now() - interval '1 day'
+admit read SELECT                | SELECT created_at AT TIME ZONE 'UTC' FROM t
+admit read SELECT                | SELECT coalesce(a, 0), nullif(b, ''), greatest(a, b) FROM t
+admit read SELECT                | SELECT extract(epoch FROM created_at) FROM t
+admit read SELECT                | SELECT * FROM generate_series(1, 10) g
+admit read SELECT                | SELECT * FROM unnest($1::int[]) AS x(id)
+admit read SELECT                | SELECT * FROM jsonb_to_recordset($1) AS x(a int, b text)
+parse-error                      | SELECT * FROM t TABLESAMPLE BERNOULLI (10)
+admit read SELECT                | SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((a), (b), ())
+admit read SELECT                | SELECT a, sum(c) FROM t GROUP BY ROLLUP (a)
+admit read SELECT                | SELECT * FROM t WHERE (a, b) IN ((1, 2), (3, 4))
+admit read SELECT                | SELECT * FROM t WHERE a BETWEEN 1 AND 2 AND b IS NOT NULL AND c IS DISTINCT FROM d
+admit read SELECT                | SELECT 'it''s', E'a\nb', $$dollar$$, $tag$tagged$tag$
+admit read SELECT                | SELECT "quoted col" FROM "Quoted Table"
+admit read SELECT                | SELECT * FROM public.t
+admit read SELECT                | SELECT * FROM a.b.c
+admit read SELECT                | SELECT count(*) FROM t WHERE tsv @@ to_tsquery('x')
+admit read SELECT                | SELECT * FROM t ORDER BY embedding <-> $1 LIMIT 5
+admit read SELECT                | SELECT now(), current_user, current_setting('x')
+admit read SELECT                | SELECT nextval('s')
+admit read SELECT                | SELECT setval('s', 1)
+admit read SELECT                | SELECT /* comment */ 1
+admit read SELECT                | SELECT 1 -- trailing comment
+admit read SELECT                | SELECT ';'
+admit read SELECT                | SELECT $$;$$
+admit read SELECT                | SELECT 1 /* outer /* nested */ still comment */
+admit read SELECT                | SELECT * FROM t WHERE a = 'x' /*! not mysql */
+refuse statement                 | SELECT * INTO new_table FROM t
+refuse statement                 | SELECT * INTO TEMP new_table FROM t
+admit read SELECT                | SELECT a FROM t WINDOW w AS (ORDER BY a)
+admit read SELECT                | SELECT * FROM t WHERE a = ALL (SELECT b FROM u)
+admit read SELECT                | SELECT * FROM ONLY t
+admit read SELECT                | SELECT * FROM t AS x (a, b)
+parse-error                      | SELECT * FROM ROWS FROM (generate_series(1, 2), generate_series(1, 3)) AS x(a, b)
+admit read SELECT                | SELECT * FROM t LIMIT ALL
+parse-error                      | SELECT * EXCLUDE (a) FROM t
+parse-error                      | FROM t SELECT a
+parse-error                      | SELECT * FROM t |> WHERE a > 1
+admit read SELECT                | SELECT 1 WHERE 1 = 1 UNION SELECT 2 ORDER BY 1
+admit write INSERT               | INSERT INTO t (a) VALUES ($1)
+admit write INSERT               | INSERT INTO t (a, b) VALUES (1, 2), (3, 4) RETURNING id
+admit write INSERT               | INSERT INTO t DEFAULT VALUES
+admit write INSERT               | INSERT INTO t (a) SELECT a FROM u
+admit write INSERT               | INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING
+admit write INSERT               | INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b RETURNING *
+admit write INSERT               | INSERT INTO t AS x (a) VALUES (1)
+admit write INSERT               | INSERT INTO t (a) TABLE u
+admit write UPDATE               | UPDATE t SET a = 1 WHERE id = $1
+admit write UPDATE               | UPDATE t SET a = 1 WHERE id = $1 RETURNING a
+admit write UPDATE               | UPDATE t SET a = u.a FROM u WHERE t.id = u.id
+admit write UPDATE               | UPDATE t AS x SET a = 1
+admit write UPDATE               | UPDATE ONLY t SET a = 1
+admit write UPDATE               | UPDATE t SET (a, b) = (1, 2)
+admit write UPDATE               | UPDATE t SET a = (SELECT max(a) FROM u)
+admit write DELETE               | DELETE FROM t WHERE id = $1
+admit write DELETE               | DELETE FROM t WHERE id = $1 RETURNING *
+admit write DELETE               | DELETE FROM t USING u WHERE t.id = u.id
+admit write DELETE               | DELETE FROM ONLY t
+admit write DELETE               | DELETE FROM t
+admit write MERGE                | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET a = 1
+admit write MERGE                | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN DELETE
+admit write MERGE                | MERGE INTO t USING u ON t.a = u.a WHEN NOT MATCHED THEN INSERT (a) VALUES (u.a)
+parse-error                      | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET a = 1 RETURNING t.a
+admit write SELECT               | WITH a AS (SELECT 1 AS x) INSERT INTO t (a) SELECT x FROM a
+admit write SELECT               | WITH a AS (SELECT 1 AS x) UPDATE t SET a = (SELECT x FROM a)
+parse-error                      | WITH a AS (SELECT 1 AS x) INSERT INTO t (a) SELECT x FROM a RETURNING a
+admit write SELECT               | WITH a AS (SELECT 1 AS x) UPDATE t SET a = (SELECT x FROM a) RETURNING a
+parse-error                      | WITH a AS (SELECT 1 AS x) DELETE FROM t WHERE a IN (SELECT x FROM a)
+parse-error                      | WITH a AS (SELECT 1 AS x) MERGE INTO t USING a ON t.a = a.x WHEN MATCHED THEN DELETE
+admit write SELECT               | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins
+admit write SELECT               | WITH ins AS (INSERT INTO t (a) VALUES (1)) SELECT 1
+admit write SELECT               | WITH upd AS (UPDATE t SET a = 1 RETURNING a) SELECT * FROM upd
+admit write SELECT               | WITH upd AS (UPDATE t SET a = 1 WHERE id = $1) SELECT 1
+parse-error                      | WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del
+parse-error                      | WITH del AS (DELETE FROM t WHERE id = $1) SELECT 1
+parse-error                      | WITH m AS (MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN DELETE RETURNING t.a) SELECT * FROM m
+admit write SELECT               | WITH a AS (SELECT 1), ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM a
+parse-error                      | WITH a AS (SELECT 1), del AS (DELETE FROM t RETURNING a) SELECT * FROM a
+admit write SELECT               | WITH RECURSIVE ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins
+admit write SELECT               | WITH ins AS MATERIALIZED (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins
+admit write SELECT               | SELECT * FROM (WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins) x
+parse-error                      | SELECT * FROM (WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del) x
+admit write SELECT               | SELECT * FROM t WHERE id IN (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
+admit write SELECT               | SELECT (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
+admit write SELECT               | SELECT 1 UNION (WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins)
+admit write SELECT               | WITH outer_cte AS (WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins) SELECT * FROM outer_cte
+parse-error                      | WITH outer_cte AS (WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del) SELECT * FROM outer_cte
+admit write SELECT               | SELECT * FROM t JOIN (WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT * FROM upd) x ON true
+admit write SELECT               | SELECT * FROM t, LATERAL (WITH ins AS (INSERT INTO u (a) VALUES (t.a) RETURNING a) SELECT * FROM ins) x
+admit write SELECT               | SELECT * FROM (INSERT INTO t (a) VALUES (1) RETURNING a) x
+admit write SELECT               | SELECT * FROM (UPDATE t SET a = 1 RETURNING a) x
+parse-error                      | SELECT * FROM (DELETE FROM t RETURNING a) x
+parse-error                      | SELECT * FROM t WHERE a IN (DELETE FROM u RETURNING a)
+admit write SELECT               | (INSERT INTO t (a) VALUES (1) RETURNING a)
+parse-error                      | (DELETE FROM t RETURNING a)
+admit write SELECT               | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) INSERT INTO u (a) SELECT a FROM ins
+parse-error                      | WITH del AS (DELETE FROM t RETURNING a) INSERT INTO u (a) SELECT a FROM del
+admit write SELECT               | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) VALUES (1)
+admit write SELECT               | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) TABLE ins
+admit write SELECT               | SELECT * FROM t WHERE EXISTS (WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT 1 FROM upd)
+admit write SELECT               | SELECT * FROM t ORDER BY (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
+admit write SELECT               | SELECT * FROM t LIMIT (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
+parse-error                      | INSERT INTO t (a) WITH del AS (DELETE FROM u RETURNING a) SELECT a FROM del
+admit write INSERT               | INSERT INTO t (a) WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT a FROM upd
+admit write UPDATE               | UPDATE t SET a = (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
+admit write DELETE               | DELETE FROM t WHERE a IN (WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT a FROM upd)
+refuse statement                 | SELECT 1 UNION SELECT a INTO new_table FROM t
+refuse statement                 | WITH a AS (SELECT 1 AS x) SELECT x INTO new_table FROM a
+refuse statement                 | SELECT * FROM (SELECT a INTO new_table FROM t) x
+refuse statement                 | CREATE TABLE t (a int)
+refuse statement                 | CREATE TABLE IF NOT EXISTS t (a int PRIMARY KEY, b text NOT NULL)
+refuse statement                 | CREATE TEMP TABLE t (a int)
+parse-error                      | CREATE UNLOGGED TABLE t (a int)
+refuse statement                 | CREATE TABLE t AS SELECT * FROM u
+refuse statement                 | CREATE TABLE t (LIKE u)
+refuse statement                 | CREATE VIEW v AS SELECT 1
+refuse statement                 | CREATE OR REPLACE VIEW v AS SELECT 1
+refuse statement                 | CREATE MATERIALIZED VIEW v AS SELECT 1
+refuse statement                 | CREATE INDEX i ON t (a)
+refuse statement                 | CREATE UNIQUE INDEX CONCURRENTLY i ON t (a)
+refuse statement                 | CREATE SCHEMA s
+refuse statement                 | CREATE DATABASE d
+refuse statement                 | CREATE SEQUENCE s
+refuse statement                 | CREATE TYPE mood AS ENUM ('a', 'b')
+parse-error                      | CREATE DOMAIN d AS int
+refuse statement                 | CREATE ROLE r
+parse-error                      | CREATE USER u
+refuse statement                 | CREATE EXTENSION IF NOT EXISTS pgcrypto
+refuse statement                 | CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'
+refuse statement                 | CREATE OR REPLACE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql
+parse-error                      | CREATE PROCEDURE p() LANGUAGE sql AS 'SELECT 1'
+refuse statement                 | CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()
+refuse statement                 | CREATE POLICY p ON t USING (true)
+parse-error                      | CREATE RULE r AS ON INSERT TO t DO NOTHING
+parse-error                      | CREATE SERVER s FOREIGN DATA WRAPPER w
+parse-error                      | CREATE PUBLICATION p FOR ALL TABLES
+parse-error                      | CREATE SUBSCRIPTION s CONNECTION 'x' PUBLICATION p
+parse-error                      | CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = f)
+parse-error                      | CREATE AGGREGATE a (int) (SFUNC = f, STYPE = int)
+parse-error                      | CREATE COLLATION c (locale = 'C')
+parse-error                      | CREATE FOREIGN TABLE ft (a int) SERVER s
+parse-error                      | CREATE TABLESPACE ts LOCATION '/made/up'
+refuse statement                 | DROP TABLE t
+refuse statement                 | DROP TABLE IF EXISTS t CASCADE
+refuse statement                 | DROP VIEW v
+refuse statement                 | DROP INDEX i
+refuse statement                 | DROP SCHEMA s
+refuse statement                 | DROP DATABASE d
+refuse statement                 | DROP SEQUENCE s
+refuse statement                 | DROP TYPE mood
+parse-error                      | DROP DOMAIN d
+refuse statement                 | DROP ROLE r
+parse-error                      | DROP USER u
+parse-error                      | DROP EXTENSION pgcrypto
+refuse statement                 | DROP FUNCTION f
+refuse statement                 | DROP PROCEDURE p
+refuse statement                 | DROP TRIGGER tr ON t
+refuse statement                 | DROP POLICY p ON t
+parse-error                      | DROP OWNED BY r
+refuse statement                 | ALTER TABLE t ADD COLUMN b int
+refuse statement                 | ALTER TABLE t DROP COLUMN b
+refuse statement                 | ALTER TABLE t RENAME TO u
+refuse statement                 | ALTER TABLE t ENABLE ROW LEVEL SECURITY
+refuse statement                 | ALTER TABLE t DISABLE ROW LEVEL SECURITY
+refuse statement                 | ALTER TABLE t OWNER TO r
+refuse statement                 | ALTER INDEX i RENAME TO j
+refuse statement                 | ALTER VIEW v AS SELECT 2
+refuse statement                 | ALTER ROLE r WITH SUPERUSER
+parse-error                      | ALTER USER u WITH PASSWORD 'made-up'
+refuse statement                 | ALTER POLICY p ON t USING (false)
+parse-error                      | ALTER TYPE mood ADD VALUE 'c'
+parse-error                      | ALTER SCHEMA s RENAME TO s2
+parse-error                      | ALTER SEQUENCE s RESTART
+parse-error                      | ALTER DATABASE d SET x = 1
+parse-error                      | ALTER SYSTEM SET x = 1
+parse-error                      | ALTER FUNCTION f() OWNER TO r
+parse-error                      | ALTER EXTENSION pgcrypto UPDATE
+parse-error                      | ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO r
+refuse statement                 | TRUNCATE t
+refuse statement                 | TRUNCATE TABLE t, u RESTART IDENTITY CASCADE
+refuse statement                 | GRANT SELECT ON t TO r
+refuse statement                 | GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO r
+parse-error                      | GRANT r TO u
+refuse statement                 | REVOKE SELECT ON t FROM r
+parse-error                      | REASSIGN OWNED BY r TO u
+parse-error                      | SECURITY LABEL ON TABLE t IS 'x'
+refuse statement                 | COMMENT ON TABLE t IS 'x'
+parse-error                      | REINDEX TABLE t
+parse-error                      | REFRESH MATERIALIZED VIEW v
+parse-error                      | CLUSTER t
+parse-error                      | VACUUM
+parse-error                      | VACUUM FULL t
+parse-error                      | ANALYZE
+parse-error                      | ANALYZE t
+parse-error                      | CHECKPOINT
+parse-error                      | IMPORT FOREIGN SCHEMA s FROM SERVER x INTO y
+refuse statement                 | COPY t TO STDOUT
+parse-error                      | COPY t FROM STDIN
+refuse statement                 | COPY t TO PROGRAM 'made-up-command'
+refuse statement                 | COPY t FROM '/made/up/path'
+refuse statement                 | COPY (SELECT * FROM t) TO '/made/up/path'
+refuse statement                 | SET search_path TO public
+refuse statement                 | SET search_path = public
+refuse statement                 | SET LOCAL search_path TO public
+refuse statement                 | SET SESSION x = 1
+refuse statement                 | SET ROLE r
+refuse statement                 | SET LOCAL ROLE r
+refuse statement                 | SET ROLE NONE
+parse-error                      | RESET ROLE
+parse-error                      | RESET ALL
+parse-error                      | RESET search_path
+parse-error                      | SET SESSION AUTHORIZATION r
+refuse statement                 | SET TIME ZONE 'UTC'
+parse-error                      | SET NAMES 'utf8'
+refuse statement                 | SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+parse-error                      | SET CONSTRAINTS ALL DEFERRED
+refuse statement                 | SET x.y = 'z'
+refuse statement                 | SHOW search_path
+refuse statement                 | SHOW ALL
+refuse statement                 | SHOW TABLES
+refuse statement                 | SHOW server_version
+refuse statement                 | LISTEN ch
+refuse statement                 | NOTIFY ch
+refuse statement                 | NOTIFY ch, 'payload'
+refuse statement                 | UNLISTEN ch
+refuse statement                 | UNLISTEN *
+refuse statement                 | PREPARE p AS SELECT 1
+refuse statement                 | PREPARE p (int) AS DELETE FROM t WHERE id = $1
+refuse statement                 | EXECUTE p
+refuse statement                 | EXECUTE p (1)
+refuse statement                 | DEALLOCATE p
+refuse statement                 | DEALLOCATE ALL
+refuse statement                 | BEGIN
+refuse statement                 | BEGIN TRANSACTION
+refuse statement                 | BEGIN ISOLATION LEVEL SERIALIZABLE
+refuse statement                 | START TRANSACTION
+refuse statement                 | COMMIT
+refuse statement                 | END
+refuse statement                 | ROLLBACK
+parse-error                      | ABORT
+refuse statement                 | ROLLBACK TO SAVEPOINT s
+refuse statement                 | SAVEPOINT s
+refuse statement                 | RELEASE SAVEPOINT s
+refuse statement                 | RELEASE s
+refuse statement                 | DISCARD ALL
+refuse statement                 | DISCARD PLANS
+refuse statement                 | USE d
+refuse statement                 | LOAD 'made_up_library'
+parse-error                      | INSTALL made_up
+refuse statement                 | PRAGMA x
+parse-error                      | LOCK TABLE t
+parse-error                      | LOCK TABLE t IN ACCESS EXCLUSIVE MODE
+parse-error                      | LOCK TABLES t WRITE
+parse-error                      | UNLOCK TABLES
+refuse statement                 | KILL 1
+refuse statement                 | DECLARE c CURSOR FOR SELECT 1
+refuse statement                 | FETCH NEXT FROM c
+refuse statement                 | FETCH ALL IN c
+parse-error                      | MOVE NEXT FROM c
+refuse statement                 | CLOSE c
+refuse statement                 | CLOSE ALL
+refuse statement                 | CALL p()
+refuse statement                 | CALL p(1, 2)
+parse-error                      | DO $$ BEGIN DELETE FROM t; END $$
+parse-error                      | DO LANGUAGE plpgsql $$ BEGIN PERFORM 1; END $$
+refuse statement                 | EXPLAIN SELECT 1
+refuse statement                 | EXPLAIN ANALYZE SELECT 1
+refuse statement                 | EXPLAIN ANALYZE DELETE FROM t
+refuse statement                 | EXPLAIN (ANALYZE, BUFFERS) INSERT INTO t (a) VALUES (1)
+refuse statement                 | EXPLAIN ANALYZE CREATE TABLE x AS SELECT 1
+refuse statement                 | EXPLAIN t
+refuse statement                 | DESCRIBE t
+refuse statement                 | ATTACH DATABASE 'x' AS y
+parse-error                      | DETACH DATABASE y
+parse-error                      | FLUSH TABLES
+parse-error                      | OPTIMIZE TABLE t
+refuse statement                 | ASSERT 1 = 1
+parse-error                      | RAISE NOTICE 'x'
+parse-error                      | PRINT 'x'
+parse-error                      | RETURN 1
+parse-error                      | IF 1 = 1 THEN SELECT 1; END IF
+parse-error                      | WHILE 1 = 1 DO SELECT 1; END WHILE
+parse-error                      | BEGIN SELECT 1; END
+parse-error                      | OPEN c
+parse-error                      | RENAME TABLE t TO u
+parse-error                      | EXPORT DATA OPTIONS(uri = 'x') AS SELECT 1
+parse-error                      | DENY SELECT ON t TO r
+parse-error                      | THROW
+parse-error                      | WAITFOR DELAY '00:00:01'
+refuse function set_config       | SELECT set_config('search_path', 'x', false)
+refuse function set_config       | SELECT SET_CONFIG('search_path', 'x', false)
+refuse function pg_catalog.set_config | SELECT pg_catalog.set_config('search_path', 'x', false)
+refuse function set_config       | SELECT "set_config"('search_path', 'x', false)
+admit read SELECT                | SELECT public.set_config('search_path', 'x', false)
+admit read SELECT                | SELECT a.b.set_config('search_path', 'x', false)
+refuse function pg_notify        | SELECT pg_notify('ch', 'x')
+refuse function query_to_xml     | SELECT query_to_xml('DELETE FROM t', true, true, '')
+refuse function pg_catalog.query_to_xml | SELECT pg_catalog.query_to_xml('SELECT 1', true, true, '')
+refuse function table_to_xml     | SELECT table_to_xml('t', true, true, '')
+refuse function cursor_to_xml    | SELECT cursor_to_xml('c', 1, true, true, '')
+refuse function schema_to_xml    | SELECT schema_to_xml('public', true, true, '')
+refuse function database_to_xml  | SELECT database_to_xml(true, true, '')
+parse-error                      | SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
+refuse function pg_advisory_lock | SELECT pg_advisory_lock(1)
+refuse function pg_advisory_xact_lock | SELECT pg_advisory_xact_lock(1)
+refuse function pg_try_advisory_lock | SELECT pg_try_advisory_lock(1)
+refuse function pg_advisory_unlock_all | SELECT pg_advisory_unlock_all()
+refuse function lo_import        | SELECT lo_import('/made/up')
+refuse function lo_export        | SELECT lo_export(1, '/made/up')
+refuse function lo_unlink        | SELECT lo_unlink(1)
+refuse function lo_from_bytea    | SELECT lo_from_bytea(0, 'x')
+refuse function set_config       | SELECT a FROM t WHERE set_config('x', 'y', false) IS NOT NULL
+refuse function pg_advisory_lock | SELECT a FROM t ORDER BY pg_advisory_lock(a)
+refuse function pg_advisory_lock | SELECT a FROM t GROUP BY a HAVING pg_advisory_lock(a) IS NULL
+refuse function pg_advisory_lock | SELECT count(*) FILTER (WHERE pg_advisory_lock(a) IS NULL) FROM t
+refuse function pg_advisory_lock | SELECT sum(a) OVER (ORDER BY pg_advisory_lock(a)) FROM t
+refuse function set_config       | SELECT CASE WHEN true THEN set_config('x', 'y', false) END
+refuse function set_config       | SELECT coalesce(set_config('x', 'y', false), 'z')
+refuse function set_config       | SELECT (set_config('x', 'y', false))
+refuse function set_config       | SELECT set_config('x', 'y', false)::text
+refuse function set_config       | SELECT * FROM set_config('x', 'y', false)
+refuse function pg_catalog.set_config | SELECT * FROM pg_catalog.set_config('x', 'y', false)
+refuse function query_to_xml     | SELECT * FROM query_to_xml('SELECT 1', true, true, '') q
+refuse function query_to_xml     | SELECT * FROM t, LATERAL query_to_xml('SELECT 1', true, true, '') q
+parse-error                      | SELECT * FROM ROWS FROM (query_to_xml('SELECT 1', true, true, '')) q
+refuse function lo_import        | SELECT * FROM t JOIN LATERAL lo_import('/made/up') x ON true
+refuse function set_config       | WITH a AS (SELECT set_config('x', 'y', false)) SELECT * FROM a
+refuse function pg_notify        | SELECT * FROM (SELECT pg_notify('ch', 'x')) q
+refuse function set_config       | SELECT 1 UNION SELECT length(set_config('x', 'y', false))
+refuse function set_config       | INSERT INTO t (a) VALUES (set_config('x', 'y', false))
+refuse function set_config       | INSERT INTO t (a) SELECT set_config('x', 'y', false)
+refuse function set_config       | INSERT INTO t (a) VALUES (1) RETURNING set_config('x', 'y', false)
+refuse function set_config       | INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = set_config('x', 'y', false)
+refuse function set_config       | UPDATE t SET a = set_config('x', 'y', false)
+refuse function pg_advisory_lock | UPDATE t SET a = 1 WHERE pg_advisory_lock(1) IS NULL
+refuse function lo_unlink        | DELETE FROM t WHERE lo_unlink(a) = 1
+parse-error                      | DELETE FROM t RETURNING pg_notify('ch', a)
+refuse function set_config       | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET a = set_config('x', 'y', false)
+refuse function pg_sleep         | SELECT pg_sleep(1)
+refuse function pg_read_file     | SELECT pg_read_file('/made/up')
+refuse function pg_read_server_files | SELECT pg_read_server_files()
+refuse function pg_ls_dir        | SELECT pg_ls_dir('.')
+refuse function pg_terminate_backend | SELECT pg_terminate_backend(1)
+refuse function pg_cancel_backend | SELECT pg_cancel_backend(1)
+refuse function dblink           | SELECT * FROM dblink('made-up', 'SELECT 1') AS x(a int)
+refuse function dblink_exec      | SELECT dblink_exec('made-up', 'DELETE FROM t')
+refuse function pg_reload_conf   | SELECT pg_reload_conf()
+admit read SELECT                | SELECT pg_stat_reset()
+admit read SELECT                | SELECT current_setting('x')
+refuse function set_config       | SELECT a FROM t WHERE a = ANY(ARRAY(SELECT set_config('x', 'y', false)))
+refuse function set_config       | SELECT ARRAY[set_config('x', 'y', false)]
+refuse function set_config       | SELECT ROW(set_config('x', 'y', false))
+refuse function set_config       | SELECT set_config(set_config('x', 'y', false), 'z', false)
+refuse function set_config       | SELECT a FROM t LIMIT length(set_config('x', 'y', false))
+refuse function set_config       | SELECT a FROM t OFFSET length(set_config('x', 'y', false))
+parse-error                      | SELECT a FROM t FETCH FIRST length(set_config('x', 'y', false)) ROWS ONLY
+refuse function set_config       | SELECT DISTINCT ON (set_config('x', 'y', false)) a FROM t
+parse-error                      | SELECT a FROM t TABLESAMPLE BERNOULLI (length(set_config('x', 'y', false)))
+refuse function set_config       | SELECT * FROM t JOIN u ON set_config('x', 'y', false) = u.a
+refuse function set_config       | SELECT a FROM t WINDOW w AS (PARTITION BY set_config('x', 'y', false))
+admit read SELECT                | SELECT a FROM t FOR UPDATE OF t
+refuse function set_config       | VALUES (set_config('x', 'y', false))
+refuse function set_config       | SELECT extract(epoch FROM set_config('x', 'y', false)::timestamptz)
+refuse function pg_advisory_lock | SELECT a FROM t WHERE a IN (SELECT pg_advisory_lock(1))
+refuse function lo_import        | SELECT a FROM t WHERE a BETWEEN lo_import('/made/up') AND 2
+refuse function set_config       | SELECT set_config ('x', 'y', false)
+refuse function set_config       | SELECT set_config/**/('x', 'y', false)
+refuse function pg_catalog.set_config | SELECT pg_catalog . set_config('x', 'y', false)
+parse-error                      | SELECT (pg_catalog.set_config)('x', 'y', false)
+statements=2                     | SELECT 1; SELECT 2
+statements=2                     | SELECT 1; DROP TABLE t
+statements=2                     | SELECT 1; DELETE FROM t
+admit read SELECT                | SELECT 1;;
+statements=0                     | ;
+admit read SELECT                | ; SELECT 1
+statements=0                     | -- only a comment
+statements=0                     | /* only a comment */
+admit read SELECT                | SELECT 1 -- ; DROP TABLE t
+admit read SELECT                | SELECT 1 /* ; DROP TABLE t */
+statements=2                     | SELECT 'a;b'; DELETE FROM t
+statements=2                     | SELECT $$a$$; DELETE FROM t
+statements=2                     | SELECT $x$ $$ ; $x$; DELETE FROM t
+admit read SELECT                | SELECT E'\'; DELETE FROM t; --'
+statements=2                     | SELECT 'a\'; DELETE FROM t; --'
+admit read SELECT                | SELECT U&'d\0061t\+000061'
+admit read SELECT                | SELECT 1 /* /* */ ; DELETE FROM t; -- */
+admit read SELECT                | SELECT "a;b" FROM t
+admit read SELECT                | SELECT 1 FROM t WHERE a = 'x' -- '; DELETE FROM t
+statements=3                     | BEGIN; DELETE FROM t; COMMIT
+admit read SELECT                | SELECT (((((((((((((((((((((1)))))))))))))))))))))
+parse-error                      | SELECT
+parse-error                      | SELECT FROM
+parse-error                      | SELEC 1
+parse-error                      | INSERT INTO
+parse-error                      | )(

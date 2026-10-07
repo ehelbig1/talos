@@ -28,6 +28,8 @@ mod admission;
 mod build_skew;
 mod guest_session;
 mod kernel;
+#[cfg(test)]
+mod sql_corpus_tests;
 pub mod write_ceiling;
 use kernel::record_rpc_metric;
 use talos_metrics::{RpcOutcome, RpcSubject};
@@ -473,6 +475,9 @@ fn controller_permits_data_statement(stmt: &sqlparser::ast::Statement) -> bool {
         stmt,
         S::Query(_) | S::Insert(_) | S::Update { .. } | S::Delete(_) | S::Merge { .. }
     )
+        // `SELECT … INTO new_table` creates a table and parses as an ordinary
+        // `Query` — the one DDL statement this match cannot tell from a read.
+        && !talos_sql_classify::selects_into_table(stmt)
 }
 
 /// Does this statement MUTATE? The write-ceiling half of the classification
