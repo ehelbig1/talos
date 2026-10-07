@@ -266,7 +266,7 @@ impl SecretProvider for TalosVaultProvider {
             anyhow::bail!("cannot sign with empty secret value");
         }
 
-        let mut mac = Hmac::<Sha256>::new_from_slice(entry.value.as_bytes())
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(entry.value.as_bytes())
             .map_err(|e| anyhow::anyhow!("hmac init: {e}"))?;
         mac.update(payload);
         Ok(mac.finalize().into_bytes().to_vec())

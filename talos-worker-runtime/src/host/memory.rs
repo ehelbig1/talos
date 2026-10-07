@@ -427,7 +427,7 @@ impl wit_agent_memory::Host for TalosContext {
         // SHA-256 of the key_path; operators reading the ledger
         // should not learn raw search-query strings.
         if require_agent_memory_capability(&self.capability_world).is_err() {
-            let query_hash = format!("{:x}", Sha256::digest(query.as_bytes()));
+            let query_hash = hex::encode(Sha256::digest(query.as_bytes())).to_string();
             self.record_capability_denied("agent-memory-search", "capability-world", &query_hash)
                 .await;
             return Err(wit_agent_memory::Error::NotAvailable);

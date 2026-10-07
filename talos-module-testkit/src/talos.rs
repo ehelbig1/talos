@@ -152,7 +152,7 @@ pub mod core {
         #[must_use]
         pub fn test_hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
             // HMAC takes a key of any length, so `new_from_slice` cannot fail.
-            let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key)
+            let mut mac = <Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(key)
                 .unwrap_or_else(|_| unreachable!("HMAC accepts any key length"));
             mac.update(data);
             mac.finalize().into_bytes().to_vec()

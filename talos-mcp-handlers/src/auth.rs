@@ -704,7 +704,7 @@ async fn authenticate_mcp_request(
     };
 
     // 2. Compute SHA-256 lookup hash for efficient DB query
-    let token_lookup_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let token_lookup_hash = hex::encode(Sha256::digest(token.as_bytes())).to_string();
 
     // 2b. Check bcrypt verification cache — avoids expensive CPU work on repeat requests
     let now = Instant::now();
@@ -1191,7 +1191,7 @@ mod bcrypt_cache_invalidation_tests {
     /// full token → (now, identity). Uses the SAME hash computation as
     /// `mcp_auth_middleware` so the test exercises the real key format.
     fn seed_cache(token: &str, agent_id: Uuid) -> String {
-        let token_lookup_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let token_lookup_hash = hex::encode(Sha256::digest(token.as_bytes())).to_string();
         BCRYPT_VERIFY_CACHE.insert(
             token_lookup_hash.clone(),
             (Instant::now(), test_identity(agent_id)),

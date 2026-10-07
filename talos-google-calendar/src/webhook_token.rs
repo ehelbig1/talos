@@ -92,7 +92,8 @@ pub fn sign_channel_token(user_id: Uuid, channel_id: &str, key: &[u8]) -> String
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts any key length");
     mac.update(&mac_input(user_id, channel_id));
     let tag = mac.finalize().into_bytes();
 
@@ -131,7 +132,8 @@ pub fn verify_channel_token(token: &str, channel_id: &str, key: &[u8]) -> Option
 
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts any key length");
     mac.update(&mac_input(user_id, channel_id));
     let expected = mac.finalize().into_bytes();
 
@@ -288,7 +290,7 @@ mod tests {
         let user = Uuid::new_v4();
         let ch = "ch";
 
-        let mut mac = Hmac::<Sha256>::new_from_slice(&key()).unwrap();
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&key()).unwrap();
         mac.update(user.as_bytes());
         mac.update(ch.as_bytes());
         let foreign_tag = mac.finalize().into_bytes();

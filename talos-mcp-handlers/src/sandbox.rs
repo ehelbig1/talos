@@ -1534,7 +1534,7 @@ async fn handle_compile_custom_sandbox(
             // means a hypothetical Phase 3.2 rollback wouldn't have to
             // backfill the alias columns.
             use sha2::{Digest, Sha256};
-            let content_hash = format!("{:x}", Sha256::digest(&wasm_bytes));
+            let content_hash = hex::encode(Sha256::digest(&wasm_bytes)).to_string();
             // Persist the ACTUAL source language ("rust" default). Routes
             // future hot-update recompiles to the right toolchain; pre-fix
             // the mirror hardcoded 'rust' for every sandbox compile.

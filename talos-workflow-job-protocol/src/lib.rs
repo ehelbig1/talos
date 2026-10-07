@@ -475,6 +475,29 @@ pub fn validate_worker_id(worker_id: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod envelope_key_derivation_tests {
+    use super::{derive_envelope_aead_key_v1, derive_envelope_aead_key_v2};
+
+    /// Known answers for the key derivation, computed OUTSIDE this code — by
+    /// Python's standard `hmac`/`hashlib`, implementing RFC 5869 directly —
+    /// for made-up inputs. Every envelope ever written decrypts only if this
+    /// derivation never changes; a dependency bump that altered it would make
+    /// them all unreadable without a single test failing elsewhere.
+    #[test]
+    fn the_envelope_key_derivation_matches_rfc_5869() {
+        let root = b"made-up worker shared key, 32 b!";
+        assert_eq!(
+            hex::encode(derive_envelope_aead_key_v1(root)),
+            "d5d27a24c06debcca733cc7317e2819724b2b3077b8273a227b4f7ec014f4c57"
+        );
+        assert_eq!(
+            hex::encode(derive_envelope_aead_key_v2(root, b"made-up execution 0001")),
+            "f28889c330c69cfb71d57b57389219e642ea419cb79ee9d88df46543a35be0e7"
+        );
+    }
+}
+
+#[cfg(test)]
 mod worker_id_validation_tests {
     use super::validate_worker_id;
 
@@ -1457,8 +1480,8 @@ trait SignedMessage {
         let rand_bytes: [u8; 16] = rand::thread_rng().gen();
         self.set_nonce(format!("{}:{}", ts, hex::encode(rand_bytes)));
 
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key)
+            .map_err(|e| format!("HMAC key error: {e}"))?;
         mac.update(&self.payload_bytes());
         self.set_signature(mac.finalize().into_bytes().to_vec());
         Ok(())
@@ -1544,7 +1567,7 @@ trait SignedMessage {
         let ts = self.check_freshness_window(max_age_secs)?;
 
         // Constant-time HMAC verification.
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| {
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key).map_err(|e| {
             VerifyError::new(VerifyFailureKind::KeyError, format!("HMAC key error: {e}"))
         })?;
         mac.update(&self.payload_bytes());
@@ -1719,7 +1742,7 @@ trait SignedMessage {
             now.saturating_sub(age_secs),
             hex::encode([7u8; 16])
         ));
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key");
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key).expect("HMAC key");
         mac.update(&self.payload_bytes());
         self.set_signature(mac.finalize().into_bytes().to_vec());
     }
@@ -7192,7 +7215,7 @@ impl WorkerHeartbeat {
     /// production signing must always mint a fresh nonce.
     #[cfg(test)]
     fn sign_core_with_fixed_nonce_for_test(&mut self, key: &[u8]) {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key");
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key).expect("HMAC key");
         mac.update(&self.signing_payload());
         self.signature = mac.finalize().into_bytes().to_vec();
     }
@@ -7689,7 +7712,7 @@ impl CancelCommand {
     #[cfg(test)]
     fn sign_core_with_fixed_nonce_for_test(&mut self, key: &[u8]) {
         self.crypto_scheme = CRYPTO_SCHEME_HMAC;
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key");
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key).expect("HMAC key");
         mac.update(&self.signing_payload());
         self.signature = mac.finalize().into_bytes().to_vec();
     }
@@ -7870,8 +7893,8 @@ pub fn load_worker_shared_key_previous(
 /// worker mismatch while revealing nothing usable about the key.
 #[must_use]
 pub fn worker_key_fingerprint(key: &[u8]) -> String {
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC-SHA256 accepts a key of any length");
+    let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts a key of any length");
     mac.update(b"talos-worker-shared-key-fingerprint-v1");
     let tag = mac.finalize().into_bytes();
     hex::encode(&tag[..4])
@@ -11630,7 +11653,7 @@ mod protocol_review_2026_09_tests {
     /// wire, which `sign_with_worker_id` refuses to produce.
     fn raw_hmac_sign<M: SignedMessage>(m: &mut M) {
         m.set_nonce(fresh_nonce());
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&KEY).expect("key");
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(&KEY).expect("key");
         mac.update(&m.payload_bytes());
         m.set_signature(mac.finalize().into_bytes().to_vec());
     }

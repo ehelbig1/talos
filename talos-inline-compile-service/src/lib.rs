@@ -731,7 +731,11 @@ impl InlineCompileService {
             .unwrap_or_else(|| talos_compilation::scaffold::compute_max_fuel(10, 2000, 2.0) as i64);
 
         use sha2::{Digest, Sha256};
-        let content_hash = format!("{:x}", Sha256::digest(&wasm_bytes));
+        let content_hash = (Sha256::digest(&wasm_bytes))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            .to_string();
 
         let template_id = existing_id.unwrap_or_else(Uuid::new_v4);
 

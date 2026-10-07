@@ -558,7 +558,11 @@ impl WorkflowRepository {
         capability_world: &str,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
-        let content_hash = format!("{:x}", Sha256::digest(wasm_bytes));
+        let content_hash = (Sha256::digest(wasm_bytes))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            .to_string();
         // Normalise to long form for the modules table CHECK.
         let cw_long = if capability_world == "trusted" {
             "automation-node".to_string()

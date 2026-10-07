@@ -51,7 +51,7 @@ async fn seed_agent(pool: &PgPool, lookup_of: &str, bcrypt_of: &str, user_id: Op
     // Cost 4 keeps the test fast; the middleware verifies whatever cost the
     // row carries.
     let token_hash = bcrypt::hash(bcrypt_of, 4).expect("bcrypt");
-    let lookup = format!("{:x}", Sha256::digest(lookup_of.as_bytes()));
+    let lookup = hex::encode(Sha256::digest(lookup_of.as_bytes())).to_string();
     sqlx::query(
         "INSERT INTO mcp_agents (id, user_id, name, role_id, token_hash, token_lookup_hash, is_active) \
          VALUES ($1, $2, $3, $4, $5, $6, true)",

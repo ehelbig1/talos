@@ -747,6 +747,25 @@ mod m11_key_length_tests {
 
 #[cfg(test)]
 mod checkpoint_aead_tests {
+    /// Known answers for the key derivation, computed OUTSIDE this code — by
+    /// Python's standard `hmac`/`hashlib`, implementing RFC 5869 directly —
+    /// for made-up inputs. Every checkpoint ever written decrypts only if this
+    /// derivation never changes; a dependency bump that altered it would make
+    /// them all unreadable without a single test failing elsewhere.
+    #[test]
+    fn the_checkpoint_key_derivation_matches_rfc_5869() {
+        let hex = |key: &[u8]| key.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let root = b"made-up worker shared key, 32 b!";
+        assert_eq!(
+            hex(derive_checkpoint_aead_key_legacy_v1(root).as_ref()),
+            "49c3b5a6540a966a0fae540c4025a2bf1e11308f4c3f341465e79556ff3f146e"
+        );
+        assert_eq!(
+            hex(derive_checkpoint_aead_key(root, b"made-up execution 0001").as_ref()),
+            "a85b4dd1949191ca5ade5b8ed66be941aecba8dc56a6558815ea725b225f64c7"
+        );
+    }
+
     use super::*;
 
     fn k(n: usize) -> Vec<u8> {

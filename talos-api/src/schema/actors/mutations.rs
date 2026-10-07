@@ -125,10 +125,8 @@ impl ActorsMutations {
                 async_graphql::Error::new("Failed to hash token").extend_safe()
             })?;
 
-        let lookup_hash = format!(
-            "{:x}",
-            <sha2::Sha256 as sha2::Digest>::digest(token.as_bytes())
-        );
+        let lookup_hash =
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(token.as_bytes())).to_string();
 
         let agent_id = Uuid::new_v4();
         let registration = register_mcp_agent_recorded(

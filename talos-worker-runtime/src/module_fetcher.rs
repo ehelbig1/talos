@@ -348,7 +348,7 @@ pub async fn resolve_and_hash_cosign_binary() -> anyhow::Result<String> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to read cosign at {path}: {e}"))?;
     use sha2::Digest as _;
-    let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let hash = hex::encode(sha2::Sha256::digest(&bytes)).to_string();
     // Pin the resolved absolute path for the process lifetime so every
     // `verify_oci_signature` invocation targets the same binary the M5
     // startup gate just hashed. `set` is idempotent on success — a later
@@ -389,7 +389,10 @@ pub fn pin_oci_manifest(
     use oci_client::manifest::OciManifest;
     use sha2::Digest as _;
     use subtle::ConstantTimeEq as _;
-    let manifest_digest = format!("sha256:{:x}", sha2::Sha256::digest(manifest_body));
+    let manifest_digest = format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(manifest_body))
+    );
     if let Some(requested) = reference.digest() {
         let same: bool = requested
             .as_bytes()
@@ -550,7 +553,7 @@ pub fn verify_oci_layer<'a>(
 ) -> LayerVerdict<'a> {
     use sha2::Digest as _;
     use subtle::ConstantTimeEq as _;
-    let computed = format!("sha256:{:x}", sha2::Sha256::digest(layer_data));
+    let computed = format!("sha256:{}", hex::encode(sha2::Sha256::digest(layer_data)));
     match manifest_digest {
         Some(expected) => {
             let eq: bool = expected.as_bytes().ct_eq(computed.as_bytes()).into();
@@ -1353,7 +1356,7 @@ mod oci_layer_tests {
 
     fn sha256_hex(bytes: &[u8]) -> String {
         use sha2::Digest as _;
-        format!("sha256:{:x}", sha2::Sha256::digest(bytes))
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
     }
 
     #[test]
@@ -1940,7 +1943,7 @@ mod w13_pinning_tests {
 
     fn sha(b: &[u8]) -> String {
         use sha2::Digest as _;
-        format!("sha256:{:x}", sha2::Sha256::digest(b))
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(b)))
     }
 
     #[test]

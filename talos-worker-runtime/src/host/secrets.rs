@@ -102,7 +102,7 @@ impl wit_secrets::Host for TalosContext {
             // Hash before audit — same convention as the secret-allowlist
             // deny below; operators reading the ledger should not learn
             // unowned vault paths from a capability-world deny either.
-            let key_hash = format!("{:x}", Sha256::digest(key_path.as_bytes()));
+            let key_hash = hex::encode(Sha256::digest(key_path.as_bytes())).to_string();
             self.record_capability_denied("secret-access", "capability-world", &key_hash)
                 .await;
             tracing::warn!(
@@ -126,14 +126,14 @@ impl wit_secrets::Host for TalosContext {
             // key_path itself — operators reading the ledger should not learn
             // unowned vault paths). Pairs with the host-reserved deny-list
             // catch (LLM provider keys) which lives inside check_secret_allowlist.
-            let key_hash = format!("{:x}", Sha256::digest(key_path.as_bytes()));
+            let key_hash = hex::encode(Sha256::digest(key_path.as_bytes())).to_string();
             self.record_capability_denied("secret-access", "secret-allowlist", &key_hash)
                 .await;
             return Err(wit_secrets::Error::Unauthorized);
         }
 
         if let Some(ledger_mutex) = &self.audit_ledger {
-            let key_hash = format!("{:x}", Sha256::digest(key_path.as_bytes()));
+            let key_hash = hex::encode(Sha256::digest(key_path.as_bytes())).to_string();
             let mut ledger = ledger_mutex.lock().await;
             let event = ledger.append(
                 "agent:wasm",

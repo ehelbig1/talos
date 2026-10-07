@@ -597,8 +597,14 @@ pub fn register_hmac_key_ring(signing: Arc<Vec<u8>>, previous: Vec<Arc<Vec<u8>>>
                 == 1;
             if !same {
                 use sha2::Digest;
-                let cur_fp = format!("{:x}", Sha256::digest(existing.signing.as_slice()));
-                let new_fp = format!("{:x}", Sha256::digest(rejected.signing.as_slice()));
+                let cur_fp = Sha256::digest(existing.signing.as_slice())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                let new_fp = Sha256::digest(rejected.signing.as_slice())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
                 tracing::error!(
                     current_key_fingerprint = %&cur_fp[..16],
                     rejected_key_fingerprint = %&new_fp[..16],
@@ -992,7 +998,7 @@ fn signing_payload(subject: &str, actor_id: Uuid, nonce: &str, body: &[u8]) -> V
 /// has been registered.
 pub fn sign(subject: &str, actor_id: Uuid, nonce: &str, body: &[u8]) -> Option<Vec<u8>> {
     let ring = HMAC_KEY.get()?;
-    let mut mac = HmacSha256::new_from_slice(ring.signing.as_slice()).ok()?;
+    let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(ring.signing.as_slice()).ok()?;
     mac.update(&signing_payload(subject, actor_id, nonce, body));
     Some(mac.finalize().into_bytes().to_vec())
 }
@@ -1013,7 +1019,7 @@ pub fn verify(subject: &str, actor_id: Uuid, nonce: &str, body: &[u8], signature
     let payload = signing_payload(subject, actor_id, nonce, body);
     let mut matched = 0u8;
     for key in &ring.verify {
-        let Ok(mut mac) = HmacSha256::new_from_slice(key.as_slice()) else {
+        let Ok(mut mac) = <HmacSha256 as hmac::KeyInit>::new_from_slice(key.as_slice()) else {
             continue;
         };
         mac.update(&payload);

@@ -2369,7 +2369,7 @@ pub(crate) async fn seed_templates(
                                 if let Some(wasm_bytes) = result.wasm_bytes {
                                     let bytes_len = wasm_bytes.len();
                                     use sha2::{Digest, Sha256};
-                                    let hash = format!("{:x}", Sha256::digest(&wasm_bytes));
+                                    let hash = hex::encode(Sha256::digest(&wasm_bytes)).to_string();
                                     match talos_registry::reconcile::refresh_catalog_wasm_by_slug(
                                         &pool_bg,
                                         &slug_bg,

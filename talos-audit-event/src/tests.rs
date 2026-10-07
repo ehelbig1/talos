@@ -3,7 +3,7 @@ use super::*;
 // Sign an event with an explicit key (tests don't rely on the process-global
 // signing key, which is unset in the test environment).
 fn hmac_sign(event: &AuditEvent, key: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
     mac.update(event.calculate_hash().as_bytes());
     hex::encode(mac.finalize().into_bytes())
