@@ -26,7 +26,7 @@ zeroize = { workspace = true, features = ["derive"] }
 # crypto/parse core builds without these.
 anyhow = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
-reqwest = { workspace = true, features = ["rustls-tls"], optional = true }
+reqwest = { workspace = true, features = ["rustls"], optional = true }
 talos-http-body = { path = "../talos-http-body", optional = true }
 talos-http-utils = { path = "../talos-http-utils", optional = true }
 tokio = { workspace = true, features = ["sync"], optional = true }

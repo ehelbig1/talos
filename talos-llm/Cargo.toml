@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 serde_json.workspace = true
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }

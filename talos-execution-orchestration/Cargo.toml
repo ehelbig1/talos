@@ -10,7 +10,7 @@ publish.workspace = true
 anyhow.workspace = true
 async-nats.workspace = true
 chrono = { workspace = true, features = ["serde"] }
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 serde_json.workspace = true
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 thiserror.workspace = true

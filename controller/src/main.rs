@@ -76,6 +76,8 @@ mod module_payload_encryption;
 mod module_repository;
 mod oauth;
 mod organizations;
+#[cfg(test)]
+mod outbound_tls_pin;
 mod rate_limit;
 mod registry;
 mod replay_diff;

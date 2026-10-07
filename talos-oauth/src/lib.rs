@@ -121,6 +121,55 @@ use anyhow::{anyhow, Context, Result};
 fn oauth_http_client() -> reqwest::Client {
     talos_http_utils::trusted_client::build_integration_client(std::time::Duration::from_secs(15))
 }
+
+/// Talos's HTTP client, as `oauth2` wants one.
+///
+/// `oauth2` 5.0 — its latest release — implements its HTTP-client trait for
+/// the `reqwest` 0.12 client and no newer one, so a client from the
+/// workspace's `reqwest` (0.13 from 2026-10-07) cannot be passed to
+/// `request_async` directly. This is `oauth2`'s own implementation, line for
+/// line, with two differences. The body is read under the cap every other
+/// token response in this file is read under, where theirs reads without
+/// limit; and `oauth2` no longer needs its `reqwest` feature, so it no longer
+/// brings a second copy of the library.
+///
+/// Build it from [`oauth_http_client`]: redirects refused, timeouts set.
+struct Oauth2Http(reqwest::Client);
+
+impl<'c> oauth2::AsyncHttpClient<'c> for Oauth2Http {
+    type Error = oauth2::HttpClientError<reqwest::Error>;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<oauth2::HttpResponse, Self::Error>> + Send + 'c,
+        >,
+    >;
+
+    fn call(&'c self, request: oauth2::HttpRequest) -> Self::Future {
+        Box::pin(async move {
+            let response = self
+                .0
+                .execute(request.try_into().map_err(Box::new)?)
+                .await
+                .map_err(Box::new)?;
+            let mut builder = http::Response::builder()
+                .status(response.status())
+                .version(response.version());
+            for (name, value) in response.headers() {
+                builder = builder.header(name, value);
+            }
+            let body = talos_http_body::read_body_capped(
+                response,
+                talos_http_body::DEFAULT_MAX_RESPONSE_BYTES,
+            )
+            .await
+            .map_err(|_| {
+                oauth2::HttpClientError::Other("the token response could not be read".to_string())
+            })?;
+            builder.body(body).map_err(oauth2::HttpClientError::Http)
+        })
+    }
+}
+
 /// Revoke an OAuth token at the provider (best-effort).
 ///
 /// Returns `Ok(true)` when the provider acknowledges revocation,
@@ -1277,7 +1326,7 @@ impl OAuthService {
         if let Some(verifier) = pkce_verifier {
             exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(verifier));
         }
-        let http = oauth_http_client();
+        let http = Oauth2Http(oauth_http_client());
         let token_response = exchange
             .request_async(&http)
             .await
@@ -1347,7 +1396,7 @@ impl OAuthService {
         if let Some(verifier) = pkce_verifier {
             exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(verifier));
         }
-        let http = oauth_http_client();
+        let http = Oauth2Http(oauth_http_client());
         let token_response = exchange
             .request_async(&http)
             .await
@@ -2698,7 +2747,7 @@ mod oauth2_v5_exchange_wire_contract {
         if let Some(v) = verifier {
             exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(v.to_string()));
         }
-        let http = oauth_http_client();
+        let http = Oauth2Http(oauth_http_client());
         let outcome = exchange
             .request_async(&http)
             .await

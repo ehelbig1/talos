@@ -38,6 +38,8 @@ mod fuel_emission_pin;
 #[cfg(test)]
 mod inference_wait_pin;
 #[cfg(test)]
+mod outbound_tls_pin;
+#[cfg(test)]
 mod rehearsal_pin;
 mod rejected_jobs;
 #[cfg(test)]

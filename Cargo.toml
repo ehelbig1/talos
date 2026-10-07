@@ -250,7 +250,7 @@ proptest = "1.5"
 rand = { version = "0.8", default-features = false }
 redis = { version = "1.7", default-features = false }
 regex = "1.12"
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.13", default-features = false }
 rhai = "1.19"
 rsa = "0.9"
 rustls = { version = "0.23", default-features = false }

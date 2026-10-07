@@ -12,7 +12,7 @@ publish.workspace = true
 # for the OOM-defense established across PRs #76–#81 — replaces the
 # per-crate copies of the same `Response::chunk()` cap loop.
 [dependencies]
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
