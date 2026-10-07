@@ -18,7 +18,7 @@ futures.workspace = true
 hkdf.workspace = true
 rand = { workspace = true, features = ["default", "std"] }
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 rhai = { workspace = true, features = ["serde"] }
 talos-dlp = { path = "../talos-dlp" }
 thiserror.workspace = true

@@ -10,7 +10,7 @@ publish.workspace = true
 talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
 arc-swap.workspace = true
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 serde_json.workspace = true
 talos-config = { path = "../talos-config" }
 talos-http-body = { path = "../talos-http-body" }

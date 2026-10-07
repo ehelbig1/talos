@@ -40,7 +40,7 @@ talos-shutdown = { path = "../talos-shutdown" }
 talos-config = { path = "../talos-config" }
 
 # HTTP client (self_register boot-time identity registration)
-reqwest = { workspace = true, features = ["json", "gzip", "brotli", "deflate", "stream", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "gzip", "brotli", "deflate", "stream", "rustls"] }
 
 # Async utilities
 futures-util.workspace = true

@@ -18,7 +18,7 @@ chrono = { workspace = true, features = ["serde"] }
 hmac.workspace = true
 pgvector = { workspace = true, features = ["sqlx"] }
 rand = { workspace = true, features = ["default", "std"] }
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true, features = ["derive"] }
 # `raw_value` powers `rpc_auth::RawSigned<T>`: signed bodies cover the EXACT
 # wire text (Box<RawValue>) so serde_json's non-idempotent f64 round trip

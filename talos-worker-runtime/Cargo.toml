@@ -72,7 +72,7 @@ cap-std.workspace = true  # Capability-based filesystem security
 tempfile.workspace = true  # Ephemeral per-execution sandbox directories (auto-shredded on Drop)
 
 # HTTP client
-reqwest = { workspace = true, features = ["json", "gzip", "brotli", "deflate", "stream", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "gzip", "brotli", "deflate", "stream", "rustls"] }
 url.workspace = true
 
 # Async utilities

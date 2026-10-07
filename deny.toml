@@ -324,6 +324,16 @@ deny = [
 # by OCI registry fetches (our internal registry — trust boundary) and
 # OTLP export (our OTLP collector — trust boundary). Both endpoints
 # are operator-controlled, not attacker-controlled.
+#
+# CORRECTION, 2026-10-07: the paragraph above was not true when written.
+# Disabling reqwest's default features in OUR manifests did not keep
+# native-tls out of OUR calls: Cargo merges features into the one reqwest
+# a binary links, and reqwest uses native-tls for every client once it is
+# compiled in. Every direct call ran on OpenSSL until the workspace moved
+# to reqwest 0.13 (feature `rustls`), which oci-distribution's 0.12 copy
+# no longer shares. `outbound_tls_pin` in the controller and the worker
+# now checks the built client. See
+# docs/engineering-log/packages/2026-10-07-reqwest-0.13.md.
 # Tracking upstream:
 #   - oci-distribution: https://github.com/oras-project/rust-oci-client/issues (rustls feature)
 #   - opentelemetry-rust: rustls support via default-features = false

@@ -17,7 +17,7 @@ regex.workspace = true
 # — talos-engine / talos-execution-orchestration / talos-mcp-handlers — which
 # all already depend on talos-http-utils). `tokio` "net" is for the resolver's
 # `lookup_host`; reqwest matches the workspace feature set.
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 url.workspace = true

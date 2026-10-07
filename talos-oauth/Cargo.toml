@@ -20,8 +20,11 @@ hex.workspace = true
 http.workspace = true
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 talos-redis = { path = "../talos-redis" }
-oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls"] }
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+# No `reqwest` feature: oauth2 5.0 implements its HTTP client for reqwest 0.12
+# only, so talos-oauth sends its requests itself (`oauth2_send`) on the
+# workspace's client and oauth2 brings no second copy of the library.
+oauth2 = { version = "5.0.0", default-features = false }
+reqwest = { workspace = true, features = ["json", "rustls", "form"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
