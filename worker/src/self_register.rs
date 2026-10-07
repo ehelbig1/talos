@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn registration_body_shape_and_proof_verify() {
-        let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let pk = sk.verifying_key().to_bytes();
         let body = build_registration_body(
             "worker-42",
@@ -394,7 +394,7 @@ mod tests {
     /// this test fails loudly and names the compatibility break.
     #[test]
     fn build_version_does_not_affect_the_proof() {
-        let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let pk = sk.verifying_key().to_bytes();
 
         let mk = |bv: &str| {
@@ -464,7 +464,7 @@ mod tests {
     ///    NEW worker's body.
     #[test]
     fn write_ceiling_flags_travel_unswapped_and_unsigned() {
-        let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let pk = sk.verifying_key().to_bytes();
 
         let mk = |p: WriteCeilingEnforcement| {

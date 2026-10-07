@@ -1396,7 +1396,7 @@ mod ed25519_rpc_tests {
     use talos_workflow_job_protocol::DispatchSigningKey;
 
     fn keypair() -> DispatchSigningKey {
-        DispatchSigningKey::generate(&mut rand::rngs::OsRng)
+        talos_workflow_job_protocol::generate_dispatch_signing_key()
     }
 
     #[test]

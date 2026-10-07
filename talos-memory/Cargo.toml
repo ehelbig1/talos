@@ -13,7 +13,7 @@ arc-swap.workspace = true
 dashmap.workspace = true
 # RFC 0010 P2 inc.3: per-worker Ed25519 RPC signing. Same major as
 # talos-workflow-job-protocol so the re-exported key types unify.
-ed25519-dalek = { workspace = true, features = ["rand_core"] }
+ed25519-dalek.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 hmac.workspace = true
 pgvector = { workspace = true, features = ["sqlx"] }

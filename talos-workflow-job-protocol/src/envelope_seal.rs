@@ -140,7 +140,7 @@ pub fn seal_secrets(
     worker_id: &str,
     plaintext: &[u8],
 ) -> Result<SealOutput, String> {
-    let esk_c = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+    let esk_c = EphemeralSecret::random();
     let epk_c = PublicKey::from(&esk_c).to_bytes();
     let peer = PublicKey::from(*epk_w);
     let ss = esk_c.diffie_hellman(&peer);
@@ -194,7 +194,7 @@ impl WorkerEphemeral {
     /// Generate a fresh per-execution ephemeral keypair.
     #[must_use]
     pub fn generate() -> Self {
-        let secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let secret = EphemeralSecret::random();
         let public = PublicKey::from(&secret).to_bytes();
         Self { secret, public }
     }
@@ -489,8 +489,137 @@ pub enum ClaimResponse {
 mod tests {
     use super::*;
 
+    /// A random-number source that hands out fixed bytes, so a test can hold
+    /// the worker's "ephemeral" secret. Never anything but a test fixture.
+    struct FixedBytes([u8; 32]);
+    impl x25519_dalek::rand_core::TryRng for FixedBytes {
+        type Error = std::convert::Infallible;
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            unimplemented!("only try_fill_bytes is used")
+        }
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            unimplemented!("only try_fill_bytes is used")
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+            dest.copy_from_slice(&self.0[..dest.len()]);
+            Ok(())
+        }
+    }
+    impl x25519_dalek::rand_core::TryCryptoRng for FixedBytes {}
+
+    /// An envelope sealed OUTSIDE this code — X25519, HKDF-SHA256 and
+    /// AES-256-GCM by Python's `cryptography`, over made-up inputs — opened by
+    /// the worker's real `open`. A controller on one build seals for a worker
+    /// on another, and a round trip through one version of the curve library
+    /// cannot show they still agree on the key exchange, the key derivation or
+    /// the bytes the tag covers.
+    #[test]
+    fn an_envelope_sealed_by_another_implementation_opens() {
+        let secret = EphemeralSecret::random_from_rng(&mut FixedBytes(
+            hex::decode("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        ));
+        let public = PublicKey::from(&secret).to_bytes();
+        // The public key for that secret, as the other implementation has it.
+        assert_eq!(
+            hex::encode(public),
+            "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
+        );
+        let epk_c: [u8; 32] =
+            hex::decode("79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let exec_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let sealed = hex::decode(
+            "2fa35c67ab378e5dceb4ce1799f25822aa024c8563361021f3e8870dd1132348800e73f9ded7638b25ef",
+        )
+        .unwrap();
+        let nonce: [u8; 12] = hex::decode("0102030405060708090a0b0c")
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        let worker = WorkerEphemeral { secret, public };
+        let opened = worker
+            .open(&epk_c, exec_id, "made-up-worker", &sealed, &nonce)
+            .expect("opens");
+        assert_eq!(opened.as_slice(), br#"{"made-up/secret":"value"}"#);
+    }
+
+    /// The same envelope is bound to the worker and the execution it was
+    /// sealed for.
+    #[test]
+    fn that_envelope_does_not_open_for_another_worker_or_execution() {
+        let fixed = || {
+            let secret = EphemeralSecret::random_from_rng(&mut FixedBytes(
+                hex::decode("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ));
+            let public = PublicKey::from(&secret).to_bytes();
+            WorkerEphemeral { secret, public }
+        };
+        let epk_c: [u8; 32] =
+            hex::decode("79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let exec_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let other_exec = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let sealed = hex::decode(
+            "2fa35c67ab378e5dceb4ce1799f25822aa024c8563361021f3e8870dd1132348800e73f9ded7638b25ef",
+        )
+        .unwrap();
+        let nonce: [u8; 12] = hex::decode("0102030405060708090a0b0c")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(fixed()
+            .open(&epk_c, exec_id, "another-worker", &sealed, &nonce)
+            .is_err());
+        assert!(fixed()
+            .open(&epk_c, other_exec, "made-up-worker", &sealed, &nonce)
+            .is_err());
+    }
+
+    /// Ed25519 is deterministic (RFC 8032): one seed, one message, one
+    /// signature. The public key and the signature here are Python
+    /// `cryptography`'s for a made-up seed. Dispatch signatures and secret
+    /// claims are verified by a peer that may be on another build.
+    #[test]
+    fn the_signing_key_agrees_with_another_implementation() {
+        use ed25519_dalek::{Signer as _, Verifier as _};
+        let seed: [u8; 32] =
+            hex::decode("606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let sk = DispatchSigningKey::from_bytes(&seed);
+        assert_eq!(
+            hex::encode(sk.verifying_key().to_bytes()),
+            "174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5"
+        );
+        let expected = "7e4e591227bd6a6e9090105848956261b7d02333feddb4226a2ead135ddb9757\
+                        80092a76ce5e99b28e2db66e9efbec507a671f09bbe18a1f93106f0a908c2a0e";
+        let signature = sk.sign(b"made-up message");
+        assert_eq!(hex::encode(signature.to_bytes()), expected);
+        let theirs = ed25519_dalek::Signature::from_slice(&hex::decode(expected).unwrap()).unwrap();
+        assert!(sk
+            .verifying_key()
+            .verify(b"made-up message", &theirs)
+            .is_ok());
+        assert!(sk
+            .verifying_key()
+            .verify(b"made-up massage", &theirs)
+            .is_err());
+    }
+
     fn kp() -> (DispatchSigningKey, DispatchVerifyingKey) {
-        let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let sk = crate::generate_dispatch_signing_key();
         let vk = sk.verifying_key();
         (sk, vk)
     }

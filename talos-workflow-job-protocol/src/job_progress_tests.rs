@@ -85,8 +85,8 @@ fn a_report_signed_with_another_key_is_refused() {
 
 #[test]
 fn ed25519_reports_verify_against_the_workers_key_only() {
-    let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
-    let other = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+    let sk = crate::generate_dispatch_signing_key();
+    let other = crate::generate_dispatch_signing_key();
     let mut p = JobProgress::new(job(), 1, JobProgressState::Waiting);
     p.sign_ed25519_with_worker_id(&sk, "worker-a").unwrap();
     assert_eq!(p.crypto_scheme, CRYPTO_SCHEME_ED25519);

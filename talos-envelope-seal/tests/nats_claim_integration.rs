@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use talos_envelope_seal::{run_claim_responder, InFlightSeals, SealContext};
 use talos_workflow_job_protocol::{
-    set_dynamic_worker_public_keys, ClaimResponse, DispatchSigningKey, SecretClaim, WorkerEphemeral,
+    set_dynamic_worker_public_keys, ClaimResponse, SecretClaim, WorkerEphemeral,
 };
 
 fn nats_url() -> Option<String> {
@@ -37,9 +37,9 @@ async fn claim_handshake_over_live_nats() {
     };
 
     // Worker + controller long-term keys.
-    let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+    let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
     set_dynamic_worker_public_keys(vec![("it-worker".to_string(), worker_sk.verifying_key())]);
-    let controller_sk = Arc::new(DispatchSigningKey::generate(&mut rand::rngs::OsRng));
+    let controller_sk = Arc::new(talos_workflow_job_protocol::generate_dispatch_signing_key());
     let controller_vk = controller_sk.verifying_key();
 
     // Register one in-flight seal context.

@@ -107,7 +107,6 @@ unused_self = "allow"
 unused_async = "allow"
 
 [dev-dependencies]
-rand = { workspace = true, features = ["default"] }
 # `net` + `io-util`: `tests/nats_client_resilience.rs` writes one publish on a
 # raw connection, with a subject no client library will send.
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util", "net", "io-util"] }

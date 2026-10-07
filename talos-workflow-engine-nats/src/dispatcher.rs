@@ -2477,8 +2477,8 @@ mod p3_full_loop_tests {
         WorkerSharedKey,
     };
     use talos_workflow_job_protocol::{
-        set_dynamic_worker_public_keys, ClaimResponse, DispatchSigner, DispatchSigningKey,
-        JobRequest, JobResult, JobStatus, SecretClaim, WorkerEphemeral, SEALING_CLAIM_ECIES,
+        set_dynamic_worker_public_keys, ClaimResponse, DispatchSigner, JobRequest, JobResult,
+        JobStatus, SecretClaim, WorkerEphemeral, SEALING_CLAIM_ECIES,
     };
 
     /// The per-step secret maps a worker observed on ONE pipeline claim.
@@ -2545,9 +2545,9 @@ mod p3_full_loop_tests {
 
         // Keys: controller Ed25519 (signs dispatch + SealedSecrets), worker
         // Ed25519 (signs the claim), shared HMAC key (signs the JobResult).
-        let controller_sk = Arc::new(DispatchSigningKey::generate(&mut rand::rngs::OsRng));
+        let controller_sk = Arc::new(talos_workflow_job_protocol::generate_dispatch_signing_key());
         let controller_vk = controller_sk.verifying_key();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![(worker_id.to_string(), worker_sk.verifying_key())]);
         let shared = WorkerSharedKey::new(vec![7u8; 32]);
         let ring = WorkerKeyRing::single(shared.clone());
@@ -2746,9 +2746,9 @@ mod p3_full_loop_tests {
         const S1: &str = "sk-STEP1-SUPERSECRET";
         let worker_id = "e2e-pipe-worker";
 
-        let controller_sk = Arc::new(DispatchSigningKey::generate(&mut rand::rngs::OsRng));
+        let controller_sk = Arc::new(talos_workflow_job_protocol::generate_dispatch_signing_key());
         let controller_vk = controller_sk.verifying_key();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![(worker_id.to_string(), worker_sk.verifying_key())]);
         let shared = WorkerSharedKey::new(vec![9u8; 32]);
         let ring = WorkerKeyRing::single(shared.clone());
