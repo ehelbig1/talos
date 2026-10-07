@@ -97,11 +97,13 @@ async fn seed_module(pool: &sqlx::PgPool, user: Uuid, world: &str) -> Uuid {
 }
 
 async fn actor_column(pool: &sqlx::PgPool, actor: Uuid, column: &str) -> Option<String> {
-    sqlx::query_scalar(&format!("SELECT {column} FROM actors WHERE id = $1"))
-        .bind(actor)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT {column} FROM actors WHERE id = $1"
+    )))
+    .bind(actor)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 async fn call(

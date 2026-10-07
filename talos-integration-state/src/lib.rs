@@ -396,7 +396,10 @@ pub async fn execute_op(
             }
             sql.push_str(&format!(" ORDER BY updated_at DESC LIMIT ${}", bind_idx));
 
-            let mut q = sqlx::query(&sql).bind(integration_name).bind(user_id);
+            // sql-safe: a literal plus fixed AND-clauses chosen by which filters are set; the only formatted value is a placeholder number, every filter value is bound
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(integration_name)
+                .bind(user_id);
             if let Some(ref p) = filter.key_prefix {
                 // Escape LIKE metacharacters so a `%` or `_` in the
                 // caller's prefix doesn't silently become a wildcard.

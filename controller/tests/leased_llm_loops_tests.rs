@@ -46,11 +46,12 @@ async fn wait_for_stamp(
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
-        let stamp: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(stamp_sql)
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .expect("read stamp");
+        let stamp: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(stamp_sql))
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read stamp");
         if let Some(s) = stamp {
             if after.is_none_or(|a| s > a) {
                 return Some(s);

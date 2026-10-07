@@ -84,7 +84,8 @@ async fn run_batched_delete(
 ) -> Result<(u64, bool)> {
     let mut rows = 0u64;
     for batch in 0..MAX_SWEEP_BATCHES {
-        let n = sqlx::query(sql)
+        // sql-safe: both callers pass a literal with the SWEEP_BATCH constant formatted in; nothing from a request
+        let n = sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(pool)
             .await
             .map(|r| r.rows_affected())
@@ -2144,7 +2145,8 @@ impl AuthService {
         );
         let mut rows = 0u64;
         for batch in 0..MAX_SWEEP_BATCHES {
-            let n = sqlx::query(&sql)
+            // sql-safe: a literal with the SWEEP_BATCH constant formatted in; the retention period is bound
+            let n = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(days)
                 .execute(&self.db_pool)
                 .await

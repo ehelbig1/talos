@@ -2363,7 +2363,8 @@ impl ActorRepository {
             param_count + 1,
             param_count + 2,
         );
-        let mut q = sqlx::query(&sql);
+        // sql-safe: fixed `column = $n` fragments chosen by which fields are set; the only formatted values are placeholder numbers
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
         if let Some(n) = name {
             q = q.bind(n.trim());
         }
@@ -4380,13 +4381,14 @@ impl ActorRepository {
         actor_id: Uuid,
         limit: i64,
     ) -> Result<Vec<PublishedWorkflowRow>> {
-        let rows = sqlx::query(&format!(
+        // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT id, name, description, capabilities \
              FROM workflows \
              WHERE actor_id = $1 AND {live} \
              ORDER BY updated_at DESC, id DESC LIMIT $2",
             live = talos_workflow_liveness::live_sql(None),
-        ))
+        )))
         .bind(actor_id)
         .bind(limit)
         .fetch_all(&self.db_pool)

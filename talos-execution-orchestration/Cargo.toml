@@ -12,7 +12,7 @@ async-nats.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true

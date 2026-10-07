@@ -12,7 +12,7 @@ talos-execution-pause = { path = "../talos-execution-pause" }
 anyhow.workspace = true
 async-nats.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid"] }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-advanced-repository = { path = "../talos-advanced-repository" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }

@@ -6,52 +6,112 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "secret_audit_log",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "secret_id!",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "secret_audit_log",
+            "name": "secret_id"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "action",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "secret_audit_log",
+            "name": "action"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "actor_type",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "secret_audit_log",
+            "name": "actor_type"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "actor_id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "secret_audit_log",
+            "name": "actor_id"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "module_id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "secret_audit_log",
+            "name": "module_id"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "success!",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "secret_audit_log",
+            "name": "success"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "error_message",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "secret_audit_log",
+            "name": "error_message"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "ip_address",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "secret_audit_log",
+            "name": "ip_address"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "timestamp!",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "secret_audit_log",
+            "name": "timestamp"
+          }
+        }
       }
     ],
     "parameters": {

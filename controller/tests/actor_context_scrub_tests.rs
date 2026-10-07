@@ -102,9 +102,9 @@ async fn event(pool: &PgPool, execution: Uuid, event_type: &str, message: &str) 
 }
 
 async fn input_of(pool: &PgPool, table: &str, id: Uuid) -> (Value, String) {
-    sqlx::query_as(&format!(
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT input_data, xmin::text FROM {table} WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await

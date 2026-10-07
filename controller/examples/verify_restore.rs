@@ -285,9 +285,11 @@ async fn main() -> Result<()> {
     // ── 2. Critical tables ───────────────────────────────────────────────
     for (table, must_be_non_empty) in CRITICAL_TABLES {
         // Table names come from the const list above, never from input.
-        let count: Result<(i64,), _> = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(&pool)
-            .await;
+        // sql-safe: the table name is an entry of the CRITICAL_TABLES constant in this file
+        let count: Result<(i64,), _> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&pool)
+                .await;
         match count {
             Ok((n,)) => {
                 println!("  {table:<22} {n:>8} rows");

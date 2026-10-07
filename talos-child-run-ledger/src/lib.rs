@@ -503,7 +503,8 @@ impl ChildRunLedger {
         );
         let mut out = LedgerPurge::default();
         for batch in 0..LEDGER_PURGE_MAX_BATCHES {
-            let deleted = sqlx::query(&sql)
+            // sql-safe: a literal with the LEDGER_PURGE_BATCH constant formatted in; the retention period is bound
+            let deleted = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(days)
                 .execute(&self.pool)
                 .await

@@ -19,7 +19,7 @@ talos-workflow-repository = { path = "../talos-workflow-repository" }
 anyhow.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 # The child-workflow reference scan — `session_start`'s auto-archive is a
 # DESTRUCTIVE draft path and must not treat a workflow somebody dispatches into
 # as a scaffolding leftover. Shared leaf, not a second copy (see #758/#759).

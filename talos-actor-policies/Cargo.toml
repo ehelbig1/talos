@@ -16,7 +16,7 @@ hex.workspace = true
 rand = { workspace = true, features = ["default", "std"] }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-actor-policy-hook = { path = "../talos-actor-policy-hook" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-actor-types = { path = "../talos-actor-types" }

@@ -33,7 +33,7 @@ talos-search-service = { path = "../talos-search-service" }
 # `unreadable_platform_tests` drives `build` against a pool whose every read
 # fails (a closed port), so the null-not-zero rendering is tested without a
 # database.
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

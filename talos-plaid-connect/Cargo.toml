@@ -11,7 +11,7 @@ publish.workspace = true
 anyhow.workspace = true
 axum = { workspace = true, features = ["json"] }
 serde.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "chrono"] }
 talos-organizations = { path = "../talos-organizations" }
 talos-plaid = { path = "../talos-plaid" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }

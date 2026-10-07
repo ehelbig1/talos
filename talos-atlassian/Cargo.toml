@@ -15,7 +15,7 @@ chrono.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 # MCP-1021: route FRONTEND_URL through the canonical validated helper
 # (rejects ? and # in addition to /; the inline validator only checked /).
 talos-config = { path = "../talos-config" }

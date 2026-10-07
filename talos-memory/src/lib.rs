@@ -3077,7 +3077,8 @@ pub async fn fetch_rank_training_examples(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query(&format!(
+    // sql-safe: JUDGE_LABEL_LATERAL is a constant join in this file; every value is bound
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT emc.memory_key, emc.relevance, emc.recency, emc.importance, \
                 emc.access_boost, emc.fused_score, emc.rank, emc.created_at, \
                 js.score AS judge_score, js.passed AS judge_passed, \
@@ -3089,7 +3090,7 @@ pub async fn fetch_rank_training_examples(
          WHERE emc.actor_id = $1 AND emc.created_at >= $2 \
          ORDER BY emc.created_at DESC \
          LIMIT $3"
-    ))
+    )))
     .bind(actor_id)
     .bind(since)
     .bind(limit)
@@ -3206,7 +3207,8 @@ pub async fn fetch_execution_memory_outcomes(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query(&format!(
+    // sql-safe: JUDGE_LABEL_LATERAL is a constant join in this file; every value is bound
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT emc.execution_id, \
                 AVG(emc.fused_score)::float8 AS mean_fused, \
                 MAX(emc.fused_score)::float8 AS max_fused, \
@@ -3221,7 +3223,7 @@ pub async fn fetch_execution_memory_outcomes(
          GROUP BY emc.execution_id, js.score, js.passed, js.disputed, we.status \
          ORDER BY MAX(emc.created_at) DESC \
          LIMIT $3"
-    ))
+    )))
     .bind(actor_id)
     .bind(since)
     .bind(limit)
@@ -3293,7 +3295,8 @@ async fn run_batched_sweep(
 ) -> Result<MemorySweep> {
     let mut out = MemorySweep::default();
     for batch in 0..MAX_SWEEP_BATCHES {
-        let n = sqlx::query(sql)
+        // sql-safe: both callers pass a literal with the SWEEP_BATCH constant formatted in; the one argument is bound
+        let n = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(arg)
             .execute(pool)
             .await

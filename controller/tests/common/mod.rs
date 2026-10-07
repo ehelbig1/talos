@@ -69,9 +69,9 @@ impl Drop for TestDb {
                 };
                 let admin_opts = admin_opts.database("postgres");
                 if let Ok(mut conn) = PgConnection::connect_with(&admin_opts).await {
-                    let _ = sqlx::query(&format!(
+                    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
                         "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-                    ))
+                    )))
                     .execute(&mut conn)
                     .await;
                     let _ = conn.close().await;
@@ -133,7 +133,10 @@ pub async fn isolated_db_pool() -> (Pool<Postgres>, TestDb) {
     let create_sql = format!("CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\"");
     let mut attempt = 0;
     loop {
-        match sqlx::query(&create_sql).execute(&mut admin).await {
+        match sqlx::query(sqlx::AssertSqlSafe(create_sql.as_str()))
+            .execute(&mut admin)
+            .await
+        {
             Ok(_) => break,
             Err(e) if attempt < 10 && e.to_string().contains("being accessed by other users") => {
                 attempt += 1;

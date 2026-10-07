@@ -9,7 +9,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 dotenvy.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono", "migrate"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono", "migrate"] }
 talos-config = { path = "../talos-config" }
 talos-tenancy = { path = "../talos-tenancy" }
 tokio = { workspace = true, features = ["time"] }

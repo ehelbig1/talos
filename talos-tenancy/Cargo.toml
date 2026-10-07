@@ -11,7 +11,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "uuid"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "uuid"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [lints]

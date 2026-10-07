@@ -14,7 +14,7 @@ chrono.workspace = true
 hex.workspace = true
 rand = { workspace = true, features = ["default", "std"] }
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 subtle.workspace = true
 talos-db = { path = "../talos-db" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }

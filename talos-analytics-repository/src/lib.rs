@@ -5202,7 +5202,8 @@ impl AnalyticsRepository {
         // — verified against the live catalog, 0 rows.)
         let hygiene_dispatchable = talos_workflow_liveness::dispatchable_sql(None);
         let undescribed_fut = async {
-            let fetched = sqlx::query(&format!(
+            // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+            let fetched = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT id, name, readiness_score, NULL::text AS description, created_at \
              FROM workflows \
              WHERE user_id = $1 AND {hygiene_dispatchable} \
@@ -5210,7 +5211,7 @@ impl AnalyticsRepository {
                AND (description IS NULL OR description = '') \
                AND (readiness_score IS NULL OR readiness_score >= 10) \
              ORDER BY readiness_score DESC NULLS LAST, id LIMIT 25"
-            ))
+            )))
             .bind(user_id)
             .fetch_all(&self.db_pool)
             .await;
@@ -5238,7 +5239,8 @@ impl AnalyticsRepository {
 
         // 2. Uncapabilized workflows (same `, id` tiebreaker rationale as #1).
         let uncapabilized_fut = async {
-            let fetched = sqlx::query(&format!(
+            // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+            let fetched = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT id, name, readiness_score, description, created_at \
              FROM workflows \
              WHERE user_id = $1 AND {hygiene_dispatchable} \
@@ -5246,7 +5248,7 @@ impl AnalyticsRepository {
                AND (capabilities IS NULL OR array_length(capabilities, 1) IS NULL) \
                AND (readiness_score IS NULL OR readiness_score >= 10) \
              ORDER BY readiness_score DESC NULLS LAST, id LIMIT 25"
-            ))
+            )))
             .bind(user_id)
             .fetch_all(&self.db_pool)
             .await;
@@ -5274,11 +5276,12 @@ impl AnalyticsRepository {
 
         // 3. Suppressed count (internal/test workflow types)
         let suppressed_count_fut = async {
-            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(&format!(
+            // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*)::bigint FROM workflows \
              WHERE user_id = $1 AND {hygiene_dispatchable} \
                AND workflow_type IN ('internal', 'test')"
-            ))
+            )))
             .bind(user_id)
             .fetch_one(&self.db_pool)
             .await;
@@ -5287,12 +5290,13 @@ impl AnalyticsRepository {
 
         // 3b. Suppressed low-score count (drafts with readiness_score < 10 excluded from hygiene)
         let suppressed_low_score_count_fut = async {
-            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(&format!(
+            // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*)::bigint FROM workflows \
              WHERE user_id = $1 AND {hygiene_dispatchable} \
                AND workflow_type IN ('production', 'template') \
                AND readiness_score < 10"
-            ))
+            )))
             .bind(user_id)
             .fetch_one(&self.db_pool)
             .await;
@@ -5557,7 +5561,8 @@ impl AnalyticsRepository {
         // no aggregate over an empty set to misread here).
         let dormant_retired = talos_workflow_liveness::retired_sql(Some("w"));
         let dormant_archived_fut = async {
-            let fetched = sqlx::query(&format!(
+            // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+            let fetched = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "WITH last_run AS ( \
                  SELECT w.id, GREATEST( \
                      (SELECT MAX(started_at) FROM workflow_executions we \
@@ -5575,7 +5580,7 @@ impl AnalyticsRepository {
              WHERE lr.last_execution IS NULL \
                 OR lr.last_execution < NOW() - INTERVAL '30 days' \
              ORDER BY w.created_at ASC LIMIT {ARCHIVED_EXCLUSION_NAME_LIMIT}"
-            ))
+            )))
             .bind(user_id)
             .fetch_all(&self.db_pool)
             .await;
@@ -5600,7 +5605,8 @@ impl AnalyticsRepository {
 
         let dormant_dispatchable = talos_workflow_liveness::dispatchable_sql(Some("w"));
         let dormant_workflows_fut = async {
-            let fetched = sqlx::query(&format!(
+            // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+            let fetched = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "WITH last_run AS ( \
                  SELECT w.id, GREATEST( \
                      (SELECT MAX(started_at) FROM workflow_executions we \
@@ -5618,7 +5624,7 @@ impl AnalyticsRepository {
              WHERE lr.last_execution IS NULL \
                 OR lr.last_execution < NOW() - INTERVAL '30 days' \
              ORDER BY w.created_at ASC LIMIT 25"
-            ))
+            )))
             .bind(user_id)
             .fetch_all(&self.db_pool)
             .await;
@@ -6164,7 +6170,8 @@ impl AnalyticsRepository {
         // alias; no user input reaches it.
         let workflows_needing_schema_fut = async {
             let fetched = sqlx::query(
-                &format!(
+                // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+                sqlx::AssertSqlSafe(format!(
                     "SELECT w.id, w.name, COUNT(e.id)::bigint AS execution_count, MAX(e.started_at) AS last_run \
              FROM workflows w \
              JOIN workflow_executions e ON e.workflow_id = w.id AND e.status = 'completed' \
@@ -6175,7 +6182,7 @@ impl AnalyticsRepository {
              HAVING COUNT(e.id) >= 1 \
              ORDER BY COUNT(e.id) DESC LIMIT 20",
                     live = talos_workflow_liveness::live_sql(Some("w")),
-                ),
+                )),
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)

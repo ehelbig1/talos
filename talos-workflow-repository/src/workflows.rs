@@ -288,8 +288,11 @@ impl WorkflowRepository {
         );
         let count_sql = format!("SELECT COUNT(*) FROM workflows w WHERE {where_str}");
 
-        let mut data_q = sqlx::query(&data_sql).bind(user_id);
-        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql).bind(user_id);
+        // sql-safe: literals joined with fixed filter clauses chosen by which filters are set; the only formatted values are placeholder numbers
+        let mut data_q = sqlx::query(sqlx::AssertSqlSafe(data_sql)).bind(user_id);
+        // sql-safe: the same fixed filter clauses as the listing above it; every value is bound
+        let mut count_q =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql)).bind(user_id);
         if let Some(s) = status_filter {
             data_q = data_q.bind(s);
             count_q = count_q.bind(s);
@@ -496,13 +499,14 @@ impl WorkflowRepository {
         // two cannot answer differently about which workflows the platform can
         // still run (they used to spell it `!=` and `<>` in two crates).
         let dispatchable = talos_workflow_liveness::dispatchable_sql(None);
-        let rows: Vec<(Option<String>,)> = sqlx::query_as(&format!(
+        // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT CASE WHEN octet_length(graph_json) <= $2 THEN graph_json::text END \
                FROM workflows \
               WHERE {dispatchable} \
               ORDER BY updated_at DESC NULLS LAST, id \
               LIMIT $1"
-        ))
+        )))
         .bind(limit)
         .bind(BOOT_WARMUP_MAX_GRAPH_BYTES)
         .fetch_all(&self.db_pool)
@@ -1295,7 +1299,8 @@ impl WorkflowRepository {
             where_uid_pos
         );
 
-        let mut q = sqlx::query(&sql);
+        // sql-safe: fixed `column = $n` fragments chosen by which fields are set; the only formatted values are placeholder numbers
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
         if let Some(n) = name {
             q = q.bind(n);
         }
@@ -3011,10 +3016,11 @@ impl talos_workflow_engine_core::WorkflowGraphStore for WorkflowRepository {
         // falls through to `get_graph`, which reports `Archived` and counts the
         // refusal. One policy, one message, one increment.
         let not_retired = talos_workflow_liveness::not_retired_sql(None);
-        let rows: Vec<(Uuid, String)> = sqlx::query_as(&format!(
+        // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT id, graph_json FROM workflows \
              WHERE id = ANY($1) AND user_id = $2 AND {not_retired}",
-        ))
+        )))
         .bind(ids)
         .bind(user_id)
         .fetch_all(&self.db_pool)
@@ -3048,10 +3054,11 @@ impl talos_workflow_engine_core::WorkflowGraphStore for WorkflowRepository {
         // candidate, and there is no one named workflow being refused to count.
         // Stated as a limit in CLAUDE.md rather than left to look like coverage.
         let not_retired = talos_workflow_liveness::not_retired_sql(None);
-        let row: Option<(Uuid,)> = sqlx::query_as(&format!(
+        // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+        let row: Option<(Uuid,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT id FROM workflows WHERE name = $1 AND user_id = $2 \
              AND {not_retired} LIMIT 1"
-        ))
+        )))
         .bind(name)
         .bind(user_id)
         .fetch_optional(&self.db_pool)
@@ -3083,11 +3090,12 @@ impl talos_workflow_engine_core::WorkflowGraphStore for WorkflowRepository {
             // than classifying is right because this chooses AMONG candidates:
             // a retired candidate must not shadow a live one, which a
             // read-then-refuse would do.
-            &format!(
+            // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+            sqlx::AssertSqlSafe(format!(
                 "SELECT id, name FROM workflows \
                  WHERE user_id = $1 AND capabilities @> $2 AND {not_retired} \
                  ORDER BY updated_at DESC, id DESC LIMIT 1"
-            ),
+            )),
         )
         .bind(user_id)
         .bind(required_capabilities)

@@ -25,7 +25,7 @@ jsonwebtoken = { workspace = true, features = ["rust_crypto", "use_pem"] }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 subtle.workspace = true
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
@@ -61,7 +61,7 @@ base64.workspace = true
 rand = { workspace = true, features = ["default"] }
 rsa = { workspace = true, features = ["pem"] }
 # `tests/absence_vs_failure.rs` drives a live pool (env-gated).
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 
 [lints]
 workspace = true

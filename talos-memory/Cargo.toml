@@ -27,7 +27,7 @@ serde = { workspace = true, features = ["derive"] }
 # talos-workflow-job-protocol, which could vanish under a future dep change.
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 subtle.workspace = true
 thiserror.workspace = true
 talos-http-body = { path = "../talos-http-body" }

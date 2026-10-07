@@ -71,12 +71,18 @@ pub async fn run_migrations(pool: &Pool<Postgres>, migrator: &Migrator) -> anyho
             .await
             .context("acquire migration connection")?
             .detach();
-        conn.execute(format!("SET lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'").as_str())
-            .await
-            .context("SET lock_timeout")?;
-        conn.execute(format!("SET statement_timeout = '{MIGRATION_STATEMENT_TIMEOUT}'").as_str())
-            .await
-            .context("SET statement_timeout")?;
+        // sql-safe: the only value is a constant in this file; SET takes no bind parameters
+        conn.execute(sqlx::AssertSqlSafe(format!(
+            "SET lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'"
+        )))
+        .await
+        .context("SET lock_timeout")?;
+        // sql-safe: the only value is a constant in this file; SET takes no bind parameters
+        conn.execute(sqlx::AssertSqlSafe(format!(
+            "SET statement_timeout = '{MIGRATION_STATEMENT_TIMEOUT}'"
+        )))
+        .await
+        .context("SET statement_timeout")?;
         let result = migrator.run(&mut conn).await;
         // Best-effort close; a failure here only leaks one server session
         // until the server notices the socket is gone.

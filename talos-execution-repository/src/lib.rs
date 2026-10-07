@@ -2772,7 +2772,8 @@ impl ExecutionRepository {
         // alive-but-slow, the epoch it holds (the pre-claim value) no longer
         // matches the row, so its fence heartbeat sees the mismatch and aborts.
         // The bumped value is returned so the resumer can heartbeat against it.
-        let row = sqlx::query_as::<_, StuckExecutionForResume>(&format!(
+        // sql-safe: RESUME_GRAPH_SQL is a constant expression in this file; every value is bound
+        let row = sqlx::query_as::<_, StuckExecutionForResume>(sqlx::AssertSqlSafe(format!(
             "WITH claimed AS ( \
                  SELECT id FROM workflow_executions \
                  WHERE status = 'running' \
@@ -2789,7 +2790,7 @@ impl ExecutionRepository {
                        (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
                            AS workflow_default_actor_id, \
                        {RESUME_GRAPH_SQL} AS graph_json",
-        ))
+        )))
         .bind(stale_after_minutes)
         .fetch_optional(&self.db_pool)
         .await?;
@@ -2830,7 +2831,8 @@ impl ExecutionRepository {
         // scoping (the MCP submit_workflow_approval path). The resumed run
         // itself executes as the EXECUTION's owner (RETURNING e.user_id) —
         // the org editor authorizes the resume, they don't impersonate it.
-        let row = sqlx::query_as::<_, StuckExecutionForResume>(&format!(
+        // sql-safe: RESUME_GRAPH_SQL is a constant expression in this file; every value is bound
+        let row = sqlx::query_as::<_, StuckExecutionForResume>(sqlx::AssertSqlSafe(format!(
             "UPDATE workflow_executions e \
              SET status = 'resuming', updated_at = NOW(), epoch = e.epoch + 1 \
              WHERE e.id = $1 \
@@ -2842,7 +2844,7 @@ impl ExecutionRepository {
                        (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
                            AS workflow_default_actor_id, \
                        {RESUME_GRAPH_SQL} AS graph_json",
-        ))
+        )))
         .bind(execution_id)
         .bind(user_id)
         .bind(writable_org_ids)
@@ -2862,11 +2864,12 @@ impl ExecutionRepository {
         user_id: Uuid,
         writable_org_ids: &[Uuid],
     ) -> Result<Option<String>> {
-        let row: Option<(Option<String>,)> = sqlx::query_as(&format!(
+        // sql-safe: RESUME_GRAPH_SQL is a constant expression in this file; every value is bound
+        let row: Option<(Option<String>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {RESUME_GRAPH_SQL} FROM workflow_executions e \
              LEFT JOIN workflows w0 ON w0.id = e.workflow_id \
              WHERE e.id = $1 AND (e.user_id = $2 OR w0.org_id = ANY($3))"
-        ))
+        )))
         .bind(execution_id)
         .bind(user_id)
         .bind(writable_org_ids)

@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "uuid", "json", "chrono"] }
 thiserror.workspace = true
 uuid.workspace = true
 

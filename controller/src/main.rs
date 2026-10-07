@@ -71,6 +71,8 @@ mod integrations;
 mod llm;
 mod mcp;
 mod memory_crypto;
+#[cfg(test)]
+mod migrations_pin;
 mod module_executions;
 mod module_payload_encryption;
 mod module_repository;

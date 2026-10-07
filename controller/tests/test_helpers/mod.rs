@@ -191,9 +191,12 @@ async fn ensure_template(base: &PgConnectOptions) {
                 .await
                 .expect("connect to container maintenance db");
             // Idempotent: a re-run inside the same container is fine.
-            let _ = sqlx::query(&format!("CREATE DATABASE \"{}\"", TEMPLATE_DB))
-                .execute(&mut admin)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE DATABASE \"{}\"",
+                TEMPLATE_DB
+            )))
+            .execute(&mut admin)
+            .await;
             let _ = admin.close().await;
 
             let pool = PgPoolOptions::new()
@@ -232,7 +235,10 @@ pub async fn get_isolated_db_pool() -> Pool<Postgres> {
     );
     let mut attempt = 0;
     loop {
-        match sqlx::query(&create_sql).execute(&mut admin).await {
+        match sqlx::query(sqlx::AssertSqlSafe(create_sql.as_str()))
+            .execute(&mut admin)
+            .await
+        {
             Ok(_) => break,
             Err(e) if attempt < 10 && e.to_string().contains("being accessed by other users") => {
                 attempt += 1;

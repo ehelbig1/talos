@@ -47,13 +47,10 @@ async fn scratch_sessions_rls_isolates_users_through_the_repository() {
     let user_b = Uuid::new_v4();
 
     // Setup: non-superuser role, two users, grants.
-    su.execute(
-        format!(
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{ROLE}') THEN \
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{ROLE}') THEN \
                CREATE ROLE {ROLE} LOGIN PASSWORD '{PW}'; END IF; END $$;"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create role");
     for (u, label) in [(user_a, "a"), (user_b, "b")] {
@@ -65,9 +62,9 @@ async fn scratch_sessions_rls_isolates_users_through_the_repository() {
             .await
             .expect("insert user");
     }
-    su.execute(
-        format!("GRANT SELECT, INSERT, UPDATE, DELETE ON scratch_sessions TO {ROLE};").as_str(),
-    )
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON scratch_sessions TO {ROLE};"
+    )))
     .await
     .expect("grant");
 
@@ -156,7 +153,7 @@ async fn scratch_sessions_rls_isolates_users_through_the_repository() {
             .await;
     }
     let _ = su
-        .execute(format!("DROP ROLE IF EXISTS {ROLE};").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {ROLE};")))
         .await;
 }
 
@@ -170,18 +167,15 @@ async fn user_module_pins_rls_isolates_per_user() {
     let user_a = Uuid::new_v4();
     let user_b = Uuid::new_v4();
 
-    su.execute(
-        format!(
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{PINS_ROLE}') THEN \
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{PINS_ROLE}') THEN \
                CREATE ROLE {PINS_ROLE} LOGIN PASSWORD '{PW}'; END IF; END $$;"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create pins role");
-    su.execute(
-        format!("GRANT SELECT, INSERT, DELETE ON user_module_pins TO {PINS_ROLE};").as_str(),
-    )
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT, INSERT, DELETE ON user_module_pins TO {PINS_ROLE};"
+    )))
     .await
     .expect("grant");
     for (u, label) in [(user_a, "pa"), (user_b, "pb")] {
@@ -247,6 +241,8 @@ async fn user_module_pins_rls_isolates_per_user() {
             .await;
     }
     let _ = su
-        .execute(format!("DROP ROLE IF EXISTS {PINS_ROLE};").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {PINS_ROLE};"
+        )))
         .await;
 }

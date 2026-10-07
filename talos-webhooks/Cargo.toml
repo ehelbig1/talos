@@ -27,7 +27,7 @@ talos-redis = { path = "../talos-redis" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 subtle.workspace = true
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-config = { path = "../talos-config" }

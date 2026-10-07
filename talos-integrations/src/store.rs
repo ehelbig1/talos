@@ -33,7 +33,8 @@ pub async fn list_user_service_integrations(
     pool: &PgPool,
     user_id: Uuid,
 ) -> Result<Vec<ServiceIntegrationRow>> {
-    sqlx::query_as::<_, ServiceIntegrationRow>(&connections_union_sql())
+    // sql-safe: table, column and tag names are &'static str fields of the PROVIDERS registry; the user id is bound
+    sqlx::query_as::<_, ServiceIntegrationRow>(sqlx::AssertSqlSafe(connections_union_sql()))
         .bind(user_id)
         .fetch_all(pool)
         .await
@@ -102,7 +103,8 @@ pub async fn list_user_connections(pool: &PgPool, user_id: Uuid) -> Result<Vec<C
         "SELECT * FROM ({}) c ORDER BY provider_id, created_at, id LIMIT {MAX_LISTED_CONNECTIONS}",
         connections_union_sql()
     );
-    sqlx::query_as::<_, ConnectionRow>(&sql)
+    // sql-safe: table, column and tag names are &'static str fields of the PROVIDERS registry; the user id is bound
+    sqlx::query_as::<_, ConnectionRow>(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
         .fetch_all(pool)
         .await
@@ -167,12 +169,14 @@ pub async fn disconnect_user_integration(
         )
     };
 
-    let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(&sql)
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .context("Failed to disconnect integration")?;
+    // sql-safe: table, column and tag names are &'static str fields of the PROVIDERS registry; the user id is bound
+    let row: Option<(Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .context("Failed to disconnect integration")?;
 
     Ok(match row {
         Some((provider_key, tier, account_email)) => DisconnectOutcome {

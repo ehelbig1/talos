@@ -11,7 +11,7 @@ anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 thiserror = "1"  # not-inherited: a different major from the workspace (2.0.18)
 talos-execution-orchestration = { path = "../talos-execution-orchestration" }
 talos-execution-repository = { path = "../talos-execution-repository" }

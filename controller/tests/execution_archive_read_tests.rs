@@ -332,14 +332,11 @@ async fn the_archive_is_rls_isolated_from_another_tenant() {
     // the EXTENDED protocol, which refuses multiple commands in one parse.
     use sqlx::Executor as _;
     (&mut *tx)
-        .execute(
-            format!(
-                "SET LOCAL ROLE talos_app; SET LOCAL app.current_user_id = '{}'; \
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL ROLE talos_app; SET LOCAL app.current_user_id = '{}'; \
                  SET LOCAL app.current_org_ids = ''",
-                a.user
-            )
-            .as_str(),
-        )
+            a.user
+        )))
         .await
         .expect("set role + GUCs");
 
@@ -371,14 +368,11 @@ async fn the_owner_still_sees_their_own_archived_execution_under_rls() {
     let mut tx = pool.begin().await.expect("begin");
     use sqlx::Executor as _;
     (&mut *tx)
-        .execute(
-            format!(
-                "SET LOCAL ROLE talos_app; SET LOCAL app.current_user_id = '{}'; \
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL ROLE talos_app; SET LOCAL app.current_user_id = '{}'; \
                  SET LOCAL app.current_org_ids = ''",
-                a.user
-            )
-            .as_str(),
-        )
+            a.user
+        )))
         .await
         .expect("set role + GUCs");
 

@@ -104,10 +104,12 @@ async fn seed_disagreement(
 }
 
 async fn rename(pool: &Pool<Postgres>, from: &str, to: &str) {
-    sqlx::query(&format!("ALTER TABLE {from} RENAME TO {to}"))
-        .execute(pool)
-        .await
-        .unwrap_or_else(|e| panic!("rename {from} -> {to}: {e}"));
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {from} RENAME TO {to}"
+    )))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("rename {from} -> {to}: {e}"));
 }
 
 /// The HANDLER layer, through the production MCP dispatch. `ml_set_policy`

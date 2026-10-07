@@ -64,12 +64,13 @@ async fn manifest_columns(pool: &Pool<Postgres>, id: Uuid) -> Vec<(String, Optio
     let mut out = Vec::new();
     for column in COLUMNS {
         // A fixed list of column names, not caller input.
-        let value: Option<String> =
-            sqlx::query_scalar(&format!("SELECT {column}::text FROM modules WHERE id = $1"))
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .unwrap_or_else(|e| panic!("{column}: {e}"));
+        let value: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT {column}::text FROM modules WHERE id = $1"
+        )))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{column}: {e}"));
         out.push((column.to_string(), value));
     }
     out

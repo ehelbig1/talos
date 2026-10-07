@@ -194,10 +194,10 @@ async fn clocks(
 }
 
 async fn backdate_attempt(pool: &Pool, model_id: Uuid, interval: &str) {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE ml_models SET last_policy_eval_attempt_at = NOW() - INTERVAL '{interval}' \
          WHERE id = $1"
-    ))
+    )))
     .bind(model_id)
     .execute(pool)
     .await
@@ -238,9 +238,9 @@ async fn tick_visiting(pool: &Pool, ds: &DatasetService, ls: &LifecycleService, 
 }
 
 async fn touch_dataset(pool: &Pool, dataset_id: Uuid, interval: &str) {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE ml_datasets SET updated_at = NOW() - INTERVAL '{interval}' WHERE id = $1"
-    ))
+    )))
     .bind(dataset_id)
     .execute(pool)
     .await
@@ -421,9 +421,9 @@ async fn every_model_past_the_per_tick_cap_is_reached_within_two_ticks() {
     }
 
     async fn stamped(pool: &Pool, column: &str) -> i64 {
-        sqlx::query_scalar(&format!(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*)::bigint FROM ml_models WHERE {column} IS NOT NULL"
-        ))
+        )))
         .fetch_one(pool)
         .await
         .expect("count stamped rows")

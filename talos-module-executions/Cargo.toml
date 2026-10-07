@@ -10,7 +10,7 @@ publish.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-cost-attribution = { path = "../talos-cost-attribution" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-metrics = { path = "../talos-metrics" }

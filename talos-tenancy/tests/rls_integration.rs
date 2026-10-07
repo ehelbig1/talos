@@ -123,12 +123,16 @@ async fn visible_executions(pool: &PgPool, user_id: &str, org_ids: &str) -> Vec<
     // One connection/tx: set the read-scope GUCs, SET ROLE to the non-superuser
     // (RLS enforced), query, then unwind.
     let mut conn = pool.acquire().await.unwrap();
-    conn.execute(format!("SET {READ_USER_GUC} = '{user_id}'").as_str())
-        .await
-        .unwrap();
-    conn.execute(format!("SET {READ_ORGS_GUC} = '{org_ids}'").as_str())
-        .await
-        .unwrap();
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "SET {READ_USER_GUC} = '{user_id}'"
+    )))
+    .await
+    .unwrap();
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "SET {READ_ORGS_GUC} = '{org_ids}'"
+    )))
+    .await
+    .unwrap();
     conn.execute("SET ROLE rls_test_user").await.unwrap();
 
     let rows = sqlx::query("SELECT id FROM workflow_executions ORDER BY id")

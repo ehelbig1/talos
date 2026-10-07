@@ -44,7 +44,7 @@ aws-smithy-types = "1.4"
 chrono.workspace = true
 futures.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-audit-event = { path = "../talos-audit-event" }
 # Prometheus counter for the two verification-failure detectors (event-level at

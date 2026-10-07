@@ -16,7 +16,7 @@ rand = { workspace = true, features = ["default", "std"] }
 subtle.workspace = true
 talos-text-util = { path = "../talos-text-util" }
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 # envelope.rs — the shared `__ops_alert__` ingest core (parse → cap →
 # DLP → tenancy → ingest) consumed by the engine node hook AND the
 # module-result completion chokepoint. Domain crate owns the protocol

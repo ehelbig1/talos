@@ -549,7 +549,12 @@ async fn stamp_pool(pool: &PgPool, model_id: Uuid, column: &'static str) {
         "stamp_pool takes a fixed column literal, never caller data"
     );
     let sql = format!("UPDATE ml_models SET {column} = NOW() WHERE id = $1");
-    if let Err(e) = sqlx::query(&sql).bind(model_id).execute(pool).await {
+    // sql-safe: the column is a &'static str, one of two literals of this module; the model id is bound
+    if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(model_id)
+        .execute(pool)
+        .await
+    {
         tracing::warn!(%model_id, column, error = %e, "failed to stamp evaluator clock");
     }
 }
