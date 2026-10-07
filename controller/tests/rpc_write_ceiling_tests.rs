@@ -521,4 +521,67 @@ async fn write_ceiling_gates_every_controller_served_rpc_mutation() {
         "the database control write must land — otherwise the refusals above \
          prove nothing"
     );
+
+    // The shape the WORKER admitted with no operation granted until
+    // 2026-10-06: a write as the body of the query a `WITH` introduces. It
+    // parses as a query, so the worker sends it on the fetch path and the
+    // handler wraps it in a CTE — where PostgreSQL runs it. The row changing
+    // is the measurement that the shape is a real write, and not only
+    // something the parser accepts.
+    let probe_value = |pool: sqlx::Pool<sqlx::Postgres>| async move {
+        sqlx::query_scalar::<_, i32>("SELECT a FROM rpcwc_probe")
+            .fetch_one(&pool)
+            .await
+            .expect("read the probe row")
+    };
+    let carried = "WITH src AS (SELECT 4 AS x) \
+                   UPDATE rpcwc_probe SET a = (SELECT x FROM src) RETURNING a";
+    let reply = call_database_rpc(&nats, ro_actor, carried.into(), vec![], true).await;
+    assert!(
+        reply.result.is_err() && probe_value(pool.clone()).await == 3,
+        "a readonly actor's WITH … UPDATE must be refused, got {:?}",
+        reply.result
+    );
+    let reply = call_database_rpc(&nats, rw_actor, carried.into(), vec![], true).await;
+    assert!(
+        reply.result.is_ok(),
+        "a write-ceiling actor's WITH … UPDATE runs, got {:?}",
+        reply.result
+    );
+    assert_eq!(
+        probe_value(pool.clone()).await,
+        4,
+        "PostgreSQL executes an UPDATE that is the body of a WITH query"
+    );
+
+    // ── Phase 7: `SELECT … INTO` creates a table, and is refused for anyone ──
+    // It parses as an ordinary query, so until 2026-10-06 the admission gate
+    // (which exists to refuse DDL) let it through as a READ, past the write
+    // ceiling as well. Sent with `is_fetch = false`: on the fetch path the
+    // handler wraps the SQL in a CTE and PostgreSQL itself refuses `INTO`
+    // there, so an honest worker — which fetches every query — could not
+    // reach it. `is_fetch` is the SENDER's word, and the gate is there for a
+    // sender that holds the fleet key and is not honest. Refused for the
+    // write-ceiling actor too: this is admission, not the ceiling. The
+    // assertion is on the catalog.
+    for (actor, who) in [(ro_actor, "readonly"), (rw_actor, "write-ceiling")] {
+        let reply = call_database_rpc(
+            &nats,
+            actor,
+            "SELECT a INTO rpcwc_made FROM rpcwc_probe".into(),
+            vec![],
+            false,
+        )
+        .await;
+        let made: bool = sqlx::query_scalar("SELECT to_regclass('rpcwc_made') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("look the table up");
+        assert!(!made, "a {who} actor's SELECT INTO must not create a table");
+        assert!(
+            reply.result.is_err(),
+            "a {who} actor's SELECT INTO must be refused, got {:?}",
+            reply.result
+        );
+    }
 }

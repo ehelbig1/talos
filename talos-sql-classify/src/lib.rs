@@ -23,6 +23,19 @@
 //! leaf crate that depends on `sqlparser` and nothing else, and both consumers
 //! call in.
 //!
+//! ## What else lives here, for the same reason
+//!
+//! * [`try_for_each_carried_statement`] — WHICH statements a statement
+//!   carries. The worker's operation allowlist is asked about each one; it
+//!   used to answer with its own walk, which missed positions this one
+//!   reaches.
+//! * [`selects_into_table`] — `SELECT … INTO new_table`, a table creation
+//!   that parses as a plain query. [`classify`] calls it
+//!   [`SqlAccess::Unclassified`] and both consumers refuse it.
+//!
+//! The verdicts of this crate and of both consumers over one corpus of
+//! statements are recorded in `corpus/` (see its README).
+//!
 //! ## What this crate does NOT decide
 //!
 //! * **Which statement kinds may run at all.** Admission (DDL / `CALL` /
@@ -48,7 +61,7 @@
 //!   receives is already shallow; `parse_depth_is_bounded_by_sqlparser` pins
 //!   that rather than assuming it.
 
-use sqlparser::ast::{Statement, Visit, Visitor};
+use sqlparser::ast::{Query, SetExpr, Statement, Visit, Visitor};
 use std::ops::ControlFlow;
 
 /// How a single parsed SQL statement accesses data.
@@ -78,8 +91,9 @@ pub enum SqlAccess {
     ///   one nested inside a derived table. This is the shape both consumers
     ///   used to call a read.
     Mutates { nested: bool },
-    /// Neither: DDL, `CALL`, `COPY`, `SET`, `PREPARE`, or any `Statement`
-    /// variant a future sqlparser adds. NOT read-only.
+    /// Neither: DDL, `CALL`, `COPY`, `SET`, `PREPARE`, a query that creates a
+    /// table (`SELECT … INTO`), or any `Statement` variant a future sqlparser
+    /// adds. NOT read-only.
     ///
     /// Both consumers reject these before the read/write question is even
     /// asked, so in practice this variant is a fail-closed backstop rather
@@ -115,7 +129,11 @@ pub fn classify(stmt: &Statement) -> SqlAccess {
         | Statement::Delete(_)
         | Statement::Merge { .. } => SqlAccess::Mutates { nested: false },
         Statement::Query(_) => {
-            if carries_nested_statement(stmt) {
+            if selects_into_table(stmt) {
+                // `SELECT … INTO new_table` CREATES a table. It is a query
+                // only in shape; both consumers refuse it outright.
+                SqlAccess::Unclassified
+            } else if carries_nested_statement(stmt) {
                 SqlAccess::Mutates { nested: true }
             } else {
                 SqlAccess::ReadOnly
@@ -132,26 +150,85 @@ pub fn is_read_only(stmt: &Statement) -> bool {
 }
 
 fn carries_nested_statement(stmt: &Statement) -> bool {
-    struct NestedStatementVisitor {
-        /// The root is visited too; skip exactly one `Query` so the walk
-        /// answers "is there a non-`Query` statement BELOW the root".
+    try_for_each_carried_statement(stmt, |_| ControlFlow::Break(())).is_break()
+}
+
+/// Call `f` with every statement `stmt` CARRIES: each `Statement` node below
+/// the root that is not itself a `Query`.
+///
+/// This is the one walk behind "does this query hide a mutation". The
+/// classifier asks it whether there is any such statement; the worker's
+/// operation allowlist asks it WHICH, so that a carried `DELETE` is admitted
+/// only where a top-level `DELETE` would be. It rides sqlparser's derived
+/// `Visit`, which reaches every position a statement can sit in — a CTE body,
+/// the body of the query a `WITH` introduces, a derived table, a subquery in
+/// any expression. The worker used to answer this with a hand-written walk
+/// over the positions someone had thought of, and was patched twice for the
+/// ones nobody had (`corpus/README.md`).
+///
+/// The root is skipped whatever its kind, so an `INSERT` whose source query
+/// carries an `UPDATE` reports the `UPDATE`.
+pub fn try_for_each_carried_statement<B>(
+    stmt: &Statement,
+    f: impl FnMut(&Statement) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    struct CarriedStatementVisitor<F> {
         root_seen: bool,
+        f: F,
     }
-    impl Visitor for NestedStatementVisitor {
-        type Break = ();
-        fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<()> {
+    impl<B, F: FnMut(&Statement) -> ControlFlow<B>> Visitor for CarriedStatementVisitor<F> {
+        type Break = B;
+        fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<B> {
+            if !self.root_seen {
+                self.root_seen = true;
+                return ControlFlow::Continue(());
+            }
             match s {
-                Statement::Query(_) => {
-                    self.root_seen = true;
-                    ControlFlow::Continue(())
-                }
-                _ => ControlFlow::Break(()),
+                Statement::Query(_) => ControlFlow::Continue(()),
+                carried => (self.f)(carried),
             }
         }
     }
 
-    let mut v = NestedStatementVisitor { root_seen: false };
-    matches!(stmt.visit(&mut v), ControlFlow::Break(()))
+    stmt.visit(&mut CarriedStatementVisitor {
+        root_seen: false,
+        f,
+    })
+}
+
+/// Does any query in `stmt` carry an `INTO` target — Postgres's
+/// `SELECT … INTO [TEMP] new_table FROM …`, which CREATES a table?
+///
+/// sqlparser parses it as an ordinary `Query` with a field set on the
+/// `Select`, so nothing that matches on statement kind can see it: until
+/// 2026-10-06 both consumers called it a read. Postgres accepts it only at
+/// the top level; this looks everywhere, because the question is what the
+/// parser will hand over, not what the server will then run.
+#[must_use]
+pub fn selects_into_table(stmt: &Statement) -> bool {
+    fn body_selects_into(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Select(select) => select.into.is_some(),
+            SetExpr::SetOperation { left, right, .. } => {
+                body_selects_into(left) || body_selects_into(right)
+            }
+            // A parenthesised query is a `Query` of its own and is visited
+            // as one; the other bodies hold no `Select` at this level.
+            _ => false,
+        }
+    }
+    struct SelectIntoVisitor;
+    impl Visitor for SelectIntoVisitor {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            if body_selects_into(&query.body) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    stmt.visit(&mut SelectIntoVisitor).is_break()
 }
 
 #[cfg(test)]
@@ -165,6 +242,72 @@ mod tests {
             .unwrap_or_else(|e| panic!("parse {sql}: {e}"));
         assert_eq!(s.len(), 1, "expected one statement: {sql}");
         s.remove(0)
+    }
+
+    /// `SELECT … INTO new_table` creates a table. It parses as a `Query`, and
+    /// until 2026-10-06 that made it a read here and for both consumers.
+    #[test]
+    fn select_into_is_never_a_read() {
+        for sql in [
+            "SELECT * INTO new_table FROM t",
+            "SELECT * INTO TEMP new_table FROM t",
+            "SELECT 1 UNION SELECT a INTO new_table FROM t",
+            "WITH a AS (SELECT 1 AS x) SELECT x INTO new_table FROM a",
+            "SELECT * FROM (SELECT a INTO new_table FROM t) x",
+        ] {
+            let stmt = parse1(sql);
+            assert!(selects_into_table(&stmt), "{sql}");
+            assert_eq!(classify(&stmt), SqlAccess::Unclassified, "{sql}");
+        }
+        // `INSERT INTO … SELECT` and a plain read have no such target.
+        for sql in ["SELECT a FROM t", "INSERT INTO t (a) SELECT a FROM u"] {
+            assert!(!selects_into_table(&parse1(sql)), "{sql}");
+        }
+    }
+
+    /// The carried-statement walk names each statement below the root, in
+    /// every position, and skips the root whatever its kind.
+    #[test]
+    fn the_carried_walk_names_what_a_statement_carries() {
+        fn carried(sql: &str) -> Vec<&'static str> {
+            let mut kinds = Vec::new();
+            let _ = try_for_each_carried_statement(&parse1(sql), |s| {
+                kinds.push(match s {
+                    Statement::Insert(_) => "INSERT",
+                    Statement::Update { .. } => "UPDATE",
+                    Statement::Delete(_) => "DELETE",
+                    _ => "OTHER",
+                });
+                ControlFlow::<()>::Continue(())
+            });
+            kinds
+        }
+        assert_eq!(carried("SELECT 1"), Vec::<&str>::new());
+        assert_eq!(carried("INSERT INTO t (a) VALUES (1)"), Vec::<&str>::new());
+        assert_eq!(
+            carried("WITH a AS (SELECT 1 AS x) INSERT INTO t (a) SELECT x FROM a"),
+            ["INSERT"]
+        );
+        assert_eq!(
+            carried(
+                "INSERT INTO t (a) WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT a FROM upd"
+            ),
+            ["UPDATE"]
+        );
+        assert_eq!(
+            carried(
+                "WITH i AS (INSERT INTO t (a) VALUES (1) RETURNING a), \
+                 u AS (UPDATE t SET a = 2 RETURNING a) SELECT * FROM i, u"
+            ),
+            ["INSERT", "UPDATE"]
+        );
+        assert_eq!(
+            carried(
+                "SELECT * FROM t WHERE a IN \
+                 (WITH i AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM i)"
+            ),
+            ["INSERT"]
+        );
     }
 
     /// The corpus both consumers are pinned against. Every entry states the
