@@ -221,6 +221,12 @@ A new test of a script needs neither: `make test-scripts` finds every
 `scripts/tests/*.sh`, `deploy/k3s/tests/*.sh` and every `scripts/*.py` that
 has a `--self-test`.
 
+A recipe runs under `bash -eu -o pipefail` on every make, the 3.81 that macOS
+ships included: the flags are on the Makefile's `SHELL` line, because 3.81
+ignores `.SHELLFLAGS`. `scripts/tests/make-strict-shell-test.sh` holds that. A
+command whose failure the recipe goes on to handle says so (`|| true` inside
+the `$(…)`, or an `if`).
+
 Until 2026-10-06 six of CI's gate steps called make and 31 did not. The lint job ran `scripts/lint-structural.sh` itself, so two checks added
 to `make lint` that day ran on a developer's machine and never in CI.
 
