@@ -784,6 +784,10 @@ pub enum RedisTransport {
     /// `REDIS_URL` is set but the redis client cannot parse it, so there will
     /// be no Redis at all.
     Unparseable,
+    /// The client parsed the URL into an address kind this audit does not
+    /// know (the client's address type is open to new kinds from redis 1.0).
+    /// TLS is neither confirmed nor ruled out.
+    Unrecognised,
 }
 
 /// Resolve `REDIS_URL` through `redis::Client::open` — the same call
@@ -806,11 +810,14 @@ pub fn probe_redis_transport(redis_url: &str) -> RedisTransport {
     let Ok(client) = redis::Client::open(redis_url) else {
         return RedisTransport::Unparseable;
     };
-    match client.get_connection_info().addr {
+    match client.get_connection_info().addr() {
         redis::ConnectionAddr::TcpTls { insecure: true, .. } => RedisTransport::TlsInsecure,
         redis::ConnectionAddr::TcpTls { .. } => RedisTransport::Tls,
         redis::ConnectionAddr::Tcp(..) => RedisTransport::Plaintext,
         redis::ConnectionAddr::Unix(..) => RedisTransport::UnixSocket,
+        // Never reported as TLS: a kind this probe cannot read is not one it
+        // can vouch for.
+        _ => RedisTransport::Unrecognised,
     }
 }
 
@@ -869,6 +876,16 @@ pub fn check_redis_tls(transport: RedisTransport, is_prod: bool) -> Check {
             name: "redis_tls",
             status: if is_prod { Status::Fail } else { Status::Info },
             detail: "Redis using plaintext (redis://) — use rediss:// in production".to_string(),
+            verification: Verification::Parsed,
+            points: 0,
+            parts: None,
+        },
+        RedisTransport::Unrecognised => Check {
+            name: "redis_tls",
+            status: if is_prod { Status::Fail } else { Status::Info },
+            detail: "Redis is reached over a transport this audit does not recognise — \
+                     TLS could not be confirmed"
+                .to_string(),
             verification: Verification::Parsed,
             points: 0,
             parts: None,

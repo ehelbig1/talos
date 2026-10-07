@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
+talos-redis = { path = "../talos-redis" }
 talos-config = { path = "../talos-config" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true

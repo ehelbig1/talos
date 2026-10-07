@@ -95,9 +95,7 @@ impl DistributedRateLimiter {
     async fn conn(&self) -> Result<redis::aio::ConnectionManager> {
         let mgr = self
             .conn_mgr
-            .get_or_try_init(|| async {
-                redis::aio::ConnectionManager::new((*self.redis).clone()).await
-            })
+            .get_or_try_init(|| async { talos_redis::manager((*self.redis).clone()).await })
             .await?;
         Ok(mgr.clone())
     }

@@ -14,6 +14,7 @@ uuid = { workspace = true, features = ["v4"] }
 zeroize.workspace = true
 serde_json.workspace = true
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "script"] }
+talos-redis = { path = "../talos-redis" }
 async-nats.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

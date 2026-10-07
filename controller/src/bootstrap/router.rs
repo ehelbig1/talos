@@ -1189,7 +1189,7 @@ async fn compute_composite_health(
         match redis_client {
             Some(client) => tokio::time::timeout(check_timeout, async {
                 let conn = HEALTH_REDIS_CONN
-                    .get_or_try_init(|| client.get_connection_manager())
+                    .get_or_try_init(|| talos_redis::manager(redis::Client::clone(client)))
                     .await;
                 match conn {
                     Ok(shared) => {
@@ -1257,13 +1257,10 @@ pub(crate) async fn health_check_redis(
 ) -> Result<&'static str, axum::http::StatusCode> {
     if let Some(client) = redis_client {
         // Test Redis connection
-        let mut conn = client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| {
-                tracing::error!("Redis health check failed: connection error: {}", e);
-                axum::http::StatusCode::SERVICE_UNAVAILABLE
-            })?;
+        let mut conn = talos_redis::multiplexed(&client).await.map_err(|e| {
+            tracing::error!("Redis health check failed: connection error: {}", e);
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        })?;
 
         // Test PING command
         redis::cmd("PING")
@@ -1426,7 +1423,7 @@ pub(crate) async fn readiness_probe(
     // Redis and NATS are optional — their absence degrades but doesn't block
     let redis_ok = if let Some(ref client) = redis_client {
         tokio::time::timeout(check_timeout, async {
-            match client.get_multiplexed_async_connection().await {
+            match talos_redis::multiplexed(client).await {
                 Ok(mut conn) => redis::cmd("PING")
                     .query_async::<String>(&mut conn)
                     .await

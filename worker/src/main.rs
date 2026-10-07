@@ -2887,7 +2887,7 @@ async fn main() -> anyhow::Result<()> {
         match redis::Client::open(redis_url.as_str()) {
             Ok(client) => {
                 // Test connection
-                match client.get_multiplexed_async_connection().await {
+                match talos_redis::multiplexed(&client).await {
                     Ok(_) => {
                         println!(
                             "      Connected to Redis at {}",

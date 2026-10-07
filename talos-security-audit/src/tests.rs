@@ -397,6 +397,20 @@ fn redis_plaintext_grades_by_environment_as_before() {
     assert_eq!(check_redis_tls(RedisTransport::Plaintext, true).points, 0);
 }
 
+/// The redis client's address type is open to new kinds from 1.0. One this
+/// audit does not know earns no points and, in production, fails: it is never
+/// taken for TLS.
+#[test]
+fn an_unrecognised_redis_transport_is_never_reported_as_tls() {
+    let prod = check_redis_tls(RedisTransport::Unrecognised, true);
+    assert_eq!(prod.status, Status::Fail);
+    assert_eq!(prod.points, 0);
+    assert_eq!(
+        check_redis_tls(RedisTransport::Unrecognised, false).status,
+        Status::Info
+    );
+}
+
 #[test]
 fn redis_tls_scores_ten_as_before() {
     let c = check_redis_tls(RedisTransport::Tls, true);

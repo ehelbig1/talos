@@ -1090,7 +1090,7 @@ pub async fn fetch(
             let redis_key = Some(format!("oci_cache:{}", pinned.layer.digest));
             if let (Some(digest), Some(key)) = (Some(&pinned.layer.digest), &redis_key) {
                 if let Some(redis_client) = runtime.redis_client() {
-                    if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
+                    if let Ok(mut conn) = talos_redis::multiplexed(&redis_client).await {
                         if let Ok(Some(b)) = redis::cmd("GET")
                             .arg(key)
                             .query_async::<Option<Vec<u8>>>(&mut conn)
@@ -1191,7 +1191,7 @@ pub async fn fetch(
                                 if let Some(key) = redis_key.as_deref() {
                                     if let Some(redis_client) = runtime.redis_client() {
                                         if let Ok(mut conn) =
-                                            redis_client.get_multiplexed_async_connection().await
+                                            talos_redis::multiplexed(&redis_client).await
                                         {
                                             let _: Result<(), _> = redis::cmd("SET")
                                                 .arg(key)
@@ -1253,7 +1253,7 @@ pub async fn fetch(
 
         let mut found_bytes: Option<Vec<u8>> = None;
         if let Some(redis_client) = runtime.redis_client() {
-            if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
+            if let Ok(mut conn) = talos_redis::multiplexed(&redis_client).await {
                 // remove "redis:" prefix to get the actual key: "wasm:{user_id}:{module_id}"
                 let key = req
                     .module_uri

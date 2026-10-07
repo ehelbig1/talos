@@ -1654,8 +1654,7 @@ mod expose_limit_absence_tests {
             return;
         };
         let client = std::sync::Arc::new(redis::Client::open(url).expect("redis client"));
-        let mut conn = client
-            .get_multiplexed_async_connection()
+        let mut conn = talos_redis::multiplexed(&client)
             .await
             .expect("redis connection");
         let key = format!("talos:test:tier2_expose:{}", uuid::Uuid::new_v4());

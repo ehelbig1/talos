@@ -98,7 +98,7 @@ pub async fn approval_handler(
         None => return (StatusCode::INTERNAL_SERVER_ERROR, "NATS not available").into_response(),
     };
 
-    let mut con = match redis.get_multiplexed_tokio_connection().await {
+    let mut con = match talos_redis::multiplexed(&redis).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to get Redis connection: {}", e);

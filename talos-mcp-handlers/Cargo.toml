@@ -21,6 +21,7 @@ hex.workspace = true
 petgraph.workspace = true
 rand = { workspace = true, features = ["default", "std"] }
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+talos-redis = { path = "../talos-redis" }
 regex.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 rhai = { workspace = true, features = ["serde"] }

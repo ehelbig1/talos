@@ -1,0 +1,20 @@
+[package]
+name = "talos-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The one place a Redis connection is opened, so the timeouts it carries are a
+# decision made once and not the library's default at 40 call sites. A leaf:
+# `redis` and nothing else.
+
+[dependencies]
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "test-util"] }
+
+[lints]
+workspace = true

@@ -241,7 +241,7 @@ static REDIS_CM: tokio::sync::OnceCell<redis::aio::ConnectionManager> =
 /// failure to connect is a WARN + same-worker-only degradation, never fatal
 /// (matching the OCI cache's posture toward Redis availability).
 pub async fn init_redis(client: redis::Client) {
-    match redis::aio::ConnectionManager::new(client).await {
+    match talos_redis::manager(client).await {
         Ok(cm) => {
             if REDIS_CM.set(cm).is_ok() {
                 ::tracing::info!("job idempotency: fleet-wide Redis tier enabled");

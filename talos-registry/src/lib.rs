@@ -379,7 +379,7 @@ pub struct ModuleRegistry {
     /// ONE lazily-built, auto-reconnecting multiplexed Redis connection shared
     /// by every cache read/write in this registry (the `wasm:{user}:{module}`
     /// SETEX / GET / EXISTS sites). Until 2026-09-10 each of those five sites
-    /// called `client.get_multiplexed_async_connection()` per call — a fresh
+    /// called `talos_redis::multiplexed(&client)` per call — a fresh
     /// TCP (+TLS) handshake on every dispatch-time cache fill. Same shape as
     /// `talos-node-cache` / `talos-idempotency`; `Arc` so the fire-and-forget
     /// fill task (`cache_wasm_bytes_under`) can share it without borrowing
@@ -424,7 +424,7 @@ async fn redis_conn_from(
     client: &redis::Client,
 ) -> Result<redis::aio::ConnectionManager, redis::RedisError> {
     let mgr = cell
-        .get_or_try_init(|| async { redis::aio::ConnectionManager::new(client.clone()).await })
+        .get_or_try_init(|| async { talos_redis::manager(client.clone()).await })
         .await?;
     Ok(mgr.clone())
 }

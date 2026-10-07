@@ -43,6 +43,7 @@ members = [
     "talos-nats-tls",
     "talos-tenancy",
     "talos-replay-guard",
+    "talos-redis",
     "talos-envelope-seal",
     "talos-worker-fleet",
     "talos-schedule-repo",
@@ -247,7 +248,7 @@ pgvector = "0.4"
 prometheus = "0.14"
 proptest = "1.5"
 rand = { version = "0.8", default-features = false }
-redis = { version = "0.27", default-features = false }
+redis = { version = "1.7", default-features = false }
 regex = "1.12"
 reqwest = { version = "0.12", default-features = false }
 rhai = "1.19"

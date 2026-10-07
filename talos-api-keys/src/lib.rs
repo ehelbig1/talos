@@ -912,8 +912,7 @@ impl ApiKeyService {
     /// atomically — a separate EXPIRE that failed left a key with no TTL that
     /// rate-limited the prefix forever.
     async fn redis_failures(prefix: &str, redis: &Arc<redis::Client>, charge: bool) -> Result<i64> {
-        let mut conn = redis
-            .get_multiplexed_async_connection()
+        let mut conn = talos_redis::multiplexed(redis)
             .await
             .context("Failed to get Redis connection")?;
 

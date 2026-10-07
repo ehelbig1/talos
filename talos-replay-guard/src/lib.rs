@@ -83,7 +83,7 @@ impl RedisReplayGuard {
     /// multiplexes + auto-reconnects, so this is created once at boot and cheap
     /// to clone per call.
     pub async fn connect(client: &redis::Client) -> redis::RedisResult<Self> {
-        let conn = redis::aio::ConnectionManager::new(client.clone()).await?;
+        let conn = talos_redis::manager(client.clone()).await?;
         Ok(Self {
             conn,
             prefix: "talos:nonce:".to_string(),

@@ -57,6 +57,7 @@ rand = { workspace = true, features = ["default", "std"] }
 
 # Redis (OCI module cache wiring in main.rs)
 redis = { workspace = true, features = ["default", "tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }  # rustls for rediss:// (Upstash, ElastiCache TLS)
+talos-redis = { path = "../talos-redis" }
 # rustls direct dep so worker/main.rs can install the ring CryptoProvider
 # at startup — required since rustls 0.23 stopped auto-selecting one when
 # multiple crates pull rustls in (redis + reqwest in our case).

@@ -281,6 +281,14 @@ confidence-threshold = 0.93
 exceptions = [
     # Per-crate license exemptions go here with justification, e.g.:
     # { allow = ["OpenSSL"], name = "ring", version = "*" },
+    #
+    # BSL-1.0 (Boost Software License) — for this one crate, not the
+    # allowlist. `redis` depends on xxhash-rust unconditionally from 1.0 (its
+    # value-digest helper), so it cannot be switched off with a feature. The
+    # licence is permissive (OSI-approved, FSF free, no copyleft) and asks for
+    # its text only with SOURCE copies, not with a compiled binary. Accepted
+    # by the operator's merge of the redis 1.7 change (2026-10-07).
+    { allow = ["BSL-1.0"], name = "xxhash-rust" },
 ]
 
 # ============================================================================

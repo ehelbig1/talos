@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+talos-redis = { path = "../talos-redis" }
 serde_json.workspace = true
 sha2.workspace = true
 talos-actor-repository = { path = "../talos-actor-repository" }

@@ -19,6 +19,7 @@ image = "0.25"
 qrcode = "0.14"
 rand = { workspace = true, features = ["default", "std"] }
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+talos-redis = { path = "../talos-redis" }
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-metrics = { path = "../talos-metrics" }
