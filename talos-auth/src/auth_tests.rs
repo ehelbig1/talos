@@ -1044,7 +1044,7 @@ fn a_refresh_consumes_the_old_session_before_it_stores_the_new_one() {
     );
 }
 
-/// What the session-token verifier accepts and refuses, for 34 tokens made by
+/// What the session-token verifier accepts and refuses, for 39 tokens made by
 /// hand: each is signed with the service's own secret unless its name says
 /// otherwise, so every refusal below is the verifier's rule and not a bad
 /// signature.
@@ -1055,14 +1055,13 @@ fn a_refresh_consumes_the_old_session_before_it_stores_the_new_one() {
 /// was a parse error in 10 and is ignored in 11 (it already ignored unknown
 /// string-valued ones). That row is marked. Everything else is identical.
 ///
-/// Two rows are RECORDED, NOT ENDORSED — they are what the verifier does, and
-/// are here so that changing them is a decision someone makes:
-///   * a token with no `iss` is accepted. `set_issuer` refuses a WRONG issuer
-///     and does not require one, and `Claims::iss` defaults to empty;
-///   * a header with `crit` is accepted. Neither library version honours
-///     `crit` (RFC 7515 §4.1.11 says an unsupported critical extension must
-///     be refused).
-/// Both still need a valid signature under this service's key.
+/// Two rows that table first recorded as accepted are refused since the
+/// same day, by this verifier's own rules and not the library's:
+///   * a token with no `iss` — `set_issuer` refuses a WRONG issuer and does
+///     not require one, so `iss` is now a required claim;
+///   * a header with `crit` — the library parses it and does not act on it
+///     (RFC 7515 §4.1.11 says an unsupported critical extension must be
+///     refused), so `refuse_critical_extensions` does.
 #[tokio::test]
 async fn the_session_verifier_accepts_and_refuses_what_it_is_recorded_to() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -1167,10 +1166,12 @@ async fn the_session_verifier_accepts_and_refuses_what_it_is_recorded_to() {
             own(with("iss", json!("Talos"))),
             REFUSED,
         ),
+        ("no iss", own(without("iss")), REFUSED),
+        ("iss empty", own(with("iss", json!(""))), REFUSED),
         (
-            "no iss — RECORDED, NOT ENDORSED",
-            own(without("iss")),
-            ACCEPTED,
+            "iss a list containing talos",
+            own(with("iss", json!(["talos"]))),
+            REFUSED,
         ),
         ("aud wrong", own(with("aud", json!("other"))), REFUSED),
         (
@@ -1275,10 +1276,26 @@ async fn the_session_verifier_accepts_and_refuses_what_it_is_recorded_to() {
             headed(json!({"alg": "HS256", "typ": "JWT", "made_up": true})),
             ACCEPTED,
         ),
+        // Critical extensions: this verifier understands none.
         (
-            "header with crit — RECORDED, NOT ENDORSED",
+            "header with crit",
             headed(json!({"alg": "HS256", "typ": "JWT", "crit": ["made_up"], "made_up": "yes"})),
-            ACCEPTED,
+            REFUSED,
+        ),
+        (
+            "header with crit naming a parameter the library knows",
+            headed(json!({"alg": "HS256", "typ": "JWT", "crit": ["kid"], "kid": "k1"})),
+            REFUSED,
+        ),
+        (
+            "header with an empty crit list",
+            headed(json!({"alg": "HS256", "typ": "JWT", "crit": []})),
+            REFUSED,
+        ),
+        (
+            "header with crit that is not a list",
+            headed(json!({"alg": "HS256", "typ": "JWT", "crit": "made_up"})),
+            REFUSED,
         ),
         // Not a token.
         (
@@ -1290,13 +1307,98 @@ async fn the_session_verifier_accepts_and_refuses_what_it_is_recorded_to() {
         ("empty", String::new(), REFUSED),
         ("trailing newline", format!("{valid}\n"), REFUSED),
     ];
-    assert_eq!(cases.len(), 34);
+    assert_eq!(cases.len(), 39);
     for (name, token, expected) in cases {
         let verdict = service.verify_token(&token);
         assert_eq!(
             verdict.is_ok(),
             expected,
             "{name}: recorded as {}, the verifier says {:?}",
+            if expected { "accepted" } else { "refused" },
+            verdict.map(|claims| claims.sub)
+        );
+    }
+}
+
+/// A token verified through the PREVIOUS algorithm (`JWT_ALGORITHM_PREVIOUS`,
+/// the migration window) passes the same rules as one verified through the
+/// current algorithm. The second decode is a separate call, so each rule is
+/// asserted here on its own.
+#[tokio::test]
+async fn a_token_on_the_previous_algorithm_meets_the_same_rules() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use serde_json::{json, Value};
+    const SECRET: &str = "this-is-a-test-secret-that-is-32bytes";
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://localhost/talos_test")
+        .unwrap();
+    let mut service = AuthService::new(pool, SECRET.into(), 10, None).unwrap();
+    service.previous_key_pair = Some(PreviousKeyPair {
+        algorithm: jsonwebtoken::Algorithm::HS384,
+        decoding_key: jsonwebtoken::DecodingKey::from_secret(SECRET.as_bytes()),
+    });
+    let now = chrono::Utc::now().timestamp();
+    let craft = |header: Value, payload: Value| -> String {
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(payload.to_string())
+        );
+        let signature = jsonwebtoken::crypto::sign(
+            input.as_bytes(),
+            &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()),
+            jsonwebtoken::Algorithm::HS384,
+        )
+        .unwrap();
+        format!("{input}.{signature}")
+    };
+    let h = || json!({"alg": "HS384", "typ": "JWT"});
+    let good = json!({
+        "sub": "11111111-1111-4111-8111-111111111111",
+        "email": "user@example.com",
+        "exp": now + 600,
+        "iat": now,
+        "is_2fa_verified": true,
+        "iss": "talos",
+        "aud": "talos",
+    });
+    let with = |key: &str, value: Value| {
+        let mut claims = good.clone();
+        claims[key] = value;
+        claims
+    };
+    let mut no_iss = good.clone();
+    no_iss.as_object_mut().unwrap().remove("iss");
+
+    let cases: Vec<(&str, String, bool)> = vec![
+        ("valid", craft(h(), good.clone()), true),
+        (
+            "expired 90 s ago",
+            craft(h(), with("exp", json!(now - 90))),
+            false,
+        ),
+        (
+            "iss wrong",
+            craft(h(), with("iss", json!("someone-else"))),
+            false,
+        ),
+        ("no iss", craft(h(), no_iss), false),
+        ("aud wrong", craft(h(), with("aud", json!("other"))), false),
+        (
+            "header with crit",
+            craft(
+                json!({"alg": "HS384", "typ": "JWT", "crit": ["made_up"], "made_up": "yes"}),
+                good.clone(),
+            ),
+            false,
+        ),
+    ];
+    for (name, token, expected) in cases {
+        let verdict = service.verify_token(&token);
+        assert_eq!(
+            verdict.is_ok(),
+            expected,
+            "{name}: expected {}, the verifier says {:?}",
             if expected { "accepted" } else { "refused" },
             verdict.map(|claims| claims.sub)
         );

@@ -746,6 +746,19 @@ pub enum JwtSelfTest {
     Broken { stage: &'static str },
 }
 
+/// RFC 7515 §4.1.11: a token that names critical header extensions (`crit`)
+/// must be refused by a verifier that does not understand them. This one
+/// understands none, and `jsonwebtoken` parses the field without acting on
+/// it — so any `crit`, an empty list included, is a refusal.
+fn refuse_critical_extensions(header: &Header) -> Result<()> {
+    if header.crit.is_some() {
+        return Err(anyhow!(
+            "Token names critical header extensions (crit); none are supported"
+        ));
+    }
+    Ok(())
+}
+
 /// Name an [`Algorithm`] with a stable, operator-facing string.
 fn algorithm_name(alg: Algorithm) -> &'static str {
     match alg {
@@ -2167,8 +2180,13 @@ impl AuthService {
             let mut v = Validation::new(algo);
             v.validate_exp = true; // reject expired tokens (exp < now)
             v.validate_nbf = false; // we don't issue nbf claims
-            v.set_required_spec_claims(&["exp", "sub"]); // must have sub + exp
-                                                         // Validate issuer to prevent tokens issued by other systems from being accepted.
+                                    // `iss` is REQUIRED, not only checked when present: `set_issuer`
+                                    // alone refuses a wrong issuer and lets a token with no issuer
+                                    // through. Every token this service has issued carries it, and
+                                    // an access token lives 15 minutes, so there is no older token
+                                    // to keep accepting (2026-10-06).
+            v.set_required_spec_claims(&["exp", "sub", "iss"]);
+            // Validate issuer to prevent tokens issued by other systems from being accepted.
             v.set_issuer(&["talos"]);
             // NOTE: We do NOT call `v.set_audience` here because that would
             // *require* the `aud` claim, rejecting tokens minted before this
@@ -2230,11 +2248,19 @@ impl AuthService {
             }
         };
 
+        // What a token must still pass once its signature and registered
+        // claims have verified. One closure, so the previous-algorithm path
+        // below cannot apply fewer rules than the current one.
+        let admit = |token_data: &jsonwebtoken::TokenData<Claims>| -> Result<()> {
+            refuse_critical_extensions(&token_data.header)?;
+            check_audience(&token_data.claims)
+        };
+
         // Try the current algorithm first
         let validation = build_validation(self.key_pair.algorithm());
         match decode::<Claims>(token, self.key_pair.decoding_key(), &validation) {
             Ok(token_data) => {
-                check_audience(&token_data.claims)?;
+                admit(&token_data)?;
                 Ok(token_data.claims)
             }
             Err(current_err) => {
@@ -2244,7 +2270,7 @@ impl AuthService {
                     if let Ok(token_data) =
                         decode::<Claims>(token, &prev.decoding_key, &prev_validation)
                     {
-                        check_audience(&token_data.claims)?;
+                        admit(&token_data)?;
                         tracing::debug!(
                             "Token verified with previous JWT algorithm — \
                              client should refresh to get a token signed with the current algorithm"
