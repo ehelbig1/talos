@@ -18,16 +18,16 @@
 //!
 //! ## Auth
 //!
-//! Delegated to `oci_distribution::Client`, which handles anonymous pulls of
+//! Delegated to `oci_client::Client`, which handles anonymous pulls of
 //! public packages and the Bearer-token challenge-response that GHCR uses
 //! even for anonymous reads. For private packages set
 //! `OCI_REGISTRY_USERNAME` + `OCI_REGISTRY_PASSWORD` (PAT works as the
 //! password for GHCR private packages).
 
 use anyhow::{Context, Result};
-use oci_distribution::client::{ClientConfig, ClientProtocol};
-use oci_distribution::secrets::RegistryAuth;
-use oci_distribution::{Client as OciClient, Reference};
+use oci_client::client::{ClientConfig, ClientProtocol};
+use oci_client::secrets::RegistryAuth;
+use oci_client::{Client as OciClient, Reference};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use std::env;
@@ -522,7 +522,7 @@ async fn pull_config_by_digest(
     pinned: &Reference,
     auth: &RegistryAuth,
 ) -> Result<String> {
-    use oci_distribution::manifest;
+    use oci_client::manifest;
     let digest = pinned
         .digest()
         .context("pull_config_by_digest called with an unpinned reference")?;
@@ -579,7 +579,7 @@ async fn try_pull_index(
     // policy are logged but allowed to proceed (migration window).
     let pinned = match resolve_pinned_reference(oci, &reference, auth).await {
         Ok(p) => p,
-        Err(e) if is_not_found_error(&format!("{e:#}")) => {
+        Err(e) if is_registry_not_found(&e) => {
             tracing::debug!("Index artifact {reference} not found — first deploy?");
             return Ok(None);
         }
@@ -596,11 +596,9 @@ async fn try_pull_index(
             Ok(Some(parsed.templates))
         }
         Err(e) => {
-            // oci_distribution doesn't expose typed 404s — match on the message.
-            // This is intentional: most other errors (auth, network) we want to
-            // bubble up; a missing index is an expected first-deploy state.
-            let msg = format!("{e:#}");
-            if is_not_found_error(&msg) {
+            // Most other errors (auth, network) we want to bubble up; a
+            // missing index is an expected first-deploy state.
+            if is_registry_not_found(&e) {
                 tracing::debug!("Index artifact {reference} not found — first deploy?");
                 Ok(None)
             } else {
@@ -923,6 +921,47 @@ fn registry_auth_from_env() -> RegistryAuth {
     }
 }
 
+/// Did the registry say "there is no such artifact"?
+///
+/// Read from the client's TYPED error first: the registry's own error code
+/// (`MANIFEST_UNKNOWN`, `NAME_UNKNOWN`, `BLOB_UNKNOWN`, `NOT_FOUND`) or a
+/// 404. The message matcher below is only the fallback for an error that did
+/// not come from the client.
+///
+/// Measured 2026-10-07 against `registry:2` (the stack's own registry
+/// image): a missing tag, repository or manifest digest is reported as
+/// `Registry error: url …, envelope: OCI API errors: [OCI API error:
+/// manifest unknown]` — by `oci-distribution` 0.11 and `oci-client` 0.18
+/// alike. That text holds no `manifest_unknown`, no `404` and no `not
+/// found`, so the message matcher answered NO, and a first deploy with no
+/// index failed instead of falling back to `/v2/_catalog`. The code is in the
+/// error; the text never carried it.
+fn is_registry_not_found(e: &anyhow::Error) -> bool {
+    use oci_client::errors::{OciDistributionError as E, OciErrorCode as C};
+    for cause in e.chain() {
+        if let Some(err) = cause.downcast_ref::<E>() {
+            let missing = match err {
+                E::RegistryError { envelope, .. } => envelope.errors.iter().any(|x| {
+                    matches!(
+                        x.code,
+                        C::ManifestUnknown | C::NameUnknown | C::BlobUnknown | C::NotFound
+                    )
+                }),
+                E::ImageManifestNotFoundError(_) => true,
+                E::ServerError { code, .. } => *code == 404,
+                E::RequestError(request) => {
+                    request.status() == Some(reqwest::StatusCode::NOT_FOUND)
+                }
+                _ => false,
+            };
+            if missing {
+                return true;
+            }
+        }
+    }
+    is_not_found_error(&format!("{e:#}"))
+}
+
 /// L-25: tightened matcher to reduce false positives.
 ///
 /// Pre-fix: any error string containing "404" anywhere matched (e.g. a
@@ -1097,6 +1136,59 @@ mod tests {
         std::env::remove_var("OCI_REGISTRY_USERNAME");
         std::env::remove_var("OCI_REGISTRY_PASSWORD");
         assert!(matches!(registry_auth_from_env(), RegistryAuth::Anonymous));
+    }
+
+    /// The registry's answer for a missing artifact, as `registry:2` sends it
+    /// (measured 2026-10-07), parsed by the client into its typed error.
+    fn registry_error(body: &str) -> anyhow::Error {
+        let envelope: oci_client::errors::OciEnvelope =
+            serde_json::from_str(body).expect("an OCI error envelope");
+        anyhow::Error::from(oci_client::errors::OciDistributionError::RegistryError {
+            envelope,
+            url: "http://registry.example.test/v2/made-up/manifests/1.0".to_string(),
+        })
+    }
+
+    #[test]
+    fn a_missing_artifact_is_recognised_by_its_registry_code() {
+        for code in ["MANIFEST_UNKNOWN", "NAME_UNKNOWN", "BLOB_UNKNOWN"] {
+            let e = registry_error(&format!(
+                r#"{{"errors":[{{"code":"{code}","message":"{}","detail":null}}]}}"#,
+                code.to_lowercase().replace('_', " ")
+            ));
+            // The text the client renders carries neither the code nor a 404,
+            // which is why the message matcher alone missed it.
+            assert!(!is_not_found_error(&format!("{e:#}")), "{code}: {e:#}");
+            assert!(is_registry_not_found(&e), "{code}");
+            // And it is still found through context added by a caller.
+            assert!(
+                is_registry_not_found(&e.context("resolve _index digest")),
+                "{code}"
+            );
+        }
+        for code in ["UNAUTHORIZED", "DENIED", "TOOMANYREQUESTS"] {
+            let e = registry_error(&format!(
+                r#"{{"errors":[{{"code":"{code}","message":"made up","detail":null}}]}}"#
+            ));
+            assert!(
+                !is_registry_not_found(&e),
+                "{code} is not a missing artifact"
+            );
+        }
+        let server_404 =
+            anyhow::Error::from(oci_client::errors::OciDistributionError::ServerError {
+                code: 404,
+                url: "http://registry.example.test/v2/".to_string(),
+                message: "made up".to_string(),
+            });
+        assert!(is_registry_not_found(&server_404));
+        let server_500 =
+            anyhow::Error::from(oci_client::errors::OciDistributionError::ServerError {
+                code: 500,
+                url: "http://registry.example.test/v2/".to_string(),
+                message: "made up".to_string(),
+            });
+        assert!(!is_registry_not_found(&server_500));
     }
 
     #[test]

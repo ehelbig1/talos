@@ -45,7 +45,7 @@ const OCI_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// H-3: Maximum decompressed OCI layer size the worker will accept.
 ///
-/// `oci_distribution::Client::pull` buffers each layer into a
+/// `oci_client::Client::pull` buffers each layer into a
 /// `Vec<u8>` AFTER gzip decompression. Without a cap, a hostile or
 /// compromised registry can serve a small gzipped layer that
 /// decompresses to many gigabytes and OOMs the worker (the pooling
@@ -360,8 +360,8 @@ pub async fn resolve_and_hash_cosign_binary() -> anyhow::Result<String> {
 /// Manifest media types the worker accepts: single-arch image manifests
 /// only. A multi-arch index is refused (Wasm artifacts are single-arch).
 const OCI_IMAGE_MANIFEST_MEDIA_TYPES: &[&str] = &[
-    oci_distribution::manifest::OCI_IMAGE_MEDIA_TYPE,
-    oci_distribution::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
+    oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+    oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
 ];
 const WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";
 
@@ -373,7 +373,7 @@ pub struct PinnedManifest {
     /// `registry/repository@<manifest_digest>` — what cosign verifies.
     pub pinned_ref: String,
     /// The Wasm layer to fetch, with foreign `urls` stripped.
-    pub layer: oci_distribution::manifest::OciDescriptor,
+    pub layer: oci_client::manifest::OciDescriptor,
 }
 
 /// Bind an OCI reference to the manifest body the registry returned. Pure:
@@ -382,11 +382,11 @@ pub struct PinnedManifest {
 /// refuses an index / non-Wasm / empty / oversized manifest, and builds the
 /// digest-pinned reference cosign must verify.
 pub fn pin_oci_manifest(
-    reference: &oci_distribution::Reference,
+    reference: &oci_client::Reference,
     manifest_body: &[u8],
     layer_cap: u64,
 ) -> Result<PinnedManifest, String> {
-    use oci_distribution::manifest::OciManifest;
+    use oci_client::manifest::OciManifest;
     use sha2::Digest as _;
     use subtle::ConstantTimeEq as _;
     let manifest_digest = format!("sha256:{:x}", sha2::Sha256::digest(manifest_body));
@@ -463,9 +463,9 @@ enum BlobFetchError {
 /// Stream a layer blob by digest, refusing once it exceeds `cap` (so a
 /// registry cannot grow host memory past the cap before any check runs).
 async fn fetch_capped_blob(
-    client: &oci_distribution::Client,
-    image: &oci_distribution::Reference,
-    layer: &oci_distribution::manifest::OciDescriptor,
+    client: &oci_client::Client,
+    image: &oci_client::Reference,
+    layer: &oci_client::manifest::OciDescriptor,
     cap: u64,
 ) -> Result<Vec<u8>, BlobFetchError> {
     use futures_util::StreamExt as _;
@@ -565,7 +565,7 @@ pub fn verify_oci_layer<'a>(
 }
 
 // MCP-913 (2026-05-14): bare OnceLock<Client>, no outer Mutex.
-// `oci_distribution::Client::pull` takes `&self` (verified against
+// `oci_client::Client::pull` takes `&self` (verified against
 // the 0.11 source — internal `auth_store: Arc<RwLock<HashMap<...>>>`
 // handles the token cache concurrency). Pre-fix `OnceLock<Mutex<Client>>`
 // + `client_mutex.lock().await` SERIALIZED every concurrent OCI pull
@@ -579,22 +579,22 @@ pub fn verify_oci_layer<'a>(
 // capped worker module-load throughput at one-at-a-time per scheme
 // (HTTPS / HTTP separately). The two schemes don't share locks but
 // neither do they handle hostname-level isolation.
-static OCI_CLIENT_HTTPS: OnceLock<oci_distribution::Client> = OnceLock::new();
-static OCI_CLIENT_HTTP: OnceLock<oci_distribution::Client> = OnceLock::new();
+static OCI_CLIENT_HTTPS: OnceLock<oci_client::Client> = OnceLock::new();
+static OCI_CLIENT_HTTP: OnceLock<oci_client::Client> = OnceLock::new();
 
-fn get_oci_client(is_http: bool) -> &'static oci_distribution::Client {
+fn get_oci_client(is_http: bool) -> &'static oci_client::Client {
     if is_http {
         OCI_CLIENT_HTTP.get_or_init(|| {
-            let client_config = oci_distribution::client::ClientConfig {
-                protocol: oci_distribution::client::ClientProtocol::Http,
+            let client_config = oci_client::client::ClientConfig {
+                protocol: oci_client::client::ClientProtocol::Http,
                 ..Default::default()
             };
-            oci_distribution::Client::new(client_config)
+            oci_client::Client::new(client_config)
         })
     } else {
         OCI_CLIENT_HTTPS.get_or_init(|| {
-            let client_config = oci_distribution::client::ClientConfig::default();
-            oci_distribution::Client::new(client_config)
+            let client_config = oci_client::client::ClientConfig::default();
+            oci_client::Client::new(client_config)
         })
     }
 }
@@ -608,7 +608,7 @@ fn get_oci_client(is_http: bool) -> &'static oci_distribution::Client {
 /// IMDS/STS token (or whatever the cloud's metadata service hands out
 /// to authenticated callers).
 ///
-/// `host` is the registry component of a parsed `oci_distribution::Reference`,
+/// `host` is the registry component of a parsed `oci_client::Reference`,
 /// which is the hostname-with-optional-port (e.g. `"169.254.169.254:5000"`).
 /// The port is stripped before comparison so `169.254.169.254:5000` still
 /// matches the IPv4 literal.
@@ -837,8 +837,8 @@ pub async fn fetch(
         // eliminates the cache-poisoning window.
         let mut found_bytes: Option<Vec<u8>> = None;
 
-        use oci_distribution::secrets::RegistryAuth;
-        use oci_distribution::Reference;
+        use oci_client::secrets::RegistryAuth;
+        use oci_client::Reference;
 
         if let Ok(reference) = image_ref.parse::<Reference>() {
             // SECURITY: registry-host SSRF gate.
@@ -1921,7 +1921,7 @@ mod oci_layer_tests {
 #[cfg(test)]
 mod w13_pinning_tests {
     use super::*;
-    use oci_distribution::Reference;
+    use oci_client::Reference;
 
     fn manifest(layers: &str) -> Vec<u8> {
         format!(

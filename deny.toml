@@ -313,8 +313,16 @@ deny = [
     # pulling in openssl-src means someone in the dep tree is using
     # native-tls at build time, which is a security regression.
     { name = "openssl-src", reason = "prefer rustls — vendored OpenSSL expands attack surface" },
+    # The hard deny the note below wished for. From 2026-10-07 nothing in the
+    # build needs native-tls: reqwest 0.13 is on rustls and oci-distribution,
+    # the last crate that dragged it in, is replaced by oci-client on rustls.
+    # Any of these back in the tree means some client in a binary has
+    # silently gone back to OpenSSL (`outbound_tls_pin` would also fail).
+    { name = "native-tls", reason = "outbound TLS is rustls; native-tls in the tree flips every reqwest client in the binary to OpenSSL" },
+    { name = "openssl-sys", reason = "outbound TLS is rustls; nothing in the build should link OpenSSL" },
 ]
-# NOTE on `native-tls`: the ideal policy is a hard deny (rustls is our
+# NOTE on `native-tls` (HISTORY — the hard deny is in place above since
+# 2026-10-07): the ideal policy is a hard deny (rustls is our
 # TLS standard for every direct call). In practice, `oci-distribution`
 # 0.11 and `opentelemetry-otlp` 0.27's `reqwest-client` feature pull
 # native-tls transitively through reqwest's defaults — neither crate
