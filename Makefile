@@ -10,8 +10,21 @@
 #   make logs    SERVICE=postgres
 #   make shell   SERVICE=frontend
 
-SHELL              := /bin/bash
-.SHELLFLAGS        := -eu -o pipefail -c
+# Every recipe line and every $(shell …) runs as `bash -eu -o pipefail -c`.
+# The flags are on SHELL and NOT in .SHELLFLAGS: that variable arrived in GNU
+# Make 3.82, and the /usr/bin/make macOS ships is 3.81, which ignores it
+# without a word. Until 2026-10-07 they were in .SHELLFLAGS, so on a Mac no
+# recipe had -e, -u or pipefail: `make clippy` exited 0 when clippy failed to
+# compile (the pipeline's status was `tee`'s), and in `make up` a failed image
+# build was followed by "NOTHING REBUILT" and a start of the old images. Every
+# make splits SHELL into words, so 3.81 and 4.x now run the same argv, and 4.x
+# runs the one it always did. scripts/tests/make-strict-shell-test.sh proves
+# it on each make it finds; do not move the flags back.
+#
+# Writing a recipe under these flags: a command whose failure the recipe goes
+# on to HANDLE must say so (`|| true` inside the `$$(…)`, or an `if`), and an
+# environment variable that may be unset is read as `$${NAME:-}`.
+SHELL              := /bin/bash -eu -o pipefail
 MAKEFLAGS          += --warn-undefined-variables --no-print-directory
 .DEFAULT_GOAL      := help
 
@@ -80,11 +93,11 @@ up: ## Build + start the full dev stack, wait for health
 	@# drill (running as you) cannot write its metric and refuses to run. Make
 	@# the directory here, owned by the invoking user, so that never happens.
 	@mkdir -p "$${TALOS_TEXTFILE_DIR:-$$HOME/.talos/metrics/textfile_collector}"
-	@dirty="$$(git status --porcelain 2>/dev/null | head -5)"; \
+	@dirty="$$(git status --porcelain 2>/dev/null | head -5 || true)"; \
 	 if [ -n "$$dirty" ]; then \
 	    printf '\033[1;33m⚠ working tree is DIRTY — images will be stamped `-dirty` and correspond to NO commit.\033[0m\n'; \
 	    printf '\033[1;33m  Nobody (including you, later) can reason about what is in them. Modified:\033[0m\n'; \
-	    git status --porcelain 2>/dev/null | head -5 | sed 's/^/    /'; \
+	    git status --porcelain 2>/dev/null | head -5 | sed 's/^/    /' || true; \
 	 fi
 	@before_c="$$(docker image inspect -f '{{.Id}}' talos-controller 2>/dev/null || echo none)"; \
 	 before_w="$$(docker image inspect -f '{{.Id}}' talos-worker 2>/dev/null || echo none)"; \
@@ -114,7 +127,7 @@ up: ## Build + start the full dev stack, wait for health
 	@printf '\033[1;32m✓ stack healthy — http://localhost:8000/health\033[0m\n'
 	@if grep -Eq '^NGROK_AUTHTOKEN=.+' .env 2>/dev/null; then \
 	    sleep 2; \
-	    url="$$(curl -sf http://127.0.0.1:4040/api/tunnels 2>/dev/null | grep -o '"public_url":"https:[^"]*"' | head -1 | cut -d'"' -f4)"; \
+	    url="$$(curl -sf http://127.0.0.1:4040/api/tunnels 2>/dev/null | grep -o '"public_url":"https:[^"]*"' | head -1 | cut -d'"' -f4 || true)"; \
 	    if [ -n "$$url" ]; then \
 	        printf '\033[1;36m🌐 public tunnel: %s\033[0m (run get_public_url_status for integration setup)\n' "$$url"; \
 	    else \
@@ -187,7 +200,7 @@ observability-reload: ## Apply edited Prometheus AND Alertmanager config to the 
 	@# when it was started WITHOUT --web.enable-lifecycle, i.e. the container
 	@# predates this flag being added. Recreating it is the fix, and a wrong
 	@# remedy in an error message costs more than no message at all.
-	@code="$$(curl -s -o /dev/null -w '%{http_code}' -XPOST http://127.0.0.1:9090/-/reload 2>/dev/null)"; \
+	@code="$$(curl -s -o /dev/null -w '%{http_code}' -XPOST http://127.0.0.1:9090/-/reload 2>/dev/null || true)"; \
 	case "$$code" in \
 	  200) printf 'reloaded — verifying it actually took effect\n' ;; \
 	  403) printf 'reload refused (403): this container was started without --web.enable-lifecycle.\n'; \
@@ -205,7 +218,7 @@ observability-reload: ## Apply edited Prometheus AND Alertmanager config to the 
 	@# (that flag is Prometheus-only and Alertmanager rejects it outright, see
 	@# docker-compose.yml); POST /-/reload is always served.
 	@if [ "$$(docker inspect -f '{{.State.Running}}' talos-alertmanager 2>/dev/null)" = "true" ]; then \
-	  amcode="$$(curl -s -o /dev/null -w '%{http_code}' -XPOST http://127.0.0.1:9093/-/reload 2>/dev/null)"; \
+	  amcode="$$(curl -s -o /dev/null -w '%{http_code}' -XPOST http://127.0.0.1:9093/-/reload 2>/dev/null || true)"; \
 	  case "$$amcode" in \
 	    200) printf 'alertmanager reloaded\n' ;; \
 	    000) printf 'alertmanager is running but http://127.0.0.1:9093 did not answer.\n'; \
@@ -440,7 +453,7 @@ coverage-html: ## HTML coverage report via cargo-tarpaulin (slow; local only)
 sqlx-prepare: ## Regenerate the compile-checked .sqlx offline cache (needs a migrated DATABASE_URL)
 	@command -v sqlx >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ sqlx-cli missing\033[0m — install: cargo install sqlx-cli --locked\n'; exit 1; }
-	@[ -n "$$DATABASE_URL" ] \
+	@[ -n "$${DATABASE_URL:-}" ] \
 	    || { printf '\033[1;31m✗ DATABASE_URL unset\033[0m — point it at a MIGRATED Postgres (e.g. the compose DB or a disposable pgvector).\n'; exit 1; }
 	@# --all-targets so queries in test/bin targets are collected too, else
 	@# `sqlx-check` (and CI) would flag them as missing from the cache.
@@ -450,7 +463,7 @@ sqlx-prepare: ## Regenerate the compile-checked .sqlx offline cache (needs a mig
 sqlx-check: ## Verify the committed .sqlx cache matches the queries (needs a migrated DATABASE_URL) — CI gate
 	@command -v sqlx >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ sqlx-cli missing\033[0m — install: cargo install sqlx-cli --locked\n'; exit 1; }
-	@[ -n "$$DATABASE_URL" ] \
+	@[ -n "$${DATABASE_URL:-}" ] \
 	    || { printf '\033[1;31m✗ DATABASE_URL unset\033[0m — point it at a MIGRATED Postgres.\n'; exit 1; }
 	@SQLX_OFFLINE=false cargo sqlx prepare --workspace --check -- --all-targets \
 	    || { printf '\033[1;31m✗ .sqlx cache is STALE\033[0m — run `make sqlx-prepare` and commit the result.\n'; exit 1; }
