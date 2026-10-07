@@ -1,6 +1,7 @@
-use secrecy::{ExposeSecret, Secret};
+use secrecy::{ExposeSecret, SecretString};
 use std::borrow::Cow;
 use std::fmt;
+use zeroize::Zeroize;
 
 /// A secret string value that cannot be accidentally printed or serialized.
 ///
@@ -11,7 +12,7 @@ use std::fmt;
 ///
 /// `grep -rn "expose_for_http" worker/src/` should return exactly one result.
 pub struct SecretValue {
-    inner: Secret<String>,
+    inner: SecretString,
     key_path: String,
 }
 
@@ -21,9 +22,16 @@ impl SecretValue {
     /// * `value` — the plaintext secret string
     /// * `key_path` — human-readable identifier used in `Debug` output (e.g. `"vault://aws/key"`)
     /// * `_field_name` — reserved for future audit logging; currently unused
-    pub fn new(value: String, key_path: impl Into<String>, _field_name: &str) -> Self {
+    pub fn new(mut value: String, key_path: impl Into<String>, _field_name: &str) -> Self {
+        // Copied into an allocation of exactly its length, and the buffer that
+        // was handed in is then wiped — all of it, spare capacity included.
+        // `SecretString::from(String)` would instead shrink that buffer in
+        // place, and a shrink may move the bytes and free the old block with
+        // the plaintext still in it.
+        let inner = SecretString::from(value.as_str());
+        value.zeroize();
         Self {
-            inner: Secret::new(value),
+            inner,
             key_path: key_path.into(),
         }
     }
@@ -48,8 +56,8 @@ impl SecretValue {
     /// Returns `Cow::Borrowed` when no replacement is needed (zero allocation in the common case).
     pub fn redact_from_str<'a>(&self, text: &'a str) -> Cow<'a, str> {
         let val = self.inner.expose_secret();
-        if val.len() >= 4 && text.contains(val.as_str()) {
-            Cow::Owned(text.replace(val.as_str(), "[REDACTED:SECRET]"))
+        if val.len() >= 4 && text.contains(val) {
+            Cow::Owned(text.replace(val, "[REDACTED:SECRET]"))
         } else {
             Cow::Borrowed(text)
         }
@@ -73,6 +81,21 @@ mod tests {
     fn test_new_creates_secret() {
         let secret = SecretValue::new("my-secret".to_string(), "vault://test/key", "apiKey");
         assert_eq!(secret.expose_for_http(), "my-secret");
+    }
+
+    #[test]
+    fn a_secret_built_from_a_string_with_spare_capacity_reads_back_whole() {
+        // The wrapper may copy or shrink the buffer it is handed; either way
+        // the value it exposes is the value it was given, and nothing more.
+        let mut value = String::with_capacity(256);
+        value.push_str("tok-0123456789");
+        assert!(value.capacity() > value.len());
+        let secret = SecretValue::new(value, "vault://test/key", "apiKey");
+        assert_eq!(secret.expose_for_http(), "tok-0123456789");
+        assert_eq!(
+            secret.redact_from_str("a tok-0123456789 b"),
+            "a [REDACTED:SECRET] b"
+        );
     }
 
     #[test]
