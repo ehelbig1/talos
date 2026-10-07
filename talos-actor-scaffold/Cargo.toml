@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-actor-types = { path = "../talos-actor-types" }
 talos-capability-world = { path = "../talos-capability-world" }

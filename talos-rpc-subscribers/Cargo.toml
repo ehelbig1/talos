@@ -26,7 +26,7 @@ serde_json.workspace = true
 # misses).
 sqlparser = { workspace = true, features = ["visitor"] }
 talos-sql-classify = { path = "../talos-sql-classify" }  # THE read-only/mutation classifier, shared with the worker
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 # #754: the write-ceiling gate reads `actors.max_write_ceiling` before
 # persisting an actor-attributed mutation on a worker's behalf. The read lives
 # in the persistence layer (`read_actor_write_ceiling`) so this crate does not

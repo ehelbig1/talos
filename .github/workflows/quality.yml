@@ -614,7 +614,7 @@ jobs:
         # is the drift gate that keeps that fast path trustworthy.
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: sqlx-cli
+          tool: sqlx-cli@0.9.0
 
       - name: make test-integration
         # Self-contained: provisions disposable Docker pgvector + Redis, migrates,
@@ -812,7 +812,7 @@ jobs:
       - name: Install sqlx-cli
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: sqlx-cli
+          tool: sqlx-cli@0.9.0
 
       - name: Install PostgreSQL 17 client
         # pg_dump refuses servers NEWER than itself; ubuntu-latest ships
@@ -945,7 +945,7 @@ jobs:
       - name: Install sqlx-cli
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: sqlx-cli
+          tool: sqlx-cli@0.9.0
 
       - name: Migrate the check database
         run: sqlx migrate run --source migrations

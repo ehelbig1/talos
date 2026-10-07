@@ -140,7 +140,8 @@ impl GithubAppInstallationRepository {
         .await
         .context("read prior github_app_installation")?;
 
-        let row = sqlx::query_as::<_, GithubAppInstallation>(&format!(
+        // sql-safe: COLS is a constant column list in this file; every value is bound
+        let row = sqlx::query_as::<_, GithubAppInstallation>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO github_app_installations \
                  (user_id, installation_id, account_login, account_type, \
                   permissions, repository_selection, is_active) \
@@ -156,7 +157,7 @@ impl GithubAppInstallationRepository {
              WHERE github_app_installations.user_id = EXCLUDED.user_id \
                 OR NOT github_app_installations.is_active \
              RETURNING {COLS}"
-        ))
+        )))
         .bind(claim.user_id)
         .bind(claim.installation_id)
         .bind(claim.account_login)
@@ -210,9 +211,10 @@ impl GithubAppInstallationRepository {
         &self,
         installation_id: i64,
     ) -> Result<Option<GithubAppInstallation>> {
-        let row = sqlx::query_as::<_, GithubAppInstallation>(&format!(
+        // sql-safe: COLS is a constant column list in this file; every value is bound
+        let row = sqlx::query_as::<_, GithubAppInstallation>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLS} FROM github_app_installations WHERE installation_id = $1"
-        ))
+        )))
         .bind(installation_id)
         .fetch_optional(&self.pool)
         .await
@@ -235,11 +237,12 @@ impl GithubAppInstallationRepository {
         account_login: &str,
         user_id: Uuid,
     ) -> Result<Option<GithubAppInstallation>> {
-        let row = sqlx::query_as::<_, GithubAppInstallation>(&format!(
+        // sql-safe: COLS is a constant column list in this file; every value is bound
+        let row = sqlx::query_as::<_, GithubAppInstallation>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLS} FROM github_app_installations \
              WHERE account_login = $1 AND user_id = $2 AND is_active \
              ORDER BY updated_at DESC, id DESC LIMIT 1"
-        ))
+        )))
         .bind(account_login)
         .bind(user_id)
         .fetch_optional(&self.pool)
@@ -250,10 +253,11 @@ impl GithubAppInstallationRepository {
 
     /// List a user's installations (most recent first).
     pub async fn list_for_user(&self, user_id: Uuid) -> Result<Vec<GithubAppInstallation>> {
-        let rows = sqlx::query_as::<_, GithubAppInstallation>(&format!(
+        // sql-safe: COLS is a constant column list in this file; every value is bound
+        let rows = sqlx::query_as::<_, GithubAppInstallation>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLS} FROM github_app_installations \
              WHERE user_id = $1 ORDER BY created_at DESC, id DESC"
-        ))
+        )))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await

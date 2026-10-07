@@ -570,7 +570,8 @@ async fn run_batched(
 ) -> Result<BatchedSweep> {
     let mut out = BatchedSweep::default();
     for batch in 0..MAX_BATCHES_PER_SWEEP {
-        let n = sqlx::query(sql)
+        // sql-safe: every caller passes a literal with constants of this file formatted in; the one argument is bound
+        let n = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(days)
             .execute(pool)
             .await
@@ -623,7 +624,7 @@ pub fn archived_execution_column_sql() -> String {
 /// reads it (Postgres executes every `WITH` DML exactly once).
 /// `rows_affected` is still the outer INSERT's count — the batch-termination
 /// test above it is unchanged.
-fn archive_move_sql(extra_predicate: &str) -> String {
+fn archive_move_sql(extra_predicate: &'static str) -> String {
     let cols = archived_execution_column_sql();
     let statuses = TERMINAL_EXECUTION_STATUSES
         .iter()
@@ -1622,7 +1623,8 @@ impl AdvancedRepository {
         // RFC 0005 S3: self-scope so the workflow_executions RLS policy
         // backstops the DELETE (only the caller's rows are archived).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
-        let n = sqlx::query(&archive_move_sql("AND user_id = $2"))
+        // sql-safe: constants of this file and one of two literal predicates; days and the user id are bound
+        let n = sqlx::query(sqlx::AssertSqlSafe(archive_move_sql("AND user_id = $2")))
             .bind(days)
             .bind(user_id)
             .execute(&mut *tx)
@@ -4194,7 +4196,8 @@ impl AdvancedRepository {
                      WHERE CAST(\"{}\" AS text) > $2 ORDER BY \"{}\" ASC LIMIT $1",
                     validated_base_query, column, column
                 );
-                sqlx::query(&q)
+                // sql-safe: caller-written SQL by design (the platform-admin query_paginated tool): the control is the validation in talos-mcp-handlers/src/advanced.rs, which also restricts the cursor column to [A-Za-z0-9_]
+                sqlx::query(sqlx::AssertSqlSafe(q))
                     .bind(page_size + 1)
                     .bind(after)
                     .fetch_all(&self.db_pool)
@@ -4209,7 +4212,8 @@ impl AdvancedRepository {
                     "SELECT * FROM ({}) AS _paginated_subquery LIMIT $1 OFFSET $2",
                     validated_base_query
                 );
-                sqlx::query(&q)
+                // sql-safe: caller-written SQL by design (the platform-admin query_paginated tool): the control is the validation in talos-mcp-handlers/src/advanced.rs, which also restricts the cursor column to [A-Za-z0-9_]
+                sqlx::query(sqlx::AssertSqlSafe(q))
                     .bind(page_size + 1)
                     .bind(offset)
                     .fetch_all(&self.db_pool)
@@ -4262,7 +4266,8 @@ impl AdvancedRepository {
             bind_idx
         ));
 
-        let mut q = sqlx::query(&sql);
+        // sql-safe: a literal plus fixed AND-clauses chosen by which filters are set; the only formatted values are placeholder numbers
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
         for b in &binds {
             q = q.bind(b);
         }

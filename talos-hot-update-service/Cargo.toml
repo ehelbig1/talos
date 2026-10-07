@@ -19,7 +19,7 @@ talos-module-repository = { path = "../talos-module-repository" }
 talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-validation = { path = "../talos-workflow-validation" }
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki"] }
 thiserror.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "v5", "serde"] }

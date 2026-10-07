@@ -321,7 +321,7 @@ async fn a_planted_ansi_escape_in_an_alias_does_not_survive_into_the_report() {
     // a double-quoted identifier verbatim.
     let alias = "p39probe\u{1b}[31m\u{202e}gnitrofni\nX";
     let sql = format!("SELECT 1 AS \"{alias}\"");
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .fetch_one(&pool)
         .await
         .expect("plant the alias");
@@ -369,10 +369,12 @@ async fn the_ordering_is_a_closed_set_and_the_row_cap_is_honoured() {
     let admin = seed_user(&pool, true).await;
     let state = mcp_state(pool.clone()).await;
     for i in 0..4 {
-        sqlx::query(&format!("SELECT {i}, count(*) FROM users"))
-            .fetch_one(&pool)
-            .await
-            .expect("probe");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {i}, count(*) FROM users"
+        )))
+        .fetch_one(&pool)
+        .await
+        .expect("probe");
     }
 
     let v = machine_json(
@@ -565,7 +567,7 @@ async fn a_statement_from_another_database_is_not_in_this_databases_report() {
         .await
         .expect("connect to the maintenance database");
     let marker = format!("p39_other_db_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("SELECT 1 AS \"{marker}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("SELECT 1 AS \"{marker}\"")))
         .fetch_one(&other)
         .await
         .expect("probe in the other database");
@@ -573,7 +575,7 @@ async fn a_statement_from_another_database_is_not_in_this_databases_report() {
     // CONTROL: the same shape of statement issued HERE does appear, so a
     // report that simply found nothing would not pass this test.
     let here = format!("p39_this_db_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("SELECT 1 AS \"{here}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("SELECT 1 AS \"{here}\"")))
         .fetch_one(&pool)
         .await
         .expect("probe in this database");
@@ -743,7 +745,7 @@ async fn entries_from_a_dropped_database_are_counted_and_disclosed() {
 
         // Mint an entry in a database, then drop the database.
         let victim = format!("p39_victim_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE DATABASE \"{victim}\""))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{victim}\"")))
             .execute(&admin_pool)
             .await
             .expect("create the victim database");
@@ -753,19 +755,21 @@ async fn entries_from_a_dropped_database_are_counted_and_disclosed() {
                 .connect(&format!("{prefix}/{victim}"))
                 .await
                 .expect("connect to the victim");
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT 1 AS \"p39_victim_marker_{}\"",
                 Uuid::new_v4().simple()
-            ))
+            )))
             .fetch_one(&vp)
             .await
             .expect("mint an entry");
             vp.close().await;
         }
-        sqlx::query(&format!("DROP DATABASE \"{victim}\" WITH (FORCE)"))
-            .execute(&admin_pool)
-            .await
-            .expect("drop the victim database");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE \"{victim}\" WITH (FORCE)"
+        )))
+        .execute(&admin_pool)
+        .await
+        .expect("drop the victim database");
 
         let (after, evictions_after) = reading(machine_json(
             &report(&state, admin, serde_json::json!({})).await,

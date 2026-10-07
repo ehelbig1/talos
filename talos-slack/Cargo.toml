@@ -17,7 +17,7 @@ regex.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls", "query"] }
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }

@@ -124,17 +124,21 @@ async fn seed_module(pool: &sqlx::PgPool, user_id: Option<Uuid>, name: &str) -> 
 }
 
 async fn drop_column(pool: &sqlx::PgPool, table: &str, column: &str) {
-    sqlx::query(&format!("ALTER TABLE {table} DROP COLUMN {column} CASCADE"))
-        .execute(pool)
-        .await
-        .unwrap_or_else(|e| panic!("drop {table}.{column}: {e}"));
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {table} DROP COLUMN {column} CASCADE"
+    )))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("drop {table}.{column}: {e}"));
 }
 
 async fn drop_relation(pool: &sqlx::PgPool, relation: &str) {
-    sqlx::query(&format!("DROP TABLE IF EXISTS {relation} CASCADE"))
-        .execute(pool)
-        .await
-        .unwrap_or_else(|e| panic!("drop {relation}: {e}"));
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS {relation} CASCADE"
+    )))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("drop {relation}: {e}"));
 }
 
 fn not_measured(body: &Value) -> Vec<String> {

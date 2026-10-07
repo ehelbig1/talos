@@ -23,7 +23,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres"] }
 
 [lints]
 workspace = true

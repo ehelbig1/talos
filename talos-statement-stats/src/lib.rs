@@ -508,7 +508,12 @@ pub async fn read_statement_stats(pool: &sqlx::PgPool, opts: ReadOptions) -> Sta
         OrderBy::MeanTime => ROWS_BY_MEAN_TIME,
     };
     let sql = format!("{ROWS_SELECT}{order}");
-    let raw = match sqlx::query(&sql).bind(limit).fetch_all(pool).await {
+    // sql-safe: two constants of this file joined: the SELECT and one of three ORDER BY clauses chosen by an enum; the limit is bound
+    let raw = match sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(

@@ -10,7 +10,7 @@ publish.workspace = true
 anyhow.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "uuid", "chrono"] }
 uuid.workspace = true
 tracing.workspace = true
 talos-analytics-repository = { path = "../talos-analytics-repository" }

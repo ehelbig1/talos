@@ -24,7 +24,7 @@ rhai = { workspace = true, features = ["serde"] }
 talos-rhai-sandbox = { path = "../talos-rhai-sandbox" }
 serde_json.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-actor-lifecycle-service = { path = "../talos-actor-lifecycle-service" }
 # Package DY: the privileged and platform-admin gates record their outcomes.

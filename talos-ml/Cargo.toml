@@ -19,7 +19,7 @@ hmac.workspace = true
 hex.workspace = true
 futures.workspace = true
 pgvector = { workspace = true, features = ["sqlx"] }
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-llm = { path = "../talos-llm" }
 talos-measurement = { path = "../talos-measurement" }
 talos-memory = { path = "../talos-memory" }

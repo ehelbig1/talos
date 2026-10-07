@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid"] }
 # The child-workflow reference set (`child_workflow_ids_checked`) — the eight
 # `data` keys through which a node names another workflow, read from the crate
 # the ENGINE's own parser shares rather than restated here. `-core` is a leaf

@@ -28,7 +28,7 @@ reqwest = { workspace = true, features = ["json", "rustls", "form"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 # Constant-time equality for the session-binding hash check.
 subtle.workspace = true
 talos-config = { path = "../talos-config" }

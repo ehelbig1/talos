@@ -788,7 +788,8 @@ impl DatasetService {
             i64,
             i64,
             i64,
-        ) = sqlx::query_as(&survey_sql)
+            // sql-safe: the CONTENT_RANK_CTE constant in front of a literal; every value is bound
+        ) = sqlx::query_as(sqlx::AssertSqlSafe(survey_sql))
             .bind(dataset_id)
             .bind(protect_corrections)
             .fetch_one(&mut *conn)
@@ -825,7 +826,8 @@ impl DatasetService {
                AND (NOT $2 OR r.source <> 'correction')",
             Self::CONTENT_RANK_CTE
         );
-        let res = sqlx::query(&delete_sql)
+        // sql-safe: the CONTENT_RANK_CTE constant in front of a literal; every value is bound
+        let res = sqlx::query(sqlx::AssertSqlSafe(delete_sql))
             .bind(dataset_id)
             .bind(protect_corrections)
             .execute(&mut *conn)
@@ -1029,7 +1031,8 @@ impl DatasetService {
         per_label: i64,
     ) -> Result<Vec<SampledExample>> {
         let per_label = per_label.clamp(1, 25);
-        let rows: Vec<EncRow> = sqlx::query_as(&format!(
+        // sql-safe: ENC_ROW_COLS is a constant column list in this file; every value is bound
+        let rows: Vec<EncRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {ENC_ROW_COLS} FROM ml_examples \
              WHERE id IN ( \
                  SELECT id FROM (SELECT id, ROW_NUMBER() OVER \
@@ -1037,7 +1040,7 @@ impl DatasetService {
                    FROM ml_examples \
                    WHERE dataset_id = $1 AND label_json ? 'label') t \
                  WHERE rn <= $2)",
-        ))
+        )))
         .bind(dataset_id)
         .bind(per_label)
         .fetch_all(&mut *conn)
@@ -1079,7 +1082,8 @@ impl DatasetService {
         // Up to k_total per label (the interleave below trims to k_total
         // overall); ranked window first, ciphertext joined only for the
         // winners — same shape as `sample_examples`.
-        let rows: Vec<EncRow> = sqlx::query_as(&format!(
+        // sql-safe: ENC_ROW_COLS is a constant column list in this file; every value is bound
+        let rows: Vec<EncRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {ENC_ROW_COLS} FROM ml_examples \
              WHERE id IN ( \
                  SELECT id FROM (SELECT id, ROW_NUMBER() OVER \
@@ -1089,7 +1093,7 @@ impl DatasetService {
                      AND label_json ? 'label') t \
                  WHERE rn <= $2) \
              ORDER BY created_at DESC",
-        ))
+        )))
         .bind(dataset_id)
         .bind(k_total as i64)
         .fetch_all(&mut *conn)
@@ -1142,11 +1146,12 @@ impl DatasetService {
         limit: i64,
     ) -> Result<Vec<GoldExample>> {
         let limit = limit.clamp(1, 100);
-        let rows: Vec<EncRow> = sqlx::query_as(&format!(
+        // sql-safe: ENC_ROW_COLS is a constant column list in this file; every value is bound
+        let rows: Vec<EncRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {ENC_ROW_COLS} FROM ml_examples \
              WHERE dataset_id = $1 AND source = 'correction' AND label_json ? 'label' \
              ORDER BY created_at DESC, id LIMIT $2",
-        ))
+        )))
         .bind(dataset_id)
         .bind(limit)
         .fetch_all(&mut *conn)
@@ -1440,13 +1445,14 @@ impl DatasetService {
         Fut: std::future::Future<Output = Option<Vec<f32>>>,
     {
         let limit = limit.clamp(1, RE_EMBED_MAX_BATCH);
-        let rows: Vec<EncRow> = sqlx::query_as(&format!(
+        // sql-safe: ENC_ROW_COLS is a constant column list in this file; every value is bound
+        let rows: Vec<EncRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {ENC_ROW_COLS} FROM ml_examples \
               WHERE dataset_id = $1 \
                 AND ($2::uuid IS NULL OR id > $2) \
                 AND ($3 OR embedding IS NULL OR embedding_model IS DISTINCT FROM $4) \
               ORDER BY id ASC LIMIT $5",
-        ))
+        )))
         .bind(dataset_id)
         .bind(after)
         .bind(scope == ReEmbedScope::All)
@@ -1528,10 +1534,11 @@ impl DatasetService {
             String,
             Option<String>,
             Option<pgvector::Vector>,
-        )> = sqlx::query_as(&format!(
+            // sql-safe: ENC_ROW_COLS is a constant column list in this file; every value is bound
+        )> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {ENC_ROW_COLS}, embedding FROM ml_examples \
                  WHERE dataset_id = $1 AND split = 'holdout' AND label_json ? 'label'",
-        ))
+        )))
         .bind(dataset_id)
         .fetch_all(&mut *conn)
         .await?;

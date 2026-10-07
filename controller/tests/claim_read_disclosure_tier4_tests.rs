@@ -150,10 +150,12 @@ fn not_measured(body: &Value) -> Vec<String> {
 }
 
 async fn drop_relation(pool: &sqlx::PgPool, relation: &str) {
-    sqlx::query(&format!("DROP TABLE IF EXISTS {relation} CASCADE"))
-        .execute(pool)
-        .await
-        .unwrap_or_else(|e| panic!("drop {relation}: {e}"));
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS {relation} CASCADE"
+    )))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("drop {relation}: {e}"));
 }
 
 /// The text body of an `mcp_text` response, for the two handlers that render a

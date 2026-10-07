@@ -108,17 +108,16 @@ async fn seed_tenant(pool: &sqlx::PgPool) -> Seeded {
 async fn as_user(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, user: Uuid) {
     (&mut **tx)
         .execute(
-            format!(
+            sqlx::AssertSqlSafe(format!(
                 "SET LOCAL ROLE talos_app; SET LOCAL app.current_user_id = '{user}'; SET LOCAL app.current_org_ids = ''"
-            )
-            .as_str(),
+            )),
         )
         .await
         .expect("set role + GUCs");
 }
 
 async fn count(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, sql: &str, id: Uuid) -> i64 {
-    sqlx::query_scalar(sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .fetch_one(&mut **tx)
         .await

@@ -116,9 +116,9 @@ async fn hold_at_cap(pool: &Pool<Postgres>, f: &Fixture, column: &str) {
     .await
     .expect("seed tokens");
     // `column` is a test constant, never input.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO actor_budget_policies (actor_id, {column}, on_budget_exceeded) VALUES ($1, 1, 'block')"
-    ))
+    )))
     .bind(f.actor)
     .execute(pool)
     .await

@@ -12,7 +12,7 @@ anyhow.workspace = true
 chrono.workspace = true
 regex.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-child-workflow-refs = { path = "../talos-child-workflow-refs" }
 # RFC 0012 P2. The child-run ledger is the only table that can measure a
 # sub-workflow's reliability and freshness, and this crate owns the readiness

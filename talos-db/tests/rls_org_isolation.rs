@@ -76,16 +76,13 @@ async fn rls_isolates_rows_by_active_org_under_non_superuser_role() {
     let org_b = Uuid::new_v4();
 
     // ── Setup as superuser: app role, probe table, RLS policy, grants ──
-    su.execute(
-        format!(
-            "DO $$ BEGIN \
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "DO $$ BEGIN \
                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{APP_ROLE}') THEN \
                  CREATE ROLE {APP_ROLE} LOGIN PASSWORD '{APP_PW}'; \
                END IF; \
              END $$;"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create app role");
 
@@ -101,12 +98,16 @@ async fn rls_isolates_rows_by_active_org_under_non_superuser_role() {
     .await
     .expect("probe table + policy");
 
-    su.execute(format!("GRANT SELECT, INSERT ON rls_probe TO {APP_ROLE};").as_str())
-        .await
-        .expect("grant table");
-    su.execute(format!("GRANT USAGE, SELECT ON SEQUENCE rls_probe_id_seq TO {APP_ROLE};").as_str())
-        .await
-        .expect("grant seq");
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT, INSERT ON rls_probe TO {APP_ROLE};"
+    )))
+    .await
+    .expect("grant table");
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT USAGE, SELECT ON SEQUENCE rls_probe_id_seq TO {APP_ROLE};"
+    )))
+    .await
+    .expect("grant seq");
 
     sqlx::query("INSERT INTO rls_probe (org_id, val) VALUES ($1,'A'), ($2,'B')")
         .bind(org_a)
@@ -175,7 +176,9 @@ async fn rls_isolates_rows_by_active_org_under_non_superuser_role() {
     // ── Cleanup ────────────────────────────────────────────────────────
     let _ = su.execute("DROP TABLE IF EXISTS rls_probe;").await;
     let _ = su
-        .execute(format!("DROP ROLE IF EXISTS {APP_ROLE};").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {APP_ROLE};"
+        )))
         .await;
 }
 
@@ -202,16 +205,13 @@ async fn membership_union_rls_shows_owned_and_member_orgs_only() {
     let org_b = Uuid::new_v4();
     let org_c = Uuid::new_v4(); // a NON-member org
 
-    su.execute(
-        format!(
-            "DO $$ BEGIN \
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "DO $$ BEGIN \
                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{UNION_ROLE}') THEN \
                  CREATE ROLE {UNION_ROLE} LOGIN PASSWORD '{APP_PW}'; \
                END IF; \
              END $$;"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create union app role");
 
@@ -233,12 +233,14 @@ async fn membership_union_rls_shows_owned_and_member_orgs_only() {
     .await
     .expect("union probe table + policy");
 
-    su.execute(format!("GRANT SELECT, INSERT ON rls_union_probe TO {UNION_ROLE};").as_str())
-        .await
-        .unwrap();
-    su.execute(
-        format!("GRANT USAGE, SELECT ON SEQUENCE rls_union_probe_id_seq TO {UNION_ROLE};").as_str(),
-    )
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT, INSERT ON rls_union_probe TO {UNION_ROLE};"
+    )))
+    .await
+    .unwrap();
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT USAGE, SELECT ON SEQUENCE rls_union_probe_id_seq TO {UNION_ROLE};"
+    )))
     .await
     .unwrap();
 
@@ -285,7 +287,9 @@ async fn membership_union_rls_shows_owned_and_member_orgs_only() {
 
     let _ = su.execute("DROP TABLE IF EXISTS rls_union_probe;").await;
     let _ = su
-        .execute(format!("DROP ROLE IF EXISTS {UNION_ROLE};").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {UNION_ROLE};"
+        )))
         .await;
 }
 
@@ -309,16 +313,13 @@ async fn permissive_when_unset_policy_is_nonbreaking_then_enforces_when_set() {
     let org_a = Uuid::new_v4();
     let org_c = Uuid::new_v4(); // a non-member org
 
-    su.execute(
-        format!(
-            "DO $$ BEGIN \
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "DO $$ BEGIN \
                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{PERM_ROLE}') THEN \
                  CREATE ROLE {PERM_ROLE} LOGIN PASSWORD '{APP_PW}'; \
                END IF; \
              END $$;"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create perm role");
 
@@ -339,12 +340,14 @@ async fn permissive_when_unset_policy_is_nonbreaking_then_enforces_when_set() {
     )
     .await
     .expect("perm probe table + policy");
-    su.execute(format!("GRANT SELECT, INSERT ON rls_perm_probe TO {PERM_ROLE};").as_str())
-        .await
-        .unwrap();
-    su.execute(
-        format!("GRANT USAGE, SELECT ON SEQUENCE rls_perm_probe_id_seq TO {PERM_ROLE};").as_str(),
-    )
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT, INSERT ON rls_perm_probe TO {PERM_ROLE};"
+    )))
+    .await
+    .unwrap();
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT USAGE, SELECT ON SEQUENCE rls_perm_probe_id_seq TO {PERM_ROLE};"
+    )))
     .await
     .unwrap();
 
@@ -411,7 +414,9 @@ async fn permissive_when_unset_policy_is_nonbreaking_then_enforces_when_set() {
 
     let _ = su.execute("DROP TABLE IF EXISTS rls_perm_probe;").await;
     let _ = su
-        .execute(format!("DROP ROLE IF EXISTS {PERM_ROLE};").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {PERM_ROLE};"
+        )))
         .await;
 }
 
@@ -437,18 +442,17 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
     let name_a = format!("wfa-{}", user_a.simple());
     let name_b = format!("wfb-{}", user_b.simple());
 
-    su.execute(
-        format!(
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{WF_ROLE}') THEN \
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{WF_ROLE}') THEN \
                CREATE ROLE {WF_ROLE} LOGIN PASSWORD '{APP_PW}'; END IF; END $$;"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create wf role");
-    su.execute(format!("GRANT SELECT, INSERT ON workflows TO {WF_ROLE};").as_str())
-        .await
-        .expect("grant");
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT, INSERT ON workflows TO {WF_ROLE};"
+    )))
+    .await
+    .expect("grant");
     for (u, label) in [(user_a, "wa"), (user_b, "wb")] {
         sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
             .bind(u)
@@ -578,7 +582,9 @@ async fn workflows_permissive_rls_unscoped_sees_all_scoped_enforces() {
             .await;
     }
     let _ = su
-        .execute(format!("DROP ROLE IF EXISTS {WF_ROLE};").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {WF_ROLE};"
+        )))
         .await;
 }
 
@@ -600,18 +606,17 @@ async fn secrets_permissive_rls_unscoped_sees_all_scoped_enforces() {
     let kp_a = format!("ka-{}", user_a.simple());
     let kp_b = format!("kb-{}", user_b.simple());
 
-    su.execute(
-        format!(
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{SECRETS_ROLE}') THEN \
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{SECRETS_ROLE}') THEN \
                CREATE ROLE {SECRETS_ROLE} LOGIN PASSWORD '{APP_PW}'; END IF; END $$;"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create secrets role");
-    su.execute(format!("GRANT SELECT ON secrets TO {SECRETS_ROLE};").as_str())
-        .await
-        .expect("grant");
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT ON secrets TO {SECRETS_ROLE};"
+    )))
+    .await
+    .expect("grant");
     for (u, label) in [(user_a, "sa"), (user_b, "sb")] {
         sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
             .bind(u)
@@ -692,7 +697,9 @@ async fn secrets_permissive_rls_unscoped_sees_all_scoped_enforces() {
             .await;
     }
     let _ = su
-        .execute(format!("DROP ROLE IF EXISTS {SECRETS_ROLE};").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {SECRETS_ROLE};"
+        )))
         .await;
 }
 
@@ -720,24 +727,25 @@ async fn workflow_executions_permissive_rls_member_sees_shared_stranger_blocked(
     let exec_owner = Uuid::new_v4();
     let exec_mate = Uuid::new_v4();
 
-    su.execute(
-        format!(
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{EXEC_ROLE}') THEN \
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{EXEC_ROLE}') THEN \
                CREATE ROLE {EXEC_ROLE} LOGIN PASSWORD '{APP_PW}'; END IF; END $$;"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create exec role");
     // The policy's EXISTS clause reads `workflows`, so the role needs
     // SELECT on both (workflows is itself RLS-enabled — the subquery
     // composes with its policy under the same GUC).
-    su.execute(format!("GRANT SELECT ON workflow_executions TO {EXEC_ROLE};").as_str())
-        .await
-        .expect("grant exec");
-    su.execute(format!("GRANT SELECT ON workflows TO {EXEC_ROLE};").as_str())
-        .await
-        .expect("grant wf");
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT ON workflow_executions TO {EXEC_ROLE};"
+    )))
+    .await
+    .expect("grant exec");
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT ON workflows TO {EXEC_ROLE};"
+    )))
+    .await
+    .expect("grant wf");
 
     for (u, label) in [(owner, "wo"), (teammate, "wm"), (stranger, "ws")] {
         sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
@@ -863,7 +871,9 @@ async fn workflow_executions_permissive_rls_member_sees_shared_stranger_blocked(
             .await;
     }
     let _ = su
-        .execute(format!("DROP ROLE IF EXISTS {EXEC_ROLE};").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {EXEC_ROLE};"
+        )))
         .await;
 }
 
@@ -885,18 +895,17 @@ async fn actors_permissive_rls_unscoped_sees_all_scoped_enforces() {
     let actor_a = Uuid::new_v4();
     let actor_b = Uuid::new_v4();
 
-    su.execute(
-        format!(
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{ACTORS_ROLE}') THEN \
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{ACTORS_ROLE}') THEN \
                CREATE ROLE {ACTORS_ROLE} LOGIN PASSWORD '{APP_PW}'; END IF; END $$;"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create actors role");
-    su.execute(format!("GRANT SELECT ON actors TO {ACTORS_ROLE};").as_str())
-        .await
-        .expect("grant");
+    su.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT ON actors TO {ACTORS_ROLE};"
+    )))
+    .await
+    .expect("grant");
     for (u, label) in [(user_a, "aa"), (user_b, "ab")] {
         sqlx::query("INSERT INTO users (id, email, password_hash, name) VALUES ($1,$2,'x',$3)")
             .bind(u)
@@ -954,7 +963,9 @@ async fn actors_permissive_rls_unscoped_sees_all_scoped_enforces() {
             .await;
     }
     let _ = su
-        .execute(format!("DROP ROLE IF EXISTS {ACTORS_ROLE};").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS {ACTORS_ROLE};"
+        )))
         .await;
 }
 
@@ -1015,14 +1026,11 @@ async fn set_role_talos_app_enforces_rls_under_superuser_connection() {
     // SET LOCAL ROLE talos_app + scope to user B → RLS enforces → row hidden.
     let mut tx = su.begin().await.unwrap();
     (&mut *tx)
-        .execute(
-            format!(
-                "SET LOCAL ROLE talos_app; \
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL ROLE talos_app; \
                  SET LOCAL app.current_user_id = '{user_b}'; \
                  SET LOCAL app.current_org_ids = ''"
-            )
-            .as_str(),
-        )
+        )))
         .await
         .unwrap();
     let b_sees: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows WHERE id = $1")
@@ -1039,14 +1047,11 @@ async fn set_role_talos_app_enforces_rls_under_superuser_connection() {
     // Same, scoped to the owner A → visible (positive control).
     let mut tx = su.begin().await.unwrap();
     (&mut *tx)
-        .execute(
-            format!(
-                "SET LOCAL ROLE talos_app; \
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL ROLE talos_app; \
                  SET LOCAL app.current_user_id = '{user_a}'; \
                  SET LOCAL app.current_org_ids = ''"
-            )
-            .as_str(),
-        )
+        )))
         .await
         .unwrap();
     let a_sees: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows WHERE id = $1")
@@ -1161,9 +1166,9 @@ async fn set_role_with_check_gates_cross_tenant_writes() {
     // Scoped to ORG A, INSERT a workflow into ORG A → satisfies the org-based WITH CHECK.
     let mut tx = su.begin().await.unwrap();
     (&mut *tx)
-        .execute(
-            format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_org_id = '{org_a}'").as_str(),
-        )
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL ROLE talos_app; SET LOCAL app.current_org_id = '{org_a}'"
+        )))
         .await
         .unwrap();
     sqlx::query(
@@ -1181,9 +1186,9 @@ async fn set_role_with_check_gates_cross_tenant_writes() {
     // Scoped to ORG A, INSERT a workflow into ORG B → violates the WITH CHECK.
     let mut tx = su.begin().await.unwrap();
     (&mut *tx)
-        .execute(
-            format!("SET LOCAL ROLE talos_app; SET LOCAL app.current_org_id = '{org_a}'").as_str(),
-        )
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL ROLE talos_app; SET LOCAL app.current_org_id = '{org_a}'"
+        )))
         .await
         .unwrap();
     let res = sqlx::query(
@@ -1290,7 +1295,10 @@ async fn secrets_owner_pin_is_personal_only_org_shared_is_collaborative() {
 
     // 1. PERSONAL secret (org_id NULL) owned by user_a → owner pin satisfied.
     let mut tx = su.begin().await.unwrap();
-    (&mut *tx).execute(scope_personal.as_str()).await.unwrap();
+    (&mut *tx)
+        .execute(sqlx::AssertSqlSafe(scope_personal.as_str()))
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO secrets (id, name, key_path, encrypted_value, encryption_key_id, owner_user_id, created_by, org_id) \
          VALUES ($1, 's', 'sec/personal-own', ''::bytea, $2, $3, $3, NULL)",
@@ -1305,7 +1313,10 @@ async fn secrets_owner_pin_is_personal_only_org_shared_is_collaborative() {
 
     // 2. PERSONAL secret (org_id NULL) owned by user_b → owner pin REJECTS.
     let mut tx = su.begin().await.unwrap();
-    (&mut *tx).execute(scope_personal.as_str()).await.unwrap();
+    (&mut *tx)
+        .execute(sqlx::AssertSqlSafe(scope_personal.as_str()))
+        .await
+        .unwrap();
     let res = sqlx::query(
         "INSERT INTO secrets (id, name, key_path, encrypted_value, encryption_key_id, owner_user_id, created_by, org_id) \
          VALUES ($1, 's', 'sec/personal-forge', ''::bytea, $2, $3, $3, NULL)",
@@ -1332,7 +1343,10 @@ async fn secrets_owner_pin_is_personal_only_org_shared_is_collaborative() {
     //    user_a → PERMITTED. Owner pin is skipped for org_id IS NOT NULL; the org
     //    pin (org_a = current_org_id) is satisfied. Collaborative, like workflows.
     let mut tx = su.begin().await.unwrap();
-    (&mut *tx).execute(scope_org.as_str()).await.unwrap();
+    (&mut *tx)
+        .execute(sqlx::AssertSqlSafe(scope_org.as_str()))
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO secrets (id, name, key_path, encrypted_value, encryption_key_id, owner_user_id, created_by, org_id) \
          VALUES ($1, 's', 'sec/org-shared', ''::bytea, $2, $3, $3, $4)",
@@ -1349,7 +1363,10 @@ async fn secrets_owner_pin_is_personal_only_org_shared_is_collaborative() {
     // 4. workflows stay ORG-PINNED ONLY: a workflow with a DIFFERENT user_id under
     //    the org scope must still succeed (collaboration is not user-pinned).
     let mut tx = su.begin().await.unwrap();
-    (&mut *tx).execute(scope_org.as_str()).await.unwrap();
+    (&mut *tx)
+        .execute(sqlx::AssertSqlSafe(scope_org.as_str()))
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO workflows (id, user_id, org_id, name, module_uri, graph_json) \
          VALUES ($1, $2, $3, 'collab', 'mod://x', '{}'::jsonb)",

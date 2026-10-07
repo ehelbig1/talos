@@ -6,57 +6,123 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "user_id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "user_id"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "provider",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "provider"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "provider_user_id",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "provider_user_id"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "email",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "email"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "name",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "name"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "picture_url",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "picture_url"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "metadata",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "metadata"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "updated_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "updated_at"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "last_login_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oauth_accounts",
+            "name": "last_login_at"
+          }
+        }
       }
     ],
     "parameters": {

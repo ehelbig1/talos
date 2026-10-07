@@ -83,7 +83,7 @@ async fn every_immutable_audit_table_refuses_truncate_and_delete() {
             format!("UPDATE {table} SET id = id"),
         ] {
             let mut tx = pool.begin().await.unwrap();
-            let err = sqlx::query(&stmt)
+            let err = sqlx::query(sqlx::AssertSqlSafe(stmt.as_str()))
                 .execute(&mut *tx)
                 .await
                 .expect_err(&format!("{stmt} must be refused"));

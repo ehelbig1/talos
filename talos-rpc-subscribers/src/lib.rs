@@ -880,7 +880,8 @@ async fn run_guest_transaction(
         // at startup so this format!-into-SQL is safe.
         if let Some(role) = guest_role {
             let set_role_sql = format!("SET LOCAL ROLE \"{role}\"");
-            sqlx::query(&set_role_sql)
+            // sql-safe: the role is operator configuration, checked by is_valid_pg_role_identifier where it is read (guest_role_for_query) and quoted; SET LOCAL ROLE takes no bind parameters
+            sqlx::query(sqlx::AssertSqlSafe(set_role_sql))
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -904,7 +905,8 @@ async fn run_guest_transaction(
                 user_sql = sql,
                 lim = MAX_RESULT_ROWS + 1
             );
-            let mut q = sqlx::query(&wrapped);
+            // sql-safe: guest-written SQL by design (the database capability world): the controls are the worker sql_validator, controller_permits_data_statement, the write ceiling and the guest role, not this string; guest parameters are bound
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(wrapped));
             for p in params {
                 q = q.bind(p);
             }
@@ -945,7 +947,8 @@ async fn run_guest_transaction(
                 rows_affected: 0,
             })
         } else {
-            let mut q = sqlx::query(sql);
+            // sql-safe: guest-written SQL by design (the database capability world): the controls are the worker sql_validator, controller_permits_data_statement, the write ceiling and the guest role, not this string; guest parameters are bound
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             for p in params {
                 q = q.bind(p);
             }

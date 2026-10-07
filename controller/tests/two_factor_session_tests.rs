@@ -543,7 +543,7 @@ async fn the_bootstrap_backfill_marks_only_deployments_that_have_bootstrapped() 
     let pool = &ctx.db_pool;
     let run = |statements: &'static [&'static str]| async move {
         for statement in statements {
-            sqlx::raw_sql(statement).execute(pool).await.unwrap();
+            sqlx::raw_sql(*statement).execute(pool).await.unwrap();
         }
     };
     let rows = || async {

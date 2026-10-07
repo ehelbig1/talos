@@ -21,7 +21,7 @@ reqwest = { workspace = true, features = ["json", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-db = { path = "../talos-db" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }

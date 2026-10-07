@@ -20,7 +20,7 @@ anyhow.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 bcrypt.workspace = true
 talos-unusable-password = { path = "../talos-unusable-password" }
 # One writer for admin_event_log (check 94): the first-user grant is recorded.

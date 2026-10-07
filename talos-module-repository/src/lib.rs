@@ -3546,7 +3546,8 @@ impl ModuleRepository {
               ORDER BY u.name",
             not_retired = talos_workflow_liveness::not_retired_sql(Some("w")),
         );
-        let rows = sqlx::query(&sql)
+        // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .fetch_all(&self.db_pool)
             .await?;
@@ -4247,11 +4248,13 @@ impl ModuleRepository {
         template_id: Option<Uuid>,
         owner: Uuid,
     ) -> Result<Vec<(Uuid, String, Uuid)>> {
-        let rows: Vec<(Uuid, String, Uuid)> = sqlx::query_as(&dependent_workflows_sql("user_id"))
-            .bind(dependent_module_ids(module_id, template_id))
-            .bind(owner)
-            .fetch_all(&self.db_pool)
-            .await?;
+        // sql-safe: a literal with one of two column names, each a literal at its call site
+        let rows: Vec<(Uuid, String, Uuid)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(dependent_workflows_sql("user_id")))
+                .bind(dependent_module_ids(module_id, template_id))
+                .bind(owner)
+                .fetch_all(&self.db_pool)
+                .await?;
         Ok(rows)
     }
 
@@ -4271,7 +4274,8 @@ impl ModuleRepository {
         owner: Uuid,
     ) -> Result<Vec<(Uuid, String, Option<Uuid>)>> {
         let rows: Vec<(Uuid, String, Option<Uuid>)> =
-            sqlx::query_as(&dependent_workflows_sql("actor_id"))
+            // sql-safe: a literal with one of two column names, each a literal at its call site
+            sqlx::query_as(sqlx::AssertSqlSafe(dependent_workflows_sql("actor_id")))
                 .bind(dependent_module_ids(module_id, template_id))
                 .bind(owner)
                 .fetch_all(&self.db_pool)
@@ -4717,7 +4721,7 @@ fn dependent_module_ids(module_id: Uuid, template_id: Option<Uuid>) -> Vec<Strin
 /// The dependent-workflow statement, projecting `third` (`user_id` or
 /// `actor_id`). `$1` = the id set, `$2` = the module's owner. A node references
 /// a module through `type` or `data.moduleId` (`node_module_id`'s rule).
-fn dependent_workflows_sql(third: &str) -> String {
+fn dependent_workflows_sql(third: &'static str) -> String {
     debug_assert!(matches!(third, "user_id" | "actor_id"));
     format!(
         "SELECT w.id, w.name, w.{third} FROM workflows w \

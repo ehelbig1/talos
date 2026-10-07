@@ -98,7 +98,7 @@ async fn every_collector_export_statement_prepares() {
         let sql = format!(
             "SELECT count(*) FROM {table} WHERE {ts} >= (now() - interval '90 days')::timestamptz"
         );
-        let n: i64 = sqlx::query_scalar(&sql)
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_one(&pool)
             .await
             .unwrap_or_else(|e| panic!("collector export for {table} cannot run: {e}"));

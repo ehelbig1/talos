@@ -298,7 +298,8 @@ pub async fn scan_child_parents(
     // that spells it `status <> 'archived'` cannot drift apart. The fragment
     // carries no caller input — the alias is a literal here.
     let live_parent = talos_workflow_liveness::dispatchable_sql(None);
-    let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(&format!(
+    // sql-safe: the one fragment is talos_workflow_liveness::dispatchable_sql(None), fixed text; every value is bound
+    let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, name, \
                 CASE WHEN octet_length(graph_json) <= $3 THEN graph_json END AS graph_json \
          FROM workflows \
@@ -306,7 +307,7 @@ pub async fn scan_child_parents(
            AND EXISTS (SELECT 1 FROM unnest($2::uuid[]) c \
                        WHERE graph_json LIKE '%' || c::text || '%') \
          ORDER BY id"
-    ))
+    )))
     .bind(user_id)
     .bind(candidates)
     .bind(MAX_PARENT_GRAPH_BYTES)

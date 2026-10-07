@@ -389,6 +389,7 @@ introduced per-org v4 per table).
 - NEVER send `encrypted_secrets: Default::default()` in a dispatch path that should have secrets — use `build_encrypted_secrets()`.
 - NEVER modify already-applied migration files. Create new migrations instead.
 - ALWAYS use parameterized queries (sqlx `$1` bind params). Never string-concatenate SQL.
+- A SQL string that is not a literal is wrapped in `sqlx::AssertSqlSafe` with a `// sql-safe: <what varies in it>` comment on or directly above the line (`scripts/check-sql-safe-reasons.py`, in `make lint`; test code is exempt). Prefer a literal with binds; a helper that formats an argument into SQL takes `&'static str` (2026-10-07).
 - ALWAYS use constant-time comparison for security-sensitive values (tokens, HMAC, CSRF).
 - ALWAYS set HttpOnly, Secure, SameSite=Strict on authentication cookies.
 - ALWAYS validate and sanitize external input at API boundaries.
@@ -496,6 +497,7 @@ introduced per-org v4 per table).
 - Always create new migration files with timestamp prefix: `YYYYMMDDHHMMSS_description.sql`
 - Use `IF NOT EXISTS` / `IF EXISTS` for idempotency.
 - No `CONCURRENTLY` (incompatible with sqlx transaction wrapper).
+- The `sqlx` command-line tool and the migrator the controller embeds write one `_sqlx_migrations` table: the tool is pinned to the `sqlx` version in `Cargo.lock` in `controller/Dockerfile` and in `quality.yml` (`scripts/check-sqlx-cli-pin.py`, in `make lint`), and a `sqlx` bump moves all three together (2026-10-07).
 - For row-level data migrations that may hit malformed rows, use a PL/pgSQL `FOR ... LOOP` with nested `BEGIN/EXCEPTION` per iteration — the nested block creates an implicit SAVEPOINT so one bad row doesn't abort the batch. A bare `DO $$ ... EXCEPTION WHEN others $$` at the outer level catches errors but rolls back everything, silently no-op'ing the migration.
 
 ## Architectural Mandate (CRITICAL)

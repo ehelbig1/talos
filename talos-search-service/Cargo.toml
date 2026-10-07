@@ -14,7 +14,7 @@ regex.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "uuid"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "uuid"] }
 thiserror.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }

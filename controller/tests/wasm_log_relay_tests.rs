@@ -145,9 +145,9 @@ async fn rows_until(
 
 async fn rows(pool: &sqlx::Pool<sqlx::Postgres>, table: &str, exec: Uuid, like: &str) -> i64 {
     // `table` is one of two literals below, never input.
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT count(*) FROM {table} WHERE execution_id = $1 AND message LIKE $2"
-    ))
+    )))
     .bind(exec)
     .bind(like)
     .fetch_one(pool)

@@ -14,9 +14,13 @@ RUN rustup component add rustfmt && \
 
 # Install tools one at a time (each cached independently). Every install is
 # version-pinned: an unpinned `cargo install` resolves to the newest release
-# at build time (sqlx-cli would silently jump to 0.9 while the workspace
-# links sqlx 0.8.6).
-RUN cargo install sqlx-cli --version 0.8.6 --locked --features postgres
+# at build time. sqlx-cli is held to the version of `sqlx` in Cargo.lock by
+# scripts/check-sqlx-cli-pin.py (make lint): this binary and the migrator the
+# controller embeds write the same `_sqlx_migrations` table. Built with the
+# Postgres driver and rustls only: the default features add the MySQL and
+# SQLite drivers and link OpenSSL, none of which this image uses, and the
+# controller reaches the same database through rustls.
+RUN cargo install sqlx-cli --version 0.9.0 --locked --no-default-features --features postgres,rustls
 RUN cargo install wizer --version 9.0.0 --locked --features="env_logger structopt"
 RUN cargo install cargo-component --version 0.21.1 --locked
 # cargo-audit gates every WASM compile in production. The compilation

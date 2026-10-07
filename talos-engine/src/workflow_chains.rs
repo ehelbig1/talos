@@ -411,29 +411,31 @@ pub async fn run_workflow_chains(
     // on this path; the per-workflow auth resolve and engine build are, which
     // is why the plan runs before both.
     let dispatchable = talos_workflow_liveness::dispatchable_sql(None);
-    let workflows = match sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(&format!(
-        "SELECT id, graph_json, actor_id \
+    // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+    let workflows =
+        match sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(sqlx::AssertSqlSafe(format!(
+            "SELECT id, graph_json, actor_id \
          FROM workflows \
          WHERE user_id = $1 AND graph_json LIKE $2 AND {dispatchable} \
          ORDER BY updated_at DESC, id DESC \
          LIMIT $3"
-    ))
-    .bind(user_id)
-    .bind(&search)
-    .bind(chain_cap + 1) // +1 so we can detect cap-hit without a second query
-    .fetch_all(db_pool)
-    .await
-    {
-        Ok(ws) => ws,
-        Err(e) => {
-            tracing::warn!(
-                "run_workflow_chains: failed to query workflows for module {}: {}",
-                trigger_module_id,
-                e
-            );
-            return Ok(());
-        }
-    };
+        )))
+        .bind(user_id)
+        .bind(&search)
+        .bind(chain_cap + 1) // +1 so we can detect cap-hit without a second query
+        .fetch_all(db_pool)
+        .await
+        {
+            Ok(ws) => ws,
+            Err(e) => {
+                tracing::warn!(
+                    "run_workflow_chains: failed to query workflows for module {}: {}",
+                    trigger_module_id,
+                    e
+                );
+                return Ok(());
+            }
+        };
 
     if workflows.is_empty() {
         tracing::debug!(

@@ -12,7 +12,7 @@ chrono.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 async-trait.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-memory = { path = "../talos-memory" }
 tracing.workspace = true
 uuid.workspace = true

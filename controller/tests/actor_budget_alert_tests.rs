@@ -70,9 +70,9 @@ async fn admit(
 
 async fn set_policy(pool: &Pool<Postgres>, actor: Uuid, column: &str, cap: i64, mode: &str) {
     // `column` is a test constant, never input.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO actor_budget_policies (actor_id, {column}, on_budget_exceeded) VALUES ($1, $2, $3)"
-    ))
+    )))
     .bind(actor)
     .bind(cap)
     .bind(mode)

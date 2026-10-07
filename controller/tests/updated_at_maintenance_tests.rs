@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 async fn updated_at_of(pool: &Pool<Postgres>, table: &str, id: Uuid) -> DateTime<Utc> {
     let sql = format!("SELECT updated_at FROM {table} WHERE id = $1");
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(id)
         .fetch_one(pool)
         .await
@@ -35,7 +35,11 @@ async fn updated_at_of(pool: &Pool<Postgres>, table: &str, id: Uuid) -> DateTime
 /// when nothing else changed, which is itself part of the contract).
 async fn pin_updated_at(pool: &Pool<Postgres>, table: &str, id: Uuid) -> DateTime<Utc> {
     let sql = format!("UPDATE {table} SET updated_at = '2020-01-01T00:00:00Z' WHERE id = $1");
-    sqlx::query(&sql).bind(id).execute(pool).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
     updated_at_of(pool, table, id).await
 }
 
@@ -719,7 +723,7 @@ async fn every_table_carrying_the_trigger_supports_record_comparison() {
         let sql = format!(
             "SELECT ROW(x.*) IS NOT DISTINCT FROM ROW(x.*) AS ok FROM (SELECT (NULL::{t}).*) x"
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_one(&pool)
             .await
             .unwrap_or_else(|e| {

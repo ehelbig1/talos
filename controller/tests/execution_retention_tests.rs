@@ -1392,11 +1392,13 @@ async fn state_rows(f: &Fixture, exec: Uuid) -> i64 {
 
 async fn row_exists(f: &Fixture, table: &str, id: Uuid) -> bool {
     // `table` is a compile-time literal from the tests below, never input.
-    sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table} WHERE id = $1"))
-        .bind(id)
-        .fetch_one(&f.pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {table} WHERE id = $1"
+    )))
+    .bind(id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap()
         > 0
 }
 

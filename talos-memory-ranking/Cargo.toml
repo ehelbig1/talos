@@ -14,7 +14,7 @@ anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 # The truncation disclosure's machine-readable half. `talos-metrics` is a
 # near-leaf (prometheus + talos-workflow-liveness), so this edge introduces no

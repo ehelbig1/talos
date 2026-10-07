@@ -28,7 +28,7 @@ rhai = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-actor-policies = { path = "../talos-actor-policies" }
 talos-actor-repository = { path = "../talos-actor-repository" }

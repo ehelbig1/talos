@@ -85,7 +85,8 @@ pub async fn begin_org_scoped<'a>(
     use sqlx::Executor as _;
     let sql = format!("{}{}", rls_role_prefix(), scope.set_local_org_sql());
     (&mut *tx)
-        .execute(sql.as_str())
+        // sql-safe: a fixed role prefix, then SET LOCALs whose only values are Uuids (TenantScope::set_local_org_sql); SET LOCAL takes no bind parameters
+        .execute(sqlx::AssertSqlSafe(sql))
         .await
         .context("set role + app.current_org_id for tenant scope")?;
     Ok(tx)
@@ -116,7 +117,8 @@ pub async fn begin_tenant_read_scoped<'a>(
     use sqlx::Executor as _;
     let sql = format!("{}{}", rls_role_prefix(), scope.set_local_sql());
     (&mut *tx)
-        .execute(sql.as_str())
+        // sql-safe: a fixed role prefix, then SET LOCALs whose only values are Uuids (TenantReadScope::set_local_sql); SET LOCAL takes no bind parameters
+        .execute(sqlx::AssertSqlSafe(sql))
         .await
         .context("set role + app.current_user_id + app.current_org_ids")?;
     Ok(tx)
@@ -531,7 +533,11 @@ pub async fn init_pool() -> anyhow::Result<Pool<Postgres>> {
                 conn.execute("SET application_name = 'talos_controller'")
                     .await?;
                 conn.execute(
-                    format!("SET statement_timeout = '{}s'", statement_timeout_secs).as_str(),
+                    // sql-safe: the only value is a u64 read from configuration; SET takes no bind parameters
+                    sqlx::AssertSqlSafe(format!(
+                        "SET statement_timeout = '{}s'",
+                        statement_timeout_secs
+                    )),
                 )
                 .await?;
                 conn.execute("SET idle_in_transaction_session_timeout = '60s'")
@@ -584,7 +590,11 @@ pub async fn init_read_replica_pool() -> Option<Pool<Postgres>> {
                 conn.execute("SET application_name = 'talos_controller_replica'")
                     .await?;
                 conn.execute(
-                    format!("SET statement_timeout = '{}s'", statement_timeout_secs).as_str(),
+                    // sql-safe: the only value is a u64 read from configuration; SET takes no bind parameters
+                    sqlx::AssertSqlSafe(format!(
+                        "SET statement_timeout = '{}s'",
+                        statement_timeout_secs
+                    )),
                 )
                 .await?;
                 // MCP-1059 (2026-05-15): mirror the primary pool's

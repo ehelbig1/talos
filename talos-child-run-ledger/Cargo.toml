@@ -9,7 +9,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "chrono"] }
 talos-db = { path = "../talos-db" }
 # The record TYPE and the dispatch-kind taxonomy live with the port that
 # produces them, so the writer and the row cannot name different things.

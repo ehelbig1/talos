@@ -293,6 +293,10 @@ lint: ## Fast gate: rustfmt + WIT drift + structural lints (no clippy) + offline
 	@python3 scripts/check-workspace-package.py
 	@printf '▶ Redis connections are opened in one place\n'
 	@python3 scripts/lint-clippy-disallowed.py check redis
+	@printf '▶ dynamic SQL strings say what varies in them\n'
+	@python3 scripts/check-sql-safe-reasons.py
+	@printf '▶ the sqlx command-line tool matches the library\n'
+	@python3 scripts/check-sqlx-cli-pin.py
 # NOTE: no `cargo fmt --all -- --check` here. It ran TWICE per `make lint` —
 # once from this target and again as structural check 35 — which is pure
 # duplicated wall-clock for identical coverage. Check 35 is the copy that was
