@@ -226,16 +226,7 @@ async fn enrolment_signs_out_earlier_sessions_and_reissues_the_enrolling_one() {
         .as_str()
         .unwrap()
         .to_string();
-    let code = totp_rs::TOTP::new(
-        totp_rs::Algorithm::SHA1,
-        6,
-        1,
-        30,
-        totp_rs::Secret::Encoded(secret.clone()).to_bytes().unwrap(),
-    )
-    .unwrap()
-    .generate_current()
-    .unwrap();
+    let code = common::authenticator_code(&secret);
 
     let cookies = tower_cookies::Cookies::default();
     let enable = ctx

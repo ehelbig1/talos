@@ -471,3 +471,21 @@ where
 {
     eventually(what, std::time::Duration::from_secs(10), probe).await;
 }
+
+/// The six digits an authenticator app would show right now for `secret` (the
+/// base32 string enrolment hands out): SHA-1, 30-second steps — the
+/// parameters in the enrolment URL. Three test binaries each built this for
+/// themselves until the TOTP library's API changed (2026-10-06).
+#[allow(dead_code)]
+pub fn authenticator_code(secret: &str) -> String {
+    totp_rs::Builder::new()
+        .with_algorithm(totp_rs::Algorithm::SHA1)
+        .with_digits(6)
+        .with_skew(1)
+        .with_step_duration(30)
+        .with_secret(totp_rs::Secret::try_from_base32(secret).expect("a base32 secret"))
+        .build()
+        .expect("a secret of at least 128 bits")
+        .generate_current()
+        .to_string()
+}

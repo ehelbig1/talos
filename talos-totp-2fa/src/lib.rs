@@ -4,7 +4,7 @@ use redis::AsyncCommands;
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
 use std::time::Instant;
-use totp_rs::{Algorithm, Secret, TOTP};
+use totp_rs::{Algorithm, Builder, Secret, Totp};
 use uuid::Uuid;
 
 use talos_secrets_manager::SecretsManager;
@@ -532,7 +532,7 @@ impl TotpService {
         rand::rngs::OsRng.fill_bytes(&mut bytes);
 
         // Encode as base32
-        Secret::Raw(bytes.to_vec()).to_encoded().to_string()
+        Secret::from(bytes).to_base32().to_string()
     }
 
     /// Generate backup codes (10 codes, 12 hex characters each = 48 bits of entropy).
@@ -551,17 +551,20 @@ impl TotpService {
 
     /// Get TOTP instance for a user
     // `email` is not needed for TOTP generation; underscore silences the warning.
-    fn get_totp(&self, secret: &str, _email: &str) -> Result<TOTP> {
-        let totp = TOTP::new(
-            Algorithm::SHA1,
-            6, // 6-digit codes
-            1, // 1 step (30 seconds)
-            30,
-            Secret::Encoded(secret.to_string())
-                .to_bytes()
-                .context("Invalid secret")?,
-        )
-        .context("Failed to create TOTP")?;
+    fn get_totp(&self, secret: &str, _email: &str) -> Result<Totp> {
+        // Every parameter is stated, though these are the builder's defaults:
+        // they are also written into the enrolment URL below, and the two
+        // must not come apart because a default moved.
+        let secret = Secret::try_from_base32(secret).map_err(|_| anyhow!("Invalid secret"))?;
+        let totp = Builder::new()
+            .with_algorithm(Algorithm::SHA1)
+            .with_digits(6) // 6-digit codes
+            .with_skew(1) // 1 step (30 seconds)
+            .with_step_duration(30)
+            .with_secret(secret)
+            // Refuses a secret shorter than 128 bits, as `TOTP::new` did.
+            .build()
+            .map_err(|_| anyhow!("Failed to create TOTP"))?;
 
         Ok(totp)
     }
@@ -612,13 +615,21 @@ impl TotpService {
     /// Accepts codes from the previous, current, and next time step (±30s) to
     /// tolerate minor clock drift between client and server.
     pub fn verify_code(&self, secret: &str, email: &str, code: &str) -> Result<bool> {
-        use subtle::ConstantTimeEq;
-
-        let totp = self.get_totp(secret, email)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .context("System time error")?
             .as_secs();
+        self.verify_code_at(secret, email, code, now)
+    }
+
+    /// [`Self::verify_code`] with the clock passed in (`now`, seconds since
+    /// the Unix epoch), so the acceptance window can be tested: until
+    /// 2026-10-06 the only test was "the current code is accepted and
+    /// `000000` is not", which says nothing about how wide the window is.
+    fn verify_code_at(&self, secret: &str, email: &str, code: &str, now: u64) -> Result<bool> {
+        use subtle::ConstantTimeEq;
+
+        let totp = self.get_totp(secret, email)?;
 
         // Check the previous, current, and next 30-second windows so that minor
         // clock drift between client and server is tolerated.  All comparisons
@@ -629,7 +640,7 @@ impl TotpService {
         let mut valid = subtle::Choice::from(0u8);
 
         for t in [now.saturating_sub(step), now, now + step] {
-            let expected = totp.generate(t);
+            let expected = totp.generate(t).to_string();
             valid |= code_bytes.ct_eq(expected.as_bytes());
         }
 
@@ -1181,83 +1192,128 @@ mod tests {
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
     }
 
-    #[test]
-    #[ignore]
-    fn test_generate_secret() {
-        let db_pool = Pool::<Postgres>::connect_lazy("").unwrap();
-        std::env::set_var(
-            "TALOS_MASTER_KEY",
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        );
-        // allow-secrets-manager-new: test stub — no McpState in unit tests
-        let secrets_manager =
-            Arc::new(talos_secrets_manager::SecretsManager::new(db_pool.clone()).unwrap());
-        let service = TotpService::new(db_pool, None, secrets_manager);
+    // The three tests that stood here (`test_generate_secret`,
+    // `test_generate_backup_codes`, `test_verify_code`) were `#[ignore]`d: they
+    // built a pool with `connect_lazy("")` outside a runtime, so they could
+    // not run, and so nothing in this crate exercised secret generation or
+    // code verification. The four below replace them and run.
 
-        let secret1 = service.generate_secret();
-        let secret2 = service.generate_secret();
+    /// The RFC 6238 reference secret, base32-encoded.
+    const RFC_SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 
-        // Secrets should be different
-        assert_ne!(secret1, secret2);
-
-        // Secrets should be base32 encoded
-        assert!(secret1.len() > 10);
+    /// An enrolment secret is 160 random bits in the exact form an
+    /// authenticator app expects and this service later decodes: 32
+    /// characters of upper-case base32, no padding.
+    #[tokio::test]
+    async fn a_generated_secret_is_160_bits_of_unpadded_upper_case_base32() {
+        let service = stub_service(None);
+        let (a, b) = (service.generate_secret(), service.generate_secret());
+        assert_ne!(a, b);
+        for secret in [&a, &b] {
+            assert_eq!(secret.len(), 32, "{secret}");
+            assert!(
+                secret
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)),
+                "{secret}"
+            );
+            // It is usable as generated.
+            assert!(service.get_totp(secret, "user@example.com").is_ok());
+        }
     }
 
-    #[test]
-    #[ignore]
-    fn test_generate_backup_codes() {
-        let db_pool = Pool::<Postgres>::connect_lazy("").unwrap();
-        std::env::set_var(
-            "TALOS_MASTER_KEY",
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        );
-        // allow-secrets-manager-new: test stub — no McpState in unit tests
-        let secrets_manager =
-            Arc::new(talos_secrets_manager::SecretsManager::new(db_pool.clone()).unwrap());
-        let service = TotpService::new(db_pool, None, secrets_manager);
-
+    #[tokio::test]
+    async fn backup_codes_are_ten_distinct_twelve_digit_hex_strings() {
+        let service = stub_service(None);
         let codes = service.generate_backup_codes();
-
-        // Should generate 10 codes
         assert_eq!(codes.len(), 10);
-
-        // Each code should be 12 hex chars (48 bits entropy)
         for code in &codes {
             assert_eq!(code.len(), 12);
             assert!(code.chars().all(|c| c.is_ascii_hexdigit()));
         }
-
-        // Codes should be unique
-        let unique_codes: std::collections::HashSet<_> = codes.iter().collect();
-        assert_eq!(unique_codes.len(), 10);
+        let unique: std::collections::HashSet<_> = codes.iter().collect();
+        assert_eq!(unique.len(), 10);
     }
 
-    #[test]
-    #[ignore]
-    fn test_verify_code() {
-        let db_pool = Pool::<Postgres>::connect_lazy("").unwrap();
-        std::env::set_var(
-            "TALOS_MASTER_KEY",
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        );
-        // allow-secrets-manager-new: test stub — no McpState in unit tests
-        let secrets_manager =
-            Arc::new(talos_secrets_manager::SecretsManager::new(db_pool.clone()).unwrap());
-        let service = TotpService::new(db_pool, None, secrets_manager);
+    /// The codes this service expects are the ones every authenticator app
+    /// computes: RFC 6238 appendix B, SHA-1 (the last six digits of each
+    /// eight-digit reference value). Identical under totp-rs 5.7.2 and 6.0.0,
+    /// along with 3,248 other secret/time pairs compared when the crate moved.
+    #[tokio::test]
+    async fn generated_codes_match_the_rfc_6238_reference_values() {
+        let service = stub_service(None);
+        let totp = service.get_totp(RFC_SECRET, "user@example.com").unwrap();
+        for (time, expected) in [
+            (59u64, "287082"),
+            (1_111_111_109, "081804"),
+            (1_111_111_111, "050471"),
+            (1_234_567_890, "005924"),
+            (2_000_000_000, "279037"),
+            (20_000_000_000, "353130"),
+        ] {
+            assert_eq!(totp.generate(time).to_string(), expected, "t={time}");
+        }
+    }
 
-        let secret = service.generate_secret();
-        let email = "test@example.com";
+    /// The acceptance window is the current 30-second step and one on either
+    /// side — no wider, and a code is the whole six digits.
+    #[tokio::test]
+    async fn a_code_is_accepted_for_its_own_step_and_one_either_side() {
+        let service = stub_service(None);
+        let email = "user@example.com";
+        let check = |code: &str, now: u64| {
+            service
+                .verify_code_at(RFC_SECRET, email, code, now)
+                .unwrap()
+        };
+        // "050471" is the code for the step containing t = 1_111_111_111
+        // (1_111_111_110 ..= 1_111_111_139).
+        let (code, t) = ("050471", 1_111_111_111u64);
+        for now in [t, t - 1, t + 28, t - 30, t + 30, t - 31, t + 58] {
+            assert!(check(code, now), "should be accepted at {now}");
+        }
+        for now in [t - 32, t + 59, t - 60, t + 90, 0, 59] {
+            assert!(!check(code, now), "must be refused at {now}");
+        }
+        // The neighbouring steps' codes, at t: accepted. Two steps away: not.
+        assert!(check("081804", t)); // the step before (t = 1_111_111_109)
+        let two_before = service
+            .get_totp(RFC_SECRET, email)
+            .unwrap()
+            .generate(t - 60)
+            .to_string();
+        assert!(!check(&two_before, t));
+        // Not a code at all.
+        for bad in [
+            "", "05047", "0504710", "05047a", " 050471", "050471 ", "000000",
+        ] {
+            assert!(!check(bad, t), "{bad:?}");
+        }
+    }
 
-        // Generate current code
-        let totp = service.get_totp(&secret, email).unwrap();
-        let code = totp.generate_current().unwrap();
-
-        // Verify the code
-        assert!(service.verify_code(&secret, email, &code).unwrap());
-
-        // Invalid code should fail
-        assert!(!service.verify_code(&secret, email, "000000").unwrap());
+    /// A secret this service did not write is refused, never guessed at:
+    /// only upper-case unpadded base32 of at least 128 bits builds a verifier.
+    #[tokio::test]
+    async fn a_malformed_or_short_secret_is_refused() {
+        let service = stub_service(None);
+        for bad in [
+            "",
+            "gezdgnbvgy3tqojqgezdgnbvgy3tqojq",
+            "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ======",
+            "GEZD GNBV GY3T QOJQ GEZD GNBV GY3T QOJQ",
+            "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJ1",
+            "GEZDGNBVGY3TQOJQ",         // 80 bits
+            "GEZDGNBVGY3TQOJQGEZDGNBV", // 120 bits
+            "not a secret",
+        ] {
+            assert!(
+                service.get_totp(bad, "user@example.com").is_err(),
+                "{bad:?}"
+            );
+            assert!(service
+                .verify_code_at(bad, "user@example.com", "050471", 1_111_111_111)
+                .is_err());
+        }
     }
 
     /// The DEV fallback limiter, driven through the production function

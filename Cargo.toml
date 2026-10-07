@@ -264,7 +264,9 @@ tempfile = "3"
 thiserror = "2.0.18"
 tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
 tokio-util = "0.7"
-totp-rs = "5.7"
+# Without the default `migration` feature: it only re-exports the 5.x names
+# as deprecated aliases, and the workspace was ported off them (2026-10-06).
+totp-rs = { version = "6.0", default-features = false, features = ["std"] }
 tower = "0.5"
 tower-cookies = "0.11"
 tower_governor = "0.8.0"
