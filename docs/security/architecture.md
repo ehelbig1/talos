@@ -286,7 +286,8 @@ when no Redis client is configured (`talos-totp-2fa/src/lib.rs`).
 | Check | Implementation | File |
 |-------|---------------|------|
 | Algorithm | Pinned to the configured `JWT_ALGORITHM` — `HS256` (default), `RS256` or `ES256`; a token signed with any other algorithm is rejected. During a key/algorithm migration the previous key pair's algorithm is also accepted | `talos-auth/src/lib.rs::verify_token` |
-| Issuer claim | Must match `"talos"` | `Claims.iss` field, validated in `verify_token` |
+| Issuer claim | Required, and must match `"talos"`; a token with no `iss` is refused | `Claims.iss` field, validated in `verify_token` |
+| Critical header extensions | A header with `crit` is refused: the verifier understands none (RFC 7515 §4.1.11). The Google push-token verifier applies the same rule | `refuse_critical_extensions` in `talos-auth/src/lib.rs`; `talos-integration-helpers/src/google_jwt.rs::verify_signed` |
 | Audience claim | If present, must be `"talos"`; tokens with no `aud` are accepted unless `JWT_REQUIRE_AUD=true` | `talos-auth/src/lib.rs::verify_token` |
 | Expiration | 15-minute TTL | `Claims.exp` checked by jsonwebtoken crate |
 | 2FA status | `is_2fa_verified` claim: the session is not waiting for its 2FA code. It is `true` for an account with no second factor enrolled, so `require_2fa` refuses only a half-finished 2FA login | `require_2fa` on ordinary mutations (`talos-api/src/schema/mod.rs`) |

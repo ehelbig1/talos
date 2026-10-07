@@ -397,6 +397,15 @@ impl GoogleOidcVerifier {
         if header.alg != Algorithm::RS256 {
             return Err(VerifyError::WrongAlgorithm);
         }
+        // RFC 7515 §4.1.11: a verifier refuses a token naming critical
+        // header extensions it does not understand. This one understands
+        // none, and `jsonwebtoken` parses `crit` without acting on it.
+        // Google's push tokens carry no such header.
+        if header.crit.is_some() {
+            return Err(VerifyError::Invalid(
+                "the token names critical header extensions (crit); none are supported".to_string(),
+            ));
+        }
         let kid = header.kid.ok_or(VerifyError::MissingKid)?;
 
         // 2. Find the key. If unknown or our cache is old, refresh
@@ -1200,6 +1209,39 @@ mod tests {
         bytes[last] ^= 0x01;
         let tampered = String::from_utf8(bytes).unwrap();
         assert!(v.verify_signed(&tampered, TEST_AUDIENCE).await.is_err());
+    }
+
+    /// A correctly signed, otherwise valid token that names critical header
+    /// extensions is refused (RFC 7515 §4.1.11): this verifier understands
+    /// none. The same token without `crit` verifies, so the refusal is the
+    /// header's and nothing else's.
+    #[tokio::test]
+    async fn a_token_naming_critical_extensions_is_rejected() {
+        let (enc, dec, kid) = keypair();
+        let v = make_verifier(dec, &kid);
+        let claims = json!({
+            "iss": GOOGLE_ISSUER,
+            "email": TEST_SA,
+            "email_verified": true,
+            "aud": TEST_AUDIENCE,
+            "iat": now(),
+            "exp": now() + 300,
+        });
+        for crit in [vec!["made_up".to_string()], vec!["kid".to_string()], vec![]] {
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some(kid.clone());
+            header.crit = Some(crit.clone());
+            let token = encode(&header, &claims, &enc).unwrap();
+            let refused = v.verify_signed(&token, TEST_AUDIENCE).await;
+            assert!(
+                matches!(refused, Err(VerifyError::Invalid(ref why)) if why.contains("crit")),
+                "crit {crit:?}: {refused:?}"
+            );
+        }
+        let without = sign(&enc, &kid, claims);
+        v.verify_signed(&without, TEST_AUDIENCE)
+            .await
+            .expect("the same token without crit verifies");
     }
 
     #[test]
