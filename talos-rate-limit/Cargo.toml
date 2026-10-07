@@ -15,6 +15,7 @@ axum = { workspace = true, features = ["json"] }
 governor.workspace = true
 ipnetwork.workspace = true
 redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
+talos-redis = { path = "../talos-redis" }
 talos-config = { path = "../talos-config" }
 talos-metrics = { path = "../talos-metrics" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }

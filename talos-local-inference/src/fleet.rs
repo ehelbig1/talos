@@ -298,11 +298,9 @@ impl FleetAdmission {
         timing: FleetTiming,
         sink: Option<Arc<FleetSink>>,
     ) -> redis::RedisResult<Self> {
-        let conn = tokio::time::timeout(timing.redis_call * 5, ConnectionManager::new(client))
+        let conn = tokio::time::timeout(timing.redis_call * 5, talos_redis::manager(client))
             .await
-            .map_err(|_| {
-                redis::RedisError::from((redis::ErrorKind::IoError, "connect timed out"))
-            })??;
+            .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "connect timed out")))??;
         Ok(Self {
             inner: Arc::new(Inner {
                 conn,

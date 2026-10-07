@@ -153,8 +153,7 @@ impl TotpService {
     /// count this attempt. The TTL is set only by the `SET NX`, so the window
     /// is fixed from the first attempt and cannot be left without an expiry.
     async fn charge_enrolment_redis(&self, user_id: Uuid, redis: &redis::Client) -> Result<u64> {
-        let mut conn = redis
-            .get_multiplexed_async_connection()
+        let mut conn = talos_redis::multiplexed(redis)
             .await
             .context("Failed to get Redis connection")?;
         let key = format!("totp_enrol:{user_id}");
@@ -259,8 +258,7 @@ impl TotpService {
         user_id: Uuid,
         redis: &Arc<redis::Client>,
     ) -> Result<Result<()>> {
-        let mut conn = redis
-            .get_multiplexed_async_connection()
+        let mut conn = talos_redis::multiplexed(redis)
             .await
             .context("Failed to get Redis connection")?;
 
@@ -482,8 +480,7 @@ impl TotpService {
         user_id: Uuid,
         redis: &Arc<redis::Client>,
     ) -> Result<()> {
-        let mut conn = redis
-            .get_multiplexed_async_connection()
+        let mut conn = talos_redis::multiplexed(redis)
             .await
             .context("Failed to get Redis connection")?;
 
@@ -972,7 +969,7 @@ impl TotpService {
             // the same window is rejected even if the signature is valid.
             if let Some(redis) = &self.redis_client {
                 let cache_key = format!("totp_used:{}:{}", user_id, code);
-                match redis.get_multiplexed_async_connection().await {
+                match talos_redis::multiplexed(redis).await {
                     Err(e) => {
                         // Fail closed: if Redis is unavailable we cannot enforce replay
                         // prevention, so reject the login rather than accept a potentially
@@ -1556,13 +1553,10 @@ mod redis_lockout_tests {
     /// The shared counter as Redis holds it.
     async fn read_attempts(service: &TotpService, user_id: Uuid) -> i64 {
         use redis::AsyncCommands as _;
-        let mut conn = service
-            .redis_client
-            .as_ref()
-            .expect("redis client")
-            .get_multiplexed_async_connection()
-            .await
-            .expect("redis connection");
+        let mut conn =
+            talos_redis::multiplexed(service.redis_client.as_ref().expect("redis client"))
+                .await
+                .expect("redis connection");
         conn.hget::<_, _, Option<i64>>(format!("totp_rate_limit:{user_id}"), "failed_attempts")
             .await
             .expect("read the counter")
@@ -1713,11 +1707,7 @@ mod redis_lockout_tests {
             Err(EnrolmentThrottled)
         );
         use redis::AsyncCommands as _;
-        let mut conn = a
-            .redis_client
-            .as_ref()
-            .expect("redis client")
-            .get_multiplexed_async_connection()
+        let mut conn = talos_redis::multiplexed(a.redis_client.as_ref().expect("redis client"))
             .await
             .expect("redis connection");
         let ttl: i64 = conn

@@ -34,6 +34,7 @@ hex.workspace = true
 rand = { workspace = true, features = ["default", "std"] }
 tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
+talos-redis = { path = "../talos-redis" }
 
 [dev-dependencies]
 # Crafting tokens by hand in the verifier's verdict-table test.

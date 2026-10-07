@@ -72,7 +72,7 @@ pub struct RedisLease {
 impl RedisLease {
     /// Connect a lease from a shared `redis::Client`.
     pub async fn connect(client: &redis::Client) -> redis::RedisResult<Self> {
-        let conn = redis::aio::ConnectionManager::new(client.clone()).await?;
+        let conn = talos_redis::manager(client.clone()).await?;
         Ok(Self {
             conn,
             prefix: "envelope:lease:".to_string(),

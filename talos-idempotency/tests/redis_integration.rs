@@ -232,7 +232,7 @@ async fn a_dedup_claim_is_held_for_the_window_the_caller_passed() {
 
     // The claim's TTL is the window the caller asked for, not the store's own
     // idea of one — read back from the server.
-    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let mut conn = talos_redis::multiplexed(&client).await.unwrap();
     let ttl: i64 = redis::cmd("TTL")
         .arg(format!("webhook:processed:{trigger}:{event}"))
         .query_async(&mut conn)

@@ -3872,12 +3872,10 @@ impl TalosContext {
         let cell = self.redis_conn_mgr.clone();
         async move {
             let client = client.ok_or_else(|| {
-                redis::RedisError::from((redis::ErrorKind::IoError, "Redis not configured"))
+                redis::RedisError::from((redis::ErrorKind::Io, "Redis not configured"))
             })?;
             let mgr = cell
-                .get_or_try_init(|| async {
-                    redis::aio::ConnectionManager::new((*client).clone()).await
-                })
+                .get_or_try_init(|| async { talos_redis::manager((*client).clone()).await })
                 .await?;
             Ok(mgr.clone())
         }

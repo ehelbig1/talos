@@ -698,8 +698,7 @@ async fn deduplicate_messages<'a>(
     messages: &[&'a super::api::HistoryMessageRef],
     email: &str,
 ) -> Result<Vec<&'a super::api::HistoryMessageRef>> {
-    let mut conn = client
-        .get_multiplexed_async_connection()
+    let mut conn = talos_redis::multiplexed(client)
         .await
         .context("redis connection")?;
     let mut fresh = Vec::with_capacity(messages.len());
@@ -727,8 +726,7 @@ async fn mark_message_processed(
     message_id: &str,
     email: &str,
 ) -> Result<()> {
-    let mut conn = client
-        .get_multiplexed_async_connection()
+    let mut conn = talos_redis::multiplexed(client)
         .await
         .context("redis connection")?;
     let key = format!("gmail:processed:{}:{}", email, message_id);

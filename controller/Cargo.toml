@@ -163,6 +163,7 @@ tower = { workspace = true, features = ["util"] }
 # External services for WASM capabilities
 # Updated to match worker versions for type compatibility
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+talos-redis = { path = "../talos-redis" }
 # rustls is pulled in transitively by redis/sqlx/reqwest. We add it as a
 # direct dep so main.rs can call rustls::crypto::ring::default_provider()
 # .install_default() at startup — required since rustls 0.23 stopped

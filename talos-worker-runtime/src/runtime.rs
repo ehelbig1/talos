@@ -3088,7 +3088,7 @@ impl TalosRuntime {
         }
         // Fall back to Redis if configured.
         if let Some(redis) = &self.redis_client {
-            if let Ok(mut conn) = redis.get_multiplexed_async_connection().await {
+            if let Ok(mut conn) = talos_redis::multiplexed(redis).await {
                 use redis::AsyncCommands;
                 if let Ok(cached_str) = conn.get::<_, String>(cache_key).await {
                     if let Ok(cached_json) = serde_json::from_str::<JsonValue>(&cached_str) {
@@ -3143,7 +3143,7 @@ impl TalosRuntime {
         self.insert_to_cache(cache_key.to_string(), result.clone(), ttl_secs);
         // Also push to Redis if available.
         if let Some(redis) = &self.redis_client {
-            if let Ok(mut conn) = redis.get_multiplexed_async_connection().await {
+            if let Ok(mut conn) = talos_redis::multiplexed(redis).await {
                 use redis::AsyncCommands;
                 if let Ok(result_str) = serde_json::to_string(result) {
                     let _ = conn

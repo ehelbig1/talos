@@ -6998,7 +6998,7 @@ async fn handle_submit_workflow_approval(
     // containing the NATS reply topic.  Publishing "true"/"false" unblocks the waiting WASM.
     let mut nats_published = false;
     if let Some(ref redis) = state.registry.redis_client {
-        match redis.get_multiplexed_tokio_connection().await {
+        match talos_redis::multiplexed(redis).await {
             Ok(mut con) => {
                 let redis_key = format!("approval:{}", exec_id);
                 // MCP-999 (2026-05-15): MCP-535 sibling on Redis side.

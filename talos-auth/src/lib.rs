@@ -2510,8 +2510,7 @@ impl AuthService {
         const LIMIT: i64 = 10;
         const WINDOW_SECS: i64 = 60;
 
-        let mut conn = redis
-            .get_multiplexed_async_connection()
+        let mut conn = talos_redis::multiplexed(redis)
             .await
             .context("Failed to get Redis connection")?;
 

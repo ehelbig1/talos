@@ -140,7 +140,7 @@ pub(crate) async fn init_redis() -> Option<std::sync::Arc<redis::Client>> {
         match redis::Client::open(redis_url.as_str()) {
             Ok(client) => {
                 // Test connection
-                match client.get_multiplexed_async_connection().await {
+                match talos_redis::multiplexed(&client).await {
                     Ok(_) => {
                         // Use `next_back` to avoid iterating the whole iterator when extracting the host part.
                         tracing::info!(

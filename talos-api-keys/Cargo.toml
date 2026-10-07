@@ -13,6 +13,7 @@ chrono.workspace = true
 hex.workspace = true
 rand = { workspace = true, features = ["default", "std"] }
 redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
+talos-redis = { path = "../talos-redis" }
 subtle.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

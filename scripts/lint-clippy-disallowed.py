@@ -18,7 +18,12 @@ disallowed method on its item. This script owns that half:
                 three lines above it, naming a path this table knows, and
                 every clippy.toml entry belongs to a rule here.
 
-Called by scripts/lint-structural.sh (checks 7, 29, 53, 63, 78).
+A rule may own several paths (`"paths"`) and be named by a word instead of a
+structural-check number: `redis` covers every way of opening a Redis
+connection, and is run from `make lint` as `check redis`.
+
+Called by scripts/lint-structural.sh (checks 7, 29, 53, 63, 78) and by
+`make lint` (`check redis`).
 """
 import fnmatch
 import os
@@ -55,7 +60,30 @@ RULES = {
         "sanctioned": ["talos-engine/src/nats_run.rs", "talos-workflow-engine-nats/*"],
         "defined": ("talos-workflow-engine-nats/src/dispatcher.rs", r"impl NatsNodeDispatcher \{[\s\S]*?pub fn new\("),
     },
+    # Every way the `redis` crate opens an async connection. From 1.0 each of
+    # them carries the library's default deadlines unless a config is passed,
+    # and there is no client-wide setting — so the one sanctioned caller is
+    # the crate that passes the workspace's (2026-10-07).
+    "redis": {
+        "paths": [
+            "redis::Client::get_multiplexed_async_connection",
+            "redis::Client::get_multiplexed_async_connection_with_config",
+            "redis::Client::get_connection_manager",
+            "redis::Client::get_connection_manager_with_config",
+            "redis::Client::get_connection_manager_lazy",
+            "redis::aio::ConnectionManager::new",
+            "redis::aio::ConnectionManager::new_with_config",
+            "redis::aio::ConnectionManager::new_lazy_with_config",
+        ],
+        "sanctioned": ["talos-redis/src/lib.rs"],
+        "defined": None,
+    },
 }
+
+
+def rule_paths(rule) -> list:
+    """The clippy paths a rule owns: one (`path`) or several (`paths`)."""
+    return rule["paths"] if "paths" in rule else [rule["path"]]
 
 ATTR_RE = re.compile(r"#!?\[\s*(allow|expect)\s*\([^\]]*clippy::disallowed_methods")
 MARKER_RE = re.compile(r"//\s*disallowed-method:\s*([A-Za-z0-9_:]+)")
@@ -109,17 +137,20 @@ def sanctioned(rel: Path, globs) -> bool:
     return any(fnmatch.fnmatch(s, g) or fnmatch.fnmatch("/" + s, "*/" + g.lstrip("*/")) for g in globs)
 
 
-def check_rule(n: int) -> int:
+def check_rule(n) -> int:
     rule = RULES.get(n)
     if rule is None:
         print(f"✗ no disallowed-methods rule for check {n}")
         return 2
     errors = []
+    owned = rule_paths(rule)
     paths = toml_paths()
     if paths is None:
         errors.append("clippy.toml is missing")
-    elif rule["path"] not in paths:
-        errors.append(f"clippy.toml no longer disallows `{rule['path']}` — clippy stopped enforcing check {n}")
+    else:
+        for owned_path in owned:
+            if owned_path not in paths:
+                errors.append(f"clippy.toml no longer disallows `{owned_path}` — clippy stopped enforcing check {n}")
     if rule["defined"]:
         f, pat = rule["defined"]
         try:
@@ -130,22 +161,24 @@ def check_rule(n: int) -> int:
             errors.append(f"{f} is gone — repoint the check {n} entry in scripts/lint-clippy-disallowed.py")
     allowed = 0
     for rel, ln, named in allow_sites():
-        if rule["path"] not in named:
+        waived = [p for p in owned if p in named]
+        if not waived:
             continue
         allowed += 1
         if not sanctioned(rel, rule["sanctioned"]):
-            errors.append(f"{rel}:{ln} allows `{rule['path']}` outside the files check {n} sanctions")
+            errors.append(f"{rel}:{ln} allows `{waived[0]}` outside the files check {n} sanctions")
     for e in errors:
         print(f"✗ {e}")
     if errors:
         return 1
-    print(f"✓ clippy disallows `{rule['path']}`; {allowed} sanctioned allow(s), all in permitted files")
+    what = f"`{owned[0]}`" if len(owned) == 1 else f"{len(owned)} `{owned[0].split('::')[0]}` paths"
+    print(f"✓ clippy disallows {what}; {allowed} sanctioned allow(s), all in permitted files")
     return 0
 
 
 def check_allows() -> int:
     errors = []
-    known = {r["path"] for r in RULES.values()}
+    known = {p for r in RULES.values() for p in rule_paths(r)}
     paths = toml_paths()
     if paths is None:
         errors.append("clippy.toml is missing")
@@ -173,8 +206,8 @@ def check_allows() -> int:
 def main(argv) -> int:
     if len(argv) == 2 and argv[1] == "check-allows":
         return check_allows()
-    if len(argv) == 3 and argv[1] == "check" and argv[2].isdigit():
-        return check_rule(int(argv[2]))
+    if len(argv) == 3 and argv[1] == "check":
+        return check_rule(int(argv[2]) if argv[2].isdigit() else argv[2])
     print(__doc__, file=sys.stderr)
     return 2
 

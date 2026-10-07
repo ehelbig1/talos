@@ -974,7 +974,7 @@ async fn invalidate_redis_cache(module_id: Uuid, effective_wm_id: Uuid, user_id:
             return;
         }
     };
-    let mut con = match client.get_multiplexed_async_connection().await {
+    let mut con = match talos_redis::multiplexed(&client).await {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(

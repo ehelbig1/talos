@@ -778,7 +778,7 @@ impl OAuthService {
 
         // Step 2: Redis marker (defence in depth behind the DB claim above).
         if let Some(redis) = &self.redis_client {
-            match redis.get_multiplexed_tokio_connection().await {
+            match talos_redis::multiplexed(redis).await {
                 Ok(mut con) => {
                     // Lua script: Check if key exists, if not set it with TTL and return 1
                     // If key exists, return 0 (replay detected)

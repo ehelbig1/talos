@@ -1964,8 +1964,7 @@ async fn deduplicate_events(
     }
 
     // Get async connection
-    let mut conn = redis
-        .get_multiplexed_async_connection()
+    let mut conn = talos_redis::multiplexed(redis)
         .await
         .context("Failed to connect to Redis for deduplication")?;
 
@@ -2022,8 +2021,7 @@ async fn mark_event_processed(
 ) -> Result<()> {
     let cache_key = generate_event_cache_key(event, channel_uuid)?;
 
-    let mut conn = redis
-        .get_multiplexed_async_connection()
+    let mut conn = talos_redis::multiplexed(redis)
         .await
         .context("Failed to connect to Redis")?;
 

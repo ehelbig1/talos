@@ -724,7 +724,7 @@ impl DistributedRateLimiter {
     ) -> Result<redis::aio::ConnectionManager, redis::RedisError> {
         let mgr = self
             .conn_mgr
-            .get_or_try_init(|| async { redis::aio::ConnectionManager::new(client.clone()).await })
+            .get_or_try_init(|| async { talos_redis::manager(client.clone()).await })
             .await?;
         Ok(mgr.clone())
     }
@@ -814,7 +814,7 @@ impl DistributedRateLimiter {
         {
             Ok(res) => res,
             Err(_elapsed) => Err(redis::RedisError::from((
-                redis::ErrorKind::IoError,
+                redis::ErrorKind::Io,
                 "rate-limit Redis check timed out",
             ))),
         }

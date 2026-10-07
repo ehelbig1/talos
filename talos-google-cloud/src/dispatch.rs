@@ -543,8 +543,7 @@ async fn audit_dispatch_failed(
 /// created (this incident is fresh), `false` when it already existed
 /// (duplicate).
 async fn reserve_dedup(client: &Arc<redis::Client>, key: &str) -> Result<bool> {
-    let mut conn = client
-        .get_multiplexed_async_connection()
+    let mut conn = talos_redis::multiplexed(client)
         .await
         .context("redis connection")?;
     let was_new: bool = conn
@@ -561,8 +560,7 @@ async fn reserve_dedup(client: &Arc<redis::Client>, key: &str) -> Result<bool> {
 }
 
 async fn mark_processed(client: &Arc<redis::Client>, key: &str) -> Result<()> {
-    let mut conn = client
-        .get_multiplexed_async_connection()
+    let mut conn = talos_redis::multiplexed(client)
         .await
         .context("redis connection")?;
     let _: () = conn

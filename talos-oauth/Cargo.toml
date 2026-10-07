@@ -19,6 +19,7 @@ hex.workspace = true
 # `http` 1.x axum and reqwest already use).
 http.workspace = true
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+talos-redis = { path = "../talos-redis" }
 oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde.workspace = true

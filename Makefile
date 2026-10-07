@@ -291,6 +291,8 @@ lint: ## Fast gate: rustfmt + WIT drift + structural lints (no clippy) + offline
 	@python3 scripts/check-ci-uses-make.py
 	@printf '▶ crates inherit the workspace package fields and lints\n'
 	@python3 scripts/check-workspace-package.py
+	@printf '▶ Redis connections are opened in one place\n'
+	@python3 scripts/lint-clippy-disallowed.py check redis
 # NOTE: no `cargo fmt --all -- --check` here. It ran TWICE per `make lint` —
 # once from this target and again as structural check 35 — which is pure
 # duplicated wall-clock for identical coverage. Check 35 is the copy that was

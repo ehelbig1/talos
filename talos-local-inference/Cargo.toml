@@ -14,6 +14,7 @@ publish.workspace = true
 [dependencies]
 futures-util.workspace = true
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "script", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+talos-redis = { path = "../talos-redis" }
 reqwest = { workspace = true, features = ["json", "stream", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true

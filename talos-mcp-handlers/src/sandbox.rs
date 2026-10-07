@@ -3438,7 +3438,7 @@ async fn handle_update_module_secrets(
     // Invalidate Redis cache (best-effort)
     if let Ok(redis_url) = std::env::var("REDIS_URL") {
         if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-            if let Ok(mut con) = client.get_multiplexed_async_connection().await {
+            if let Ok(mut con) = talos_redis::multiplexed(&client).await {
                 let cache_key = format!("wasm:{}", module_id);
                 let _: Result<(), _> = redis::cmd("DEL")
                     .arg(&cache_key)
@@ -3574,7 +3574,7 @@ async fn handle_update_module_hosts(
 
     if let Ok(redis_url) = std::env::var("REDIS_URL") {
         if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-            if let Ok(mut con) = client.get_multiplexed_async_connection().await {
+            if let Ok(mut con) = talos_redis::multiplexed(&client).await {
                 let cache_key = format!("wasm:{}", module_id);
                 let _: Result<(), _> = redis::cmd("DEL")
                     .arg(&cache_key)
@@ -3706,7 +3706,7 @@ async fn handle_update_module_methods(
 
     if let Ok(redis_url) = std::env::var("REDIS_URL") {
         if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-            if let Ok(mut con) = client.get_multiplexed_async_connection().await {
+            if let Ok(mut con) = talos_redis::multiplexed(&client).await {
                 let cache_key = format!("wasm:{}", module_id);
                 let _: Result<(), _> = redis::cmd("DEL")
                     .arg(&cache_key)
