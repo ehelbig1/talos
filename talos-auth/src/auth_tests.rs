@@ -776,6 +776,86 @@ async fn password_matches_refuses_the_legacy_oauth_sentinel() {
         .unwrap());
 }
 
+/// Password hashes already in the database were written by whichever bcrypt
+/// was current at the time, and every later one has to keep reading them. The
+/// three below were produced by bcrypt 0.18.0 (made-up passwords, cost 4),
+/// the fourth is the OpenBSD reference vector for the empty password in the
+/// older `$2a$` spelling.
+///
+/// Recorded when the crate moved to 0.19 (2026-10-06): hashing and verifying
+/// across the two versions agreed on every case tried, and differed only in
+/// the wording of the error for a malformed hash. A future release that
+/// stopped reading one of these would lock every such account out, and
+/// nothing else here would notice — the other tests hash and verify with the
+/// same version.
+#[tokio::test]
+async fn a_hash_written_by_an_older_bcrypt_still_verifies() {
+    const OF_CORRECT_HORSE_9: &str = "$2b$04$a/1VWP65M8Rj.yQsZrxgM.t/H59Pxfa4EHdGl0ZPZynnqqA7Z3e9.";
+    const OF_EMPTY: &str = "$2b$04$tejtqH1llkyU5njbWYhGsekCiDKFiny7w31Dfnb0qpRYGv1M41rd2";
+    const OF_72_BYTES: &str = "$2b$04$WJrF05ToUqti34t5KXJUIexKuE6qJe0jN/p3dSyPSoXMF26FmTvmq";
+    const OPENBSD_2A_EMPTY: &str = "$2a$06$DCq7YPn5Rq63x1Lad4cll.TV4S6ytwfsfvkgY8jIucDrjc8deX1s.";
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://localhost/talos_test")
+        .unwrap();
+    let service = AuthService::new(
+        pool,
+        "this-is-a-test-secret-that-is-32bytes".into(),
+        10,
+        None,
+    )
+    .unwrap();
+
+    // Through the one password check the login path uses.
+    assert!(service
+        .password_matches("Correct-Horse-9", OF_CORRECT_HORSE_9)
+        .await
+        .unwrap());
+    assert!(!service
+        .password_matches("Correct-Horse-8", OF_CORRECT_HORSE_9)
+        .await
+        .unwrap());
+    let seventy_two: String = (0..72u8).map(|i| (b'a' + i % 26) as char).collect();
+    assert!(service
+        .password_matches(&seventy_two, OF_72_BYTES)
+        .await
+        .unwrap());
+    assert!(!service
+        .password_matches(&seventy_two[..71], OF_72_BYTES)
+        .await
+        .unwrap());
+
+    // The library itself, on the spellings a stored hash may have.
+    assert!(bcrypt::verify("", OF_EMPTY).unwrap());
+    assert!(bcrypt::verify("", OPENBSD_2A_EMPTY).unwrap());
+    assert!(!bcrypt::verify("x", OPENBSD_2A_EMPTY).unwrap());
+    assert!(bcrypt::verify(
+        "Correct-Horse-9",
+        &OF_CORRECT_HORSE_9.replacen("$2b$", "$2y$", 1)
+    )
+    .unwrap());
+
+    // A stored value that is not a hash is an error, never a match.
+    for malformed in [
+        "",
+        "plaintext-password",
+        &OF_CORRECT_HORSE_9[..59],
+        &format!("{OF_CORRECT_HORSE_9}A"),
+        &format!("{OF_CORRECT_HORSE_9}\n"),
+        &OF_CORRECT_HORSE_9.replacen("$04$", "$03$", 1),
+        &OF_CORRECT_HORSE_9.replacen("$04$", "$32$", 1),
+    ] {
+        assert!(
+            bcrypt::verify("Correct-Horse-9", malformed).is_err(),
+            "{malformed:?}"
+        );
+        assert!(service
+            .password_matches("Correct-Horse-9", malformed)
+            .await
+            .is_err());
+    }
+}
+
 #[test]
 fn a_reserved_password_cannot_be_chosen() {
     use talos_unusable_password::LEGACY_OAUTH_NO_PASSWORD_SENTINEL as SENTINEL;
