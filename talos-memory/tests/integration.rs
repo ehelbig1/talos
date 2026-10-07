@@ -67,14 +67,14 @@ mod test_crypto {
             aad: Vec<u8>,
         ) -> talos_memory::EncryptFuture {
             Box::pin(async move {
-                let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&TEST_KEY));
+                let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(TEST_KEY));
                 // Random 12-byte nonce, prepended to the ciphertext so decrypt
                 // can recover it. Same on-wire shape the production cipher uses.
                 let mut nonce_bytes = [0u8; 12];
                 rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
                 let ct = cipher
                     .encrypt(
-                        Nonce::from_slice(&nonce_bytes),
+                        &Nonce::from(nonce_bytes),
                         Payload {
                             msg: plaintext.as_bytes(),
                             aad: &aad,
@@ -101,10 +101,10 @@ mod test_crypto {
                     anyhow::bail!("test ciphertext too short");
                 }
                 let (nonce_bytes, ct) = ciphertext.split_at(12);
-                let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&TEST_KEY));
+                let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(TEST_KEY));
                 let pt = cipher
                     .decrypt(
-                        Nonce::from_slice(nonce_bytes),
+                        <&Nonce<_>>::try_from(nonce_bytes).expect("12 bytes"),
                         Payload { msg: ct, aad: &aad },
                     )
                     // A wrong AAD (cross-row swap) or tampered ciphertext lands

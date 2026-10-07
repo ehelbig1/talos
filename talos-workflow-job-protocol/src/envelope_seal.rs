@@ -153,7 +153,7 @@ pub fn seal_secrets(
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "invalid AES key".to_string())?;
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce_bytes),
+            &Nonce::from(nonce_bytes),
             Payload {
                 msg: plaintext,
                 aad: &aad,
@@ -228,7 +228,7 @@ impl WorkerEphemeral {
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "invalid AES key".to_string())?;
         let plaintext = cipher
             .decrypt(
-                Nonce::from_slice(nonce),
+                &Nonce::from(*nonce),
                 Payload {
                     msg: ciphertext,
                     aad: &aad,
