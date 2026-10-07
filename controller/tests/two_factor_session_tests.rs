@@ -59,18 +59,7 @@ async fn totp_ready(ctx: &common::TestContext, user: Uuid) {
 }
 
 fn current_code(secret: &str) -> String {
-    totp_rs::TOTP::new(
-        totp_rs::Algorithm::SHA1,
-        6,
-        1,
-        30,
-        totp_rs::Secret::Encoded(secret.to_string())
-            .to_bytes()
-            .unwrap(),
-    )
-    .unwrap()
-    .generate_current()
-    .unwrap()
+    common::authenticator_code(secret)
 }
 
 async fn totp_enabled(pool: &sqlx::PgPool, user: Uuid) -> bool {

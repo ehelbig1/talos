@@ -297,16 +297,7 @@ async fn a_grant_that_cannot_be_recorded_does_not_happen() {
 
 async fn enrol(ctx: &common::TestContext, user: Uuid) -> Result<Vec<String>, anyhow::Error> {
     let secret = ctx.totp_service.generate_secret();
-    let code = totp_rs::TOTP::new(
-        totp_rs::Algorithm::SHA1,
-        6,
-        1,
-        30,
-        totp_rs::Secret::Encoded(secret.clone()).to_bytes().unwrap(),
-    )
-    .unwrap()
-    .generate_current()
-    .unwrap();
+    let code = common::authenticator_code(&secret);
     let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
         .bind(user)
         .fetch_one(&ctx.db_pool)
