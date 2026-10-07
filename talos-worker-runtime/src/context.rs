@@ -2621,10 +2621,8 @@ impl TalosContext {
         header_name: Option<&str>,
     ) -> Option<crate::audit::AuditEvent> {
         self.audit_ledger.as_ref()?;
-        let key_hash = format!(
-            "{:x}",
-            <sha2::Sha256 as sha2::Digest>::digest(key_name.as_bytes())
-        );
+        let key_hash =
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(key_name.as_bytes())).to_string();
         let dedupe = format!("{}|{}|{}", surface.as_str(), key_hash, destination);
         let action = match secret_use_admission(
             &mut self.secret_use_recorded,
@@ -4087,10 +4085,8 @@ mod secret_use_ledger_tests {
         assert_eq!(event.action, "wasi:secret_use");
         assert_eq!(event.actor, "worker");
         let p: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
-        let expected_hash = format!(
-            "{:x}",
-            <sha2::Sha256 as sha2::Digest>::digest(PATH.as_bytes())
-        );
+        let expected_hash =
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(PATH.as_bytes())).to_string();
         assert_eq!(p["key_hash"], expected_hash);
         assert_eq!(p["surface"], "http-header");
         assert_eq!(p["destination"], "gmail.googleapis.com");

@@ -312,6 +312,27 @@ pub fn env_kek_legacy_provider_from_environment() -> Result<Option<Arc<dyn KekPr
 
 #[cfg(test)]
 mod tests {
+    /// Known answers for the key derivation, computed OUTSIDE this code — by
+    /// Python's standard `hmac`/`hashlib`, implementing RFC 5869 directly —
+    /// for made-up inputs. Every purpose key the environment KEK hands out stays the same only if this
+    /// derivation never changes; a dependency bump that altered it would make
+    /// them all unreadable without a single test failing elsewhere.
+    #[test]
+    fn the_purpose_key_derivation_matches_rfc_5869() {
+        let kek = EnvKekProvider::from_raw_bytes(b"made-up master key material 32b!".to_vec());
+        let key = kek
+            .derive_purpose_key(
+                b"talos-ml-content-key/v1",
+                b"ml-example-content-fingerprint",
+            )
+            .expect("derive")
+            .expect("the environment KEK derives purpose keys");
+        assert_eq!(
+            hex::encode(*key),
+            "7b2db116df02fd692266b15721fe5730d065d9cc31666f783cbe8d18df0d7df1"
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

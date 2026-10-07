@@ -1667,7 +1667,7 @@ fn aot_key_ring() -> &'static AotKeyRing {
         {
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
-            let mut mac = Hmac::<Sha256>::new_from_slice(&signing_key)
+            let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&signing_key)
                 .expect("HMAC-SHA256 accepts any key length");
             mac.update(b"talos-aot-key-fingerprint-v1");
             let tag = mac.finalize().into_bytes();
@@ -6054,7 +6054,7 @@ impl TalosRuntime {
         // blob to a specific cap-world. Always sign with the current
         // key from the key ring.
         let key_ring = aot_key_ring();
-        let mut mac = Hmac::<Sha256>::new_from_slice(&key_ring.signing_key)
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&key_ring.signing_key)
             .map_err(|e| anyhow::anyhow!("Failed to create AOT HMAC: {}", e))?;
         mac.update(&aot_hmac_input(&cap, &serialized));
         let tag: [u8; AOT_HMAC_LEN] = mac.finalize().into_bytes().into();
@@ -6232,7 +6232,7 @@ fn load_precompiled_on(
     let mut matched_key_index = 0usize;
 
     for (idx, key) in key_ring.verification_keys.iter().enumerate() {
-        let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key)
             .map_err(|e| anyhow::anyhow!("Failed to create AOT HMAC: {}", e))?;
         mac.update(&hmac_input);
         let expected_tag = mac.finalize().into_bytes();

@@ -143,7 +143,7 @@ impl AuditEvent {
         hasher.update(b"|");
         hasher.update(&event_bytes);
 
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// Sign this event using HMAC-SHA256 if a signing key is configured.
@@ -175,7 +175,7 @@ impl AuditEvent {
     /// selftest needs a *chosen* key pair (including a deliberately mismatched
     /// one) to pin the present-but-non-functional case.
     pub fn sign_with_hash_using(&mut self, event_hash: &str, key: &[u8]) {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         if let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) {
             mac.update(event_hash.as_bytes());
             self.hmac_signature = Some(hex::encode(mac.finalize().into_bytes()));
@@ -195,7 +195,7 @@ impl AuditEvent {
         let event_hash = self.calculate_hash();
 
         for key in keys {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
             if let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) {
                 mac.update(event_hash.as_bytes());
                 // Use constant-time verification
@@ -508,7 +508,7 @@ impl ExecutionLedger {
         hasher.update(execution_id.len().to_string().as_bytes());
         hasher.update(b"\0");
         hasher.update(execution_id.as_bytes());
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// Appends a new event to the ledger, calculating the proper sequence,

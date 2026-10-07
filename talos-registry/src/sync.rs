@@ -494,7 +494,9 @@ fn parse_sha256_digest(digest: &str) -> Result<&str> {
 /// Does `bytes` hash to `digest` (`sha256:<hex>`)?
 fn content_matches_digest(bytes: &[u8], digest: &str) -> bool {
     use sha2::Digest as _;
-    format!("sha256:{:x}", sha2::Sha256::digest(bytes)) == digest
+    let hash = sha2::Sha256::digest(bytes);
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}") == digest
 }
 
 /// Resolve a tag reference to its manifest digest ONCE and return the

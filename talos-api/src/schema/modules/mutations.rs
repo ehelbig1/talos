@@ -181,7 +181,7 @@ impl ModulesMutations {
             let precompiled_len = precompiled.len() as i32;
             let mut hasher = sha2::Sha256::new();
             hasher.update(&precompiled);
-            let hash = format!("{:x}", hasher.finalize());
+            let hash = hex::encode(hasher.finalize()).to_string();
             let inspection = talos_worker_runtime::inspect_component(&precompiled);
 
             (
@@ -206,7 +206,7 @@ impl ModulesMutations {
                     .as_bytes(),
             );
             hasher.update(Uuid::new_v4().to_string().as_bytes()); // Force uniqueness to bypass WASM deduplication layer
-            let hash = format!("{:x}", hasher.finalize());
+            let hash = hex::encode(hasher.finalize()).to_string();
 
             (
                 vec![],         // Empty WASM bytes

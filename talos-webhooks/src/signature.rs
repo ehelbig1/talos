@@ -182,7 +182,7 @@ pub fn header_is_sensitive(name: &str) -> bool {
 }
 
 fn hmac_sha256_hex(secret: &str, parts: &[&[u8]]) -> Option<String> {
-    let mut mac = match Hmac::<Sha256>::new_from_slice(secret.as_bytes()) {
+    let mut mac = match <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(secret.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
             tracing::error!("Invalid HMAC secret size");

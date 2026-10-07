@@ -59,7 +59,7 @@
 //! ([`is_reserved_content_key`]), because those prefixes are an ENGINE
 //! assertion about a row's provenance and a caller must not be able to make it.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 /// Prefix of a keyed content fingerprint. Distinct from the retired `"ch:"`

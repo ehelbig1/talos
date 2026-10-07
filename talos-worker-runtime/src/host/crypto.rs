@@ -93,32 +93,36 @@ impl wit_crypto::Host for TalosContext {
         // new_from_slice() accepts any key length for HMAC (unlike block ciphers), so
         // the error branch is unreachable in practice, but we handle it to avoid panics.
         let result = match algorithm {
-            wit_crypto::HashAlgorithm::Sha256 => match Hmac::<sha2::Sha256>::new_from_slice(&key) {
-                Ok(mut mac) => {
-                    mac.update(&data);
-                    mac.finalize().into_bytes().to_vec()
+            wit_crypto::HashAlgorithm::Sha256 => {
+                match <Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(&key) {
+                    Ok(mut mac) => {
+                        mac.update(&data);
+                        mac.finalize().into_bytes().to_vec()
+                    }
+                    Err(_) => {
+                        tracing::warn!("hmac() failed to build HMAC instance");
+                        vec![]
+                    }
                 }
-                Err(_) => {
-                    tracing::warn!("hmac() failed to build HMAC instance");
-                    vec![]
+            }
+            wit_crypto::HashAlgorithm::Sha512 => {
+                match <Hmac<sha2::Sha512> as hmac::KeyInit>::new_from_slice(&key) {
+                    Ok(mut mac) => {
+                        mac.update(&data);
+                        mac.finalize().into_bytes().to_vec()
+                    }
+                    Err(_) => {
+                        tracing::warn!("hmac() failed to build HMAC instance");
+                        vec![]
+                    }
                 }
-            },
-            wit_crypto::HashAlgorithm::Sha512 => match Hmac::<sha2::Sha512>::new_from_slice(&key) {
-                Ok(mut mac) => {
-                    mac.update(&data);
-                    mac.finalize().into_bytes().to_vec()
-                }
-                Err(_) => {
-                    tracing::warn!("hmac() failed to build HMAC instance");
-                    vec![]
-                }
-            },
+            }
             wit_crypto::HashAlgorithm::Md5 => {
                 // HMAC-MD5 is cryptographically weak; fall back to HMAC-SHA256.
                 // The md5 0.7 crate is not digest 0.10 compatible, so we cannot
                 // construct Hmac::<md5::Md5> directly.  Returning HMAC-SHA256 keeps
                 // the interface functional while steering callers away from MD5.
-                match Hmac::<sha2::Sha256>::new_from_slice(&key) {
+                match <Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(&key) {
                     Ok(mut mac) => {
                         mac.update(&data);
                         mac.finalize().into_bytes().to_vec()

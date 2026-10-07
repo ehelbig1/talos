@@ -810,7 +810,7 @@ impl TalosContext {
             // `secrets::get` deny site); the truncated `vault_path_hash`
             // above is what the operator will see in the guest-side
             // error and the corresponding tracing log line.
-            let full_path_hash = format!("{:x}", Sha256::digest(vault_path.as_bytes()));
+            let full_path_hash = hex::encode(Sha256::digest(vault_path.as_bytes())).to_string();
             self.record_capability_denied(
                 placement.audit_label(),
                 "secret-allowlist",
@@ -850,7 +850,7 @@ impl TalosContext {
             // so the redaction here is mostly for consistency with the
             // allowlist-deny path above. Same audit/log/error shape:
             // full hash in audit, truncated hash in guest error + log.
-            let full_path_hash = format!("{:x}", Sha256::digest(vault_path.as_bytes()));
+            let full_path_hash = hex::encode(Sha256::digest(vault_path.as_bytes())).to_string();
             self.record_capability_denied(
                 placement.audit_label(),
                 "tier1-llm-egress",

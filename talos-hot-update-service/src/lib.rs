@@ -600,7 +600,11 @@ impl HotUpdateService {
                 ));
             }
         };
-        let content_hash = format!("{:x}", Sha256::digest(wasm_bytes));
+        let content_hash = (Sha256::digest(wasm_bytes))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            .to_string();
         let (stored_secrets, stored_hosts) = match self
             .module_repo
             .get_template_secrets_and_hosts(module_id)

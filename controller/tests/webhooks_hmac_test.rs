@@ -74,7 +74,7 @@ async fn verify_slack_hmac() {
     let base = format!("v0:{}:", timestamp);
     let mut msg = base.into_bytes();
     msg.extend_from_slice(body);
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(&msg);
     let result = mac.finalize();
     let expected_hex = hex::encode(result.into_bytes());

@@ -110,7 +110,7 @@ fn hmac_over(subject: &str, actor_id: Uuid, nonce: &str, body: &[u8]) -> Vec<u8>
     payload.push(0);
     payload.extend_from_slice(body);
 
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&TEST_KEY).expect("32-byte key");
+    let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(&TEST_KEY).expect("32-byte key");
     mac.update(&payload);
     mac.finalize().into_bytes().to_vec()
 }

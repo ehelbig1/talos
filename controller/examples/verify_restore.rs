@@ -509,7 +509,7 @@ async fn main() -> Result<()> {
             let ph = {
                 use sha2::{Digest, Sha256};
                 let d = Sha256::digest(p.as_bytes());
-                format!("{:x}", d)[..16].to_string()
+                hex::encode(d).to_string()[..16].to_string()
             };
             match secrets
                 .get_secret(p, SecretRequestor::System, &org_ids)

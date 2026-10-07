@@ -232,7 +232,7 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
         use std::fmt::Write as _;
         let _ = write!(payload, ":fuel={}", req.max_fuel);
     }
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap();
+    let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key).unwrap();
     mac.update(payload.as_bytes());
     req.signature = mac.finalize().into_bytes().to_vec();
 }

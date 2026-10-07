@@ -4805,7 +4805,7 @@ pub(crate) fn rebuildable_template(
 /// two cannot describe the same bytes differently.
 pub(crate) fn catalog_wasm_content_hash(wasm: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(wasm))
+    hex::encode(Sha256::digest(wasm)).to_string()
 }
 
 /// Normalise a template name or display name to its slug form

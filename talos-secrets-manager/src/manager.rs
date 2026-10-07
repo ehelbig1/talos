@@ -5973,6 +5973,24 @@ pub(crate) async fn rewrap_bound_under_active(
 
 #[cfg(test)]
 mod aead_framing_tests {
+    /// Known answers for the key derivation, computed OUTSIDE this code — by
+    /// Python's standard `hmac`/`hashlib`, implementing RFC 5869 directly —
+    /// for made-up inputs. Every row sealed in formats v3 and v4 decrypts only if this
+    /// derivation never changes; a dependency bump that altered it would make
+    /// them all unreadable without a single test failing elsewhere.
+    #[test]
+    fn the_per_context_subkey_derivation_matches_rfc_5869() {
+        let subkey = super::SecretsManager::derive_per_context_subkey(
+            b"made-up data encryption key 32b!",
+            b"made-up execution 0001",
+        )
+        .expect("derive");
+        assert_eq!(
+            hex::encode(*subkey),
+            "69c7eaf8f9c57fd8a0db979cd9f98f354a4cfaf2d05ea429c93ca1ae2bdd8c8f"
+        );
+    }
+
     use super::*;
 
     /// The pre-consolidation writers framed by hand as `nonce || ct`; values
