@@ -364,6 +364,10 @@ SELECT cursor_to_xml('c', 1, true, true, '')
 SELECT schema_to_xml('public', true, true, '')
 SELECT database_to_xml(true, true, '')
 SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
+SELECT * FROM t, XMLTABLE('/a' PASSING t.x COLUMNS a int PATH 'a') AS q
+SELECT * FROM t JOIN LATERAL xmltable('/a' PASSING t.x COLUMNS a int PATH 'a') q ON true
+WITH q AS (SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')) SELECT * FROM q
+INSERT INTO t (a) SELECT a FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
 SELECT pg_advisory_lock(1)
 SELECT pg_advisory_xact_lock(1)
 SELECT pg_try_advisory_lock(1)

@@ -82,29 +82,40 @@ fn the_validator_matches_the_recorded_verdict_for_every_corpus_statement() {
     );
 }
 
-/// The words that start a write, as the corpus spells them. Read off the SQL
-/// TEXT, so the two tests below do not lean on the walk they are checking.
-/// A statement that quotes one of these inside a string or a comment is left
-/// out: there the word is data.
+/// What a statement names that no ungranted module may do, read off the SQL
+/// TEXT so the two tests below do not lean on the walk they are checking: the
+/// words that start a write, as the corpus spells them, and `XMLTABLE(` — a
+/// denied function with syntax of its own, which a parser bump turned from
+/// unparseable into a node no name check saw.
+///
+/// A statement that quotes a write inside a string or a comment is left out:
+/// there the word is data. `XMLTABLE(` is looked for regardless, since every
+/// use of it carries a string.
 fn writes_named_in(sql: &str) -> Vec<&'static str> {
-    if sql.contains('\'') || sql.contains("--") || sql.contains("/*") || sql.contains("$$") {
-        return Vec::new();
-    }
     let upper = sql.to_ascii_uppercase();
-    [
-        ("INSERT", "INSERT INTO"),
-        ("UPDATE", "UPDATE T "),
-        ("UPDATE", "UPDATE U "),
-        ("UPDATE", "UPDATE ONLY "),
-        ("DELETE", "DELETE FROM"),
-        ("MERGE", "MERGE INTO"),
-        ("SELECT INTO", "INTO NEW_TABLE"),
-        ("SELECT INTO", "INTO TEMP "),
-    ]
-    .into_iter()
-    .filter(|(_, spelling)| upper.contains(spelling))
-    .map(|(kind, _)| kind)
-    .collect()
+    let mut named = Vec::new();
+    if upper.contains("XMLTABLE(") {
+        named.push("XMLTABLE");
+    }
+    if sql.contains('\'') || sql.contains("--") || sql.contains("/*") || sql.contains("$$") {
+        return named;
+    }
+    named.extend(
+        [
+            ("INSERT", "INSERT INTO"),
+            ("UPDATE", "UPDATE T "),
+            ("UPDATE", "UPDATE U "),
+            ("UPDATE", "UPDATE ONLY "),
+            ("DELETE", "DELETE FROM"),
+            ("MERGE", "MERGE INTO"),
+            ("SELECT INTO", "INTO NEW_TABLE"),
+            ("SELECT INTO", "INTO TEMP "),
+        ]
+        .into_iter()
+        .filter(|(_, spelling)| upper.contains(spelling))
+        .map(|(kind, _)| kind),
+    );
+    named
 }
 
 /// With an empty allowlist and mutations denied — the only configuration the

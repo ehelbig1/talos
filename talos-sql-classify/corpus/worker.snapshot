@@ -47,7 +47,7 @@
 *=ok(SELECT,rows,ReadOnly) | SELECT * FROM generate_series(1, 10) g
 *=ok(SELECT,rows,ReadOnly) | SELECT * FROM unnest($1::int[]) AS x(id)
 *=ok(SELECT,rows,ReadOnly) | SELECT * FROM jsonb_to_recordset($1) AS x(a int, b text)
-*=parse-error | SELECT * FROM t TABLESAMPLE BERNOULLI (10)
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM t TABLESAMPLE BERNOULLI (10)
 *=ok(SELECT,rows,ReadOnly) | SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((a), (b), ())
 *=ok(SELECT,rows,ReadOnly) | SELECT a, sum(c) FROM t GROUP BY ROLLUP (a)
 *=ok(SELECT,rows,ReadOnly) | SELECT * FROM t WHERE (a, b) IN ((1, 2), (3, 4))
@@ -102,47 +102,47 @@ E=disallowed(DELETE) I=disallowed(DELETE) P=ok(DELETE,no-rows,Mutates { nested: 
 E=disallowed(MERGE) I=disallowed(MERGE) P=ok(MERGE,no-rows,Mutates { nested: false }) | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET a = 1
 E=disallowed(MERGE) I=disallowed(MERGE) P=ok(MERGE,no-rows,Mutates { nested: false }) | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN DELETE
 E=disallowed(MERGE) I=disallowed(MERGE) P=ok(MERGE,no-rows,Mutates { nested: false }) | MERGE INTO t USING u ON t.a = u.a WHEN NOT MATCHED THEN INSERT (a) VALUES (u.a)
-*=parse-error | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET a = 1 RETURNING t.a
+E=disallowed(MERGE) I=disallowed(MERGE) P=ok(MERGE,rows,Mutates { nested: false }) | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET a = 1 RETURNING t.a
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH a AS (SELECT 1 AS x) INSERT INTO t (a) SELECT x FROM a
 E=cte(UPDATE) I=cte(UPDATE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH a AS (SELECT 1 AS x) UPDATE t SET a = (SELECT x FROM a)
-*=parse-error | WITH a AS (SELECT 1 AS x) INSERT INTO t (a) SELECT x FROM a RETURNING a
+E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH a AS (SELECT 1 AS x) INSERT INTO t (a) SELECT x FROM a RETURNING a
 E=cte(UPDATE) I=cte(UPDATE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH a AS (SELECT 1 AS x) UPDATE t SET a = (SELECT x FROM a) RETURNING a
-*=parse-error | WITH a AS (SELECT 1 AS x) DELETE FROM t WHERE a IN (SELECT x FROM a)
-*=parse-error | WITH a AS (SELECT 1 AS x) MERGE INTO t USING a ON t.a = a.x WHEN MATCHED THEN DELETE
+E=cte(DELETE) I=cte(DELETE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH a AS (SELECT 1 AS x) DELETE FROM t WHERE a IN (SELECT x FROM a)
+E=cte(MERGE) I=cte(MERGE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH a AS (SELECT 1 AS x) MERGE INTO t USING a ON t.a = a.x WHEN MATCHED THEN DELETE
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH ins AS (INSERT INTO t (a) VALUES (1)) SELECT 1
 E=cte(UPDATE) I=cte(UPDATE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH upd AS (UPDATE t SET a = 1 RETURNING a) SELECT * FROM upd
 E=cte(UPDATE) I=cte(UPDATE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH upd AS (UPDATE t SET a = 1 WHERE id = $1) SELECT 1
-*=parse-error | WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del
-*=parse-error | WITH del AS (DELETE FROM t WHERE id = $1) SELECT 1
-*=parse-error | WITH m AS (MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN DELETE RETURNING t.a) SELECT * FROM m
+E=cte(DELETE) I=cte(DELETE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del
+E=cte(DELETE) I=cte(DELETE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH del AS (DELETE FROM t WHERE id = $1) SELECT 1
+E=cte(MERGE) I=cte(MERGE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH m AS (MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN DELETE RETURNING t.a) SELECT * FROM m
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH a AS (SELECT 1), ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM a
-*=parse-error | WITH a AS (SELECT 1), del AS (DELETE FROM t RETURNING a) SELECT * FROM a
+E=cte(DELETE) I=cte(DELETE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH a AS (SELECT 1), del AS (DELETE FROM t RETURNING a) SELECT * FROM a
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH RECURSIVE ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH ins AS MATERIALIZED (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM (WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins) x
-*=parse-error | SELECT * FROM (WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del) x
+E=cte(DELETE) I=cte(DELETE) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM (WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del) x
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM t WHERE id IN (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT 1 UNION (WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins)
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH outer_cte AS (WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins) SELECT * FROM outer_cte
-*=parse-error | WITH outer_cte AS (WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del) SELECT * FROM outer_cte
+E=cte(DELETE) I=cte(DELETE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH outer_cte AS (WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del) SELECT * FROM outer_cte
 E=cte(UPDATE) I=cte(UPDATE) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM t JOIN (WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT * FROM upd) x ON true
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM t, LATERAL (WITH ins AS (INSERT INTO u (a) VALUES (t.a) RETURNING a) SELECT * FROM ins) x
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM (INSERT INTO t (a) VALUES (1) RETURNING a) x
 E=cte(UPDATE) I=cte(UPDATE) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM (UPDATE t SET a = 1 RETURNING a) x
-*=parse-error | SELECT * FROM (DELETE FROM t RETURNING a) x
-*=parse-error | SELECT * FROM t WHERE a IN (DELETE FROM u RETURNING a)
+E=cte(DELETE) I=cte(DELETE) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM (DELETE FROM t RETURNING a) x
+E=cte(DELETE) I=cte(DELETE) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM t WHERE a IN (DELETE FROM u RETURNING a)
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | (INSERT INTO t (a) VALUES (1) RETURNING a)
-*=parse-error | (DELETE FROM t RETURNING a)
+E=cte(DELETE) I=cte(DELETE) P=ok(SELECT,rows,Mutates { nested: true }) | (DELETE FROM t RETURNING a)
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) INSERT INTO u (a) SELECT a FROM ins
-*=parse-error | WITH del AS (DELETE FROM t RETURNING a) INSERT INTO u (a) SELECT a FROM del
+E=cte(DELETE) I=cte(DELETE) P=ok(SELECT,rows,Mutates { nested: true }) | WITH del AS (DELETE FROM t RETURNING a) INSERT INTO u (a) SELECT a FROM del
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) VALUES (1)
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) TABLE ins
 E=cte(UPDATE) I=cte(UPDATE) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM t WHERE EXISTS (WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT 1 FROM upd)
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM t ORDER BY (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
 E=cte(INSERT) I=ok(SELECT,rows,Mutates { nested: true }) P=ok(SELECT,rows,Mutates { nested: true }) | SELECT * FROM t LIMIT (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
-*=parse-error | INSERT INTO t (a) WITH del AS (DELETE FROM u RETURNING a) SELECT a FROM del
+E=cte(DELETE) I=cte(DELETE) P=ok(INSERT,no-rows,Mutates { nested: false }) | INSERT INTO t (a) WITH del AS (DELETE FROM u RETURNING a) SELECT a FROM del
 E=cte(UPDATE) I=cte(UPDATE) P=ok(INSERT,no-rows,Mutates { nested: false }) | INSERT INTO t (a) WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT a FROM upd
 E=cte(INSERT) I=disallowed(UPDATE) P=ok(UPDATE,no-rows,Mutates { nested: false }) | UPDATE t SET a = (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
 E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DELETE FROM t WHERE a IN (WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT a FROM upd)
@@ -152,7 +152,7 @@ E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DEL
 *=ddl(CREATE) | CREATE TABLE t (a int)
 *=ddl(CREATE) | CREATE TABLE IF NOT EXISTS t (a int PRIMARY KEY, b text NOT NULL)
 *=ddl(CREATE) | CREATE TEMP TABLE t (a int)
-*=parse-error | CREATE UNLOGGED TABLE t (a int)
+*=ddl(CREATE) | CREATE UNLOGGED TABLE t (a int)
 *=ddl(CREATE) | CREATE TABLE t AS SELECT * FROM u
 *=ddl(CREATE) | CREATE TABLE t (LIKE u)
 *=ddl(CREATE) | CREATE VIEW v AS SELECT 1
@@ -164,9 +164,9 @@ E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DEL
 *=ddl(CREATE) | CREATE DATABASE d
 *=ddl(CREATE) | CREATE SEQUENCE s
 *=ddl(CREATE) | CREATE TYPE mood AS ENUM ('a', 'b')
-*=parse-error | CREATE DOMAIN d AS int
+*=ddl(CREATE) | CREATE DOMAIN d AS int
 *=ddl(CREATE) | CREATE ROLE r
-*=parse-error | CREATE USER u
+*=ddl(CREATE) | CREATE USER u
 *=ddl(CREATE) | CREATE EXTENSION IF NOT EXISTS pgcrypto
 *=ddl(CREATE) | CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'
 *=ddl(CREATE) | CREATE OR REPLACE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql
@@ -174,12 +174,12 @@ E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DEL
 *=ddl(CREATE) | CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()
 *=ddl(CREATE) | CREATE POLICY p ON t USING (true)
 *=parse-error | CREATE RULE r AS ON INSERT TO t DO NOTHING
-*=parse-error | CREATE SERVER s FOREIGN DATA WRAPPER w
+*=ddl(CREATE) | CREATE SERVER s FOREIGN DATA WRAPPER w
 *=parse-error | CREATE PUBLICATION p FOR ALL TABLES
 *=parse-error | CREATE SUBSCRIPTION s CONNECTION 'x' PUBLICATION p
 *=parse-error | CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = f)
 *=parse-error | CREATE AGGREGATE a (int) (SFUNC = f, STYPE = int)
-*=parse-error | CREATE COLLATION c (locale = 'C')
+*=ddl(CREATE) | CREATE COLLATION c (locale = 'C')
 *=parse-error | CREATE FOREIGN TABLE ft (a int) SERVER s
 *=parse-error | CREATE TABLESPACE ts LOCATION '/made/up'
 *=ddl(DROP) | DROP TABLE t
@@ -190,10 +190,10 @@ E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DEL
 *=ddl(DROP) | DROP DATABASE d
 *=ddl(DROP) | DROP SEQUENCE s
 *=ddl(DROP) | DROP TYPE mood
-*=parse-error | DROP DOMAIN d
+*=ddl(DROP) | DROP DOMAIN d
 *=ddl(DROP) | DROP ROLE r
-*=parse-error | DROP USER u
-*=parse-error | DROP EXTENSION pgcrypto
+*=ddl(DROP) | DROP USER u
+*=ddl(DROP) | DROP EXTENSION pgcrypto
 *=ddl(DROP) | DROP FUNCTION f
 *=ddl(DROP) | DROP PROCEDURE p
 *=ddl(DROP) | DROP TRIGGER tr ON t
@@ -208,14 +208,14 @@ E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DEL
 *=ddl(ALTER) | ALTER INDEX i RENAME TO j
 *=ddl(ALTER) | ALTER VIEW v AS SELECT 2
 *=ddl(ALTER) | ALTER ROLE r WITH SUPERUSER
-*=parse-error | ALTER USER u WITH PASSWORD 'made-up'
+*=ddl(ALTER) | ALTER USER u WITH PASSWORD 'made-up'
 *=ddl(ALTER) | ALTER POLICY p ON t USING (false)
-*=parse-error | ALTER TYPE mood ADD VALUE 'c'
-*=parse-error | ALTER SCHEMA s RENAME TO s2
+*=ddl(ALTER) | ALTER TYPE mood ADD VALUE 'c'
+*=ddl(ALTER) | ALTER SCHEMA s RENAME TO s2
 *=parse-error | ALTER SEQUENCE s RESTART
 *=parse-error | ALTER DATABASE d SET x = 1
 *=parse-error | ALTER SYSTEM SET x = 1
-*=parse-error | ALTER FUNCTION f() OWNER TO r
+*=ddl(ALTER) | ALTER FUNCTION f() OWNER TO r
 *=parse-error | ALTER EXTENSION pgcrypto UPDATE
 *=parse-error | ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO r
 *=ddl(TRUNCATE) | TRUNCATE t
@@ -230,14 +230,14 @@ E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DEL
 *=parse-error | REINDEX TABLE t
 *=parse-error | REFRESH MATERIALIZED VIEW v
 *=parse-error | CLUSTER t
-*=parse-error | VACUUM
-*=parse-error | VACUUM FULL t
-*=parse-error | ANALYZE
-*=parse-error | ANALYZE t
+*=blocked(VACUUM) | VACUUM
+*=blocked(VACUUM) | VACUUM FULL t
+*=unknown | ANALYZE
+*=unknown | ANALYZE t
 *=parse-error | CHECKPOINT
 *=parse-error | IMPORT FOREIGN SCHEMA s FROM SERVER x INTO y
 *=blocked(COPY) | COPY t TO STDOUT
-*=parse-error | COPY t FROM STDIN
+*=blocked(COPY) | COPY t FROM STDIN
 *=blocked(COPY) | COPY t TO PROGRAM 'made-up-command'
 *=blocked(COPY) | COPY t FROM '/made/up/path'
 *=blocked(COPY) | COPY (SELECT * FROM t) TO '/made/up/path'
@@ -248,12 +248,12 @@ E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DEL
 *=blocked(SET ROLE) | SET ROLE r
 *=blocked(SET ROLE) | SET LOCAL ROLE r
 *=blocked(SET ROLE) | SET ROLE NONE
-*=parse-error | RESET ROLE
-*=parse-error | RESET ALL
-*=parse-error | RESET search_path
-*=parse-error | SET SESSION AUTHORIZATION r
+*=blocked(RESET) | RESET ROLE
+*=blocked(RESET) | RESET ALL
+*=blocked(RESET) | RESET search_path
+*=blocked(SET SESSION AUTHORIZATION) | SET SESSION AUTHORIZATION r
 *=blocked(SET TIME ZONE) | SET TIME ZONE 'UTC'
-*=parse-error | SET NAMES 'utf8'
+*=blocked(SET NAMES) | SET NAMES 'utf8'
 *=blocked(SET TRANSACTION) | SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
 *=parse-error | SET CONSTRAINTS ALL DEFERRED
 *=blocked(SET) | SET x.y = 'z'
@@ -279,7 +279,7 @@ E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DEL
 *=blocked(COMMIT) | COMMIT
 *=blocked(COMMIT) | END
 *=blocked(ROLLBACK) | ROLLBACK
-*=parse-error | ABORT
+*=blocked(ROLLBACK) | ABORT
 *=blocked(ROLLBACK) | ROLLBACK TO SAVEPOINT s
 *=blocked(SAVEPOINT) | SAVEPOINT s
 *=blocked(RELEASE SAVEPOINT) | RELEASE SAVEPOINT s
@@ -290,8 +290,8 @@ E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DEL
 *=blocked(LOAD) | LOAD 'made_up_library'
 *=parse-error | INSTALL made_up
 *=blocked(PRAGMA) | PRAGMA x
-*=parse-error | LOCK TABLE t
-*=parse-error | LOCK TABLE t IN ACCESS EXCLUSIVE MODE
+*=blocked(LOCK) | LOCK TABLE t
+*=blocked(LOCK) | LOCK TABLE t IN ACCESS EXCLUSIVE MODE
 *=parse-error | LOCK TABLES t WRITE
 *=parse-error | UNLOCK TABLES
 *=blocked(KILL) | KILL 1
@@ -318,17 +318,17 @@ E=disallowed(ATTACH) I=disallowed(ATTACH) P=ok(ATTACH,no-rows,Unclassified) | AT
 *=parse-error | OPTIMIZE TABLE t
 *=blocked(ASSERT) | ASSERT 1 = 1
 *=parse-error | RAISE NOTICE 'x'
-*=parse-error | PRINT 'x'
-*=parse-error | RETURN 1
-*=parse-error | IF 1 = 1 THEN SELECT 1; END IF
+*=unknown | PRINT 'x'
+*=unknown | RETURN 1
+*=unknown | IF 1 = 1 THEN SELECT 1; END IF
 *=parse-error | WHILE 1 = 1 DO SELECT 1; END WHILE
 *=parse-error | BEGIN SELECT 1; END
-*=parse-error | OPEN c
-*=parse-error | RENAME TABLE t TO u
-*=parse-error | EXPORT DATA OPTIONS(uri = 'x') AS SELECT 1
-*=parse-error | DENY SELECT ON t TO r
-*=parse-error | THROW
-*=parse-error | WAITFOR DELAY '00:00:01'
+*=blocked(OPEN) | OPEN c
+*=unknown | RENAME TABLE t TO u
+*=unknown | EXPORT DATA OPTIONS(uri = 'x') AS SELECT 1
+*=unknown | DENY SELECT ON t TO r
+*=unknown | THROW
+*=unknown | WAITFOR DELAY '00:00:01'
 *=function(set_config) | SELECT set_config('search_path', 'x', false)
 *=function(set_config) | SELECT SET_CONFIG('search_path', 'x', false)
 *=function(pg_catalog.set_config) | SELECT pg_catalog.set_config('search_path', 'x', false)
@@ -342,7 +342,11 @@ E=disallowed(ATTACH) I=disallowed(ATTACH) P=ok(ATTACH,no-rows,Unclassified) | AT
 *=function(cursor_to_xml) | SELECT cursor_to_xml('c', 1, true, true, '')
 *=function(schema_to_xml) | SELECT schema_to_xml('public', true, true, '')
 *=function(database_to_xml) | SELECT database_to_xml(true, true, '')
-*=parse-error | SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
+*=function(xmltable) | SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
+*=function(xmltable) | SELECT * FROM t, XMLTABLE('/a' PASSING t.x COLUMNS a int PATH 'a') AS q
+*=parse-error | SELECT * FROM t JOIN LATERAL xmltable('/a' PASSING t.x COLUMNS a int PATH 'a') q ON true
+*=function(xmltable) | WITH q AS (SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')) SELECT * FROM q
+*=function(xmltable) | INSERT INTO t (a) SELECT a FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
 *=function(pg_advisory_lock) | SELECT pg_advisory_lock(1)
 *=function(pg_advisory_xact_lock) | SELECT pg_advisory_xact_lock(1)
 *=function(pg_try_advisory_lock) | SELECT pg_try_advisory_lock(1)
@@ -376,7 +380,7 @@ E=disallowed(ATTACH) I=disallowed(ATTACH) P=ok(ATTACH,no-rows,Unclassified) | AT
 *=function(set_config) | UPDATE t SET a = set_config('x', 'y', false)
 *=function(pg_advisory_lock) | UPDATE t SET a = 1 WHERE pg_advisory_lock(1) IS NULL
 *=function(lo_unlink) | DELETE FROM t WHERE lo_unlink(a) = 1
-*=parse-error | DELETE FROM t RETURNING pg_notify('ch', a)
+*=function(pg_notify) | DELETE FROM t RETURNING pg_notify('ch', a)
 *=function(set_config) | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET a = set_config('x', 'y', false)
 *=function(pg_sleep) | SELECT pg_sleep(1)
 *=function(pg_read_file) | SELECT pg_read_file('/made/up')
@@ -397,7 +401,7 @@ E=disallowed(ATTACH) I=disallowed(ATTACH) P=ok(ATTACH,no-rows,Unclassified) | AT
 *=function(set_config) | SELECT a FROM t OFFSET length(set_config('x', 'y', false))
 *=parse-error | SELECT a FROM t FETCH FIRST length(set_config('x', 'y', false)) ROWS ONLY
 *=function(set_config) | SELECT DISTINCT ON (set_config('x', 'y', false)) a FROM t
-*=parse-error | SELECT a FROM t TABLESAMPLE BERNOULLI (length(set_config('x', 'y', false)))
+*=function(set_config) | SELECT a FROM t TABLESAMPLE BERNOULLI (length(set_config('x', 'y', false)))
 *=function(set_config) | SELECT * FROM t JOIN u ON set_config('x', 'y', false) = u.a
 *=function(set_config) | SELECT a FROM t WINDOW w AS (PARTITION BY set_config('x', 'y', false))
 *=ok(SELECT,rows,ReadOnly) | SELECT a FROM t FOR UPDATE OF t

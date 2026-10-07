@@ -113,17 +113,27 @@ fn nothing_the_controller_calls_a_read_carries_a_mutation() {
 }
 
 /// Nothing the controller would run at all — as a read or as a write —
-/// creates a table through `SELECT … INTO`.
+/// creates a table through `SELECT … INTO`, or calls `XMLTABLE`, a denied
+/// function with syntax of its own that no name check sees.
 #[test]
-fn nothing_the_controller_admits_creates_a_table() {
+fn nothing_the_controller_admits_creates_a_table_or_calls_xmltable() {
+    let mut checked = 0;
     for sql in statements() {
         let upper = sql.to_ascii_uppercase();
-        if upper.contains("INTO NEW_TABLE") || upper.contains("INTO TEMP ") {
+        if upper.contains("INTO NEW_TABLE")
+            || upper.contains("INTO TEMP ")
+            || upper.contains("XMLTABLE(")
+        {
+            checked += 1;
             let verdict = verdict(sql);
             assert!(
                 !verdict.starts_with("admit"),
-                "admitted, and it creates a table: {sql} -> {verdict}"
+                "admitted, and it should never be: {sql} -> {verdict}"
             );
         }
     }
+    assert!(
+        checked >= 6,
+        "the corpus holds only {checked} such statements"
+    );
 }

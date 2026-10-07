@@ -518,9 +518,9 @@ mod write_ceiling_db_tests {
     ///
     /// The allowlist here ADMITS the mutation on purpose: the module's
     /// `allowed_operations` policy and the actor's write ceiling are different
-    /// controls, and this test is about the ceiling. `DELETE` and `MERGE`
-    /// inside a CTE are sqlparser 0.53 parse errors and are pinned as such by
-    /// `talos_sql_classify`.
+    /// controls, and this test is about the ceiling. (`DELETE` and `MERGE`
+    /// inside a CTE were parse errors until sqlparser 0.63; the shared corpus
+    /// in `talos-sql-classify/corpus/` records them as carried writes.)
     #[test]
     fn a_writable_cte_reaches_the_ceiling_gate() {
         let allowed = ops(&["INSERT", "UPDATE", "DELETE"]);
