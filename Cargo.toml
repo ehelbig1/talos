@@ -227,7 +227,7 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 dashmap = "6.1.0"
 dotenvy = "0.15"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 futures = "0.3"
 futures-util = "0.3"
 governor = "0.6"

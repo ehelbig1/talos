@@ -128,12 +128,12 @@ mod tests {
     #[test]
     fn build_response_seals_valid_claim_and_rejects_garbage() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![(
             "resp-worker".to_string(),
             worker_sk.verifying_key(),
         )]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
 
         let exec = uuid::Uuid::new_v4();
         let in_flight = InFlightSeals::new();
@@ -161,10 +161,10 @@ mod tests {
     #[test]
     fn build_response_sealed_payload_opens_to_registered_secrets() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let worker_vk = worker_sk.verifying_key();
         set_dynamic_worker_public_keys(vec![("resp-open".to_string(), worker_vk)]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let controller_vk = controller_sk.verifying_key();
 
         let exec = uuid::Uuid::new_v4();
@@ -206,13 +206,13 @@ mod tests {
     #[test]
     fn build_response_rejections_are_generic_and_leak_nothing() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
-        let forger_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
+        let forger_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![(
             "resp-generic".to_string(),
             worker_sk.verifying_key(),
         )]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
 
         let in_flight = InFlightSeals::new(); // nothing dispatched
         let we = WorkerEphemeral::generate();
@@ -264,9 +264,9 @@ mod tests {
     #[test]
     fn build_response_second_claim_for_same_exec_rejected() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![("resp-dup".to_string(), worker_sk.verifying_key())]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
 
         let exec = uuid::Uuid::new_v4();
         let in_flight = InFlightSeals::new();

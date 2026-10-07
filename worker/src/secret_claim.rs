@@ -238,8 +238,8 @@ mod tests {
 
     #[test]
     fn build_and_process_roundtrip_against_simulated_controller() {
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let controller_vk = controller_sk.verifying_key();
         let job_id = uuid::Uuid::new_v4();
 
@@ -266,8 +266,9 @@ mod tests {
 
     #[test]
     fn rejected_reply_fails_closed() {
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
-        let controller_vk = DispatchSigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
+        let controller_vk =
+            talos_workflow_job_protocol::generate_dispatch_signing_key().verifying_key();
         let job_id = uuid::Uuid::new_v4();
         let (we, _payload) = build_claim(job_id, "w", &worker_sk).unwrap();
         let reply = serde_json::to_vec(&ClaimResponse::Rejected {
@@ -280,9 +281,9 @@ mod tests {
 
     #[test]
     fn wrong_controller_key_fails_verify() {
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
-        let real_controller = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
-        let wrong_vk = DispatchSigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
+        let real_controller = talos_workflow_job_protocol::generate_dispatch_signing_key();
+        let wrong_vk = talos_workflow_job_protocol::generate_dispatch_signing_key().verifying_key();
         let job_id = uuid::Uuid::new_v4();
         let (we, claim_payload) = build_claim(job_id, "w", &worker_sk).unwrap();
         let claim: SecretClaim = serde_json::from_slice(&claim_payload).unwrap();

@@ -22,7 +22,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
-rand = { workspace = true, features = ["default"] }
 
 [lints]
 workspace = true

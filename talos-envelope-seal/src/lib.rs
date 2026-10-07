@@ -398,11 +398,11 @@ mod tests {
     fn full_claim_seal_open_roundtrip() {
         let _g = REGISTRY_LOCK.lock().unwrap();
         // Register a worker key in the process registry.
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let worker_vk = worker_sk.verifying_key();
         set_dynamic_worker_public_keys(vec![("worker-roundtrip".to_string(), worker_vk)]);
 
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let controller_vk = controller_sk.verifying_key();
 
         let exec = Uuid::new_v4();
@@ -453,8 +453,8 @@ mod tests {
         let _g = REGISTRY_LOCK.lock().unwrap();
         // Deterministically ensure "ghost-worker" is not registered.
         set_dynamic_worker_public_keys(vec![]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
-        let stranger_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
+        let stranger_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let exec = Uuid::new_v4();
         let seals = InFlightSeals::new();
         seals.register(exec, ctx_of(&[("k", "v")]));
@@ -671,12 +671,12 @@ mod tests {
     #[test]
     fn empty_secrets_map_round_trips() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![(
             "worker-empty".to_string(),
             worker_sk.verifying_key(),
         )]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
 
         let exec = Uuid::new_v4();
         let seals = InFlightSeals::new();
@@ -706,9 +706,9 @@ mod tests {
     #[test]
     fn sealed_secrets_do_not_open_under_wrong_ephemeral() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![("worker-wk".to_string(), worker_sk.verifying_key())]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
 
         let exec = Uuid::new_v4();
         let seals = InFlightSeals::new();
@@ -740,9 +740,9 @@ mod tests {
     #[test]
     fn tampered_or_transposed_seal_is_rejected() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![("worker-tam".to_string(), worker_sk.verifying_key())]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let controller_vk = controller_sk.verifying_key();
 
         let exec = Uuid::new_v4();
@@ -799,13 +799,13 @@ mod tests {
     #[test]
     fn rotation_ring_accepts_either_registered_key() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let old_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
-        let new_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let old_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
+        let new_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![
             ("worker-rot".to_string(), old_sk.verifying_key()),
             ("worker-rot".to_string(), new_sk.verifying_key()),
         ]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
 
         let seals = InFlightSeals::new();
         for sk in [&old_sk, &new_sk] {
@@ -825,13 +825,13 @@ mod tests {
     #[test]
     fn claim_with_transposed_worker_id_rejected_without_taking_context() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let sk_a = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
-        let sk_b = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let sk_a = talos_workflow_job_protocol::generate_dispatch_signing_key();
+        let sk_b = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![
             ("worker-ta".to_string(), sk_a.verifying_key()),
             ("worker-tb".to_string(), sk_b.verifying_key()),
         ]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
 
         let exec = Uuid::new_v4();
         let seals = InFlightSeals::new();
@@ -852,9 +852,9 @@ mod tests {
     #[test]
     fn valid_claim_for_undispatched_execution_rejected() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![("worker-ud".to_string(), worker_sk.verifying_key())]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
 
         let seals = InFlightSeals::new(); // nothing registered
         let we = WorkerEphemeral::generate();
@@ -878,9 +878,9 @@ mod tests {
     #[test]
     fn low_order_ephemeral_key_fails_seal_but_context_is_recoverable() {
         let _g = REGISTRY_LOCK.lock().unwrap();
-        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let worker_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![("worker-lo".to_string(), worker_sk.verifying_key())]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
 
         let exec = Uuid::new_v4();
         let seals = InFlightSeals::new();
@@ -927,10 +927,10 @@ mod tests {
         let _g = REGISTRY_LOCK.lock().unwrap();
         // Register worker-A's key, but sign the claim with worker-B's key under
         // worker-A's id — authentication must fail and the context survive.
-        let real_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
-        let forger_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let real_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
+        let forger_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         set_dynamic_worker_public_keys(vec![("worker-A".to_string(), real_sk.verifying_key())]);
-        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_sk = talos_workflow_job_protocol::generate_dispatch_signing_key();
         let exec = Uuid::new_v4();
         let seals = InFlightSeals::new();
         seals.register(exec, ctx_of(&[("k", "v")]));

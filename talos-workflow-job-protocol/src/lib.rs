@@ -863,6 +863,20 @@ pub fn parse_ed25519_signing_key_hex(hex_str: &str) -> Result<DispatchSigningKey
     Ok(DispatchSigningKey::from_bytes(&arr))
 }
 
+/// A fresh Ed25519 signing key from the operating system's random source.
+///
+/// The one way a signing key is generated. `SigningKey::generate` takes a
+/// random-number generator by the `rand_core` trait of whichever generation
+/// the curve library was built against, which is not the workspace's `rand`;
+/// a key is 32 random bytes, so this draws them and builds the key from them.
+#[must_use]
+pub fn generate_dispatch_signing_key() -> DispatchSigningKey {
+    use rand::RngCore as _;
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(seed.as_mut());
+    DispatchSigningKey::from_bytes(&seed)
+}
+
 /// Generate a fresh Ed25519 keypair for the RFC 0010 worker-trust boundary,
 /// returned as `(signing_seed_hex, verifying_key_hex)` — both 64-char lowercase
 /// hex, in the exact shape [`parse_ed25519_signing_key_hex`] /
@@ -874,7 +888,7 @@ pub fn parse_ed25519_signing_key_hex(hex_str: &str) -> Result<DispatchSigningKey
 /// `TALOS_{CONTROLLER_PUBLIC_KEY,WORKER_PUBLIC_KEYS}`.
 #[must_use]
 pub fn generate_ed25519_keypair_hex() -> (String, String) {
-    let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+    let sk = generate_dispatch_signing_key();
     let vk = sk.verifying_key();
     (hex::encode(sk.to_bytes()), hex::encode(vk.to_bytes()))
 }
@@ -9192,7 +9206,7 @@ mod tests {
     }
 
     fn ed_keypair() -> DispatchSigningKey {
-        DispatchSigningKey::generate(&mut rand::rngs::OsRng)
+        crate::generate_dispatch_signing_key()
     }
 
     fn hmac_ring(key: &[u8]) -> talos_workflow_engine_core::WorkerKeyRing {
@@ -11739,7 +11753,7 @@ mod protocol_review_2026_09_tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let ring = ring();
-        let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let sk = crate::generate_dispatch_signing_key();
         let pk = sk.verifying_key();
 
         // Ed25519-signed request: the OLD pre-check (`verify_no_replay_with_ring`,
@@ -11927,7 +11941,7 @@ mod protocol_review_2026_09_tests {
             .is_err());
         // Ed25519 arm as well (the shape check runs before the key lookup).
         forged.crypto_scheme = CRYPTO_SCHEME_ED25519;
-        let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let sk = crate::generate_dispatch_signing_key();
         assert!(forged
             .verify_no_replay_ed25519(&[sk.verifying_key()], 300)
             .is_err());
