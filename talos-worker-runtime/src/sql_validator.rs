@@ -156,7 +156,19 @@ fn statement_type(stmt: &Statement) -> &'static str {
         | Statement::CreatePolicy { .. }
         | Statement::CreateSecret { .. }
         | Statement::CreateMacro { .. }
-        | Statement::CreateStage { .. } => "CREATE",
+        | Statement::CreateStage { .. }
+        // Statement kinds sqlparser gained between 0.53 and 0.63.
+        | Statement::CreateCollation { .. }
+        | Statement::CreateConnector(_)
+        | Statement::CreateDomain(_)
+        | Statement::CreateFileFormat { .. }
+        | Statement::CreateOperator(_)
+        | Statement::CreateOperatorClass(_)
+        | Statement::CreateOperatorFamily(_)
+        | Statement::CreateServer(_)
+        | Statement::CreateTextSearch(_)
+        | Statement::CreateUser(_)
+        | Statement::CreateWarehouse { .. } => "CREATE",
         // DROP — `Statement::Drop` is the generic form (DROP TABLE /
         // VIEW / etc.); each specialised Drop* variant maps here too
         // so the DDL gate fires.
@@ -165,13 +177,30 @@ fn statement_type(stmt: &Statement) -> &'static str {
         | Statement::DropProcedure { .. }
         | Statement::DropSecret { .. }
         | Statement::DropPolicy { .. }
-        | Statement::DropTrigger { .. } => "DROP",
+        | Statement::DropTrigger { .. }
+        | Statement::DropConnector { .. }
+        | Statement::DropDomain(_)
+        | Statement::DropExtension(_)
+        | Statement::DropOperator(_)
+        | Statement::DropOperatorClass(_)
+        | Statement::DropOperatorFamily(_) => "DROP",
         // ALTER — every Alter* the parser knows about.
         Statement::AlterTable { .. }
         | Statement::AlterIndex { .. }
         | Statement::AlterView { .. }
         | Statement::AlterRole { .. }
-        | Statement::AlterPolicy { .. } => "ALTER",
+        | Statement::AlterPolicy { .. }
+        | Statement::AlterCollation(_)
+        | Statement::AlterConnector { .. }
+        | Statement::AlterFunction(_)
+        | Statement::AlterOperator(_)
+        | Statement::AlterOperatorClass(_)
+        | Statement::AlterOperatorFamily(_)
+        | Statement::AlterSchema(_)
+        | Statement::AlterSession { .. }
+        | Statement::AlterTextSearch(_)
+        | Statement::AlterType(_)
+        | Statement::AlterUser(_) => "ALTER",
         Statement::Truncate { .. } => "TRUNCATE",
         // Grant/Revoke
         Statement::Grant { .. } => "GRANT",
@@ -249,11 +278,18 @@ fn always_blocked_label(stmt: &Statement) -> Option<&'static str> {
         // strictly weaker. (Plain `EXPLAIN SELECT` is collateral — it never
         // worked end-to-end since the controller already rejects all EXPLAIN.)
         Statement::Explain { .. } | Statement::ExplainTable { .. } => Some("EXPLAIN"),
-        Statement::SetRole { .. } => Some("SET ROLE"),
-        Statement::SetVariable { .. } => Some("SET"),
-        Statement::SetTimeZone { .. } => Some("SET TIME ZONE"),
-        Statement::SetNamesDefault { .. } | Statement::SetNames { .. } => Some("SET NAMES"),
-        Statement::SetTransaction { .. } => Some("SET TRANSACTION"),
+        // Every `SET` is one `Statement::Set` from sqlparser 0.54. The label
+        // names the sub-kind for the error text; all of them are blocked, and
+        // a sub-kind a later sqlparser adds is blocked as plain `SET`.
+        Statement::Set(set) => Some(match set {
+            ast::Set::SetRole { .. } => "SET ROLE",
+            ast::Set::SetTimeZone { .. } => "SET TIME ZONE",
+            ast::Set::SetNamesDefault { .. } | ast::Set::SetNames { .. } => "SET NAMES",
+            ast::Set::SetTransaction { .. } => "SET TRANSACTION",
+            ast::Set::SetSessionAuthorization(_) => "SET SESSION AUTHORIZATION",
+            _ => "SET",
+        }),
+        Statement::Reset(_) => Some("RESET"),
         Statement::ShowVariable { .. }
         | Statement::ShowStatus { .. }
         | Statement::ShowVariables { .. }
@@ -264,7 +300,11 @@ fn always_blocked_label(stmt: &Statement) -> Option<&'static str> {
         | Statement::ShowSchemas { .. }
         | Statement::ShowViews { .. }
         | Statement::ShowCollation { .. }
-        | Statement::ShowFunctions { .. } => Some("SHOW"),
+        | Statement::ShowFunctions { .. }
+        | Statement::ShowCatalogs { .. }
+        | Statement::ShowCharset { .. }
+        | Statement::ShowObjects { .. }
+        | Statement::ShowProcessList { .. } => Some("SHOW"),
         Statement::LISTEN { .. } => Some("LISTEN"),
         Statement::NOTIFY { .. } => Some("NOTIFY"),
         Statement::UNLISTEN { .. } => Some("UNLISTEN"),
@@ -312,6 +352,12 @@ fn always_blocked_label(stmt: &Statement) -> Option<&'static str> {
         Statement::Install { .. } => Some("INSTALL"),
         Statement::Pragma { .. } => Some("PRAGMA"),
         Statement::LockTables { .. } => Some("LOCK TABLES"),
+        // sqlparser 0.63 parses these; 0.53 refused them at the parser. The
+        // PostgreSQL `LOCK TABLE`, `VACUUM` and a cursor `OPEN` are session
+        // and maintenance operations a module has no business issuing.
+        Statement::Lock(_) => Some("LOCK"),
+        Statement::Vacuum(_) => Some("VACUUM"),
+        Statement::Open(_) => Some("OPEN"),
         Statement::UnlockTables => Some("UNLOCK TABLES"),
         Statement::Kill { .. } => Some("KILL"),
         Statement::Comment { .. } => Some("COMMENT"),
@@ -542,6 +588,12 @@ fn check_disallowed_functions(stmt: &Statement) -> Result<(), SqlValidationError
                         return ControlFlow::Break(denied);
                     }
                 }
+                // `XMLTABLE(…)` has its own syntax and, from sqlparser 0.63,
+                // its own node — no name to look up. 0.53 could not parse it
+                // at all, which is the only reason it was refused.
+                ast::TableFactor::XmlTable { .. } if is_denied_sql_function("xmltable") => {
+                    return ControlFlow::Break("xmltable".to_string());
+                }
                 _ => {}
             }
             ControlFlow::Continue(())
@@ -619,7 +671,17 @@ fn is_denied_sql_function(fn_name: &str) -> bool {
 }
 
 fn denied_function_name(name: &ast::ObjectName) -> Option<String> {
-    let segments: Vec<&str> = name.0.iter().map(|ident| ident.value.as_str()).collect();
+    // From sqlparser 0.54 a name part is an identifier or (in other dialects)
+    // a function that computes one. A name this list cannot read is not a
+    // name it can clear: refuse it.
+    let Some(segments) = name
+        .0
+        .iter()
+        .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+        .collect::<Option<Vec<&str>>>()
+    else {
+        return Some(name.to_string().to_ascii_lowercase());
+    };
     match segments.as_slice() {
         [bare] => {
             if is_denied_sql_function(bare) {
@@ -690,8 +752,8 @@ pub struct ValidatedStmt {
 }
 
 /// AST-based check for whether a statement actually emits rows.
-/// SELECT does. INSERT/UPDATE/DELETE only do if they carry a real
-/// `RETURNING` clause. MERGE does not (no RETURNING support in PG).
+/// SELECT does. INSERT/UPDATE/DELETE/MERGE only do if they carry a real
+/// `RETURNING` clause.
 /// Everything else (EXPLAIN, CALL, etc.) is treated as non-row-emitting
 /// for routing purposes — the AST gate above already rejected DDL
 /// and the deny-list catches the dangerous ones.
@@ -700,8 +762,11 @@ fn statement_returns_rows(stmt: &Statement) -> bool {
     match stmt {
         S::Query(_) => true,
         S::Insert(ins) => !ins.returning.as_deref().unwrap_or(&[]).is_empty(),
-        S::Update { returning, .. } => !returning.as_deref().unwrap_or(&[]).is_empty(),
+        S::Update(upd) => !upd.returning.as_deref().unwrap_or(&[]).is_empty(),
         S::Delete(del) => !del.returning.as_deref().unwrap_or(&[]).is_empty(),
+        // PostgreSQL 17 has `MERGE … RETURNING`, and sqlparser parses it from
+        // 0.54 (as the statement's output clause).
+        S::Merge(merge) => merge.output.is_some(),
         // EXPLAIN would emit analysis rows, but `always_blocked_label`
         // rejects it before routing — this arm is unreachable via
         // `validate_sql` and kept only so the pure classifier stays correct.

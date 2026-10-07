@@ -118,9 +118,8 @@ impl SqlAccess {
 /// `Query`, so the walk completes; anything else present is a mutation the
 /// outer `Query` is carrying. That is fail-closed against every statement type
 /// sqlparser learns to nest in future — including `DELETE` and `MERGE` inside
-/// a CTE, which 0.53 refuses to parse today (pinned by
-/// `delete_and_merge_ctes_are_parse_errors_today`) and a later version may
-/// accept.
+/// a CTE, which 0.53 refused to parse and 0.63 accepts
+/// (`delete_and_merge_ctes_parse_and_are_carried_writes`).
 #[must_use]
 pub fn classify(stmt: &Statement) -> SqlAccess {
     match stmt {
@@ -404,18 +403,21 @@ mod tests {
     }
 
     /// The two statement kinds #757 measured as UNPARSEABLE inside a CTE on
-    /// sqlparser 0.53. Pinned so a version bump that starts accepting them is
-    /// noticed — the walk already handles them, but silently gaining a new
-    /// admitted shape should be a visible event.
+    /// sqlparser 0.53, pinned then so that a bump which started accepting them
+    /// would be noticed. 0.63 accepts them (2026-10-06), and the walk — which
+    /// breaks on any carried statement and never listed kinds — calls them
+    /// what they are.
     #[test]
-    fn delete_and_merge_ctes_are_parse_errors_today() {
+    fn delete_and_merge_ctes_parse_and_are_carried_writes() {
         for sql in [
             "WITH d AS (DELETE FROM t RETURNING a) SELECT * FROM d",
             "WITH m AS (MERGE INTO t USING u ON t.a=u.a WHEN MATCHED THEN UPDATE SET a=1) SELECT 1",
+            "WITH a AS (SELECT 1 AS x) DELETE FROM t WHERE a IN (SELECT x FROM a)",
         ] {
-            assert!(
-                Parser::parse_sql(&PostgreSqlDialect {}, sql).is_err(),
-                "sqlparser 0.53 now parses this — re-check the walk: {sql}"
+            assert_eq!(
+                classify(&parse1(sql)),
+                SqlAccess::Mutates { nested: true },
+                "{sql}"
             );
         }
     }
@@ -458,10 +460,10 @@ mod tests {
     /// the parser, so no deep tree is ever handed to the walk, the `Drop`, or
     /// the controller.
     ///
-    /// Measured threshold on sqlparser 0.53 + `PostgreSqlDialect`: depth 45
-    /// parses, depth 48 is a `ParserError`. Both nesting shapes are checked —
-    /// a derived-table chain and a CTE chain — because they descend through
-    /// different parser functions.
+    /// Measured thresholds with `PostgreSqlDialect` (2026-10-06): a CTE chain
+    /// parses to depth 47 on sqlparser 0.53 and 46 on 0.63; a derived-table
+    /// chain parsed to 46 on 0.53 and parses to 22 on 0.63. Both shapes are
+    /// checked because they descend through different parser functions.
     ///
     /// **The stack question, answered with numbers instead of a claim.** Run
     /// under a **release** build (what the fleet ships) a 3 500-deep, 124 KB
@@ -506,10 +508,14 @@ mod tests {
         };
 
         for shape in [&derived as &dyn Fn(usize) -> String, &ctes] {
-            // Shallow nesting is legitimate SQL and must still parse.
+            // Shallow nesting is legitimate SQL and must still parse. Measured
+            // 2026-10-06: the deepest nesting that parses is 46 CTEs on 0.63
+            // (47 on 0.53), and 22 derived tables on 0.63 (46 on 0.53) — a
+            // derived table now costs two of the budget's 50. Twenty is the
+            // floor this pins: the limit must not be tightened silently.
             assert!(
-                !parse_in_a_deep_stack(shape(40)),
-                "depth 40 must parse — the limit must not be tightened silently"
+                !parse_in_a_deep_stack(shape(20)),
+                "depth 20 must parse — the limit must not be tightened silently"
             );
             // Beyond the limit the parser refuses, at every depth up to and
             // past what the callers' byte caps admit.
@@ -520,6 +526,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// sqlparser 0.53 parsed nested function calls in time that DOUBLED per
+    /// level: `abs(abs(…abs(1)…))` took 363 ms at 18 levels, 1.5 s at 20 and
+    /// 5.8 s at 22 (release build, 2026-10-06) — a 118-byte statement, with
+    /// the recursion limit not reached until 46. Both gates parse a guest's
+    /// SQL before anything else, so that was hours of one core for 240 bytes.
+    /// 0.63 parses 46 levels in under a millisecond. The bound here is loose
+    /// on purpose: it separates linear from exponential, not fast from slow.
+    #[test]
+    fn nested_function_calls_parse_in_bounded_time() {
+        let sql = format!("SELECT {}1{}", "abs(".repeat(40), ")".repeat(40));
+        let started = std::time::Instant::now();
+        let parsed = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Parser::parse_sql(&PostgreSqlDialect {}, &sql).is_ok())
+            .expect("spawn")
+            .join()
+            .expect("parser must return, not abort");
+        assert!(parsed, "40 nested calls is inside the recursion limit");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "40 nested function calls took {:?}",
+            started.elapsed()
+        );
     }
 
     /// Mutation guard: deleting the nested walk must break the CTE cases and

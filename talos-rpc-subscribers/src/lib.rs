@@ -390,7 +390,17 @@ fn controller_side_denied_function(stmt: &sqlparser::ast::Statement) -> Option<S
     use std::ops::ControlFlow;
 
     fn check_object_name(name: &ObjectName) -> Option<String> {
-        let segments: Vec<&str> = name.0.iter().map(|i| i.value.as_str()).collect();
+        // From sqlparser 0.54 a name part is an identifier or (in other
+        // dialects) a function that computes one. A name this list cannot
+        // read is not a name it can clear: refuse it.
+        let Some(segments) = name
+            .0
+            .iter()
+            .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+            .collect::<Option<Vec<&str>>>()
+        else {
+            return Some(name.to_string().to_ascii_lowercase());
+        };
         match segments.as_slice() {
             [bare] => {
                 if talos_workflow_job_protocol::is_disallowed_sql_function(bare) {
@@ -442,6 +452,14 @@ fn controller_side_denied_function(stmt: &sqlparser::ast::Statement) -> Option<S
                     if let Some(denied) = check_object_name(name) {
                         return ControlFlow::Break(denied);
                     }
+                }
+                // `XMLTABLE(…)` has its own syntax and, from sqlparser 0.63,
+                // its own node — no name to look up. 0.53 could not parse it
+                // at all, which is the only reason it was refused.
+                TableFactor::XmlTable { .. }
+                    if talos_workflow_job_protocol::is_disallowed_sql_function("xmltable") =>
+                {
+                    return ControlFlow::Break("xmltable".to_string());
                 }
                 _ => {}
             }
@@ -523,7 +541,8 @@ fn statement_type_label(stmt: &sqlparser::ast::Statement) -> &'static str {
 /// and the `UPDATE` form likewise into `SetExpr::Update(Statement)`. Both are
 /// ADMITTED by [`controller_permits_data_statement`]. A `readonly` actor could
 /// therefore have smuggled an INSERT past a ceiling gate that called it a
-/// read. (`DELETE` and `MERGE` inside a CTE are parse errors in 0.53 — today.)
+/// read. (`DELETE` and `MERGE` inside a CTE were parse errors in 0.53; 0.63
+/// parses them, and the walk below already treated them as writes.)
 ///
 /// # …and the worker was answering the same question differently
 ///
@@ -2452,11 +2471,20 @@ pub fn spawn_database_rpc_subscriber(
                 use sqlparser::ast::Statement as S;
                 let blocked_label: Option<&'static str> = match &stmts[0] {
                     S::Copy { .. } | S::CopyIntoSnowflake { .. } => Some("COPY"),
-                    S::SetRole { .. } => Some("SET ROLE"),
-                    S::SetVariable { .. } => Some("SET"),
-                    S::SetTimeZone { .. } => Some("SET TIME ZONE"),
-                    S::SetNamesDefault { .. } | S::SetNames { .. } => Some("SET NAMES"),
-                    S::SetTransaction { .. } => Some("SET TRANSACTION"),
+                    // Every `SET` is one `Statement::Set` from sqlparser
+                    // 0.54; see the worker's list for the sub-kinds.
+                    S::Set(set) => Some(match set {
+                        sqlparser::ast::Set::SetRole { .. } => "SET ROLE",
+                        sqlparser::ast::Set::SetTimeZone { .. } => "SET TIME ZONE",
+                        sqlparser::ast::Set::SetNamesDefault { .. }
+                        | sqlparser::ast::Set::SetNames { .. } => "SET NAMES",
+                        sqlparser::ast::Set::SetTransaction { .. } => "SET TRANSACTION",
+                        sqlparser::ast::Set::SetSessionAuthorization(_) => {
+                            "SET SESSION AUTHORIZATION"
+                        }
+                        _ => "SET",
+                    }),
+                    S::Reset(_) => Some("RESET"),
                     S::ShowVariable { .. }
                     | S::ShowStatus { .. }
                     | S::ShowVariables { .. }
@@ -2467,7 +2495,11 @@ pub fn spawn_database_rpc_subscriber(
                     | S::ShowSchemas { .. }
                     | S::ShowViews { .. }
                     | S::ShowCollation { .. }
-                    | S::ShowFunctions { .. } => Some("SHOW"),
+                    | S::ShowFunctions { .. }
+                    | S::ShowCatalogs { .. }
+                    | S::ShowCharset { .. }
+                    | S::ShowObjects { .. }
+                    | S::ShowProcessList { .. } => Some("SHOW"),
                     S::LISTEN { .. } => Some("LISTEN"),
                     S::NOTIFY { .. } => Some("NOTIFY"),
                     S::UNLISTEN { .. } => Some("UNLISTEN"),
@@ -2492,6 +2524,9 @@ pub fn spawn_database_rpc_subscriber(
                     S::Install { .. } => Some("INSTALL"),
                     S::Pragma { .. } => Some("PRAGMA"),
                     S::LockTables { .. } => Some("LOCK TABLES"),
+                    S::Lock(_) => Some("LOCK"),
+                    S::Vacuum(_) => Some("VACUUM"),
+                    S::Open(_) => Some("OPEN"),
                     S::UnlockTables => Some("UNLOCK TABLES"),
                     S::Kill { .. } => Some("KILL"),
                     S::Comment { .. } => Some("COMMENT"),
@@ -3508,23 +3543,20 @@ mod controller_statement_allowlist_tests {
         }
     }
 
-    /// The forms sqlparser 0.53 refuses today. Pinned so a dependency bump
-    /// that teaches it these forms is NOISY rather than silent — and note the
-    /// walk already handles them fail-closed if it does, because it breaks on
-    /// any non-`Query` statement node rather than on a list.
+    /// The forms sqlparser 0.53 refused, pinned then so that a bump which
+    /// taught it these would be noticed. 0.63 parses them (2026-10-06), and
+    /// the walk — which breaks on any carried statement and never listed
+    /// kinds — sends them to the write ceiling like any other write.
     #[test]
-    fn delete_and_merge_ctes_do_not_parse_today() {
+    fn delete_and_merge_ctes_parse_and_are_writes() {
+        use super::controller_statement_mutates;
         for sql in [
             "WITH d AS (DELETE FROM t RETURNING a) SELECT * FROM d",
             "WITH m AS (MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a) SELECT 1",
         ] {
-            assert!(
-                Parser::parse_sql(&PostgreSqlDialect {}, sql).is_err(),
-                "sqlparser now parses this. That is FINE for the ceiling gate \
-                 (`controller_statement_mutates` breaks on any non-Query \
-                 statement node), but update this test so the change is \
-                 recorded: {sql}"
-            );
+            let stmt = parse1(sql);
+            assert!(controller_permits_data_statement(&stmt), "{sql}");
+            assert!(controller_statement_mutates(&stmt), "{sql}");
         }
     }
 
