@@ -236,7 +236,7 @@ hkdf = "0.12"
 hmac = "0.12"
 http = "1"
 ipnetwork = "0.21"
-jsonwebtoken = { version = "10.3", default-features = false }
+jsonwebtoken = { version = "11.1", default-features = false }
 libc = "0.2"
 oci-distribution = { version = "0.11.0", default-features = false }
 opentelemetry = "0.33"

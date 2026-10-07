@@ -1043,3 +1043,262 @@ fn a_refresh_consumes_the_old_session_before_it_stores_the_new_one() {
         "a lost consume must go to the reuse detector, not mint a session"
     );
 }
+
+/// What the session-token verifier accepts and refuses, for 34 tokens made by
+/// hand: each is signed with the service's own secret unless its name says
+/// otherwise, so every refusal below is the verifier's rule and not a bad
+/// signature.
+///
+/// Recorded when `jsonwebtoken` moved from 10 to 11 (2026-10-06). A harness
+/// running both versions on 117 token/validation pairs found one change: a
+/// header parameter the library does not know, whose value is not a string,
+/// was a parse error in 10 and is ignored in 11 (it already ignored unknown
+/// string-valued ones). That row is marked. Everything else is identical.
+///
+/// Two rows are RECORDED, NOT ENDORSED — they are what the verifier does, and
+/// are here so that changing them is a decision someone makes:
+///   * a token with no `iss` is accepted. `set_issuer` refuses a WRONG issuer
+///     and does not require one, and `Claims::iss` defaults to empty;
+///   * a header with `crit` is accepted. Neither library version honours
+///     `crit` (RFC 7515 §4.1.11 says an unsupported critical extension must
+///     be refused).
+/// Both still need a valid signature under this service's key.
+#[tokio::test]
+async fn the_session_verifier_accepts_and_refuses_what_it_is_recorded_to() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use serde_json::{json, Value};
+    const SECRET: &str = "this-is-a-test-secret-that-is-32bytes";
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://localhost/talos_test")
+        .unwrap();
+    let service = AuthService::new(pool, SECRET.into(), 10, None).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let b64 = |text: String| URL_SAFE_NO_PAD.encode(text);
+    let craft_as =
+        |header: Value, payload: String, secret: &str, alg: jsonwebtoken::Algorithm| -> String {
+            let input = format!("{}.{}", b64(header.to_string()), b64(payload));
+            let signature = jsonwebtoken::crypto::sign(
+                input.as_bytes(),
+                &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+                alg,
+            )
+            .unwrap();
+            format!("{input}.{signature}")
+        };
+    let craft = |header: Value, payload: String, secret: &str| -> String {
+        craft_as(header, payload, secret, jsonwebtoken::Algorithm::HS256)
+    };
+    let h = || json!({"alg": "HS256", "typ": "JWT"});
+    let good = json!({
+        "sub": "11111111-1111-4111-8111-111111111111",
+        "email": "user@example.com",
+        "exp": now + 600,
+        "iat": now,
+        "is_2fa_verified": true,
+        "iss": "talos",
+        "aud": "talos",
+    });
+    let with = |key: &str, value: Value| {
+        let mut claims = good.clone();
+        claims[key] = value;
+        claims.to_string()
+    };
+    let without = |key: &str| {
+        let mut claims = good.clone();
+        claims.as_object_mut().unwrap().remove(key);
+        claims.to_string()
+    };
+    let valid = craft(h(), good.to_string(), SECRET);
+    let parts: Vec<&str> = valid.split('.').collect();
+    let own = |payload: String| craft(h(), payload, SECRET);
+    let headed = |header: Value| craft(header, good.to_string(), SECRET);
+
+    const ACCEPTED: bool = true;
+    const REFUSED: bool = false;
+    let cases: Vec<(&str, String, bool)> = vec![
+        ("valid", valid.clone(), ACCEPTED),
+        // Expiry, with the library's 60-second leeway.
+        (
+            "expired 30 s ago",
+            own(with("exp", json!(now - 30))),
+            ACCEPTED,
+        ),
+        (
+            "expired 90 s ago",
+            own(with("exp", json!(now - 90))),
+            REFUSED,
+        ),
+        ("no exp", own(without("exp")), REFUSED),
+        (
+            "exp a string",
+            own(with("exp", json!((now + 600).to_string()))),
+            REFUSED,
+        ),
+        (
+            "exp a float",
+            own(with("exp", json!((now + 600) as f64 + 0.5))),
+            REFUSED,
+        ),
+        (
+            "exp twice, expired first",
+            own(format!(
+                r#"{{"sub":"u","email":"e","iat":1,"is_2fa_verified":true,"iss":"talos","exp":{},"exp":{}}}"#,
+                now - 3600,
+                now + 600
+            )),
+            REFUSED,
+        ),
+        // The claims the session needs.
+        ("no sub", own(without("sub")), REFUSED),
+        ("no email", own(without("email")), REFUSED),
+        (
+            "no is_2fa_verified",
+            own(without("is_2fa_verified")),
+            REFUSED,
+        ),
+        // Issuer and audience.
+        (
+            "iss wrong",
+            own(with("iss", json!("someone-else"))),
+            REFUSED,
+        ),
+        (
+            "iss differs in case",
+            own(with("iss", json!("Talos"))),
+            REFUSED,
+        ),
+        (
+            "no iss — RECORDED, NOT ENDORSED",
+            own(without("iss")),
+            ACCEPTED,
+        ),
+        ("aud wrong", own(with("aud", json!("other"))), REFUSED),
+        (
+            "aud a list containing talos",
+            own(with("aud", json!(["x", "talos"]))),
+            REFUSED,
+        ),
+        (
+            "no aud (legacy tokens; JWT_REQUIRE_AUD refuses it)",
+            own(without("aud")),
+            ACCEPTED,
+        ),
+        (
+            "nbf in the future (not issued, not checked)",
+            own(with("nbf", json!(now + 600))),
+            ACCEPTED,
+        ),
+        // The signature.
+        (
+            "signed with another secret",
+            craft(
+                h(),
+                good.to_string(),
+                "another-made-up-secret-of-32-bytes!!",
+            ),
+            REFUSED,
+        ),
+        (
+            "signature removed",
+            format!("{}.{}.", parts[0], parts[1]),
+            REFUSED,
+        ),
+        (
+            "payload swapped, old signature",
+            format!(
+                "{}.{}.{}",
+                parts[0],
+                b64(with("email", json!("attacker@example.com"))),
+                parts[2]
+            ),
+            REFUSED,
+        ),
+        // The algorithm is the configured one, never the token's choice.
+        (
+            "alg none, no signature",
+            format!(
+                "{}.{}.",
+                b64(json!({"alg": "none", "typ": "JWT"}).to_string()),
+                parts[1]
+            ),
+            REFUSED,
+        ),
+        (
+            "header says RS256",
+            headed(json!({"alg": "RS256", "typ": "JWT"})),
+            REFUSED,
+        ),
+        (
+            "header says HS384",
+            headed(json!({"alg": "HS384", "typ": "JWT"})),
+            REFUSED,
+        ),
+        // …even when the token really is signed that way, with the right secret.
+        (
+            "signed HS384 with the service's secret",
+            craft_as(
+                json!({"alg": "HS384", "typ": "JWT"}),
+                good.to_string(),
+                SECRET,
+                jsonwebtoken::Algorithm::HS384,
+            ),
+            REFUSED,
+        ),
+        (
+            "signed HS512 with the service's secret",
+            craft_as(
+                json!({"alg": "HS512", "typ": "JWT"}),
+                good.to_string(),
+                SECRET,
+                jsonwebtoken::Algorithm::HS512,
+            ),
+            REFUSED,
+        ),
+        // Header parameters the verifier has no use for.
+        (
+            "header without typ",
+            headed(json!({"alg": "HS256"})),
+            ACCEPTED,
+        ),
+        (
+            "header with kid",
+            headed(json!({"alg": "HS256", "typ": "JWT", "kid": "k1"})),
+            ACCEPTED,
+        ),
+        (
+            "unknown string header parameter",
+            headed(json!({"alg": "HS256", "typ": "JWT", "made_up": "yes"})),
+            ACCEPTED,
+        ),
+        (
+            "unknown non-string header parameter (refused by jsonwebtoken 10)",
+            headed(json!({"alg": "HS256", "typ": "JWT", "made_up": true})),
+            ACCEPTED,
+        ),
+        (
+            "header with crit — RECORDED, NOT ENDORSED",
+            headed(json!({"alg": "HS256", "typ": "JWT", "crit": ["made_up"], "made_up": "yes"})),
+            ACCEPTED,
+        ),
+        // Not a token.
+        (
+            "two segments",
+            format!("{}.{}", parts[0], parts[1]),
+            REFUSED,
+        ),
+        ("four segments", format!("{valid}.extra"), REFUSED),
+        ("empty", String::new(), REFUSED),
+        ("trailing newline", format!("{valid}\n"), REFUSED),
+    ];
+    assert_eq!(cases.len(), 34);
+    for (name, token, expected) in cases {
+        let verdict = service.verify_token(&token);
+        assert_eq!(
+            verdict.is_ok(),
+            expected,
+            "{name}: recorded as {}, the verifier says {:?}",
+            if expected { "accepted" } else { "refused" },
+            verdict.map(|claims| claims.sub)
+        );
+    }
+}

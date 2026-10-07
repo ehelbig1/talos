@@ -761,6 +761,11 @@ fn algorithm_name(alg: Algorithm) -> &'static str {
         Algorithm::PS384 => "PS384",
         Algorithm::PS512 => "PS512",
         Algorithm::EdDSA => "EdDSA",
+        // `Algorithm` is `non_exhaustive` from jsonwebtoken 11. The self-test
+        // can only meet an algorithm this process was configured to sign
+        // with, and `JWT_ALGORITHM` accepts three; a name the library adds
+        // later is reported as what it is to this code, not guessed at.
+        _ => "unrecognised",
     }
 }
 
