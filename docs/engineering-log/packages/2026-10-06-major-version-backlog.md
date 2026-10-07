@@ -126,3 +126,49 @@ release. A first attempt through the crates.io API with Python's `urllib`
 reported "0 behind": every request failed certificate verification and the
 script skipped failures. The second version reports unreadable crates; it
 read all 105.
+
+## Closed out, and corrected (2026-10-07)
+
+**Every item in the order above is merged**: `md5` (#1161), `quick-xml`
+(#1162), `criterion` (#1165), `cap-std` (#1166), the OpenTelemetry family
+(#1174), `bcrypt` (#1175), `totp-rs` (#1176), `jsonwebtoken` (#1177),
+`sqlparser` (#1180), `async-nats` (#1182), `redis` (#1183), `reqwest`
+(#1184, with `oci-client` in #1185), `sha2`/`hmac`/`hkdf` (#1186), `aes-gcm`
+(#1187), `ed25519-dalek`/`x25519-dalek` (#1188), `sqlx` (#1189).
+
+**The table above was short by five.** Re-measured after the last merge, 12
+direct dependencies are behind a breaking release — the seven held ones, and
+five the table never listed:
+
+| Crate | Built with | Newest | Workspace crates that declare it |
+|---|---|---|---|
+| `secrecy` | 0.8.0 | 0.10.3 | 1 |
+| `syn` | 2.0.119 | 3.0.6 | 1 |
+| `governor` | 0.6.3 | 0.10.4 | 2 |
+| `base64` | 0.22.1 | 0.23.1 | 11 |
+| `rand` | 0.8.8 | 0.10.3 | 22 |
+
+For each of the five the lockfile already holds the newer version, brought
+in by some other crate (`rand` 0.10.1, `base64` 0.23.1, `governor` 0.10.4,
+`secrecy` 0.10.3, `syn` 3.0.6). The script that made the table was not kept,
+so why it missed them cannot be shown; comparing the newest copy of a name
+anywhere in the lockfile, rather than the version the member is built with,
+would miss exactly these — and `sha2` and `hmac`, which were also absent and
+were only moved because `hkdf` needed them. All five releases predate the
+table, so none is a new arrival.
+
+The survey is now `scripts/survey-major-versions.py`. It reads the version
+each member's declaration resolves to, reports a crate it cannot read rather
+than skipping it, and its self-test holds the case above: a newer copy
+elsewhere in the tree does not hide the one the member is built with.
+
+**The five are the remaining list**, smallest reach first: `secrecy`, `syn`,
+`governor`, `base64`, `rand`. Each also removes a second copy of the crate
+from the build.
+
+**The held ones were re-tested against the index, and each reason still
+holds**: `testcontainers-modules` 0.15.0 (the newest) requires
+`testcontainers ^0.27`; `wasm-compose` 0.261.0 (the newest) requires
+`petgraph ^0.6.2`; `wasmtime` 49.0.2 is the newest and is what is locked, so
+there is no bump to move the `wasmparser` family with; `croner` 4.0.1 is the
+release that was measured; `age` 0.12.1 is unchanged.
