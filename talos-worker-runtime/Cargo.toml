@@ -121,7 +121,7 @@ prometheus = { workspace = true, features = ["process"] } # opentelemetry-promet
                     # tokens, and rate limiting as defence-in-depth.
 tracing-opentelemetry.workspace = true
 wasmtime-wasi-http.workspace = true
-oci-distribution = { workspace = true, features = ["default"] }
+oci-client = { workspace = true, features = ["rustls-tls"] }
 bytes.workspace = true
 # `host::wasi_http` (2026-09-25): the gated wasi:http send path converts the
 # upstream hyper request/response to and from the hardened reqwest client, and

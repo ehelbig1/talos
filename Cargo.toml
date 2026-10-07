@@ -239,7 +239,7 @@ http = "1"
 ipnetwork = "0.21"
 jsonwebtoken = { version = "11.1", default-features = false }
 libc = "0.2"
-oci-distribution = { version = "0.11.0", default-features = false }
+oci-client = { version = "0.18", default-features = false }
 opentelemetry = "0.33"
 opentelemetry-otlp = { version = "0.33", default-features = false }
 opentelemetry_sdk = "0.33"

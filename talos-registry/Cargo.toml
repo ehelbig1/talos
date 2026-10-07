@@ -11,7 +11,7 @@ talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
 axum = { workspace = true, features = ["json"] }
 chrono.workspace = true
-oci-distribution = { workspace = true, features = ["rustls-tls"] }
+oci-client = { workspace = true, features = ["rustls-tls"] }
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 talos-redis = { path = "../talos-redis" }
 reqwest = { workspace = true, features = ["json", "rustls"] }
