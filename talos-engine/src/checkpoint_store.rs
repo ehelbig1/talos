@@ -541,7 +541,7 @@ fn encrypt_checkpoint(
         .map_err(|e| format!("Failed to create cipher: {e}"))?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = &Nonce::from(nonce_bytes);
     let ciphertext = cipher
         .encrypt(
             nonce,
@@ -584,7 +584,8 @@ fn decrypt_checkpoint(
             nonce.len()
         ));
     }
-    let nonce = Nonce::from_slice(nonce);
+    let nonce = <&Nonce<_>>::try_from(nonce)
+        .map_err(|_| format!("Nonce must be exactly {NONCE_LEN} bytes"))?;
 
     // Try the v2 per-execution key first (the steady-state hit), then the
     // legacy v1 static key. AES-GCM's tag makes the fallback unambiguous:
@@ -747,6 +748,42 @@ mod m11_key_length_tests {
 
 #[cfg(test)]
 mod checkpoint_aead_tests {
+    /// Ciphertexts sealed OUTSIDE this code — by Python's `cryptography`
+    /// (AES-256-GCM), under keys derived by RFC 5869 in Python — over made-up
+    /// inputs, opened here by the real decrypt path. What is stored must
+    /// stay readable across a change of AEAD library, and a round trip
+    /// through one version of a library cannot show that.
+    #[test]
+    fn a_checkpoint_sealed_by_another_implementation_opens() {
+        let unhex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let root = b"made-up worker shared key, 32 b!";
+        let aad = b"made-up execution 0001";
+        let nonce = unhex("0102030405060708090a0b0c");
+        let expected = serde_json::json!({"made_up": "checkpoint", "n": 1});
+        // Under the per-execution key (v2), and under the legacy static key
+        // (v1) that in-flight checkpoints from before v2 still use.
+        for sealed in [
+            "2e438db60a293a2e994b8bd1f95b4a0d974fb0e4a3bced704da6e6ad6667560321548d5d6d982e47c68f0f76cb27",
+            "1ddb3b3e0d6aa2866de1e0b68ee79ce76af9ae8417134da11139daad9f04679b7760bc4af061966cb0ddcb883069",
+        ] {
+            let opened = decrypt_checkpoint(&unhex(sealed), &nonce, root, aad).expect("opens");
+            assert_eq!(opened, expected);
+        }
+        // The tag covers the execution it was sealed for.
+        assert!(decrypt_checkpoint(
+            &unhex("2e438db60a293a2e994b8bd1f95b4a0d974fb0e4a3bced704da6e6ad6667560321548d5d6d982e47c68f0f76cb27"),
+            &nonce,
+            root,
+            b"made-up execution 0002"
+        )
+        .is_err());
+    }
+
     /// Known answers for the key derivation, computed OUTSIDE this code — by
     /// Python's standard `hmac`/`hashlib`, implementing RFC 5869 directly —
     /// for made-up inputs. Every checkpoint ever written decrypts only if this
@@ -850,7 +887,7 @@ mod checkpoint_aead_tests {
         let pt = serde_json::to_vec(&snapshot).unwrap();
         let ct = cipher
             .encrypt(
-                Nonce::from_slice(&nonce_bytes),
+                &Nonce::from(nonce_bytes),
                 Payload {
                     msg: pt.as_ref(),
                     aad: exec.as_bytes(),

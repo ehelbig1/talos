@@ -478,6 +478,41 @@ pub fn validate_worker_id(worker_id: &str) -> Result<(), String> {
 mod envelope_key_derivation_tests {
     use super::{derive_envelope_aead_key_v1, derive_envelope_aead_key_v2};
 
+    /// Ciphertexts sealed OUTSIDE this code — by Python's `cryptography`
+    /// (AES-256-GCM), under keys derived by RFC 5869 in Python — over made-up
+    /// inputs, opened here by the real decrypt path. A worker on one build must open what a
+    /// controller on another sealed across a change of AEAD library, and a round trip
+    /// through one version of a library cannot show that.
+    #[test]
+    fn an_envelope_sealed_by_another_implementation_opens() {
+        let root = b"made-up worker shared key, 32 b!";
+        let aad = b"made-up execution 0001";
+        let nonce = hex::decode("0102030405060708090a0b0c").unwrap();
+        let expected: std::collections::HashMap<String, String> =
+            [("made-up/secret".to_string(), "value".to_string())].into();
+
+        let v2 = super::EncryptedSecrets {
+            ciphertext: hex::decode(
+                "fb4ec72b497618e7de8b21228ea4e060f3298e3dcf3b672b2686a8ea28660cbfeade61a26112af42e1ee",
+            )
+            .unwrap(),
+            nonce: nonce.clone(),
+        };
+        assert_eq!(v2.decrypt_with_aad(root, aad).expect("opens"), expected);
+        assert!(v2
+            .decrypt_with_aad(root, b"made-up execution 0002")
+            .is_err());
+
+        let v1 = super::EncryptedSecrets {
+            ciphertext: hex::decode(
+                "4e6073493eb14680e402ef0a5fa4c08f8bbd89684edf5b4933c9c8f3daaa0c055c8f77ca5ca8e96e9403",
+            )
+            .unwrap(),
+            nonce,
+        };
+        assert_eq!(v1.decrypt(root).expect("opens"), expected);
+    }
+
     /// Known answers for the key derivation, computed OUTSIDE this code — by
     /// Python's standard `hmac`/`hashlib`, implementing RFC 5869 directly —
     /// for made-up inputs. Every envelope ever written decrypts only if this
@@ -3833,7 +3868,7 @@ impl EncryptedSecrets {
         // birthday-bound footnote from this primitive.
         let mut nonce_bytes = [0u8; 12];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = &Nonce::from(nonce_bytes);
 
         let ciphertext = cipher
             .encrypt(
@@ -3881,7 +3916,8 @@ impl EncryptedSecrets {
             return Err("invalid nonce length".to_string());
         }
 
-        let nonce = Nonce::from_slice(&self.nonce);
+        let nonce = <&Nonce<_>>::try_from(self.nonce.as_slice())
+            .map_err(|_| "invalid nonce length".to_string())?;
 
         // The AES-GCM key is an HKDF subkey of the root, never the raw root
         // (which is also the HMAC signing key). For a non-empty `aad` (the
@@ -8077,7 +8113,7 @@ mod tests {
         let plaintext = serde_json::to_vec(&secrets).unwrap();
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce_bytes),
+                &Nonce::from(nonce_bytes),
                 Payload {
                     msg: plaintext.as_ref(),
                     aad,
@@ -8114,7 +8150,7 @@ mod tests {
 
         // Must NOT open if you treat the raw root as the AES-GCM key.
         let raw_cipher = Aes256Gcm::new_from_slice(&root).unwrap();
-        let nonce = Nonce::from_slice(&env.nonce);
+        let nonce = <&Nonce<_>>::try_from(env.nonce.as_slice()).unwrap();
         let opened_raw = raw_cipher.decrypt(
             nonce,
             Payload {

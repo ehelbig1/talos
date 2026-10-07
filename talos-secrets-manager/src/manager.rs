@@ -4656,7 +4656,8 @@ impl SecretsManager {
         }
         // Parse: KEY_ID_LEN-byte key_id UUID || NONCE_LEN-byte nonce || ciphertext
         let key_id = Uuid::from_slice(&ciphertext[..KEY_ID_LEN]).map_err(|_| SecretsError::Aead)?;
-        let nonce = Nonce::from_slice(&ciphertext[KEY_ID_LEN..HEADER_LEN]);
+        let nonce = <&Nonce<_>>::try_from(&ciphertext[KEY_ID_LEN..HEADER_LEN])
+            .map_err(|_| SecretsError::Aead)?;
         let payload = &ciphertext[HEADER_LEN..];
 
         let dek = self.get_dek(key_id).await?;
@@ -5746,7 +5747,7 @@ fn aead_seal(key: &[u8], msg: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let nonce_bytes = SecretsManager::generate_nonce();
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce_bytes),
+            &Nonce::from(nonce_bytes),
             aes_gcm::aead::Payload { msg, aad },
         )
         .map_err(|e| anyhow!("Encryption failed: {}", e))?;
@@ -5769,14 +5770,12 @@ fn aead_open_utf8(
         return Err(SecretsError::Aead);
     }
     let (nonce, msg) = stored.split_at(AEAD_NONCE_LEN);
+    let nonce = <&Nonce<_>>::try_from(nonce).map_err(|_| SecretsError::Aead)?;
     // Only a wrong-length key fails construction, which the DEK contract rules out.
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| SecretsError::Internal(anyhow!(e)))?;
     let decrypted: Zeroizing<Vec<u8>> = Zeroizing::new(
         cipher
-            .decrypt(
-                Nonce::from_slice(nonce),
-                aes_gcm::aead::Payload { msg, aad },
-            )
+            .decrypt(nonce, aes_gcm::aead::Payload { msg, aad })
             .map_err(|_| SecretsError::Aead)?,
     );
     let plaintext = std::str::from_utf8(&decrypted).map_err(|_| SecretsError::Serde)?;
@@ -5973,6 +5972,25 @@ pub(crate) async fn rewrap_bound_under_active(
 
 #[cfg(test)]
 mod aead_framing_tests {
+    /// Ciphertexts sealed OUTSIDE this code — by Python's `cryptography`
+    /// (AES-256-GCM), under keys derived by RFC 5869 in Python — over made-up
+    /// inputs, opened here by the real decrypt path. What is stored must
+    /// stay readable across a change of AEAD library, and a round trip
+    /// through one version of a library cannot show that.
+    #[test]
+    fn a_value_sealed_by_another_implementation_opens() {
+        let key = b"made-up data encryption key 32b!";
+        let aad = b"made-up execution 0001";
+        let stored = hex::decode(
+            "0102030405060708090a0b0c8b53c11b4fe33a41e6bd61533629efb946676916b50062cd2e31f44f7292083efe83d9cb",
+        )
+        .unwrap();
+        let opened = super::aead_open_utf8(key, &stored, aad).expect("opens");
+        assert_eq!(opened.as_str(), "made-up secret value");
+        // Bound to its context: another AAD is another row.
+        assert!(super::aead_open_utf8(key, &stored, b"made-up execution 0002").is_err());
+    }
+
     /// Known answers for the key derivation, computed OUTSIDE this code — by
     /// Python's standard `hmac`/`hashlib`, implementing RFC 5869 directly —
     /// for made-up inputs. Every row sealed in formats v3 and v4 decrypts only if this
@@ -6003,7 +6021,7 @@ mod aead_framing_tests {
         for aad in [&b""[..], &b"row-id"[..]] {
             let ct = cipher
                 .encrypt(
-                    Nonce::from_slice(&nonce),
+                    &Nonce::from(nonce),
                     aes_gcm::aead::Payload {
                         msg: b"hunter2",
                         aad,
@@ -6021,7 +6039,7 @@ mod aead_framing_tests {
             assert_eq!(sealed.len(), legacy.len(), "same [nonce][ct+tag] layout");
             let reopened = cipher
                 .decrypt(
-                    Nonce::from_slice(&sealed[..12]),
+                    <&Nonce<_>>::try_from(&sealed[..12]).unwrap(),
                     aes_gcm::aead::Payload {
                         msg: &sealed[12..],
                         aad,
@@ -6365,8 +6383,8 @@ mod aad_binding_tests {
         let key = fresh_key();
         let cipher = Aes256Gcm::new(&key.into());
 
-        let nonce_a = Nonce::from_slice(&[1u8; 12]);
-        let nonce_b = Nonce::from_slice(&[2u8; 12]);
+        let nonce_a = &Nonce::from([1u8; 12]);
+        let nonce_b = &Nonce::from([2u8; 12]);
 
         let pt_a = b"plaintext A";
         let pt_b = b"plaintext B";
@@ -6393,8 +6411,8 @@ mod aad_binding_tests {
         let secret_id_a = Uuid::new_v4();
         let secret_id_b = Uuid::new_v4();
 
-        let nonce_a = Nonce::from_slice(&[3u8; 12]);
-        let nonce_b = Nonce::from_slice(&[4u8; 12]);
+        let nonce_a = &Nonce::from([3u8; 12]);
+        let nonce_b = &Nonce::from([4u8; 12]);
 
         let pt = b"shared plaintext shape";
 
@@ -6465,7 +6483,7 @@ mod aad_binding_tests {
         // backward-compat invariant the v0/v1 dispatcher relies on.
         let key = fresh_key();
         let cipher = Aes256Gcm::new(&key.into());
-        let nonce = Nonce::from_slice(&[7u8; 12]);
+        let nonce = &Nonce::from([7u8; 12]);
         let pt = b"v0 legacy bytes";
 
         // Encrypt without AAD (legacy path).
@@ -6523,8 +6541,8 @@ mod aad_binding_tests {
         // WITH AAD it fails AES-GCM tag verification.
         let key = fresh_dek();
         let cipher = Aes256Gcm::new(&key.into());
-        let nonce_a = Nonce::from_slice(&[7u8; 12]);
-        let nonce_b = Nonce::from_slice(&[8u8; 12]);
+        let nonce_a = &Nonce::from([7u8; 12]);
+        let nonce_b = &Nonce::from([8u8; 12]);
 
         let aad_a: &[u8] = &[0x01, 0x02, 0x03, 0x04];
         let aad_b: &[u8] = &[0x99, 0x88, 0x77, 0x66];
@@ -6606,7 +6624,7 @@ mod aad_binding_tests {
         // (and vice versa) get an error — not silent decrypt.
         let key = fresh_dek();
         let cipher = Aes256Gcm::new(&key.into());
-        let nonce = Nonce::from_slice(&[0u8; 12]);
+        let nonce = &Nonce::from([0u8; 12]);
         let pt = b"plaintext";
 
         // Construct via no-Payload (v0 shape).
@@ -6641,7 +6659,7 @@ mod aad_binding_tests {
         // covers every AAD byte, no truncation.
         let key = fresh_dek();
         let cipher = Aes256Gcm::new(&key.into());
-        let nonce = Nonce::from_slice(&[0u8; 12]);
+        let nonce = &Nonce::from([0u8; 12]);
 
         let aad_correct: &[u8] = b"actor-id-bytes-0123456789ABCDEF";
         let mut aad_wrong = aad_correct.to_vec();
@@ -7016,7 +7034,7 @@ mod per_context_subkey_tests {
         let aad = Uuid::new_v4();
         let subkey = SecretsManager::derive_per_context_subkey(&dek, aad.as_bytes()).unwrap();
         let cipher = Aes256Gcm::new_from_slice(subkey.as_slice()).unwrap();
-        let nonce = Nonce::from_slice(&[9u8; 12]);
+        let nonce = &Nonce::from([9u8; 12]);
         let pt = b"per-context plaintext";
         let ct = cipher
             .encrypt(
@@ -7052,7 +7070,7 @@ mod per_context_subkey_tests {
         let key_b = SecretsManager::derive_per_context_subkey(&dek, ctx_b.as_bytes()).unwrap();
 
         let cipher_a = Aes256Gcm::new_from_slice(key_a.as_slice()).unwrap();
-        let nonce = Nonce::from_slice(&[11u8; 12]);
+        let nonce = &Nonce::from([11u8; 12]);
         let ct = cipher_a
             .encrypt(
                 nonce,
@@ -7103,7 +7121,7 @@ mod per_context_subkey_tests {
         );
 
         let cipher_a = Aes256Gcm::new_from_slice(key_a.as_slice()).unwrap();
-        let nonce = Nonce::from_slice(&[7u8; 12]);
+        let nonce = &Nonce::from([7u8; 12]);
         let ct = cipher_a
             .encrypt(
                 nonce,
@@ -7147,7 +7165,7 @@ mod per_context_subkey_tests {
         );
 
         let cipher = Aes256Gcm::new_from_slice(totp_key.as_slice()).unwrap();
-        let nonce = Nonce::from_slice(&[3u8; 12]);
+        let nonce = &Nonce::from([3u8; 12]);
         let totp_blob = cipher
             .encrypt(
                 nonce,
@@ -7188,7 +7206,7 @@ mod per_context_subkey_tests {
             "tagged AAD: distinct subkey per column"
         );
 
-        let nonce = Nonce::from_slice(&[4u8; 12]);
+        let nonce = &Nonce::from([4u8; 12]);
         let totp_blob = Aes256Gcm::new_from_slice(totp_key.as_slice())
             .unwrap()
             .encrypt(

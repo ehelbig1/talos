@@ -211,7 +211,7 @@ publish = false
 # * A crate on a different major keeps its own line, marked
 #   `# not-inherited: <reason>` (one today: talos-evaluation, thiserror 1).
 [workspace.dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 anyhow = "1.0"
 arc-swap = "1.7"
 async-graphql = "7.2"

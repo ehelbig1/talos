@@ -206,7 +206,7 @@ impl KekProvider for EnvKekProvider {
             // byte-identical to the pre-RFC-0013 `encrypt(nonce, dek)`.
             let ciphertext = cipher
                 .encrypt(
-                    Nonce::from_slice(&nonce_bytes),
+                    &Nonce::from(nonce_bytes),
                     Payload {
                         msg: dek.as_ref(),
                         aad: &aad,
@@ -238,7 +238,8 @@ impl KekProvider for EnvKekProvider {
             }
             let cipher = Aes256Gcm::new_from_slice(&self.master_key)
                 .context("Failed to construct master cipher")?;
-            let nonce = Nonce::from_slice(&wrapped[..12]);
+            let nonce = <&Nonce<_>>::try_from(&wrapped[..12])
+                .map_err(|_| anyhow!("Invalid wrapped DEK: nonce"))?;
             let ciphertext = &wrapped[12..];
             let plaintext = Zeroizing::new(
                 cipher
@@ -312,6 +313,39 @@ pub fn env_kek_legacy_provider_from_environment() -> Result<Option<Arc<dyn KekPr
 
 #[cfg(test)]
 mod tests {
+    /// Ciphertexts sealed OUTSIDE this code — by Python's `cryptography`
+    /// (AES-256-GCM), under keys derived by RFC 5869 in Python — over made-up
+    /// inputs, opened here by the real decrypt path. Every wrapped DEK in `encryption_keys` must
+    /// stay unwrappable across a change of AEAD library, and a round trip
+    /// through one version of a library cannot show that.
+    #[tokio::test]
+    async fn a_dek_wrapped_by_another_implementation_unwraps() {
+        let kek = EnvKekProvider::from_raw_bytes(b"made-up master key material 32b!".to_vec());
+        let dek = b"made-up 32-byte wrapped dek key!";
+        let bound = hex::decode(
+            "0102030405060708090a0b0c5c9b7893a859b12790e80caa2ad31324054928b2716d3e3c120856517df558d866dea4cd9abc2dddefa85d9dc1264f28",
+        )
+        .unwrap();
+        let opened = kek
+            .unwrap_dek(&bound, b"made-up dek row")
+            .await
+            .expect("unwraps");
+        assert_eq!(opened.as_slice(), dek);
+        assert!(kek.unwrap_dek(&bound, b"another row").await.is_err());
+        // The pre-RFC-0013 wrap: no AAD.
+        let plain = hex::decode(
+            "0102030405060708090a0b0c5c9b7893a859b12790e80caa2ad31324054928b2716d3e3c120856517df558d810981c2df86275e86db5bf6c8c25cff0",
+        )
+        .unwrap();
+        assert_eq!(
+            kek.unwrap_dek(&plain, &[])
+                .await
+                .expect("unwraps")
+                .as_slice(),
+            dek
+        );
+    }
+
     /// Known answers for the key derivation, computed OUTSIDE this code — by
     /// Python's standard `hmac`/`hashlib`, implementing RFC 5869 directly —
     /// for made-up inputs. Every purpose key the environment KEK hands out stays the same only if this
@@ -367,11 +401,7 @@ mod tests {
         let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
         let nonce = [1u8; 12];
         let mut wrapped = nonce.to_vec();
-        wrapped.extend(
-            cipher
-                .encrypt(Nonce::from_slice(&nonce), &[7u8; 16][..])
-                .unwrap(),
-        );
+        wrapped.extend(cipher.encrypt(&Nonce::from(nonce), &[7u8; 16][..]).unwrap());
         assert!(kek.unwrap_dek(&wrapped, &[]).await.is_err());
     }
 
@@ -405,7 +435,7 @@ mod tests {
         legacy.extend(
             Aes256Gcm::new_from_slice(&key)
                 .unwrap()
-                .encrypt(Nonce::from_slice(&nonce), &dek[..])
+                .encrypt(&Nonce::from(nonce), &dek[..])
                 .unwrap(),
         );
         assert_eq!(kek.unwrap_dek(&legacy, &[]).await.unwrap().as_slice(), &dek);
