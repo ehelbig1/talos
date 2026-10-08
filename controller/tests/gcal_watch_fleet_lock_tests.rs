@@ -319,6 +319,59 @@ async fn the_fleet_lock_excludes_another_replica_until_the_guard_drops() {
     assert!(waited >= Duration::from_millis(500), "waited {waited:?}");
 }
 
+/// A fleet lock outlives the pool's limit on idle transactions. Every pooled
+/// controller connection ends a transaction that sits idle for 60 seconds
+/// (`talos-db`), and a fleet lock IS a transaction that sits idle: it takes
+/// the advisory lock and then runs nothing until the guard drops. A holder
+/// slower than that — a renewal makes two upstream calls of up to 30 seconds
+/// each — lost its lock partway, and the next caller went ahead beside it.
+/// Here the limit is one second instead of sixty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_fleet_lock_outlives_the_pools_idle_transaction_limit() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let pool_a = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                use sqlx::Executor as _;
+                conn.execute("SET idle_in_transaction_session_timeout = '1s'")
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("a pool that ends idle transactions after 1 s");
+    let pool_b = second_pool(&pool).await;
+    let (map_a, map_b): (CreateLockMap<u8>, CreateLockMap<u8>) =
+        (CreateLockMap::new(), CreateLockMap::new());
+
+    let guard = map_a
+        .acquire_fleet(&pool_a, 1, "test:idle")
+        .await
+        .expect("a");
+    // Idle well past the pool's limit, as a holder waiting on an upstream call.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    let waiter = tokio::spawn(async move {
+        map_b
+            .acquire_fleet(&pool_b, 1, "test:idle")
+            .await
+            .expect("b")
+    });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !waiter.is_finished(),
+        "the lock was released while its holder still held the guard"
+    );
+
+    drop(guard);
+    let _b = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("the waiter proceeds once the guard is dropped")
+        .expect("join");
+}
+
 #[tokio::test]
 async fn an_unreachable_database_is_an_error_not_an_unlocked_create() {
     let dead = sqlx::postgres::PgPoolOptions::new()

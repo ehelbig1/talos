@@ -282,6 +282,13 @@ impl<K: Eq + Hash> CreateLockMap<K> {
         sqlx::query(FLEET_LOCK_TIMEOUT_SQL)
             .execute(&mut *tx)
             .await?;
+        // The pool ends any transaction left idle for 60 s, and this one is
+        // left idle on purpose: it holds the lock and runs nothing until the
+        // guard drops. Without this, a holder slower than a minute lost the
+        // lock partway and the next caller went ahead beside it.
+        sqlx::query(FLEET_LOCK_HOLD_LIMIT_SQL)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(FLEET_LOCK_SQL)
             .bind(fleet_key)
             .execute(&mut *tx)
@@ -316,6 +323,18 @@ pub const FLEET_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// pinned equal to [`FLEET_LOCK_TIMEOUT`] by a unit test.
 const FLEET_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '45s'";
 
+/// How long a held fleet lock may sit idle before Postgres ends its
+/// transaction, and with it the lock. The pooled connections' own limit
+/// (60 s, `talos-db`) is shorter than a legitimate hold: gcal's renewal lock
+/// is held across a wait of up to [`FLEET_LOCK_TIMEOUT`] for the create lock
+/// and then two upstream calls of up to 30 s each. A holder that is not done
+/// in five minutes is stuck, and its lock is let go.
+pub const FLEET_LOCK_HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `SET LOCAL` cannot bind parameters; pinned equal to
+/// [`FLEET_LOCK_HOLD_LIMIT`] by a unit test.
+const FLEET_LOCK_HOLD_LIMIT_SQL: &str = "SET LOCAL idle_in_transaction_session_timeout = '300s'";
+
 const FLEET_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 
 /// Held for the length of one create/renew. Field order is drop order: the
@@ -347,6 +366,20 @@ mod tests {
         // Expiration far enough past that even the grace is consumed.
         let long_gone = Utc::now().timestamp_millis() - (TTL_GRACE_SECONDS + 10) * 1000;
         assert_eq!(ttl_with_grace(long_gone), Some(3600));
+    }
+
+    #[test]
+    fn the_hold_limit_statement_matches_the_constant_and_outlasts_a_legitimate_hold() {
+        assert_eq!(
+            FLEET_LOCK_HOLD_LIMIT_SQL,
+            format!(
+                "SET LOCAL idle_in_transaction_session_timeout = '{}s'",
+                FLEET_LOCK_HOLD_LIMIT.as_secs()
+            )
+        );
+        // A renewal: the wait for the create lock, then two upstream calls of
+        // up to 30 s each.
+        assert!(FLEET_LOCK_HOLD_LIMIT > FLEET_LOCK_TIMEOUT + std::time::Duration::from_secs(60));
     }
 
     #[test]
