@@ -376,6 +376,13 @@ pub(crate) async fn revoke_at_provider(
         // settings page or Atlassian admin console. Local cleanup
         // (vault delete + soft-delete) still proceeds.
         "atlassian" => Ok(false),
+        // Microsoft has no endpoint that revokes one refresh token: revoking
+        // sign-in sessions (Graph `revokeSignInSessions`) ends every app's
+        // session for the user, far beyond this connection. Local cleanup
+        // still proceeds; the owner removes the app at
+        // myapplications.microsoft.com, and an unused refresh token lapses
+        // after 90 days. Named so it does not read as a provider left out.
+        "microsoft_365" => Ok(false),
         // Unknown provider — caller should not have called us, but treat as no-op.
         _ => Ok(false),
     }

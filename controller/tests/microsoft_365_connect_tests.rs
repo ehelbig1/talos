@@ -13,8 +13,10 @@
 //!   NOTHING — no row, no credential;
 //! * reconnecting the same account updates its row;
 //! * the generic disconnect's STORE step hides the row and hands back the key
-//!   to revoke, and cannot be used on another user's connection. A token
-//!   refresh is not driven here.
+//!   to revoke, and cannot be used on another user's connection;
+//! * a refresh is form-encoded (Microsoft refuses a JSON token body) and the
+//!   rotated refresh token is the one stored; a refused grant marks the
+//!   credential for re-authorization.
 //!
 //! `common` harness (a template clone per test), so CTRL_TESTS (64b).
 
@@ -64,6 +66,8 @@ struct Fake {
 }
 
 /// A stand-in for login.microsoftonline.com's token endpoint and Graph's `/me`.
+/// A canned answer is keyed by the authorization code, or for a refresh by
+/// the refresh token presented.
 async fn fake_microsoft(codes: Vec<(&str, Canned)>) -> (String, Fake) {
     let fake = Fake {
         codes: Arc::new(codes.into_iter().map(|(c, a)| (c.to_string(), a)).collect()),
@@ -91,7 +95,11 @@ async fn fake_microsoft(codes: Vec<(&str, Canned)>) -> (String, Fake) {
                 )
             })
             .collect();
-        let code = form.get("code").cloned().unwrap_or_default();
+        let code = form
+            .get("code")
+            .or_else(|| form.get("refresh_token"))
+            .cloned()
+            .unwrap_or_default();
         f.exchanges.lock().unwrap().push((content_type, form));
         match f.codes.get(&code) {
             Some(c) => (
@@ -150,8 +158,14 @@ async fn world(codes: Vec<(&str, Canned)>) -> World {
     let (pool, _db) = common::isolated_db_pool().await;
     let secrets = Arc::new(SecretsManager::new(pool.clone()).expect("secrets manager"));
     secrets.initialize().await.expect("active DEK");
-    let creds = Arc::new(OAuthCredentialService::new(pool.clone(), secrets));
     let (base, fake) = fake_microsoft(codes).await;
+    let creds = Arc::new(
+        OAuthCredentialService::new(pool.clone(), secrets).with_microsoft_365_refresh_for_tests(
+            &format!("{base}/token"),
+            "client-id",
+            "client-secret",
+        ),
+    );
     let service = Microsoft365Service::for_tests(
         pool.clone(),
         Some(("client-id", "client-secret")),
@@ -582,4 +596,115 @@ async fn reconnecting_one_account_updates_its_row_and_disconnect_is_the_owners()
             true
         )]
     );
+}
+
+#[tokio::test]
+async fn a_refresh_is_form_encoded_and_stores_the_rotated_refresh_token() {
+    // Microsoft rotates the refresh token on every refresh: the old one is
+    // dead once the new one is issued.
+    let rotated = Canned {
+        status: 200,
+        token: json!({"access_token": "token-b", "refresh_token": "refresh-rotated", "expires_in": 3599, "scope": GRANTED, "token_type": "Bearer"}),
+        account: json!({}),
+    };
+    let w = world(vec![
+        (
+            "code-a",
+            good("token-a", OBJECT_ID, "owner@contoso.example"),
+        ),
+        ("refresh-token-a", rotated),
+    ])
+    .await;
+    let alice = seed_user(&w.pool).await;
+    let (state, cookies, _) = start(&w, alice).await;
+    finish(&w, "code-a", &state, &cookies)
+        .await
+        .expect("connect");
+    let vault_path = format!("oauth/microsoft_365/{alice}/{OBJECT_ID}/access_token");
+    let expire_soon = || async {
+        sqlx::query(
+            "UPDATE integration_credentials SET token_expires_at = now() + interval '1 minute' \
+             WHERE user_id = $1 AND provider = 'microsoft_365'",
+        )
+        .bind(alice)
+        .execute(&w.pool)
+        .await
+        .expect("move the expiry into the refresh window");
+    };
+
+    // A token far from expiry is not refreshed.
+    assert!(!w
+        .creds
+        .refresh_oauth_token_if_needed(&vault_path)
+        .await
+        .expect("still valid"));
+
+    // The dispatcher's predictive refresh, once the expiry is near.
+    expire_soon().await;
+    assert!(w
+        .creds
+        .refresh_oauth_token_if_needed(&vault_path)
+        .await
+        .expect("refreshed"));
+    let sent = w.fake.exchanges.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2, "the code exchange, then one refresh");
+    let (content_type, form) = &sent[1];
+    assert_eq!(content_type, "application/x-www-form-urlencoded");
+    for (key, want) in [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", "refresh-token-a"),
+        ("client_id", "client-id"),
+        ("client_secret", "client-secret"),
+    ] {
+        assert_eq!(form.get(key).map(String::as_str), Some(want), "{key}");
+    }
+
+    // The new access token is served and the ROTATED refresh token is stored:
+    // the next refresh presents it, not the one Microsoft has retired.
+    assert_eq!(
+        w.creds
+            .get_valid_access_token(alice, "microsoft_365", OBJECT_ID)
+            .await
+            .unwrap(),
+        "token-b"
+    );
+    assert_eq!(
+        w.creds
+            .get_refresh_token(alice, "microsoft_365", OBJECT_ID)
+            .await
+            .unwrap(),
+        "refresh-rotated"
+    );
+
+    // The stand-in knows no `refresh-rotated` grant and answers invalid_grant,
+    // as Microsoft does for a revoked or lapsed one. The credential is marked
+    // for re-authorization rather than retried on every dispatch.
+    expire_soon().await;
+    let err = w
+        .creds
+        .refresh_oauth_token_if_needed(&vault_path)
+        .await
+        .expect_err("a refused grant fails the refresh");
+    assert!(err.to_string().contains("re-link"), "{err:#}");
+    let sent = w.fake.exchanges.lock().unwrap().clone();
+    assert_eq!(
+        sent[2].1.get("refresh_token").map(String::as_str),
+        Some("refresh-rotated")
+    );
+    let needs_reauth: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT needs_reauth_at FROM integration_credentials \
+         WHERE user_id = $1 AND provider = 'microsoft_365'",
+    )
+    .bind(alice)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert!(needs_reauth.is_some());
+    // And no further call reaches the token endpoint until it is re-linked.
+    assert!(w
+        .creds
+        .refresh_oauth_token_if_needed(&vault_path)
+        .await
+        .is_err());
+    assert_eq!(w.fake.exchanges.lock().unwrap().len(), 3);
 }

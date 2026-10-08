@@ -27,6 +27,9 @@ pub struct OAuthCredentialService {
     refresh_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Google's revoke endpoint. Always [`crate::GOOGLE_REVOKE_URL`] outside tests.
     google_revoke_url: String,
+    /// A stand-in for Microsoft's token endpoint and client. Always `None`
+    /// outside tests.
+    microsoft_365_refresh: Option<RefreshEndpoint>,
 }
 
 /// Non-sensitive metadata for a stored OAuth integration credential.
@@ -65,6 +68,7 @@ impl OAuthCredentialService {
             secrets_manager,
             refresh_locks: DashMap::new(),
             google_revoke_url: crate::GOOGLE_REVOKE_URL.to_string(),
+            microsoft_365_refresh: None,
         }
     }
 
@@ -73,6 +77,25 @@ impl OAuthCredentialService {
     #[doc(hidden)]
     pub fn with_google_revoke_url_for_tests(mut self, url: &str) -> Self {
         self.google_revoke_url = url.to_string();
+        self
+    }
+
+    /// Point Microsoft 365 refreshes at a stand-in token endpoint, with the
+    /// given client. Tests only: a refresh token must never be sent anywhere
+    /// but Microsoft.
+    #[doc(hidden)]
+    pub fn with_microsoft_365_refresh_for_tests(
+        mut self,
+        token_url: &str,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Self {
+        self.microsoft_365_refresh = Some(RefreshEndpoint {
+            token_url: token_url.to_string(),
+            client_id: Some(client_id.to_string()),
+            client_secret: Some(client_secret.to_string()),
+            body: TokenBody::Form,
+        });
         self
     }
 
@@ -1054,72 +1077,16 @@ impl OAuthCredentialService {
             .get_refresh_token(user_id, provider, provider_key)
             .await?;
 
-        // Look up provider's token endpoint and client credentials from env
-        let (token_url, client_id, client_secret) = match provider {
-            // MCP-710 (2026-05-13): empty-env class. `.filter(|v|
-            // !v.is_empty())` so `GOOGLE_CLIENT_ID=""` (helm placeholder)
-            // falls through to `GMAIL_CLIENT_ID` rather than shadowing
-            // it with the empty string. Without this, the refresh
-            // request to Google's token endpoint carries empty
-            // client_id and Google returns 400 "invalid_client".
-            "atlassian" => (
-                "https://auth.atlassian.com/oauth/token",
-                std::env::var("ATLASSIAN_CLIENT_ID")
-                    .ok()
-                    .filter(|v| !v.is_empty()),
-                std::env::var("ATLASSIAN_CLIENT_SECRET")
-                    .ok()
-                    .filter(|v| !v.is_empty()),
-            ),
-            // Keyed on the list, not on literals, so a provider added to the
-            // shared Google client cannot be left out of the refresh path.
-            p if crate::GOOGLE_SHARED_CLIENT_PROVIDERS.contains(&p) => {
-                let (client_id, client_secret) = crate::shared_google_client();
-                (
-                    "https://oauth2.googleapis.com/token",
-                    client_id,
-                    client_secret,
-                )
-            }
-            // The google_cloud consent tiers (Phase A read / C write / D
-            // full) all refresh IDENTICALLY under GOOGLE_CLOUD_CLIENT_ID —
-            // distinct provider strings only for vault-path isolation.
-            // Data-driven so a NEW tier can't silently miss the refresh path:
-            // `google_cloud_full` omitted here 401'd the impersonation mint
-            // once its ~1h token expired (Phase D live-test bug). Kept in
-            // lockstep with `GOOGLE_REVOKE_PROVIDERS` by a unit test.
-            p if GOOGLE_CLOUD_TIER_PROVIDERS.contains(&p) => (
-                "https://oauth2.googleapis.com/token",
-                // Empty-env class (MCP-710): a helm placeholder `""` falls
-                // through to the shared GOOGLE_CLIENT_ID rather than shadowing
-                // it. Without an arm here the proactive refresh task would log
-                // "No token refresh endpoint configured" and silently skip
-                // every google_cloud token, so they'd expire un-refreshed.
-                std::env::var("GOOGLE_CLOUD_CLIENT_ID")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .or_else(|| {
-                        std::env::var("GOOGLE_CLIENT_ID")
-                            .ok()
-                            .filter(|v| !v.is_empty())
-                    }),
-                std::env::var("GOOGLE_CLOUD_CLIENT_SECRET")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .or_else(|| {
-                        std::env::var("GOOGLE_CLIENT_SECRET")
-                            .ok()
-                            .filter(|v| !v.is_empty())
-                    }),
-            ),
-            "slack" => {
-                // Slack bot tokens don't expire. If the proactive refresh task
-                // finds this token (because it has a far-future expiry in
-                // integration_credentials), we skip it gracefully. User tokens
-                // (which do expire) are not stored in the credential service yet.
-                return Ok(false);
-            }
-            _ => {
+        // Look up provider's token endpoint, client credentials and body encoding.
+        let RefreshEndpoint {
+            token_url,
+            client_id,
+            client_secret,
+            body,
+        } = match refresh_route(provider, self.microsoft_365_refresh.as_ref())? {
+            RefreshRoute::Endpoint(endpoint) => endpoint,
+            RefreshRoute::NonExpiring => return Ok(false),
+            RefreshRoute::Unknown => {
                 tracing::warn!(
                     provider,
                     "No token refresh endpoint configured for provider"
@@ -1140,14 +1107,22 @@ impl OAuthCredentialService {
         // redirect-following and fail loudly on TLS init rather than
         // silently re-enabling default redirects via
         // `unwrap_or_else(|_| Client::new())`.
-        let resp = refresh_http_client()
-            .post(token_url)
-            .json(&serde_json::json!({
+        let request = refresh_http_client().post(&token_url);
+        let request = match body {
+            TokenBody::Json => request.json(&serde_json::json!({
                 "grant_type": "refresh_token",
                 "client_id": cid,
                 "client_secret": csec,
                 "refresh_token": refresh_token,
-            }))
+            })),
+            TokenBody::Form => request.form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", cid.as_str()),
+                ("client_secret", csec.as_str()),
+                ("refresh_token", refresh_token.as_str()),
+            ]),
+        };
+        let resp = request
             .send()
             .await
             .context("Token refresh request failed")?;
@@ -1404,6 +1379,142 @@ fn record_reactive_refresh(outcome: &'static str) {
             .with_label_values(&[outcome])
             .inc();
     }
+}
+
+/// How a provider's token endpoint wants a refresh request's body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenBody {
+    /// A JSON object. Google and Atlassian accept it.
+    Json,
+    /// `application/x-www-form-urlencoded`, as RFC 6749 specifies. Microsoft
+    /// accepts only this.
+    Form,
+}
+
+/// Where one provider's tokens are refreshed, and under which client.
+#[derive(Debug, Clone)]
+pub(crate) struct RefreshEndpoint {
+    pub(crate) token_url: String,
+    pub(crate) client_id: Option<String>,
+    pub(crate) client_secret: Option<String>,
+    pub(crate) body: TokenBody,
+}
+
+#[derive(Debug)]
+pub(crate) enum RefreshRoute {
+    Endpoint(RefreshEndpoint),
+    /// The provider's tokens do not expire; there is nothing to refresh.
+    NonExpiring,
+    /// No refresh endpoint is known for this provider.
+    Unknown,
+}
+
+/// The refresh endpoint for `provider`, its client read from the environment.
+/// `microsoft_365_override` is a test stand-in and `None` in production.
+///
+/// An `Err` is a provider whose endpoint cannot be built (an unusable
+/// `MICROSOFT_365_TENANT`): the refresh fails rather than going elsewhere.
+pub(crate) fn refresh_route(
+    provider: &str,
+    microsoft_365_override: Option<&RefreshEndpoint>,
+) -> Result<RefreshRoute> {
+    fn json(
+        token_url: &str,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+    ) -> RefreshEndpoint {
+        RefreshEndpoint {
+            token_url: token_url.to_string(),
+            client_id,
+            client_secret,
+            body: TokenBody::Json,
+        }
+    }
+    let endpoint = match provider {
+        // MCP-710 (2026-05-13): empty-env class. `.filter(|v|
+        // !v.is_empty())` so `GOOGLE_CLIENT_ID=""` (helm placeholder)
+        // falls through to `GMAIL_CLIENT_ID` rather than shadowing
+        // it with the empty string. Without this, the refresh
+        // request to Google's token endpoint carries empty
+        // client_id and Google returns 400 "invalid_client".
+        "atlassian" => json(
+            "https://auth.atlassian.com/oauth/token",
+            std::env::var("ATLASSIAN_CLIENT_ID")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            std::env::var("ATLASSIAN_CLIENT_SECRET")
+                .ok()
+                .filter(|v| !v.is_empty()),
+        ),
+        // Keyed on the list, not on literals, so a provider added to the
+        // shared Google client cannot be left out of the refresh path.
+        p if crate::GOOGLE_SHARED_CLIENT_PROVIDERS.contains(&p) => {
+            let (client_id, client_secret) = crate::shared_google_client();
+            json(
+                "https://oauth2.googleapis.com/token",
+                client_id,
+                client_secret,
+            )
+        }
+        // The google_cloud consent tiers (Phase A read / C write / D
+        // full) all refresh IDENTICALLY under GOOGLE_CLOUD_CLIENT_ID —
+        // distinct provider strings only for vault-path isolation.
+        // Data-driven so a NEW tier can't silently miss the refresh path:
+        // `google_cloud_full` omitted here 401'd the impersonation mint
+        // once its ~1h token expired (Phase D live-test bug). Kept in
+        // lockstep with `GOOGLE_REVOKE_PROVIDERS` by a unit test.
+        p if GOOGLE_CLOUD_TIER_PROVIDERS.contains(&p) => json(
+            "https://oauth2.googleapis.com/token",
+            // Empty-env class (MCP-710): a helm placeholder `""` falls
+            // through to the shared GOOGLE_CLIENT_ID rather than shadowing
+            // it. Without an arm here the proactive refresh task would log
+            // "No token refresh endpoint configured" and silently skip
+            // every google_cloud token, so they'd expire un-refreshed.
+            std::env::var("GOOGLE_CLOUD_CLIENT_ID")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    std::env::var("GOOGLE_CLIENT_ID")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                }),
+            std::env::var("GOOGLE_CLOUD_CLIENT_SECRET")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    std::env::var("GOOGLE_CLIENT_SECRET")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                }),
+        ),
+        // Microsoft refuses a JSON token body (AADSTS900144: the request
+        // body must contain `grant_type`), so its refresh is form-encoded.
+        // Each refresh also rotates the refresh token; the caller stores
+        // whichever one comes back. The endpoint is the tenant's, the same
+        // one the connect exchanged the code at.
+        "microsoft_365" => match microsoft_365_override {
+            Some(endpoint) => endpoint.clone(),
+            None => RefreshEndpoint {
+                token_url: crate::microsoft_365_token_url()?,
+                client_id: std::env::var("MICROSOFT_365_CLIENT_ID")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
+                client_secret: std::env::var("MICROSOFT_365_CLIENT_SECRET")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
+                body: TokenBody::Form,
+            },
+        },
+        "slack" => {
+            // Slack bot tokens don't expire. If the proactive refresh task
+            // finds this token (because it has a far-future expiry in
+            // integration_credentials), we skip it gracefully. User tokens
+            // (which do expire) are not stored in the credential service yet.
+            return Ok(RefreshRoute::NonExpiring);
+        }
+        _ => return Ok(RefreshRoute::Unknown),
+    };
+    Ok(RefreshRoute::Endpoint(endpoint))
 }
 
 /// One hardened client for every token refresh (redirects off, connect and

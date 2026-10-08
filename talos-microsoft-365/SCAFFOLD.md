@@ -31,7 +31,7 @@ is the smallest finished example of every step below.
 
 ## Token refresh and revoke (a provider missing from either fails quietly)
 
-- [ ] `talos-oauth/src/credentials.rs`: add `"microsoft_365"` to the refresh
+- [x] `talos-oauth/src/credentials.rs`: add `"microsoft_365"` to the refresh
       `match provider` (token URL, client id, client secret), and to revoke if
       the provider has a revoke endpoint. Left out of refresh, the connection
       works for one token lifetime and then stops.
