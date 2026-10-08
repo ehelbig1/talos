@@ -105,15 +105,22 @@ Mutations (each restored, the tree's hash compared):
 
 ## Deliberately not done
 
-* **Running the statement as a lesser role with `SET LOCAL ROLE`.** A
-  statement can reset the role from inside itself, and privileges for
-  functions it then calls are checked when they are called. A lesser role is
-  a boundary only on a connection that logged in as it, which is a deployment
-  change (a second database credential), not a code change.
-* **Parsing the statement and allowing a list of functions.** That is the
-  code-side control for the rows this leaves open, and it changes which
-  queries an operator may run. It is a decision for the operator, not a side
-  effect of this package.
+* **Running the statement as a lesser role with `SET LOCAL ROLE`, in this
+  package.** Measured afterwards on a throwaway Postgres: inside a read-only
+  transaction, a role with SELECT on one table was refused an ungranted
+  table (directly and through functions that run SQL they are handed), the
+  server's files, the role catalog, the statistics reset and the
+  configuration reload, each by Postgres's own privilege check. The role is
+  not a boundary alone: a statement can change the role setting from inside
+  itself. The function that does so is on the parsed deny list the module
+  SQL path already uses (`talos_workflow_job_protocol::
+  is_disallowed_sql_function`), and `query_paginated` does not yet parse its
+  statement. So the two belong together and follow this package: the parsed
+  gate first, then the role behind it.
+* **Allowing a list of functions instead of denying one.** With the role
+  behind the gate, the functions that matter are refused by privilege, and
+  an allow list would be a second function policy beside the one the module
+  SQL path has.
 * Rolling back and returning the connection: a rollback does not release a
   session-level advisory lock (measured), and listing what to undo is the
   weaker design at 3 ms a call on an operator's tool.
