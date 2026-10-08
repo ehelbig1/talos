@@ -343,6 +343,13 @@ E=disallowed(ATTACH) I=disallowed(ATTACH) P=ok(ATTACH,no-rows,Unclassified) | AT
 *=function(schema_to_xml) | SELECT schema_to_xml('public', true, true, '')
 *=function(database_to_xml) | SELECT database_to_xml(true, true, '')
 *=function(xmltable) | SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
+*=function(ts_stat) | SELECT word FROM ts_stat('SELECT to_tsvector(a) FROM t')
+*=function(ts_stat) | SELECT * FROM t, LATERAL ts_stat('SELECT to_tsvector(a) FROM t') s
+*=function(pg_catalog.ts_stat) | SELECT pg_catalog.ts_stat('SELECT to_tsvector(a) FROM t')
+*=function(ts_rewrite) | SELECT ts_rewrite('a'::tsquery, 'SELECT a, b FROM t')
+*=function(ts_rewrite) | SELECT ts_rewrite('a'::tsquery, 'a'::tsquery, 'b'::tsquery)
+*=function(crosstab) | SELECT * FROM crosstab('SELECT a, b, c FROM t') AS ct(a text, b text)
+*=ok(SELECT,rows,ReadOnly) | SELECT to_tsvector('simple', a) FROM t
 *=function(xmltable) | SELECT * FROM t, XMLTABLE('/a' PASSING t.x COLUMNS a int PATH 'a') AS q
 *=parse-error | SELECT * FROM t JOIN LATERAL xmltable('/a' PASSING t.x COLUMNS a int PATH 'a') q ON true
 *=function(xmltable) | WITH q AS (SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')) SELECT * FROM q

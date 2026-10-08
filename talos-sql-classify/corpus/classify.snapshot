@@ -343,6 +343,13 @@ ReadOnly                 | SELECT cursor_to_xml('c', 1, true, true, '')
 ReadOnly                 | SELECT schema_to_xml('public', true, true, '')
 ReadOnly                 | SELECT database_to_xml(true, true, '')
 ReadOnly                 | SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
+ReadOnly                 | SELECT word FROM ts_stat('SELECT to_tsvector(a) FROM t')
+ReadOnly                 | SELECT * FROM t, LATERAL ts_stat('SELECT to_tsvector(a) FROM t') s
+ReadOnly                 | SELECT pg_catalog.ts_stat('SELECT to_tsvector(a) FROM t')
+ReadOnly                 | SELECT ts_rewrite('a'::tsquery, 'SELECT a, b FROM t')
+ReadOnly                 | SELECT ts_rewrite('a'::tsquery, 'a'::tsquery, 'b'::tsquery)
+ReadOnly                 | SELECT * FROM crosstab('SELECT a, b, c FROM t') AS ct(a text, b text)
+ReadOnly                 | SELECT to_tsvector('simple', a) FROM t
 ReadOnly                 | SELECT * FROM t, XMLTABLE('/a' PASSING t.x COLUMNS a int PATH 'a') AS q
 parse-error              | SELECT * FROM t JOIN LATERAL xmltable('/a' PASSING t.x COLUMNS a int PATH 'a') q ON true
 ReadOnly                 | WITH q AS (SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')) SELECT * FROM q
