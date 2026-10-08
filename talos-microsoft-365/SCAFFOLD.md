@@ -16,14 +16,14 @@ is the smallest finished example of every step below.
 
 ## Wiring in the controller
 
-- [ ] `controller/Cargo.toml`: `talos-microsoft-365 = { path = "../talos-microsoft-365" }`.
-- [ ] `controller/src/main.rs`: `mod microsoft_365;` and a
+- [x] `controller/Cargo.toml`: `talos-microsoft-365 = { path = "../talos-microsoft-365" }`.
+- [x] `controller/src/main.rs`: `mod microsoft_365;` and a
       `microsoft_365_service: std::sync::Arc<microsoft_365::Microsoft365Service>` field
       beside `google_health_service`.
-- [ ] `controller/src/bootstrap/services.rs`: build it the way
+- [x] `controller/src/bootstrap/services.rs`: build it the way
       `google_health_service` is built
       (`Microsoft365Service::new(db_pool.clone()).with_credentials_service(oauth_credential_service.clone())`).
-- [ ] `controller/src/bootstrap/router.rs`: two routes, copied from the
+- [x] `controller/src/bootstrap/router.rs`: two routes, copied from the
       `google_health_*_route` pair —
       `/api/microsoft-365/connect` behind `rest_auth_middleware` + `rest_cookie_csrf_gate`,
       and `/api/microsoft-365/callback` with NO session auth (rate-limited only),

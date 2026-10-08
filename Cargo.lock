@@ -1871,6 +1871,7 @@ dependencies = [
  "talos-memory-crypto",
  "talos-memory-ranking",
  "talos-metrics",
+ "talos-microsoft-365",
  "talos-ml",
  "talos-module-executions",
  "talos-module-payload-encryption",

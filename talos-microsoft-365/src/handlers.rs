@@ -151,6 +151,27 @@ pub async fn callback_handler(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn an_unconfigured_server_answers_connect_with_503() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let service = Arc::new(Microsoft365Service::for_tests(
+            pool,
+            None,
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            "https://graph.microsoft.com/v1.0/me",
+        ));
+        let response = connect_handler(
+            State(service),
+            Extension(Uuid::new_v4()),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[test]
     fn a_failed_callback_shows_one_of_a_closed_set_of_codes() {
         assert_eq!(
