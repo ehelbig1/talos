@@ -11,6 +11,10 @@ publish.workspace = true
 # the shared SQL corpus (`talos-sql-classify/corpus/`). No database, no async.
 [dependencies]
 regex.workspace = true
+# allow-new-sqlparser-dep: the fourth recorded SQL gate (query_paginated). It
+# parses and reads identifiers only; whether a statement is a read, which
+# functions it calls and which relations it reads all come from
+# talos-sql-classify, and its function list is the one in the job protocol.
 sqlparser.workspace = true
 talos-sql-classify = { path = "../talos-sql-classify" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
