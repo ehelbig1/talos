@@ -1,0 +1,1023 @@
+[
+  {
+    "method": "GET",
+    "url_contains": "graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?",
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; odata.metadata=minimal; odata.streaming=true; IEEE754Compatible=false; charset=utf-8"
+    },
+    "body": {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('made-up-user-id')/mailFolders('inbox')/messages(id,subject,from,toRecipients,receivedDateTime,bodyPreview,isRead,webLink)",
+      "value": [
+        {
+          "@odata.etag": "W/\"CQAAABYAAADa35deab8f524c53fde4fb7e9AAAA\"",
+          "id": "AAMkAGrfmuyiYhMslqSpyVrB3F4aPD48nPi8xM4hoa38dAKKp2bGGAAE2wWCVLkBTA-GV29kZyTcFcPEaz1PHt7BETSLcKFO4eFdeqlL2BDsBvTLd6NG6PM672v-rj18RELXqTAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T11:59:00Z",
+          "subject": "Quarterly planning: agenda and pre-reads for Thursday",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we st",
+          "isRead": true,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGrfmuyiYhMslqSpyVrB3F4aPD48nPi8xM4hoa38dAKKp2bGGAAE2wWCVLkBTA-GV29kZyTcFcPEaz1PHt7BETSLcKFO4eFdeqlL2BDsBvTLd6NG6PM672v-rj18RELXqTAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Avery Example",
+              "address": "avery@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADd9bc007a0e58015517175a6aAAAA\"",
+          "id": "AAMkAGep4I3Ax_7GVuZiL2k4izG0s8TOv1gs-kiIW5XqSkBc6lMnHYFO-G2FbgVqzqC9NFR1HDa7SNY0h0VVsmeK3ypuwxaC_eVhkXlS_3inqK3v_Q_rw3LdJocZFsRsYwOBtFAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T11:52:13Z",
+          "subject": "Your invoice INV-4101 is ready",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadlin",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGep4I3Ax_7GVuZiL2k4izG0s8TOv1gs-kiIW5XqSkBc6lMnHYFO-G2FbgVqzqC9NFR1HDa7SNY0h0VVsmeK3ypuwxaC_eVhkXlS_3inqK3v_Q_rw3LdJocZFsRsYwOBtFAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Billing",
+              "address": "billing@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD2dc1a58a0560bf15006f38a1AAAA\"",
+          "id": "AAMkAGlYGEcRwZ6r9dppUCPciNUuiu1PgCPIvY7jwDpYphIoDMuzM-gCaJ5NkBSeFyQ9NW1sP6U_P3rCdhAV7Vi17yQYROzAgWTi6rJ2NKmt7hr6ZZnliVcOcZeE4IDOdH_A5FAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T10:45:26Z",
+          "subject": "Re: Draft proposal — comments on section 3",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and ",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGlYGEcRwZ6r9dppUCPciNUuiu1PgCPIvY7jwDpYphIoDMuzM-gCaJ5NkBSeFyQ9NW1sP6U_P3rCdhAV7Vi17yQYROzAgWTi6rJ2NKmt7hr6ZZnliVcOcZeE4IDOdH_A5FAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Doe, Jordan",
+              "address": "jordan.doe@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 3",
+                "address": "colleague3@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 4",
+                "address": "colleague4@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 5",
+                "address": "colleague5@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADef1f6b90bc1a4b99d1a6f020AAAA\"",
+          "id": "AAMkAGKKu9ygoyGZEFE3d30Al3rEUh7n9p0Lp8S4bkFUWkp3fWGem0wAg-zF4t-0DsS45vTuGXPYGB43k830bh8bDff4RLacTVTMJkvC2ttrtw9TvBI76vwPWNge2M1KB8JKWnAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T09:38:39Z",
+          "subject": "Weekly digest: 12 new items in your workspace",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and reply with your comments by end of da",
+          "isRead": true,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGKKu9ygoyGZEFE3d30Al3rEUh7n9p0Lp8S4bkFUWkp3fWGem0wAg-zF4t-0DsS45vTuGXPYGB43k830bh8bDff4RLacTVTMJkvC2ttrtw9TvBI76vwPWNge2M1KB8JKWnAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "",
+              "address": "noreply@example.org"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADbf28f031550fcc54e9452529AAAA\"",
+          "id": "AAMkAGCb_dKg5k9D1XnBMBT-n7H2U7OtqsnRVpOxTheG9t3hadSXz05E6qrkvXIX2tGXQh3x2Dq21MSN49HjreAFMrlHmFsMi4WOd_V8bUA7MVreBNJIXW7C0JaUJW6t0g228nAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T08:31:52Z",
+          "subject": "Build #4104 passed on main",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to ",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGCb_dKg5k9D1XnBMBT-n7H2U7OtqsnRVpOxTheG9t3hadSXz05E6qrkvXIX2tGXQh3x2Dq21MSN49HjreAFMrlHmFsMi4WOd_V8bUA7MVreBNJIXW7C0JaUJW6t0g228nAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Project Updates",
+              "address": "updates@example.net"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADc3c5214880312ca28a7286f1AAAA\"",
+          "id": "AAMkAGWCjis-hr7m6QvIeT3WQ-QJeIdmNmqpZEfsTWHRG6lRLsNimdS-2_fqHJkBh-uE4V0WxBA9u80RLu1DldnZa9CinyOU65LQ3tkke41xiOvdrj4Txx68-TkwJhmylgRIawAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T07:24:05Z",
+          "subject": "Kurze Frage zum Termin nächste Woche",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could eac",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGWCjis-hr7m6QvIeT3WQ-QJeIdmNmqpZEfsTWHRG6lRLsNimdS-2_fqHJkBh-uE4V0WxBA9u80RLu1DldnZa9CinyOU65LQ3tkke41xiOvdrj4Txx68-TkwJhmylgRIawAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Sam Müller",
+              "address": "sam.mueller@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 3",
+                "address": "colleague3@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 4",
+                "address": "colleague4@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 5",
+                "address": "colleague5@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD50040acd8e5d7e332cab78efAAAA\"",
+          "id": "AAMkAG3QOuexD7edTgCUU8Xakm6EehLaV9ZL1UPON41wT98ZQ2qFVL9NaPAGPE1W8akj93_o0Bm-mRkdDSbSzlSKM7RAUgIg4PEruEe1etS7Pf6Qg2ihBXpwKLkhhuc3af48xiAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T06:17:18Z",
+          "subject": "Updated invitation: Design review @ Fri 10:00 – 11:00 (UTC)",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and reply with y",
+          "isRead": true,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAG3QOuexD7edTgCUU8Xakm6EehLaV9ZL1UPON41wT98ZQ2qFVL9NaPAGPE1W8akj93_o0Bm-mRkdDSbSzlSKM7RAUgIg4PEruEe1etS7Pf6Qg2ihBXpwKLkhhuc3af48xiAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Team Calendar",
+              "address": "calendar@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADb31fd28225ba23a7b76d1ecaAAAA\"",
+          "id": "AAMkAGD3EOfejZfpI5_UTdUHrvzmFZ-QwUutYoNopHhvX_OigqUH_f6cGzXob9t4phVrfU_FWUMTKp9FIU-6zVfdCPt4zz672s3f3dbxNnP5RfUjzJgT3y_N8qQgojDSg730p6AAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T05:10:31Z",
+          "subject": "Re: Re: Fwd: Offsite logistics, travel and rooms",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and reply with your comments by end of day tomorrow? ",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGD3EOfejZfpI5_UTdUHrvzmFZ-QwUutYoNopHhvX_OigqUH_f6cGzXob9t4phVrfU_FWUMTKp9FIU-6zVfdCPt4zz672s3f3dbxNnP5RfUjzJgT3y_N8qQgojDSg730p6AAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Riley Placeholder",
+              "address": "riley@example.org"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD08175e82fb37e4280dc80ebaAAAA\"",
+          "id": "AAMkAG-DOTez0Zt_3MSgU7Bq8zMkl6xq54HsSzLNBszN6Mz2vMqADBiaY_ZG1fEKi3v-tjVfhn98AixI_dWSTXWStcXiQKQjdPqB0kUIY4KCpBbEay_30dxSmHHnFR5e7_13sTAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T04:03:44Z",
+          "subject": "Quarterly planning: agenda and pre-reads for Thursday",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle befor",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAG-DOTez0Zt_3MSgU7Bq8zMkl6xq54HsSzLNBszN6Mz2vMqADBiaY_ZG1fEKi3v-tjVfhn98AixI_dWSTXWStcXiQKQjdPqB0kUIY4KCpBbEay_30dxSmHHnFR5e7_13sTAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Avery Example",
+              "address": "avery@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 3",
+                "address": "colleague3@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 4",
+                "address": "colleague4@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 5",
+                "address": "colleague5@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD1f6b3caa3362c2ae112bfdbeAAAA\"",
+          "id": "AAMkAGA_iS9OBms4F0ApKnuGHd5FuSZ-Yvb8enTDA-qBh9YND-O8pJA6402upeOWf-jq5IndlfJewq1Lu2AsRIZIjH8AW7XwRQvXroQ-zwsKWWmP2T2Do5MGhut8_PM_uybt3kAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T04:56:57Z",
+          "subject": "Your invoice INV-4109 is ready",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you tak",
+          "isRead": true,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGA_iS9OBms4F0ApKnuGHd5FuSZ-Yvb8enTDA-qBh9YND-O8pJA6402upeOWf-jq5IndlfJewq1Lu2AsRIZIjH8AW7XwRQvXroQ-zwsKWWmP2T2Do5MGhut8_PM_uybt3kAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Billing",
+              "address": "billing@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADcdc47601957a3df2629a4d0fAAAA\"",
+          "id": "AAMkAGZgOP1a3k4rSRjlmhg0T8TaGOgKWwOUNE3N3i4N50iCCHFsmGlSuA27JgWpoTxZjE0h7E4do9QYULgtQqhX-a2ZamEK7jc1rWZtekCg8DBJi2uLJuoyQKcwhyO2GneUqHAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T03:49:10Z",
+          "subject": "Re: Draft proposal — comments on section 3",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and reply with your comments",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGZgOP1a3k4rSRjlmhg0T8TaGOgKWwOUNE3N3i4N50iCCHFsmGlSuA27JgWpoTxZjE0h7E4do9QYULgtQqhX-a2ZamEK7jc1rWZtekCg8DBJi2uLJuoyQKcwhyO2GneUqHAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Doe, Jordan",
+              "address": "jordan.doe@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD417b8e377eea82e9c735a1f5AAAA\"",
+          "id": "AAMkAGp53pwgzA5cvqRFFu2zZmPdJSFqLYbmu_EqD6khkwmjISaY2NMqcuN_PYucqN1B_IhLQ2lCcoCZ837ACjH5rZlP43IpOsb8h2fSSCeOnOrLtTqlfejTsw7yCBOTOTXRMyAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T02:42:23Z",
+          "subject": "Weekly digest: 12 new items in your workspace",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and reply with your comments by end of day tomorrow? Thanks, and ",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGp53pwgzA5cvqRFFu2zZmPdJSFqLYbmu_EqD6khkwmjISaY2NMqcuN_PYucqN1B_IhLQ2lCcoCZ837ACjH5rZlP43IpOsb8h2fSSCeOnOrLtTqlfejTsw7yCBOTOTXRMyAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "",
+              "address": "noreply@example.org"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 3",
+                "address": "colleague3@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 4",
+                "address": "colleague4@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 5",
+                "address": "colleague5@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD23bf5880206220d73f6ff95bAAAA\"",
+          "id": "AAMkAGElMIX0MpVuVOdmYeqY1kvtW7UzFE6r04m5Ig3Zf__DUI3uJMxy9XrdF1CpXxXYHW6ju6ssv16Zl4E8x7Ahmfg15KRQE2WQS5SDjdJL6KU5kdFgOllKY-Fk_A6rNh0yW1AAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T01:35:36Z",
+          "subject": "Build #4112 passed on main",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadli",
+          "isRead": true,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGElMIX0MpVuVOdmYeqY1kvtW7UzFE6r04m5Ig3Zf__DUI3uJMxy9XrdF1CpXxXYHW6ju6ssv16Zl4E8x7Ahmfg15KRQE2WQS5SDjdJL6KU5kdFgOllKY-Fk_A6rNh0yW1AAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Project Updates",
+              "address": "updates@example.net"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD14ceda4b408976b9ec546c0aAAAA\"",
+          "id": "AAMkAG0XGOdtXJrPd5eyPZqA_WEGphhvIqkgdGu8OMx_HyEBH6l0iF_nlWGAE8NhO-oCgF0dgTjbMpD7ifkgF5xjTvXDkFeoI7klRZjahp2Mr8FJbW9xl7oaYBamN_dHr6Hm-JAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T00:28:49Z",
+          "subject": "Kurze Frage zum Termin nächste Woche",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAG0XGOdtXJrPd5eyPZqA_WEGphhvIqkgdGu8OMx_HyEBH6l0iF_nlWGAE8NhO-oCgF0dgTjbMpD7ifkgF5xjTvXDkFeoI7klRZjahp2Mr8FJbW9xl7oaYBamN_dHr6Hm-JAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Sam Müller",
+              "address": "sam.mueller@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD6a802ba5f9869d3ed9f22337AAAA\"",
+          "id": "AAMkAGLaX91b_Ftbh04UmvMS--A_Dwv_AnmuSqD_gb9IVuF2oi0dy6hDwNxj3_oaI-Nc_EGoUusJ3r8yQZktRYItSkPa4BDm_fry_olcWjqnh8GkBJR4SWQ3tVVmfEDyEg02x7AAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-1:21:02Z",
+          "subject": "Updated invitation: Design review @ Fri 10:00 – 11:00 (UTC)",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and reply with your comments by end of d",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGLaX91b_Ftbh04UmvMS--A_Dwv_AnmuSqD_gb9IVuF2oi0dy6hDwNxj3_oaI-Nc_EGoUusJ3r8yQZktRYItSkPa4BDm_fry_olcWjqnh8GkBJR4SWQ3tVVmfEDyEg02x7AAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Team Calendar",
+              "address": "calendar@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 3",
+                "address": "colleague3@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 4",
+                "address": "colleague4@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 5",
+                "address": "colleague5@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD01d248921f180f5fa0bd3ef5AAAA\"",
+          "id": "AAMkAG1KX4j8Dd7wnbfQtKP5OYDa61eXK8nEGdkoUTW-YwyC5yr1rA0EP7G2-chwZZ4W_-rTP8dnpPoE8DQN0adCSc8L22PWt8NditHeE7oD1hxCZYE8O7LQD0fa0F6dHOHqR0AAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-2:14:15Z",
+          "subject": "Re: Re: Fwd: Offsite logistics, travel and rooms",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to",
+          "isRead": true,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAG1KX4j8Dd7wnbfQtKP5OYDa61eXK8nEGdkoUTW-YwyC5yr1rA0EP7G2-chwZZ4W_-rTP8dnpPoE8DQN0adCSc8L22PWt8NditHeE7oD1hxCZYE8O7LQD0fa0F6dHOHqR0AAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Riley Placeholder",
+              "address": "riley@example.org"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD2b00f3531ede7ce52b24e592AAAA\"",
+          "id": "AAMkAG44G06gN2ea90OuXT0GYrSb90GrQE64uxKjKeTT3YUQNRkhUsE2t_DizYdzHPu1rF_G6F60YlaImEKZX-9Uwa_6dN2rPZ4ehOcYSntxv4tZA5QhCTLSaG7T15ky8vJICaAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-3:07:28Z",
+          "subject": "Quarterly planning: agenda and pre-reads for Thursday",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could ea",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAG44G06gN2ea90OuXT0GYrSb90GrQE64uxKjKeTT3YUQNRkhUsE2t_DizYdzHPu1rF_G6F60YlaImEKZX-9Uwa_6dN2rPZ4ehOcYSntxv4tZA5QhCTLSaG7T15ky8vJICaAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Avery Example",
+              "address": "avery@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD36aafe8a6e616c90bee4724dAAAA\"",
+          "id": "AAMkAGoxXtV16tmD8F9WcOIen523WcJ-gn7yLpCAzox8707LOAbO2Wb_35MIetK_zO95zlpefh4RXpyerSY3Gw0y70GeVxil7lCb9CBdSMpSRzu6cbUzOMa5zRbbUgu9Qu9fnUAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-3:00:41Z",
+          "subject": "Your invoice INV-4117 is ready",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and reply with ",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGoxXtV16tmD8F9WcOIen523WcJ-gn7yLpCAzox8707LOAbO2Wb_35MIetK_zO95zlpefh4RXpyerSY3Gw0y70GeVxil7lCb9CBdSMpSRzu6cbUzOMa5zRbbUgu9Qu9fnUAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Billing",
+              "address": "billing@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 3",
+                "address": "colleague3@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 4",
+                "address": "colleague4@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 5",
+                "address": "colleague5@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD2883a6c34d6dfb72fb578bb3AAAA\"",
+          "id": "AAMkAG9tJLB0c0WExolSx8dHB9xJnhnJpUMLGBH7by7-x3hE42xw8qjm71yvO9vQHxUqAv5dme2o87I47kipP7K24aEioAaFf0-9Rp0Jor8R1wLEUt9IofKvW0Pl88rRfO7ECIAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-4:53:54Z",
+          "subject": "Re: Draft proposal — comments on section 3",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and reply with your comments by end of day tomorrow?",
+          "isRead": true,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAG9tJLB0c0WExolSx8dHB9xJnhnJpUMLGBH7by7-x3hE42xw8qjm71yvO9vQHxUqAv5dme2o87I47kipP7K24aEioAaFf0-9Rp0Jor8R1wLEUt9IofKvW0Pl88rRfO7ECIAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Doe, Jordan",
+              "address": "jordan.doe@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADddc35fdca0d4f0d5c0d8cb82AAAA\"",
+          "id": "AAMkAGplnNUrqzGyBZbfzg9B904diMDhS3tPxjcdqYBYLTu_9M4GWpobuOUHzgTiP4EPbsgdcciiOI1KJkeL8cwhCzxNG7eNzwwxn_6ID28Qn5mAfyfWMUqfWiOtzS4mtujmOyAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-5:46:07Z",
+          "subject": "Weekly digest: 12 new items in your workspace",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle befo",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGplnNUrqzGyBZbfzg9B904diMDhS3tPxjcdqYBYLTu_9M4GWpobuOUHzgTiP4EPbsgdcciiOI1KJkeL8cwhCzxNG7eNzwwxn_6ID28Qn5mAfyfWMUqfWiOtzS4mtujmOyAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "",
+              "address": "noreply@example.org"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADe26e2ea39d13a32048f6f4e9AAAA\"",
+          "id": "AAMkAGz840t3GnOkOQ5qKujR_4d7cR1yntpdjd3zxh2SLXtyw0bURCtmfdRuG9yEl1r-cKjqwxQZGWYuaWq7EOADzlajOELAIEX1sn3saTtoI9byx3gvmisZDC2vuL4Rg3SpXTAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-6:39:20Z",
+          "subject": "Build #4120 passed on main",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you ta",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGz840t3GnOkOQ5qKujR_4d7cR1yntpdjd3zxh2SLXtyw0bURCtmfdRuG9yEl1r-cKjqwxQZGWYuaWq7EOADzlajOELAIEX1sn3saTtoI9byx3gvmisZDC2vuL4Rg3SpXTAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Project Updates",
+              "address": "updates@example.net"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 3",
+                "address": "colleague3@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 4",
+                "address": "colleague4@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 5",
+                "address": "colleague5@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADb8379c2c0b3140e11fe6526aAAAA\"",
+          "id": "AAMkAGd2J0_ha3wI2Xk8dUOMuHekaXkMfzOskF6fsfqmbZwUdR2R66N7yzak6AxZqI6-0nytQy89uzbIIgWTzpzGqbtxPEY8aKI7xjNje2E-Y-ACXi1JjPUu92h3rm7TR19KumAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-7:32:33Z",
+          "subject": "Kurze Frage zum Termin nächste Woche",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and reply with your comment",
+          "isRead": true,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGd2J0_ha3wI2Xk8dUOMuHekaXkMfzOskF6fsfqmbZwUdR2R66N7yzak6AxZqI6-0nytQy89uzbIIgWTzpzGqbtxPEY8aKI7xjNje2E-Y-ACXi1JjPUu92h3rm7TR19KumAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Sam Müller",
+              "address": "sam.mueller@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADb529a04cf239dfd0a18cc77fAAAA\"",
+          "id": "AAMkAGqAFUZbeuDAa7Yz9EtgYRJJ8Tvl3Hd-YwsFKcjE0Eyhg3qirxby2Jz-WHWYB3dCbipa_EqvIuGVAN_lai0940_Or76jCrJp-DviFxtek_c2IilveAZ0zr2u6KI_lIBoudAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-8:25:46Z",
+          "subject": "Updated invitation: Design review @ Fri 10:00 – 11:00 (UTC)",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look and reply with your comments by end of day tomorrow? Thanks, and",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGqAFUZbeuDAa7Yz9EtgYRJJ8Tvl3Hd-YwsFKcjE0Eyhg3qirxby2Jz-WHWYB3dCbipa_EqvIuGVAN_lai0940_Or76jCrJp-DviFxtek_c2IilveAZ0zr2u6KI_lIBoudAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Team Calendar",
+              "address": "calendar@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAAD5b55d3f3a3871c6cfacecb94AAAA\"",
+          "id": "AAMkAGxPA8Gdh-7grgFaK7dSIOoXgAJh7btyfCTLvcUNOr7i6aLu2wq90x4YEektqcwzcIHy2bOegGXkmcYDT8XHkxFZrcGifqySIBVeVWLb5t-AdHRlIoj-WT6zQJ4su2xrzwAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-9:18:59Z",
+          "subject": "Re: Re: Fwd: Offsite logistics, travel and rooms",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadl",
+          "isRead": false,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGxPA8Gdh-7grgFaK7dSIOoXgAJh7btyfCTLvcUNOr7i6aLu2wq90x4YEektqcwzcIHy2bOegGXkmcYDT8XHkxFZrcGifqySIBVeVWLb5t-AdHRlIoj-WT6zQJ4su2xrzwAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Riley Placeholder",
+              "address": "riley@example.org"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 0",
+                "address": "colleague0@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 1",
+                "address": "colleague1@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 2",
+                "address": "colleague2@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 3",
+                "address": "colleague3@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 4",
+                "address": "colleague4@example.com"
+              }
+            },
+            {
+              "emailAddress": {
+                "name": "Colleague 5",
+                "address": "colleague5@example.com"
+              }
+            }
+          ]
+        },
+        {
+          "@odata.etag": "W/\"CQAAABYAAADb2a039ce1ba553187c55ad51AAAA\"",
+          "id": "AAMkAGHgm6OAKhZOT1hGOd7m6-i37kulag2E6HcbOBrAJcCUpcs2rLhk7lFkFw0sm922czIqBzUoO5e9TeYzVldFZkkq5Iby78nReYDfwwas83O56RoYbVWe_0Ly6wwuSz43PbAAAAAAAAAAAAAAA=",
+          "receivedDateTime": "2026-10-08T-10:11:12Z",
+          "subject": "Quarterly planning: agenda and pre-reads for Thursday",
+          "bodyPreview": "Hi team, following up on our conversation from earlier this week. I have attached the notes and the open questions we still need to settle before the deadline. Could each of you take a look an",
+          "isRead": true,
+          "webLink": "https://outlook.office365.com/owa/?ItemID=AAMkAGHgm6OAKhZOT1hGOd7m6-i37kulag2E6HcbOBrAJcCUpcs2rLhk7lFkFw0sm922czIqBzUoO5e9TeYzVldFZkkq5Iby78nReYDfwwas83O56RoYbVWe_0Ly6wwuSz43PbAAAAAAAAAAAAAAA%3D&exvsurl=1&viewmodel=ReadMessageItem",
+          "from": {
+            "emailAddress": {
+              "name": "Avery Example",
+              "address": "avery@example.com"
+            }
+          },
+          "toRecipients": [
+            {
+              "emailAddress": {
+                "name": "Made Up Owner",
+                "address": "owner@example.com"
+              }
+            }
+          ]
+        }
+      ],
+      "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?%24select=id%2csubject%2cfrom%2ctoRecipients%2creceivedDateTime%2cbodyPreview%2cisRead%2cwebLink&%24orderby=receivedDateTime+desc&%24filter=receivedDateTime+ge+2026-10-07T12%3a00%3a00Z&%24top=25&%24skip=25"
+    }
+  }
+]
