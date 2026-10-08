@@ -356,7 +356,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "name": "query_paginated",
             "description": "Execute a SQL query with pagination support. Returns results with page metadata. \
                 Runs against the platform DB pool (not subject to WASM memory limits). \
-                Requires admin capability ('*' or 'admin') — non-admin agents receive a -32601 error. \
+                Requires platform-admin privileges — any other caller receives a -32601 error. \
+                Runs in a read-only transaction on a connection that is closed afterwards: a query whose \
+                functions write, advance a sequence or lock rows is refused by the database. \
                 Security controls enforced: SELECT-only (no INSERT/UPDATE/DELETE/DDL), no semicolons, \
                 no UNION/INTERSECT/EXCEPT, no CTEs, no EXPLAIN, no SQL comments. \
                 Access to auth/encryption tables (user_sessions, mcp_agents, encryption_keys, \
@@ -1284,6 +1286,18 @@ async fn handle_query_paginated(
             mcp_text(
                 req_id,
                 &serde_json::to_string_pretty(&response).unwrap_or_default(),
+            )
+        }
+        Err(e) if talos_advanced_repository::is_read_only_refusal(&e) => {
+            tracing::warn!(
+                "query_paginated: a statement that writes was refused: {}",
+                e
+            );
+            mcp_error(
+                req_id,
+                -32602,
+                "query_paginated runs in a read-only transaction and this query tried to change \
+                 something (a function it calls writes, advances a sequence or locks rows).",
             )
         }
         Err(e) => {

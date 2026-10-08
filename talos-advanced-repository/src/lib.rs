@@ -4181,13 +4181,36 @@ impl AdvancedRepository {
     /// `validated_base_query` MUST be a single `SELECT` statement that has
     /// already passed the handler's validation pipeline. `mode` carries the
     /// pre-validated cursor column or offset.
+    ///
+    /// **What the database itself holds this statement to** (2026-10-08; the
+    /// handler's rules read the text, these do not):
+    /// * It runs in a `READ ONLY` transaction, so a function the SELECT calls
+    ///   cannot write a row, advance a sequence or take a row lock, and the
+    ///   statement cannot switch the transaction back to read-write.
+    /// * Its connection is closed afterwards, never handed back to the pool.
+    ///   A SELECT can change the SESSION it runs on, and a read-only
+    ///   transaction does not stop that: a session-level `pg_advisory_lock`
+    ///   survives even a rollback, and on a pooled connection it would be
+    ///   held by whichever request borrowed the connection next. Closing
+    ///   ends every kind of session state without listing the kinds.
+    ///
+    /// Neither limits what a SELECT may READ or which server functions it may
+    /// call — see `docs/engineering-log/packages/2026-10-08-query-paginated-read-only.md`.
     pub async fn execute_paginated_select(
         &self,
         validated_base_query: &str,
         page_size: i64,
         mode: PaginationMode<'_>,
     ) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
-        match mode {
+        let mut conn = self.db_pool.acquire().await?;
+        // Before anything of the caller's runs, and before the first await
+        // that could be cancelled: whatever happens next, this connection
+        // does not go back to the pool.
+        conn.close_on_drop();
+        sqlx::query(PAGINATED_SELECT_BEGIN)
+            .execute(&mut *conn)
+            .await?;
+        let rows = match mode {
             PaginationMode::Cursor { column, after } => {
                 // The cursor `column` is already constrained to [a-zA-Z0-9_]
                 // by the calling handler; double-quoting handles reserved words.
@@ -4200,7 +4223,7 @@ impl AdvancedRepository {
                 sqlx::query(sqlx::AssertSqlSafe(q))
                     .bind(page_size + 1)
                     .bind(after)
-                    .fetch_all(&self.db_pool)
+                    .fetch_all(&mut *conn)
                     .await
             }
             PaginationMode::Offset { offset } => {
@@ -4216,10 +4239,17 @@ impl AdvancedRepository {
                 sqlx::query(sqlx::AssertSqlSafe(q))
                     .bind(page_size + 1)
                     .bind(offset)
-                    .fetch_all(&self.db_pool)
+                    .fetch_all(&mut *conn)
                     .await
             }
+        };
+        // Closing ends the transaction and the session with it. A failure to
+        // say goodbye changes nothing the caller is owed: the rows are read,
+        // and the connection is dropped either way.
+        if let Err(e) = conn.close().await {
+            tracing::debug!(error = %e, "query_paginated: closing its connection failed");
         }
+        rows
     }
 
     // ── advanced.rs MCP-handler support ────────────────────────────────────
@@ -4532,6 +4562,20 @@ impl AdvancedRepository {
             })
             .collect::<Result<Vec<_>>>()
     }
+}
+
+/// Opens the transaction a `query_paginated` statement runs in.
+const PAGINATED_SELECT_BEGIN: &str = "BEGIN READ ONLY";
+
+/// Whether `execute_paginated_select` failed because the statement tried to
+/// write: Postgres refused it under the read-only transaction (SQLSTATE
+/// 25006, `read_only_sql_transaction`). The handler says so instead of
+/// blaming the caller's syntax.
+pub fn is_read_only_refusal(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .is_some_and(|code| code == "25006")
 }
 
 /// Pagination mode for `execute_paginated_select`. The `column` field in
