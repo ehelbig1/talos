@@ -19,7 +19,7 @@ dashmap.workspace = true
 futures.workspace = true
 hex.workspace = true
 petgraph.workspace = true
-rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 talos-redis = { path = "../talos-redis" }
 regex.workspace = true

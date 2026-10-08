@@ -138,7 +138,7 @@ mod tests {
     /// Generate a fresh 2048-bit test keypair at runtime (no embedded secrets):
     /// returns (PKCS#8 PEM, PKCS#1 PEM, SPKI public PEM).
     fn test_keys() -> (String, String, String) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rsa::rand_core::OsRng;
         let priv_key = RsaPrivateKey::new(&mut rng, 2048).expect("generate test key");
         let pkcs8 = priv_key
             .to_pkcs8_pem(LineEnding::LF)

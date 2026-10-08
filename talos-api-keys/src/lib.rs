@@ -138,17 +138,14 @@ impl ApiKeyService {
     /// every already-issued key, so it is deliberately deferred to a key-format
     /// migration rather than done implicitly here.
     pub fn generate_key() -> (String, String) {
-        use rand::RngCore;
-        let mut rng = rand::rngs::OsRng;
-
         // Generate prefix (4 bytes = 8 hex chars)
         let mut prefix_bytes = [0u8; 4];
-        rng.fill_bytes(&mut prefix_bytes);
+        talos_random::fill(&mut prefix_bytes);
         let prefix = hex::encode(prefix_bytes);
 
         // Generate secret (32 bytes = 64 hex chars)
         let mut secret_bytes = [0u8; 32];
-        rng.fill_bytes(&mut secret_bytes);
+        talos_random::fill(&mut secret_bytes);
         let secret = hex::encode(secret_bytes);
 
         let full_key = format!("talos_sk_{}{}", prefix, secret);

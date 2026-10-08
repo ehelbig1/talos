@@ -186,7 +186,7 @@ mod tests {
     // the Gmail notification envelope decode.
 
     fn keypair() -> (EncodingKey, DecodingKey, String) {
-        let priv_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let priv_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let pub_key = RsaPublicKey::from(&priv_key);
         let priv_pem = priv_key.to_pkcs1_pem(Default::default()).unwrap();
         let pub_pem = pub_key.to_public_key_pem(Default::default()).unwrap();

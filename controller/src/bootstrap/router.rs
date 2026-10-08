@@ -1316,7 +1316,6 @@ pub(crate) async fn liveness_probe() -> &'static str {
 /// removes the indirection entirely).
 pub(crate) async fn seed_csrf_handler(headers: axum::http::HeaderMap) -> axum::response::Response {
     use axum::http::{header, HeaderValue, StatusCode};
-    use rand::RngCore;
 
     let already_has_cookie = headers
         .get(header::COOKIE)
@@ -1357,7 +1356,7 @@ pub(crate) async fn seed_csrf_handler(headers: axum::http::HeaderMap) -> axum::r
 
     if !already_has_cookie {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        talos_random::fill(&mut bytes);
         let token = hex::encode(bytes);
 
         // Frontend reads this cookie via JS to populate X-CSRF-Token, so it

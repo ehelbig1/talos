@@ -17,7 +17,7 @@ ed25519-dalek.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 hmac.workspace = true
 pgvector = { workspace = true, features = ["sqlx"] }
-rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true, features = ["derive"] }
 # `raw_value` powers `rpc_auth::RawSigned<T>`: signed bodies cover the EXACT

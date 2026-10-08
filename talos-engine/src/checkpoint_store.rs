@@ -13,7 +13,6 @@ use aes_gcm::{
 };
 use async_trait::async_trait;
 use hkdf::Hkdf;
-use rand::RngCore;
 use serde_json::Value as JsonValue;
 use sha2::Sha256;
 use sqlx::{Pool, Postgres};
@@ -540,7 +539,7 @@ fn encrypt_checkpoint(
     let cipher = Aes256Gcm::new_from_slice(aead_key.as_slice())
         .map_err(|e| format!("Failed to create cipher: {e}"))?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    talos_random::fill(&mut nonce_bytes);
     let nonce = &Nonce::from(nonce_bytes);
     let ciphertext = cipher
         .encrypt(
@@ -883,7 +882,7 @@ mod checkpoint_aead_tests {
         let v1_key = derive_checkpoint_aead_key_legacy_v1(&root);
         let cipher = Aes256Gcm::new_from_slice(v1_key.as_slice()).unwrap();
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        talos_random::fill(&mut nonce_bytes);
         let pt = serde_json::to_vec(&snapshot).unwrap();
         let ct = cipher
             .encrypt(

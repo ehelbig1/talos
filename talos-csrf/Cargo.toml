@@ -10,7 +10,7 @@ publish.workspace = true
 axum = { workspace = true, features = ["json"] }
 dashmap.workspace = true
 hex.workspace = true
-rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 serde_json.workspace = true
 subtle.workspace = true
 talos-config = { path = "../talos-config" }

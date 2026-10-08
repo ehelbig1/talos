@@ -12,7 +12,7 @@ talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 anyhow.workspace = true
 chrono.workspace = true
 hex.workspace = true
-rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 subtle.workspace = true
 talos-text-util = { path = "../talos-text-util" }
 serde_json.workspace = true

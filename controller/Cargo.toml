@@ -137,7 +137,7 @@ talos-workflow-engine-nats = { path = "../talos-workflow-engine-nats" }
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono", "migrate"] } # `migrate` enables sqlx::migrate! macro for auto-applying migrations at controller startup.
 dotenvy.workspace = true
 talos-worker-runtime = { path = "../talos-worker-runtime" }
-rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 anyhow.workspace = true
 # Logging dependencies
 tracing.workspace = true
@@ -198,7 +198,7 @@ talos-github-repository = { path = "../talos-github-repository" }
 # Used by gmail::pubsub_jwt tests to mint RSA keypairs that back
 # locally-signed test JWTs. Production verifier fetches JWKs from
 # Google and never calls rsa::* directly.
-rsa = { workspace = true, features = ["pem"] }
+rsa = { workspace = true, features = ["pem", "getrandom"] }
 # write_ceiling_memory_write_tests: builds a REAL `ParallelWorkflowEngine`
 # wired to the REAL `ControllerNodeHook` and a stub dispatcher, so the
 # `__memory_write__` write-ceiling gate (#750) is proven on the production

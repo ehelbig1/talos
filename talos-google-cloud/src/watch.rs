@@ -47,7 +47,6 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use talos_integration_helpers::audit::{insert_channel_audit, ChannelAuditEvent};
@@ -592,7 +591,7 @@ fn is_lookupable_token(raw: &str) -> bool {
 /// watch row.
 fn mint_push_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    talos_random::fill(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 

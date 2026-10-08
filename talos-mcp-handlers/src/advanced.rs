@@ -3675,9 +3675,8 @@ async fn handle_create_approval_gate(
 
     // Generate a cryptographically random URL-safe token (32 bytes → 64 hex chars)
     let token = {
-        use rand::RngCore;
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        talos_random::fill(&mut bytes);
         hex::encode(bytes)
     };
 
@@ -5336,9 +5335,8 @@ async fn handle_create_workflow_suspension(
 ) -> JsonRpcResponse {
     // Generate 256-bit random correlation_id (= bearer token for the callback URL)
     let correlation_id = {
-        use rand::RngCore;
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        talos_random::fill(&mut bytes);
         hex::encode(bytes)
     };
 

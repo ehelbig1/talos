@@ -157,9 +157,8 @@ fn now_ms() -> u64 {
 }
 
 fn random_nonce() -> String {
-    use rand::RngCore;
     let mut buf = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    talos_random::fill(&mut buf);
     hex::encode(buf)
 }
 
