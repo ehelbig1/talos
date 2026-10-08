@@ -2223,10 +2223,15 @@ pub fn is_tier2_llm_vault_path(vault_path: &str) -> bool {
     is_llm_provider_vault_path(vault_path)
 }
 
-/// Postgres function names that WASM modules must never invoke from
-/// `database::execute_query`. Canonical single-source-of-truth for both
-/// the worker (`worker::sql_validator`) and the controller's database-RPC
-/// re-parse path (`talos-rpc-subscribers`).
+/// Postgres function names that caller SQL must never invoke.
+///
+/// **A PIN since 2026-10-08, not the policy.** The policy is the allow list,
+/// [`ALLOWED_SQL_FUNCTIONS`] asked through [`is_allowed_sql_function`]; no
+/// gate asks this list any more. It stays as the record of what was found
+/// dangerous and why, and a test holds the allow list to it: nothing named
+/// here, nothing in a [`DISALLOWED_SQL_FUNCTION_PREFIXES`] family and
+/// nothing in [`SQL_TEXT_EVALUATOR_FUNCTIONS`] may ever be admitted. The text
+/// below describes the deny list as it was used until then.
 ///
 /// **Why a function deny-list is needed.** The statement-level deny-list
 /// blocks `COPY`, `SET ROLE`, `PREPARE`, etc. — but a benign-looking
@@ -2478,6 +2483,364 @@ pub const SQL_TEXT_EVALUATOR_FUNCTIONS: &[&str] = &[
 /// `lo` without the underscore would deny `lower` / `log`.
 pub const DISALLOWED_SQL_FUNCTION_PREFIXES: &[&str] = &["pg_advisory_", "pg_try_advisory_", "lo_"];
 
+/// The functions a caller's SQL may call: the ONE function policy for
+/// module SQL (the worker's validator and the controller's re-parse of
+/// `talos.database.query`) and for the platform-admin `query_paginated`
+/// tool. Asked through [`is_allowed_sql_function`]; a function not named
+/// here is refused, including one nobody has reviewed.
+///
+/// **What earns an entry.** A built-in Postgres 17 function that changes
+/// nothing, reads no stored data beyond its arguments and the rows of the
+/// statement, and does not execute SQL handed to it. The exceptions read
+/// state outside the statement that reveals nothing stored: the clock
+/// (`now`, `clock_timestamp`, …), randomness (`random`, `gen_random_uuid`)
+/// and the transaction counter (`age(xid)`). Looking a name up is not
+/// reading: the text search functions find their configuration by name, as
+/// a cast finds its type. Nothing that returns catalog contents, a session
+/// setting, the server's files or another session's state is here, and no
+/// extension function is here.
+///
+/// **Names, not overloads.** A parsed statement carries no argument types,
+/// so an entry admits every overload of its name. Each entry was checked
+/// for every overload Postgres 17 has.
+///
+/// **Syntax that sqlparser parses as a call.** Some entries are not
+/// functions in Postgres at all but syntax that sqlparser 0.63 reports as a
+/// call by name: `array` (the `ARRAY(subquery)` constructor), `row`,
+/// `coalesce`, `nullif`, `greatest`, `least`, the SQL-standard clock
+/// keywords (`current_timestamp`, …) and the SQL/JSON constructors and
+/// queries (`json_object`, `json_value`, …). Syntax sqlparser gives a node
+/// of its own (`CAST`, `EXTRACT`, `SUBSTRING`, `TRIM`, `POSITION`,
+/// `OVERLAY`, `CEIL`, `FLOOR`, `CASE`, `AT TIME ZONE`) is never reported as
+/// a call and needs no entry (`talos_sql_classify::try_for_each_called_function`).
+///
+/// **The deny lists are a PIN on this list, not the policy.** Nothing
+/// [`DISALLOWED_SQL_FUNCTIONS`], [`DISALLOWED_SQL_FUNCTION_PREFIXES`] or
+/// [`SQL_TEXT_EVALUATOR_FUNCTIONS`] covers may appear here; a test holds it.
+///
+/// **Adding an entry** is a security review of the function — every
+/// overload — against the rule above, in a change that also re-records the
+/// SQL corpus snapshots (`talos-sql-classify/corpus/README.md`). The worker
+/// and the controller must roll together: a worker with a longer list than
+/// its controller forwards a call the controller then refuses.
+///
+/// Sorted within each group; lower case; plain identifiers only.
+pub const ALLOWED_SQL_FUNCTIONS: &[&str] = &[
+    // ── Aggregates ──────────────────────────────────────────────────────
+    "any_value",
+    "array_agg",
+    "avg",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "bool_and",
+    "bool_or",
+    "corr",
+    "count",
+    "covar_pop",
+    "covar_samp",
+    "every",
+    "grouping",
+    "json_agg",
+    "json_object_agg",
+    "jsonb_agg",
+    "jsonb_object_agg",
+    "max",
+    "min",
+    "mode",
+    "percentile_cont",
+    "percentile_disc",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "string_agg",
+    "sum",
+    "var_pop",
+    "var_samp",
+    "variance",
+    // ── Window functions ────────────────────────────────────────────────
+    "cume_dist",
+    "dense_rank",
+    "first_value",
+    "lag",
+    "last_value",
+    "lead",
+    "nth_value",
+    "ntile",
+    "percent_rank",
+    "rank",
+    "row_number",
+    // ── String ──────────────────────────────────────────────────────────
+    "ascii",
+    "bit_length",
+    "btrim",
+    "char_length",
+    "character_length",
+    "chr",
+    "concat",
+    "concat_ws",
+    "convert_from",
+    "convert_to",
+    "decode",
+    "encode",
+    "format",
+    "initcap",
+    "left",
+    "length",
+    "lower",
+    "lpad",
+    "ltrim",
+    "normalize",
+    "octet_length",
+    "quote_ident",
+    "quote_literal",
+    "quote_nullable",
+    "regexp_count",
+    "regexp_instr",
+    "regexp_like",
+    "regexp_match",
+    "regexp_matches",
+    "regexp_replace",
+    "regexp_split_to_array",
+    "regexp_split_to_table",
+    "regexp_substr",
+    "repeat",
+    "replace",
+    "reverse",
+    "right",
+    "rpad",
+    "rtrim",
+    "split_part",
+    "starts_with",
+    "string_to_array",
+    "string_to_table",
+    "strpos",
+    "substr",
+    "to_hex",
+    "translate",
+    "upper",
+    // ── Numeric ─────────────────────────────────────────────────────────
+    "abs",
+    "acos",
+    "asin",
+    "atan",
+    "atan2",
+    "cbrt",
+    "ceiling",
+    "cos",
+    "degrees",
+    "div",
+    "exp",
+    "gcd",
+    "lcm",
+    "ln",
+    "log",
+    "log10",
+    "min_scale",
+    "mod",
+    "pi",
+    "power",
+    "radians",
+    "round",
+    "scale",
+    "sign",
+    "sin",
+    "sqrt",
+    "tan",
+    "trim_scale",
+    "trunc",
+    "width_bucket",
+    // ── Date and time ───────────────────────────────────────────────────
+    "age",
+    "clock_timestamp",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "date_add",
+    "date_bin",
+    "date_part",
+    "date_subtract",
+    "date_trunc",
+    "isfinite",
+    "justify_days",
+    "justify_hours",
+    "justify_interval",
+    "localtime",
+    "localtimestamp",
+    "make_date",
+    "make_interval",
+    "make_time",
+    "make_timestamp",
+    "make_timestamptz",
+    "now",
+    "statement_timestamp",
+    "timezone",
+    "transaction_timestamp",
+    // ── Type conversion (formatting) ────────────────────────────────────
+    "to_char",
+    "to_date",
+    "to_number",
+    "to_timestamp",
+    // ── JSON and JSONB: build and read ──────────────────────────────────
+    "json_array",
+    "json_array_elements",
+    "json_array_elements_text",
+    "json_array_length",
+    "json_build_array",
+    "json_build_object",
+    "json_each",
+    "json_each_text",
+    "json_exists",
+    "json_extract_path",
+    "json_extract_path_text",
+    "json_object",
+    "json_object_keys",
+    "json_populate_record",
+    "json_populate_recordset",
+    "json_query",
+    "json_strip_nulls",
+    "json_to_record",
+    "json_to_recordset",
+    "json_typeof",
+    "json_value",
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    "jsonb_array_length",
+    "jsonb_build_array",
+    "jsonb_build_object",
+    "jsonb_each",
+    "jsonb_each_text",
+    "jsonb_extract_path",
+    "jsonb_extract_path_text",
+    "jsonb_insert",
+    "jsonb_object_keys",
+    "jsonb_path_exists",
+    "jsonb_path_match",
+    "jsonb_path_query",
+    "jsonb_path_query_array",
+    "jsonb_path_query_first",
+    "jsonb_populate_record",
+    "jsonb_populate_recordset",
+    "jsonb_pretty",
+    "jsonb_set",
+    "jsonb_set_lax",
+    "jsonb_strip_nulls",
+    "jsonb_to_record",
+    "jsonb_to_recordset",
+    "jsonb_typeof",
+    "row_to_json",
+    "to_json",
+    "to_jsonb",
+    // ── Arrays ──────────────────────────────────────────────────────────
+    "array",
+    "array_append",
+    "array_cat",
+    "array_dims",
+    "array_length",
+    "array_lower",
+    "array_ndims",
+    "array_position",
+    "array_positions",
+    "array_prepend",
+    "array_remove",
+    "array_replace",
+    "array_to_string",
+    "array_upper",
+    "cardinality",
+    "trim_array",
+    // ── Conditionals and null handling ──────────────────────────────────
+    "coalesce",
+    "greatest",
+    "least",
+    "nullif",
+    "num_nonnulls",
+    "num_nulls",
+    // ── Ranges ──────────────────────────────────────────────────────────
+    "daterange",
+    "int4range",
+    "int8range",
+    "isempty",
+    "lower_inc",
+    "lower_inf",
+    "numrange",
+    "range_merge",
+    "tsrange",
+    "tstzrange",
+    "upper_inc",
+    "upper_inf",
+    // ── Row construction ────────────────────────────────────────────────
+    "row",
+    // ── UUID, randomness and hashing ────────────────────────────────────
+    "gen_random_uuid",
+    "md5",
+    "random",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    // ── Text search that runs no query ──────────────────────────────────
+    "array_to_tsvector",
+    "numnode",
+    "phraseto_tsquery",
+    "plainto_tsquery",
+    "querytree",
+    "setweight",
+    "strip",
+    "to_tsquery",
+    "to_tsvector",
+    "ts_delete",
+    "ts_filter",
+    "ts_headline",
+    "ts_rank",
+    "ts_rank_cd",
+    "tsvector_to_array",
+    "websearch_to_tsquery",
+    // ── Row generators ──────────────────────────────────────────────────
+    "generate_series",
+    "generate_subscripts",
+    "unnest",
+];
+
+/// True iff a caller's SQL may call the function `name`, as
+/// `talos_sql_classify::CalledFunction::spelled` writes it: a bare name
+/// (`lower`) or a `pg_catalog`-qualified one (`pg_catalog.lower`) whose
+/// function part is in [`ALLOWED_SQL_FUNCTIONS`], compared without regard to
+/// case (Postgres folds an unquoted name to lower case).
+///
+/// Refused: a name qualified by any other schema (`public.lower` is
+/// whatever the deployment put there), a name of three or more parts, and a
+/// name with a part that is not a plain identifier — which includes a
+/// quoted part, so `"LOWER"(x)`, a different function to Postgres, is never
+/// read as `lower`.
+///
+/// This is the ONE matcher every gate asks; never test
+/// `ALLOWED_SQL_FUNCTIONS.contains(..)` directly.
+pub fn is_allowed_sql_function(name: &str) -> bool {
+    fn plain_identifier(part: &str) -> bool {
+        let mut chars = part.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    let function = match name.split('.').collect::<Vec<_>>().as_slice() {
+        [bare] => *bare,
+        [schema, function] if schema.eq_ignore_ascii_case("pg_catalog") => *function,
+        _ => return false,
+    };
+    plain_identifier(function)
+        && ALLOWED_SQL_FUNCTIONS.contains(&function.to_ascii_lowercase().as_str())
+}
+
 /// True iff `name` (case-insensitive, schema component already stripped)
 /// appears in [`DISALLOWED_SQL_FUNCTIONS`] OR starts with one of the
 /// [`DISALLOWED_SQL_FUNCTION_PREFIXES`] families. The schema strip is the
@@ -2486,11 +2849,10 @@ pub const DISALLOWED_SQL_FUNCTION_PREFIXES: &[&str] = &["pg_advisory_", "pg_try_
 /// qualified form because user code may write `pg_catalog.pg_sleep` to
 /// bypass search-path tricks.
 ///
-/// This is the ONE matcher: the worker validator
-/// (`talos-worker-runtime::sql_validator`) and the controller's
-/// `talos.database.query` re-parse (`talos-rpc-subscribers`) both call it,
-/// so the family match reaches both fences from this one function. Never
-/// test `DISALLOWED_SQL_FUNCTIONS.contains(..)` directly — that is the
+/// Until 2026-10-08 this was the ONE matcher both module-SQL gates called.
+/// They now call [`is_allowed_sql_function`]; this matcher remains the
+/// deny-list PIN's matcher, and the allow list's tests ask it. Never test
+/// `DISALLOWED_SQL_FUNCTIONS.contains(..)` directly — that is the
 /// exact-only match and misses every family.
 ///
 /// Constant-time match isn't needed — function names are not secrets and
@@ -2916,6 +3278,106 @@ mod disallowed_sql_function_tests {
 }
 
 // ============================================================================
+// The function allow list (2026-10-08) and its pin against the deny lists
+// ============================================================================
+#[cfg(test)]
+mod allowed_sql_function_tests {
+    use super::{
+        is_allowed_sql_function, is_disallowed_sql_function, ALLOWED_SQL_FUNCTIONS,
+        DISALLOWED_SQL_FUNCTIONS, DISALLOWED_SQL_FUNCTION_PREFIXES, SQL_TEXT_EVALUATOR_FUNCTIONS,
+    };
+
+    /// THE PIN. The deny lists stopped being the policy on 2026-10-08; they
+    /// stay as the names the allow list must never admit, bare or
+    /// `pg_catalog`-qualified, in any case.
+    #[test]
+    fn nothing_the_deny_lists_cover_is_admitted() {
+        let pinned = DISALLOWED_SQL_FUNCTIONS
+            .iter()
+            .chain(SQL_TEXT_EVALUATOR_FUNCTIONS)
+            .chain(super::disallowed_sql_function_family_tests::PG17_SESSION_STATE_FAMILY);
+        for f in pinned {
+            for spelled in [
+                f.to_string(),
+                f.to_ascii_uppercase(),
+                format!("pg_catalog.{f}"),
+                format!("PG_CATALOG.{}", f.to_ascii_uppercase()),
+            ] {
+                assert!(
+                    !is_allowed_sql_function(&spelled),
+                    "`{spelled}` is admitted"
+                );
+            }
+        }
+        for f in ALLOWED_SQL_FUNCTIONS {
+            assert!(!is_disallowed_sql_function(f), "`{f}` is on both lists");
+            for family in DISALLOWED_SQL_FUNCTION_PREFIXES {
+                assert!(!f.starts_with(family), "`{f}` is in the `{family}` family");
+            }
+        }
+    }
+
+    #[test]
+    fn every_entry_is_a_lower_case_plain_identifier_listed_once() {
+        let mut seen = std::collections::HashSet::new();
+        for f in ALLOWED_SQL_FUNCTIONS {
+            assert!(seen.insert(*f), "`{f}` is listed twice");
+            assert!(
+                !f.is_empty()
+                    && !f.starts_with(|c: char| c.is_ascii_digit())
+                    && f.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "`{f}` is not a lower-case plain identifier"
+            );
+        }
+    }
+
+    /// Every entry is admitted bare and `pg_catalog`-qualified, in any case,
+    /// because Postgres folds an unquoted name to lower case.
+    #[test]
+    fn every_entry_is_admitted_bare_and_pg_catalog_qualified() {
+        for f in ALLOWED_SQL_FUNCTIONS {
+            for spelled in [
+                f.to_string(),
+                f.to_ascii_uppercase(),
+                format!("pg_catalog.{f}"),
+                format!("Pg_Catalog.{f}"),
+            ] {
+                assert!(is_allowed_sql_function(&spelled), "`{spelled}` is refused");
+            }
+        }
+    }
+
+    /// Only a bare or a `pg_catalog` name is read. Any other schema is
+    /// whatever the deployment put there; a quoted part is a different name
+    /// to Postgres; anything else is not a name.
+    #[test]
+    fn only_a_bare_or_pg_catalog_name_of_plain_identifiers_is_admitted() {
+        for spelled in [
+            "public.lower",
+            "myschema.lower",
+            "db.pg_catalog.lower",
+            "pg_catalog.pg_catalog.lower",
+            "\"lower\"",
+            "\"LOWER\"",
+            "pg_catalog.\"lower\"",
+            "\"pg_catalog\".lower",
+            "",
+            ".lower",
+            "lower.",
+            "lower ",
+            " lower",
+            "low-er",
+            "lower()",
+            "1lower",
+            "unknown_function",
+        ] {
+            assert!(!is_allowed_sql_function(spelled), "`{spelled}` is admitted");
+        }
+    }
+}
+
+// ============================================================================
 // Session-state families (advisory locks + large objects): denied by PREFIX
 // ============================================================================
 #[cfg(test)]
@@ -2940,7 +3402,7 @@ mod disallowed_sql_function_family_tests {
     /// an `(integer, integer)` form). Migration
     /// `20260925160000_revoke_advisory_and_lo_from_public.sql` walks the same
     /// predicate, so this list and the REVOKE cover one population.
-    const PG17_SESSION_STATE_FAMILY: &[&str] = &[
+    pub(super) const PG17_SESSION_STATE_FAMILY: &[&str] = &[
         "lo_close",
         "lo_creat",
         "lo_create",

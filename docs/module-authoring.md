@@ -83,6 +83,33 @@ interface state {
 }
 ```
 
+### Database Interface (`database-node`)
+
+`database::execute-query(sql, params)` runs one statement with `$1`, `$2`, …
+parameters. The worker checks it before forwarding it and the controller
+checks it again before running it:
+
+- One statement; no DDL, `COPY`, `SET`, `CALL`, `EXPLAIN`, `SELECT … INTO`.
+  A write (`INSERT` / `UPDATE` / `DELETE`, including one inside a CTE) runs
+  only when the module's `allowed_sql_operations` grants it.
+- **Functions come from an allow list** (2026-10-08):
+  `talos_workflow_job_protocol::ALLOWED_SQL_FUNCTIONS` — aggregates, window
+  functions, string, numeric, date/time, JSON readers and builders, arrays,
+  ranges, `coalesce` / `nullif`, hashing, text search that runs no query, and
+  `generate_series` / `unnest`. A function not on it is refused, and the
+  error names it. Call it by its bare name or `pg_catalog.` name: a name in
+  any other schema (`public.f`) or a quoted name (`"F"`) is refused.
+  Functions that read session or server state (`current_setting`,
+  `current_user`, `version`), sequences (`nextval`), and any function the
+  deployment defined itself are not on the list.
+- Fixed SQL syntax needs no entry: `CAST` / `::`, `CASE`, `EXTRACT`,
+  `SUBSTRING`, `TRIM`, `POSITION`, `CEIL` / `FLOOR`, `AT TIME ZONE`,
+  `ARRAY[…]`, operators.
+
+A function you need that is not listed is added by a change to that list
+(reviewed against its rule, every overload) and a redeploy of the worker and
+the controller together; there is no per-deployment setting.
+
 ### Logging Interface
 
 ```wit

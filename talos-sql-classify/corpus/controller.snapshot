@@ -58,9 +58,9 @@ admit read SELECT                | SELECT * FROM public.t
 admit read SELECT                | SELECT * FROM a.b.c
 admit read SELECT                | SELECT count(*) FROM t WHERE tsv @@ to_tsquery('x')
 admit read SELECT                | SELECT * FROM t ORDER BY embedding <-> $1 LIMIT 5
-admit read SELECT                | SELECT now(), current_user, current_setting('x')
-admit read SELECT                | SELECT nextval('s')
-admit read SELECT                | SELECT setval('s', 1)
+refuse function current_user     | SELECT now(), current_user, current_setting('x')
+refuse function nextval          | SELECT nextval('s')
+refuse function setval           | SELECT setval('s', 1)
 admit read SELECT                | SELECT /* comment */ 1
 admit read SELECT                | SELECT 1 -- trailing comment
 admit read SELECT                | SELECT ';'
@@ -332,9 +332,9 @@ refuse statement                 | WAITFOR DELAY '00:00:01'
 refuse function set_config       | SELECT set_config('search_path', 'x', false)
 refuse function set_config       | SELECT SET_CONFIG('search_path', 'x', false)
 refuse function pg_catalog.set_config | SELECT pg_catalog.set_config('search_path', 'x', false)
-refuse function set_config       | SELECT "set_config"('search_path', 'x', false)
-admit read SELECT                | SELECT public.set_config('search_path', 'x', false)
-admit read SELECT                | SELECT a.b.set_config('search_path', 'x', false)
+refuse function "set_config"     | SELECT "set_config"('search_path', 'x', false)
+refuse function public.set_config | SELECT public.set_config('search_path', 'x', false)
+refuse function a.b.set_config   | SELECT a.b.set_config('search_path', 'x', false)
 refuse function pg_notify        | SELECT pg_notify('ch', 'x')
 refuse function query_to_xml     | SELECT query_to_xml('DELETE FROM t', true, true, '')
 refuse function pg_catalog.query_to_xml | SELECT pg_catalog.query_to_xml('SELECT 1', true, true, '')
@@ -398,8 +398,8 @@ refuse function pg_cancel_backend | SELECT pg_cancel_backend(1)
 refuse function dblink           | SELECT * FROM dblink('made-up', 'SELECT 1') AS x(a int)
 refuse function dblink_exec      | SELECT dblink_exec('made-up', 'DELETE FROM t')
 refuse function pg_reload_conf   | SELECT pg_reload_conf()
-admit read SELECT                | SELECT pg_stat_reset()
-admit read SELECT                | SELECT current_setting('x')
+refuse function pg_stat_reset    | SELECT pg_stat_reset()
+refuse function current_setting  | SELECT current_setting('x')
 refuse function set_config       | SELECT a FROM t WHERE a = ANY(ARRAY(SELECT set_config('x', 'y', false)))
 refuse function set_config       | SELECT ARRAY[set_config('x', 'y', false)]
 refuse function set_config       | SELECT ROW(set_config('x', 'y', false))

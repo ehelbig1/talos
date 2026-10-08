@@ -58,9 +58,9 @@
 *=ok(SELECT,rows,ReadOnly) | SELECT * FROM a.b.c
 *=ok(SELECT,rows,ReadOnly) | SELECT count(*) FROM t WHERE tsv @@ to_tsquery('x')
 *=ok(SELECT,rows,ReadOnly) | SELECT * FROM t ORDER BY embedding <-> $1 LIMIT 5
-*=ok(SELECT,rows,ReadOnly) | SELECT now(), current_user, current_setting('x')
-*=ok(SELECT,rows,ReadOnly) | SELECT nextval('s')
-*=ok(SELECT,rows,ReadOnly) | SELECT setval('s', 1)
+*=function(current_user) | SELECT now(), current_user, current_setting('x')
+*=function(nextval) | SELECT nextval('s')
+*=function(setval) | SELECT setval('s', 1)
 *=ok(SELECT,rows,ReadOnly) | SELECT /* comment */ 1
 *=ok(SELECT,rows,ReadOnly) | SELECT 1 -- trailing comment
 *=ok(SELECT,rows,ReadOnly) | SELECT ';'
@@ -301,8 +301,8 @@ E=cte(UPDATE) I=cte(UPDATE) P=ok(DELETE,no-rows,Mutates { nested: false }) | DEL
 *=parse-error | MOVE NEXT FROM c
 *=blocked(CLOSE) | CLOSE c
 *=blocked(CLOSE) | CLOSE ALL
-E=disallowed(CALL) I=disallowed(CALL) P=ok(CALL,no-rows,Unclassified) | CALL p()
-E=disallowed(CALL) I=disallowed(CALL) P=ok(CALL,no-rows,Unclassified) | CALL p(1, 2)
+*=function(p) | CALL p()
+*=function(p) | CALL p(1, 2)
 *=parse-error | DO $$ BEGIN DELETE FROM t; END $$
 *=parse-error | DO LANGUAGE plpgsql $$ BEGIN PERFORM 1; END $$
 *=blocked(EXPLAIN) | EXPLAIN SELECT 1
@@ -332,9 +332,9 @@ E=disallowed(ATTACH) I=disallowed(ATTACH) P=ok(ATTACH,no-rows,Unclassified) | AT
 *=function(set_config) | SELECT set_config('search_path', 'x', false)
 *=function(set_config) | SELECT SET_CONFIG('search_path', 'x', false)
 *=function(pg_catalog.set_config) | SELECT pg_catalog.set_config('search_path', 'x', false)
-*=function(set_config) | SELECT "set_config"('search_path', 'x', false)
-*=ok(SELECT,rows,ReadOnly) | SELECT public.set_config('search_path', 'x', false)
-*=ok(SELECT,rows,ReadOnly) | SELECT a.b.set_config('search_path', 'x', false)
+*=function("set_config") | SELECT "set_config"('search_path', 'x', false)
+*=function(public.set_config) | SELECT public.set_config('search_path', 'x', false)
+*=function(a.b.set_config) | SELECT a.b.set_config('search_path', 'x', false)
 *=function(pg_notify) | SELECT pg_notify('ch', 'x')
 *=function(query_to_xml) | SELECT query_to_xml('DELETE FROM t', true, true, '')
 *=function(pg_catalog.query_to_xml) | SELECT pg_catalog.query_to_xml('SELECT 1', true, true, '')
@@ -398,8 +398,8 @@ E=disallowed(ATTACH) I=disallowed(ATTACH) P=ok(ATTACH,no-rows,Unclassified) | AT
 *=function(dblink) | SELECT * FROM dblink('made-up', 'SELECT 1') AS x(a int)
 *=function(dblink_exec) | SELECT dblink_exec('made-up', 'DELETE FROM t')
 *=function(pg_reload_conf) | SELECT pg_reload_conf()
-*=ok(SELECT,rows,ReadOnly) | SELECT pg_stat_reset()
-*=ok(SELECT,rows,ReadOnly) | SELECT current_setting('x')
+*=function(pg_stat_reset) | SELECT pg_stat_reset()
+*=function(current_setting) | SELECT current_setting('x')
 *=function(set_config) | SELECT a FROM t WHERE a = ANY(ARRAY(SELECT set_config('x', 'y', false)))
 *=function(set_config) | SELECT ARRAY[set_config('x', 'y', false)]
 *=function(set_config) | SELECT ROW(set_config('x', 'y', false))

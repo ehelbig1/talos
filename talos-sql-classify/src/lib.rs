@@ -54,10 +54,11 @@
 //! * **Function side effects.** `SELECT nextval('s')` / `setval` / a
 //!   `VOLATILE` function that writes are mutations Postgres will happily run
 //!   inside a statement this crate calls [`SqlAccess::ReadOnly`]. No
-//!   statement-shape classifier can see them; the worker's expression-level
-//!   `check_disallowed_functions` deny-list is the surface that can, and
-//!   widening it is a separate piece of work. Stated so the gap is visible
-//!   rather than implied.
+//!   statement-shape classifier can see them. The function gate is the
+//!   surface that can: [`first_function_not_admitted`] with
+//!   `talos_workflow_job_protocol::is_allowed_sql_function`, an allow list
+//!   since 2026-10-08 that admits none of these. Stated so the gap is
+//!   visible rather than implied.
 //! * **Size and recursion bounds.** Callers cap the SQL byte length before
 //!   parsing (the worker's `MAX_SQL_BYTES`, the controller's
 //!   `database_rpc::validate_structure`). sqlparser's own
@@ -365,6 +366,37 @@ pub fn try_for_each_called_function<B>(
     stmt.visit(&mut CalledFunctionVisitor { f })
 }
 
+/// The first function `stmt` calls that `admits` does not admit, spelled as
+/// [`CalledFunction::spelled`] writes it; `None` when every call is
+/// admitted.
+///
+/// `admits` is asked the spelled name of each call (`lower`,
+/// `pg_catalog.lower`, `"Lower"`, `xmltable`). A call whose name cannot be
+/// read is refused without asking. Every gate that decides which functions a
+/// caller's SQL may call goes through here with
+/// `talos_workflow_job_protocol::is_allowed_sql_function`, so that the walk,
+/// the spelling and the matcher each have one home; this crate stays a leaf
+/// by taking the matcher as an argument.
+pub fn first_function_not_admitted(
+    stmt: &Statement,
+    mut admits: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    let walk = try_for_each_called_function(stmt, |call| {
+        let spelled = call.spelled();
+        match call {
+            CalledFunction::Unreadable(_) => ControlFlow::Break(spelled),
+            CalledFunction::Named(_) | CalledFunction::Syntax(_) if admits(&spelled) => {
+                ControlFlow::Continue(())
+            }
+            CalledFunction::Named(_) | CalledFunction::Syntax(_) => ControlFlow::Break(spelled),
+        }
+    });
+    match walk {
+        ControlFlow::Break(name) => Some(name),
+        ControlFlow::Continue(()) => None,
+    }
+}
+
 /// Does any query in `stmt` carry an `INTO` target — Postgres's
 /// `SELECT … INTO [TEMP] new_table FROM …`, which CREATES a table?
 ///
@@ -546,6 +578,39 @@ mod tests {
         assert_eq!(called("CALL p(1)"), ["p"]);
     }
 
+    /// The shared gate asks the matcher the spelled name of every call and
+    /// stops at the first it refuses; a name it cannot read is refused
+    /// without asking.
+    #[test]
+    fn first_function_not_admitted_asks_every_call_and_names_the_refused_one() {
+        let admits = |name: &str| ["lower", "pg_catalog.upper", "unnest"].contains(&name);
+        let refused = |sql: &str| first_function_not_admitted(&parse1(sql), admits);
+        assert_eq!(refused("SELECT 1"), None);
+        assert_eq!(refused("SELECT lower(a), pg_catalog.upper(b) FROM t"), None);
+        assert_eq!(refused("SELECT * FROM unnest(ARRAY[1])"), None);
+        assert_eq!(
+            refused("SELECT lower(a) FROM t WHERE upper(b) = 'X'").as_deref(),
+            Some("upper")
+        );
+        assert_eq!(
+            refused("SELECT \"lower\"(a) FROM t").as_deref(),
+            Some("\"lower\"")
+        );
+        assert_eq!(
+            refused("SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS a int PATH 'a')").as_deref(),
+            Some("xmltable")
+        );
+        // A caller-supplied matcher that admits everything still cannot
+        // admit a call it is never asked about: there is none here, but the
+        // walk must not ask about a plain relation.
+        assert_eq!(
+            first_function_not_admitted(&parse1("SELECT * FROM t JOIN u ON t.a = u.a"), |_| {
+                false
+            }),
+            None
+        );
+    }
+
     /// What sqlparser 0.63 parses into a node of its own is fixed syntax, not
     /// a named call, and the walk does not report it. Measured 2026-10-08;
     /// pinned so a parser bump that turns one into a named call is noticed
@@ -717,8 +782,8 @@ mod tests {
     }
 
     /// A STATED LIMIT, pinned so it cannot be forgotten: a function with a
-    /// side effect is invisible to a statement-shape classifier. The worker's
-    /// `check_disallowed_functions` deny-list is the surface that can see it.
+    /// side effect is invisible to a statement-shape classifier. The function
+    /// gate (`first_function_not_admitted`) is the surface that can see it.
     #[test]
     fn function_side_effects_are_out_of_range_and_read_as_reads() {
         for sql in [
