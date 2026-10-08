@@ -71,5 +71,5 @@ is the smallest finished example of every step below.
       stored under the user who started the flow, a URL minted in one browser
       refused in another, reconnect updates the row.
 - [ ] `make lint` and the crate's tests pass.
-- [ ] A setup page (`docs/microsoft-365-setup.md`): where to create the OAuth client
+- [x] A setup page (`docs/microsoft-365-setup.md`): where to create the OAuth client
       and which redirect URI to register.
