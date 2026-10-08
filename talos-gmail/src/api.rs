@@ -123,9 +123,8 @@ impl GmailWatchApiClient {
     }
 
     /// The production client pointed at another base URL, for tests that
-    /// capture the request a call puts on the wire.
-    #[cfg(test)]
-    fn with_base_url(base_url: &str) -> Self {
+    /// capture the request a call puts on the wire, or stand in for Google.
+    pub(crate) fn with_base_url(base_url: &str) -> Self {
         Self {
             base_url: base_url.to_string(),
             ..Self::new()

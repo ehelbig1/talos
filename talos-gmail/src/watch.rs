@@ -57,7 +57,7 @@ use talos_integration_helpers::audit::{
     insert_channel_audit, truncate_and_redact_error, ChannelAuditEvent,
 };
 use talos_integration_helpers::state_store::{
-    ttl_with_grace, ChannelStore, CreateLockMap, RowUpdate, UpdateOutcome,
+    ttl_with_grace, ChannelStore, CreateLockMap, FleetCreateGuard, RowUpdate, UpdateOutcome,
 };
 use talos_integration_helpers::watch_binding::{check_module_binding, ModuleBindingRefusal};
 use talos_integration_state::execute_op;
@@ -67,6 +67,27 @@ use talos_memory::integration_state_rpc::{
 use uuid::Uuid;
 
 pub const GMAIL_INTEGRATION_NAME: &str = "gmail";
+
+/// Every watch row's key starts with this.
+const WATCH_KEY_PREFIX: &str = "watch/";
+
+/// What a renewal returns when another renewal got there first.
+fn already_renewed(renewed: GmailWatchRow) -> GmailWatchRow {
+    tracing::info!(
+        channel_uuid = %renewed.id,
+        "gmail renew: another renewer already replaced this watch"
+    );
+    renewed
+}
+
+fn not_found(user_id: Uuid, channel_uuid: Uuid) -> anyhow::Error {
+    // The wording this error has always had.
+    anyhow!(
+        "gmail watch {} not found for user {}",
+        channel_uuid,
+        user_id
+    )
+}
 
 /// Row stored in `integration_state.value`. Separate from any API-
 /// facing struct so controller-private fields never leak through.
@@ -99,6 +120,12 @@ pub struct GmailWatchRow {
     pub workflow_id: Option<Uuid>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// The row this one replaced, when it was made by a renewal. A caller
+    /// still holding THAT uuid is handed this row instead of "not found". One
+    /// generation only. Absent from rows that replaced nothing, and from every
+    /// row written before 2026-10-08, so those keep the exact bytes they had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewed_from: Option<Uuid>,
 }
 
 /// The stored form of a watch row. Same 14-day TTL grace as gcal so a streak
@@ -187,7 +214,7 @@ impl CreateWatchError {
 /// create-lock map; `GmailWatchService::list_for_user` delegates here so the
 /// two cannot drift.
 pub async fn list_rows_for_user(pool: &sqlx::PgPool, user_id: Uuid) -> Result<Vec<GmailWatchRow>> {
-    let entries = ChannelStore::new(pool.clone(), GMAIL_INTEGRATION_NAME, "watch/")
+    let entries = ChannelStore::new(pool.clone(), GMAIL_INTEGRATION_NAME, WATCH_KEY_PREFIX)
         .list_entries(user_id, ListFilter::default(), 500)
         .await?;
     let mut out = Vec::with_capacity(entries.len());
@@ -215,9 +242,17 @@ pub struct GmailWatchService {
     /// Default label filter for new watches. If empty, every
     /// message triggers. Most users want `["INBOX"]`.
     pub(crate) default_label_ids: Vec<String>,
-    /// Serializes `create_watch` per `(user_id, integration_id)` so
-    /// two concurrent callers can't register with Google twice.
+    /// Serializes create and renew per `(user_id, integration_id)` so two
+    /// callers can't register the mailbox with Google twice. Taken through
+    /// `CreateLockMap::acquire_fleet` — the process-local mutex plus a
+    /// Postgres advisory lock — because every controller replica serves the
+    /// create endpoint and runs the renewal loop. (Until 2026-10-08 it was
+    /// the process-local mutex alone, and two replicas could both create.)
     create_locks: CreateLockMap<(Uuid, Uuid)>,
+    /// One renewal at a time per `(user_id, watch uuid)`, taken before the
+    /// renewal acts on the row it was asked to renew. The create lock is
+    /// keyed by the integration, which a renewal only learns from that row.
+    renew_locks: CreateLockMap<(Uuid, Uuid)>,
     /// API client — cheap to clone (reqwest internally Arcs).
     pub(crate) api: GmailWatchApiClient,
 }
@@ -235,6 +270,7 @@ impl GmailWatchService {
             topic_name,
             default_label_ids,
             create_locks: CreateLockMap::new(),
+            renew_locks: CreateLockMap::new(),
             api: GmailWatchApiClient::new(),
         }
     }
@@ -242,13 +278,23 @@ impl GmailWatchService {
     /// User-scoped handle over `integration_state` for gmail watch
     /// rows. Cheap to construct per call (`PgPool` is `Arc`-backed).
     fn store(&self) -> ChannelStore {
-        ChannelStore::new(self.pool.clone(), GMAIL_INTEGRATION_NAME, "watch/")
+        ChannelStore::new(self.pool.clone(), GMAIL_INTEGRATION_NAME, WATCH_KEY_PREFIX)
     }
 
-    /// Evict idle create-locks. Paired with the webhook rate-limiter
-    /// sweep in main.rs for consistency with gcal.
+    /// Test-only: send this service's `users.watch` / `users.stop` calls to
+    /// another origin (an in-process stand-in for Google). Never set in
+    /// production; same shape as the Calendar service's hook.
+    #[must_use]
+    pub fn with_api_base_url_for_tests(mut self, base_url: &str) -> Self {
+        self.api = GmailWatchApiClient::with_base_url(base_url);
+        self
+    }
+
+    /// Evict idle create- and renewal-locks. Paired with the webhook
+    /// rate-limiter sweep in main.rs for consistency with gcal.
     pub fn cleanup_create_locks(&self) {
         self.create_locks.cleanup();
+        self.renew_locks.cleanup();
     }
 
     // ------------------------------------------------------------------
@@ -279,7 +325,7 @@ impl GmailWatchService {
         // one being created wrong (#777's resume argument).
         check_module_binding(&self.pool, user_id, module_id, GMAIL_INTEGRATION_NAME).await?;
 
-        let _guard = self.acquire_lock(user_id, integration_id).await;
+        let guard = self.acquire_lock(user_id, integration_id).await?;
 
         // Fast path: if there's already a row for this (user,
         // integration), update module_id (and optionally labels) on
@@ -328,11 +374,13 @@ impl GmailWatchService {
 
         Ok(self
             .create_fresh_watch_locked(
+                &guard,
                 user_id,
                 integration_id,
                 module_id,
                 workflow_id,
                 label_ids.unwrap_or_else(|| self.default_label_ids.clone()),
+                None,
             )
             .await?)
     }
@@ -340,14 +388,44 @@ impl GmailWatchService {
     /// Delete the old row BEFORE creating fresh, same pattern as gcal —
     /// prevents the fast-path from incorrectly returning the about-to-
     /// be-deleted row.
-    pub(crate) async fn renew_watch(
-        &self,
-        user_id: Uuid,
-        channel_uuid: Uuid,
-    ) -> Result<GmailWatchRow> {
-        let old = self.require_by_id(user_id, channel_uuid).await?;
+    ///
+    /// Renewals of one watch are serialized from before they act on its row,
+    /// by a lock keyed by what the caller holds (the watch uuid): the create
+    /// lock is keyed by the integration, which only the row names. A renewal
+    /// that finds its row gone — replaced by the renewal it waited for, or
+    /// being replaced right now — is handed the replacement. Until 2026-10-08
+    /// the row was read once, outside any lock, and a second renewal stopped
+    /// the mailbox's subscription and registered it again from that stale
+    /// read, leaving two rows for one mailbox.
+    pub async fn renew_watch(&self, user_id: Uuid, channel_uuid: Uuid) -> Result<GmailWatchRow> {
+        // Looked for BEFORE the renewal lock is taken: a request for a uuid
+        // that is not a watch must not hold a pooled connection (the lock is
+        // a transaction) while it waits for another to read with.
+        if self.find_by_id(user_id, channel_uuid).await?.is_none() {
+            if let Some(renewed) = self.find_renewed_from(user_id, channel_uuid).await? {
+                return Ok(already_renewed(renewed));
+            }
+            // Being replaced right now? Wait for that renewal, holding
+            // nothing while looking again.
+            drop(self.acquire_renewal_lock(user_id, channel_uuid).await?);
+            return match self.find_renewed_from(user_id, channel_uuid).await? {
+                Some(renewed) => Ok(already_renewed(renewed)),
+                None => Err(not_found(user_id, channel_uuid)),
+            };
+        }
 
-        let _guard = self.acquire_lock(user_id, old.integration_id).await;
+        let _renewal = self.acquire_renewal_lock(user_id, channel_uuid).await?;
+        let Some(old) = self.find_by_id(user_id, channel_uuid).await? else {
+            // Replaced by the renewal this one waited for.
+            return self.replacement_or_not_found(user_id, channel_uuid).await;
+        };
+
+        let guard = self.acquire_lock(user_id, old.integration_id).await?;
+        // And again under the create lock: a create on another replica may
+        // have been holding it.
+        let Some(old) = self.find_by_id(user_id, channel_uuid).await? else {
+            return self.replacement_or_not_found(user_id, channel_uuid).await;
+        };
 
         // Gmail's users.stop is optional on renewal — users.watch
         // again effectively replaces the subscription. But calling
@@ -383,7 +461,15 @@ impl GmailWatchService {
         // returns a NEW historyId (current tip) which we deliberately
         // ignore — our stored cursor is the authority.
         let mut new_row = self
-            .create_fresh_watch_locked(user_id, integration_id, module_id, workflow_id, label_ids)
+            .create_fresh_watch_locked(
+                &guard,
+                user_id,
+                integration_id,
+                module_id,
+                workflow_id,
+                label_ids,
+                Some(old_id),
+            )
             .await
             .context("create_fresh during renew")?;
         if new_row.history_id < history_id {
@@ -395,6 +481,51 @@ impl GmailWatchService {
         // successful renew MUST produce a different channel_uuid.
         debug_assert_ne!(new_row.id, old_id);
         Ok(new_row)
+    }
+
+    async fn replacement_or_not_found(
+        &self,
+        user_id: Uuid,
+        channel_uuid: Uuid,
+    ) -> Result<GmailWatchRow> {
+        match self.find_renewed_from(user_id, channel_uuid).await? {
+            Some(renewed) => Ok(already_renewed(renewed)),
+            None => Err(not_found(user_id, channel_uuid)),
+        }
+    }
+
+    /// The row that replaced `old_uuid` in a renewal, if there is one. A
+    /// user holds one watch per connected mailbox.
+    async fn find_renewed_from(
+        &self,
+        user_id: Uuid,
+        old_uuid: Uuid,
+    ) -> Result<Option<GmailWatchRow>> {
+        let entries = self
+            .store()
+            .list_entries(
+                user_id,
+                ListFilter {
+                    key_prefix: Some(WATCH_KEY_PREFIX.to_string()),
+                    ..Default::default()
+                },
+                500,
+            )
+            .await?;
+        for entry in entries {
+            // A row that cannot be read is not the replacement being looked
+            // for, and must not turn every stale uuid into an error.
+            match decode_row(&entry) {
+                Ok(row) if row.renewed_from == Some(old_uuid) => return Ok(Some(row)),
+                Ok(_) => {}
+                Err(e) => tracing::error!(
+                    key = %entry.key,
+                    error = %e,
+                    "Skipping malformed gmail watch row"
+                ),
+            }
+        }
+        Ok(None)
     }
 
     /// Stop + delete. Idempotent: missing rows succeed silently.
@@ -579,11 +710,15 @@ impl GmailWatchService {
 
     pub(crate) async fn create_fresh_watch_locked(
         &self,
+        // Proof the caller holds the fleet create lock, as in gcal.
+        _lock: &FleetCreateGuard,
         user_id: Uuid,
         integration_id: Uuid,
         module_id: Option<Uuid>,
         workflow_id: Option<Uuid>,
         label_ids: Vec<String>,
+        // The row a renewal is replacing; `None` for a first create.
+        renewed_from: Option<Uuid>,
     ) -> Result<GmailWatchRow> {
         let integration = self
             .integrations
@@ -620,6 +755,7 @@ impl GmailWatchService {
             workflow_id,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            renewed_from,
         };
 
         // Orphan-stop pattern: if persist fails, tell Google to
@@ -704,8 +840,7 @@ impl GmailWatchService {
 
     /// Load one watch row by internal uuid (ownership via the
     /// user-scoped store). **Three-way** — `Ok(None)` is "no such
-    /// watch", `Err` is "we could not look". Callers that cannot act
-    /// on the distinction take [`Self::require_by_id`].
+    /// watch", `Err` is "we could not look".
     pub(crate) async fn find_by_id(
         &self,
         user_id: Uuid,
@@ -715,24 +850,6 @@ impl GmailWatchService {
             Some(entry) => decode_row(&entry).map(Some),
             None => Ok(None),
         }
-    }
-
-    /// [`Self::find_by_id`] for callers to which an absent row is just
-    /// another failure. The message is the pre-split one, verbatim.
-    pub(crate) async fn require_by_id(
-        &self,
-        user_id: Uuid,
-        channel_uuid: Uuid,
-    ) -> Result<GmailWatchRow> {
-        self.find_by_id(user_id, channel_uuid)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "gmail watch {} not found for user {}",
-                    channel_uuid,
-                    user_id
-                )
-            })
     }
 
     async fn find_single_for_integration(
@@ -829,12 +946,32 @@ impl GmailWatchService {
         Ok(out)
     }
 
-    async fn acquire_lock(
+    async fn acquire_lock(&self, user_id: Uuid, integration_id: Uuid) -> Result<FleetCreateGuard> {
+        self.create_locks
+            .acquire_fleet(
+                &self.pool,
+                (user_id, integration_id),
+                &format!("gmail:{user_id}:{integration_id}"),
+            )
+            .await
+            .context("could not take the gmail watch create lock")
+    }
+
+    /// Taken before the create lock, never after it; the create path takes
+    /// only the create lock.
+    async fn acquire_renewal_lock(
         &self,
         user_id: Uuid,
-        integration_id: Uuid,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
-        self.create_locks.acquire((user_id, integration_id)).await
+        channel_uuid: Uuid,
+    ) -> Result<FleetCreateGuard> {
+        self.renew_locks
+            .acquire_fleet(
+                &self.pool,
+                (user_id, channel_uuid),
+                &format!("gmail-renew:{user_id}:{channel_uuid}"),
+            )
+            .await
+            .context("could not take the gmail watch renewal lock")
     }
 }
 
@@ -855,7 +992,41 @@ mod tests {
             workflow_id: Some(Uuid::from_u128(7)),
             created_at_ms: 1,
             updated_at_ms: 1,
+            renewed_from: None,
         }
+    }
+
+    /// The stored row is a storage format. A row written before
+    /// `renewed_from` existed reads back, and a row that replaced nothing is
+    /// written exactly as it was before the field existed.
+    #[test]
+    fn a_row_without_renewed_from_reads_back_and_is_written_unchanged() {
+        let before = serde_json::json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "integration_id": "22222222-2222-4222-8222-222222222222",
+            "email_address": "a@example.com",
+            "topic_name": "projects/p/topics/t",
+            "history_id": 42,
+            "label_ids": ["INBOX"],
+            "expiration_ms": 1_800_000_000_000_i64,
+            "module_id": null,
+            "workflow_id": null,
+            "created_at_ms": 1_700_000_000_000_i64,
+            "updated_at_ms": 1_700_000_000_000_i64
+        });
+        let row: GmailWatchRow = serde_json::from_value(before.clone()).expect("an old row");
+        assert_eq!(row.renewed_from, None);
+        assert_eq!(serde_json::to_value(&row).expect("serialize"), before);
+
+        let replaced = Uuid::new_v4();
+        let renewed = GmailWatchRow {
+            renewed_from: Some(replaced),
+            ..row
+        };
+        let written = serde_json::to_value(&renewed).expect("serialize");
+        assert_eq!(written["renewed_from"], serde_json::json!(replaced));
+        let read: GmailWatchRow = serde_json::from_value(written).expect("a renewed row");
+        assert_eq!(read.renewed_from, Some(replaced));
     }
 
     #[test]
