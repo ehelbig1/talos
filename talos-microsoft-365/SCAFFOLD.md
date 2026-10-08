@@ -57,9 +57,9 @@ is the smallest finished example of every step below.
 
 ## Configuration (lints 89 and 97 fail until these exist)
 
-- [ ] `docs/configuration-reference.md`: a row for
+- [x] `docs/configuration-reference.md`: a row for
       `MICROSOFT_365_CLIENT_ID` / `MICROSOFT_365_CLIENT_SECRET` / `MICROSOFT_365_REDIRECT_URI`.
-- [ ] `docker-compose.yml` controller `environment:` and the chart's
+- [x] `docker-compose.yml` controller `environment:` and the chart's
       controller deployment: the same three, empty by default.
 
 ## Lints and tests

@@ -1849,6 +1849,11 @@ bootstrapSecret:
     SLACK_CLIENT_SECRET: ""
     ATLASSIAN_CLIENT_ID: ""
     ATLASSIAN_CLIENT_SECRET: ""
+    # Microsoft 365 (an Entra ID app registration). MICROSOFT_365_TENANT blank
+    # = `common`; a tenant id or domain restricts who can connect.
+    MICROSOFT_365_CLIENT_ID: ""
+    MICROSOFT_365_CLIENT_SECRET: ""
+    MICROSOFT_365_TENANT: ""
     # RFC 0008 — GitHub App (optional). Leave GITHUB_APP_ID blank to disable
     # (feature off). PRIVATE_KEY is the PEM (PKCS#1 or PKCS#8); WEBHOOK_SECRET is
     # the App's webhook HMAC secret. The connect flow ALSO needs the App's user
