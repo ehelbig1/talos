@@ -183,6 +183,7 @@ members = [
     "talos-workflow-engine-nats",
     "talos-workflow-engine-test-utils",
     "talos-workflow-job-protocol",
+    "talos-microsoft-365",
 ]
 
 # Shared package metadata. Crates opt in via `version.workspace = true`

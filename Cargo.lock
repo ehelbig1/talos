@@ -9110,6 +9110,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-microsoft-365"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "reqwest",
+ "serde",
+ "sqlx",
+ "talos-config",
+ "talos-dlp-provider",
+ "talos-http-body",
+ "talos-http-utils",
+ "talos-oauth",
+ "talos-text-util",
+ "tokio",
+ "tracing",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "talos-ml"
 version = "0.1.0"
 dependencies = [
