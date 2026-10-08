@@ -209,14 +209,16 @@ impl TrustedProxies {
 /// IP-based rate limiter
 pub type IpRateLimiter = Arc<RateLimiter<String, DashMapStateStore<String>, DefaultClock>>;
 
-/// Create a new IP-based rate limiter
-pub fn create_rate_limiter(config: RateLimitConfig) -> IpRateLimiter {
+/// The quota a [`RateLimitConfig`] asks for: `burst_size` calls at once, one
+/// more every `per / requests`. Both limiters below are built from it, and
+/// the tests drive it on a clock they control.
+fn quota_for(config: &RateLimitConfig) -> Quota {
     // If we want N requests per window of length W, the time between replenishing
     // individual cells is W / N.
     let period = config.per / config.requests;
 
     // Handle invalid config gracefully instead of panicking
-    let quota = match Quota::with_period(period) {
+    match Quota::with_period(period) {
         Some(q) => match NonZeroU32::new(config.burst_size) {
             Some(burst) => q.allow_burst(burst),
             None => {
@@ -231,9 +233,12 @@ pub fn create_rate_limiter(config: RateLimitConfig) -> IpRateLimiter {
                 .unwrap_or_else(|| Quota::per_second(NonZeroU32::MIN))
                 .allow_burst(NonZeroU32::MIN)
         }
-    };
+    }
+}
 
-    Arc::new(RateLimiter::dashmap(quota))
+/// Create a new IP-based rate limiter
+pub fn create_rate_limiter(config: RateLimitConfig) -> IpRateLimiter {
+    Arc::new(RateLimiter::dashmap(quota_for(&config)))
 }
 
 /// Paths exempt from per-IP rate limiting: kubelet probes, the Prometheus
@@ -492,8 +497,8 @@ pub async fn rate_limit_middleware(
             // the headers. Using `not_until.wait_time_from(clock.now())`
             // gives the real GCRA replenishment time, accurate to the
             // configured quota.
-            let clock = DefaultClock::default();
-            let wait = not_until.wait_time_from(clock.now());
+            // On the limiter's own clock, the one the refusal was decided on.
+            let wait = not_until.wait_time_from(limiter.clock().now());
             // Round up so a sub-second wait still produces a
             // semantically-valid `Retry-After: N` (zero seconds tells
             // a client "retry now," which would just re-hit the
@@ -557,27 +562,7 @@ pub type GlobalRateLimiter =
 
 /// Create a global rate limiter (not per-IP)
 pub fn create_global_rate_limiter(config: RateLimitConfig) -> GlobalRateLimiter {
-    let period = config.per / config.requests;
-
-    // Handle invalid config gracefully instead of panicking
-    let quota = match Quota::with_period(period) {
-        Some(q) => match NonZeroU32::new(config.burst_size) {
-            Some(burst) => q.allow_burst(burst),
-            None => {
-                tracing::warn!("Invalid burst_size: {}, using default", config.burst_size);
-                q.allow_burst(NonZeroU32::MIN)
-            }
-        },
-        None => {
-            tracing::warn!("Invalid rate limit period: {:?}, using default", period);
-            // Use a sensible default: 1 request per second with burst of 1
-            Quota::with_period(Duration::from_secs(1))
-                .unwrap_or_else(|| Quota::per_second(NonZeroU32::MIN))
-                .allow_burst(NonZeroU32::MIN)
-        }
-    };
-
-    Arc::new(RateLimiter::direct(quota))
+    Arc::new(RateLimiter::direct(quota_for(&config)))
 }
 
 /// Global rate limiting middleware (protects against overall system overload)
@@ -606,8 +591,8 @@ pub async fn global_rate_limit_middleware(
             // backed off far longer than needed. Cap at 60s so a
             // wildly-misconfigured quota doesn't surface a multi-
             // minute backoff for what should be a transient spike.
-            let clock = DefaultClock::default();
-            let wait = not_until.wait_time_from(clock.now());
+            // On the limiter's own clock, the one the refusal was decided on.
+            let wait = not_until.wait_time_from(limiter.clock().now());
             let retry_after_secs = wait.as_secs().saturating_add(1).clamp(1, 60);
             let path = request.uri().path().to_string();
             tracing::warn!(
@@ -1193,6 +1178,60 @@ mod tests {
         };
         let limiter = create_rate_limiter(config);
         assert!(limiter.check_key(&"127.0.0.1".to_string()).is_ok());
+    }
+
+    /// How many calls in a row a limiter built from `config` admits, on a
+    /// clock the test moves: first on a new bucket, then after `idle`.
+    fn admitted_in_a_row(config: &RateLimitConfig, idle: Duration) -> (u32, u32) {
+        use governor::clock::FakeRelativeClock;
+        let clock = FakeRelativeClock::default();
+        let limiter = RateLimiter::direct_with_clock(quota_for(config), clock.clone());
+        let drain = || {
+            let mut n = 0;
+            while limiter.check().is_ok() {
+                n += 1;
+                assert!(n < 10_000, "the limiter never refused");
+            }
+            n
+        };
+        let fresh = drain();
+        clock.advance(idle);
+        (fresh, drain())
+    }
+
+    /// A limit is a limit after a quiet spell too. A bucket left idle refills
+    /// to its burst and no further: it must not admit one extra call for
+    /// having waited. (`governor` before 0.8 did — one more than the burst
+    /// for any bucket idle past a full refill.)
+    #[test]
+    fn a_bucket_left_idle_admits_its_burst_and_no_more() {
+        for (requests, per_secs, burst) in [(60, 60, 1), (60, 60, 5), (10, 60, 20), (120, 60, 100)]
+        {
+            let config = RateLimitConfig {
+                requests,
+                per: Duration::from_secs(per_secs),
+                burst_size: burst,
+            };
+            let period = config.per / config.requests;
+            // Exactly refilled, refilled with time to spare, and idle for a day.
+            for idle in [
+                period * burst,
+                period * (burst + 1),
+                period * (burst + 50),
+                Duration::from_secs(86_400),
+            ] {
+                assert_eq!(
+                    admitted_in_a_row(&config, idle),
+                    (burst, burst),
+                    "{requests} per {per_secs}s, burst {burst}, idle {idle:?}"
+                );
+            }
+            // Half refilled: half the burst comes back, rounded down.
+            assert_eq!(
+                admitted_in_a_row(&config, period * (burst / 2)),
+                (burst, burst / 2)
+            );
+        }
     }
 
     #[tokio::test]

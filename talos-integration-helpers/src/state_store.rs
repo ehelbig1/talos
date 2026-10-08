@@ -304,6 +304,12 @@ impl<K: Eq + Hash> CreateLockMap<K> {
 /// How long [`CreateLockMap::acquire_fleet`] waits for another replica. The
 /// holder is inside one upstream API call (30 s client timeout) plus a row
 /// write, so a longer wait means a stuck holder, not a slow one.
+///
+/// A lock taken BEFORE another one (gcal's per-channel renewal lock, taken
+/// before the create lock) is held for longer than that: its holder may
+/// itself be waiting this long for the second lock, and then makes two
+/// upstream calls. A waiter that gives up here reports that it could not take
+/// the lock; it does not proceed without it.
 pub const FLEET_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// `SET LOCAL` cannot bind parameters; the value is this crate's constant,
