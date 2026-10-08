@@ -5,8 +5,12 @@
 //!
 //! The statements here are ones the handler's text rules admit (each begins
 //! with SELECT and names nothing on a deny list). They are run through the
-//! real `AdvancedRepository::execute_paginated_select`, as the superuser the
-//! controller's own pool connects as.
+//! real `AdvancedRepository::execute_paginated_select`, from a superuser
+//! pool, as the role the method enters (`QUERY_PAGINATED_ROLE`). The fixture
+//! creates that role if this cluster has none, and grants it WRITE privileges
+//! on the fixture's own schema, so that what refuses a write below is the
+//! read-only transaction and not the role (the role's own limits are
+//! `paginated_select_role.rs`).
 //!
 //! Gated on `TALOS_TEST_DATABASE_URL` (any Postgres; needs no migrations).
 //! ```sh
@@ -16,7 +20,9 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, Pool, Postgres, Row};
 use std::time::Duration;
-use talos_advanced_repository::{is_read_only_refusal, AdvancedRepository, PaginationMode};
+use talos_advanced_repository::{
+    is_read_only_refusal, AdvancedRepository, PaginationMode, QUERY_PAGINATED_ROLE,
+};
 use uuid::Uuid;
 
 fn url() -> Option<String> {
@@ -58,6 +64,23 @@ impl Fixture {
             format!(
                 "CREATE FUNCTION {schema}.write_a_row() RETURNS int LANGUAGE plpgsql AS \
                  $$ BEGIN INSERT INTO {schema}.t VALUES (99, 'written'); RETURN 1; END $$"
+            ),
+            // The role, as the migration makes it, on a cluster that has not
+            // run the migrations (this store needs none). Two tests may race
+            // to create it.
+            format!(
+                "DO $$ BEGIN CREATE ROLE {QUERY_PAGINATED_ROLE} \
+                 NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS; \
+                 EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            ),
+            format!(
+                "DO $$ BEGIN IF NOT pg_has_role(current_user, '{QUERY_PAGINATED_ROLE}', 'MEMBER') \
+                 THEN GRANT {QUERY_PAGINATED_ROLE} TO CURRENT_USER; END IF; END $$"
+            ),
+            format!("GRANT USAGE ON SCHEMA {schema} TO {QUERY_PAGINATED_ROLE}"),
+            format!("GRANT SELECT, INSERT, UPDATE ON {schema}.t TO {QUERY_PAGINATED_ROLE}"),
+            format!(
+                "GRANT USAGE, SELECT, UPDATE ON SEQUENCE {schema}.seq TO {QUERY_PAGINATED_ROLE}"
             ),
         ] {
             admin

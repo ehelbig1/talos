@@ -504,6 +504,7 @@ introduced per-org v4 per table).
 - No `CONCURRENTLY` (incompatible with sqlx transaction wrapper).
 - The `sqlx` command-line tool and the migrator the controller embeds write one `_sqlx_migrations` table: the tool is pinned to the `sqlx` version in `Cargo.lock` in `controller/Dockerfile` and in `quality.yml` (`scripts/check-sqlx-cli-pin.py`, in `make lint`), and a `sqlx` bump moves all three together (2026-10-07).
 - For row-level data migrations that may hit malformed rows, use a PL/pgSQL `FOR ... LOOP` with nested `BEGIN/EXCEPTION` per iteration — the nested block creates an implicit SAVEPOINT so one bad row doesn't abort the batch. A bare `DO $$ ... EXCEPTION WHEN others $$` at the outer level catches errors but rolls back everything, silently no-op'ing the migration.
+- A migration that creates a table or view in `public` decides whether the platform-admin `query_paginated` tool may read it: `GRANT SELECT ON public.<t> TO talos_admin_read;` in that migration, or the name added to `BLOCKED_TABLES_LIST` (`talos-admin-query-gate`). `talos-advanced-repository/tests/admin_read_role_grants.rs` fails until one is done; the role has no default privileges (2026-10-08).
 
 ## Architectural Mandate (CRITICAL)
 
