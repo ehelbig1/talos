@@ -172,3 +172,25 @@ holds**: `testcontainers-modules` 0.15.0 (the newest) requires
 `petgraph ^0.6.2`; `wasmtime` 49.0.2 is the newest and is what is locked, so
 there is no bump to move the `wasmparser` family with; `croner` 4.0.1 is the
 release that was measured; `age` 0.12.1 is unchanged.
+
+## The five, done (2026-10-08)
+
+`secrecy` (#1191), `syn` (#1192), `governor` (#1193), `base64` (#1194),
+`rand` (#1196). `scripts/survey-major-versions.py` on `main` afterwards:
+104 direct registry dependencies, 7 behind a breaking release — the held
+ones above, each re-tested against the index on 2026-10-07.
+
+Two of the five changed behaviour, deliberately:
+
+* `governor` 0.6.3 admitted one call more than the configured burst from a
+  bucket left idle past a full refill; every in-process rate limiter now
+  holds to its burst (`2026-10-07-governor-0.10.md`).
+* `rand` 0.10 made the operating system's source fallible; every key, nonce,
+  salt and token is now drawn through `talos-random`, which panics rather
+  than return an unfilled buffer, as 0.8 did implicitly
+  (`2026-10-08-rand-0.10.md`).
+
+One bump exposed a defect it did not cause: after `sqlx` 0.9 (#1189) a
+calendar-watch renewal race that had failed its test about once in a
+hundred runs failed it almost every time. Fixed in #1195
+(`2026-10-08-gcal-renewal-reads-under-a-lock.md`).
