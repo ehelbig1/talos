@@ -28,7 +28,6 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
-use rand::RngCore;
 use sqlx::{Pool, Postgres, Row};
 
 /// Rows per DELETE statement in [`SecretsManager::cleanup_audit_logs`]
@@ -592,7 +591,7 @@ impl SecretsManager {
         let provider = kek.name().to_string();
 
         let mut probe = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(probe.as_mut());
+        talos_random::fill(probe.as_mut());
 
         // Bound like a real row (RFC 0013): the path every new DEK takes.
         let probe_aad = DekRowIdentity::new(Uuid::nil(), None).bound_aad();
@@ -1004,7 +1003,7 @@ impl SecretsManager {
     /// Wrap with the active KEK provider and store opaque bytes.
     async fn create_new_dek(&self) -> Result<Uuid> {
         let mut dek_bytes = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(dek_bytes.as_mut());
+        talos_random::fill(dek_bytes.as_mut());
 
         let mut tx = self
             .db_pool
@@ -1257,7 +1256,7 @@ impl SecretsManager {
     /// the KMS round-trip does not serialise same-org provisioners.
     async fn create_new_dek_for_org(&self, org_id: Uuid) -> Result<Uuid> {
         let mut dek_bytes = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(dek_bytes.as_mut());
+        talos_random::fill(dek_bytes.as_mut());
 
         let mut tx = self
             .db_pool
@@ -3342,7 +3341,7 @@ impl SecretsManager {
     /// Generate a random 96-bit nonce for AES-GCM
     pub fn generate_nonce() -> [u8; 12] {
         let mut nonce_bytes = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        talos_random::fill(&mut nonce_bytes);
         nonce_bytes
     }
 
@@ -4683,9 +4682,8 @@ impl SecretsManager {
     ///
     /// `auditor` is an optional user ID for audit-logging who triggered the rotation.
     pub async fn rotate_dek(&self, auditor: Option<Uuid>) -> Result<Uuid> {
-        use rand::RngCore;
         let mut new_key = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(new_key.as_mut());
+        talos_random::fill(new_key.as_mut());
 
         let mut tx = self
             .db_pool
@@ -4832,7 +4830,7 @@ impl SecretsManager {
         }
 
         let mut new_key = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(new_key.as_mut());
+        talos_random::fill(new_key.as_mut());
 
         let mut tx = self
             .db_pool

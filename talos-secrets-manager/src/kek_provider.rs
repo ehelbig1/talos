@@ -40,7 +40,6 @@ use std::sync::Arc;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anyhow::{anyhow, Context, Result};
-use rand::RngCore;
 use zeroize::Zeroizing;
 
 /// Pluggable wrap / unwrap surface for the KEK that protects DEKs.
@@ -201,7 +200,7 @@ impl KekProvider for EnvKekProvider {
             let cipher = Aes256Gcm::new_from_slice(&self.master_key)
                 .context("Failed to construct master cipher")?;
             let mut nonce_bytes = [0u8; 12];
-            rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+            talos_random::fill(&mut nonce_bytes);
             // An empty `aad` authenticates nothing extra, so the output is
             // byte-identical to the pre-RFC-0013 `encrypt(nonce, dek)`.
             let ciphertext = cipher

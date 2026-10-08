@@ -1572,10 +1572,8 @@ impl AuthService {
             // Generate cryptographically secure random token (32 bytes = 256 bits).
             // Use OsRng directly — explicit, auditable, and bypasses any potential
             // thread-local seeding concerns with thread_rng().
-            use rand::RngCore;
-            let mut rng = rand::rngs::OsRng;
             let mut token_bytes = [0u8; 32];
-            rng.fill_bytes(&mut token_bytes);
+            talos_random::fill(&mut token_bytes);
             let refresh_token = zeroize::Zeroizing::new(hex::encode(token_bytes));
 
             // Generate lookup hash for fast queries (not for security, just for efficient lookups)

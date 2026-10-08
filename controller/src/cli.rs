@@ -223,9 +223,8 @@ pub(crate) async fn run_worker_provisioning_token_cli(
             // 32 bytes of OS entropy, hex-encoded, prefixed for greppability.
             // Only the SHA-256 of this string is persisted.
             let raw_token = {
-                use rand::RngCore;
                 let mut buf = [0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut buf);
+                talos_random::fill(&mut buf);
                 format!("wpt_{}", hex::encode(buf))
             };
             let expires_at = chrono::Utc::now() + chrono::Duration::hours(ttl_hours);

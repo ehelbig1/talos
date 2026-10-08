@@ -1,0 +1,17 @@
+[package]
+name = "talos-random"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The one place bytes are drawn from the operating system's random source for
+# a key, a nonce or a token, so what happens when the source fails is decided
+# once and not at fifty call sites. A leaf: `rand` and nothing else.
+
+[dependencies]
+rand = { workspace = true, features = ["std", "sys_rng"] }
+
+[lints]
+workspace = true

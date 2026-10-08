@@ -186,7 +186,6 @@ impl wit_crypto::Host for TalosContext {
 
     async fn random_bytes(&mut self, length: u32) -> Vec<u8> {
         self.host_call("crypto::random-bytes");
-        use rand::RngCore;
         const MAX_RANDOM_BYTES: u32 = 1_000_000; // 1 MB — prevents host memory exhaustion
         if length > MAX_RANDOM_BYTES {
             tracing::warn!(
@@ -211,7 +210,7 @@ impl wit_crypto::Host for TalosContext {
         // upgrade. Matches the convention already established in
         // talos-auth (refresh tokens) and talos-csrf (CSRF tokens) /
         // talos-api (mcp agent tokens).
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        talos_random::fill(&mut bytes);
         bytes
     }
 

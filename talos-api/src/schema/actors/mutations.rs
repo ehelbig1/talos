@@ -96,9 +96,8 @@ impl ActorsMutations {
         })?;
 
         // Generate a secure random token via OS entropy
-        use rand::RngCore;
         let mut token_bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+        talos_random::fill(&mut token_bytes);
         let token = format!("talos_mcp_{}", hex::encode(token_bytes));
 
         // Hash for storage (bcrypt) and lookup (SHA-256)

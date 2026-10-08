@@ -71,7 +71,7 @@ mod test_crypto {
                 // Random 12-byte nonce, prepended to the ciphertext so decrypt
                 // can recover it. Same on-wire shape the production cipher uses.
                 let mut nonce_bytes = [0u8; 12];
-                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
+                talos_random::fill(&mut nonce_bytes);
                 let ct = cipher
                     .encrypt(
                         &Nonce::from(nonce_bytes),

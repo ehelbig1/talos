@@ -12,7 +12,7 @@ use aes_gcm::{
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use rand::{Rng, RngCore};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -871,9 +871,8 @@ pub fn parse_ed25519_signing_key_hex(hex_str: &str) -> Result<DispatchSigningKey
 /// a key is 32 random bytes, so this draws them and builds the key from them.
 #[must_use]
 pub fn generate_dispatch_signing_key() -> DispatchSigningKey {
-    use rand::RngCore as _;
     let mut seed = zeroize::Zeroizing::new([0u8; 32]);
-    rand::rngs::OsRng.fill_bytes(seed.as_mut());
+    talos_random::fill(seed.as_mut());
     DispatchSigningKey::from_bytes(&seed)
 }
 
@@ -1526,7 +1525,7 @@ trait SignedMessage {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| format!("system time error: {e}"))?
             .as_secs();
-        let rand_bytes: [u8; 16] = rand::thread_rng().gen();
+        let rand_bytes: [u8; 16] = rand::rng().random();
         self.set_nonce(format!("{}:{}", ts, hex::encode(rand_bytes)));
 
         let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key)
@@ -1651,7 +1650,7 @@ trait SignedMessage {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| format!("system time error: {e}"))?
             .as_secs();
-        let rand_bytes: [u8; 16] = rand::thread_rng().gen();
+        let rand_bytes: [u8; 16] = rand::rng().random();
         self.set_nonce(format!("{}:{}", ts, hex::encode(rand_bytes)));
         let sig = signing_key.sign(&self.ed25519_signing_input());
         self.set_signature(sig.to_bytes().to_vec());
@@ -3881,7 +3880,7 @@ impl EncryptedSecrets {
         // workspace-wide makes audit easier and removes the ChaCha-12
         // birthday-bound footnote from this primitive.
         let mut nonce_bytes = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        talos_random::fill(&mut nonce_bytes);
         let nonce = &Nonce::from(nonce_bytes);
 
         let ciphertext = cipher
@@ -11694,7 +11693,7 @@ mod protocol_review_2026_09_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_secs();
-        let r: [u8; 16] = rand::thread_rng().gen();
+        let r: [u8; 16] = rand::rng().random();
         format!("{ts}:{}", hex::encode(r))
     }
 

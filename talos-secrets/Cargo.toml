@@ -21,7 +21,7 @@ talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 # L-13 (2026-05-22): random slot-handle allocation. Defense-in-depth
 # against guest enumeration of adjacent slot IDs; see
 # `fresh_slot_handle` in `talos_vault.rs`.
-rand = { workspace = true, features = ["std", "getrandom"] }
+talos-random = { path = "../talos-random" }
 
 [dev-dependencies]
 # capture test over the real AuditingProvider log lines (check 91's behavioural half)

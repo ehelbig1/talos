@@ -522,11 +522,9 @@ impl TotpService {
 
     /// Generate a new TOTP secret for a user
     pub fn generate_secret(&self) -> String {
-        use rand::RngCore;
-
         // Generate 20 random bytes for the secret (160 bits) via OS entropy
         let mut bytes = [0u8; 20];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        talos_random::fill(&mut bytes);
 
         // Encode as base32
         Secret::from(bytes).to_base32().to_string()
@@ -536,11 +534,10 @@ impl TotpService {
     /// Using hex rather than decimal avoids collisions from the birthday paradox at
     /// lower digit counts and matches standard backup-code entropy recommendations.
     pub fn generate_backup_codes(&self) -> Vec<String> {
-        use rand::RngCore;
         (0..10)
             .map(|_| {
                 let mut bytes = [0u8; 6];
-                rand::rngs::OsRng.fill_bytes(&mut bytes);
+                talos_random::fill(&mut bytes);
                 hex::encode(bytes) // 12 lowercase hex chars, 48 bits of entropy
             })
             .collect()

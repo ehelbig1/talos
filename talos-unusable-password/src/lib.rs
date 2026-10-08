@@ -22,7 +22,6 @@
 //! sentinel's hash; [`is_reserved_password`] names the one password that
 //! verifies against them, and every password check refuses it.
 
-use rand::RngCore;
 use zeroize::Zeroizing;
 
 /// The literal whose bcrypt hash OAuth sign-ups stored until 2026-09-18.
@@ -40,7 +39,7 @@ const SEED_BYTES: usize = 32;
 /// Only if bcrypt rejects `cost` (outside 4..=31).
 pub fn unusable_password_hash(cost: u32) -> Result<String, bcrypt::BcryptError> {
     let mut seed = Zeroizing::new([0u8; SEED_BYTES]);
-    rand::rngs::OsRng.fill_bytes(seed.as_mut());
+    talos_random::fill(seed.as_mut());
     let mut hex = Zeroizing::new(String::with_capacity(SEED_BYTES * 2));
     for b in seed.iter() {
         hex.push(char::from(HEX[usize::from(b >> 4)]));

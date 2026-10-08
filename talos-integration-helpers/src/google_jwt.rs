@@ -743,7 +743,7 @@ mod tests {
     /// ready to use.
     fn keypair() -> (EncodingKey, DecodingKey, String) {
         // 2048-bit RSA; deterministic random isn't needed for tests.
-        let priv_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let priv_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let pub_key = RsaPublicKey::from(&priv_key);
         let priv_pem = priv_key.to_pkcs1_pem(Default::default()).unwrap();
         let pub_pem = pub_key.to_public_key_pem(Default::default()).unwrap();
@@ -1350,7 +1350,7 @@ mod tests {
     }
 
     fn keypair_with_public() -> (EncodingKey, RsaPublicKey) {
-        let priv_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let priv_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let pub_key = RsaPublicKey::from(&priv_key);
         let pem = priv_key.to_pkcs1_pem(Default::default()).unwrap();
         (EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(), pub_key)

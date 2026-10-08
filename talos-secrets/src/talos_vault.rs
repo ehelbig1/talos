@@ -1,5 +1,4 @@
 use dashmap::DashMap;
-use rand::{rngs::OsRng, RngCore};
 use std::collections::HashMap;
 use std::time::Instant;
 use zeroize::Zeroizing;
@@ -93,7 +92,7 @@ pub struct TalosVaultProvider {
 /// code path.
 fn fresh_slot_handle() -> SlotHandle {
     let mut buf = [0u8; 8];
-    OsRng.fill_bytes(&mut buf);
+    talos_random::fill(&mut buf);
     let v = u64::from_le_bytes(buf) & 0x7FFF_FFFF_FFFF_FFFF;
     // Make sure we never return 0 — some downstream code uses 0 as a
     // sentinel "no slot" value. Probability of hitting 0 is ~1e-19.

@@ -13,7 +13,7 @@ async-trait.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 hex.workspace = true
-rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde_json.workspace = true
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }

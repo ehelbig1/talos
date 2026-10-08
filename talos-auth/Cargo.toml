@@ -31,7 +31,7 @@ jsonwebtoken = { workspace = true, features = ["rust_crypto", "use_pem"] }
 regex.workspace = true
 sha2.workspace = true
 hex.workspace = true
-rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
 talos-redis = { path = "../talos-redis" }

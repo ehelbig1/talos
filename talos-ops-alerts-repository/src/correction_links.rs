@@ -42,7 +42,6 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rand::RngCore;
 use sqlx::Row;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -67,7 +66,7 @@ pub struct CorrectionTokenContext {
 
 fn new_raw_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    talos_random::fill(&mut bytes);
     hex::encode(bytes)
 }
 

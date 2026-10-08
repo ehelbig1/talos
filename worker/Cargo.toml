@@ -53,7 +53,7 @@ hex.workspace = true
 subtle.workspace = true
 
 # Random number generation (secret-claim nonces, self-register jitter)
-rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 
 # Redis (OCI module cache wiring in main.rs)
 redis = { workspace = true, features = ["default", "tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }  # rustls for rediss:// (Upstash, ElastiCache TLS)

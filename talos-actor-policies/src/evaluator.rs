@@ -501,9 +501,8 @@ impl PolicyEvaluator {
         // silently degrade THIS one path while leaving the sibling
         // sites secure. Same N-inline-copies-with-subtle-drift class
         // as MCP-1037..1053; smaller blast radius.
-        use rand::RngCore;
         let mut token_bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+        talos_random::fill(&mut token_bytes);
         let token = hex::encode(token_bytes);
 
         let title = format!("Actor policy block: {}", policy.trigger.label());

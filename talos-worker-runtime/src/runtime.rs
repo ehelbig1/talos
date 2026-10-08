@@ -1626,9 +1626,8 @@ fn aot_key_ring() -> &'static AotKeyRing {
         } else if is_prod {
             panic!("CRITICAL: TALOS_AOT_HMAC_KEY must be set in production.");
         } else {
-            use rand::RngCore;
             let mut key = vec![0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut key);
+            talos_random::fill(&mut key);
             tracing::warn!(
                 "TALOS_AOT_HMAC_KEY is not set — using an ephemeral random key. \
                  Set TALOS_AOT_HMAC_KEY for stable AOT caching across restarts."

@@ -178,7 +178,7 @@ async fn fake_github(codes: &[(&str, &str)], visible: &[(&str, &[i64])]) -> Fake
 
 fn service(pool: &sqlx::PgPool, gh: &FakeGithub) -> GithubConnectService {
     use rsa::pkcs8::{EncodePrivateKey, LineEnding};
-    let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let pem = key.to_pkcs8_pem(LineEnding::LF).unwrap();
     let signing = AppSigningKey::from_pem(pem.as_str()).unwrap();
     let app = GithubAppClient::with_base(signing, "4242", &gh.base).unwrap();

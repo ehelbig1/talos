@@ -16,7 +16,7 @@ async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
 hkdf.workspace = true
-rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 rhai = { workspace = true, features = ["serde"] }

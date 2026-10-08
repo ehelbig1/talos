@@ -72,8 +72,7 @@ talos-metrics = { path = "../talos-metrics" }
 # rsa::* directly. jsonwebtoken is test-only now that the verifier kernel
 # lives in talos-integration-helpers.
 jsonwebtoken = { workspace = true, features = ["rust_crypto", "use_pem"] }
-rand = { workspace = true, features = ["default"] }
-rsa = { workspace = true, features = ["pem"] }
+rsa = { workspace = true, features = ["pem", "getrandom"] }
 # Enable the helpers `test-util` feature so pubsub_jwt's wrapper tests can
 # call GoogleOidcVerifier::with_keys_for_test (gated cross-crate behind
 # that feature).

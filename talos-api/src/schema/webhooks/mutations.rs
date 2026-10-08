@@ -225,9 +225,8 @@ impl WebhooksMutations {
 
         // Generate verification token if not provided
         let verification_token = input.verification_token.unwrap_or_else(|| {
-            use rand::RngCore;
             let mut random_bytes = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut random_bytes);
+            talos_random::fill(&mut random_bytes);
             hex::encode(random_bytes)
         });
 

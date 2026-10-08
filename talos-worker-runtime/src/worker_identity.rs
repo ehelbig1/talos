@@ -98,9 +98,8 @@ fn resolve_worker_id() -> String {
     }
 
     // 3. Random fallback — dev / CI containers without HOSTNAME.
-    use rand::RngCore;
     let mut buf = [0u8; 8];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    talos_random::fill(&mut buf);
     let id = format!("fallback-{}", hex::encode(buf));
     tracing::warn!(
         worker_id = %id,

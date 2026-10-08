@@ -531,8 +531,7 @@ impl VaultTransitProvider {
         // named key exists. Use random bytes so we don't accidentally
         // leak a known fingerprint into Vault audit logs.
         let mut probe = [0u8; 32];
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut probe);
+        talos_random::fill(&mut probe);
         // Bound like a real row (RFC 0013), so the probe exercises transit's
         // `associated_data` path — the one every new DEK now takes.
         let probe_aad = crate::dek_wrap::DekRowIdentity::new(uuid::Uuid::nil(), None).bound_aad();

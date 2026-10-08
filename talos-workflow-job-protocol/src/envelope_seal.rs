@@ -41,7 +41,6 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
@@ -148,7 +147,7 @@ pub fn seal_secrets(
 
     let aad = seal_aad(exec_id, worker_id, epk_w);
     let mut nonce_bytes = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    talos_random::fill(&mut nonce_bytes);
 
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "invalid AES key".to_string())?;
     let ciphertext = cipher
@@ -299,7 +298,7 @@ impl SecretClaim {
     ) -> Self {
         use ed25519_dalek::Signer;
         let mut nonce_raw = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_raw);
+        talos_random::fill(&mut nonce_raw);
         let claim_nonce = hex::encode(nonce_raw);
         let issued_at_ms = now_ms();
         let bytes = secret_claim_signing_bytes(

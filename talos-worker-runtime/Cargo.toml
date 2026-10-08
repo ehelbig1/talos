@@ -93,6 +93,7 @@ subtle.workspace = true
 
 # Random number generation
 rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 
 # Date/time operations
 chrono = { workspace = true, features = ["serde"] }

@@ -34,6 +34,7 @@ uuid = { workspace = true, features = ["serde", "v4"] }
 # Encryption and signing (for secure secret transport and job authentication)
 aes-gcm.workspace = true
 rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random", version = "0.1.0" }
 hex.workspace = true
 hmac.workspace = true
 sha2.workspace = true

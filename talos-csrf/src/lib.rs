@@ -3,7 +3,6 @@ use axum::{
     http::{Method, Request, Response, StatusCode},
     middleware::Next,
 };
-use rand::RngCore;
 use tower_cookies::{Cookie, Cookies};
 
 use dashmap::DashMap;
@@ -173,7 +172,7 @@ fn prune_grace_cache() {
 /// Generate a cryptographically secure random CSRF token
 pub fn generate_csrf_token() -> String {
     let mut token_bytes = vec![0u8; CSRF_TOKEN_LENGTH];
-    rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+    talos_random::fill(&mut token_bytes);
     hex::encode(token_bytes)
 }
 

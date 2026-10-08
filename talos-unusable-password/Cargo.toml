@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 bcrypt.workspace = true
-rand = { workspace = true, features = ["default", "std"] }
+talos-random = { path = "../talos-random" }
 zeroize.workspace = true
 
 [lints]

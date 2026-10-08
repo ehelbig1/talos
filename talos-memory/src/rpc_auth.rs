@@ -1055,9 +1055,8 @@ pub fn verify(subject: &str, actor_id: Uuid, nonce: &str, body: &[u8], signature
 /// difference is in nanoseconds and `OsRng` removes any ambiguity
 /// about whether the per-thread PRNG was reseeded recently enough.
 pub fn random_nonce() -> String {
-    use rand::RngCore;
     let mut bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    talos_random::fill(&mut bytes);
 
     // Pre-allocate the exact output length (32 hex chars) and write
     // each byte as two lowercase hex chars without per-byte heap

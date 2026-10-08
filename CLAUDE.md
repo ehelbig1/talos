@@ -391,6 +391,7 @@ introduced per-org v4 per table).
 - ALWAYS use parameterized queries (sqlx `$1` bind params). Never string-concatenate SQL.
 - A SQL string that is not a literal is wrapped in `sqlx::AssertSqlSafe` with a `// sql-safe: <what varies in it>` comment on or directly above the line (`scripts/check-sql-safe-reasons.py`, in `make lint`; test code is exempt). Prefer a literal with binds; a helper that formats an argument into SQL takes `&'static str` (2026-10-07).
 - ALWAYS use constant-time comparison for security-sensitive values (tokens, HMAC, CSRF).
+- Bytes for a key, nonce, salt or bearer token come from `talos_random::fill` / `talos_random::bytes` (the operating system's source; it panics rather than return an unfilled buffer), not from the `rand` crate directly (2026-10-08).
 - ALWAYS set HttpOnly, Secure, SameSite=Strict on authentication cookies.
 - ALWAYS validate and sanitize external input at API boundaries.
 - ALWAYS cap resource consumption (timeouts, memory limits, rate limits) for untrusted inputs.
