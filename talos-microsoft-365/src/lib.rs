@@ -40,26 +40,23 @@ pub const SCOPES: &[&str] = &["offline_access", "User.Read", "Mail.Read", "Calen
 /// The scopes a connection is useless without: at least one must be granted.
 const READING_SCOPES: &[&str] = &["Mail.Read", "Calendars.Read"];
 
-/// The Entra ID tenant the endpoints are under. `common` admits any work or
-/// school account and personal Microsoft accounts.
-fn tenant() -> &'static str {
-    "common"
+/// The endpoints under `MICROSOFT_365_TENANT` (`talos_oauth` resolves it, so
+/// the connect here and the refresh there hit the same one). Built once:
+/// `AuthorizeRequest` wants a `&'static str` and the tenant is part of the
+/// path. `None` when the variable names no tenant; no connect can start then.
+static AUTH_URL: LazyLock<Option<String>> =
+    LazyLock::new(|| endpoint(talos_oauth::microsoft_365_authorize_url()));
+static TOKEN_URL: LazyLock<Option<String>> =
+    LazyLock::new(|| endpoint(talos_oauth::microsoft_365_token_url()));
+
+fn endpoint(url: Result<String>) -> Option<String> {
+    url.map_err(|e| tracing::error!("Microsoft 365 connect is unavailable: {e}"))
+        .ok()
 }
 
-/// Built once: `AuthorizeRequest` wants a `&'static str` and the tenant is
-/// part of the path.
-static AUTH_URL: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize",
-        tenant()
-    )
-});
-static TOKEN_URL: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
-        tenant()
-    )
-});
+fn no_tenant() -> anyhow::Error {
+    anyhow!("MICROSOFT_365_TENANT names no tenant")
+}
 /// Answers "which account is this?" for the token just issued.
 const ACCOUNT_URL: &str = "https://graph.microsoft.com/v1.0/me?$select=id,userPrincipalName,mail";
 
@@ -96,7 +93,8 @@ pub struct Microsoft365Service {
     client_secret: Option<String>,
     redirect_uri: String,
     credentials_service: Option<Arc<OAuthCredentialService>>,
-    token_url: String,
+    /// `None` when `MICROSOFT_365_TENANT` names no tenant.
+    token_url: Option<String>,
     account_url: String,
 }
 
@@ -163,14 +161,18 @@ impl Microsoft365Service {
             client_secret: client.map(|(_, secret)| secret.to_string()),
             redirect_uri: DEFAULT_REDIRECT_URI.to_string(),
             credentials_service: None,
-            token_url: token_url.to_string(),
+            token_url: Some(token_url.to_string()),
             account_url: account_url.to_string(),
         }
     }
 
-    /// Whether the OAuth client is configured.
+    /// Whether the OAuth client is configured and `MICROSOFT_365_TENANT`, if
+    /// set, names a tenant.
     pub fn is_configured(&self) -> bool {
-        self.client_id.is_some() && self.client_secret.is_some()
+        self.client_id.is_some()
+            && self.client_secret.is_some()
+            && AUTH_URL.is_some()
+            && self.token_url.is_some()
     }
 
     /// The authorize URL for `user_id`, with the state bound to that user and
@@ -263,8 +265,8 @@ impl talos_oauth::OAuthIntegration for Microsoft365Service {
     fn authorize_request(&self) -> Result<talos_oauth::AuthorizeRequest<'static>> {
         Ok(talos_oauth::AuthorizeRequest {
             provider: PROVIDER,
-            auth_url: AUTH_URL.as_str(),
-            token_url: TOKEN_URL.as_str(),
+            auth_url: AUTH_URL.as_deref().ok_or_else(no_tenant)?,
+            token_url: TOKEN_URL.as_deref().ok_or_else(no_tenant)?,
             client_id: self
                 .client_id
                 .clone()
@@ -315,7 +317,7 @@ impl talos_oauth::OAuthIntegration for Microsoft365Service {
             form.push(("code_verifier", verifier));
         }
         let resp = HTTP
-            .post(&self.token_url)
+            .post(self.token_url.as_deref().ok_or_else(no_tenant)?)
             .form(&form)
             .send()
             .await
@@ -507,7 +509,10 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused@127.0.0.1:1/unused")
             .expect("lazy pool");
-        Microsoft365Service::for_tests(pool, client, &TOKEN_URL, ACCOUNT_URL)
+        let token_url = TOKEN_URL
+            .as_deref()
+            .expect("MICROSOFT_365_TENANT is unset in tests");
+        Microsoft365Service::for_tests(pool, client, token_url, ACCOUNT_URL)
     }
 
     #[tokio::test]
@@ -522,8 +527,8 @@ mod tests {
             req.redirect_uri,
             "http://localhost:8000/api/microsoft-365/callback"
         );
-        assert_eq!(req.auth_url, AUTH_URL.as_str());
-        assert_eq!(req.token_url, TOKEN_URL.as_str());
+        assert_eq!(Some(req.auth_url), AUTH_URL.as_deref());
+        assert_eq!(Some(req.token_url), TOKEN_URL.as_deref());
         assert_eq!(req.extra_params, &[("prompt", "select_account")]);
     }
 
@@ -543,12 +548,13 @@ mod tests {
 
     #[test]
     fn the_endpoints_are_under_the_tenant() {
+        // `MICROSOFT_365_TENANT` is unset here; `talos_oauth` tests the override.
         assert_eq!(
-            AUTH_URL.as_str(),
+            AUTH_URL.as_deref().unwrap(),
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
         );
         assert_eq!(
-            TOKEN_URL.as_str(),
+            TOKEN_URL.as_deref().unwrap(),
             "https://login.microsoftonline.com/common/oauth2/v2.0/token"
         );
     }
@@ -612,7 +618,11 @@ mod tests {
     /// Fails until the provider's real endpoints replace the scaffold's.
     #[test]
     fn the_provider_endpoints_were_filled_in() {
-        for url in [AUTH_URL.as_str(), TOKEN_URL.as_str(), ACCOUNT_URL] {
+        for url in [
+            AUTH_URL.as_deref().unwrap(),
+            TOKEN_URL.as_deref().unwrap(),
+            ACCOUNT_URL,
+        ] {
             assert!(
                 url.starts_with("https://") && !url.contains("provider.example"),
                 "{url} is still the scaffold's placeholder"
