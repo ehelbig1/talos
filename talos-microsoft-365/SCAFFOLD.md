@@ -38,7 +38,7 @@ is the smallest finished example of every step below.
 
 ## Settings page
 
-- [ ] `talos-integrations/src/provider_config.rs`: a `PROVIDERS` entry
+- [x] `talos-integrations/src/provider_config.rs`: a `PROVIDERS` entry
       (`id: "microsoft-365"`, `graphql_enum: "MICROSOFT_365"`,
       `db_table: "microsoft_365_integrations"`,
       `account_identifier_column: "COALESCE(t.account_label, 'Microsoft 365')"`,
@@ -48,11 +48,11 @@ is the smallest finished example of every step below.
       `env_vars: &["MICROSOFT_365_CLIENT_ID", "MICROSOFT_365_CLIENT_SECRET"]`,
       `redirect_path: "/api/microsoft-365/callback"`).
       `list_connections` and the generic disconnect work from this entry.
-- [ ] `talos-api/src/schema/types.rs`: a `Microsoft365` variant on
+- [x] `talos-api/src/schema/types.rs`: a `Microsoft365` variant on
       `IntegrationService`, with its arms in `platform/queries.rs`
       (`"MICROSOFT_365" => IntegrationService::Microsoft365`) and
       `platform/mutations.rs`.
-- [ ] `cd frontend && npm run codegen` and commit `schema.graphql` and
+- [x] `cd frontend && npm run codegen` and commit `schema.graphql` and
       `src/generated/*`.
 
 ## Configuration (lints 89 and 97 fail until these exist)

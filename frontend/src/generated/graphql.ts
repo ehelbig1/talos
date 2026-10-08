@@ -92,6 +92,7 @@ export type IntegrationService =
   | "GOOGLE_CLOUD"
   | "GOOGLE_HEALTH"
   | "JIRA"
+  | "MICROSOFT_365"
   | "PLAID"
   | "SLACK";
 

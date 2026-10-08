@@ -283,6 +283,28 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         account_email_column: Some("account_email"),
     },
     IntegrationProviderConfig {
+        id: "microsoft-365",
+        display_name: "Microsoft 365",
+        description: "Read Outlook mail and calendar from a work or school account",
+        icon: "Building2",
+        color: "#0078D4",
+        graphql_enum: "MICROSOFT_365",
+        oauth_hosts: &["login.microsoftonline.com"],
+        env_vars: &["MICROSOFT_365_CLIENT_ID", "MICROSOFT_365_CLIENT_SECRET"],
+        redirect_path: "/api/microsoft-365/callback",
+        db_table: "microsoft_365_integrations",
+        // No join: alias `t`, and never NULL (see google-health above).
+        account_identifier_column: "COALESCE(t.account_label, 'Microsoft 365')",
+        account_identifier_join: None,
+        extra_where: "AND t.is_active = true",
+        disconnect_is_soft_delete: true,
+        provider_key_column: "provider_key",
+        credential_provider: "microsoft_365",
+        tier_column: None,
+        // Not a Google grant: nothing relates it to another connection.
+        account_email_column: None,
+    },
+    IntegrationProviderConfig {
         id: PLAID_PROVIDER_ID,
         display_name: "Bank accounts",
         description:
@@ -387,7 +409,7 @@ mod tests {
                 "{id} has no account_email_column"
             );
         }
-        for id in ["slack", "atlassian"] {
+        for id in ["slack", "atlassian", "microsoft-365"] {
             let p = PROVIDERS.iter().find(|p| p.id == id).expect(id);
             assert!(p.account_email_column.is_none(), "{id}");
         }
@@ -416,6 +438,34 @@ mod tests {
             Some("google_health")
         );
         assert_eq!(p.redirect_path, "/api/google-health/callback");
+    }
+
+    /// The same for Microsoft 365, whose tokens are stored under
+    /// `microsoft_365` and whose rows key them by `provider_key`.
+    #[test]
+    fn microsoft_365_is_listed_and_revoked_by_the_generic_paths() {
+        let p = PROVIDERS
+            .iter()
+            .find(|p| p.id == "microsoft-365")
+            .expect("microsoft-365 provider must exist");
+        assert_eq!(p.graphql_enum, "MICROSOFT_365");
+        assert_eq!(p.db_table, "microsoft_365_integrations");
+        assert!(p.account_identifier_join.is_none());
+        assert!(
+            p.account_identifier_column
+                .to_uppercase()
+                .starts_with("COALESCE(T."),
+            "{}",
+            p.account_identifier_column
+        );
+        assert!(p.disconnect_is_soft_delete && p.extra_where.contains("t.is_active = true"));
+        assert_eq!(p.provider_key_column, "provider_key");
+        assert_eq!(
+            revoke_provider_for(p, None).as_deref(),
+            Some("microsoft_365")
+        );
+        assert_eq!(p.redirect_path, "/api/microsoft-365/callback");
+        assert_eq!(p.oauth_hosts, &["login.microsoftonline.com"]);
     }
 
     /// GCP tier → OAuth provider string must match

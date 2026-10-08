@@ -3,6 +3,7 @@
  */
 
 import {
+  Building2,
   Calendar,
   HeartPulse,
   Landmark,
@@ -36,6 +37,7 @@ export interface GithubInstallation {
 
 /** Maps an icon name string from the API to the corresponding Lucide component. */
 const ICON_MAP: Record<string, LucideIcon> = {
+  Building2,
   Calendar,
   HeartPulse,
   Landmark,
