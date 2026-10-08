@@ -386,88 +386,38 @@ mod memory_set_error_tests {
 /// the AST. The `talos_guest` role-wrap (M-2) is the fence for that
 /// case.
 fn controller_side_denied_function(stmt: &sqlparser::ast::Statement) -> Option<String> {
-    use sqlparser::ast::{Expr, ObjectName, TableFactor, Visit, Visitor};
     use std::ops::ControlFlow;
+    use talos_sql_classify::CalledFunction;
 
-    fn check_object_name(name: &ObjectName) -> Option<String> {
-        // From sqlparser 0.54 a name part is an identifier or (in other
-        // dialects) a function that computes one. A name this list cannot
-        // read is not a name it can clear: refuse it.
-        let Some(segments) = name
-            .0
-            .iter()
-            .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
-            .collect::<Option<Vec<&str>>>()
-        else {
-            return Some(name.to_string().to_ascii_lowercase());
+    fn denied(call: &CalledFunction<'_>) -> Option<String> {
+        let parts = match call {
+            CalledFunction::Named(parts) => parts,
+            // A name this list cannot read is not a name it can clear:
+            // refuse it.
+            CalledFunction::Unreadable(_) => return Some(call.spelled()),
+            // `XMLTABLE(…)` has its own syntax and, from sqlparser 0.63, its
+            // own node — no name to look up.
+            CalledFunction::Syntax(name) => {
+                return talos_workflow_job_protocol::is_disallowed_sql_function(name)
+                    .then(|| (*name).to_string())
+            }
         };
-        match segments.as_slice() {
-            [bare] => {
-                if talos_workflow_job_protocol::is_disallowed_sql_function(bare) {
-                    Some(bare.to_ascii_lowercase())
-                } else {
-                    None
-                }
-            }
-            [schema, fn_name] => {
-                if schema.eq_ignore_ascii_case("pg_catalog")
-                    && talos_workflow_job_protocol::is_disallowed_sql_function(fn_name)
-                {
-                    Some(format!("pg_catalog.{}", fn_name.to_ascii_lowercase()))
-                } else {
-                    None
-                }
-            }
+        match parts.as_slice() {
+            [bare] => talos_workflow_job_protocol::is_disallowed_sql_function(&bare.value)
+                .then(|| bare.value.to_ascii_lowercase()),
+            [schema, fn_name] => (schema.value.eq_ignore_ascii_case("pg_catalog")
+                && talos_workflow_job_protocol::is_disallowed_sql_function(&fn_name.value))
+            .then(|| format!("pg_catalog.{}", fn_name.value.to_ascii_lowercase())),
             _ => None,
         }
     }
 
-    struct DenyVisitor;
-    impl Visitor for DenyVisitor {
-        type Break = String;
-        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-            if let Expr::Function(func) = expr {
-                if let Some(name) = check_object_name(&func.name) {
-                    return ControlFlow::Break(name);
-                }
-            }
-            ControlFlow::Continue(())
-        }
-
-        // FROM-clause set-returning function calls (`SELECT * FROM
-        // dblink(...)`) parse as TableFactor, NOT Expr::Function.
-        // Sibling-mirror to `worker::sql_validator::check_disallowed_functions`.
-        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<Self::Break> {
-            match tf {
-                TableFactor::Table {
-                    name,
-                    args: Some(_),
-                    ..
-                } => {
-                    if let Some(denied) = check_object_name(name) {
-                        return ControlFlow::Break(denied);
-                    }
-                }
-                TableFactor::Function { name, .. } => {
-                    if let Some(denied) = check_object_name(name) {
-                        return ControlFlow::Break(denied);
-                    }
-                }
-                // `XMLTABLE(…)` has its own syntax and, from sqlparser 0.63,
-                // its own node — no name to look up. 0.53 could not parse it
-                // at all, which is the only reason it was refused.
-                TableFactor::XmlTable { .. }
-                    if talos_workflow_job_protocol::is_disallowed_sql_function("xmltable") =>
-                {
-                    return ControlFlow::Break("xmltable".to_string());
-                }
-                _ => {}
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
-    match stmt.visit(&mut DenyVisitor) {
+    // The walk is `talos_sql_classify::try_for_each_called_function`, the
+    // one the worker's validator asks too.
+    match talos_sql_classify::try_for_each_called_function(stmt, |call| match denied(&call) {
+        Some(name) => ControlFlow::Break(name),
+        None => ControlFlow::Continue(()),
+    }) {
         ControlFlow::Break(name) => Some(name),
         ControlFlow::Continue(()) => None,
     }

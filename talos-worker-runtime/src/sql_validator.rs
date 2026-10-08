@@ -10,7 +10,7 @@
 //!
 //! If parsing fails, the query is rejected (fail-closed).
 
-use sqlparser::ast::{self, Statement, Visit, Visitor};
+use sqlparser::ast::{self, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::fmt;
@@ -535,73 +535,17 @@ fn enforce_cte_mutation_policy(
 /// against a 100-line SELECT (deeply-nested CASE WHEN) is ~5-20 µs,
 /// well below the 30 s `statement_timeout`.
 fn check_disallowed_functions(stmt: &Statement) -> Result<(), SqlValidationError> {
-    struct FunctionDenyVisitor;
-
-    impl Visitor for FunctionDenyVisitor {
-        type Break = String;
-
-        fn pre_visit_expr(&mut self, expr: &ast::Expr) -> ControlFlow<Self::Break> {
-            if let ast::Expr::Function(func) = expr {
-                if let Some(name) = denied_function_name(&func.name) {
-                    return ControlFlow::Break(name);
-                }
-            }
-            ControlFlow::Continue(())
+    // The walk is `talos_sql_classify::try_for_each_called_function`, shared
+    // with the controller's re-parse: a call in an expression, a
+    // set-returning function in FROM (`FROM dblink(…)`), the nameless table
+    // factors (`XMLTABLE`), and calls held outside an expression.
+    let walk = talos_sql_classify::try_for_each_called_function(stmt, |call| {
+        match denied_function_name(&call) {
+            Some(name) => ControlFlow::Break(name),
+            None => ControlFlow::Continue(()),
         }
-
-        /// `dblink(...)` and other set-returning function calls in a
-        /// FROM clause (`SELECT * FROM dblink('...', '...')`) parse
-        /// as `TableFactor`, NOT `Expr::Function`. The Expr-only
-        /// visitor would miss them — pre-fix, the dblink test fired
-        /// here. Two variants to catch:
-        ///
-        ///   * `TableFactor::Table { name, args: Some(_), .. }` —
-        ///     PostgreSQL set-returning function used in FROM
-        ///     (`FROM generate_series(1,10)`, `FROM dblink(...)`).
-        ///     The `args.is_some()` discriminator distinguishes a
-        ///     table-valued function call from a plain table read;
-        ///     plain `FROM users` has `args = None`. This is the
-        ///     critical case for the dblink bypass.
-        ///
-        ///   * `TableFactor::Function { name, .. }` — LATERAL/UNNEST
-        ///     style (`FROM LATERAL flatten(...)`). Less common in
-        ///     Postgres but the same shape (denied function name
-        ///     drives the check).
-        ///
-        /// We accept the (very small) false-positive risk that a user
-        /// has defined a TABLE called `dblink` — that's already a
-        /// footgun on its own and the role-wrap (M-2) bounds the
-        /// blast radius.
-        fn pre_visit_table_factor(&mut self, tf: &ast::TableFactor) -> ControlFlow<Self::Break> {
-            match tf {
-                ast::TableFactor::Table {
-                    name,
-                    args: Some(_),
-                    ..
-                } => {
-                    if let Some(denied) = denied_function_name(name) {
-                        return ControlFlow::Break(denied);
-                    }
-                }
-                ast::TableFactor::Function { name, .. } => {
-                    if let Some(denied) = denied_function_name(name) {
-                        return ControlFlow::Break(denied);
-                    }
-                }
-                // `XMLTABLE(…)` has its own syntax and, from sqlparser 0.63,
-                // its own node — no name to look up. 0.53 could not parse it
-                // at all, which is the only reason it was refused.
-                ast::TableFactor::XmlTable { .. } if is_denied_sql_function("xmltable") => {
-                    return ControlFlow::Break("xmltable".to_string());
-                }
-                _ => {}
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
-    let mut visitor = FunctionDenyVisitor;
-    if let ControlFlow::Break(name) = stmt.visit(&mut visitor) {
+    });
+    if let ControlFlow::Break(name) = walk {
         return Err(SqlValidationError::DisallowedFunction(name));
     }
     Ok(())
@@ -670,22 +614,23 @@ fn is_denied_sql_function(fn_name: &str) -> bool {
     talos_workflow_job_protocol::is_disallowed_sql_function(fn_name)
 }
 
-fn denied_function_name(name: &ast::ObjectName) -> Option<String> {
-    // From sqlparser 0.54 a name part is an identifier or (in other dialects)
-    // a function that computes one. A name this list cannot read is not a
-    // name it can clear: refuse it.
-    let Some(segments) = name
-        .0
-        .iter()
-        .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
-        .collect::<Option<Vec<&str>>>()
-    else {
-        return Some(name.to_string().to_ascii_lowercase());
+fn denied_function_name(call: &talos_sql_classify::CalledFunction<'_>) -> Option<String> {
+    use talos_sql_classify::CalledFunction;
+    let parts = match call {
+        CalledFunction::Named(parts) => parts,
+        // A name this list cannot read is not a name it can clear: refuse it.
+        CalledFunction::Unreadable(_) => return Some(call.spelled()),
+        // `XMLTABLE(…)` has its own syntax and, from sqlparser 0.63, its own
+        // node — no name to look up. 0.53 could not parse it at all, which
+        // was the only reason it was refused then.
+        CalledFunction::Syntax(name) => {
+            return is_denied_sql_function(name).then(|| (*name).to_string())
+        }
     };
-    match segments.as_slice() {
+    match parts.as_slice() {
         [bare] => {
-            if is_denied_sql_function(bare) {
-                Some(bare.to_ascii_lowercase())
+            if is_denied_sql_function(&bare.value) {
+                Some(bare.value.to_ascii_lowercase())
             } else {
                 None
             }
@@ -695,8 +640,10 @@ fn denied_function_name(name: &ast::ObjectName) -> Option<String> {
             // user-defined) name-collide are out of scope: the validator
             // can't disambiguate the user's intent from the AST and the
             // role-wrap (M-2) is the fence for that case.
-            if schema.eq_ignore_ascii_case("pg_catalog") && is_denied_sql_function(fn_name) {
-                Some(format!("pg_catalog.{}", fn_name.to_ascii_lowercase()))
+            if schema.value.eq_ignore_ascii_case("pg_catalog")
+                && is_denied_sql_function(&fn_name.value)
+            {
+                Some(format!("pg_catalog.{}", fn_name.value.to_ascii_lowercase()))
             } else {
                 None
             }
