@@ -1,0 +1,6 @@
+{
+  "AUTH_HEADER": "Bearer vault://oauth/microsoft_365/made-up-user/made-up-account/access_token",
+  "HOURS_AHEAD": 168,
+  "MAX_RESULTS": 100,
+  "TIME_ZONE": "America/New_York"
+}

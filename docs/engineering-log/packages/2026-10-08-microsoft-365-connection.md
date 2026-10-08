@@ -85,4 +85,10 @@ Graph permissions in a form `reading_scopes_granted` recognises, and that
 - An expired client secret fails every refresh with `invalid_client`, which is
   not marked as needing reconnect; every connection fails until the secret is
   replaced.
-- There is no catalog template for the reader yet.
+- The readers are `outlook-list-messages` (one GET, at most 25 messages) and
+  `outlook-calendar-list-events` (calendarView, paged up to 250 events). Their
+  recorded runs use 25.9% and 44.1% of the declared fuel; the calendar's
+  limit is sized for about 100 events, so a node asking for more sets
+  `max_fuel` above the default (its `MAX_RESULTS` description says so). A
+  next-page link off `https://graph.microsoft.com/v1.0/` fails the run rather
+  than receiving the token.

@@ -9,7 +9,7 @@ sending mail is not asked for.
 | Piece | Where | What it does |
 |---|---|---|
 | The connection | `talos-microsoft-365`, `/api/microsoft-365/connect` and `/callback`, the **Microsoft 365** card on the integrations page | Obtains and refreshes the OAuth token. Holds no API client. |
-| The reader | a sandboxed module with `allowed_hosts: ["graph.microsoft.com"]` and `allowed_methods: ["GET"]` | Calls Graph with a `vault://` token reference. There is no catalog template for it yet. |
+| The readers | catalog templates `outlook-list-messages` and `outlook-calendar-list-events` (`allowed_hosts: ["graph.microsoft.com"]`, `allowed_methods: ["GET"]`) | Call Graph with a `vault://` token reference. |
 
 The module never holds the token: the worker resolves the `vault://` reference
 at the outbound call.
@@ -40,10 +40,11 @@ With the client id and secret unset the card is shown as not configured and
 `/api/microsoft-365/connect` answers 503. So does a `MICROSOFT_365_TENANT` that
 names no tenant: it is refused, not widened to `common`.
 
-Then connect from the integrations page. A module reads with
-`AUTH_HEADER` = `Bearer vault://oauth/microsoft_365/{user_id}/{provider_key}/access_token`,
-where `provider_key` is the account's Graph object id (`list_connections`
-gives the whole reference).
+Then connect from the integrations page, install `outlook-list-messages` or
+`outlook-calendar-list-events` from the catalog, and set its `AUTH_HEADER` to
+`Bearer vault://oauth/microsoft_365/{user_id}/{account_id}/access_token`, where
+`account_id` is the account's Graph object id (the connection's
+`provider_key`; `list_connections` gives the whole reference).
 
 ### Admin consent
 
@@ -61,7 +62,7 @@ administrator who has not seen the app yet, is
   sign-in name (a label; its mail address when it has no sign-in name), the
   granted scopes, the expiry. No token.
 - The access and refresh tokens, encrypted, at
-  `oauth/microsoft_365/{user_id}/{provider_key}/…`. A module granted another
+  `oauth/microsoft_365/{user_id}/{account_id}/…`. A module granted another
   provider's `oauth/<provider>/*` cannot name them.
 - Nothing from Graph is stored by the connection. What a workflow does with the
   reader's output is the workflow's own design; a module's output is kept,
@@ -98,11 +99,12 @@ administrator who has not seen the app yet, is
 - **A mailbox that is not in Exchange Online** (on-premises Exchange, or a
   hosted Exchange outside Microsoft 365) connects — `User.Read` works — but
   every mail and calendar read is refused by Graph with
-  `MailboxNotEnabledForRESTAPI`. That is out of scope; a reader sees Graph's
-  error, not an empty mailbox.
+  `MailboxNotEnabledForRESTAPI`. That is out of scope; the templates fail with
+  Graph's error, not an empty mailbox.
 
 ## Privacy posture
 
 Bind the workflow that reads mail to an actor with `max_llm_tier = tier1` and
-`egress_scope = public`: the reader reaches `graph.microsoft.com`, and no
-external model provider can be reached from that actor.
+`egress_scope = public`: the templates reach `graph.microsoft.com`, and no
+external model provider can be reached from that actor. Neither template calls
+a model.
