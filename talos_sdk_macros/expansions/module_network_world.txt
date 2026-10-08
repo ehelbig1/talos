@@ -1,0 +1,25 @@
+# [allow (warnings)] mod bindings {
+include ! (concat ! (env ! ("CARGO_MANIFEST_DIR") , "/src/bindings.rs")) ;
+}
+# [allow (unused_imports)] use crate :: bindings :: talos as talos ;
+struct TalosGuest ;
+impl bindings :: Guest for TalosGuest {
+fn run (input_str : String) -> Result < String , String > {
+match :: std :: panic :: catch_unwind (:: std :: panic :: AssertUnwindSafe (|| {
+run (input_str) }
+)) {
+Ok (r) => r , Err (p) => {
+let msg = p . downcast_ref :: < & str > () . map (| s | s . to_string ()) . or_else (|| p . downcast_ref :: < :: std :: string :: String > () . cloned ()) . unwrap_or_else (|| "panic (non-string payload)" . to_string ()) ;
+Err (:: std :: format ! ("PANIC: {
+}
+" , msg)) }
+}
+}
+}
+bindings :: export ! (TalosGuest with_types_in bindings) ;
+# [used] # [no_mangle] pub static __TALOS_WORLD : & [u8] = b"__talos_world_network-node__" ;
+# [export_name = "wizer.initialize"] pub extern "C" fn init () {
+let _prime = Vec :: < u8 > :: with_capacity (1024 * 1024) ;
+}
+# [doc = r" A doc comment and an attribute travel with the function."] # [allow (clippy :: needless_pass_by_value)] pub fn run (input : String) -> Result < String , String > {
+Ok (input) }
