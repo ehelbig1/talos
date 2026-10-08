@@ -117,10 +117,10 @@ Mutations (each restored, the tree's hash compared):
   is_disallowed_sql_function`), and `query_paginated` does not yet parse its
   statement. So the two belong together and follow this package: the parsed
   gate first, then the role behind it.
-* **Allowing a list of functions instead of denying one.** With the role
-  behind the gate, the functions that matter are refused by privilege, and
-  an allow list would be a second function policy beside the one the module
-  SQL path has.
+* **An allow list of functions, in this package.** It is the better rule
+  than the deny list (a function nobody has read about is refused, not
+  admitted), and it belongs to the parsed gate that follows, as the ONE
+  function policy for this tool and for module SQL, not a second one.
 * Rolling back and returning the connection: a rollback does not release a
   session-level advisory lock (measured), and listing what to undo is the
   weaker design at 3 ms a call on an operator's tool.
