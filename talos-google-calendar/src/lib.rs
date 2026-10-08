@@ -154,6 +154,16 @@ pub struct GoogleCalendarService {
     /// replica serves the create endpoint and runs the renewal loop.
     pub(crate) create_channel_locks:
         talos_integration_helpers::state_store::CreateLockMap<(Uuid, Uuid, String)>,
+    /// One renewal at a time per `(user_id, channel uuid)`, taken BEFORE the
+    /// renewal reads the row it was asked to renew.
+    ///
+    /// The create lock above is keyed by the calendar, which a renewal only
+    /// learns from that row. So the first read used to happen outside any
+    /// lock, and a renewal arriving while another was mid-rotation — old row
+    /// deleted, replacement not yet written — found nothing and reported the
+    /// channel missing. Same two-level lock, for the same reason.
+    pub(crate) renew_channel_locks:
+        talos_integration_helpers::state_store::CreateLockMap<(Uuid, Uuid)>,
     /// Test-only override of the Calendar API origin; unset in production.
     pub(crate) api_base_url: OnceLock<String>,
 }
@@ -186,6 +196,7 @@ impl GoogleCalendarService {
             credentials_service: OnceLock::new(),
             shared_key: OnceLock::new(),
             create_channel_locks: talos_integration_helpers::state_store::CreateLockMap::new(),
+            renew_channel_locks: talos_integration_helpers::state_store::CreateLockMap::new(),
             api_base_url: OnceLock::new(),
         }
     }
@@ -245,6 +256,7 @@ impl GoogleCalendarService {
     /// re-create it on demand.
     pub fn cleanup_create_channel_locks(&self) {
         self.create_channel_locks.cleanup();
+        self.renew_channel_locks.cleanup();
     }
 
     /// The per-channel limiter key: `(user_id, channel_id)`, both VERIFIED.
