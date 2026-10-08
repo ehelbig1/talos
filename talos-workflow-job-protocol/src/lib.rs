@@ -2414,6 +2414,46 @@ pub const DISALLOWED_SQL_FUNCTIONS: &[&str] = &[
     "database_to_xmlschema",
     "database_to_xml_and_xmlschema",
     "xmltable",
+    // 2026-10-08. The same class outside the SQL/XML family: functions
+    // whose TEXT argument is a query the server runs for them. `ts_stat`
+    // and the two-argument `ts_rewrite` are built in (text search) and were
+    // measured to return another table's contents from inside a statement
+    // every gate here called a read of nothing. Denied by NAME, so the
+    // three-argument `ts_rewrite`, which runs no query, is refused with it:
+    // an AST carries no argument types to tell the two apart.
+    "ts_stat",
+    "ts_rewrite",
+    // `tablefunc` and `xml2` take a query as text the same way. Neither is
+    // installed here; denied in the same fail-closed spirit as dblink.
+    "crosstab",
+    "crosstab2",
+    "crosstab3",
+    "crosstab4",
+    "connectby",
+    "xpath_table",
+];
+
+/// The members of [`DISALLOWED_SQL_FUNCTIONS`] that take SQL as TEXT and run
+/// it. Named apart from the rest because a gate that reads the statement
+/// cannot read the string: what such a function reaches is decided by the
+/// role it runs as, never by the statement around it. Postgres has no
+/// catalog column for "runs its argument"; this list is from reading the
+/// server's sources (xml.c, tsvector_op.c, tsquery_rewrite.c) as of
+/// Postgres 17 and the two contrib modules above.
+pub const SQL_TEXT_EVALUATOR_FUNCTIONS: &[&str] = &[
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "ts_stat",
+    "ts_rewrite",
+    "crosstab",
+    "crosstab2",
+    "crosstab3",
+    "crosstab4",
+    "connectby",
+    "xpath_table",
 ];
 
 /// Function-name FAMILIES guest SQL must never invoke, matched as a
@@ -2749,6 +2789,28 @@ mod external_llm_host_normalisation_tests {
 #[cfg(test)]
 mod disallowed_sql_function_tests {
     use super::{is_disallowed_sql_function, DISALLOWED_SQL_FUNCTIONS};
+
+    /// A function that runs the SQL in its text argument is denied whichever
+    /// family it belongs to. Until 2026-10-08 the list named the SQL/XML ones
+    /// and not the text-search ones.
+    #[test]
+    fn every_function_that_runs_sql_it_is_handed_is_denied() {
+        for f in super::SQL_TEXT_EVALUATOR_FUNCTIONS {
+            assert!(DISALLOWED_SQL_FUNCTIONS.contains(f), "`{f}` is not listed");
+            assert!(is_disallowed_sql_function(f), "`{f}` must be denied");
+            assert!(
+                is_disallowed_sql_function(&f.to_ascii_uppercase()),
+                "`{f}` must be denied in upper case"
+            );
+        }
+        for f in ["ts_stat", "ts_rewrite"] {
+            assert!(super::SQL_TEXT_EVALUATOR_FUNCTIONS.contains(&f));
+        }
+        // Text search that runs no query stays available.
+        for f in ["to_tsvector", "to_tsquery", "ts_rank", "ts_headline"] {
+            assert!(!is_disallowed_sql_function(f), "`{f}` runs no query");
+        }
+    }
 
     #[test]
     fn every_canonical_entry_is_matched() {

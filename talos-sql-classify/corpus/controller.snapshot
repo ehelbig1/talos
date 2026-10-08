@@ -343,6 +343,13 @@ refuse function cursor_to_xml    | SELECT cursor_to_xml('c', 1, true, true, '')
 refuse function schema_to_xml    | SELECT schema_to_xml('public', true, true, '')
 refuse function database_to_xml  | SELECT database_to_xml(true, true, '')
 refuse function xmltable         | SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
+refuse function ts_stat          | SELECT word FROM ts_stat('SELECT to_tsvector(a) FROM t')
+refuse function ts_stat          | SELECT * FROM t, LATERAL ts_stat('SELECT to_tsvector(a) FROM t') s
+refuse function pg_catalog.ts_stat | SELECT pg_catalog.ts_stat('SELECT to_tsvector(a) FROM t')
+refuse function ts_rewrite       | SELECT ts_rewrite('a'::tsquery, 'SELECT a, b FROM t')
+refuse function ts_rewrite       | SELECT ts_rewrite('a'::tsquery, 'a'::tsquery, 'b'::tsquery)
+refuse function crosstab         | SELECT * FROM crosstab('SELECT a, b, c FROM t') AS ct(a text, b text)
+admit read SELECT                | SELECT to_tsvector('simple', a) FROM t
 refuse function xmltable         | SELECT * FROM t, XMLTABLE('/a' PASSING t.x COLUMNS a int PATH 'a') AS q
 parse-error                      | SELECT * FROM t JOIN LATERAL xmltable('/a' PASSING t.x COLUMNS a int PATH 'a') q ON true
 refuse function xmltable         | WITH q AS (SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')) SELECT * FROM q

@@ -364,6 +364,13 @@ SELECT cursor_to_xml('c', 1, true, true, '')
 SELECT schema_to_xml('public', true, true, '')
 SELECT database_to_xml(true, true, '')
 SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
+SELECT word FROM ts_stat('SELECT to_tsvector(a) FROM t')
+SELECT * FROM t, LATERAL ts_stat('SELECT to_tsvector(a) FROM t') s
+SELECT pg_catalog.ts_stat('SELECT to_tsvector(a) FROM t')
+SELECT ts_rewrite('a'::tsquery, 'SELECT a, b FROM t')
+SELECT ts_rewrite('a'::tsquery, 'a'::tsquery, 'b'::tsquery)
+SELECT * FROM crosstab('SELECT a, b, c FROM t') AS ct(a text, b text)
+SELECT to_tsvector('simple', a) FROM t
 SELECT * FROM t, XMLTABLE('/a' PASSING t.x COLUMNS a int PATH 'a') AS q
 SELECT * FROM t JOIN LATERAL xmltable('/a' PASSING t.x COLUMNS a int PATH 'a') q ON true
 WITH q AS (SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')) SELECT * FROM q
