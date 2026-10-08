@@ -1790,7 +1790,7 @@ dependencies = [
  "base64 0.22.1",
  "bcrypt",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "dotenvy",
  "futures",
  "hex",
@@ -2514,19 +2514,6 @@ dependencies = [
  "darling_core 0.24.1",
  "quote",
  "syn 3.0.6",
-]
-
-[[package]]
-name = "dashmap"
-version = "5.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
-dependencies = [
- "cfg-if",
- "hashbrown 0.14.5",
- "lock_api",
- "once_cell",
- "parking_lot_core",
 ]
 
 [[package]]
@@ -3402,32 +3389,12 @@ dependencies = [
 
 [[package]]
 name = "governor"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68a7f542ee6b35af73b06abc0dad1c1bae89964e4e253bc4b587b91c9637867b"
-dependencies = [
- "cfg-if",
- "dashmap 5.5.3",
- "futures",
- "futures-timer",
- "no-std-compat",
- "nonzero_ext",
- "parking_lot",
- "portable-atomic",
- "quanta",
- "rand 0.8.8",
- "smallvec",
- "spinning_top",
-]
-
-[[package]]
-name = "governor"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9efcab3c1958580ff1f25a2a41be1668f7603d849bb63af523b208a3cc1223b8"
 dependencies = [
  "cfg-if",
- "dashmap 6.2.1",
+ "dashmap",
  "futures-sink",
  "futures-timer",
  "futures-util",
@@ -4730,12 +4697,6 @@ dependencies = [
  "rand 0.8.8",
  "signatory",
 ]
-
-[[package]]
-name = "no-std-compat"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b93853da6d84c2e3c7d730d6473e8817692dd89be387eb01b94d7f108ecb5b8c"
 
 [[package]]
 name = "no_std_io2"
@@ -7606,7 +7567,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "hex",
  "rand 0.8.8",
  "reqwest",
@@ -8126,7 +8087,7 @@ name = "talos-csrf"
 version = "0.1.0"
 dependencies = [
  "axum",
- "dashmap 6.2.1",
+ "dashmap",
  "hex",
  "rand 0.8.8",
  "serde_json",
@@ -8262,7 +8223,7 @@ name = "talos-envelope-seal"
 version = "0.1.0"
 dependencies = [
  "async-nats",
- "dashmap 6.2.1",
+ "dashmap",
  "futures",
  "redis",
  "serde_json",
@@ -8435,7 +8396,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "jsonwebtoken",
  "rand 0.8.8",
  "reqwest",
@@ -8542,7 +8503,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "hmac 0.13.0",
  "redis",
  "reqwest",
@@ -8589,7 +8550,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "jsonwebtoken",
  "rand 0.8.8",
  "redis",
@@ -8791,7 +8752,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "jsonwebtoken",
  "rand 0.8.8",
  "reqwest",
@@ -8942,7 +8903,7 @@ dependencies = [
  "axum",
  "bcrypt",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "futures",
  "hex",
  "petgraph",
@@ -9066,7 +9027,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "ed25519-dalek 3.0.0",
  "hex",
  "hmac 0.13.0",
@@ -9269,7 +9230,7 @@ dependencies = [
  "base64 0.22.1",
  "bcrypt",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "futures",
  "hex",
  "http",
@@ -9443,7 +9404,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "governor 0.6.3",
+ "governor",
  "ipnetwork",
  "redis",
  "serde_json",
@@ -9647,7 +9608,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
- "governor 0.6.3",
+ "governor",
  "regex",
  "reqwest",
  "serde",
@@ -9668,7 +9629,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "dashmap 6.2.1",
+ "dashmap",
  "hmac 0.13.0",
  "rand 0.8.8",
  "serde",
@@ -9691,7 +9652,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "hex",
  "hkdf 0.13.0",
  "rand 0.8.8",
@@ -9912,7 +9873,7 @@ dependencies = [
  "base64 0.22.1",
  "bcrypt",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "hex",
  "image",
  "qrcode",
@@ -10013,7 +9974,7 @@ dependencies = [
  "async-nats",
  "axum",
  "chrono",
- "dashmap 6.2.1",
+ "dashmap",
  "futures",
  "hex",
  "hmac 0.13.0",
@@ -10076,7 +10037,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-nats",
- "dashmap 6.2.1",
+ "dashmap",
  "futures",
  "serde_json",
  "talos-task-supervision",
@@ -10110,7 +10071,7 @@ dependencies = [
  "chrono",
  "chrono-tz 0.10.4",
  "csv",
- "dashmap 6.2.1",
+ "dashmap",
  "futures-util",
  "hex",
  "hmac 0.13.0",
@@ -10218,7 +10179,7 @@ dependencies = [
  "async-trait",
  "cap-std",
  "criterion",
- "dashmap 6.2.1",
+ "dashmap",
  "futures",
  "petgraph",
  "proptest",
@@ -10280,7 +10241,7 @@ name = "talos-workflow-engine-test-utils"
 version = "0.3.0"
 dependencies = [
  "async-trait",
- "dashmap 6.2.1",
+ "dashmap",
  "serde_json",
  "talos-workflow-engine",
  "talos-workflow-engine-core",
@@ -10968,7 +10929,7 @@ checksum = "44de9b94d849d3c46e06a883d72d408c2de6403367b39df2b1c9d9e7b6736fe6"
 dependencies = [
  "axum",
  "forwarded-header-value",
- "governor 0.10.4",
+ "governor",
  "http",
  "pin-project",
  "thiserror 2.0.18",
