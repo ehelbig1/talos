@@ -43,8 +43,10 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# BLOCKED_TABLES_LIST: the grants test holds the query_paginated role to it.
+talos-admin-query-gate = { path = "../talos-admin-query-gate" }
 tracing-subscriber = { workspace = true, features = ["default", "fmt"] }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
 
 [lints]
 workspace = true

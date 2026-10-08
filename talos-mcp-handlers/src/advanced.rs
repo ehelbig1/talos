@@ -166,6 +166,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 Requires platform-admin privileges — any other caller receives a -32601 error. \
                 Runs in a read-only transaction on a connection that is closed afterwards: a query whose \
                 functions write, advance a sequence or lock rows is refused by the database. \
+                Runs as the database role talos_admin_read, which may read only the public tables a \
+                migration grants it (across every tenant); a table it is not granted is refused by \
+                the database, and the error names it. \
                 Security controls enforced: SELECT-only (no INSERT/UPDATE/DELETE/DDL), no semicolons, \
                 no UNION/INTERSECT/EXCEPT, no CTEs, no EXPLAIN, no SQL comments. \
                 The query is parsed and must be one statement that reads. It may call only functions \
@@ -999,6 +1002,32 @@ async fn handle_query_paginated(
             mcp_text(
                 req_id,
                 &serde_json::to_string_pretty(&response).unwrap_or_default(),
+            )
+        }
+        Err(talos_advanced_repository::PaginatedSelectError::RoleUnavailable { role, detail }) => {
+            tracing::error!(
+                role = %role,
+                detail = %detail,
+                "query_paginated: refused, its database role cannot be used"
+            );
+            mcp_error(
+                req_id,
+                -32000,
+                &talos_advanced_repository::PaginatedSelectError::role_remedy(&role),
+            )
+        }
+        Err(e) if talos_advanced_repository::ungranted_relation(&e).is_some() => {
+            let relation = talos_advanced_repository::ungranted_relation(&e).unwrap_or_default();
+            tracing::warn!(relation = %relation, "query_paginated: a relation the role is not granted");
+            mcp_error(
+                req_id,
+                -32602,
+                &format!(
+                    "query_paginated may not read '{relation}': its database role ({}) holds no \
+                     privilege on it. A table the tool may read is granted to that role by a \
+                     migration; a withheld one is on BLOCKED_TABLES_LIST.",
+                    talos_advanced_repository::QUERY_PAGINATED_ROLE
+                ),
             )
         }
         Err(e) if talos_advanced_repository::is_read_only_refusal(&e) => {

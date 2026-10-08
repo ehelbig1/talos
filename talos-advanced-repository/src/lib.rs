@@ -4194,14 +4194,50 @@ impl AdvancedRepository {
     ///   held by whichever request borrowed the connection next. Closing
     ///   ends every kind of session state without listing the kinds.
     ///
-    /// Neither limits what a SELECT may READ or which server functions it may
-    /// call — see `docs/engineering-log/packages/2026-10-08-query-paginated-read-only.md`.
+    /// * It runs as [`QUERY_PAGINATED_ROLE`] (`SET LOCAL ROLE`, inside the
+    ///   transaction), not as the pool's role: SELECT on the public tables a
+    ///   migration names and nothing else, BYPASSRLS so a cross-tenant read
+    ///   returns every row. When the role cannot be entered, or lacks
+    ///   BYPASSRLS, or is a superuser, the call is REFUSED
+    ///   ([`PaginatedSelectError::RoleUnavailable`]) — it never falls back to
+    ///   the pool's role. The role is a boundary only behind the function gate
+    ///   (`talos_admin_query_gate`): a statement that could call `set_config`
+    ///   could set the role back (measured, 2026-10-08).
+    ///
+    /// See `docs/engineering-log/packages/2026-10-08-query-paginated-admin-read-role.md`.
     pub async fn execute_paginated_select(
         &self,
         validated_base_query: &str,
         page_size: i64,
         mode: PaginationMode<'_>,
-    ) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
+    ) -> Result<Vec<sqlx::postgres::PgRow>, PaginatedSelectError> {
+        self.execute_paginated_select_as_role(
+            QUERY_PAGINATED_ROLE,
+            validated_base_query,
+            page_size,
+            mode,
+        )
+        .await
+    }
+
+    /// [`Self::execute_paginated_select`] as a named role. For the tests that
+    /// prove the refusal when the role is missing; production passes
+    /// [`QUERY_PAGINATED_ROLE`] and nothing else. `role` must be a plain
+    /// lower-case identifier.
+    #[doc(hidden)]
+    pub async fn execute_paginated_select_as_role(
+        &self,
+        role: &str,
+        validated_base_query: &str,
+        page_size: i64,
+        mode: PaginationMode<'_>,
+    ) -> Result<Vec<sqlx::postgres::PgRow>, PaginatedSelectError> {
+        if !is_plain_role_name(role) {
+            return Err(PaginatedSelectError::RoleUnavailable {
+                role: role.to_string(),
+                detail: "not a plain lower-case identifier".to_string(),
+            });
+        }
         let mut conn = self.db_pool.acquire().await?;
         // Before anything of the caller's runs, and before the first await
         // that could be cancelled: whatever happens next, this connection
@@ -4210,6 +4246,36 @@ impl AdvancedRepository {
         sqlx::query(PAGINATED_SELECT_BEGIN)
             .execute(&mut *conn)
             .await?;
+        // Enter the role, and read back what it is, in one round trip. Any
+        // failure here is the role's, not the caller's: refuse, and the
+        // connection (marked close-on-drop) is closed with the transaction.
+        // sql-safe: the role name, a plain lower-case identifier checked above (production: the constant QUERY_PAGINATED_ROLE)
+        let entered = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL ROLE \"{role}\"; \
+             SELECT rolbypassrls, rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user"
+        )))
+        .fetch_one(&mut *conn)
+        .await;
+        let (bypass_rls, superuser): (bool, bool) = match entered {
+            Ok(row) => (row.try_get(0)?, row.try_get(1)?),
+            Err(e) => {
+                return Err(PaginatedSelectError::RoleUnavailable {
+                    role: role.to_string(),
+                    detail: e.to_string(),
+                })
+            }
+        };
+        if !bypass_rls || superuser {
+            return Err(PaginatedSelectError::RoleUnavailable {
+                role: role.to_string(),
+                detail: if superuser {
+                    "the role is a superuser".to_string()
+                } else {
+                    "the role lacks BYPASSRLS, so a cross-tenant read would silently miss rows"
+                        .to_string()
+                },
+            });
+        }
         let rows = match mode {
             PaginationMode::Cursor { column, after } => {
                 // The cursor `column` is already constrained to [a-zA-Z0-9_]
@@ -4249,7 +4315,7 @@ impl AdvancedRepository {
         if let Err(e) = conn.close().await {
             tracing::debug!(error = %e, "query_paginated: closing its connection failed");
         }
-        rows
+        Ok(rows?)
     }
 
     // ── advanced.rs MCP-handler support ────────────────────────────────────
@@ -4567,11 +4633,107 @@ impl AdvancedRepository {
 /// Opens the transaction a `query_paginated` statement runs in.
 const PAGINATED_SELECT_BEGIN: &str = "BEGIN READ ONLY";
 
+/// The database role a `query_paginated` statement runs as
+/// (`migrations/20261008200000_talos_admin_read_role.sql`).
+pub const QUERY_PAGINATED_ROLE: &str = "talos_admin_read";
+
+fn is_plain_role_name(role: &str) -> bool {
+    let mut chars = role.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && role.len() <= 63
+}
+
+/// Why `execute_paginated_select` did not return rows.
+#[derive(Debug)]
+pub enum PaginatedSelectError {
+    /// The statement's role could not be used: it does not exist, the pool's
+    /// role is not a member of it, it lacks BYPASSRLS, or it is a superuser.
+    /// Nothing of the caller's ran. The operator has to fix the role; see
+    /// [`PaginatedSelectError::role_remedy`].
+    RoleUnavailable {
+        /// The role that was to be entered.
+        role: String,
+        /// What went wrong, for the server log (may carry the database's
+        /// message; not for the caller).
+        detail: String,
+    },
+    /// The database refused or failed the statement.
+    Database(sqlx::Error),
+}
+
+impl PaginatedSelectError {
+    /// What the operator must run so the tool can be used, for a
+    /// [`PaginatedSelectError::RoleUnavailable`].
+    #[must_use]
+    pub fn role_remedy(role: &str) -> String {
+        format!(
+            "query_paginated runs its SQL as the database role {role}, and this database cannot \
+             use it (the role is missing, the pool's role is not a member of it, or it lacks \
+             BYPASSRLS). As a superuser: CREATE ROLE {role} NOLOGIN NOINHERIT BYPASSRLS (or \
+             ALTER ROLE {role} BYPASSRLS); GRANT {role} TO <the controller's database role>; then \
+             the GRANT statements in migrations/20261008200000_talos_admin_read_role.sql."
+        )
+    }
+}
+
+impl std::fmt::Display for PaginatedSelectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaginatedSelectError::RoleUnavailable { role, detail } => {
+                write!(f, "query_paginated role {role} unavailable: {detail}")
+            }
+            PaginatedSelectError::Database(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PaginatedSelectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PaginatedSelectError::RoleUnavailable { .. } => None,
+            PaginatedSelectError::Database(e) => Some(e),
+        }
+    }
+}
+
+impl From<sqlx::Error> for PaginatedSelectError {
+    fn from(e: sqlx::Error) -> Self {
+        PaginatedSelectError::Database(e)
+    }
+}
+
+/// The table or view Postgres refused the statement because the role holds
+/// no privilege on it (SQLSTATE 42501, "permission denied for table t"), so
+/// the caller can be told which. `None` for any other error.
+pub fn ungranted_relation(error: &PaginatedSelectError) -> Option<String> {
+    let PaginatedSelectError::Database(e) = error else {
+        return None;
+    };
+    let db = e.as_database_error()?;
+    if db.code().as_deref() != Some("42501") {
+        return None;
+    }
+    let message = db.message();
+    [
+        "permission denied for table ",
+        "permission denied for view ",
+    ]
+    .iter()
+    .find_map(|prefix| message.strip_prefix(prefix))
+    .map(str::to_string)
+}
+
 /// Whether `execute_paginated_select` failed because the statement tried to
 /// write: Postgres refused it under the read-only transaction (SQLSTATE
 /// 25006, `read_only_sql_transaction`). The handler says so instead of
 /// blaming the caller's syntax.
-pub fn is_read_only_refusal(error: &sqlx::Error) -> bool {
+pub fn is_read_only_refusal(error: &PaginatedSelectError) -> bool {
+    let PaginatedSelectError::Database(error) = error else {
+        return false;
+    };
     error
         .as_database_error()
         .and_then(|e| e.code())
