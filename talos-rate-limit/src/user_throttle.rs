@@ -57,10 +57,6 @@ pub struct ThrottleExceeded {
 /// one call per `60 / per_minute` seconds.
 pub struct PerUserThrottle {
     limiter: RateLimiter<Uuid, DashMapStateStore<Uuid>, DefaultClock>,
-    /// The limiter's own clock, held so `wait_time_from` is measured on the
-    /// same instant source (`RateLimiter` exposes no clock accessor in
-    /// governor 0.6).
-    clock: DefaultClock,
     per_minute: u32,
     max_tracked: usize,
     checks: AtomicU64,
@@ -77,10 +73,8 @@ impl PerUserThrottle {
 
     pub fn with_max_tracked(per_minute: u32, max_tracked: usize) -> Self {
         let n = NonZeroU32::new(per_minute).unwrap_or(NonZeroU32::MIN);
-        let clock = DefaultClock::default();
         Self {
-            limiter: RateLimiter::dashmap_with_clock(Quota::per_minute(n), &clock),
-            clock,
+            limiter: RateLimiter::dashmap(Quota::per_minute(n)),
             per_minute: n.get(),
             max_tracked: max_tracked.max(1),
             checks: AtomicU64::new(0),
@@ -93,7 +87,9 @@ impl PerUserThrottle {
         match self.limiter.check_key(&user) {
             Ok(()) => Ok(()),
             Err(not_until) => {
-                let wait = not_until.wait_time_from(self.clock.now());
+                // Measured on the limiter's own clock, the one the refusal was
+                // decided on.
+                let wait = not_until.wait_time_from(self.limiter.clock().now());
                 // Round UP so a caller who waits exactly this long is admitted.
                 let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
                 Err(ThrottleExceeded {
