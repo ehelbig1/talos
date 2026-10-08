@@ -52,6 +52,10 @@ use uuid::Uuid;
 
 pub const GCAL_INTEGRATION_NAME: &str = "gcal";
 
+/// Every watch-channel row's key starts with this; other state the integration
+/// keeps for a user does not.
+const CHANNEL_KEY_PREFIX: &str = "channel/";
+
 /// Serialized form of a `WatchChannel` stored in
 /// `integration_state.value`. Kept separate from the `WatchChannel`
 /// struct so adding ephemeral controller-side fields to `WatchChannel`
@@ -77,6 +81,13 @@ pub struct WatchChannelRow {
     pub last_message_number: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// The row this one replaced, when it was made by a renewal. A caller
+    /// still holding THAT uuid is handed this row instead of "not found". One
+    /// generation only: the uuid of the row before that resolves to nothing.
+    /// Absent from rows that were created, and from every row written before
+    /// 2026-10-08, so those keep the exact bytes they had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewed_from: Option<Uuid>,
 }
 
 impl WatchChannelRow {
@@ -174,7 +185,11 @@ impl GoogleCalendarService {
     /// User-scoped handle over `integration_state` for gcal watch
     /// rows. Cheap to construct per call (`PgPool` is `Arc`-backed).
     fn store(&self) -> ChannelStore {
-        ChannelStore::new(self.db_pool.clone(), GCAL_INTEGRATION_NAME, "channel/")
+        ChannelStore::new(
+            self.db_pool.clone(),
+            GCAL_INTEGRATION_NAME,
+            CHANNEL_KEY_PREFIX,
+        )
     }
 
     /// Create a new watch channel, or re-point an existing one at a
@@ -278,6 +293,7 @@ impl GoogleCalendarService {
             webhook_url,
             module_id,
             None,
+            None,
         )
         .await
     }
@@ -302,6 +318,8 @@ impl GoogleCalendarService {
         webhook_url: &str,
         module_id: Option<Uuid>,
         preserved_sync_token: Option<String>,
+        // The row a renewal is replacing; `None` for a first create.
+        renewed_from: Option<Uuid>,
     ) -> Result<WatchChannel> {
         let shared_key = self
             .worker_shared_key()
@@ -361,6 +379,7 @@ impl GoogleCalendarService {
             last_message_number: 0,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            renewed_from,
         };
 
         self.upsert_channel_row(user_id, &row).await.map_err(|e| {
@@ -454,16 +473,67 @@ impl GoogleCalendarService {
         user_id: Uuid,
         channel_id: Uuid,
     ) -> Result<WatchChannel> {
+        // A renewal reads the row it was asked to renew, and only the row
+        // names the calendar that the create lock below is keyed by. So this
+        // read cannot be under that lock, and a second renewal of the same
+        // channel can arrive while the first is between deleting the old row
+        // and writing the new one, and read nothing. Until 2026-10-08 that
+        // was reported as a missing channel.
+        //
+        // Renewals of one channel are therefore serialized by a lock of their
+        // own, keyed by what the caller does hold: the channel's uuid.
+        //
+        // The row is looked for BEFORE that lock is taken. A request for a
+        // uuid that is not a channel must not hold a pooled connection (the
+        // lock is a transaction) while it waits for another to read with:
+        // enough of those at once would hold every connection and wait on
+        // each other.
+        if self
+            .find_channel_by_id_raw(user_id, channel_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "gcal renew: watch channel {} lookup failed for user {}",
+                    channel_id, user_id
+                )
+            })?
+            .is_none()
+        {
+            // Not there. Replaced already?
+            if let Some(renewed) = self.find_channel_renewed_from(user_id, channel_id).await? {
+                return Ok(self.already_renewed(user_id, &renewed));
+            }
+            // Being replaced right now? Wait for that renewal to finish —
+            // and hold nothing while looking again.
+            drop(self.acquire_renewal_lock(user_id, channel_id).await?);
+            return match self.find_channel_renewed_from(user_id, channel_id).await? {
+                Some(renewed) => Ok(self.already_renewed(user_id, &renewed)),
+                None => Err(anyhow!(
+                    "Watch channel {} not found in integration_state for user {}",
+                    channel_id,
+                    user_id
+                )),
+            };
+        }
+
+        // The row exists. One renewal of it at a time from here on, and read
+        // it again now that this is the only one.
+        let _renewal = self.acquire_renewal_lock(user_id, channel_id).await?;
+
         // The `not found` wording used to sit as `with_context` over BOTH
         // outcomes, so a pool timeout was logged as a missing channel.
         let old_row = match self.find_channel_by_id_raw(user_id, channel_id).await {
             Ok(Some(r)) => r,
             Ok(None) => {
-                return Err(anyhow!(
-                    "Watch channel {} not found in integration_state for user {}",
-                    channel_id,
-                    user_id
-                ))
+                // Replaced by the renewal this one waited for.
+                return match self.find_channel_renewed_from(user_id, channel_id).await? {
+                    Some(renewed) => Ok(self.already_renewed(user_id, &renewed)),
+                    None => Err(anyhow!(
+                        "Watch channel {} not found in integration_state for user {}",
+                        channel_id,
+                        user_id
+                    )),
+                };
             }
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -563,6 +633,7 @@ impl GoogleCalendarService {
                 &webhook_url,
                 module_id,
                 sync_token,
+                Some(channel_id),
             )
             .await?;
 
@@ -582,6 +653,33 @@ impl GoogleCalendarService {
         );
 
         Ok(new)
+    }
+
+    /// The per-channel renewal lock: the process-local mutex, then the
+    /// advisory lock every replica sees. Taken before the create lock, never
+    /// after it; the create path takes only the create lock.
+    async fn acquire_renewal_lock(
+        &self,
+        user_id: Uuid,
+        channel_id: Uuid,
+    ) -> Result<talos_integration_helpers::state_store::FleetCreateGuard> {
+        self.renew_channel_locks
+            .acquire_fleet(
+                &self.db_pool,
+                (user_id, channel_id),
+                &format!("gcal-renew:{user_id}:{channel_id}"),
+            )
+            .await
+            .context("could not take the watch-channel renewal lock")
+    }
+
+    /// What a renewal returns when another renewal got there first.
+    fn already_renewed(&self, user_id: Uuid, renewed: &WatchChannelRow) -> WatchChannel {
+        tracing::info!(
+            channel_uuid = %renewed.id,
+            "gcal renew: another renewer already replaced this channel"
+        );
+        renewed.to_watch_channel(user_id)
     }
 
     /// Take the per-(user, integration, calendar) mutex that serializes
@@ -944,6 +1042,41 @@ impl GoogleCalendarService {
         Ok(None)
     }
 
+    /// The row that replaced `old_channel_uuid` in a renewal, if there is one.
+    /// A user holds a handful of channels (one per watched calendar).
+    async fn find_channel_renewed_from(
+        &self,
+        user_id: Uuid,
+        old_channel_uuid: Uuid,
+    ) -> Result<Option<WatchChannelRow>> {
+        let entries = self
+            .store()
+            .list_entries(
+                user_id,
+                ListFilter {
+                    key_prefix: Some(CHANNEL_KEY_PREFIX.to_string()),
+                    ..Default::default()
+                },
+                500,
+            )
+            .await?;
+        for entry in entries {
+            // A row that cannot be read is not the replacement being looked
+            // for, and must not turn every stale uuid into an error; the
+            // renewal listing skips such a row the same way.
+            match decode_row(&entry) {
+                Ok(row) if row.renewed_from == Some(old_channel_uuid) => return Ok(Some(row)),
+                Ok(_) => {}
+                Err(e) => tracing::error!(
+                    key = %entry.key,
+                    error = %e,
+                    "Skipping malformed gcal row"
+                ),
+            }
+        }
+        Ok(None)
+    }
+
     /// Accessor for the HMAC key used to sign webhook tokens. Held by
     /// the service as an optional because tests may construct one
     /// without a key; production construction always sets it.
@@ -955,6 +1088,40 @@ impl GoogleCalendarService {
 #[cfg(test)]
 mod hot_path_tests {
     use super::*;
+
+    /// The stored row is a storage format. A row written before
+    /// `renewed_from` existed reads back, and a row that replaced nothing is
+    /// written exactly as it was before the field existed.
+    #[test]
+    fn a_row_without_renewed_from_reads_back_and_is_written_unchanged() {
+        let before = serde_json::json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "integration_id": "22222222-2222-4222-8222-222222222222",
+            "calendar_id": "primary",
+            "channel_id": "33333333-3333-4333-8333-333333333333",
+            "resource_id": "resource-1",
+            "webhook_url": "https://hooks.example.com/api/google-calendar/webhook",
+            "expiration_ms": 1_800_000_000_000_i64,
+            "sync_token": null,
+            "module_id": null,
+            "last_message_number": 0,
+            "created_at_ms": 1_700_000_000_000_i64,
+            "updated_at_ms": 1_700_000_000_000_i64
+        });
+        let row: WatchChannelRow = serde_json::from_value(before.clone()).expect("an old row");
+        assert_eq!(row.renewed_from, None);
+        assert_eq!(serde_json::to_value(&row).expect("serialize"), before);
+
+        let replaced = Uuid::new_v4();
+        let renewed = WatchChannelRow {
+            renewed_from: Some(replaced),
+            ..row
+        };
+        let written = serde_json::to_value(&renewed).expect("serialize");
+        assert_eq!(written["renewed_from"], serde_json::json!(replaced));
+        let read: WatchChannelRow = serde_json::from_value(written).expect("a renewed row");
+        assert_eq!(read.renewed_from, Some(replaced));
+    }
 
     fn row(last: i64) -> WatchChannelRow {
         WatchChannelRow {
@@ -970,6 +1137,7 @@ mod hot_path_tests {
             last_message_number: last,
             created_at_ms: 1,
             updated_at_ms: 1,
+            renewed_from: None,
         }
     }
 
