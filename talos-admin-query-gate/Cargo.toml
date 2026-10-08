@@ -1,0 +1,19 @@
+[package]
+name = "talos-admin-query-gate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Pure: the validation of the SQL a platform admin hands `query_paginated`,
+# kept out of the MCP handler so it is unit-testable and can be recorded over
+# the shared SQL corpus (`talos-sql-classify/corpus/`). No database, no async.
+[dependencies]
+regex.workspace = true
+sqlparser.workspace = true
+talos-sql-classify = { path = "../talos-sql-classify" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
+
+[lints]
+workspace = true

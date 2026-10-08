@@ -446,3 +446,20 @@ E=disallowed(ATTACH) I=disallowed(ATTACH) P=ok(ATTACH,no-rows,Unclassified) | AT
 *=parse-error | SELEC 1
 *=parse-error | INSERT INTO
 *=parse-error | )(
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM public.t
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM PUBLIC.t WHERE id = $1
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM other_schema.t
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM a.b.c
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM "Public".t
+*=ok(SELECT,rows,ReadOnly) | SELECT table_name FROM information_schema.tables
+*=ok(SELECT,rows,ReadOnly) | SELECT relname FROM pg_catalog.pg_class
+*=ok(SELECT,rows,ReadOnly) | SELECT relname FROM pg_class
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM pg_stat_statements
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM t WHERE EXISTS (SELECT 1 FROM pg_roles)
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM ONLY t
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM "only"
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM api_keys
+*=ok(SELECT,rows,ReadOnly) | SELECT * FROM "API_KEYS"
+*=ok(SELECT,rows,ReadOnly) | SELECT lower(name), count(*) FROM public.t WHERE created_at > now() - interval '1 day' GROUP BY 1
+*=ok(SELECT,rows,ReadOnly) | SELECT date_trunc('hour', created_at) AS h, avg(duration_ms) FROM t GROUP BY 1 ORDER BY 1
+*=ok(SELECT,rows,ReadOnly) | SELECT id, payload->>'kind' AS kind, jsonb_array_length(payload->'items') FROM t LIMIT 10

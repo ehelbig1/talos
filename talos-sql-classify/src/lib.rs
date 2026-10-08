@@ -33,6 +33,9 @@
 //!   Every gate that decides which functions a caller's SQL may call asks
 //!   this walk; the worker and the controller each had a hand-written one
 //!   until 2026-10-08.
+//! * [`try_for_each_relation`] — WHICH relations a statement reads by name,
+//!   for a gate that decides which tables a caller may read
+//!   (`query_paginated`, 2026-10-08).
 //! * [`selects_into_table`] — `SELECT … INTO new_table`, a table creation
 //!   that parses as a plain query. [`classify`] calls it
 //!   [`SqlAccess::Unclassified`] and both consumers refuse it.
@@ -366,6 +369,64 @@ pub fn try_for_each_called_function<B>(
     stmt.visit(&mut CalledFunctionVisitor { f })
 }
 
+/// A relation a statement reads by name, as [`try_for_each_relation`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadRelation<'a> {
+    /// A table, view or CTE named in a `FROM` clause (`FROM t`,
+    /// `FROM public.t`, `JOIN u`): a table factor with no arguments. A CTE's
+    /// name is reported too, because nothing in the parsed tree says which a
+    /// name is. Not reported: a set-returning function in `FROM`, which is a
+    /// call ([`try_for_each_called_function`]).
+    Named(&'a ObjectName),
+    /// Postgres's `TABLE t`, which sqlparser 0.63 does not parse under the
+    /// Postgres dialect but represents as a query body of its own. Reported
+    /// without a name so a gate refuses it rather than reading a shape it
+    /// was not written for.
+    TableCommand,
+}
+
+/// Call `f` with every relation `stmt` reads by name, anywhere in it: the
+/// top-level `FROM`, joins, subqueries in any expression, CTE bodies and
+/// derived tables (sqlparser's `Visit` reaches every table factor).
+pub fn try_for_each_relation<B>(
+    stmt: &Statement,
+    f: impl FnMut(ReadRelation<'_>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    fn body_has_table_command(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Table(_) => true,
+            SetExpr::SetOperation { left, right, .. } => {
+                body_has_table_command(left) || body_has_table_command(right)
+            }
+            // A parenthesised query is a `Query` of its own and is visited as
+            // one; the other bodies hold no `TABLE` at this level.
+            _ => false,
+        }
+    }
+    struct RelationVisitor<F> {
+        f: F,
+    }
+    impl<B, F: FnMut(ReadRelation<'_>) -> ControlFlow<B>> Visitor for RelationVisitor<F> {
+        type Break = B;
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<B> {
+            if body_has_table_command(&query.body) {
+                return (self.f)(ReadRelation::TableCommand);
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<B> {
+            match tf {
+                TableFactor::Table {
+                    name, args: None, ..
+                } => (self.f)(ReadRelation::Named(name)),
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+    stmt.visit(&mut RelationVisitor { f })
+}
+
 /// The first function `stmt` calls that `admits` does not admit, spelled as
 /// [`CalledFunction::spelled`] writes it; `None` when every call is
 /// admitted.
@@ -609,6 +670,40 @@ mod tests {
             }),
             None
         );
+    }
+
+    /// The relation walk names every table a statement reads, in every
+    /// position, and not a function in FROM.
+    #[test]
+    fn the_relation_walk_names_every_relation_read() {
+        fn read(sql: &str) -> Vec<String> {
+            let mut names = Vec::new();
+            let _ = try_for_each_relation(&parse1(sql), |r| {
+                names.push(match r {
+                    ReadRelation::Named(name) => name.to_string(),
+                    ReadRelation::TableCommand => "TABLE".to_string(),
+                });
+                ControlFlow::<()>::Continue(())
+            });
+            names
+        }
+        assert_eq!(read("SELECT 1"), Vec::<String>::new());
+        assert_eq!(
+            read("SELECT * FROM generate_series(1, 3)"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            read(
+                "SELECT * FROM a JOIN public.b ON a.x = b.x \
+                 WHERE EXISTS (SELECT 1 FROM c) AND a.y IN (SELECT y FROM (SELECT y FROM d) z)"
+            ),
+            ["a", "public.b", "c", "d"]
+        );
+        assert_eq!(
+            read("WITH w AS (SELECT * FROM e) SELECT * FROM w, LATERAL (SELECT * FROM f) l"),
+            ["e", "w", "f"]
+        );
+        assert_eq!(read("SELECT * FROM \"Q\".\"R\""), ["\"Q\".\"R\""]);
     }
 
     /// What sqlparser 0.63 parses into a node of its own is fixed syntax, not

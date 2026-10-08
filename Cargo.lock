@@ -7666,6 +7666,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-admin-query-gate"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "sqlparser",
+ "talos-sql-classify",
+ "talos-workflow-job-protocol",
+]
+
+[[package]]
 name = "talos-advanced-repository"
 version = "0.1.0"
 dependencies = [
@@ -8918,6 +8928,7 @@ dependencies = [
  "talos-actor-memory-service",
  "talos-actor-policies",
  "talos-actor-repository",
+ "talos-admin-query-gate",
  "talos-advanced-repository",
  "talos-analytics-repository",
  "talos-audit-ledger",

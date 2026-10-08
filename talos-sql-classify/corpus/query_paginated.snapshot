@@ -1,0 +1,465 @@
+T=ok                     P=ok | SELECT 1
+T=semicolon              P=ok | SELECT 1;
+T=ok                     P=ok | select a, b from t where id = $1
+T=table(users)           P=relation(users,blocked) | SELECT * FROM users WHERE id = $1 AND org_id = $2
+T=ok                     P=ok | SELECT DISTINCT a FROM t
+T=ok                     P=ok | SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC
+T=ok                     P=ok | SELECT a AS x, count(*) FROM t GROUP BY a HAVING count(*) > 1
+T=ok                     P=ok | SELECT a FROM t ORDER BY a NULLS LAST LIMIT 10 OFFSET 5
+T=ok                     P=ok | SELECT a FROM t FETCH FIRST 5 ROWS ONLY
+T=ok                     P=ok | SELECT * FROM t JOIN u ON t.id = u.t_id LEFT JOIN v USING (id)
+T=ok                     P=ok | SELECT * FROM t CROSS JOIN u
+T=ok                     P=ok | SELECT * FROM t NATURAL JOIN u
+T=ok                     P=ok | SELECT * FROM t, LATERAL (SELECT * FROM u WHERE u.t_id = t.id) x
+T=ok                     P=ok | SELECT * FROM (SELECT 1) x
+T=ok                     P=ok | SELECT * FROM t WHERE id IN (SELECT id FROM u)
+T=ok                     P=ok | SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)
+T=ok                     P=ok | SELECT * FROM t WHERE id = ANY($1)
+T=ok                     P=ok | SELECT (SELECT max(a) FROM u) AS m FROM t
+T=set-operation          P=ok | SELECT * FROM t UNION SELECT * FROM u
+T=set-operation          P=ok | SELECT * FROM t UNION ALL SELECT * FROM u INTERSECT SELECT * FROM v
+T=set-operation          P=ok | SELECT * FROM t EXCEPT SELECT * FROM u
+T=not-select             P=ok | (SELECT 1) UNION (SELECT 2)
+T=not-select             P=ok | WITH a AS (SELECT 1) SELECT * FROM a
+T=not-select             P=ok | WITH a AS (SELECT 1), b AS (SELECT * FROM a) SELECT * FROM b
+T=not-select             P=ok | WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r
+T=not-select             P=ok | WITH a AS MATERIALIZED (SELECT 1) SELECT * FROM a
+T=not-select             P=ok | WITH a AS NOT MATERIALIZED (SELECT 1) SELECT * FROM a
+T=ok                     P=ok | SELECT * FROM (WITH a AS (SELECT 1) SELECT * FROM a) x
+T=not-select             P=ok | VALUES (1, 'a'), (2, 'b')
+T=not-select             P=parse-error | TABLE t
+T=ok                     P=ok | SELECT * FROM t FOR UPDATE
+T=ok                     P=ok | SELECT * FROM t FOR SHARE SKIP LOCKED
+T=ok                     P=parse-error | SELECT * FROM t FOR NO KEY UPDATE NOWAIT
+T=ok                     P=ok | SELECT row_number() OVER (PARTITION BY a ORDER BY b) FROM t
+T=ok                     P=ok | SELECT sum(a) FILTER (WHERE b > 0) FROM t
+T=ok                     P=ok | SELECT a::text, CAST(b AS integer) FROM t
+T=ok                     P=ok | SELECT CASE WHEN a > 0 THEN 'p' ELSE 'n' END FROM t
+T=ok                     P=ok | SELECT data->>'k', data->'a'->0, data @> '{"k":1}' FROM t
+T=ok                     P=ok | SELECT data #>> '{a,b}' FROM t
+T=ok                     P=ok | SELECT ARRAY[1,2,3], a[1] FROM t
+T=ok                     P=ok | SELECT * FROM t WHERE name ILIKE $1
+T=ok                     P=ok | SELECT * FROM t WHERE name ~* 'x'
+T=ok                     P=ok | SELECT * FROM t WHERE created_at > now() - interval '1 day'
+T=ok                     P=ok | SELECT created_at AT TIME ZONE 'UTC' FROM t
+T=ok                     P=ok | SELECT coalesce(a, 0), nullif(b, ''), greatest(a, b) FROM t
+T=ok                     P=ok | SELECT extract(epoch FROM created_at) FROM t
+T=ok                     P=ok | SELECT * FROM generate_series(1, 10) g
+T=ok                     P=ok | SELECT * FROM unnest($1::int[]) AS x(id)
+T=ok                     P=ok | SELECT * FROM jsonb_to_recordset($1) AS x(a int, b text)
+T=ok                     P=ok | SELECT * FROM t TABLESAMPLE BERNOULLI (10)
+T=ok                     P=ok | SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((a), (b), ())
+T=ok                     P=ok | SELECT a, sum(c) FROM t GROUP BY ROLLUP (a)
+T=ok                     P=ok | SELECT * FROM t WHERE (a, b) IN ((1, 2), (3, 4))
+T=ok                     P=ok | SELECT * FROM t WHERE a BETWEEN 1 AND 2 AND b IS NOT NULL AND c IS DISTINCT FROM d
+T=ok                     P=ok | SELECT 'it''s', E'a\nb', $$dollar$$, $tag$tagged$tag$
+T=ok                     P=ok | SELECT "quoted col" FROM "Quoted Table"
+T=ok                     P=ok | SELECT * FROM public.t
+T=ok                     P=relation(a.b.c,not-public) | SELECT * FROM a.b.c
+T=ok                     P=ok | SELECT count(*) FROM t WHERE tsv @@ to_tsquery('x')
+T=ok                     P=ok | SELECT * FROM t ORDER BY embedding <-> $1 LIMIT 5
+T=ok                     P=function(current_user) | SELECT now(), current_user, current_setting('x')
+T=ok                     P=function(nextval) | SELECT nextval('s')
+T=ok                     P=function(setval) | SELECT setval('s', 1)
+T=comment                P=ok | SELECT /* comment */ 1
+T=comment                P=ok | SELECT 1 -- trailing comment
+T=semicolon              P=ok | SELECT ';'
+T=semicolon              P=ok | SELECT $$;$$
+T=comment                P=ok | SELECT 1 /* outer /* nested */ still comment */
+T=comment                P=ok | SELECT * FROM t WHERE a = 'x' /*! not mysql */
+T=ok                     P=not-read | SELECT * INTO new_table FROM t
+T=ok                     P=not-read | SELECT * INTO TEMP new_table FROM t
+T=ok                     P=ok | SELECT a FROM t WINDOW w AS (ORDER BY a)
+T=ok                     P=ok | SELECT * FROM t WHERE a = ALL (SELECT b FROM u)
+T=ok                     P=relation(ONLY,only) | SELECT * FROM ONLY t
+T=ok                     P=ok | SELECT * FROM t AS x (a, b)
+T=ok                     P=parse-error | SELECT * FROM ROWS FROM (generate_series(1, 2), generate_series(1, 3)) AS x(a, b)
+T=ok                     P=ok | SELECT * FROM t LIMIT ALL
+T=ok                     P=parse-error | SELECT * EXCLUDE (a) FROM t
+T=not-select             P=parse-error | FROM t SELECT a
+T=ok                     P=parse-error | SELECT * FROM t |> WHERE a > 1
+T=set-operation          P=ok | SELECT 1 WHERE 1 = 1 UNION SELECT 2 ORDER BY 1
+T=not-select             P=not-read | INSERT INTO t (a) VALUES ($1)
+T=not-select             P=not-read | INSERT INTO t (a, b) VALUES (1, 2), (3, 4) RETURNING id
+T=not-select             P=not-read | INSERT INTO t DEFAULT VALUES
+T=not-select             P=not-read | INSERT INTO t (a) SELECT a FROM u
+T=not-select             P=not-read | INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING
+T=not-select             P=not-read | INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b RETURNING *
+T=not-select             P=not-read | INSERT INTO t AS x (a) VALUES (1)
+T=not-select             P=not-read | INSERT INTO t (a) TABLE u
+T=not-select             P=not-read | UPDATE t SET a = 1 WHERE id = $1
+T=not-select             P=not-read | UPDATE t SET a = 1 WHERE id = $1 RETURNING a
+T=not-select             P=not-read | UPDATE t SET a = u.a FROM u WHERE t.id = u.id
+T=not-select             P=not-read | UPDATE t AS x SET a = 1
+T=not-select             P=not-read | UPDATE ONLY t SET a = 1
+T=not-select             P=not-read | UPDATE t SET (a, b) = (1, 2)
+T=not-select             P=not-read | UPDATE t SET a = (SELECT max(a) FROM u)
+T=not-select             P=not-read | DELETE FROM t WHERE id = $1
+T=not-select             P=not-read | DELETE FROM t WHERE id = $1 RETURNING *
+T=not-select             P=not-read | DELETE FROM t USING u WHERE t.id = u.id
+T=not-select             P=not-read | DELETE FROM ONLY t
+T=not-select             P=not-read | DELETE FROM t
+T=not-select             P=not-read | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET a = 1
+T=not-select             P=not-read | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN DELETE
+T=not-select             P=not-read | MERGE INTO t USING u ON t.a = u.a WHEN NOT MATCHED THEN INSERT (a) VALUES (u.a)
+T=not-select             P=not-read | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET a = 1 RETURNING t.a
+T=not-select             P=not-read | WITH a AS (SELECT 1 AS x) INSERT INTO t (a) SELECT x FROM a
+T=not-select             P=not-read | WITH a AS (SELECT 1 AS x) UPDATE t SET a = (SELECT x FROM a)
+T=not-select             P=not-read | WITH a AS (SELECT 1 AS x) INSERT INTO t (a) SELECT x FROM a RETURNING a
+T=not-select             P=not-read | WITH a AS (SELECT 1 AS x) UPDATE t SET a = (SELECT x FROM a) RETURNING a
+T=not-select             P=not-read | WITH a AS (SELECT 1 AS x) DELETE FROM t WHERE a IN (SELECT x FROM a)
+T=not-select             P=not-read | WITH a AS (SELECT 1 AS x) MERGE INTO t USING a ON t.a = a.x WHEN MATCHED THEN DELETE
+T=not-select             P=not-read | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins
+T=not-select             P=not-read | WITH ins AS (INSERT INTO t (a) VALUES (1)) SELECT 1
+T=not-select             P=not-read | WITH upd AS (UPDATE t SET a = 1 RETURNING a) SELECT * FROM upd
+T=not-select             P=not-read | WITH upd AS (UPDATE t SET a = 1 WHERE id = $1) SELECT 1
+T=not-select             P=not-read | WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del
+T=not-select             P=not-read | WITH del AS (DELETE FROM t WHERE id = $1) SELECT 1
+T=not-select             P=not-read | WITH m AS (MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN DELETE RETURNING t.a) SELECT * FROM m
+T=not-select             P=not-read | WITH a AS (SELECT 1), ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM a
+T=not-select             P=not-read | WITH a AS (SELECT 1), del AS (DELETE FROM t RETURNING a) SELECT * FROM a
+T=not-select             P=not-read | WITH RECURSIVE ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins
+T=not-select             P=not-read | WITH ins AS MATERIALIZED (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins
+T=ok                     P=not-read | SELECT * FROM (WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins) x
+T=ok                     P=not-read | SELECT * FROM (WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del) x
+T=ok                     P=not-read | SELECT * FROM t WHERE id IN (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
+T=ok                     P=not-read | SELECT (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
+T=set-operation          P=not-read | SELECT 1 UNION (WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins)
+T=not-select             P=not-read | WITH outer_cte AS (WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins) SELECT * FROM outer_cte
+T=not-select             P=not-read | WITH outer_cte AS (WITH del AS (DELETE FROM t RETURNING a) SELECT * FROM del) SELECT * FROM outer_cte
+T=ok                     P=not-read | SELECT * FROM t JOIN (WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT * FROM upd) x ON true
+T=ok                     P=not-read | SELECT * FROM t, LATERAL (WITH ins AS (INSERT INTO u (a) VALUES (t.a) RETURNING a) SELECT * FROM ins) x
+T=ok                     P=not-read | SELECT * FROM (INSERT INTO t (a) VALUES (1) RETURNING a) x
+T=ok                     P=not-read | SELECT * FROM (UPDATE t SET a = 1 RETURNING a) x
+T=ok                     P=not-read | SELECT * FROM (DELETE FROM t RETURNING a) x
+T=ok                     P=not-read | SELECT * FROM t WHERE a IN (DELETE FROM u RETURNING a)
+T=not-select             P=not-read | (INSERT INTO t (a) VALUES (1) RETURNING a)
+T=not-select             P=not-read | (DELETE FROM t RETURNING a)
+T=not-select             P=not-read | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) INSERT INTO u (a) SELECT a FROM ins
+T=not-select             P=not-read | WITH del AS (DELETE FROM t RETURNING a) INSERT INTO u (a) SELECT a FROM del
+T=not-select             P=not-read | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) VALUES (1)
+T=not-select             P=not-read | WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) TABLE ins
+T=ok                     P=not-read | SELECT * FROM t WHERE EXISTS (WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT 1 FROM upd)
+T=ok                     P=not-read | SELECT * FROM t ORDER BY (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
+T=ok                     P=not-read | SELECT * FROM t LIMIT (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
+T=not-select             P=not-read | INSERT INTO t (a) WITH del AS (DELETE FROM u RETURNING a) SELECT a FROM del
+T=not-select             P=not-read | INSERT INTO t (a) WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT a FROM upd
+T=not-select             P=not-read | UPDATE t SET a = (WITH ins AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM ins)
+T=not-select             P=not-read | DELETE FROM t WHERE a IN (WITH upd AS (UPDATE u SET a = 1 RETURNING a) SELECT a FROM upd)
+T=set-operation          P=not-read | SELECT 1 UNION SELECT a INTO new_table FROM t
+T=not-select             P=not-read | WITH a AS (SELECT 1 AS x) SELECT x INTO new_table FROM a
+T=ok                     P=not-read | SELECT * FROM (SELECT a INTO new_table FROM t) x
+T=not-select             P=not-read | CREATE TABLE t (a int)
+T=not-select             P=not-read | CREATE TABLE IF NOT EXISTS t (a int PRIMARY KEY, b text NOT NULL)
+T=not-select             P=not-read | CREATE TEMP TABLE t (a int)
+T=not-select             P=not-read | CREATE UNLOGGED TABLE t (a int)
+T=not-select             P=not-read | CREATE TABLE t AS SELECT * FROM u
+T=not-select             P=not-read | CREATE TABLE t (LIKE u)
+T=not-select             P=not-read | CREATE VIEW v AS SELECT 1
+T=not-select             P=not-read | CREATE OR REPLACE VIEW v AS SELECT 1
+T=not-select             P=not-read | CREATE MATERIALIZED VIEW v AS SELECT 1
+T=not-select             P=not-read | CREATE INDEX i ON t (a)
+T=not-select             P=not-read | CREATE UNIQUE INDEX CONCURRENTLY i ON t (a)
+T=not-select             P=not-read | CREATE SCHEMA s
+T=not-select             P=not-read | CREATE DATABASE d
+T=not-select             P=not-read | CREATE SEQUENCE s
+T=not-select             P=not-read | CREATE TYPE mood AS ENUM ('a', 'b')
+T=not-select             P=not-read | CREATE DOMAIN d AS int
+T=not-select             P=not-read | CREATE ROLE r
+T=not-select             P=not-read | CREATE USER u
+T=not-select             P=not-read | CREATE EXTENSION IF NOT EXISTS pgcrypto
+T=not-select             P=not-read | CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'
+T=not-select             P=not-read | CREATE OR REPLACE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql
+T=not-select             P=parse-error | CREATE PROCEDURE p() LANGUAGE sql AS 'SELECT 1'
+T=not-select             P=not-read | CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()
+T=not-select             P=not-read | CREATE POLICY p ON t USING (true)
+T=not-select             P=parse-error | CREATE RULE r AS ON INSERT TO t DO NOTHING
+T=not-select             P=not-read | CREATE SERVER s FOREIGN DATA WRAPPER w
+T=not-select             P=parse-error | CREATE PUBLICATION p FOR ALL TABLES
+T=not-select             P=parse-error | CREATE SUBSCRIPTION s CONNECTION 'x' PUBLICATION p
+T=not-select             P=parse-error | CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = f)
+T=not-select             P=parse-error | CREATE AGGREGATE a (int) (SFUNC = f, STYPE = int)
+T=not-select             P=not-read | CREATE COLLATION c (locale = 'C')
+T=not-select             P=parse-error | CREATE FOREIGN TABLE ft (a int) SERVER s
+T=not-select             P=parse-error | CREATE TABLESPACE ts LOCATION '/made/up'
+T=not-select             P=not-read | DROP TABLE t
+T=not-select             P=not-read | DROP TABLE IF EXISTS t CASCADE
+T=not-select             P=not-read | DROP VIEW v
+T=not-select             P=not-read | DROP INDEX i
+T=not-select             P=not-read | DROP SCHEMA s
+T=not-select             P=not-read | DROP DATABASE d
+T=not-select             P=not-read | DROP SEQUENCE s
+T=not-select             P=not-read | DROP TYPE mood
+T=not-select             P=not-read | DROP DOMAIN d
+T=not-select             P=not-read | DROP ROLE r
+T=not-select             P=not-read | DROP USER u
+T=not-select             P=not-read | DROP EXTENSION pgcrypto
+T=not-select             P=not-read | DROP FUNCTION f
+T=not-select             P=not-read | DROP PROCEDURE p
+T=not-select             P=not-read | DROP TRIGGER tr ON t
+T=not-select             P=not-read | DROP POLICY p ON t
+T=not-select             P=parse-error | DROP OWNED BY r
+T=not-select             P=not-read | ALTER TABLE t ADD COLUMN b int
+T=not-select             P=not-read | ALTER TABLE t DROP COLUMN b
+T=not-select             P=not-read | ALTER TABLE t RENAME TO u
+T=not-select             P=not-read | ALTER TABLE t ENABLE ROW LEVEL SECURITY
+T=not-select             P=not-read | ALTER TABLE t DISABLE ROW LEVEL SECURITY
+T=not-select             P=not-read | ALTER TABLE t OWNER TO r
+T=not-select             P=not-read | ALTER INDEX i RENAME TO j
+T=not-select             P=not-read | ALTER VIEW v AS SELECT 2
+T=not-select             P=not-read | ALTER ROLE r WITH SUPERUSER
+T=not-select             P=not-read | ALTER USER u WITH PASSWORD 'made-up'
+T=not-select             P=not-read | ALTER POLICY p ON t USING (false)
+T=not-select             P=not-read | ALTER TYPE mood ADD VALUE 'c'
+T=not-select             P=not-read | ALTER SCHEMA s RENAME TO s2
+T=not-select             P=parse-error | ALTER SEQUENCE s RESTART
+T=not-select             P=parse-error | ALTER DATABASE d SET x = 1
+T=not-select             P=parse-error | ALTER SYSTEM SET x = 1
+T=not-select             P=not-read | ALTER FUNCTION f() OWNER TO r
+T=not-select             P=parse-error | ALTER EXTENSION pgcrypto UPDATE
+T=not-select             P=parse-error | ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO r
+T=not-select             P=not-read | TRUNCATE t
+T=not-select             P=not-read | TRUNCATE TABLE t, u RESTART IDENTITY CASCADE
+T=not-select             P=not-read | GRANT SELECT ON t TO r
+T=not-select             P=not-read | GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO r
+T=not-select             P=parse-error | GRANT r TO u
+T=not-select             P=not-read | REVOKE SELECT ON t FROM r
+T=not-select             P=parse-error | REASSIGN OWNED BY r TO u
+T=not-select             P=parse-error | SECURITY LABEL ON TABLE t IS 'x'
+T=not-select             P=not-read | COMMENT ON TABLE t IS 'x'
+T=not-select             P=parse-error | REINDEX TABLE t
+T=not-select             P=parse-error | REFRESH MATERIALIZED VIEW v
+T=not-select             P=parse-error | CLUSTER t
+T=not-select             P=not-read | VACUUM
+T=not-select             P=not-read | VACUUM FULL t
+T=not-select             P=not-read | ANALYZE
+T=not-select             P=not-read | ANALYZE t
+T=not-select             P=parse-error | CHECKPOINT
+T=not-select             P=parse-error | IMPORT FOREIGN SCHEMA s FROM SERVER x INTO y
+T=not-select             P=not-read | COPY t TO STDOUT
+T=not-select             P=not-read | COPY t FROM STDIN
+T=not-select             P=not-read | COPY t TO PROGRAM 'made-up-command'
+T=not-select             P=not-read | COPY t FROM '/made/up/path'
+T=not-select             P=not-read | COPY (SELECT * FROM t) TO '/made/up/path'
+T=not-select             P=not-read | SET search_path TO public
+T=not-select             P=not-read | SET search_path = public
+T=not-select             P=not-read | SET LOCAL search_path TO public
+T=not-select             P=not-read | SET SESSION x = 1
+T=not-select             P=not-read | SET ROLE r
+T=not-select             P=not-read | SET LOCAL ROLE r
+T=not-select             P=not-read | SET ROLE NONE
+T=not-select             P=not-read | RESET ROLE
+T=not-select             P=not-read | RESET ALL
+T=not-select             P=not-read | RESET search_path
+T=not-select             P=not-read | SET SESSION AUTHORIZATION r
+T=not-select             P=not-read | SET TIME ZONE 'UTC'
+T=not-select             P=not-read | SET NAMES 'utf8'
+T=not-select             P=not-read | SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+T=not-select             P=parse-error | SET CONSTRAINTS ALL DEFERRED
+T=not-select             P=not-read | SET x.y = 'z'
+T=not-select             P=not-read | SHOW search_path
+T=not-select             P=not-read | SHOW ALL
+T=not-select             P=not-read | SHOW TABLES
+T=not-select             P=not-read | SHOW server_version
+T=not-select             P=not-read | LISTEN ch
+T=not-select             P=not-read | NOTIFY ch
+T=not-select             P=not-read | NOTIFY ch, 'payload'
+T=not-select             P=not-read | UNLISTEN ch
+T=not-select             P=not-read | UNLISTEN *
+T=not-select             P=not-read | PREPARE p AS SELECT 1
+T=not-select             P=not-read | PREPARE p (int) AS DELETE FROM t WHERE id = $1
+T=not-select             P=not-read | EXECUTE p
+T=not-select             P=not-read | EXECUTE p (1)
+T=not-select             P=not-read | DEALLOCATE p
+T=not-select             P=not-read | DEALLOCATE ALL
+T=not-select             P=not-read | BEGIN
+T=not-select             P=not-read | BEGIN TRANSACTION
+T=not-select             P=not-read | BEGIN ISOLATION LEVEL SERIALIZABLE
+T=not-select             P=not-read | START TRANSACTION
+T=not-select             P=not-read | COMMIT
+T=not-select             P=not-read | END
+T=not-select             P=not-read | ROLLBACK
+T=not-select             P=not-read | ABORT
+T=not-select             P=not-read | ROLLBACK TO SAVEPOINT s
+T=not-select             P=not-read | SAVEPOINT s
+T=not-select             P=not-read | RELEASE SAVEPOINT s
+T=not-select             P=not-read | RELEASE s
+T=not-select             P=not-read | DISCARD ALL
+T=not-select             P=not-read | DISCARD PLANS
+T=not-select             P=not-read | USE d
+T=not-select             P=not-read | LOAD 'made_up_library'
+T=not-select             P=parse-error | INSTALL made_up
+T=not-select             P=not-read | PRAGMA x
+T=not-select             P=not-read | LOCK TABLE t
+T=not-select             P=not-read | LOCK TABLE t IN ACCESS EXCLUSIVE MODE
+T=not-select             P=parse-error | LOCK TABLES t WRITE
+T=not-select             P=parse-error | UNLOCK TABLES
+T=not-select             P=not-read | KILL 1
+T=not-select             P=not-read | DECLARE c CURSOR FOR SELECT 1
+T=not-select             P=not-read | FETCH NEXT FROM c
+T=not-select             P=not-read | FETCH ALL IN c
+T=not-select             P=parse-error | MOVE NEXT FROM c
+T=not-select             P=not-read | CLOSE c
+T=not-select             P=not-read | CLOSE ALL
+T=not-select             P=not-read | CALL p()
+T=not-select             P=not-read | CALL p(1, 2)
+T=not-select             P=parse-error | DO $$ BEGIN DELETE FROM t; END $$
+T=not-select             P=parse-error | DO LANGUAGE plpgsql $$ BEGIN PERFORM 1; END $$
+T=not-select             P=not-read | EXPLAIN SELECT 1
+T=not-select             P=not-read | EXPLAIN ANALYZE SELECT 1
+T=not-select             P=not-read | EXPLAIN ANALYZE DELETE FROM t
+T=not-select             P=not-read | EXPLAIN (ANALYZE, BUFFERS) INSERT INTO t (a) VALUES (1)
+T=not-select             P=not-read | EXPLAIN ANALYZE CREATE TABLE x AS SELECT 1
+T=not-select             P=not-read | EXPLAIN t
+T=not-select             P=not-read | DESCRIBE t
+T=not-select             P=not-read | ATTACH DATABASE 'x' AS y
+T=not-select             P=parse-error | DETACH DATABASE y
+T=not-select             P=parse-error | FLUSH TABLES
+T=not-select             P=parse-error | OPTIMIZE TABLE t
+T=not-select             P=not-read | ASSERT 1 = 1
+T=not-select             P=parse-error | RAISE NOTICE 'x'
+T=not-select             P=not-read | PRINT 'x'
+T=not-select             P=not-read | RETURN 1
+T=not-select             P=not-read | IF 1 = 1 THEN SELECT 1; END IF
+T=not-select             P=parse-error | WHILE 1 = 1 DO SELECT 1; END WHILE
+T=not-select             P=parse-error | BEGIN SELECT 1; END
+T=not-select             P=not-read | OPEN c
+T=not-select             P=not-read | RENAME TABLE t TO u
+T=not-select             P=not-read | EXPORT DATA OPTIONS(uri = 'x') AS SELECT 1
+T=not-select             P=not-read | DENY SELECT ON t TO r
+T=not-select             P=not-read | THROW
+T=not-select             P=not-read | WAITFOR DELAY '00:00:01'
+T=ok                     P=function(set_config) | SELECT set_config('search_path', 'x', false)
+T=ok                     P=function(set_config) | SELECT SET_CONFIG('search_path', 'x', false)
+T=schema(pg_catalog)     P=function(pg_catalog.set_config) | SELECT pg_catalog.set_config('search_path', 'x', false)
+T=ok                     P=function("set_config") | SELECT "set_config"('search_path', 'x', false)
+T=ok                     P=function(public.set_config) | SELECT public.set_config('search_path', 'x', false)
+T=ok                     P=function(a.b.set_config) | SELECT a.b.set_config('search_path', 'x', false)
+T=ok                     P=function(pg_notify) | SELECT pg_notify('ch', 'x')
+T=ok                     P=function(query_to_xml) | SELECT query_to_xml('DELETE FROM t', true, true, '')
+T=schema(pg_catalog)     P=function(pg_catalog.query_to_xml) | SELECT pg_catalog.query_to_xml('SELECT 1', true, true, '')
+T=ok                     P=function(table_to_xml) | SELECT table_to_xml('t', true, true, '')
+T=ok                     P=function(cursor_to_xml) | SELECT cursor_to_xml('c', 1, true, true, '')
+T=ok                     P=function(schema_to_xml) | SELECT schema_to_xml('public', true, true, '')
+T=ok                     P=function(database_to_xml) | SELECT database_to_xml(true, true, '')
+T=ok                     P=function(xmltable) | SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
+T=ok                     P=function(ts_stat) | SELECT word FROM ts_stat('SELECT to_tsvector(a) FROM t')
+T=ok                     P=function(ts_stat) | SELECT * FROM t, LATERAL ts_stat('SELECT to_tsvector(a) FROM t') s
+T=schema(pg_catalog)     P=function(pg_catalog.ts_stat) | SELECT pg_catalog.ts_stat('SELECT to_tsvector(a) FROM t')
+T=ok                     P=function(ts_rewrite) | SELECT ts_rewrite('a'::tsquery, 'SELECT a, b FROM t')
+T=ok                     P=function(ts_rewrite) | SELECT ts_rewrite('a'::tsquery, 'a'::tsquery, 'b'::tsquery)
+T=ok                     P=function(crosstab) | SELECT * FROM crosstab('SELECT a, b, c FROM t') AS ct(a text, b text)
+T=ok                     P=ok | SELECT to_tsvector('simple', a) FROM t
+T=ok                     P=function(xmltable) | SELECT * FROM t, XMLTABLE('/a' PASSING t.x COLUMNS a int PATH 'a') AS q
+T=ok                     P=parse-error | SELECT * FROM t JOIN LATERAL xmltable('/a' PASSING t.x COLUMNS a int PATH 'a') q ON true
+T=not-select             P=function(xmltable) | WITH q AS (SELECT * FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')) SELECT * FROM q
+T=not-select             P=not-read | INSERT INTO t (a) SELECT a FROM xmltable('/a' PASSING x COLUMNS a int PATH 'a')
+T=ok                     P=function(pg_advisory_lock) | SELECT pg_advisory_lock(1)
+T=ok                     P=function(pg_advisory_xact_lock) | SELECT pg_advisory_xact_lock(1)
+T=ok                     P=function(pg_try_advisory_lock) | SELECT pg_try_advisory_lock(1)
+T=ok                     P=function(pg_advisory_unlock_all) | SELECT pg_advisory_unlock_all()
+T=ok                     P=function(lo_import) | SELECT lo_import('/made/up')
+T=ok                     P=function(lo_export) | SELECT lo_export(1, '/made/up')
+T=ok                     P=function(lo_unlink) | SELECT lo_unlink(1)
+T=ok                     P=function(lo_from_bytea) | SELECT lo_from_bytea(0, 'x')
+T=ok                     P=function(set_config) | SELECT a FROM t WHERE set_config('x', 'y', false) IS NOT NULL
+T=ok                     P=function(pg_advisory_lock) | SELECT a FROM t ORDER BY pg_advisory_lock(a)
+T=ok                     P=function(pg_advisory_lock) | SELECT a FROM t GROUP BY a HAVING pg_advisory_lock(a) IS NULL
+T=ok                     P=function(pg_advisory_lock) | SELECT count(*) FILTER (WHERE pg_advisory_lock(a) IS NULL) FROM t
+T=ok                     P=function(pg_advisory_lock) | SELECT sum(a) OVER (ORDER BY pg_advisory_lock(a)) FROM t
+T=ok                     P=function(set_config) | SELECT CASE WHEN true THEN set_config('x', 'y', false) END
+T=ok                     P=function(set_config) | SELECT coalesce(set_config('x', 'y', false), 'z')
+T=ok                     P=function(set_config) | SELECT (set_config('x', 'y', false))
+T=ok                     P=function(set_config) | SELECT set_config('x', 'y', false)::text
+T=ok                     P=function(set_config) | SELECT * FROM set_config('x', 'y', false)
+T=schema(pg_catalog)     P=function(pg_catalog.set_config) | SELECT * FROM pg_catalog.set_config('x', 'y', false)
+T=ok                     P=function(query_to_xml) | SELECT * FROM query_to_xml('SELECT 1', true, true, '') q
+T=ok                     P=function(query_to_xml) | SELECT * FROM t, LATERAL query_to_xml('SELECT 1', true, true, '') q
+T=ok                     P=parse-error | SELECT * FROM ROWS FROM (query_to_xml('SELECT 1', true, true, '')) q
+T=ok                     P=function(lo_import) | SELECT * FROM t JOIN LATERAL lo_import('/made/up') x ON true
+T=not-select             P=function(set_config) | WITH a AS (SELECT set_config('x', 'y', false)) SELECT * FROM a
+T=ok                     P=function(pg_notify) | SELECT * FROM (SELECT pg_notify('ch', 'x')) q
+T=set-operation          P=function(set_config) | SELECT 1 UNION SELECT length(set_config('x', 'y', false))
+T=not-select             P=not-read | INSERT INTO t (a) VALUES (set_config('x', 'y', false))
+T=not-select             P=not-read | INSERT INTO t (a) SELECT set_config('x', 'y', false)
+T=not-select             P=not-read | INSERT INTO t (a) VALUES (1) RETURNING set_config('x', 'y', false)
+T=not-select             P=not-read | INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = set_config('x', 'y', false)
+T=not-select             P=not-read | UPDATE t SET a = set_config('x', 'y', false)
+T=not-select             P=not-read | UPDATE t SET a = 1 WHERE pg_advisory_lock(1) IS NULL
+T=not-select             P=not-read | DELETE FROM t WHERE lo_unlink(a) = 1
+T=not-select             P=not-read | DELETE FROM t RETURNING pg_notify('ch', a)
+T=not-select             P=not-read | MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET a = set_config('x', 'y', false)
+T=ok                     P=function(pg_sleep) | SELECT pg_sleep(1)
+T=ok                     P=function(pg_read_file) | SELECT pg_read_file('/made/up')
+T=ok                     P=function(pg_read_server_files) | SELECT pg_read_server_files()
+T=ok                     P=function(pg_ls_dir) | SELECT pg_ls_dir('.')
+T=ok                     P=function(pg_terminate_backend) | SELECT pg_terminate_backend(1)
+T=ok                     P=function(pg_cancel_backend) | SELECT pg_cancel_backend(1)
+T=ok                     P=function(dblink) | SELECT * FROM dblink('made-up', 'SELECT 1') AS x(a int)
+T=ok                     P=function(dblink_exec) | SELECT dblink_exec('made-up', 'DELETE FROM t')
+T=ok                     P=function(pg_reload_conf) | SELECT pg_reload_conf()
+T=ok                     P=function(pg_stat_reset) | SELECT pg_stat_reset()
+T=ok                     P=function(current_setting) | SELECT current_setting('x')
+T=ok                     P=function(set_config) | SELECT a FROM t WHERE a = ANY(ARRAY(SELECT set_config('x', 'y', false)))
+T=ok                     P=function(set_config) | SELECT ARRAY[set_config('x', 'y', false)]
+T=ok                     P=function(set_config) | SELECT ROW(set_config('x', 'y', false))
+T=ok                     P=function(set_config) | SELECT set_config(set_config('x', 'y', false), 'z', false)
+T=ok                     P=function(set_config) | SELECT a FROM t LIMIT length(set_config('x', 'y', false))
+T=ok                     P=function(set_config) | SELECT a FROM t OFFSET length(set_config('x', 'y', false))
+T=ok                     P=parse-error | SELECT a FROM t FETCH FIRST length(set_config('x', 'y', false)) ROWS ONLY
+T=ok                     P=function(set_config) | SELECT DISTINCT ON (set_config('x', 'y', false)) a FROM t
+T=ok                     P=function(set_config) | SELECT a FROM t TABLESAMPLE BERNOULLI (length(set_config('x', 'y', false)))
+T=ok                     P=function(set_config) | SELECT * FROM t JOIN u ON set_config('x', 'y', false) = u.a
+T=ok                     P=function(set_config) | SELECT a FROM t WINDOW w AS (PARTITION BY set_config('x', 'y', false))
+T=ok                     P=ok | SELECT a FROM t FOR UPDATE OF t
+T=not-select             P=function(set_config) | VALUES (set_config('x', 'y', false))
+T=ok                     P=function(set_config) | SELECT extract(epoch FROM set_config('x', 'y', false)::timestamptz)
+T=ok                     P=function(pg_advisory_lock) | SELECT a FROM t WHERE a IN (SELECT pg_advisory_lock(1))
+T=ok                     P=function(lo_import) | SELECT a FROM t WHERE a BETWEEN lo_import('/made/up') AND 2
+T=ok                     P=function(set_config) | SELECT set_config ('x', 'y', false)
+T=comment                P=function(set_config) | SELECT set_config/**/('x', 'y', false)
+T=schema(pg_catalog)     P=function(pg_catalog.set_config) | SELECT pg_catalog . set_config('x', 'y', false)
+T=schema(pg_catalog)     P=parse-error | SELECT (pg_catalog.set_config)('x', 'y', false)
+T=semicolon              P=statements=2 | SELECT 1; SELECT 2
+T=semicolon              P=statements=2 | SELECT 1; DROP TABLE t
+T=semicolon              P=statements=2 | SELECT 1; DELETE FROM t
+T=semicolon              P=ok | SELECT 1;;
+T=not-select             P=statements=0 | ;
+T=not-select             P=ok | ; SELECT 1
+T=not-select             P=statements=0 | -- only a comment
+T=not-select             P=statements=0 | /* only a comment */
+T=semicolon              P=ok | SELECT 1 -- ; DROP TABLE t
+T=semicolon              P=ok | SELECT 1 /* ; DROP TABLE t */
+T=semicolon              P=statements=2 | SELECT 'a;b'; DELETE FROM t
+T=semicolon              P=statements=2 | SELECT $$a$$; DELETE FROM t
+T=semicolon              P=statements=2 | SELECT $x$ $$ ; $x$; DELETE FROM t
+T=semicolon              P=ok | SELECT E'\'; DELETE FROM t; --'
+T=semicolon              P=statements=2 | SELECT 'a\'; DELETE FROM t; --'
+T=ok                     P=ok | SELECT U&'d\0061t\+000061'
+T=semicolon              P=ok | SELECT 1 /* /* */ ; DELETE FROM t; -- */
+T=semicolon              P=ok | SELECT "a;b" FROM t
+T=semicolon              P=ok | SELECT 1 FROM t WHERE a = 'x' -- '; DELETE FROM t
+T=not-select             P=statements=3 | BEGIN; DELETE FROM t; COMMIT
+T=ok                     P=ok | SELECT (((((((((((((((((((((1)))))))))))))))))))))
+T=ok                     P=parse-error | SELECT
+T=ok                     P=parse-error | SELECT FROM
+T=not-select             P=parse-error | SELEC 1
+T=not-select             P=parse-error | INSERT INTO
+T=not-select             P=parse-error | )(
+T=ok                     P=ok | SELECT * FROM public.t
+T=ok                     P=ok | SELECT * FROM PUBLIC.t WHERE id = $1
+T=ok                     P=relation(other_schema.t,not-public) | SELECT * FROM other_schema.t
+T=ok                     P=relation(a.b.c,not-public) | SELECT * FROM a.b.c
+T=ok                     P=relation("Public".t,not-public) | SELECT * FROM "Public".t
+T=schema(information_schema) P=relation(information_schema.tables,not-public) | SELECT table_name FROM information_schema.tables
+T=schema(pg_catalog)     P=relation(pg_catalog.pg_class,not-public) | SELECT relname FROM pg_catalog.pg_class
+T=ok                     P=relation(pg_class,catalog) | SELECT relname FROM pg_class
+T=ok                     P=relation(pg_stat_statements,catalog) | SELECT * FROM pg_stat_statements
+T=ok                     P=relation(pg_roles,catalog) | SELECT * FROM t WHERE EXISTS (SELECT 1 FROM pg_roles)
+T=ok                     P=relation(ONLY,only) | SELECT * FROM ONLY t
+T=ok                     P=ok | SELECT * FROM "only"
+T=table(api_keys)        P=relation(api_keys,blocked) | SELECT * FROM api_keys
+T=table(api_keys)        P=relation("API_KEYS",blocked) | SELECT * FROM "API_KEYS"
+T=ok                     P=ok | SELECT lower(name), count(*) FROM public.t WHERE created_at > now() - interval '1 day' GROUP BY 1
+T=ok                     P=ok | SELECT date_trunc('hour', created_at) AS h, avg(duration_ms) FROM t GROUP BY 1 ORDER BY 1
+T=ok                     P=ok | SELECT id, payload->>'kind' AS kind, jsonb_array_length(payload->'items') FROM t LIMIT 10

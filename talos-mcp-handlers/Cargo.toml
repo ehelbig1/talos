@@ -123,6 +123,7 @@ talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-metrics = { path = "../talos-metrics" }
 talos-execution-pause = { path = "../talos-execution-pause" }
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
+talos-admin-query-gate = { path = "../talos-admin-query-gate" }  # what SQL query_paginated may run
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-types = { path = "../talos-workflow-types" }
 talos-workflow-validation = { path = "../talos-workflow-validation" }

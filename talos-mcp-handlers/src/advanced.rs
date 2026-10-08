@@ -46,104 +46,6 @@ static APPROVAL_GATE_NOTIFY_CLIENT: std::sync::LazyLock<reqwest::Client> =
         )
     });
 
-/// MCP-1002 (2026-05-15): single source of truth for the
-/// `query_paginated` blocklist of auth/credential/bearer-token tables.
-/// Module-scoped so both the function-level runtime guard AND the
-/// precompiled `BLOCKED_TABLE_RES` regex set reference the same
-/// compile-time list. Pre-fix the list was duplicated between an outer
-/// function-scope `const` and an inner `const TABLES` inside the
-/// LazyLock initializer — a swap between the two would have escaped
-/// the `debug_assert_eq!` length-only check.
-pub(crate) const BLOCKED_TABLES_LIST: &[&str] = &[
-    "user_sessions",
-    "mcp_agents",
-    "encryption_keys",
-    "oauth_accounts",
-    "oauth_credential",
-    "refresh_tokens",
-    "users",
-    "secrets",
-    "secret_audit_log",
-    "totp_secrets",
-    "auth_events",
-    "admin_event_log",
-    "workflow_approval_gates",
-    "api_keys",
-    "oauth_state_tokens",
-    "user_capability_grants",
-    // MCP-1009 (2026-06-23): integration/webhook tables that still hold
-    // credential-class material reachable cross-tenant by this
-    // platform-admin-only tool. The OAuth *plaintext* token columns were
-    // already dropped (migrations 20260310001300 + 036 + 20260413000002/3),
-    // so this is NOT a plaintext leak — but the surviving columns are still
-    // credential-class and no single role should bulk-exfiltrate them:
-    //   * `slack_integrations` — `bot_token_enc` / `access_token_enc`
-    //     (AES-256-GCM ciphertext, mig 018) + a still-PLAINTEXT
-    //     `verification_token VARCHAR` (mig 004, never dropped).
-    //   * `webhook_triggers` (renamed from `webhook_listeners` in mig 015)
-    //     — still-PLAINTEXT `verification_token TEXT NOT NULL` (the inbound
-    //     webhook bearer) + `signing_secret_enc` BYTEA / `signing_key_id`
-    //     (mig 20260312000200; plaintext `signing_secret` dropped in
-    //     20260408000002).
-    //   * `google_calendar_watch_channels` — had a still-PLAINTEXT
-    //     `verification_token TEXT NOT NULL` (the per-channel webhook secret,
-    //     mig 010_watch_channel_security). DROPPED 2026-09-12 (migration
-    //     20260912100000): channels moved to `integration_state` and the table
-    //     had held zero rows with no writer. The deny-list entry is RETAINED as
-    //     forward-protection, the `workspace_oci_settings` precedent below.
-    //   * `workspace_oci_settings` — DROPPED as dead/never-wired schema
-    //     (mig 20260627120000; it had `password_encrypted`/`password_nonce`
-    //     columns but no crypto code ever populated them — OCI creds come from
-    //     env vars). The deny-list entry is RETAINED as forward-protection: if
-    //     the per-workspace-creds feature is ever rebuilt, it stays
-    //     export-blocked by default.
-    // Deliberately NOT added: `gmail_integrations` and
-    // `google_calendar_integrations` — both plaintext AND encrypted token
-    // columns were dropped from these (036/20260310001300 +
-    // 20260413000002/3); no credential-class column survives (tokens now
-    // live in `integration_state` / the `secrets` table, already blocked).
-    "slack_integrations",
-    "webhook_triggers",
-    "google_calendar_watch_channels",
-    "workspace_oci_settings",
-];
-
-/// MCP-627 / MCP-1002: the precompiled per-table word-boundary regex set
-/// used by `query_paginated`'s blocklist guard. Compiled ONCE (fail-closed
-/// at first use if a pattern can't compile — impossible in practice since
-/// patterns are `regex::escape`d over `[a-z0-9_]` strings) and shared by
-/// both the runtime guard and the unit tests so the test exercises the
-/// real production matcher rather than a drifting copy (Talos testing
-/// convention: extract, don't shadow).
-pub(crate) static BLOCKED_TABLE_RES: std::sync::LazyLock<Vec<(&'static str, regex::Regex)>> =
-    std::sync::LazyLock::new(|| {
-        BLOCKED_TABLES_LIST
-            .iter()
-            .map(|t| {
-                let pattern = format!(r"(?:^|[^a-z0-9_]){}(?:$|[^a-z0-9_])", regex::escape(t));
-                let re = regex::Regex::new(&pattern)
-                    .expect("BUG: BLOCKED_TABLES word-boundary regex must compile");
-                (*t, re)
-            })
-            .collect()
-    });
-
-/// Returns `Some(table)` if `query` references a blocked credential/auth
-/// table (after the same lowercase + dequote normalization the handler
-/// applies), else `None`. Single source of truth for the blocklist match
-/// so the `query_paginated` guard and its unit tests share one code path.
-pub(crate) fn blocked_table_in_query(query: &str) -> Option<&'static str> {
-    // Normalize: lowercase, then strip SQL quoted identifiers so "Users"
-    // / "USERS" / `"users"` are all caught.
-    let unquoted = query.to_lowercase().replace('"', " ");
-    for (table, re) in BLOCKED_TABLE_RES.iter() {
-        if re.is_match(&unquoted) {
-            return Some(table);
-        }
-    }
-    None
-}
-
 /// MCP-205 (2026-05-08): lightweight semver-ish check.
 ///
 /// Returns true for strings that match the MAJOR.MINOR.PATCH shape
@@ -231,101 +133,6 @@ mod semver_tests {
     }
 }
 
-#[cfg(test)]
-mod blocked_tables_tests {
-    use super::{blocked_table_in_query, BLOCKED_TABLES_LIST, BLOCKED_TABLE_RES};
-
-    /// The runtime guard's `debug_assert_eq!` only fires in debug builds;
-    /// pin the regex-set / list lockstep here so a release build can't
-    /// drift either (every list entry MUST get a compiled regex).
-    #[test]
-    fn regex_set_matches_list_length() {
-        assert_eq!(
-            BLOCKED_TABLE_RES.len(),
-            BLOCKED_TABLES_LIST.len(),
-            "every blocked table must have a compiled word-boundary regex"
-        );
-    }
-
-    /// Every table in the canonical list must be caught when referenced
-    /// in a representative SELECT — guards against a list entry whose
-    /// regex somehow fails to match its own name.
-    #[test]
-    fn every_listed_table_is_blocked() {
-        for t in BLOCKED_TABLES_LIST {
-            let q = format!("SELECT * FROM {t} LIMIT 10");
-            assert_eq!(
-                blocked_table_in_query(&q),
-                Some(*t),
-                "blocklist must reject a query against {t}"
-            );
-        }
-    }
-
-    /// MCP-1009: the four newly-added integration/webhook credential
-    /// tables must be rejected — including across casing and quoted-
-    /// identifier bypass attempts the normalization is meant to defeat.
-    #[test]
-    fn mcp_1009_integration_tables_blocked() {
-        let cases: &[(&str, &str)] = &[
-            ("slack_integrations", "SELECT * FROM slack_integrations"),
-            (
-                "slack_integrations",
-                r#"SELECT verification_token FROM "Slack_Integrations""#,
-            ),
-            ("webhook_triggers", "SELECT * FROM webhook_triggers"),
-            (
-                "webhook_triggers",
-                "select signing_secret_enc from WEBHOOK_TRIGGERS where id=1",
-            ),
-            (
-                "google_calendar_watch_channels",
-                "SELECT verification_token FROM google_calendar_watch_channels",
-            ),
-            (
-                "google_calendar_watch_channels",
-                r#"SELECT * FROM "GOOGLE_CALENDAR_WATCH_CHANNELS""#,
-            ),
-            (
-                "workspace_oci_settings",
-                "SELECT password_encrypted FROM workspace_oci_settings",
-            ),
-            (
-                "workspace_oci_settings",
-                "select * from Workspace_OCI_Settings",
-            ),
-        ];
-        for (expected, query) in cases {
-            assert_eq!(
-                blocked_table_in_query(query),
-                Some(*expected),
-                "query {query:?} must be blocked as {expected}"
-            );
-        }
-    }
-
-    /// Negative controls: the deliberately-NOT-blocked integration tables
-    /// (no credential-class column survives the token-drop migrations) and
-    /// an unrelated table must pass. A substring of a blocked name (e.g.
-    /// `my_workspace_oci_settings_archive`) is intentionally NOT a
-    /// word-boundary match and so is allowed.
-    #[test]
-    fn unrelated_and_dropped_token_tables_allowed() {
-        for q in [
-            "SELECT * FROM gmail_integrations",
-            "SELECT * FROM google_calendar_integrations",
-            "SELECT * FROM workflow_executions",
-            "SELECT * FROM my_workspace_oci_settings_archive",
-        ] {
-            assert_eq!(
-                blocked_table_in_query(q),
-                None,
-                "query {q:?} should NOT be blocked"
-            );
-        }
-    }
-}
-
 // Graph-JSON draft heuristics (`count_nodes_with_empty_data` /
 // `is_substantive_workflow`) moved to `talos-hygiene-service` in the
 // 2026-07 extraction, and on to the LEAF crate `talos-draft-heuristics` in
@@ -361,8 +168,15 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 functions write, advance a sequence or lock rows is refused by the database. \
                 Security controls enforced: SELECT-only (no INSERT/UPDATE/DELETE/DDL), no semicolons, \
                 no UNION/INTERSECT/EXCEPT, no CTEs, no EXPLAIN, no SQL comments. \
-                Access to auth/encryption tables (user_sessions, mcp_agents, encryption_keys, \
-                oauth_accounts, refresh_tokens, secret_audit_log) and system schemas is blocked. \
+                The query is parsed and must be one statement that reads. It may call only functions \
+                on Talos's SQL function allow list (aggregates, window, string, numeric, date/time, \
+                JSON, arrays, coalesce/nullif, hashing, generate_series/unnest), named bare or \
+                pg_catalog-qualified; anything else, including current_setting, nextval and every \
+                pg_* server function, is refused and the error names it. It may read only tables in \
+                the public schema, named bare or public-qualified: not system catalogs (pg_*), not \
+                information_schema, and not auth/credential tables (users, user_sessions, mcp_agents, \
+                encryption_keys, oauth_accounts, refresh_tokens, secrets, secret_audit_log, api_keys \
+                and others). \
                 Queries are NOT automatically user-scoped — admin queries see all tenants' data. \
                 Supports optional cursor-based pagination for efficient large-offset queries.",
             "inputSchema": {
@@ -951,117 +765,19 @@ async fn handle_query_paginated(
         );
     }
 
-    let query_str = match args.get("query").and_then(|v| v.as_str()) {
-        Some(q) if q.len() > 10_000 => {
-            return mcp_error(req_id, -32602, "query must be ≤ 10 000 characters")
-        }
-        Some(q) if !q.is_empty() => q,
-        _ => return mcp_error(req_id, -32602, "Missing or empty 'query' parameter"),
+    // What SQL may run: the text rules (MCP-627 / MCP-1002) and the parsed
+    // gate (2026-10-08) — one statement, a read, only functions the allow
+    // list admits, only public tables that are not withheld — live in
+    // `talos_admin_query_gate`, where they are unit-tested and recorded over
+    // the shared SQL corpus. `BLOCKED_TABLES_LIST` moved there with them.
+    let base_query = match talos_admin_query_gate::validate_paginated_query(
+        args.get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    ) {
+        Ok(query) => query,
+        Err(refusal) => return mcp_error(req_id, -32602, &refusal.message()),
     };
-
-    // Validate: only SELECT queries allowed
-    let trimmed = query_str.trim();
-    if !trimmed.to_uppercase().starts_with("SELECT") {
-        return mcp_error(req_id, -32602, "Only SELECT queries are allowed");
-    }
-
-    // SECURITY: Reject queries containing semicolons (prevent statement chaining)
-    if trimmed.contains(';') {
-        return mcp_error(req_id, -32602, "Query must not contain semicolons");
-    }
-
-    // SECURITY: Block dangerous SQL constructs
-    let query_upper = trimmed.to_uppercase();
-    if query_upper.contains("UNION")
-        || query_upper.contains("INTERSECT")
-        || query_upper.contains("EXCEPT")
-    {
-        return mcp_error(
-            req_id,
-            -32602,
-            "Query cannot contain UNION, INTERSECT, or EXCEPT clauses",
-        );
-    }
-    if trimmed.contains("--") || trimmed.contains("/*") {
-        return mcp_error(req_id, -32602, "Query cannot contain SQL comments");
-    }
-
-    // SECURITY: Block CTEs and EXPLAIN which can reveal schema or bypass table restrictions
-    if query_upper.starts_with("WITH ") {
-        return mcp_error(req_id, -32602, "CTEs (WITH ... AS) are not allowed");
-    }
-    if query_upper.starts_with("EXPLAIN") {
-        return mcp_error(req_id, -32602, "EXPLAIN queries are not allowed");
-    }
-
-    // SECURITY: Block access to sensitive auth/credential tables and system schemas.
-    // Note: blocklist approach is defence-in-depth; this tool is already admin-only.
-    // Matching uses word-boundary regex to avoid bypasses via quoting, casing, or aliases.
-    //
-    // MCP-1002 (2026-05-15): four tables added to the blocklist —
-    //   * `workflow_approval_gates` — the `token` column IS the bearer
-    //     auth for `approval_gate_handler`. Anyone holding the
-    //     64-hex-char token can approve/reject the corresponding
-    //     workflow gate (no session, no API key). A platform admin
-    //     listing rows from this table would gain consent-bypass over
-    //     every pending approval gate across all tenants.
-    //   * `api_keys` — `key_hash` is bcrypt'd but `key_prefix`,
-    //     `user_id`, `scopes`, `expires_at`, `last_used_at` collectively
-    //     form a reconnaissance set: who has admin scope across which
-    //     tenants, which keys are stale-but-active, etc. Same blocklist
-    //     class as the rest of the credential family.
-    //   * `oauth_state_tokens` — `pkce_verifier` is short-lived (10 min
-    //     TTL, consumed-on-first-use) credential material. Reading
-    //     in-flight verifiers would let an attacker who's already
-    //     intercepted the OAuth callback URL complete the
-    //     code-for-token exchange.
-    //   * `user_capability_grants` — cross-tenant elevation enumeration
-    //     surface (the QUERY counterpart of the data MCP-998 closed on
-    //     the GraphQL side). Same "list every elevated user
-    //     platform-wide" reconnaissance shape, just via a different
-    //     tool surface.
-    //
-    // Sibling drift fix: pre-MCP-1002 the BLOCKED_TABLES list was
-    // duplicated between an outer `const` and an inner `const TABLES`
-    // inside the LazyLock initializer. The `debug_assert_eq!` only
-    // checked LENGTH parity, so a swap of one table for another would
-    // pass undetected. The inner duplicate is removed — the LazyLock
-    // now iterates over the outer const directly. Single source of
-    // truth; no length-only-comparison drift hazard.
-    // MCP-1002 / MCP-627: the per-table word-boundary regex set and the
-    // match predicate now live at module scope (`BLOCKED_TABLE_RES` /
-    // `blocked_table_in_query`) so the runtime guard and the unit tests
-    // share ONE matcher — no drifting test-local copy. The regex set is
-    // compiled once (fail-closed at first use) and the list is a single
-    // module-scope `const` consumed by both, so a swap of one table for
-    // another can't escape a length-only `debug_assert_eq!`.
-    const BLOCKED_SCHEMAS: &[&str] = &["pg_catalog", "information_schema", "pg_toast"];
-    debug_assert_eq!(
-        BLOCKED_TABLE_RES.len(),
-        BLOCKED_TABLES_LIST.len(),
-        "BLOCKED_TABLE_RES and BLOCKED_TABLES_LIST must stay in lockstep"
-    );
-    if let Some(table) = blocked_table_in_query(trimmed) {
-        return mcp_error(
-            req_id,
-            -32602,
-            &format!("Access to '{}' is not permitted via query_paginated", table),
-        );
-    }
-    // Schema check reuses the same lowercase + dequote normalization.
-    let unquoted = trimmed.to_lowercase().replace('"', " ");
-    for schema in BLOCKED_SCHEMAS {
-        if unquoted.contains(schema) {
-            return mcp_error(
-                req_id,
-                -32602,
-                &format!(
-                    "Access to '{}' schema is not permitted via query_paginated",
-                    schema
-                ),
-            );
-        }
-    }
 
     let page_size = match crate::utils::validate_range_i64(args, "page_size", 1, 1000, 100, &req_id)
     {
@@ -1142,13 +858,10 @@ async fn handle_query_paginated(
         _ => {}
     }
 
-    let base_query = trimmed.trim_end_matches(';');
-
-    // Handler has done all the safety validation (admin auth, SELECT-only,
-    // no semicolons / UNION / INTERSECT / EXCEPT / CTEs / EXPLAIN / SQL
-    // comments, blocked tables, blocked schemas, cursor_column allowlisted to
-    // [a-zA-Z0-9_]). The repo's `execute_paginated_select` only owns the
-    // immutable wrapper template — see its docstring for the full contract.
+    // The query has passed `talos_admin_query_gate::validate_paginated_query`
+    // and the cursor column is allowlisted to [a-zA-Z0-9_]. The repo's
+    // `execute_paginated_select` only owns the immutable wrapper template and
+    // the read-only transaction — see its docstring for the full contract.
     // MCP-385 (2026-05-11): pre-fix `page` was parsed independently in
     // two places (offset-mode branch + response-echo block ~80 lines
     // below), both with `.and_then(as_i64).unwrap_or(1).max(1)`.
