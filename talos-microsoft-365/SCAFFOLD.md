@@ -66,7 +66,7 @@ is the smallest finished example of every step below.
 
 - [ ] `scripts/lint-structural.sh`, check 49: add `talos-microsoft-365/src` to the
       integration crate list.
-- [ ] A controller DB test of the connect flow against a loopback provider,
+- [x] A controller DB test of the connect flow against a loopback provider,
       modelled on `controller/tests/google_health_connect_tests.rs`: tokens
       stored under the user who started the flow, a URL minted in one browser
       refused in another, reconnect updates the row.
