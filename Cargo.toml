@@ -8,6 +8,9 @@ members = [
     "talos-audit-event",
     "talos-ssrf-classify",
     "talos-sql-classify",
+    # The parsed gate in front of the platform-admin `query_paginated` tool:
+    # which statements, functions and tables its caller-written SQL may use.
+    "talos-admin-query-gate",
     "talos-workflow-liveness",
     # The one reader of `pg_stat_statements` — an OPTIONAL relation whose query
     # text is caller-authorable, so availability is a five-valued

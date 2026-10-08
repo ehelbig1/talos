@@ -366,111 +366,24 @@ mod memory_set_error_tests {
     }
 }
 
-/// Wasm-security review 2026-05-22 (MEDIUM-1): controller-side
-/// expression-level function-name deny-list walker./// Wasm-security review 2026-05-22 (MEDIUM-1): controller-side
-/// expression-level function-name deny-list walker.
+/// The first function the statement calls that the allow list does not
+/// admit (`talos_workflow_job_protocol::is_allowed_sql_function`), spelled
+/// as written; `None` when every call is admitted.
 ///
-/// Walks every `Expr::Function` in the statement and returns the first
-/// canonical-form name (`pg_sleep`, `pg_catalog.pg_sleep`, etc.) that
-/// matches the canonical deny-list in
-/// [`talos_workflow_job_protocol::DISALLOWED_SQL_FUNCTIONS`]. The
-/// worker has the primary walker (which surfaces a typed
-/// `SqlValidationError::DisallowedFunction`); this mirror is
-/// defense-in-depth against worker↔controller divergence — same
-/// pattern as the statement-level deny-list at MCP-473 above.
-///
-/// **Schema-qualification.** Same rule as the worker: bare
-/// (`pg_sleep`) and `pg_catalog`-qualified (`pg_catalog.pg_sleep`)
-/// forms are denied; other-schema qualified forms (`public.pg_sleep`)
-/// are NOT matched here because the validator can't disambiguate from
-/// the AST. The `talos_guest` role-wrap (M-2) is the fence for that
-/// case.
+/// The worker's validator asks the same question first; this is
+/// defense-in-depth against worker↔controller divergence — same pattern as
+/// the statement-level deny-list at MCP-473 above. Both sides ask ONE walk
+/// and ONE matcher (`talos_sql_classify::first_function_not_admitted` with
+/// `is_allowed_sql_function`), so neither the positions a call can sit in
+/// nor the list can drift between them. Until 2026-10-08 this was a deny
+/// list, and a name in a schema other than `pg_catalog` was not matched; a
+/// bare or `pg_catalog` name of a listed function is the only thing
+/// admitted now.
 fn controller_side_denied_function(stmt: &sqlparser::ast::Statement) -> Option<String> {
-    use sqlparser::ast::{Expr, ObjectName, TableFactor, Visit, Visitor};
-    use std::ops::ControlFlow;
-
-    fn check_object_name(name: &ObjectName) -> Option<String> {
-        // From sqlparser 0.54 a name part is an identifier or (in other
-        // dialects) a function that computes one. A name this list cannot
-        // read is not a name it can clear: refuse it.
-        let Some(segments) = name
-            .0
-            .iter()
-            .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
-            .collect::<Option<Vec<&str>>>()
-        else {
-            return Some(name.to_string().to_ascii_lowercase());
-        };
-        match segments.as_slice() {
-            [bare] => {
-                if talos_workflow_job_protocol::is_disallowed_sql_function(bare) {
-                    Some(bare.to_ascii_lowercase())
-                } else {
-                    None
-                }
-            }
-            [schema, fn_name] => {
-                if schema.eq_ignore_ascii_case("pg_catalog")
-                    && talos_workflow_job_protocol::is_disallowed_sql_function(fn_name)
-                {
-                    Some(format!("pg_catalog.{}", fn_name.to_ascii_lowercase()))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    struct DenyVisitor;
-    impl Visitor for DenyVisitor {
-        type Break = String;
-        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-            if let Expr::Function(func) = expr {
-                if let Some(name) = check_object_name(&func.name) {
-                    return ControlFlow::Break(name);
-                }
-            }
-            ControlFlow::Continue(())
-        }
-
-        // FROM-clause set-returning function calls (`SELECT * FROM
-        // dblink(...)`) parse as TableFactor, NOT Expr::Function.
-        // Sibling-mirror to `worker::sql_validator::check_disallowed_functions`.
-        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<Self::Break> {
-            match tf {
-                TableFactor::Table {
-                    name,
-                    args: Some(_),
-                    ..
-                } => {
-                    if let Some(denied) = check_object_name(name) {
-                        return ControlFlow::Break(denied);
-                    }
-                }
-                TableFactor::Function { name, .. } => {
-                    if let Some(denied) = check_object_name(name) {
-                        return ControlFlow::Break(denied);
-                    }
-                }
-                // `XMLTABLE(…)` has its own syntax and, from sqlparser 0.63,
-                // its own node — no name to look up. 0.53 could not parse it
-                // at all, which is the only reason it was refused.
-                TableFactor::XmlTable { .. }
-                    if talos_workflow_job_protocol::is_disallowed_sql_function("xmltable") =>
-                {
-                    return ControlFlow::Break("xmltable".to_string());
-                }
-                _ => {}
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
-    match stmt.visit(&mut DenyVisitor) {
-        ControlFlow::Break(name) => Some(name),
-        ControlFlow::Continue(()) => None,
-    }
+    talos_sql_classify::first_function_not_admitted(
+        stmt,
+        talos_workflow_job_protocol::is_allowed_sql_function,
+    )
 }
 
 /// Controller-side fail-closed allow-list mirroring the worker's posture:
@@ -2571,37 +2484,22 @@ pub fn spawn_database_rpc_subscriber(
                     return;
                 }
 
-                // Wasm-security review 2026-05-22 (MEDIUM-1):
-                // controller-side mirror of the worker's
-                // expression-level function deny-list.
-                //
-                // The deliberate-duplication pattern follows
-                // MCP-473 (statement-level) above: the worker is
-                // primary defense, but if a future divergence bug
-                // lets a denied function reach here, the controller
-                // re-rejects. Both sides import the canonical
-                // deny-list from `talos_workflow_job_protocol::
-                // DISALLOWED_SQL_FUNCTIONS` so list-drift is
-                // architecturally impossible. The visitor wrapper
-                // is duplicated (worker uses its own to wire into
-                // `SqlValidationError::DisallowedFunction`, this
-                // side just needs a yes/no), but the deny-list
-                // itself is shared.
-                //
-                // Same cost profile as the worker walk: ~5-20 µs
-                // for a typical query, well below the network +
-                // DB time.
+                // Controller-side re-check of the worker's function
+                // gate: only functions the allow list admits. The worker
+                // is primary defense; if a divergence lets a refused call
+                // reach here, the controller re-refuses. Both sides ask
+                // the one walk and the one matcher, so neither can drift.
                 if let Some(denied) = controller_side_denied_function(&stmts[0]) {
                     tracing::warn!(
                         target: "talos_rpc",
                         event_kind = "database_rpc_disallowed_function",
                         actor_id = %req.actor_id,
                         denied_function = %denied,
-                        "database RPC: rejecting query referencing deny-listed function \
-                         — possible worker bypass (worker should already have refused)"
+                        "database RPC: rejecting query calling a function the allow list \
+                         does not admit — possible worker bypass (worker should already have refused)"
                     );
                     send(Err(DatabaseRpcError::InvalidQuery(format!(
-                            "SQL references function `{denied}` which is on the unconditional deny-list"
+                            "SQL calls function `{denied}`, which is not on the list of functions module SQL may call"
                         ))))
                         .await;
                     record_rpc_metric(
@@ -3651,13 +3549,23 @@ mod controller_function_deny_tests {
         );
     }
 
+    /// Under the deny list a name in any schema but `pg_catalog` was not
+    /// matched. The allow list admits only a bare or `pg_catalog` name, so
+    /// a name in another schema is refused, as is a quoted one.
     #[test]
-    fn user_schema_qualified_form_not_matched() {
-        // Documented trade-off — same as worker. Validator can't
-        // disambiguate user-defined vs stock; the `talos_guest` role
-        // is the fence.
-        let stmt = parse_one("SELECT public.pg_sleep(1)");
-        assert_eq!(controller_side_denied_function(&stmt), None);
+    fn a_name_in_another_schema_or_quoted_is_refused() {
+        for (sql, named) in [
+            ("SELECT public.pg_sleep(1)", "public.pg_sleep"),
+            ("SELECT public.lower(a) FROM t", "public.lower"),
+            ("SELECT \"LOWER\"(a) FROM t", "\"LOWER\""),
+        ] {
+            let stmt = parse_one(sql);
+            assert_eq!(
+                controller_side_denied_function(&stmt).as_deref(),
+                Some(named),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -3700,15 +3608,29 @@ mod controller_function_deny_tests {
             "SELECT sum(amount) FROM payments",
             "SELECT now()",
             "SELECT json_agg(t) FROM (SELECT * FROM users) t",
-            "SELECT current_user",
             "SELECT row_number() OVER (ORDER BY id) FROM events",
-            "SELECT pg_my_custom_business_func(id) FROM t",
         ] {
             let stmt = parse_one(sql);
             assert_eq!(
                 controller_side_denied_function(&stmt),
                 None,
                 "benign SQL `{sql}` was incorrectly blocked"
+            );
+        }
+        // A function nobody listed, and one that reads session state, are
+        // refused: under the deny list both were admitted.
+        for (sql, named) in [
+            (
+                "SELECT pg_my_custom_business_func(id) FROM t",
+                "pg_my_custom_business_func",
+            ),
+            ("SELECT current_user", "current_user"),
+        ] {
+            let stmt = parse_one(sql);
+            assert_eq!(
+                controller_side_denied_function(&stmt).as_deref(),
+                Some(named),
+                "{sql}"
             );
         }
     }

@@ -149,6 +149,9 @@ What follows from that:
   `talos-sql-classify/corpus/statements.sql` are recorded snapshots: a change
   to a gate, or a `sqlparser` bump, re-records them and the diff is the review
   (2026-10-06, `talos-sql-classify/corpus/README.md`).
+- Which functions a statement CALLS is asked of
+  `talos_sql_classify::try_for_each_called_function`, never of a hand-written
+  walk over expressions and table factors (2026-10-08).
 
 Before changing any of this, read "The actor write ceiling" in
 `docs/engineering-log/DECISIONS.md`.

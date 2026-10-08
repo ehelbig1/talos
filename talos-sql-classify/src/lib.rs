@@ -29,6 +29,13 @@
 //!   carries. The worker's operation allowlist is asked about each one; it
 //!   used to answer with its own walk, which missed positions this one
 //!   reaches.
+//! * [`try_for_each_called_function`] — WHICH functions a statement calls.
+//!   Every gate that decides which functions a caller's SQL may call asks
+//!   this walk; the worker and the controller each had a hand-written one
+//!   until 2026-10-08.
+//! * [`try_for_each_relation`] — WHICH relations a statement reads by name,
+//!   for a gate that decides which tables a caller may read
+//!   (`query_paginated`, 2026-10-08).
 //! * [`selects_into_table`] — `SELECT … INTO new_table`, a table creation
 //!   that parses as a plain query. [`classify`] calls it
 //!   [`SqlAccess::Unclassified`] and both consumers refuse it.
@@ -50,10 +57,11 @@
 //! * **Function side effects.** `SELECT nextval('s')` / `setval` / a
 //!   `VOLATILE` function that writes are mutations Postgres will happily run
 //!   inside a statement this crate calls [`SqlAccess::ReadOnly`]. No
-//!   statement-shape classifier can see them; the worker's expression-level
-//!   `check_disallowed_functions` deny-list is the surface that can, and
-//!   widening it is a separate piece of work. Stated so the gap is visible
-//!   rather than implied.
+//!   statement-shape classifier can see them. The function gate is the
+//!   surface that can: [`first_function_not_admitted`] with
+//!   `talos_workflow_job_protocol::is_allowed_sql_function`, an allow list
+//!   since 2026-10-08 that admits none of these. Stated so the gap is
+//!   visible rather than implied.
 //! * **Size and recursion bounds.** Callers cap the SQL byte length before
 //!   parsing (the worker's `MAX_SQL_BYTES`, the controller's
 //!   `database_rpc::validate_structure`). sqlparser's own
@@ -61,7 +69,10 @@
 //!   receives is already shallow; `parse_depth_is_bounded_by_sqlparser` pins
 //!   that rather than assuming it.
 
-use sqlparser::ast::{Query, SetExpr, Statement, Visit, Visitor};
+use sqlparser::ast::{
+    Expr, Ident, ObjectName, PipeOperator, Query, SetExpr, Statement, TableFactor, TableObject,
+    Visit, Visitor,
+};
 use std::ops::ControlFlow;
 
 /// How a single parsed SQL statement accesses data.
@@ -195,6 +206,258 @@ pub fn try_for_each_carried_statement<B>(
     })
 }
 
+/// A function call a statement makes, as [`try_for_each_called_function`]
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalledFunction<'a> {
+    /// Called by a name every part of which is a plain identifier, as
+    /// written: `lower` is `[lower]`, `pg_catalog.lower` is
+    /// `[pg_catalog, lower]`. Each part keeps its quote style, because
+    /// Postgres folds an unquoted name to lower case and leaves a quoted one
+    /// as written.
+    Named(Vec<&'a Ident>),
+    /// Called by a name with a part that is not an identifier (from
+    /// sqlparser 0.54 a name part can be a function that computes one, in
+    /// other dialects). A gate cannot read the name, so it refuses the call.
+    Unreadable(&'a ObjectName),
+    /// A function written in syntax of its own, with no name in the parsed
+    /// tree to look up. The string is the name Postgres knows it by
+    /// (`xmltable`, `unnest`), or, for a construct Postgres does not have,
+    /// the construct's name, so that a gate asking a list of names refuses
+    /// it rather than passing something it has not been taught.
+    Syntax(&'static str),
+}
+
+impl CalledFunction<'_> {
+    /// The call's name as a gate reports it in a refusal: lower case for an
+    /// unquoted part, a quoted part in double quotes as written, parts joined
+    /// by `.`. This is also the spelling a name matcher is asked about, so a
+    /// quoted part (which Postgres does not fold) can never be mistaken for
+    /// the unquoted name of the same letters.
+    #[must_use]
+    pub fn spelled(&self) -> String {
+        match self {
+            CalledFunction::Named(parts) => parts
+                .iter()
+                .map(|part| match part.quote_style {
+                    None => part.value.to_ascii_lowercase(),
+                    Some(_) => format!("\"{}\"", part.value.replace('"', "\"\"")),
+                })
+                .collect::<Vec<_>>()
+                .join("."),
+            CalledFunction::Unreadable(name) => name.to_string().to_ascii_lowercase(),
+            CalledFunction::Syntax(name) => (*name).to_string(),
+        }
+    }
+}
+
+/// Call `f` with every function call `stmt` makes, anywhere in it.
+///
+/// This is the one walk behind "which functions does this statement call".
+/// Each SQL gate asks a matcher about what it reports; until 2026-10-08 the
+/// worker's validator and the controller's re-parse each walked the tree
+/// themselves, the two walks kept identical by hand.
+///
+/// It reaches:
+///
+/// * a call in any expression (`Expr::Function`, which sqlparser's `Visit`
+///   reaches wherever an expression can sit: select list, `WHERE`, join
+///   condition, `ORDER BY`, a function's own arguments, a subquery);
+/// * a call in a `FROM` clause: a table factor with arguments
+///   (`FROM generate_series(1, 3)`) and the function table factor
+///   (`FROM LATERAL f(x)`);
+/// * a table factor that is a function call with no name in the tree
+///   (`XMLTABLE`, `UNNEST`, `JSON_TABLE`), reported as [`CalledFunction::Syntax`];
+/// * a call held outside any expression: `CALL f()`, a pipe operator's
+///   `CALL`, `INSERT INTO TABLE FUNCTION f()`.
+///
+/// It does not report what Postgres parses into a fixed node of its own and
+/// sqlparser gives its own node too: `CAST` and `::`, `CASE`, `EXTRACT`,
+/// `SUBSTRING`, `TRIM`, `POSITION`, `OVERLAY`, `CEIL`, `FLOOR`,
+/// `AT TIME ZONE`, `COLLATE`, `IS NORMALIZED`, the `ARRAY[…]` constructor,
+/// `EXISTS`, `IN`, `ANY` / `ALL`, `LIKE` / `ILIKE` / `SIMILAR TO`. Nor does it
+/// report operators, which Postgres implements with functions the parsed
+/// statement does not name. Both are stated limits of a gate built on this
+/// walk, not of the walk.
+///
+/// Every `TableFactor` variant is matched by name, without a wildcard arm, so
+/// a sqlparser release that adds one fails to compile here until someone
+/// decides whether it is a call.
+pub fn try_for_each_called_function<B>(
+    stmt: &Statement,
+    f: impl FnMut(CalledFunction<'_>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    fn named(name: &ObjectName) -> CalledFunction<'_> {
+        match name
+            .0
+            .iter()
+            .map(|part| part.as_ident())
+            .collect::<Option<Vec<&Ident>>>()
+        {
+            Some(parts) => CalledFunction::Named(parts),
+            None => CalledFunction::Unreadable(name),
+        }
+    }
+
+    struct CalledFunctionVisitor<F> {
+        f: F,
+    }
+    impl<B, F: FnMut(CalledFunction<'_>) -> ControlFlow<B>> Visitor for CalledFunctionVisitor<F> {
+        type Break = B;
+
+        fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<B> {
+            match s {
+                Statement::Call(function) => (self.f)(named(&function.name)),
+                Statement::Insert(insert) => match &insert.table {
+                    TableObject::TableFunction(function) => (self.f)(named(&function.name)),
+                    _ => ControlFlow::Continue(()),
+                },
+                _ => ControlFlow::Continue(()),
+            }
+        }
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<B> {
+            for operator in &query.pipe_operators {
+                if let PipeOperator::Call { function, .. } = operator {
+                    (self.f)(named(&function.name))?;
+                }
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<B> {
+            match expr {
+                Expr::Function(function) => (self.f)(named(&function.name)),
+                _ => ControlFlow::Continue(()),
+            }
+        }
+
+        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<B> {
+            match tf {
+                // A plain relation (`args: None`) is not a call; with
+                // arguments it is a set-returning function in FROM.
+                TableFactor::Table { name, args, .. } => match args {
+                    Some(_) => (self.f)(named(name)),
+                    None => ControlFlow::Continue(()),
+                },
+                TableFactor::Function { name, .. } => (self.f)(named(name)),
+                TableFactor::UNNEST { .. } => (self.f)(CalledFunction::Syntax("unnest")),
+                TableFactor::XmlTable { .. } => (self.f)(CalledFunction::Syntax("xmltable")),
+                TableFactor::JsonTable { .. } => (self.f)(CalledFunction::Syntax("json_table")),
+                TableFactor::OpenJsonTable { .. } => (self.f)(CalledFunction::Syntax("openjson")),
+                TableFactor::SemanticView { .. } => {
+                    (self.f)(CalledFunction::Syntax("semantic_view"))
+                }
+                // Constructs of other dialects that sqlparser parses under the
+                // Postgres dialect; Postgres has no such syntax.
+                TableFactor::Pivot { .. } => (self.f)(CalledFunction::Syntax("pivot")),
+                TableFactor::Unpivot { .. } | TableFactor::UnpivotExpr { .. } => {
+                    (self.f)(CalledFunction::Syntax("unpivot"))
+                }
+                TableFactor::MatchRecognize { .. } => {
+                    (self.f)(CalledFunction::Syntax("match_recognize"))
+                }
+                // Containers: what they hold is visited on its own.
+                // `TableFunction { expr }` holds its call as an expression.
+                TableFactor::Derived { .. }
+                | TableFactor::NestedJoin { .. }
+                | TableFactor::TableFunction { .. } => ControlFlow::Continue(()),
+            }
+        }
+    }
+
+    stmt.visit(&mut CalledFunctionVisitor { f })
+}
+
+/// A relation a statement reads by name, as [`try_for_each_relation`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadRelation<'a> {
+    /// A table, view or CTE named in a `FROM` clause (`FROM t`,
+    /// `FROM public.t`, `JOIN u`): a table factor with no arguments. A CTE's
+    /// name is reported too, because nothing in the parsed tree says which a
+    /// name is. Not reported: a set-returning function in `FROM`, which is a
+    /// call ([`try_for_each_called_function`]).
+    Named(&'a ObjectName),
+    /// Postgres's `TABLE t`, which sqlparser 0.63 does not parse under the
+    /// Postgres dialect but represents as a query body of its own. Reported
+    /// without a name so a gate refuses it rather than reading a shape it
+    /// was not written for.
+    TableCommand,
+}
+
+/// Call `f` with every relation `stmt` reads by name, anywhere in it: the
+/// top-level `FROM`, joins, subqueries in any expression, CTE bodies and
+/// derived tables (sqlparser's `Visit` reaches every table factor).
+pub fn try_for_each_relation<B>(
+    stmt: &Statement,
+    f: impl FnMut(ReadRelation<'_>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    fn body_has_table_command(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Table(_) => true,
+            SetExpr::SetOperation { left, right, .. } => {
+                body_has_table_command(left) || body_has_table_command(right)
+            }
+            // A parenthesised query is a `Query` of its own and is visited as
+            // one; the other bodies hold no `TABLE` at this level.
+            _ => false,
+        }
+    }
+    struct RelationVisitor<F> {
+        f: F,
+    }
+    impl<B, F: FnMut(ReadRelation<'_>) -> ControlFlow<B>> Visitor for RelationVisitor<F> {
+        type Break = B;
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<B> {
+            if body_has_table_command(&query.body) {
+                return (self.f)(ReadRelation::TableCommand);
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<B> {
+            match tf {
+                TableFactor::Table {
+                    name, args: None, ..
+                } => (self.f)(ReadRelation::Named(name)),
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+    stmt.visit(&mut RelationVisitor { f })
+}
+
+/// The first function `stmt` calls that `admits` does not admit, spelled as
+/// [`CalledFunction::spelled`] writes it; `None` when every call is
+/// admitted.
+///
+/// `admits` is asked the spelled name of each call (`lower`,
+/// `pg_catalog.lower`, `"Lower"`, `xmltable`). A call whose name cannot be
+/// read is refused without asking. Every gate that decides which functions a
+/// caller's SQL may call goes through here with
+/// `talos_workflow_job_protocol::is_allowed_sql_function`, so that the walk,
+/// the spelling and the matcher each have one home; this crate stays a leaf
+/// by taking the matcher as an argument.
+pub fn first_function_not_admitted(
+    stmt: &Statement,
+    mut admits: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    let walk = try_for_each_called_function(stmt, |call| {
+        let spelled = call.spelled();
+        match call {
+            CalledFunction::Unreadable(_) => ControlFlow::Break(spelled),
+            CalledFunction::Named(_) | CalledFunction::Syntax(_) if admits(&spelled) => {
+                ControlFlow::Continue(())
+            }
+            CalledFunction::Named(_) | CalledFunction::Syntax(_) => ControlFlow::Break(spelled),
+        }
+    });
+    match walk {
+        ControlFlow::Break(name) => Some(name),
+        ControlFlow::Continue(()) => None,
+    }
+}
+
 /// Does any query in `stmt` carry an `INTO` target — Postgres's
 /// `SELECT … INTO [TEMP] new_table FROM …`, which CREATES a table?
 ///
@@ -306,6 +569,183 @@ mod tests {
                  (WITH i AS (INSERT INTO u (a) VALUES (1) RETURNING a) SELECT a FROM i)"
             ),
             ["INSERT"]
+        );
+    }
+
+    fn called(sql: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let _ = try_for_each_called_function(&parse1(sql), |call| {
+            names.push(match &call {
+                CalledFunction::Named(_) => call.spelled(),
+                CalledFunction::Unreadable(_) => format!("unreadable:{}", call.spelled()),
+                CalledFunction::Syntax(_) => format!("syntax:{}", call.spelled()),
+            });
+            ControlFlow::<()>::Continue(())
+        });
+        names
+    }
+
+    /// The function walk reaches a call in every position it can sit, and
+    /// names each the way a refusal names it.
+    #[test]
+    fn the_function_walk_reaches_every_call() {
+        assert_eq!(called("SELECT 1"), Vec::<String>::new());
+        assert_eq!(called("SELECT a FROM t"), Vec::<String>::new());
+        assert_eq!(
+            called(
+                "SELECT lower(a), count(*) FILTER (WHERE b > abs(c)) FROM t \
+                 WHERE length(a) > 1 GROUP BY 1 ORDER BY max(d)"
+            ),
+            ["lower", "count", "abs", "length", "max"]
+        );
+        assert_eq!(called("SELECT upper(lower(a)) FROM t"), ["upper", "lower"]);
+        assert_eq!(
+            called("SELECT * FROM t JOIN u ON t.a = coalesce(u.a, 0)"),
+            ["coalesce"]
+        );
+        assert_eq!(
+            called("SELECT * FROM t WHERE a IN (SELECT now() FROM u)"),
+            ["now"]
+        );
+        assert_eq!(
+            called("WITH x AS (SELECT md5(a) FROM t) SELECT * FROM x"),
+            ["md5"]
+        );
+        // FROM: a table with arguments, the function table factor, and the
+        // nameless table factors.
+        assert_eq!(
+            called("SELECT * FROM generate_series(1, 3)"),
+            ["generate_series"]
+        );
+        assert_eq!(
+            called("SELECT * FROM t, LATERAL jsonb_array_elements(t.j) e"),
+            ["jsonb_array_elements"]
+        );
+        assert_eq!(
+            called("SELECT * FROM unnest(ARRAY[1, 2])"),
+            ["syntax:unnest"]
+        );
+        assert_eq!(
+            called("SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS a int PATH 'a')"),
+            ["syntax:xmltable"]
+        );
+        // Qualified and quoted names keep their parts; an unquoted part is
+        // folded, a quoted one is not.
+        assert_eq!(
+            called("SELECT PG_CATALOG.Lower(a), \"Lower\"(a), s.\"f\"(a) FROM t"),
+            ["pg_catalog.lower", "\"Lower\"", "s.\"f\""]
+        );
+        // A statement that is itself a call.
+        assert_eq!(called("CALL p(1)"), ["p"]);
+    }
+
+    /// The shared gate asks the matcher the spelled name of every call and
+    /// stops at the first it refuses; a name it cannot read is refused
+    /// without asking.
+    #[test]
+    fn first_function_not_admitted_asks_every_call_and_names_the_refused_one() {
+        let admits = |name: &str| ["lower", "pg_catalog.upper", "unnest"].contains(&name);
+        let refused = |sql: &str| first_function_not_admitted(&parse1(sql), admits);
+        assert_eq!(refused("SELECT 1"), None);
+        assert_eq!(refused("SELECT lower(a), pg_catalog.upper(b) FROM t"), None);
+        assert_eq!(refused("SELECT * FROM unnest(ARRAY[1])"), None);
+        assert_eq!(
+            refused("SELECT lower(a) FROM t WHERE upper(b) = 'X'").as_deref(),
+            Some("upper")
+        );
+        assert_eq!(
+            refused("SELECT \"lower\"(a) FROM t").as_deref(),
+            Some("\"lower\"")
+        );
+        assert_eq!(
+            refused("SELECT * FROM XMLTABLE('/r' PASSING x COLUMNS a int PATH 'a')").as_deref(),
+            Some("xmltable")
+        );
+        // A caller-supplied matcher that admits everything still cannot
+        // admit a call it is never asked about: there is none here, but the
+        // walk must not ask about a plain relation.
+        assert_eq!(
+            first_function_not_admitted(&parse1("SELECT * FROM t JOIN u ON t.a = u.a"), |_| {
+                false
+            }),
+            None
+        );
+    }
+
+    /// The relation walk names every table a statement reads, in every
+    /// position, and not a function in FROM.
+    #[test]
+    fn the_relation_walk_names_every_relation_read() {
+        fn read(sql: &str) -> Vec<String> {
+            let mut names = Vec::new();
+            let _ = try_for_each_relation(&parse1(sql), |r| {
+                names.push(match r {
+                    ReadRelation::Named(name) => name.to_string(),
+                    ReadRelation::TableCommand => "TABLE".to_string(),
+                });
+                ControlFlow::<()>::Continue(())
+            });
+            names
+        }
+        assert_eq!(read("SELECT 1"), Vec::<String>::new());
+        assert_eq!(
+            read("SELECT * FROM generate_series(1, 3)"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            read(
+                "SELECT * FROM a JOIN public.b ON a.x = b.x \
+                 WHERE EXISTS (SELECT 1 FROM c) AND a.y IN (SELECT y FROM (SELECT y FROM d) z)"
+            ),
+            ["a", "public.b", "c", "d"]
+        );
+        assert_eq!(
+            read("WITH w AS (SELECT * FROM e) SELECT * FROM w, LATERAL (SELECT * FROM f) l"),
+            ["e", "w", "f"]
+        );
+        assert_eq!(read("SELECT * FROM \"Q\".\"R\""), ["\"Q\".\"R\""]);
+    }
+
+    /// What sqlparser 0.63 parses into a node of its own is fixed syntax, not
+    /// a named call, and the walk does not report it. Measured 2026-10-08;
+    /// pinned so a parser bump that turns one into a named call is noticed
+    /// (it would then need an allow-list entry, or be refused).
+    #[test]
+    fn fixed_syntax_is_not_a_named_call() {
+        for sql in [
+            "SELECT CAST(a AS int), a::text FROM t",
+            "SELECT CASE WHEN a THEN 1 ELSE 2 END FROM t",
+            "SELECT EXTRACT(YEAR FROM ts) FROM t",
+            "SELECT SUBSTRING(a FROM 1 FOR 2), substring(a, 1, 2) FROM t",
+            "SELECT TRIM(BOTH 'x' FROM a), trim(a) FROM t",
+            "SELECT POSITION('a' IN b) FROM t",
+            "SELECT OVERLAY(a PLACING 'x' FROM 2) FROM t",
+            "SELECT CEIL(a), FLOOR(a) FROM t",
+            "SELECT ts AT TIME ZONE 'UTC' FROM t",
+            "SELECT a COLLATE \"C\" FROM t",
+            "SELECT ARRAY[1, 2], INTERVAL '1 day', DATE '2026-01-01'",
+            "SELECT a IS NORMALIZED, a IS DISTINCT FROM b, a LIKE 'x', a ILIKE 'x' FROM t",
+            "SELECT EXISTS (SELECT 1), a IN (SELECT 1), a = ANY(b), a = ALL(b) FROM t",
+            "SELECT j->'a', j->>'a', j @> '{}', a || b FROM t",
+        ] {
+            assert_eq!(called(sql), Vec::<String>::new(), "{sql}");
+        }
+        // And these, though Postgres treats them as syntax, sqlparser
+        // reports as calls by name — so a name list must carry them.
+        assert_eq!(
+            called(
+                "SELECT COALESCE(a, b), NULLIF(a, b), GREATEST(a, b), LEAST(a, b), \
+                 CURRENT_TIMESTAMP, ARRAY(SELECT 1), ROW(1, 2)"
+            ),
+            [
+                "coalesce",
+                "nullif",
+                "greatest",
+                "least",
+                "current_timestamp",
+                "array",
+                "row"
+            ]
         );
     }
 
@@ -437,8 +877,8 @@ mod tests {
     }
 
     /// A STATED LIMIT, pinned so it cannot be forgotten: a function with a
-    /// side effect is invisible to a statement-shape classifier. The worker's
-    /// `check_disallowed_functions` deny-list is the surface that can see it.
+    /// side effect is invisible to a statement-shape classifier. The function
+    /// gate (`first_function_not_admitted`) is the surface that can see it.
     #[test]
     fn function_side_effects_are_out_of_range_and_read_as_reads() {
         for sql in [

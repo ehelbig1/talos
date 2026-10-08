@@ -14,9 +14,10 @@
 //! Google Calendar fleet lock. A guest whose key collided with one of those
 //! blocked it; a guest that simply locked could pin connections.
 //!
-//! The expression deny-list (`talos_workflow_job_protocol::
-//! is_disallowed_sql_function`, the `pg_advisory_` / `pg_try_advisory_`
-//! families) now refuses the call at parse time on both fences, and migration
+//! The function gate (since 2026-10-08 the allow list,
+//! `talos_workflow_job_protocol::is_allowed_sql_function`, which admits no
+//! `pg_advisory_` / `pg_try_advisory_` family member — a test pins it against
+//! the old deny list) refuses the call at parse time on both fences, and migration
 //! `20260925160000` revokes EXECUTE from PUBLIC. This module is the third
 //! layer and the only one that does not depend on recognising the call: it
 //! guarantees that no connection a guest query touched returns to the pool

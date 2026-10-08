@@ -1,10 +1,11 @@
 # One SQL statement per line. `#` starts a comment line; blank lines are skipped.
 # Every table, column and value here is made up.
 #
-# This is the corpus the three SQL gates are pinned against:
-#   classify.snapshot    talos_sql_classify::classify
-#   worker.snapshot      talos_worker_runtime::sql_validator::validate_sql_with_policy
-#   controller.snapshot  the controller's admission functions (talos-rpc-subscribers)
+# This is the corpus the four SQL gates are pinned against:
+#   classify.snapshot         talos_sql_classify::classify
+#   worker.snapshot           talos_worker_runtime::sql_validator::validate_sql_with_policy
+#   controller.snapshot       the controller's admission functions (talos-rpc-subscribers)
+#   query_paginated.snapshot  talos_admin_query_gate (the platform-admin query_paginated tool)
 # A sqlparser bump that changes any verdict changes a snapshot line, and the
 # change is reviewed. Add a line here, then re-bless (see the README beside this file).
 
@@ -469,3 +470,24 @@ SELECT FROM
 SELEC 1
 INSERT INTO
 )(
+
+# --- the relations a read names (2026-10-08): query_paginated reads only
+# public tables, named bare or public-qualified, never a system catalog or a
+# withheld table. The module-SQL gates do not judge relations.
+SELECT * FROM public.t
+SELECT * FROM PUBLIC.t WHERE id = $1
+SELECT * FROM other_schema.t
+SELECT * FROM a.b.c
+SELECT * FROM "Public".t
+SELECT table_name FROM information_schema.tables
+SELECT relname FROM pg_catalog.pg_class
+SELECT relname FROM pg_class
+SELECT * FROM pg_stat_statements
+SELECT * FROM t WHERE EXISTS (SELECT 1 FROM pg_roles)
+SELECT * FROM ONLY t
+SELECT * FROM "only"
+SELECT * FROM api_keys
+SELECT * FROM "API_KEYS"
+SELECT lower(name), count(*) FROM public.t WHERE created_at > now() - interval '1 day' GROUP BY 1
+SELECT date_trunc('hour', created_at) AS h, avg(duration_ms) FROM t GROUP BY 1 ORDER BY 1
+SELECT id, payload->>'kind' AS kind, jsonb_array_length(payload->'items') FROM t LIMIT 10

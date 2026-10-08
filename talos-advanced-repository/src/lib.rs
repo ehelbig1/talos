@@ -4219,7 +4219,7 @@ impl AdvancedRepository {
                      WHERE CAST(\"{}\" AS text) > $2 ORDER BY \"{}\" ASC LIMIT $1",
                     validated_base_query, column, column
                 );
-                // sql-safe: caller-written SQL by design (the platform-admin query_paginated tool): the control is the validation in talos-mcp-handlers/src/advanced.rs, which also restricts the cursor column to [A-Za-z0-9_]
+                // sql-safe: caller-written SQL by design (the platform-admin query_paginated tool): the control is talos_admin_query_gate::validate_paginated_query (one parsed read, listed functions, public tables), and the handler in talos-mcp-handlers/src/advanced.rs restricts the cursor column to [A-Za-z0-9_]
                 sqlx::query(sqlx::AssertSqlSafe(q))
                     .bind(page_size + 1)
                     .bind(after)
@@ -4235,7 +4235,7 @@ impl AdvancedRepository {
                     "SELECT * FROM ({}) AS _paginated_subquery LIMIT $1 OFFSET $2",
                     validated_base_query
                 );
-                // sql-safe: caller-written SQL by design (the platform-admin query_paginated tool): the control is the validation in talos-mcp-handlers/src/advanced.rs, which also restricts the cursor column to [A-Za-z0-9_]
+                // sql-safe: caller-written SQL by design (the platform-admin query_paginated tool): the control is talos_admin_query_gate::validate_paginated_query (one parsed read, listed functions, public tables), and the handler in talos-mcp-handlers/src/advanced.rs restricts the cursor column to [A-Za-z0-9_]
                 sqlx::query(sqlx::AssertSqlSafe(q))
                     .bind(page_size + 1)
                     .bind(offset)
