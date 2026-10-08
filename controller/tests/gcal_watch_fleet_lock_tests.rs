@@ -316,3 +316,74 @@ async fn an_unreachable_database_is_an_error_not_an_unlocked_create() {
         "a failed fleet acquire leaked the process-local lock"
     );
 }
+
+/// The window itself, entered on purpose rather than by luck. A renewal
+/// spends most of its time inside Google's `events.watch` (400 ms here), and
+/// by then it has stopped the old channel and deleted its row. A second
+/// renewal of the same channel that STARTS in that window has no row to read.
+///
+/// It must wait and be handed the replacement — one more Google channel
+/// would be an orphan, and "not found" is false: the channel was renewed.
+/// Until 2026-10-08 it was "not found", and whether the two-at-once test
+/// above passed depended on which of them got a pooled connection first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_that_starts_while_another_is_mid_rotation_is_handed_the_replacement() {
+    let f = fleet().await;
+    let first =
+        f.a.create_watch_channel(f.integration, CALENDAR, WEBHOOK, None)
+            .await
+            .expect("create");
+    let (a1, user, id) = (f.a.clone(), f.user, first.id);
+    let rotating = tokio::spawn(async move { a1.renew_watch_channel(user, id).await });
+
+    // Wait until the first renewal is inside Google's call: its second
+    // `events.watch` has been received, so the old row is already gone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while f.google.watches.load(Ordering::SeqCst) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first renewal never reached Google"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        channel_rows(&f).await,
+        0,
+        "the test's premise: mid-rotation there is no row for this channel"
+    );
+
+    // The other replica, arriving now.
+    let late =
+        f.b.renew_watch_channel(f.user, first.id)
+            .await
+            .expect("a renewal arriving mid-rotation is handed the replacement");
+    let rotated = rotating.await.expect("join").expect("the first renewal");
+
+    assert_eq!(late.id, rotated.id);
+    assert_eq!(late.channel_id, rotated.channel_id);
+    assert_ne!(rotated.id, first.id);
+    assert_eq!(
+        f.google.watches.load(Ordering::SeqCst),
+        2,
+        "one create plus ONE renewal"
+    );
+    assert_eq!(f.google.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(channel_rows(&f).await, 1);
+
+    // Later still, a caller holding the old uuid: handed the same row, and
+    // Google is not asked for anything.
+    let stale =
+        f.a.renew_watch_channel(f.user, first.id)
+            .await
+            .expect("a stale uuid resolves to the row that replaced it");
+    assert_eq!(stale.id, rotated.id);
+    assert_eq!(f.google.watches.load(Ordering::SeqCst), 2);
+    assert_eq!(f.google.stops.load(Ordering::SeqCst), 1);
+
+    // A uuid that was never a channel is still not found.
+    assert!(f
+        .a
+        .renew_watch_channel(f.user, Uuid::new_v4())
+        .await
+        .is_err());
+}

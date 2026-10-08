@@ -276,6 +276,7 @@ A service struct + five methods:
 | `create_watch(user, integration_id, ...)` | Fast path: if existing row, update module_id + return. Slow path: acquire lock → call upstream create API → upsert row with indexed slots → audit-log. |
 | `create_fresh_watch_locked(...)` | Unconditionally-create helper. **Separate from `create_watch`** — never reuse the fast-path helper in renewal. See gcal commit `e43430b` for the zero-channel bug we paid to learn this. |
 | `renew_watch(user, channel_uuid)` | Read old row → acquire lock → **delete old row** → `create_fresh_watch_locked` → preserve sync cursor → audit-log. The delete-before-create order is critical — reversing it creates the zero-channel bug. |
+| ↳ the first read | "Read old row → acquire lock" leaves the read outside any lock, because the lock is keyed by something only the row knows. A second renewal that starts while the first is between **delete old row** and the new row being written reads nothing and reports the channel missing. gcal (2026-10-08) takes a second lock keyed by `(user, channel uuid)` BEFORE the read and stamps the replacement with `renewed_from`, so a late or stale caller is handed the new row. **gmail's `renew_watch` still reads before it locks** — not changed, and not known to have been hit. |
 | `stop_watch(user, channel_uuid)` | Best-effort upstream stop → delete row → audit. Idempotent. |
 | `find_by_<upstream-identifier>(identifier)` | Hot-path webhook lookup. Resolves to `(user_id, row)`. Must be O(1) with the right indexed slot. |
 
