@@ -228,6 +228,90 @@ async fn test_crypto_hash_known_answers() {
     }
 }
 
+/// What `crypto::encode` and `crypto::decode` give a module for the two
+/// base64 encodings, against the test vectors of RFC 4648 section 10, and
+/// what `decode` refuses. A module may have stored or sent what `encode`
+/// returned, so the text is a contract; and `decode` is strict on purpose —
+/// the padded form requires its padding, the URL-safe form forbids it, and
+/// neither accepts another alphabet, whitespace, or trailing bits that are
+/// not zero (two spellings of one value).
+#[tokio::test]
+async fn test_crypto_base64_known_answers_and_refusals() {
+    let mut ctx = TalosContext::new(
+        CapabilityWorld::Minimal,
+        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    use wit_crypto::Encoding::{Base64, Base64url};
+    for (plain, padded, url_safe) in [
+        (&b""[..], "", ""),
+        (&b"f"[..], "Zg==", "Zg"),
+        (&b"fo"[..], "Zm8=", "Zm8"),
+        (&b"foo"[..], "Zm9v", "Zm9v"),
+        (&b"foob"[..], "Zm9vYg==", "Zm9vYg"),
+        (&b"fooba"[..], "Zm9vYmE=", "Zm9vYmE"),
+        (&b"foobar"[..], "Zm9vYmFy", "Zm9vYmFy"),
+        // The two characters the alphabets disagree on.
+        (&[0xfb, 0xff, 0xfe][..], "+//+", "-__-"),
+        (&[0xff, 0xef][..], "/+8=", "_-8"),
+    ] {
+        for (encoding, text) in [(Base64, padded), (Base64url, url_safe)] {
+            assert_eq!(
+                <TalosContext as wit_crypto::Host>::encode(&mut ctx, encoding, plain.to_vec())
+                    .await,
+                text,
+                "encode {plain:?}"
+            );
+            assert_eq!(
+                <TalosContext as wit_crypto::Host>::decode(&mut ctx, encoding, text.to_string())
+                    .await
+                    .ok(),
+                Some(plain.to_vec()),
+                "decode {text:?}"
+            );
+        }
+    }
+
+    for (encoding, text, why) in [
+        (Base64, "Zg", "padding left off"),
+        (Base64, "Zg=", "one padding character of two"),
+        (Base64, "Zg===", "one padding character too many"),
+        (Base64, "Zh==", "trailing bits that are not zero"),
+        (Base64, "Zm9v\n", "a newline"),
+        (Base64, "Zm 9v", "a space"),
+        (Base64, "-__-", "the URL-safe alphabet"),
+        (Base64, "Zm9vY", "a length no encoding produces"),
+        (Base64url, "Zg==", "padding"),
+        (Base64url, "Zh", "trailing bits that are not zero"),
+        (Base64url, "+//+", "the standard alphabet"),
+        (Base64url, "Zm9v ", "a space"),
+        (Base64url, "Zm9vY", "a length no encoding produces"),
+    ] {
+        assert!(
+            matches!(
+                <TalosContext as wit_crypto::Host>::decode(&mut ctx, encoding, text.to_string())
+                    .await,
+                Err(wit_crypto::Error::Invalidinput)
+            ),
+            "{text:?} must be refused: {why}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_crypto_random_bytes_limits() {
     let mut ctx = TalosContext::new(
