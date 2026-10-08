@@ -24,8 +24,11 @@ no grant on the second table, `ts_stat` was refused by Postgres ("permission
 denied for table"); `ts_rewrite` was not tried under that role. Module SQL
 gets such a role only when `TALOS_RPC_GUEST_ROLE` is set, and it is unset on
 the operator's deployment, where module SQL therefore runs as the pool's role.
-That deployment has two `database-node` modules; no catalog template and no
-document in this repository uses either function.
+Module SQL is not in use on that deployment: its two `database-node` modules
+are catalog rows with no installed copy, no workflow names either, and
+`talos_rpc_calls_total{subject="talos.database.query"}` has not moved in the
+window Prometheus keeps. No catalog template and no document in this
+repository uses either function.
 
 ## Changed
 
@@ -60,6 +63,8 @@ corpus test and the controller's corpus test each fail.
 ## Deliberately not done
 
 * Setting `TALOS_RPC_GUEST_ROLE` on the operator's deployment: an edit to
-  `.env`, and the role has no table grants yet, so the two database modules
-  would lose their reads. It is the operator's decision and is listed for
-  them.
+  `.env`, which is the operator's to make.
+* Replacing the deny list with an allow list. It is the better rule for this
+  class — a function nobody has read about is refused instead of admitted —
+  and it is the next package, not this one: it changes what module SQL may
+  call, and its contents have to be chosen.
