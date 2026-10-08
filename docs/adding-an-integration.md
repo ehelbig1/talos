@@ -238,6 +238,15 @@ scopes and account lookup. CI builds the scaffold on every Rust change
    client than the one that issued it. `shared_client_providers_refresh_and_revoke`
    pins the two lists together.
 
+   **Say whether the provider's token endpoint takes JSON or form; the refresh
+   match carries that choice.** The refresh match is
+   `talos_oauth::credentials::refresh_route`, and each arm names a
+   `TokenBody`: Google and Atlassian take `Json`, Microsoft refuses it
+   (AADSTS900144) and takes `Form`. A wrong choice refreshes nothing, and the
+   provider's 400 is not `invalid_grant`, so the connection is never marked for
+   reconnect. Pin the choice in `credentials_tests.rs` beside
+   `microsoft_365_refreshes_form_encoded_at_the_tenants_endpoint`.
+
    **A Google revoke ends the account's whole grant to the shared client**, so
    `OAuthCredentialService::revoke_and_cleanup` revokes at Google only for the
    account's LAST connection (`talos_oauth::google_grant`). It recognises one
