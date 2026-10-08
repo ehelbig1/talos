@@ -2,9 +2,9 @@
 // why), so the one workspace rule that is a safety rule is stated here.
 #![forbid(unsafe_code)]
 
-use proc_macro::TokenStream;
+use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, FnArg, ItemFn, PatType};
+use syn::{FnArg, ItemFn, PatType};
 
 /// Extract a named attribute value from an attribute string like
 /// `provider = "anthropic", model = "claude-sonnet-4-20250514"`.
@@ -84,8 +84,21 @@ fn extract_attr(attr_str: &str, key: &str) -> Option<String> {
 /// See also [`talos_module`] (free-form `run(input: String)` signature) and
 /// [`talos_agent`] (LLM agent scaffold).
 #[proc_macro_attribute]
-pub fn talos_node(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let parsed_fn = parse_macro_input!(item as ItemFn);
+pub fn talos_node(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    expand_talos_node(attr.into(), item.into()).into()
+}
+
+/// What [`macro@talos_node`] expands to. Apart from the conversions above, the
+/// whole macro: tests call this directly and compare its output with a
+/// recorded expansion.
+fn expand_talos_node(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed_fn: ItemFn = match syn::parse2(item) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.to_compile_error(),
+    };
 
     // Parse the world from #[talos_node(world = "xxx")]
     // Default to minimal-node (least privilege) if not provided
@@ -192,7 +205,7 @@ pub fn talos_node(attr: TokenStream, item: TokenStream) -> TokenStream {
         #parsed_fn
     };
 
-    TokenStream::from(expanded)
+    expanded
 }
 
 /// Entry-point macro for a Talos WASM module whose `run` takes the raw envelope
@@ -222,8 +235,21 @@ pub fn talos_node(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// }
 /// ```
 #[proc_macro_attribute]
-pub fn talos_module(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let parsed_fn = parse_macro_input!(item as ItemFn);
+pub fn talos_module(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    expand_talos_module(attr.into(), item.into()).into()
+}
+
+/// What [`macro@talos_module`] expands to. Apart from the conversions above, the
+/// whole macro: tests call this directly and compare its output with a
+/// recorded expansion.
+fn expand_talos_module(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed_fn: ItemFn = match syn::parse2(item) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.to_compile_error(),
+    };
 
     let world_str = if attr.is_empty() {
         "minimal-node".to_string()
@@ -294,7 +320,7 @@ pub fn talos_module(attr: TokenStream, item: TokenStream) -> TokenStream {
         #parsed_fn
     };
 
-    TokenStream::from(expanded)
+    expanded
 }
 
 /// Macro for building LLM-powered agent modules.
@@ -337,8 +363,21 @@ pub fn talos_module(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// The generated code references `serde` and `serde_json` (pre-bundled).
 /// `wit-bindgen-rt` is also pre-bundled automatically. No additional deps needed.
 #[proc_macro_attribute]
-pub fn talos_agent(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let parsed_fn = parse_macro_input!(item as ItemFn);
+pub fn talos_agent(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    expand_talos_agent(attr.into(), item.into()).into()
+}
+
+/// What [`macro@talos_agent`] expands to. Apart from the conversions above, the
+/// whole macro: tests call this directly and compare its output with a
+/// recorded expansion.
+fn expand_talos_agent(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed_fn: ItemFn = match syn::parse2(item) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.to_compile_error(),
+    };
 
     let attr_str = attr.to_string();
 
@@ -478,12 +517,181 @@ pub fn talos_agent(attr: TokenStream, item: TokenStream) -> TokenStream {
         #parsed_fn
     };
 
-    TokenStream::from(expanded)
+    expanded
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── What the macros expand to ────────────────────────────────────────
+    //
+    // Every user module and every catalog template is wrapped by one of these
+    // three macros, so their output is the entry point of everything a worker
+    // runs. Each case below is expanded and compared, token for token, with a
+    // recorded expansion in `expansions/`. A change to a macro, or a new
+    // major of `syn` / `quote`, shows up as a diff in those files.
+    //
+    //     TALOS_MACRO_EXPANSION_BLESS=1 cargo test -p talos_sdk_macros
+    //
+    // re-records them; the diff is the review.
+
+    /// Tokens only: how they are spaced is the printer's business.
+    fn tokens(text: &str) -> String {
+        text.split_whitespace().collect()
+    }
+
+    /// One statement or brace per line, so a diff of a recording is readable.
+    fn readable(expansion: &TokenStream) -> String {
+        let mut out = String::new();
+        for part in expansion.to_string().split_inclusive([';', '{', '}']) {
+            out.push_str(part.trim());
+            out.push('\n');
+        }
+        out
+    }
+
+    fn check_expansion(case: &str, expansion: &TokenStream) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("expansions")
+            .join(format!("{case}.txt"));
+        let got = readable(expansion);
+        if std::env::var("TALOS_MACRO_EXPANSION_BLESS").is_ok_and(|v| !v.is_empty()) {
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("create expansions/");
+            std::fs::write(&path, &got).expect("write the recording");
+            return;
+        }
+        let recorded = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e} — record it with TALOS_MACRO_EXPANSION_BLESS=1",
+                path.display()
+            )
+        });
+        assert!(
+            tokens(&recorded) == tokens(&got),
+            "the expansion of `{case}` differs from {}.\n\
+             Re-record with TALOS_MACRO_EXPANSION_BLESS=1 and review the diff.\n--- got ---\n{got}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn talos_node_expands_as_recorded() {
+        check_expansion(
+            "node_typed_arguments",
+            &expand_talos_node(
+                quote! { world = "secrets-node" },
+                quote! {
+                    fn run(repo: String, limit: Option<u32>, tags: Vec<String>) -> Result<String, String> {
+                        let _ = (limit, tags);
+                        Ok(repo)
+                    }
+                },
+            ),
+        );
+        // No attribute at all: the least-privileged world.
+        check_expansion(
+            "node_default_world",
+            &expand_talos_node(
+                TokenStream::new(),
+                quote! {
+                    fn run() -> Result<String, String> {
+                        Ok(String::new())
+                    }
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn talos_module_expands_as_recorded() {
+        check_expansion(
+            "module_network_world",
+            &expand_talos_module(
+                quote! { world = "network-node" },
+                quote! {
+                    /// A doc comment and an attribute travel with the function.
+                    #[allow(clippy::needless_pass_by_value)]
+                    pub fn run(input: String) -> Result<String, String> {
+                        Ok(input)
+                    }
+                },
+            ),
+        );
+        check_expansion(
+            "module_default_world",
+            &expand_talos_module(
+                TokenStream::new(),
+                quote! {
+                    fn run(input: String) -> Result<String, String> {
+                        Ok(input)
+                    }
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn talos_agent_expands_as_recorded() {
+        check_expansion(
+            "agent_defaults",
+            &expand_talos_agent(
+                TokenStream::new(),
+                quote! {
+                    fn run(input: AgentInput) -> Result<AgentOutput, String> {
+                        Ok(AgentOutput { response: input.prompt, data: None, tool_calls: vec![] })
+                    }
+                },
+            ),
+        );
+        check_expansion(
+            "agent_named_provider_model_world",
+            &expand_talos_agent(
+                quote! { world = "agent-node", provider = "ollama", model = "example-model" },
+                quote! {
+                    fn run(input: AgentInput) -> Result<AgentOutput, String> {
+                        Ok(AgentOutput { response: input.prompt, data: None, tool_calls: vec![] })
+                    }
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn the_world_marker_follows_the_attribute() {
+        // The compile path and the worker both read the capability world out
+        // of the binary from this marker.
+        let world = |attr: TokenStream| {
+            let text = expand_talos_module(
+                attr,
+                quote! { fn run(input: String) -> Result<String, String> { Ok(input) } },
+            )
+            .to_string();
+            let start = text.find("__talos_world_").expect("a world marker");
+            text[start..]
+                .split("__")
+                .nth(1)
+                .expect("a world")
+                .to_string()
+        };
+        assert_eq!(world(TokenStream::new()), "talos_world_minimal-node");
+        assert_eq!(
+            world(quote! { world = "http-node" }),
+            "talos_world_http-node"
+        );
+        assert_eq!(
+            world(quote! { world="database-node" }),
+            "talos_world_database-node"
+        );
+    }
+
+    #[test]
+    fn something_that_is_not_a_function_is_a_compile_error_not_a_panic() {
+        for expand in [expand_talos_node, expand_talos_module, expand_talos_agent] {
+            let out = expand(TokenStream::new(), quote! { struct NotAFunction; }).to_string();
+            assert!(out.contains("compile_error"), "{out}");
+        }
+    }
 
     #[test]
     fn test_extract_attr_with_spaces() {

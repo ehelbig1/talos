@@ -1,0 +1,39 @@
+# [doc = r" Agent input deserialized from the workflow engine."] # [derive (serde :: Deserialize , Debug)] pub struct AgentInput {
+# [doc = r" The user's prompt or message."] # [serde (default)] pub prompt : String , # [doc = r" Conversation history (JSON array of messages)."] # [serde (default)] pub messages : Vec < serde_json :: Value > , # [doc = r" Tool definitions available to the agent (JSON array)."] # [serde (default)] pub tools : Vec < serde_json :: Value > , # [doc = r" System prompt for the LLM."] # [serde (default)] pub system_prompt : String , # [doc = r" Module configuration from the workflow."] # [serde (default)] pub config : serde_json :: Value , # [doc = r" Input data from parent nodes."] # [serde (default)] pub input : serde_json :: Value , }
+# [doc = r" Agent output serialized back to the workflow engine."] # [derive (serde :: Serialize , Debug)] pub struct AgentOutput {
+# [doc = r" The agent's response text."] pub response : String , # [doc = r" Optional structured data."] # [serde (skip_serializing_if = "Option::is_none")] pub data : Option < serde_json :: Value > , # [doc = r" Tool calls made during execution (for logging/audit)."] # [serde (skip_serializing_if = "Vec::is_empty")] pub tool_calls : Vec < serde_json :: Value > , }
+# [allow (warnings)] mod bindings {
+include ! (concat ! (env ! ("CARGO_MANIFEST_DIR") , "/src/bindings.rs")) ;
+}
+# [allow (unused_imports)] use crate :: bindings :: talos as talos ;
+struct TalosAgentGuest ;
+impl bindings :: Guest for TalosAgentGuest {
+fn run (raw_input : String) -> Result < String , String > {
+match :: std :: panic :: catch_unwind (:: std :: panic :: AssertUnwindSafe (|| {
+let agent_input : AgentInput = serde_json :: from_str (& raw_input) . map_err (| e | format ! ("Failed to parse agent input: {
+}
+" , e)) ? ;
+let output = run (agent_input) ? ;
+serde_json :: to_string (& output) . map_err (| e | format ! ("Failed to serialize agent output: {
+}
+" , e)) }
+)) {
+Ok (r) => r , Err (p) => {
+let msg = p . downcast_ref :: < & str > () . map (| s | s . to_string ()) . or_else (|| p . downcast_ref :: < :: std :: string :: String > () . cloned ()) . unwrap_or_else (|| "panic (non-string payload)" . to_string ()) ;
+Err (:: std :: format ! ("PANIC: {
+}
+" , msg)) }
+}
+}
+}
+bindings :: export ! (TalosAgentGuest with_types_in bindings) ;
+# [used] # [no_mangle] pub static __TALOS_WORLD : & [u8] = b"__talos_world_secrets-node__" ;
+# [used] # [no_mangle] pub static __TALOS_AGENT_PROVIDER : & [u8] = b"__talos_agent_provider_anthropic__" ;
+# [used] # [no_mangle] pub static __TALOS_AGENT_MODEL : & [u8] = b"__talos_agent_model_claude-sonnet-4-20250514__" ;
+# [export_name = "wizer.initialize"] pub extern "C" fn init () {
+let _prime = Vec :: < u8 > :: with_capacity (1024 * 1024) ;
+}
+fn run (input : AgentInput) -> Result < AgentOutput , String > {
+Ok (AgentOutput {
+response : input . prompt , data : None , tool_calls : vec ! [] }
+) }
