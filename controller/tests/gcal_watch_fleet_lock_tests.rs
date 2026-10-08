@@ -17,10 +17,13 @@ use uuid::Uuid;
 const CALENDAR: &str = "primary";
 const WEBHOOK: &str = "https://hooks.example.com/api/google-calendar/webhook";
 
-#[derive(Default)]
 struct FakeGoogle {
     watches: AtomicUsize,
     stops: AtomicUsize,
+    /// From this `events.watch` call on (1-based; 0 = never), a call does not
+    /// answer until the test adds a permit to `release`.
+    hold_from_watch: AtomicUsize,
+    release: tokio::sync::Semaphore,
 }
 
 async fn events_watch(
@@ -28,9 +31,20 @@ async fn events_watch(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let n = g.watches.fetch_add(1, Ordering::SeqCst) + 1;
-    // Long enough that a second, unserialized caller is certainly inside its
-    // own "no channel yet" window while this one is still registering.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let hold_from = g.hold_from_watch.load(Ordering::SeqCst);
+    if hold_from != 0 && n >= hold_from {
+        // Held until the test says so: the caller stays mid-rotation for as
+        // long as the test needs, not for a length of time it has to beat.
+        g.release
+            .acquire()
+            .await
+            .expect("the gate is never closed")
+            .forget();
+    } else {
+        // Long enough that a second, unserialized caller is certainly inside
+        // its own "no channel yet" window while this one is still registering.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
     let expiration = (chrono::Utc::now() + chrono::Duration::days(7)).timestamp_millis();
     Json(serde_json::json!({
         "id": body["id"],
@@ -46,7 +60,12 @@ async fn channels_stop(State(g): State<Arc<FakeGoogle>>) -> axum::http::StatusCo
 }
 
 async fn fake_google() -> (Arc<FakeGoogle>, String) {
-    let state = Arc::new(FakeGoogle::default());
+    let state = Arc::new(FakeGoogle {
+        watches: AtomicUsize::new(0),
+        stops: AtomicUsize::new(0),
+        hold_from_watch: AtomicUsize::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
     let app = Router::new()
         .route("/calendars/{calendar}/events/watch", post(events_watch))
         .route("/channels/stop", post(channels_stop))
@@ -317,15 +336,18 @@ async fn an_unreachable_database_is_an_error_not_an_unlocked_create() {
     );
 }
 
-/// The window itself, entered on purpose rather than by luck. A renewal
-/// spends most of its time inside Google's `events.watch` (400 ms here), and
-/// by then it has stopped the old channel and deleted its row. A second
-/// renewal of the same channel that STARTS in that window has no row to read.
+/// The window itself, entered on purpose and held open. A renewal spends
+/// most of its time inside Google's `events.watch`, and by then it has
+/// stopped the old channel and deleted its row. A second renewal of the same
+/// channel that STARTS in that window has no row to read.
 ///
 /// It must wait and be handed the replacement — one more Google channel
 /// would be an orphan, and "not found" is false: the channel was renewed.
 /// Until 2026-10-08 it was "not found", and whether the two-at-once test
 /// above passed depended on which of them got a pooled connection first.
+///
+/// Nothing here races a clock: Google's answer to the first renewal is held
+/// until the test has seen the second one waiting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_renewal_that_starts_while_another_is_mid_rotation_is_handed_the_replacement() {
     let f = fleet().await;
@@ -333,12 +355,12 @@ async fn a_renewal_that_starts_while_another_is_mid_rotation_is_handed_the_repla
         f.a.create_watch_channel(f.integration, CALENDAR, WEBHOOK, None)
             .await
             .expect("create");
+
+    // Google answers the create at once and holds the renewal's request.
+    f.google.hold_from_watch.store(2, Ordering::SeqCst);
     let (a1, user, id) = (f.a.clone(), f.user, first.id);
     let rotating = tokio::spawn(async move { a1.renew_watch_channel(user, id).await });
-
-    // Wait until the first renewal is inside Google's call: its second
-    // `events.watch` has been received, so the old row is already gone.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while f.google.watches.load(Ordering::SeqCst) < 2 {
         assert!(
             std::time::Instant::now() < deadline,
@@ -346,18 +368,28 @@ async fn a_renewal_that_starts_while_another_is_mid_rotation_is_handed_the_repla
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert_eq!(
-        channel_rows(&f).await,
-        0,
-        "the test's premise: mid-rotation there is no row for this channel"
-    );
+    // Mid-rotation, and staying there: the old row is gone, the new one is
+    // not written until Google answers.
+    assert_eq!(channel_rows(&f).await, 0);
 
-    // The other replica, arriving now.
-    let late =
-        f.b.renew_watch_channel(f.user, first.id)
-            .await
-            .expect("a renewal arriving mid-rotation is handed the replacement");
+    // The other replica, arriving now. It has nothing to read; it must still
+    // be waiting when looked at, not already back with an answer.
+    let (b, user, id) = (f.b.clone(), f.user, first.id);
+    let late = tokio::spawn(async move { b.renew_watch_channel(user, id).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !late.is_finished(),
+        "a renewal arriving mid-rotation answered before the rotation finished"
+    );
+    assert_eq!(channel_rows(&f).await, 0, "still mid-rotation");
+
+    // Google answers.
+    f.google.release.add_permits(1);
     let rotated = rotating.await.expect("join").expect("the first renewal");
+    let late = late
+        .await
+        .expect("join")
+        .expect("a renewal arriving mid-rotation is handed the replacement");
 
     assert_eq!(late.id, rotated.id);
     assert_eq!(late.channel_id, rotated.channel_id);
@@ -370,8 +402,8 @@ async fn a_renewal_that_starts_while_another_is_mid_rotation_is_handed_the_repla
     assert_eq!(f.google.stops.load(Ordering::SeqCst), 1);
     assert_eq!(channel_rows(&f).await, 1);
 
-    // Later still, a caller holding the old uuid: handed the same row, and
-    // Google is not asked for anything.
+    // Later, a caller still holding the old uuid: handed the same row, and
+    // Google is asked for nothing.
     let stale =
         f.a.renew_watch_channel(f.user, first.id)
             .await
@@ -386,4 +418,37 @@ async fn a_renewal_that_starts_while_another_is_mid_rotation_is_handed_the_repla
         .renew_watch_channel(f.user, Uuid::new_v4())
         .await
         .is_err());
+}
+
+/// A request to renew something that is not a channel holds no lock while
+/// it looks. The renewal lock is a transaction on a pooled connection; a
+/// caller that held one and then waited for another connection to read with
+/// would, with enough like it, hold the whole pool and wait on itself.
+/// More such requests at once than the pool has connections all come back
+/// "not found", promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renewing_ids_that_are_not_channels_does_not_hold_the_pool() {
+    let f = fleet().await;
+    // The second replica's pool has 8 connections.
+    let started = std::time::Instant::now();
+    let tasks: Vec<_> = (0..32)
+        .map(|_| {
+            let (b, user) = (f.b.clone(), f.user);
+            tokio::spawn(async move { b.renew_watch_channel(user, Uuid::new_v4()).await })
+        })
+        .collect();
+    for task in tasks {
+        let err = task
+            .await
+            .expect("join")
+            .expect_err("not a channel")
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "32 renewals of nothing took {:?}: they waited on each other for connections",
+        started.elapsed()
+    );
+    assert_eq!(f.google.watches.load(Ordering::SeqCst), 0);
 }

@@ -82,7 +82,8 @@ pub struct WatchChannelRow {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     /// The row this one replaced, when it was made by a renewal. A caller
-    /// still holding the old uuid is handed this row instead of "not found".
+    /// still holding THAT uuid is handed this row instead of "not found". One
+    /// generation only: the uuid of the row before that resolves to nothing.
     /// Absent from rows that were created, and from every row written before
     /// 2026-10-08, so those keep the exact bytes they had.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -472,37 +473,61 @@ impl GoogleCalendarService {
         user_id: Uuid,
         channel_id: Uuid,
     ) -> Result<WatchChannel> {
-        // One renewal of this channel at a time, from before the first read.
-        // The create lock further down is keyed by the calendar, which is only
-        // known once the row has been read; without this, a renewal arriving
-        // while another is between deleting the old row and writing the new
-        // one reads nothing and reports a channel that was in fact renewed.
-        let _renewal = self
-            .renew_channel_locks
-            .acquire_fleet(
-                &self.db_pool,
-                (user_id, channel_id),
-                &format!("gcal-renew:{user_id}:{channel_id}"),
-            )
+        // A renewal reads the row it was asked to renew, and only the row
+        // names the calendar that the create lock below is keyed by. So this
+        // read cannot be under that lock, and a second renewal of the same
+        // channel can arrive while the first is between deleting the old row
+        // and writing the new one, and read nothing. Until 2026-10-08 that
+        // was reported as a missing channel.
+        //
+        // Renewals of one channel are therefore serialized by a lock of their
+        // own, keyed by what the caller does hold: the channel's uuid.
+        //
+        // The row is looked for BEFORE that lock is taken. A request for a
+        // uuid that is not a channel must not hold a pooled connection (the
+        // lock is a transaction) while it waits for another to read with:
+        // enough of those at once would hold every connection and wait on
+        // each other.
+        if self
+            .find_channel_by_id_raw(user_id, channel_id)
             .await
-            .context("could not take the watch-channel renewal lock")?;
+            .with_context(|| {
+                format!(
+                    "gcal renew: watch channel {} lookup failed for user {}",
+                    channel_id, user_id
+                )
+            })?
+            .is_none()
+        {
+            // Not there. Replaced already?
+            if let Some(renewed) = self.find_channel_renewed_from(user_id, channel_id).await? {
+                return Ok(self.already_renewed(user_id, &renewed));
+            }
+            // Being replaced right now? Wait for that renewal to finish —
+            // and hold nothing while looking again.
+            drop(self.acquire_renewal_lock(user_id, channel_id).await?);
+            return match self.find_channel_renewed_from(user_id, channel_id).await? {
+                Some(renewed) => Ok(self.already_renewed(user_id, &renewed)),
+                None => Err(anyhow!(
+                    "Watch channel {} not found in integration_state for user {}",
+                    channel_id,
+                    user_id
+                )),
+            };
+        }
+
+        // The row exists. One renewal of it at a time from here on, and read
+        // it again now that this is the only one.
+        let _renewal = self.acquire_renewal_lock(user_id, channel_id).await?;
 
         // The `not found` wording used to sit as `with_context` over BOTH
         // outcomes, so a pool timeout was logged as a missing channel.
         let old_row = match self.find_channel_by_id_raw(user_id, channel_id).await {
             Ok(Some(r)) => r,
             Ok(None) => {
-                // Gone. Either it never existed, or the renewal this one
-                // waited for has replaced it — in which case the replacement
-                // says so.
+                // Replaced by the renewal this one waited for.
                 return match self.find_channel_renewed_from(user_id, channel_id).await? {
-                    Some(renewed) => {
-                        tracing::info!(
-                            channel_uuid = %renewed.id,
-                            "gcal renew: another renewer already replaced this channel"
-                        );
-                        Ok(renewed.to_watch_channel(user_id))
-                    }
+                    Some(renewed) => Ok(self.already_renewed(user_id, &renewed)),
                     None => Err(anyhow!(
                         "Watch channel {} not found in integration_state for user {}",
                         channel_id,
@@ -628,6 +653,33 @@ impl GoogleCalendarService {
         );
 
         Ok(new)
+    }
+
+    /// The per-channel renewal lock: the process-local mutex, then the
+    /// advisory lock every replica sees. Taken before the create lock, never
+    /// after it; the create path takes only the create lock.
+    async fn acquire_renewal_lock(
+        &self,
+        user_id: Uuid,
+        channel_id: Uuid,
+    ) -> Result<talos_integration_helpers::state_store::FleetCreateGuard> {
+        self.renew_channel_locks
+            .acquire_fleet(
+                &self.db_pool,
+                (user_id, channel_id),
+                &format!("gcal-renew:{user_id}:{channel_id}"),
+            )
+            .await
+            .context("could not take the watch-channel renewal lock")
+    }
+
+    /// What a renewal returns when another renewal got there first.
+    fn already_renewed(&self, user_id: Uuid, renewed: &WatchChannelRow) -> WatchChannel {
+        tracing::info!(
+            channel_uuid = %renewed.id,
+            "gcal renew: another renewer already replaced this channel"
+        );
+        renewed.to_watch_channel(user_id)
     }
 
     /// Take the per-(user, integration, calendar) mutex that serializes
@@ -1009,9 +1061,17 @@ impl GoogleCalendarService {
             )
             .await?;
         for entry in entries {
-            let row = decode_row(&entry)?;
-            if row.renewed_from == Some(old_channel_uuid) {
-                return Ok(Some(row));
+            // A row that cannot be read is not the replacement being looked
+            // for, and must not turn every stale uuid into an error; the
+            // renewal listing skips such a row the same way.
+            match decode_row(&entry) {
+                Ok(row) if row.renewed_from == Some(old_channel_uuid) => return Ok(Some(row)),
+                Ok(_) => {}
+                Err(e) => tracing::error!(
+                    key = %entry.key,
+                    error = %e,
+                    "Skipping malformed gcal row"
+                ),
             }
         }
         Ok(None)

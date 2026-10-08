@@ -44,14 +44,23 @@ failure for a channel that is fine.
 
 ## Changed
 
-* **A renewal takes a lock keyed by `(user, channel uuid)` before it reads.**
-  The same two-level lock as the create lock (process-local mutex, then a
-  Postgres advisory lock), under a separate key, taken first; the create lock
-  is still taken after the read, as before. The order is always renewal lock
-  then create lock, and the create path takes only the second.
+* **Renewals of one channel are serialized by a lock keyed by
+  `(user, channel uuid)`** — what the caller holds, where the create lock is
+  keyed by something only the row knows. The same two-level lock as the
+  create lock (process-local mutex, then a Postgres advisory lock). The order
+  is always renewal lock then create lock; the create path takes only the
+  second.
 * **The replacement row records the row it replaced** (`renewed_from`). A
-  renewal that finds its row gone looks for a row that says it replaced it,
-  and returns that. A uuid that was never a channel is still "not found".
+  renewal that finds its row gone looks for the row that says it replaced
+  it, and returns that. A uuid that was never a channel is still "not found".
+* **The row is looked for before the renewal lock is taken, and again after.**
+  The lock is a transaction on a pooled connection. A request for a uuid that
+  is not a channel waits for any renewal of it in flight and then lets the
+  lock go before it looks again, so it never holds one connection while
+  waiting for another. (The first version of this change took the lock
+  first. A review pointed out what that costs: 32 such requests against an
+  8-connection pool held all of it for the 30-second acquire timeout —
+  reproduced, and now a test.)
 * The field is absent from rows that replaced nothing and from every row
   already stored, so those are written byte for byte as before.
 * The order of the rotation itself is unchanged (delete before create —
@@ -60,21 +69,42 @@ failure for a channel that is fine.
 ## Pinned
 
 * `a_renewal_that_starts_while_another_is_mid_rotation_is_handed_the_replacement`:
-  starts the second renewal, from the other replica, once Google has received
-  the first one's request — so the row is certainly gone (asserted) — and
-  requires the same replacement, one Google channel, one stop, one row; then
-  that a caller with the old uuid later still gets the replacement without
-  Google being asked anything. It fails with the renewal lock removed and
-  fails with the replacement lookup disabled.
+  the stand-in for Google holds its answer to the first renewal, so the test
+  is mid-rotation for as long as it needs. It asserts the row is gone,
+  starts the second renewal from the other replica, asserts that it is still
+  waiting 300 ms later, lets Google answer, and requires the same
+  replacement, one Google channel, one stop, one row; then that a caller
+  with the old uuid later still gets the replacement without Google being
+  asked anything. It fails if a missing row does not wait for the renewal in
+  flight, and fails if the replacement lookup never matches.
+* `renewing_ids_that_are_not_channels_does_not_hold_the_pool`: 32 at once
+  against 8 connections all come back "not found". It fails (after the
+  30-second acquire timeout) if the lock is held while looking again.
 * A unit test holds the stored row's format: an old row reads back and is
   rewritten unchanged; a renewed row round-trips its `renewed_from`.
-* The test that was failing: 30 of 30 with the change. The whole binary, six
-  tests: 10 of 10.
+* The test that was failing, and the whole binary of seven: 30 of 30.
 
 ## Stated
 
-* A renewal now holds two lock transactions, so two pooled connections, for
-  its duration. Renewals run one at a time per replica.
+* A renewal of a real channel now holds two lock transactions, and uses a
+  third connection for its reads: three at its peak, where it was two. The
+  renewal loop runs them one at a time per replica.
+* **A lock held this way is lost after 60 seconds, and that is not new.**
+  Every pooled connection sets `idle_in_transaction_session_timeout = '60s'`
+  (`talos-db`), and a fleet lock is a transaction that sits idle. A rotation
+  slower than that — two upstream calls of up to 30 seconds each — loses its
+  locks partway. For the renewal lock that is the old behaviour back; for
+  the create lock, which has always had this, it is a second Google channel.
+  Found by the review, read in the configuration, not exercised, and not
+  changed here: it belongs to `acquire_fleet` and every caller of it.
+* A renewal that is handed another's replacement returns success, so the
+  loop on the second replica records a renewal too: two audit rows for one
+  renewal. The branch that already did this (gone when re-read under the
+  create lock) did the same.
+* A row the replacement lookup cannot decode is skipped with an error log,
+  as the renewal listing does, rather than failing the lookup.
+* The renewal-lock map gains an entry per uuid asked about until the hourly
+  sweep drops the idle ones.
 * `renewed_from` links one generation. A caller holding a uuid two renewals
   old is told "not found".
 * **Gmail's renewal has the same shape** — it reads the row and then locks —
