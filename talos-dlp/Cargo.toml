@@ -7,8 +7,9 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-secrecy = "0.8"
+secrecy = "0.10"
 serde_json.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true
