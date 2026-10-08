@@ -237,6 +237,60 @@ pub fn shared_google_client() -> (Option<String>, Option<String>) {
     )
 }
 
+/// The Entra ID tenant Microsoft 365 connections sign in under:
+/// `MICROSOFT_365_TENANT`, or `common` (any work or school account and
+/// personal Microsoft accounts) when it is unset or empty. A tenant id, a
+/// verified domain (`contoso.onmicrosoft.com`), `organizations` or
+/// `consumers` restricts who can connect.
+///
+/// An `Err` is a value that names no tenant. It is never widened to `common`:
+/// an operator who set it meant to restrict.
+pub fn microsoft_365_tenant() -> Result<String> {
+    microsoft_365_tenant_from(&std::env::var("MICROSOFT_365_TENANT").unwrap_or_default())
+}
+
+fn microsoft_365_tenant_from(raw: &str) -> Result<String> {
+    let tenant = raw.trim();
+    if tenant.is_empty() {
+        return Ok("common".to_string());
+    }
+    // The tenant is a path segment of the authorize and token URLs: only
+    // what a tenant id or a domain can hold, so it cannot leave the segment.
+    let usable = tenant.len() <= 253
+        && tenant
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+        && !tenant.starts_with(['.', '-'])
+        && !tenant.ends_with(['.', '-'])
+        && !tenant.contains("..");
+    if usable {
+        Ok(tenant.to_string())
+    } else {
+        Err(anyhow!(
+            "MICROSOFT_365_TENANT is not a tenant id, a domain, `organizations` or `consumers`"
+        ))
+    }
+}
+
+/// The Microsoft identity platform's authorize endpoint for
+/// [`microsoft_365_tenant`].
+pub fn microsoft_365_authorize_url() -> Result<String> {
+    Ok(format!(
+        "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize",
+        microsoft_365_tenant()?
+    ))
+}
+
+/// The token endpoint for [`microsoft_365_tenant`]. ONE resolution for the
+/// code exchange and for every refresh: a refresh token issued under one
+/// tenant's endpoint is refused at another's.
+pub fn microsoft_365_token_url() -> Result<String> {
+    Ok(format!(
+        "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+        microsoft_365_tenant()?
+    ))
+}
+
 /// Google's token revocation endpoint. Revoking ANY token of a Google account
 /// ends that account's whole grant to this OAuth client — see `google_grant`.
 pub(crate) const GOOGLE_REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
@@ -322,6 +376,13 @@ pub(crate) async fn revoke_at_provider(
         // settings page or Atlassian admin console. Local cleanup
         // (vault delete + soft-delete) still proceeds.
         "atlassian" => Ok(false),
+        // Microsoft has no endpoint that revokes one refresh token: revoking
+        // sign-in sessions (Graph `revokeSignInSessions`) ends every app's
+        // session for the user, far beyond this connection. Local cleanup
+        // still proceeds; the owner removes the app at
+        // myapplications.microsoft.com, and an unused refresh token lapses
+        // after 90 days. Named so it does not read as a provider left out.
+        "microsoft_365" => Ok(false),
         // Unknown provider — caller should not have called us, but treat as no-op.
         _ => Ok(false),
     }
@@ -2059,6 +2120,54 @@ mod redaction_tests {
         // observers can still tell whether a token was present.
         assert!(dbg.contains("access_token: None"), "None lost: {dbg}");
         assert!(dbg.contains("refresh_token: None"), "None lost: {dbg}");
+    }
+}
+
+#[cfg(test)]
+mod microsoft_365_tenant_tests {
+    use super::microsoft_365_tenant_from;
+
+    #[test]
+    fn unset_is_common() {
+        assert_eq!(microsoft_365_tenant_from("").unwrap(), "common");
+        assert_eq!(microsoft_365_tenant_from("   ").unwrap(), "common");
+    }
+
+    #[test]
+    fn a_tenant_id_a_domain_or_an_audience_overrides_it() {
+        for tenant in [
+            "organizations",
+            "consumers",
+            "contoso.onmicrosoft.com",
+            "6e4b2f4a-1c3d-4e5f-8a9b-0c1d2e3f4a5b",
+        ] {
+            assert_eq!(microsoft_365_tenant_from(tenant).unwrap(), tenant);
+        }
+        assert_eq!(
+            microsoft_365_tenant_from(" contoso.com ").unwrap(),
+            "contoso.com"
+        );
+    }
+
+    #[test]
+    fn a_value_that_could_leave_the_path_segment_is_refused_not_widened() {
+        for bad in [
+            "a/b",
+            "../common",
+            "..",
+            "contoso.com?x=1",
+            "contoso.com#x",
+            "evil.example:443",
+            "user@contoso.com",
+            "con toso",
+            "%2e%2e",
+            ".contoso.com",
+            "contoso.com.",
+            "-x",
+        ] {
+            assert!(microsoft_365_tenant_from(bad).is_err(), "{bad:?}");
+        }
+        assert!(microsoft_365_tenant_from(&"a".repeat(254)).is_err());
     }
 }
 

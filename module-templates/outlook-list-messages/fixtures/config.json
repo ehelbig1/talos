@@ -1,0 +1,7 @@
+{
+  "AUTH_HEADER": "Bearer made-up-not-a-token",
+  "FOLDER": "inbox",
+  "HOURS_BACK": 24,
+  "UNREAD_ONLY": false,
+  "MAX_RESULTS": 25
+}

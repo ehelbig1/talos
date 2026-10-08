@@ -1,5 +1,5 @@
 [package]
-name = "talos-__ID__"
+name = "talos-microsoft-365"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

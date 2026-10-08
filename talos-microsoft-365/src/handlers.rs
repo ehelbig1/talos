@@ -1,0 +1,200 @@
+//! The two HTTP handlers of the connect flow.
+//!
+//! `connect` is behind session auth and sets the browser-binding cookie;
+//! `callback` carries no session (the session cookie is `SameSite=Strict` and
+//! does not arrive on the provider's redirect) and is authenticated by the
+//! state token plus that binding. Listing and disconnecting are the generic
+//! `serviceIntegrations` / `disconnectServiceIntegration` paths, driven by the
+//! provider registry.
+
+use super::{ConnectRefusal, Microsoft365Service};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Json, Redirect},
+    Extension,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use uuid::Uuid;
+
+#[derive(Serialize)]
+pub struct OAuthUrlResponse {
+    pub authorization_url: String,
+    pub csrf_token: String,
+}
+
+#[derive(Deserialize)]
+pub struct OAuthCallbackParams {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ApiResponse<T> {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn refused(status: StatusCode, message: &str) -> axum::response::Response {
+    (
+        status,
+        Json(ApiResponse::<OAuthUrlResponse> {
+            success: false,
+            data: None,
+            error: Some(message.to_string()),
+        }),
+    )
+        .into_response()
+}
+
+/// Start the connect: returns the authorize URL and sets the binding cookie.
+pub async fn connect_handler(
+    State(service): State<Arc<Microsoft365Service>>,
+    Extension(user_id): Extension<Uuid>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !service.is_configured() {
+        return refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Microsoft 365 OAuth is not configured on this server",
+        );
+    }
+    // The state is bound to THIS browser: a URL minted here cannot be
+    // completed in someone else's (talos_oauth::connect_binding).
+    let binding = talos_oauth::BrowserBinding::for_request(&headers);
+    match service.get_authorization_url(user_id, &binding).await {
+        Ok((url, csrf_token)) => (
+            [binding.set_cookie_pair()],
+            Json(ApiResponse {
+                success: true,
+                data: Some(OAuthUrlResponse {
+                    authorization_url: url,
+                    csrf_token,
+                }),
+                error: None,
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("Failed to generate Microsoft 365 auth URL: {e}");
+            refused(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to initiate OAuth flow",
+            )
+        }
+    }
+}
+
+/// The code a failed callback shows the settings page. A closed set: nothing
+/// from the request or from an internal error reaches the redirect. A failure
+/// the owner can act on has a typed refusal in `lib.rs` and its own code here;
+/// everything else is `connect_failed`.
+fn failure_code(error: &anyhow::Error) -> &'static str {
+    match error.downcast_ref::<ConnectRefusal>() {
+        Some(ConnectRefusal::NoRefreshToken) => "no_refresh_token",
+        Some(ConnectRefusal::NoMailOrCalendarScope) => "no_mail_or_calendar_scope",
+        None => "connect_failed",
+    }
+}
+
+/// The provider's redirect back. Always answers with a redirect to the
+/// settings page: `?microsoft_365_connected=1` or `?microsoft_365_error=<code>`.
+pub async fn callback_handler(
+    Query(params): Query<OAuthCallbackParams>,
+    State(service): State<Arc<Microsoft365Service>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let frontend = talos_config::get_frontend_url();
+    let back = |query: &str| {
+        Redirect::to(&format!("{frontend}/settings?{query}#integrations")).into_response()
+    };
+
+    if let Some(error) = params.error {
+        // Caller-supplied: reduced to the RFC 6749 code shape before it is
+        // logged or reflected.
+        let safe = talos_config::sanitize_oauth_error_code(&error);
+        tracing::warn!("Microsoft 365 OAuth error: {safe}");
+        return back(&format!(
+            "microsoft_365_error={}",
+            urlencoding::encode(safe)
+        ));
+    }
+    let (Some(code), Some(state)) = (params.code, params.state) else {
+        tracing::warn!("Microsoft 365 callback without a code or a state");
+        return back("microsoft_365_error=missing_code_or_state");
+    };
+    match service
+        .handle_callback(
+            code,
+            state,
+            talos_oauth::presented_connect_binding(&headers).as_deref(),
+        )
+        .await
+    {
+        Ok(integration) => {
+            tracing::info!(integration_id = %integration.id, "Microsoft 365 connect completed");
+            back("microsoft_365_connected=1")
+        }
+        Err(e) => {
+            tracing::warn!("Microsoft 365 connect failed: {e:#}");
+            back(&format!("microsoft_365_error={}", failure_code(&e)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_unconfigured_server_answers_connect_with_503() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let service = Arc::new(Microsoft365Service::for_tests(
+            pool,
+            None,
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            "https://graph.microsoft.com/v1.0/me",
+        ));
+        let response = connect_handler(
+            State(service),
+            Extension(Uuid::new_v4()),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn a_failed_callback_shows_one_of_a_closed_set_of_codes() {
+        assert_eq!(
+            failure_code(&anyhow::anyhow!(ConnectRefusal::NoRefreshToken)),
+            "no_refresh_token"
+        );
+        assert_eq!(
+            failure_code(&anyhow::anyhow!(ConnectRefusal::NoMailOrCalendarScope)),
+            "no_mail_or_calendar_scope"
+        );
+        // A refusal still reads as one with context added on the way up.
+        assert_eq!(
+            failure_code(
+                &anyhow::anyhow!(ConnectRefusal::NoRefreshToken).context("Microsoft 365 connect")
+            ),
+            "no_refresh_token"
+        );
+        // Whatever an internal error says, the page is shown the generic code.
+        assert_eq!(
+            failure_code(&anyhow::anyhow!(
+                "relation \"microsoft_365_integrations\" does not exist"
+            )),
+            "connect_failed"
+        );
+    }
+}

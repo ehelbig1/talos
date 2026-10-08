@@ -71,6 +71,7 @@ mod integrations;
 mod llm;
 mod mcp;
 mod memory_crypto;
+mod microsoft_365;
 #[cfg(test)]
 mod migrations_pin;
 mod module_executions;
@@ -194,6 +195,7 @@ struct PlatformServices {
     google_cloud_write_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
     google_cloud_full_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
     google_health_service: std::sync::Arc<google_health::GoogleHealthService>,
+    microsoft_365_service: std::sync::Arc<microsoft_365::Microsoft365Service>,
     plaid_connect_service: std::sync::Arc<talos_plaid_connect::PlaidConnectService>,
     github_connect_service: std::sync::Arc<talos_github_connect::GithubConnectService>,
     gmail_watch_service: Option<std::sync::Arc<gmail::watch::GmailWatchService>>,

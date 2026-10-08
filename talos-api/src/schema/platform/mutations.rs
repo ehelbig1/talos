@@ -399,6 +399,7 @@ impl PlatformMutations {
             IntegrationService::GoogleCloud => "GOOGLE_CLOUD",
             IntegrationService::GoogleHealth => "GOOGLE_HEALTH",
             IntegrationService::Plaid => "PLAID",
+            IntegrationService::Microsoft365 => "MICROSOFT_365",
         };
 
         let provider = talos_integrations::provider_config::PROVIDERS

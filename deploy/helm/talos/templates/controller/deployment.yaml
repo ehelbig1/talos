@@ -281,6 +281,7 @@ spec:
                 "GCP_PUBSUB_AUDIENCE"
                 "SLACK_CLIENT_ID" "SLACK_CLIENT_SECRET"
                 "ATLASSIAN_CLIENT_ID" "ATLASSIAN_CLIENT_SECRET"
+                "MICROSOFT_365_CLIENT_ID" "MICROSOFT_365_CLIENT_SECRET" "MICROSOFT_365_TENANT"
                 "GITHUB_APP_ID" "GITHUB_APP_SLUG" "GITHUB_APP_PRIVATE_KEY" "GITHUB_APP_WEBHOOK_SECRET"
                 "GITHUB_APP_CLIENT_ID" "GITHUB_APP_CLIENT_SECRET" "GITHUB_APP_REDIRECT_URI"
                 "OKTA_DOMAIN" "OKTA_CLIENT_ID" "OKTA_CLIENT_SECRET"
@@ -337,6 +338,8 @@ spec:
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/slack/callback"
             - name: ATLASSIAN_REDIRECT_URI
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/atlassian/callback"
+            - name: MICROSOFT_365_REDIRECT_URI
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/microsoft-365/callback"
             - name: OKTA_REDIRECT_URI
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/auth/oauth/okta/callback"
             - name: SNYK_REDIRECT_URI

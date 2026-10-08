@@ -618,6 +618,14 @@ pub(crate) async fn build_platform_services(
             .with_credentials_service(oauth_credential_service.clone()),
     );
 
+    // ---------- Initialize Microsoft 365 connection ----------
+    // OAuth only, like Google Health: the mailbox and calendar are read by
+    // sandboxed modules with a vault:// reference.
+    let microsoft_365_service = std::sync::Arc::new(
+        microsoft_365::Microsoft365Service::new(db_pool.clone())
+            .with_credentials_service(oauth_credential_service.clone()),
+    );
+
     // Bank connections through Plaid Link. Off (every request refused) unless
     // PLAID_CLIENT_ID / PLAID_SECRET / PLAID_ENV are all set; the boot check
     // below says which.
@@ -1359,6 +1367,7 @@ pub(crate) async fn build_platform_services(
         google_cloud_write_service,
         google_cloud_full_service,
         google_health_service,
+        microsoft_365_service,
         plaid_connect_service,
         github_connect_service,
         gmail_watch_service,

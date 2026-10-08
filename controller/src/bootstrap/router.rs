@@ -2617,6 +2617,7 @@ pub(crate) fn build_router(
     let google_cloud_write_service = services.google_cloud_write_service.clone();
     let google_cloud_full_service = services.google_cloud_full_service.clone();
     let google_health_service = services.google_health_service.clone();
+    let microsoft_365_service = services.microsoft_365_service.clone();
     let plaid_connect_service = services.plaid_connect_service.clone();
     let github_connect_service = services.github_connect_service.clone();
     let gmail_watch_service = services.gmail_watch_service.clone();
@@ -2894,6 +2895,20 @@ pub(crate) fn build_router(
         .layer(Extension(api_limiter.clone()))
         .layer(Extension(whitelist.clone()));
 
+    // Microsoft 365 connect — the same stack as Google Health's.
+    let microsoft_365_connect_route = Router::new()
+        .route(
+            "/api/microsoft-365/connect",
+            get(microsoft_365::handlers::connect_handler),
+        )
+        .with_state(microsoft_365_service.clone())
+        .layer(from_fn(rest_auth_middleware))
+        .layer(from_fn(rest_cookie_csrf_gate))
+        .layer(Extension(auth_service.clone()))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
     // Bank connections through Plaid Link — both POSTs from the web app, behind
     // session auth and the cookie-session CSRF gate. No callback: Plaid Link
     // runs in Plaid's own window and hands its token back to the page.
@@ -2924,6 +2939,19 @@ pub(crate) fn build_router(
             get(google_health::handlers::callback_handler),
         )
         .with_state(google_health_service.clone())
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
+    // Microsoft 365 OAuth callback — NO auth middleware, for the same reason
+    // as Google Health's: the state token and the browser-binding cookie
+    // authenticate it.
+    let microsoft_365_callback_route = Router::new()
+        .route(
+            "/api/microsoft-365/callback",
+            get(microsoft_365::handlers::callback_handler),
+        )
+        .with_state(microsoft_365_service.clone())
         .layer(from_fn(rate_limit::rate_limit_middleware))
         .layer(Extension(api_limiter.clone()))
         .layer(Extension(whitelist.clone()));
@@ -3837,6 +3865,8 @@ pub(crate) fn build_router(
         .merge(google_health_connect_route)
         .merge(plaid_connect_routes)
         .merge(google_health_callback_route)
+        .merge(microsoft_365_connect_route)
+        .merge(microsoft_365_callback_route)
         .merge(github_connect_route)
         .merge(github_setup_callback_route);
     // Optional gmail push routes — `None` when GMAIL_PUBSUB_TOPIC

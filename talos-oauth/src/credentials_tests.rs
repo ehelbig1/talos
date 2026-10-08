@@ -4,7 +4,10 @@
 #[allow(clippy::module_inception)]
 #[cfg(test)]
 mod tests {
-    use crate::credentials::{is_pg_unique_violation, OAuthCredentialService};
+    use crate::credentials::{
+        is_pg_unique_violation, refresh_route, OAuthCredentialService, RefreshEndpoint,
+        RefreshRoute, TokenBody,
+    };
     use crate::revoke_at_provider;
 
     // ========================================================================
@@ -26,6 +29,85 @@ mod tests {
             !result,
             "atlassian provider must return Ok(false) — no revoke endpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn revoke_microsoft_365_returns_no_endpoint_marker() {
+        // No per-token revoke endpoint: `Ok(false)` and no network call, so a
+        // disconnect goes on to clean up locally.
+        let result = revoke_at_provider("microsoft_365", "fake", crate::GOOGLE_REVOKE_URL)
+            .await
+            .expect("microsoft_365 must not error");
+        assert!(!result);
+    }
+
+    // ========================================================================
+    // refresh_route: where each provider refreshes, and in which encoding
+    // ========================================================================
+
+    fn endpoint(provider: &str) -> RefreshEndpoint {
+        match refresh_route(provider, None).expect(provider) {
+            RefreshRoute::Endpoint(e) => e,
+            other => panic!("{provider} has no refresh endpoint: {other:?}"),
+        }
+    }
+
+    /// Microsoft refreshes at the tenant's token endpoint (the one the connect
+    /// used) with a form-encoded body; a JSON body is refused there with
+    /// AADSTS900144, so a connection would die at its first refresh.
+    #[test]
+    fn microsoft_365_refreshes_form_encoded_at_the_tenants_endpoint() {
+        let e = endpoint("microsoft_365");
+        assert_eq!(e.body, TokenBody::Form);
+        assert_eq!(e.token_url, crate::microsoft_365_token_url().unwrap());
+        assert!(
+            e.token_url
+                .starts_with("https://login.microsoftonline.com/"),
+            "{}",
+            e.token_url
+        );
+    }
+
+    /// Every other provider keeps the JSON body it has always sent: no change
+    /// to them rides on Microsoft's.
+    #[test]
+    fn the_other_providers_still_refresh_with_a_json_body() {
+        for p in crate::GOOGLE_SHARED_CLIENT_PROVIDERS
+            .iter()
+            .chain(crate::GOOGLE_CLOUD_TIER_PROVIDERS)
+            .chain(&["atlassian"])
+        {
+            let e = endpoint(p);
+            assert_eq!(e.body, TokenBody::Json, "{p}");
+        }
+        assert!(matches!(
+            refresh_route("slack", None).unwrap(),
+            RefreshRoute::NonExpiring
+        ));
+        assert!(matches!(
+            refresh_route("does-not-exist", None).unwrap(),
+            RefreshRoute::Unknown
+        ));
+    }
+
+    /// The test stand-in is used only for Microsoft.
+    #[test]
+    fn the_microsoft_365_stand_in_reaches_no_other_provider() {
+        let stand_in = RefreshEndpoint {
+            token_url: "http://127.0.0.1:1/token".to_string(),
+            client_id: Some("id".to_string()),
+            client_secret: Some("secret".to_string()),
+            body: TokenBody::Form,
+        };
+        let RefreshRoute::Endpoint(e) = refresh_route("microsoft_365", Some(&stand_in)).unwrap()
+        else {
+            panic!("microsoft_365 has an endpoint");
+        };
+        assert_eq!(e.token_url, "http://127.0.0.1:1/token");
+        let RefreshRoute::Endpoint(e) = refresh_route("gmail", Some(&stand_in)).unwrap() else {
+            panic!("gmail has an endpoint");
+        };
+        assert_eq!(e.token_url, "https://oauth2.googleapis.com/token");
     }
 
     #[tokio::test]

@@ -1,0 +1,68 @@
+{
+  "name": "outlook-calendar-list-events",
+  "version": "v1.0.0",
+  "display_name": "Outlook Calendar: List Events",
+  "description": "List upcoming events from an Outlook (Microsoft 365) calendar over a time window, through Microsoft Graph's calendarView. The output has the same shape as Google Calendar: List Events, so a workflow can swap one for the other: {count, events, window_hours, truncated, time_zone}, and per event id, uid (Graph's iCalUId, the same on every calendar the invitation sits on), summary, location, start, end, all_day, busy, show_as, event_type, response, guests, organizer_self, recurring, hangout_link, web_link and attendees [{email, response_status}]. Words are Google's: `busy` is true unless Graph's showAs is free (tentative, oof and workingElsewhere hold the time); `response` is the calendar owner's own answer (accepted, declined, tentative, needsAction, or \"\" for their own entry with nobody invited); `event_type` is outOfOffice for showAs oof, else default; `guests` counts the other people invited, rooms not counted; `hangout_link` is the online meeting's join URL. Times are RFC 3339 with the UTC offset of TIME_ZONE (UTC when it is not set); an all-day entry's start and end are dates, the end exclusive. A cancelled meeting still on the calendar is left out. `truncated` is true when the calendar holds more events in the window than were returned. There is no `description`: the event body is not read. Graph errors are returned as `Graph HTTP <status>: <body>` (a mailbox outside Exchange Online answers MailboxNotEnabledForRESTAPI).\n\nRequires a vault:// reference to a Microsoft 365 OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time.",
+  "category": "Integration",
+  "capability_world": "http-node",
+  "allowed_hosts": ["graph.microsoft.com"],
+  "allowed_methods": ["GET"],
+  "requires_secrets": ["oauth/microsoft_365/*"],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 100,
+    "bytes_per_item": 2200,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 1.5,
+    "fuel_per_byte": 50
+  },
+  "dependencies": {
+    "chrono": "0.4"
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/microsoft_365/{user_id}/{account_id}/access_token', where account_id is the account's Graph object id; list_connections gives the whole reference). The controller resolves + refreshes the token if expired."
+      },
+      "CALENDAR_ID": {
+        "type": "string",
+        "default": "",
+        "description": "Graph calendar id (from /me/calendars). Empty, or 'primary', for the account's default calendar. Letters, digits and - _ = + / only."
+      },
+      "HOURS_AHEAD": {
+        "type": "integer",
+        "default": 24,
+        "description": "Window size in hours (1–336, i.e. up to 14 days). Events overlapping now..now+HOURS_AHEAD are returned. A value outside the range is refused."
+      },
+      "MAX_RESULTS": {
+        "type": "integer",
+        "default": 20,
+        "description": "Maximum events to return (1–250; default 20). Read 50 per request, at most 6 requests. Costs roughly 180K fuel per event (measured on a recorded week of 64 events): the declared limit covers about 100, so above that set `max_fuel` on the node (250 needs about 45M). When the calendar holds more, the output's `truncated` is true. A value outside the range is refused."
+      },
+      "TIME_ZONE": {
+        "type": "string",
+        "description": "Optional IANA zone name (e.g. 'America/New_York'). Graph is asked for times in that zone (Prefer: outlook.timezone) and each start and end carries that zone's UTC offset on its own date, so a module can group events by local day without a time-zone database, across daylight-saving changes. Omitted: UTC. The zone used is echoed as `time_zone`. A name the host does not know is refused."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Register the Microsoft 365 app",
+      "detail": "Follow docs/microsoft-365-setup.md: an Entra app registration with the delegated Microsoft Graph permissions User.Read, Mail.Read, Calendars.Read and offline_access, and MICROSOFT_365_CLIENT_ID / MICROSOFT_365_CLIENT_SECRET set on the controller. Calendars.Read is the one this module needs."
+    },
+    {
+      "step": 2,
+      "title": "Connect the account",
+      "detail": "Connect Microsoft 365 from the Talos integrations page. The controller stores tokens at 'oauth/microsoft_365/{user_id}/{account_id}/{access|refresh}_token' and refreshes them before they expire."
+    },
+    {
+      "step": 3,
+      "title": "Configure AUTH_HEADER",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://oauth/microsoft_365/{your_user_id}/{your_account_id}/access_token'. For 401s, use refresh_oauth_token(vault_path) to force a refresh and inspect the outcome; a connection marked as needing reconnection must be reconnected from the integrations page."
+    }
+  ]
+}

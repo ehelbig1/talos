@@ -1622,6 +1622,10 @@ pub enum IntegrationService {
     GoogleCloud,
     GoogleHealth,
     Plaid,
+    // Named explicitly: the derived name would be `MICROSOFT365`, and the
+    // provider registry says `MICROSOFT_365`.
+    #[graphql(name = "MICROSOFT_365")]
+    Microsoft365,
 }
 
 #[derive(SimpleObject, Clone, Debug)]

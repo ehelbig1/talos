@@ -1,0 +1,70 @@
+{
+  "name": "outlook-list-messages",
+  "version": "v1.0.0",
+  "display_name": "Outlook: List Messages",
+  "description": "List recent messages in one Outlook (Microsoft 365) mail folder through Microsoft Graph. Choose the folder (inbox, sentitems, drafts, archive, deleteditems, junkemail, or a folder id), the window (HOURS_BACK) and whether to keep only unread mail, and receive the newest first as structured metadata under the same names as 'Gmail: List Messages' (id, subject, from, to, date, snippet) plus is_read and web_link. `truncated` is true when the folder holds more messages in the window than were returned. One GET per run; read-only. Canonical building block for morning-brief / inbox-triage workflows on a Microsoft 365 mailbox.\n\nRequires a vault:// reference to the Microsoft 365 OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time — you only pass the vault path. A mailbox that is not in Exchange Online fails with Graph's MailboxNotEnabledForRESTAPI error, not an empty list.",
+  "category": "Communication",
+  "capability_world": "http-node",
+  "allowed_hosts": ["graph.microsoft.com"],
+  "allowed_methods": ["GET"],
+  "requires_secrets": ["oauth/microsoft_365/*"],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 25,
+    "bytes_per_item": 2000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 3.0,
+    "fuel_per_byte": 30
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/microsoft_365/{user_id}/{account_id}/access_token', where account_id is the account's Graph object id; list_connections gives the whole reference). The controller resolves the vault reference and refreshes the token if expired."
+      },
+      "FOLDER": {
+        "type": "string",
+        "default": "inbox",
+        "description": "The mail folder: one of Graph's well-known names (inbox, sentitems, drafts, archive, deleteditems, junkemail; any case) or a folder id (letters, digits, '-', '_', '=', '+'; at most 256 characters). Anything else is refused."
+      },
+      "HOURS_BACK": {
+        "type": "integer",
+        "default": 24,
+        "minimum": 1,
+        "maximum": 720,
+        "description": "Only messages received in the last HOURS_BACK hours (1–720). Match it to the schedule: a run every 15 minutes needs 1, a morning brief 24."
+      },
+      "UNREAD_ONLY": {
+        "type": "boolean",
+        "default": false,
+        "description": "true: only messages not yet read."
+      },
+      "MAX_RESULTS": {
+        "type": "integer",
+        "default": 10,
+        "minimum": 1,
+        "maximum": 25,
+        "description": "Most messages returned (1–25), newest first. A value outside the range is refused rather than clamped."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Register the app (operator, once)",
+      "detail": "Follow docs/microsoft-365-setup.md: an Entra app registration with the delegated Graph permissions User.Read, Mail.Read and offline_access (Calendars.Read for the calendar template), and MICROSOFT_365_CLIENT_ID / MICROSOFT_365_CLIENT_SECRET set on the controller."
+    },
+    {
+      "step": 2,
+      "title": "Connect the account",
+      "detail": "Connect Microsoft 365 from the integrations page. The controller stores the access_token + refresh_token at 'oauth/microsoft_365/{user_id}/{account_id}/access_token' and '.../refresh_token' and refreshes them before they expire. If your organisation blocks user consent to Mail.Read, an administrator grants it once (docs/microsoft-365-setup.md, Admin consent)."
+    },
+    {
+      "step": 3,
+      "title": "Configure AUTH_HEADER",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://oauth/microsoft_365/{your_user_id}/{account_id}/access_token' (list_connections gives the whole reference). If you hit 401s, call refresh_oauth_token(vault_path) to force a refresh and read the outcome; a refused refresh means the account must be reconnected."
+    }
+  ]
+}
