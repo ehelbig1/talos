@@ -28,16 +28,31 @@ way of doing that the project knows of; this setting removes what is behind it.
    this login's user and password. In production it must pin
    `sslmode=require`, `verify-ca` or `verify-full`, as `DATABASE_URL` must.
 
+   Use a hex password (`openssl rand -hex 24`) so it needs no URL escaping.
+
    * docker compose: `TALOS_ADMIN_QUERY_DATABASE_URL=postgres://talos_admin_query:<password>@postgres:5432/talos`
-     in `.env`.
-   * k3s install: `TALOS_ADMIN_QUERY_DATABASE_URL=…` in `/etc/talos/install.env`,
-     then re-run `install.sh`.
+     in `.env`, then `docker compose up -d controller`. A plain `restart`
+     does not re-read `.env`.
+   * An existing k3s install: re-running `install.sh` does NOT update the
+     bootstrap Secret (it is create-once). Patch it instead; the helper also
+     restarts the controller:
+     `echo -n "$URL" | sudo scripts/patch-bootstrap-secret.sh TALOS_ADMIN_QUERY_DATABASE_URL=-`.
+     Add the same line to `/etc/talos/install.env` too, so a fresh install
+     carries it.
    * Helm: `bootstrapSecret.data.TALOS_ADMIN_QUERY_DATABASE_URL`.
    * A secrets mount: `TALOS_ADMIN_QUERY_DATABASE_URL_FILE=/path/to/file`.
 
-3. Restart the controller. Its log says `query_paginated connects as its own
+3. The controller's start-up log says `query_paginated connects as its own
    login` (never the URL). On a misconfigured value it logs an error instead,
    and every call is refused until the value is fixed or removed.
+
+4. Check the tool is really using the login. The query gate refuses
+   `current_user` and `session_user`, so ask the database instead. Run any
+   read through `query_paginated` (`SELECT count(*) AS n FROM workflows`).
+   Then, as a superuser, run `ALTER ROLE talos_admin_query NOLOGIN;` and run
+   the read again: it must be refused with "no connection could be made as
+   it". Finally run `ALTER ROLE talos_admin_query LOGIN;` and the read works
+   again.
 
 ## What changes
 

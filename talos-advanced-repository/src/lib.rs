@@ -5038,7 +5038,8 @@ impl PaginatedSelectError {
              ALTER ROLE {role} BYPASSRLS); GRANT {role} TO <the login query_paginated connects \
              as: the user in {ADMIN_QUERY_DATABASE_URL_VAR}, or the controller's database role \
              when that is unset>; then the GRANT statements in \
-             migrations/20261008200000_talos_admin_read_role.sql."
+             migrations/20261008200000_talos_admin_read_role.sql, followed by the REVOKE in \
+             migrations/20261009120000_talos_admin_read_withhold_auth_tables.sql."
         )
     }
 
