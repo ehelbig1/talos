@@ -7680,8 +7680,11 @@ name = "talos-advanced-repository"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "chrono",
+ "hmac 0.13.0",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "talos-actor-budget-refusal",
  "talos-admin-event-log",
@@ -7693,6 +7696,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-draft-heuristics",
  "talos-execution-finalizer",
+ "talos-random",
  "talos-registry",
  "talos-tenancy",
  "talos-text-util",
@@ -7700,7 +7704,9 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

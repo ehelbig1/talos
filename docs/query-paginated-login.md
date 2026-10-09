@@ -11,7 +11,48 @@ connection (`DATABASE_URL`). On a deployment where that is a superuser, a
 statement that set the role back would be a superuser. The gate refuses every
 way of doing that the project knows of; this setting removes what is behind it.
 
-## Setting it up
+## Setting it up: one command
+
+From the repository checkout on the host that runs the stack:
+
+```bash
+scripts/setup-admin-query-login.sh --compose          # docker compose (.env in the current directory)
+scripts/setup-admin-query-login.sh --compose --env-file /path/to/.env
+sudo scripts/setup-admin-query-login.sh --k3s         # the k3s install
+```
+
+It does the steps below for you:
+
+* Inside the running controller container,
+  `controller admin-query-login provision` makes `talos_admin_query`, or
+  gives it a new password if it exists.
+  * The password is 24 random bytes, generated there.
+  * Postgres receives only its SCRAM verifier, so the password is in no
+    statement, server log or `pg_stat_statements` row.
+  * The login is put back to LOGIN only, and is checked the way every call
+    checks it.
+* The URL comes back on a pipe and goes straight into `.env` (mode 600), or
+  into the k3s bootstrap Secret and `/etc/talos/install.env`. It is never
+  printed.
+* The controller is restarted, and its log is checked for `query_paginated
+  connects as its own login`.
+
+**If provisioning fails**, nothing else is changed, and the message says why.
+The usual reason on a managed Postgres is that the controller's database user
+may not create roles; a superuser then runs step 1 below by hand.
+
+**Running it again rotates the password.** Until the restart finishes, the
+running controller refuses `query_paginated` calls; nothing else is affected.
+
+**`--remove`** takes the setting out, restarts, and runs
+`controller admin-query-login disable`, so a copy of the old URL no longer
+logs in.
+
+The controller needs CREATEROLE (or superuser) on its database user for
+this, and the role `talos_admin_read` must exist (migration
+`20261008200000`).
+
+## Setting it up by hand
 
 1. As a superuser, make a login for the tool alone:
 

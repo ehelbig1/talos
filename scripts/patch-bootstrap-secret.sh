@@ -103,7 +103,13 @@ add_pair() {
         exit 1
     fi
     if [ "$val" = "-" ]; then
-        if ! IFS= read -r val; then
+        # `read` reports end-of-input even when it read a final line with no
+        # newline (`echo -n "$KEY" | … KEY=-`, the form this script's own
+        # README examples use), so an empty result is the failure, not the
+        # status.
+        val=""
+        IFS= read -r val || true
+        if [ -z "$val" ]; then
             err "No stdin available for key '$key' with value '-'."
             exit 1
         fi

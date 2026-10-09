@@ -10,6 +10,8 @@ use sqlx::{Connection, PgPool, Postgres, Row, Transaction};
 use talos_tenancy::TenantReadScope;
 use uuid::Uuid;
 
+pub mod admin_query_provision;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Row DTOs
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4914,6 +4916,15 @@ impl AdminQueryLogin {
             ));
         }
         Self::dedicated(options, statement_timeout_secs)
+    }
+
+    /// Why the setting cannot be used, when it is set but unusable.
+    #[must_use]
+    pub fn misconfigured(&self) -> Option<&'static str> {
+        match self.0 {
+            LoginKind::Misconfigured(why) => Some(why),
+            LoginKind::Pool | LoginKind::Dedicated(_) => None,
+        }
     }
 
     /// A login of the tool's own, from connect options (the tests build one
