@@ -205,7 +205,7 @@ mod db_tests {
             "SELECT pg_backend_pid() AS pid",
             &[],
             true,
-            None,
+            crate::GuestRoleSetting::Unset,
             Duration::from_secs(10),
         )
         .await
@@ -232,7 +232,7 @@ mod db_tests {
                 &format!("SELECT pg_advisory_lock({key})"),
                 &[],
                 is_fetch,
-                None,
+                crate::GuestRoleSetting::Unset,
                 Duration::from_secs(10),
             )
             .await;
@@ -275,7 +275,7 @@ mod db_tests {
                 &format!("SELECT pg_advisory_lock({key}), 1/(random() * 0)::int"),
                 &[],
                 is_fetch,
-                None,
+                crate::GuestRoleSetting::Unset,
                 Duration::from_secs(10),
             )
             .await;
@@ -316,7 +316,7 @@ mod db_tests {
             &format!("SELECT pg_advisory_lock({key}), pg_sleep(3)"),
             &[],
             false,
-            None,
+            crate::GuestRoleSetting::Unset,
             Duration::from_secs(1),
         )
         .await;
@@ -421,7 +421,7 @@ mod db_tests {
             &format!("SELECT pg_advisory_lock({key})"),
             &[],
             false,
-            Some("talos_guest"),
+            crate::GuestRoleSetting::Role("talos_guest"),
             Duration::from_secs(10),
         )
         .await;
@@ -439,7 +439,7 @@ mod db_tests {
             "SELECT 1 AS n",
             &[],
             true,
-            Some("talos_guest"),
+            crate::GuestRoleSetting::Role("talos_guest"),
             Duration::from_secs(10),
         )
         .await;
