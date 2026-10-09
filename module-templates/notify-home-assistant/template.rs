@@ -18,6 +18,17 @@
 //   tag              -> data.tag: a later message with the same tag replaces
 //                       the earlier one
 //
+// One thing this service can do that the contract does not name: a REPLY
+// BOX. With REPLY_TITLE set, every notification this node sends carries one
+// more action, {action: "REPLY", title, behavior: "textInput"}, and the phone
+// shows a text field under it. What is typed does not come back here: the
+// companion app fires `mobile_app_notification_action` (action REPLY, with
+// `reply_text`) inside Home Assistant, and an automation there decides what
+// to do with it. It is adapter config, not part of the notification, so a
+// compose node stays service-neutral and another adapter simply has no box.
+// The box takes one of the three action places: with three composed actions
+// the last is not sent and is counted in actions_dropped.
+//
 // DLP: logs counts only. An error names the host and the status, never the
 // response body and never the notify service.
 
@@ -244,6 +255,27 @@ struct Cfg {
     dry_run: Option<bool>,
     #[serde(rename = "TIMEOUT_MS", default)]
     timeout_ms: Option<u32>,
+    #[serde(rename = "REPLY_TITLE", default)]
+    reply_title: Option<String>,
+}
+
+/// The most actions the companion app shows under one notification.
+const MAX_SHOWN_ACTIONS: usize = 3;
+/// A reply box's label, cut like any other action title would be refused:
+/// longer than this is a config mistake, not something to trim silently.
+const MAX_REPLY_TITLE_CHARS: usize = 40;
+
+/// The reply box's label, when one is configured. Unset or blank is no box.
+fn reply_title(raw: Option<&str>) -> Result<Option<&str>, String> {
+    let Some(t) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if t.chars().count() > MAX_REPLY_TITLE_CHARS || t.chars().any(char::is_control) {
+        return Err(format!(
+            "REPLY_TITLE must be at most {MAX_REPLY_TITLE_CHARS} characters with no control characters"
+        ));
+    }
+    Ok(Some(t))
 }
 
 #[derive(Deserialize)]
@@ -260,7 +292,12 @@ struct Incoming {
 struct HaAction<'a> {
     action: &'static str,
     title: &'a str,
-    uri: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<&'a str>,
+    /// iOS shows a text field for an action with this; Android shows one for
+    /// the action named REPLY and ignores the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behavior: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -295,8 +332,33 @@ fn usable_service(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-fn ha_body(n: &Notification) -> Result<Vec<u8>, String> {
+/// How many of the composed actions are sent: all of them, or one fewer
+/// than the app shows when a reply box takes a place.
+fn actions_shown(composed: usize, reply_box: bool) -> usize {
+    composed.min(MAX_SHOWN_ACTIONS - usize::from(reply_box))
+}
+
+fn ha_body(n: &Notification, reply: Option<&str>) -> Result<Vec<u8>, String> {
     let high = n.priority == Priority::High;
+    let mut actions: Vec<HaAction> = n
+        .actions
+        .iter()
+        .take(actions_shown(n.actions.len(), reply.is_some()))
+        .map(|a| HaAction {
+            action: "URI",
+            title: &a.title,
+            uri: Some(&a.link),
+            behavior: None,
+        })
+        .collect();
+    if let Some(title) = reply {
+        actions.push(HaAction {
+            action: "REPLY",
+            title,
+            uri: None,
+            behavior: Some("textInput"),
+        });
+    }
     let message = HaMessage {
         message: &n.body,
         title: &n.title,
@@ -306,15 +368,7 @@ fn ha_body(n: &Notification) -> Result<Vec<u8>, String> {
             url: n.link.as_deref(),
             priority: high.then_some("high"),
             ttl: high.then_some(0),
-            actions: n
-                .actions
-                .iter()
-                .map(|a| HaAction {
-                    action: "URI",
-                    title: &a.title,
-                    uri: &a.link,
-                })
-                .collect(),
+            actions,
         },
     };
     serde_json::to_vec(&message).map_err(|e| format!("could not build the message: {e}"))
@@ -344,6 +398,7 @@ pub fn run(input: String) -> Result<String, String> {
         .filter(|a| !a.trim().is_empty())
         .ok_or("Missing AUTH_HEADER config (expected 'Bearer vault://homeassistant/token')")?;
     let dry_run = cfg.dry_run.unwrap_or(false);
+    let reply = reply_title(cfg.reply_title.as_deref())?;
 
     let mut verdict = Verdict {
         provider: PROVIDER,
@@ -362,8 +417,10 @@ pub fn run(input: String) -> Result<String, String> {
         verdict.skipped = true;
         return serde_json::to_string(&verdict).map_err(|e| e.to_string());
     };
-    verdict.actions_sent = n.actions.len();
-    verdict.actions_dropped = n.actions_dropped;
+    // A reply box is not one of the notification's actions and is not
+    // counted as one; an action it displaces is counted as dropped.
+    verdict.actions_sent = actions_shown(n.actions.len(), reply.is_some());
+    verdict.actions_dropped = n.actions_dropped + (n.actions.len() - verdict.actions_sent);
     verdict.link_sent = n.link.is_some();
     verdict.link_dropped = n.link_dropped;
     verdict.tag_sent = n.tag.is_some();
@@ -371,8 +428,11 @@ pub fn run(input: String) -> Result<String, String> {
     logging::log(
         Level::Info,
         &format!(
-            "notify-home-assistant: {} action(s), {} dropped, dry_run={}",
-            verdict.actions_sent, verdict.actions_dropped, dry_run
+            "notify-home-assistant: {} action(s), {} dropped, reply_box={}, dry_run={}",
+            verdict.actions_sent,
+            verdict.actions_dropped,
+            reply.is_some(),
+            dry_run
         ),
     );
     if dry_run {
@@ -386,7 +446,7 @@ pub fn run(input: String) -> Result<String, String> {
             ("Authorization".to_string(), auth.to_string()),
             ("Content-Type".to_string(), "application/json".to_string()),
         ],
-        body: ha_body(&n)?,
+        body: ha_body(&n, reply)?,
         timeout_ms: Some(cfg.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000)),
     };
     let resp = talos::core::http::fetch(&req)
@@ -470,6 +530,61 @@ mod tests {
         send(config(), json!({ "notification": { "body": "Just this." } })).unwrap();
         let body: Value = serde_json::from_slice(&host::http::requests()[0].body).unwrap();
         assert_eq!(body, json!({ "message": "Just this.", "data": {} }));
+    }
+
+    #[test]
+    fn a_reply_box_is_added_from_config_and_takes_one_action_place() {
+        let with_box = |title: Value| {
+            let mut c = config();
+            c["REPLY_TITLE"] = title;
+            c
+        };
+        // A plain notification: the box is its only action.
+        host::http::respond(200, "[]");
+        let v = send(with_box(json!("Add to list")), json!({ "notification": { "body": "Just this." } })).unwrap();
+        assert_eq!((v["actions_sent"].clone(), v["actions_dropped"].clone()), (json!(0), json!(0)));
+        let body: Value = serde_json::from_slice(&host::http::requests()[0].body).unwrap();
+        assert_eq!(
+            body,
+            json!({ "message": "Just this.", "data": { "actions": [
+                { "action": "REPLY", "title": "Add to list", "behavior": "textInput" }
+            ] } })
+        );
+
+        // Two composed actions and the box: all three are shown, the box last.
+        host::http::respond(200, "[]");
+        let v = send(with_box(json!("  Add to list  ")), json!({ "notification": note() })).unwrap();
+        assert_eq!((v["actions_sent"].clone(), v["actions_dropped"].clone()), (json!(2), json!(0)));
+        let body: Value = serde_json::from_slice(&host::http::requests()[1].body).unwrap();
+        let sent = body["data"]["actions"].as_array().unwrap();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[2], json!({ "action": "REPLY", "title": "Add to list", "behavior": "textInput" }));
+        assert_eq!(sent[0]["action"], json!("URI"));
+
+        // Three composed actions and the box: the third is not sent, and is counted.
+        let mut three = note();
+        three["actions"].as_array_mut().unwrap().push(json!({ "title": "Later", "link": "https://talos.example.test/later" }));
+        host::http::respond(200, "[]");
+        let v = send(with_box(json!("Add to list")), json!({ "notification": three.clone() })).unwrap();
+        assert_eq!((v["actions_sent"].clone(), v["actions_dropped"].clone()), (json!(2), json!(1)));
+        let body: Value = serde_json::from_slice(&host::http::requests()[2].body).unwrap();
+        let titles: Vec<&str> = body["data"]["actions"].as_array().unwrap().iter().map(|a| a["title"].as_str().unwrap()).collect();
+        assert_eq!(titles, ["Done", "Open list", "Add to list"]);
+        // Without the box the same three are all sent, as before.
+        host::http::respond(200, "[]");
+        let v = send(config(), json!({ "notification": three })).unwrap();
+        assert_eq!((v["actions_sent"].clone(), v["actions_dropped"].clone()), (json!(3), json!(0)));
+
+        // Blank is no box; a label that cannot be one is refused before anything is sent.
+        host::http::respond(200, "[]");
+        send(with_box(json!("   ")), json!({ "notification": { "body": "Just this." } })).unwrap();
+        let body: Value = serde_json::from_slice(&host::http::requests()[4].body).unwrap();
+        assert_eq!(body, json!({ "message": "Just this.", "data": {} }));
+        for bad in [json!("x".repeat(41)), json!("Add\nto list")] {
+            let e = send(with_box(bad), json!({ "notification": note() })).unwrap_err();
+            assert!(e.contains("REPLY_TITLE must be"), "{e}");
+        }
+        assert_eq!(host::http::requests().len(), 5);
     }
 
     #[test]

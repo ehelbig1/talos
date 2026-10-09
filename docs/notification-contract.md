@@ -101,6 +101,21 @@ verdict for the same notification, or if one installs able to reach
 anything. A change to the contract is a change to the block in every
 adapter, in one commit.
 
+## What an adapter may add: a reply box
+
+A place to type an answer is something one service has and another does not,
+so it is not in the `notification` object. It is adapter config:
+`notify-home-assistant` takes `REPLY_TITLE`, and every notification that node
+sends then carries a text field with that label. What is typed does not come
+back through the adapter. The companion app raises an event inside Home
+Assistant (`mobile_app_notification_action`, action `REPLY`, with
+`reply_text`), and an automation there keeps or forwards it; a workflow reads
+it from wherever that automation put it, with a reader of its own. The box
+takes one of the three action places: with three composed actions the last
+is not sent, and is counted in `actions_dropped`.
+
+Swapping to an adapter with no such setting loses the box and nothing else.
+
 ## What is not in the contract
 
 Email. The morning message is HTML mail through the delivery pattern
