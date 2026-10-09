@@ -5,6 +5,7 @@
   "description": "Combines the outputs of several `plaid-bank-digest` nodes (joined by a Collect node) into one money summary. Pure computation: no network, no memory, no clock. Returns `cash`, `owed_on_cards` and `cash_after_cards` across all banks; `spending` with last week's day-to-day and fixed totals, the usual week (the median of the earlier weeks, so one unusual week does not move it), a monthly average, `months_of_cash`, the top categories beside their own usual week and the largest items; and `recurring` monthly charges with the new ones. A figure that rests on a bank that could not be read is `null` rather than a partial sum: `cash` and `months_of_cash` need every bank, while spending from the banks that were read is still given with `partial: true`. Banks that failed upstream are listed under `missing` with the reason the engine recorded. Weeks before a bank's history begins are not counted as weeks of zero spending, and no usual week is stated from fewer than four earlier weeks.",
   "category": "Data",
   "capability_world": "minimal-node",
+  "block": {"role": "decider"},
   "allowed_hosts": [],
   "requires_secrets": [],
   "requires_approval_for": [],

@@ -5,6 +5,7 @@
   "description": "Last night's sleep, yesterday's step count and the resting heart rate from the Google Health API (Pixel Watch and Fitbit devices). Read-only: three GET requests, nothing is written. Returns `sleep` (start and end in local time, minutes asleep and awake, minutes per stage, whether it ended this morning), `resting_heart_rate` (latest value and the mean over the last 7 days), `steps` (yesterday's total) and `nothing_recorded` (true only when the API answered ALL THREE readings and every answer was empty, i.e. the device was not worn or has not synced; false whenever a reading is under `unavailable`, since what was recorded is then not known). A reading that could not be read is listed under `unavailable` with its HTTP status and the others are still returned; a reading with no data is `null`. Canonical building block for a morning message.\n\nRequires a vault:// reference to a Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time.",
   "category": "Integration",
   "capability_world": "http-node",
+  "block": {"role": "reader"},
   "allowed_hosts": ["health.googleapis.com"],
   "allowed_methods": ["GET"],
   "requires_secrets": ["oauth/google_health/*"],

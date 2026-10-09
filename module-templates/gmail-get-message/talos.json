@@ -5,6 +5,7 @@
   "description": "Fetch ONE Gmail message (or a small labeled set) with the FULL detail an email-reply channel needs that Gmail: List Messages does NOT return: the plain-text body, the routing headers (To / Message-ID / In-Reply-To), the thread_id, and a parsed Authentication-Results verdict (SPF / DKIM / DMARC) used to gate sender trust.\n\nTwo modes: set MESSAGE_ID to fetch one specific message, OR set QUERY (e.g. 'label:Ask is:unread') + MAX_RESULTS to list then fetch each. Fetches format=full and extracts the text/plain MIME part (falls back to the snippet), capped at MAX_BODY_BYTES on a UTF-8 char boundary.\n\nThis is the 'read the email my assistant was sent' leg of the email-your-assistant channel. Chains cleanly into Gmail: Modify (mark read / label) via the shared messages[].id output shape.\n\nRequires a vault:// reference to a Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time.",
   "category": "Communication",
   "capability_world": "http-node",
+  "block": {"role": "reader"},
   "allowed_hosts": ["gmail.googleapis.com"],
   "allowed_methods": ["GET"],
   "requires_secrets": ["oauth/gmail/*"],

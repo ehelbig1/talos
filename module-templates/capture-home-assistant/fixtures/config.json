@@ -1,0 +1,6 @@
+{
+  "BASE_URL": "https://home.example.test",
+  "AUTH_HEADER": "Bearer made-up-not-a-token",
+  "ENTITY": "input_text.made_up_capture",
+  "NOW_MS": 1791560000000
+}

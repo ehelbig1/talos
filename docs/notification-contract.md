@@ -110,7 +110,8 @@ sends then carries a text field with that label. What is typed does not come
 back through the adapter. The companion app raises an event inside Home
 Assistant (`mobile_app_notification_action`, action `REPLY`, with
 `reply_text`), and an automation there keeps or forwards it; a workflow reads
-it from wherever that automation put it, with a reader of its own. The box
+it back with a `capture-*` adapter (`docs/capture-contract.md`, which has the
+automation). The box
 takes one of the three action places: with three composed actions the last
 is not sent, and is counted in `actions_dropped`.
 

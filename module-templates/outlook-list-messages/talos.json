@@ -5,6 +5,7 @@
   "description": "List recent messages in one Outlook (Microsoft 365) mail folder through Microsoft Graph. Choose the folder (inbox, sentitems, drafts, archive, deleteditems, junkemail, or a folder id), the window (HOURS_BACK) and whether to keep only unread mail, and receive the newest first as structured metadata under the same names as 'Gmail: List Messages' (id, subject, from, to, date, snippet) plus is_read and web_link. `truncated` is true when the folder holds more messages in the window than were returned. One GET per run; read-only. Canonical building block for morning-brief / inbox-triage workflows on a Microsoft 365 mailbox.\n\nRequires a vault:// reference to the Microsoft 365 OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time — you only pass the vault path. A mailbox that is not in Exchange Online fails with Graph's MailboxNotEnabledForRESTAPI error, not an empty list.",
   "category": "Communication",
   "capability_world": "http-node",
+  "block": {"role": "reader"},
   "allowed_hosts": ["graph.microsoft.com"],
   "allowed_methods": ["GET"],
   "requires_secrets": ["oauth/microsoft_365/*"],
