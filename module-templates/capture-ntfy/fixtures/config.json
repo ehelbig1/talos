@@ -1,0 +1,6 @@
+{
+  "SERVER_URL": "https://ntfy.example.test",
+  "TOPIC": "made-up-inbox",
+  "AUTH_HEADER": "Bearer made-up-not-a-token",
+  "NOW_MS": 1791560000000
+}

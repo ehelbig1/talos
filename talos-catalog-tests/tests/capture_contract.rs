@@ -26,23 +26,44 @@ struct Adapter {
 
 const NOW_MS: u64 = 1_791_560_000_000;
 
-const ADAPTERS: &[Adapter] = &[Adapter {
-    slug: "capture-home-assistant",
-    run: talos_catalog_tests::capture_home_assistant::run,
-    config: || {
-        json!({ "BASE_URL": "https://home.example.test", "AUTH_HEADER": "Bearer vault://homeassistant/token",
+const ADAPTERS: &[Adapter] = &[
+    Adapter {
+        slug: "capture-home-assistant",
+        run: talos_catalog_tests::capture_home_assistant::run,
+        config: || {
+            json!({ "BASE_URL": "https://home.example.test", "AUTH_HEADER": "Bearer vault://homeassistant/token",
                 "ENTITY": "input_text.made_up_capture", "NOW_MS": NOW_MS })
-    },
-    respond: |lines| {
-        let rows: Vec<Value> = lines
+        },
+        respond: |lines| {
+            let rows: Vec<Value> = lines
             .iter()
             .map(
                 |(n, text)| json!({ "state": format!("{}|{text}", NOW_MS - 3_600_000 + n * 1000) }),
             )
             .collect();
-        host::http::respond(200, json!([rows]).to_string());
+            host::http::respond(200, json!([rows]).to_string());
+        },
     },
-}];
+    Adapter {
+        slug: "capture-ntfy",
+        run: talos_catalog_tests::capture_ntfy::run,
+        config: || {
+            json!({ "SERVER_URL": "https://ntfy.example.test", "TOPIC": "made-up-inbox",
+                "AUTH_HEADER": "Bearer vault://ntfy/token", "NOW_MS": NOW_MS })
+        },
+        respond: |lines| {
+            let body: Vec<String> = lines
+            .iter()
+            .map(|(n, text)| {
+                json!({ "id": format!("made{n:08}"), "time": NOW_MS / 1000 - 3600 + n, "event": "message",
+                        "topic": "made-up-inbox", "message": text })
+                .to_string()
+            })
+            .collect();
+            host::http::respond(200, body.join("\n"));
+        },
+    },
+];
 
 const BEGIN: &str = "// ── capture contract ──";
 const END: &str = "// ── end capture contract ──";
