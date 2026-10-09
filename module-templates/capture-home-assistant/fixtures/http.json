@@ -1,0 +1,95 @@
+[
+ {
+  "method": "GET",
+  "url_contains": "/api/history/period",
+  "status": 200,
+  "body": [
+   [
+    {
+     "state": "unknown",
+     "last_changed": "2026-10-08T14:00:00+00:00"
+    },
+    {
+     "state": "1791548000000|made-up line 0",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791548600000|made-up line 1",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791549200000|made-up line 2",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791549800000|made-up line 3",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791550400000|made-up line 4",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791551000000|made-up line 5",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791551600000|made-up line 6",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791552200000|made-up line 7",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791552800000|made-up line 8",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791553400000|made-up line 9",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791554000000|made-up line 10",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791554600000|made-up line 11",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791555200000|made-up line 12",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791555800000|made-up line 13",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791556400000|made-up line 14",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791557000000|made-up line 15",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791557600000|made-up line 16",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791558200000|made-up line 17",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791558800000|made-up line 18",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    },
+    {
+     "state": "1791559400000|made-up line 19",
+     "last_changed": "2026-10-09T14:00:00+00:00"
+    }
+   ]
+  ]
+ }
+]

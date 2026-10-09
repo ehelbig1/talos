@@ -5,6 +5,7 @@
   "description": "List upcoming events from a Google Calendar over a time window. Returns structured event data (summary, start, end, location, attendees, hangout_link) and, for each event, what a planner needs: whether it holds the time (`busy`), its kind (`event_type`: default, focusTime, outOfOffice, workingLocation …), the calendar owner's own answer (`response`), how many other people are invited (`guests`), and the invitation's `uid`, which is the same on every calendar the invitation sits on. `truncated` is true when the calendar holds more events in the window than were returned. Canonical building block for morning-brief / meeting-prep / schedule-awareness workflows.\n\nRequires a vault:// reference to a Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time.",
   "category": "Integration",
   "capability_world": "http-node",
+  "block": {"role": "reader"},
   "allowed_hosts": ["www.googleapis.com"],
   "allowed_methods": ["GET"],
   "requires_secrets": ["oauth/google_calendar/*"],

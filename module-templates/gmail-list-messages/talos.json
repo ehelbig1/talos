@@ -5,6 +5,7 @@
   "description": "List messages from the authenticated Gmail account. Filter by Gmail search query (e.g. 'is:unread newer_than:24h'), cap results, and receive structured metadata (id, subject, from, date, snippet, plus any EXTRA_HEADERS you ask for, e.g. To). Canonical building block for morning-brief / inbox-triage / follow-up-detector workflows.\n\nRequires a vault:// reference to an Atlassian-style Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time — you only need to pass the vault path.",
   "category": "Communication",
   "capability_world": "http-node",
+  "block": {"role": "reader"},
   "allowed_hosts": ["gmail.googleapis.com"],
   "allowed_methods": ["GET"],
   "requires_secrets": ["oauth/gmail/*"],

@@ -5,6 +5,7 @@
   "description": "Delivery-pattern HTML email sender. Reads {html, subject} from the upstream node's output, RFC 2047-encodes non-ASCII subjects, and POSTs an HTML message to the Gmail API using a Bearer token (a vault:// reference in AUTH_HEADER is resolved host-side). DRY_RUN gates the send. Pair with a compose node (memory, no network) per the two-node delivery pattern.",
   "category": "Communication",
   "capability_world": "http-node",
+  "block": {"role": "sender"},
   "allowed_hosts": ["gmail.googleapis.com"],
   "allowed_methods": [
     "POST"
