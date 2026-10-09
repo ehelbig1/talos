@@ -18,6 +18,7 @@
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Executor, Pool, Postgres, Row};
 use std::str::FromStr;
+use talos_admin_query_gate::BLOCKED_TABLES_LIST;
 use talos_advanced_repository::{
     ungranted_relation, AdvancedRepository, PaginatedSelectError, PaginationMode,
     QUERY_PAGINATED_ROLE,
@@ -130,17 +131,34 @@ async fn a_granted_row_secured_table_is_read_across_tenants() {
 
 /// A table the role holds no grant on is refused by Postgres's own privilege
 /// check, whatever the gate in front of it admitted, and the refusal names it.
+/// Every table `BLOCKED_TABLES_LIST` withholds that exists in the schema is
+/// asked (some names are kept on the list after their table was dropped).
 #[tokio::test]
 async fn a_table_the_role_is_not_granted_is_refused_by_postgres() {
     let Some(url) = url() else { return };
+    let admin = connect(&url).await;
     let repo = AdvancedRepository::new(connect(&url).await);
-    for table in ["users", "secrets", "api_keys"] {
+    let mut asked = 0;
+    for table in BLOCKED_TABLES_LIST {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass('public.' || $1) IS NOT NULL")
+            .bind(table)
+            .fetch_one(&admin)
+            .await
+            .expect("to_regclass");
+        if !exists {
+            continue;
+        }
+        asked += 1;
         let err = repo
             .execute_paginated_select(&format!("SELECT count(*) AS n FROM {table}"), 10, OFFSET_0)
             .await
             .expect_err(table);
-        assert_eq!(ungranted_relation(&err).as_deref(), Some(table), "{err}");
+        assert_eq!(ungranted_relation(&err).as_deref(), Some(*table), "{err}");
     }
+    assert!(
+        asked >= 15,
+        "only {asked} withheld tables exist in the schema"
+    );
     let err = repo
         .execute_paginated_select("SELECT count(*) AS n FROM pg_authid", 10, OFFSET_0)
         .await

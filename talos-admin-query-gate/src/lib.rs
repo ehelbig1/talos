@@ -406,6 +406,21 @@ pub const BLOCKED_TABLES_LIST: &[&str] = &[
     "webhook_triggers",
     "google_calendar_watch_channels",
     "workspace_oci_settings",
+    // 2026-10-09 (operator decision; migration
+    // 20261009120000_talos_admin_read_withhold_auth_tables.sql revokes the
+    // role's grant on each):
+    //   * `auth_audit_log` — every user's sign-in history: emails, IP
+    //     addresses, user agents.
+    //   * `integration_credentials` — where every user's OAuth tokens sit in
+    //     the vault, by provider and account (paths, not secrets).
+    //   * the four token tables — hashes of bearer tokens only, but nothing
+    //     an admin query needs.
+    "auth_audit_log",
+    "integration_credentials",
+    "execution_approval_tokens",
+    "ops_alert_correction_tokens",
+    "workflow_action_tokens",
+    "worker_provisioning_tokens",
 ];
 
 /// MCP-627 / MCP-1002: the precompiled per-table word-boundary regex set
@@ -514,6 +529,31 @@ mod blocked_tables_tests {
                 Some(*expected),
                 "query {query:?} must be blocked as {expected}"
             );
+        }
+    }
+
+    /// The six tables withheld on 2026-10-09 stay on the list (the parsed
+    /// gate's test walks the whole list) and the text rule refuses them,
+    /// whatever their spelling.
+    #[test]
+    fn the_auth_adjacent_tables_withheld_2026_10_09_are_refused() {
+        for table in [
+            "auth_audit_log",
+            "integration_credentials",
+            "execution_approval_tokens",
+            "ops_alert_correction_tokens",
+            "workflow_action_tokens",
+            "worker_provisioning_tokens",
+        ] {
+            for query in [
+                format!("SELECT * FROM {table}"),
+                format!(
+                    "SELECT count(*) AS n FROM public.\"{}\"",
+                    table.to_uppercase()
+                ),
+            ] {
+                assert_eq!(blocked_table_in_query(&query), Some(table), "{query}");
+            }
         }
     }
 
