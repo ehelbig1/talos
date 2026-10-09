@@ -1,7 +1,8 @@
 # Recorded run
 
 Made-up data: one notification with a title, a body, a link and three
-actions (the most the contract allows), answered by a made-up 200.
+actions (the most the contract allows) and a reply box from config, so the
+run builds the largest message this adapter can, answered by a made-up 200.
 
 `input.json` is the upstream node's output, `config.json` the node config,
 `http.json` the service's answer, and `grants.json` names the host the
