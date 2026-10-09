@@ -34,6 +34,10 @@ use talos_metrics::{ApiKeyValidation, McpAuthOutcome, RateLimitKind, TalosMetric
 use tower::ServiceExt;
 use uuid::Uuid;
 
+/// The counters are process-global and read as DELTAS, so the tests in this
+/// binary that move them take turns.
+static COUNTERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// One `mcp_agents` row behind a fresh role. `token_hash` is bcrypt of
 /// `bcrypt_of` and `token_lookup_hash` is SHA-256 of `lookup_of` — the SAME
 /// token for an honest row, DIFFERENT for the corrupted-row case that is the
@@ -121,6 +125,7 @@ fn window_cap() -> u32 {
 /// that can never connect.
 #[tokio::test]
 async fn every_path_through_the_middleware_moves_its_own_outcome() {
+    let _counters = COUNTERS.lock().await;
     let ctx = setup_test_context().await;
     let pool = ctx.db_pool.clone();
     talos_metrics::set_global(TalosMetrics::new().expect("metrics"));
@@ -266,4 +271,104 @@ async fn every_path_through_the_middleware_moves_its_own_outcome() {
         "two bearer surfaces, two series"
     );
     assert_eq!(count(McpAuthOutcome::Error), before[&McpAuthOutcome::Error]);
+}
+
+/// One `POST /mcp` with the raw `Authorization` value given, returning the
+/// whole reply.
+async fn call_raw(
+    app: &Router,
+    ip: &str,
+    authorization: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .body(Body::empty())
+        .expect("request");
+    if let Some(value) = authorization {
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, value.parse().expect("header value"));
+    }
+    req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+        ip.parse().expect("ip"),
+        40_000,
+    )));
+    let response = app.clone().oneshot(req).await.expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body")
+        .to_vec();
+    (status, headers, body)
+}
+
+fn reason(body: &[u8]) -> String {
+    let v: serde_json::Value = serde_json::from_slice(body).expect("a JSON body");
+    v["error"]["data"]["reason"]
+        .as_str()
+        .expect("error.data.reason")
+        .to_string()
+}
+
+/// Through the production middleware (2026-10-09): a refused caller is told
+/// what was wrong with ITS request — no credential, a malformed header, an
+/// API key where an agent token belongs — and a token that was read and not
+/// accepted gets ONE reply whether it is unknown or matches a corrupted row,
+/// byte for byte, so the reply says nothing about which tokens exist.
+#[tokio::test]
+async fn the_caller_is_told_why_without_learning_which_tokens_exist() {
+    let _counters = COUNTERS.lock().await;
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let user_id = create_test_user(
+        &ctx.auth_service,
+        &format!("mcp-why-{}@example.test", Uuid::new_v4()),
+    )
+    .await;
+    let honest = format!("talos_mcp_{}", Uuid::new_v4().simple());
+    seed_agent(&pool, &honest, &honest, Some(user_id)).await;
+    let corrupted = format!("talos_mcp_{}", Uuid::new_v4().simple());
+    seed_agent(&pool, &corrupted, "a different token", Some(user_id)).await;
+    let app = app(pool.clone());
+    let ip = "198.51.100.77";
+
+    let (status, headers, body) = call_raw(&app, ip, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reason(&body), "missing_credentials");
+    assert_eq!(
+        headers.get(header::WWW_AUTHENTICATE).expect("challenge"),
+        r#"Bearer realm="talos-mcp""#
+    );
+
+    let (status, _, body) = call_raw(&app, ip, Some(&honest)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a token without `Bearer `"
+    );
+    assert_eq!(reason(&body), "malformed_authorization");
+
+    let api_key = "talos_sk_0123abcd0123456789abcdef0123456789abcdef";
+    let (status, _, body) = call_raw(&app, ip, Some(&format!("Bearer {api_key}"))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reason(&body), "api_key_not_agent_token");
+    assert!(!String::from_utf8_lossy(&body).contains(api_key));
+
+    let guessed = call_raw(
+        &app,
+        ip,
+        Some(&format!("Bearer talos_mcp_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+    let corrupt_row = call_raw(&app, ip, Some(&format!("Bearer {corrupted}"))).await;
+    assert_eq!(guessed.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(reason(&guessed.2), "invalid_token");
+    assert_eq!(
+        guessed, corrupt_row,
+        "an unknown token and a corrupted row's token must get the same reply"
+    );
+
+    let (status, _, _) = call_raw(&app, ip, Some(&format!("bearer {honest}"))).await;
+    assert_eq!(status, StatusCode::OK, "the scheme is case-insensitive");
 }

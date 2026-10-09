@@ -838,6 +838,21 @@ lines under `target: "talos_audit"` with `event_kind = "mcp_auth_refused"`
 and the client IP. No alert references the series yet; a threshold needs a
 baseline it has not produced.
 
+A client that cannot connect (2026-10-09): `missing_token` covers every
+request without a usable agent credential, and its log line says which —
+`detail = "missing_credentials"` (no credential at all; INFO),
+`"malformed_authorization"` (an `Authorization` header that is not
+`Bearer <token>`; WARN) or `"api_key_not_agent_token"` (a `talos_sk_` API
+key where a `talos_mcp_` agent token belongs; WARN, refused before any
+lookup). The caller's 401 now carries the same reason in
+`error.data.reason` and a `WWW-Authenticate: Bearer` challenge, except that
+an unknown token, an invalid one and a corrupted row all get ONE reply,
+`invalid_token`, so the reply says nothing about which tokens exist. An MCP
+client proxy such as `mcp-remote` treats any 401 as "start an OAuth sign-in",
+which Talos does not offer, so its log shows "Dynamic Client Registration
+rejected (HTTP 404)": read that as "the token was refused", and look here for
+why.
+
 ### 3.4a Was a privileged operation attempted without a second factor?
 
 The fifteen privileged mutations (master-key and DEK rotation, the

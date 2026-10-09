@@ -53,13 +53,17 @@ pub struct ApiKey {
     pub usage_count: i32,
 }
 
+/// Every Talos API key starts with this. It is not an MCP agent token
+/// (`talos_mcp_…`), and `/mcp` names that mistake by this prefix.
+pub const API_KEY_PREFIX: &str = "talos_sk_";
+
 /// API Key service
 /// bcrypt's hard input-truncation limit (bytes). Input past this is ignored.
 const BCRYPT_INPUT_LIMIT: usize = 72;
 /// Fixed, non-secret preamble consumed inside the bcrypt window:
 /// `talos_sk_` (9) + the 8-hex-char prefix (which is ALSO verified separately
 /// via the constant-time prefix check + DB lookup).
-const KEY_PREAMBLE_LEN: usize = "talos_sk_".len() + 8;
+const KEY_PREAMBLE_LEN: usize = API_KEY_PREFIX.len() + 8;
 /// Compile-time guard (security review 2026-07-19, L4): the secret entropy that
 /// survives bcrypt's 72-byte truncation must stay above 128 bits. Each surviving
 /// hex char is 4 bits. Fails to compile if a future key-layout change erodes it
@@ -148,7 +152,7 @@ impl ApiKeyService {
         talos_random::fill(&mut secret_bytes);
         let secret = hex::encode(secret_bytes);
 
-        let full_key = format!("talos_sk_{}{}", prefix, secret);
+        let full_key = format!("{API_KEY_PREFIX}{prefix}{secret}");
 
         (full_key, prefix)
     }
@@ -357,7 +361,7 @@ impl ApiKeyService {
         // Constant-time format check against the known key prefix to prevent
         // timing-based enumeration of valid vs. invalid key formats.
         use subtle::ConstantTimeEq;
-        const KEY_PREFIX: &[u8] = b"talos_sk_";
+        const KEY_PREFIX: &[u8] = API_KEY_PREFIX.as_bytes();
         let key_bytes = api_key.as_bytes();
         let prefix_ok = key_bytes.len() >= KEY_PREFIX.len()
             && key_bytes[..KEY_PREFIX.len()].ct_eq(KEY_PREFIX).unwrap_u8() == 1;
