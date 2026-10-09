@@ -77,6 +77,7 @@ TALOS_WORKER_DIGEST=sha256:0000...
 TALOS_FRONTEND_DIGEST=sha256:0000...
 
 # Optional (defaults shown)
+# TALOS_ADMIN_QUERY_DATABASE_URL=            # query_paginated's own DB login (docs/query-paginated-login.md)
 # TALOS_API_HOST=api.${TALOS_HOST}            # controller ingress hostname
 # TALOS_FRONTEND_HOST=${TALOS_HOST}           # frontend ingress hostname
 # TALOS_GHCR_REPO=talos                       # for sigstore identity regex

@@ -494,8 +494,7 @@ pub async fn init_pool() -> anyhow::Result<Pool<Postgres>> {
     // DISABLES the timeout entirely. Operationally a feature regression
     // (long queries no longer killed = DoS surface), so substitute the
     // 60s default and WARN.
-    let statement_timeout_secs =
-        talos_config::positive_env_or_default::<u64>("DB_STATEMENT_TIMEOUT_SECS", 60);
+    let statement_timeout_secs = statement_timeout_secs();
 
     // There is deliberately NO second, longer timeout here. Until 2026-09-11
     // this block also read `DB_EXECUTION_TIMEOUT_SECS` (default 300) and the
@@ -572,8 +571,7 @@ pub async fn init_read_replica_pool() -> Option<Pool<Postgres>> {
     let max_connections =
         talos_config::positive_env_or_default::<u32>("DB_READ_REPLICA_MAX_CONNECTIONS", 20);
 
-    let statement_timeout_secs =
-        talos_config::positive_env_or_default::<u64>("DB_STATEMENT_TIMEOUT_SECS", 60);
+    let statement_timeout_secs = statement_timeout_secs();
 
     // Same SET-on-connect approach as the primary pool — see the comment in
     // init_pool() for why this avoids libpq `options=` startup parameters.
@@ -699,7 +697,21 @@ pub async fn release_advisory_lock(
 /// `prefer` only opportunistically negotiates TLS and silently falls back to
 /// cleartext). Pure so the production boot gate's accept/reject logic is
 /// unit-tested without env or a live DB. See `tls-prod-gate-postgres`.
-fn db_url_tls_guaranteed(db_url: &str) -> bool {
+/// The `statement_timeout` every controller connection to Postgres runs under,
+/// in seconds: `DB_STATEMENT_TIMEOUT_SECS`, default 60. The primary pool, the
+/// read-replica pool and `query_paginated`'s own login all read it here.
+///
+/// SECURITY: it bounds how long one statement can hold a backend. MCP-679:
+/// `=0`-safe — `DB_STATEMENT_TIMEOUT_SECS=0` would emit
+/// `SET statement_timeout = '0s'`, which in Postgres DISABLES the timeout, so
+/// the 60 s default is substituted with a WARN.
+pub fn statement_timeout_secs() -> u64 {
+    talos_config::positive_env_or_default::<u64>("DB_STATEMENT_TIMEOUT_SECS", 60)
+}
+
+/// Whether a Postgres URL pins an `sslmode` that guarantees TLS (`require`,
+/// `verify-ca`, `verify-full`). Production refuses any other connection URL.
+pub fn db_url_tls_guaranteed(db_url: &str) -> bool {
     db_url.contains("sslmode=require")
         || db_url.contains("sslmode=verify-ca")
         || db_url.contains("sslmode=verify-full")

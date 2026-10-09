@@ -1016,6 +1016,21 @@ async fn handle_query_paginated(
                 &talos_advanced_repository::PaginatedSelectError::role_remedy(&role),
             )
         }
+        Err(talos_advanced_repository::PaginatedSelectError::LoginUnavailable {
+            refusal,
+            detail,
+        }) => {
+            tracing::error!(
+                refusal = %refusal,
+                detail = %detail,
+                "query_paginated: refused, its own database login cannot be used"
+            );
+            mcp_error(
+                req_id,
+                -32000,
+                &talos_advanced_repository::PaginatedSelectError::login_remedy(refusal),
+            )
+        }
         Err(e) if talos_advanced_repository::ungranted_relation(&e).is_some() => {
             let relation = talos_advanced_repository::ungranted_relation(&e).unwrap_or_default();
             tracing::warn!(relation = %relation, "query_paginated: a relation the role is not granted");

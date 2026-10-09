@@ -3711,9 +3711,13 @@ pub(crate) fn build_router(
             .with_secrets_manager(secrets_manager.clone()),
     );
 
-    let advanced_repo = std::sync::Arc::new(advanced_repository::AdvancedRepository::new(
-        db_pool.clone(),
-    ));
+    // `query_paginated` runs on a login of its own when
+    // TALOS_ADMIN_QUERY_DATABASE_URL is set (read once, here; the URL is never
+    // logged).
+    let advanced_repo = std::sync::Arc::new(
+        advanced_repository::AdvancedRepository::new(db_pool.clone())
+            .with_admin_query_login(advanced_repository::AdminQueryLogin::from_env()),
+    );
 
     // workflow_repo, module_repo, execution_repo, and actor_repo are
     // constructed earlier (alongside the cross-protocol services) so

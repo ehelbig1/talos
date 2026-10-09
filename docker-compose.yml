@@ -473,6 +473,9 @@ services:
     container_name: talos-controller
     environment:
       DATABASE_URL: postgres://talos:${POSTGRES_PASSWORD}@postgres:5432/talos
+      # query_paginated's own database login (docs/query-paginated-login.md).
+      # Blank = the tool runs on the controller's own connection.
+      TALOS_ADMIN_QUERY_DATABASE_URL: ${TALOS_ADMIN_QUERY_DATABASE_URL:-}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       NATS_URL: nats://nats:4222
       NATS_USER: ${NATS_USER:?NATS_USER required in .env}

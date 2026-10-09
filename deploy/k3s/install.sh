@@ -553,6 +553,7 @@ else
     # resolves cleanly (vs missing keys, which print warnings on every pod start).
     args=(
         DATABASE_URL="$TALOS_POSTGRES_URL"
+        TALOS_ADMIN_QUERY_DATABASE_URL="${TALOS_ADMIN_QUERY_DATABASE_URL:-}"
         REDIS_URL="$TALOS_REDIS_URL"
         NATS_USER="$NATS_USER"
         NATS_PASSWORD="$NATS_PASSWORD"
