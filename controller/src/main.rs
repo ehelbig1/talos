@@ -289,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
         match sub.as_str() {
             "publish-templates" => return run_publish_templates_cli(&args[2..]).await,
             "plaid-link" => return run_plaid_link_cli(&args[2..]).await,
+            "admin-query-login" => return run_admin_query_login_cli(&args[2..]).await,
             "generate-worker-trust-keypair" => {
                 return run_generate_worker_trust_keypair_cli(&args[2..]);
             }
@@ -313,6 +314,13 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("                                        for `oras push`. See");
                 println!("                                        .github/workflows/template-publish.yml");
+                println!("  controller admin-query-login provision | disable");
+                println!(
+                    "                                        query_paginated's own DB login; see"
+                );
+                println!(
+                    "                                        scripts/setup-admin-query-login.sh"
+                );
                 println!("  controller plaid-link --sandbox | --public-token <tok>");
                 println!(
                     "                                        [--institution <id>] [--products a,b]"

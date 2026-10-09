@@ -17,6 +17,15 @@ talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
 # this crate held one of six byte-identical copies until 2026-09-11.
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 anyhow.workspace = true
+# admin_query_provision: the SCRAM-SHA-256 verifier for query_paginated's own
+# login is computed here, so its password never reaches the database in
+# plain text; the password itself comes from talos-random.
+base64.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+talos-random = { path = "../talos-random" }
+url.workspace = true
+zeroize.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }

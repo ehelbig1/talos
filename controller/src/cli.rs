@@ -3,7 +3,8 @@
 //! Dispatch (the `match` over `std::env::args`) stays at the very top of
 //! `main()`; this module owns the subcommand bodies: the worker-identity
 //! registry operations, worker provisioning-token mint/list/revoke, the
-//! RFC 0010 Ed25519 keypair generator, and `publish-templates`.
+//! RFC 0010 Ed25519 keypair generator, `publish-templates`, and
+//! `admin-query-login`.
 use crate::*;
 
 // ---------- worker-identity registry subcommands (RFC 0010 P2 inc.4) --------
@@ -721,4 +722,83 @@ pub(crate) async fn run_plaid_link_cli(args: &[String]) -> anyhow::Result<()> {
     };
     println!("{}", report.render());
     Ok(())
+}
+
+// ---------- admin-query-login (query_paginated's own database login) -------
+//
+// `provision` makes the login (or gives it a new password), checks it the way
+// every query_paginated call does, and prints the URL the controller connects
+// with — on stdout, and only when stdout is not a terminal, so the one place
+// it lands is wherever scripts/setup-admin-query-login.sh puts it.
+// `disable` takes LOGIN away. Both connect as DATABASE_URL, like the server.
+pub(crate) async fn run_admin_query_login_cli(args: &[String]) -> anyhow::Result<()> {
+    use std::io::{IsTerminal as _, Write as _};
+    use talos_advanced_repository::admin_query_provision::{
+        disable_login, provision_login, ADMIN_QUERY_LOGIN,
+    };
+
+    let usage = "usage: controller admin-query-login provision [--show] | disable";
+    let (sub, rest) = args
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("{usage}"))?;
+    let show = match rest {
+        [] => false,
+        [flag] if flag == "--show" && sub == "provision" => true,
+        _ => anyhow::bail!("{usage}"),
+    };
+    match sub.as_str() {
+        "provision" => {
+            // Refuse before anything changes: a rotated password nobody can
+            // read is a login nobody can use.
+            if std::io::stdout().is_terminal() && !show {
+                anyhow::bail!(
+                    "refusing to print a database credential to a terminal: pipe it into its \
+                     store (scripts/setup-admin-query-login.sh does), or pass --show"
+                );
+            }
+            let database_url = std::env::var("DATABASE_URL")
+                .ok()
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("DATABASE_URL must be set"))?;
+            let pool = crate::db::init_pool().await?;
+            let provisioned = provision_login(
+                &pool,
+                &database_url,
+                ADMIN_QUERY_LOGIN,
+                config::is_production(),
+                talos_db::statement_timeout_secs(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{}", provisioned.url.as_str())?;
+            out.flush()?;
+            eprintln!(
+                "{} {ADMIN_QUERY_LOGIN}; query_paginated's per-call checks pass. The line on \
+                 stdout is TALOS_ADMIN_QUERY_DATABASE_URL, a credential.",
+                if provisioned.created {
+                    "created"
+                } else {
+                    "gave a new password to"
+                }
+            );
+            Ok(())
+        }
+        "disable" => {
+            let pool = crate::db::init_pool().await?;
+            let existed = disable_login(&pool, ADMIN_QUERY_LOGIN)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            eprintln!(
+                "{}",
+                if existed {
+                    format!("{ADMIN_QUERY_LOGIN} can no longer log in")
+                } else {
+                    format!("{ADMIN_QUERY_LOGIN} does not exist; nothing to disable")
+                }
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!("{usage}"),
+    }
 }
