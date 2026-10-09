@@ -859,6 +859,12 @@ async fn main() -> anyhow::Result<()> {
         actor_repo.clone(),
     )?;
 
+    // query_paginated's database login: with TALOS_ADMIN_QUERY_LOGIN=auto the
+    // login is made sure of here, after migrations (bootstrap/admin_query_login.rs).
+    let admin_query_login =
+        bootstrap::admin_query_login::resolve_admin_query_login(&db_pool, &core.secrets_manager)
+            .await;
+
     // Axum router — route/middleware/Extension assembly. Middleware ORDER and
     // sub-router merge ORDER are load-bearing; see build_router's comments.
     let app = build_router(
@@ -871,6 +877,7 @@ async fn main() -> anyhow::Result<()> {
         &bundle,
         actor_repo.clone(),
         ollama_client.clone(),
+        admin_query_login,
     )?;
 
     // Stale-execution cleanup, workflow scheduler, SLA threshold breach check.

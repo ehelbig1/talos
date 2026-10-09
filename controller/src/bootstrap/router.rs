@@ -2602,6 +2602,7 @@ pub(crate) fn build_router(
     bundle: &SchemaBundle,
     actor_repo: std::sync::Arc<actor_repository::ActorRepository>,
     ollama_client: std::sync::Arc<talos_llm::OllamaClient>,
+    admin_query_login: advanced_repository::AdminQueryLogin,
 ) -> anyhow::Result<Router> {
     let secrets_manager = core.secrets_manager.clone();
     let registry = core.registry.clone();
@@ -3711,12 +3712,11 @@ pub(crate) fn build_router(
             .with_secrets_manager(secrets_manager.clone()),
     );
 
-    // `query_paginated` runs on a login of its own when
-    // TALOS_ADMIN_QUERY_DATABASE_URL is set (read once, here; the URL is never
-    // logged).
+    // `query_paginated`'s database login, resolved at start-up
+    // (bootstrap/admin_query_login.rs; the URL is never logged).
     let advanced_repo = std::sync::Arc::new(
         advanced_repository::AdvancedRepository::new(db_pool.clone())
-            .with_admin_query_login(advanced_repository::AdminQueryLogin::from_env()),
+            .with_admin_query_login(admin_query_login),
     );
 
     // workflow_repo, module_repo, execution_repo, and actor_repo are

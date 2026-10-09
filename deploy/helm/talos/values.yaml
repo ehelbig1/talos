@@ -467,6 +467,16 @@ controller:
   # and the controller refuses to start in that combination.
   moduleCompilation: true
 
+  # query_paginated's own database login (docs/query-paginated-login.md).
+  # `auto`: the controller makes the login `talos_admin_query` at start-up,
+  # with a password derived from its KEK, so there is nothing to store, and
+  # repairs it if it drifts. Needs the controller's database user to be able
+  # to create roles; where it cannot, the tool refuses calls and the
+  # controller log says why. `off`: the tool runs on the controller's own
+  # connection. bootstrapSecret.data.TALOS_ADMIN_QUERY_DATABASE_URL, when set,
+  # wins over either.
+  adminQueryLogin: auto
+
   # ------------------------------------------------------------------
   # WORM audit-ledger persistence to S3 / MinIO with Object Lock.
   # ------------------------------------------------------------------
