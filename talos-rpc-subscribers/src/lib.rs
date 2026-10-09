@@ -26,6 +26,8 @@
 
 mod admission;
 mod build_skew;
+#[cfg(test)]
+mod guest_role_db_tests;
 mod guest_session;
 mod kernel;
 #[cfg(test)]
@@ -482,63 +484,84 @@ fn controller_statement_mutates(stmt: &sqlparser::ast::Statement) -> bool {
     !talos_sql_classify::is_read_only(stmt)
 }
 
-/// Wasm-security review 2026-05-22 (MEDIUM-2): resolve the operator-
-/// configured guest role for per-query `SET LOCAL ROLE`.
+/// `TALOS_RPC_GUEST_ROLE`, read: the role guest SQL runs as.
 ///
-/// Returns `Some(role_name)` when `TALOS_RPC_GUEST_ROLE` is set to a
-/// non-empty value, `None` otherwise. Cached at first call so the env
-/// lookup happens once at startup, not on every RPC.
-///
-/// **Validation.** The role name is the operator's input but is
-/// **`pub` since 2026-09-10, for a SECOND, READ-ONLY consumer.**
-/// `get_sql_statement_report` renders the Postgres ROLE each tracked
-/// statement ran as, and that name is only provenance when this fence is
-/// ON: unfenced, guest SQL runs as the app user and is indistinguishable
-/// from the controller's own. The report therefore calls THIS function
-/// rather than reading the env itself — a second reader that skipped
-/// [`is_valid_pg_role_identifier`] would report a control as working when
-/// an invalid value has silently switched it off.
-///
-/// substituted into SQL via Postgres's `quote_ident` semantics
-/// (`SET LOCAL ROLE "..."`) so injection is bounded to the role
-/// namespace — the worst case is the SET failing with "role does not
-/// exist" and the transaction rolling back. The role name MUST match
-/// a strict identifier pattern (alphanumeric + underscore, leading
-/// non-digit, ≤ 63 bytes — Postgres `NAMEDATALEN - 1`) so a
-/// misconfigured env can't smuggle a SQL fragment. Invalid values
-/// produce a startup-time warning and the wrap is disabled (fail-
-/// open is acceptable because the role wrap is itself defense-in-
-/// depth; the validator is the primary fence).
-pub fn guest_role_for_query() -> Option<&'static str> {
-    use std::sync::OnceLock;
-    static ROLE: OnceLock<Option<String>> = OnceLock::new();
-    ROLE.get_or_init(|| {
-        let raw = std::env::var("TALOS_RPC_GUEST_ROLE").ok()?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
+/// * [`GuestRoleSetting::Unset`] — unset or empty: guest SQL runs as the app
+///   user (the legacy posture; production refuses to boot in it unless
+///   `TALOS_ALLOW_UNSCOPED_DB_SANDBOX` acknowledges it, and the shipped
+///   compose files and chart set `talos_guest`).
+/// * [`GuestRoleSetting::Role`] — a valid role name: every guest query runs
+///   under `SET LOCAL ROLE`, and is refused when the role cannot be entered
+///   or is a superuser or has BYPASSRLS.
+/// * [`GuestRoleSetting::Invalid`] — set to something that is not a role
+///   name: every guest query is REFUSED. Until 2026-10-09 this ran guest SQL
+///   as the app user with a warning — a misconfigured fence switched itself
+///   off. A set-but-unusable fence now refuses, as `query_paginated`'s login
+///   does (#1206), and is never treated as unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestRoleSetting<'a> {
+    Unset,
+    Role(&'a str),
+    Invalid,
+}
+
+impl<'a> GuestRoleSetting<'a> {
+    /// Read a raw `TALOS_RPC_GUEST_ROLE` value (surrounding space ignored).
+    #[must_use]
+    pub fn parse(raw: Option<&'a str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("") => Self::Unset,
+            Some(role) if is_valid_pg_role_identifier(role) => Self::Role(role),
+            Some(_) => Self::Invalid,
         }
-        if !is_valid_pg_role_identifier(trimmed) {
-            tracing::warn!(
+    }
+}
+
+/// [`GuestRoleSetting`] for this process, read once (the first call logs
+/// it). The ONE reader of `TALOS_RPC_GUEST_ROLE` besides the production
+/// posture gate, which applies the same parse.
+pub fn guest_role_setting() -> GuestRoleSetting<'static> {
+    use std::sync::OnceLock;
+    static RAW: OnceLock<Option<String>> = OnceLock::new();
+    let raw = RAW.get_or_init(|| {
+        let raw = std::env::var("TALOS_RPC_GUEST_ROLE").ok();
+        match GuestRoleSetting::parse(raw.as_deref()) {
+            GuestRoleSetting::Unset => {}
+            GuestRoleSetting::Role(role) => tracing::info!(
+                target: "talos_rpc",
+                event_kind = "guest_role_enabled",
+                role = %role,
+                "Guest SQL will run with SET LOCAL ROLE, and is refused if the role \
+                 cannot be entered or is a superuser or has BYPASSRLS"
+            ),
+            GuestRoleSetting::Invalid => tracing::error!(
                 target: "talos_rpc",
                 event_kind = "guest_role_invalid_identifier",
-                raw_len = trimmed.len(),
-                "TALOS_RPC_GUEST_ROLE is set to an invalid Postgres identifier — \
-                 guest queries will continue to run as the app user. \
-                 Role names must match `[A-Za-z_][A-Za-z0-9_]{{,62}}`."
-            );
-            return None;
+                raw_len = raw.as_deref().map_or(0, |r| r.trim().len()),
+                "TALOS_RPC_GUEST_ROLE is set to an invalid Postgres identifier — every \
+                 guest SQL query is REFUSED until it is fixed or unset. Role names must \
+                 match `[A-Za-z_][A-Za-z0-9_]{{,62}}`."
+            ),
         }
-        tracing::info!(
-            target: "talos_rpc",
-            event_kind = "guest_role_enabled",
-            role = %trimmed,
-            "Guest SQL will run with SET LOCAL ROLE — \
-             ensure the role has minimal privileges (see talos_guest migration)."
-        );
-        Some(trimmed.to_string())
-    })
-    .as_deref()
+        raw
+    });
+    GuestRoleSetting::parse(raw.as_deref())
+}
+
+/// The guest role when the fence is ON: `Some` only for a valid role name.
+///
+/// **`pub` since 2026-09-10, for a READ-ONLY consumer.**
+/// `get_sql_statement_report` renders the Postgres ROLE each tracked
+/// statement ran as, and that name is only provenance when this fence is
+/// ON. The report calls THIS function rather than reading the env itself, so
+/// it cannot disagree with the executor about whether the fence is on. The
+/// executor itself asks [`guest_role_setting`], because an invalid value
+/// must refuse guest SQL, not run it unfenced.
+pub fn guest_role_for_query() -> Option<&'static str> {
+    match guest_role_setting() {
+        GuestRoleSetting::Role(role) => Some(role),
+        GuestRoleSetting::Unset | GuestRoleSetting::Invalid => None,
+    }
 }
 
 /// Strict Postgres role-identifier validator. Pure function so it's
@@ -678,7 +701,7 @@ async fn execute_guest_query(
     sql: &str,
     params: &[String],
     is_fetch: bool,
-    guest_role: Option<&str>,
+    guest_role: GuestRoleSetting<'_>,
 ) -> Result<talos_memory::database_rpc::DatabaseResult, talos_memory::database_rpc::DatabaseRpcError>
 {
     execute_guest_query_within(
@@ -702,12 +725,25 @@ async fn execute_guest_query_within(
     sql: &str,
     params: &[String],
     is_fetch: bool,
-    guest_role: Option<&str>,
+    guest_role: GuestRoleSetting<'_>,
     budget: std::time::Duration,
 ) -> Result<talos_memory::database_rpc::DatabaseResult, talos_memory::database_rpc::DatabaseRpcError>
 {
     use talos_memory::database_rpc::DatabaseRpcError;
 
+    // A fence that is configured but unusable refuses before a connection is
+    // taken; it is never read as "no fence".
+    let guest_role = match guest_role {
+        GuestRoleSetting::Unset => None,
+        GuestRoleSetting::Role(role) => Some(role),
+        GuestRoleSetting::Invalid => {
+            return Err(DatabaseRpcError::ConnectionFailed(
+                "TALOS_RPC_GUEST_ROLE is not a valid role name; guest SQL is refused until it \
+                 is fixed or unset"
+                    .to_string(),
+            ))
+        }
+    };
     let deadline = tokio::time::Instant::now() + budget;
     let conn = match tokio::time::timeout_at(deadline, pool.acquire()).await {
         Ok(Ok(conn)) => conn,
@@ -788,23 +824,41 @@ async fn run_guest_transaction(
             .await
             .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
 
-        // SET LOCAL ROLE — reverted automatically at COMMIT/ROLLBACK.
-        // `guest_role` is validated by `is_valid_pg_role_identifier`
-        // at startup so this format!-into-SQL is safe.
+        // SET LOCAL ROLE — reverted automatically at COMMIT/ROLLBACK — and
+        // read back what the role is, in the same round trip. `guest_role`
+        // is validated by `is_valid_pg_role_identifier` where it is read
+        // (`GuestRoleSetting::parse`), so this format!-into-SQL is safe.
         if let Some(role) = guest_role {
-            let set_role_sql = format!("SET LOCAL ROLE \"{role}\"");
-            // sql-safe: the role is operator configuration, checked by is_valid_pg_role_identifier where it is read (guest_role_for_query) and quoted; SET LOCAL ROLE takes no bind parameters
-            sqlx::query(sqlx::AssertSqlSafe(set_role_sql))
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    // Most likely cause: role doesn't exist or the app
-                    // user isn't a member of it. Both are operator-
-                    // configuration errors — surface as ConnectionFailed
-                    // (not QueryError) so the metric / log distinguishes
-                    // them from guest SQL faults.
-                    DatabaseRpcError::ConnectionFailed(format!("SET LOCAL ROLE failed: {e}"))
-                })?;
+            // sql-safe: the role is operator configuration, checked by is_valid_pg_role_identifier where it is read (GuestRoleSetting::parse) and quoted; SET LOCAL ROLE takes no bind parameters
+            let entered = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "SET LOCAL ROLE \"{role}\"; \
+                 SELECT rolsuper, rolbypassrls FROM pg_catalog.pg_roles \
+                 WHERE rolname = current_user"
+            )))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                // Most likely cause: role doesn't exist or the app
+                // user isn't a member of it. Both are operator-
+                // configuration errors — surface as ConnectionFailed
+                // (not QueryError) so the metric / log distinguishes
+                // them from guest SQL faults.
+                DatabaseRpcError::ConnectionFailed(format!("SET LOCAL ROLE failed: {e}"))
+            })?;
+            let superuser: bool = entered
+                .try_get(0)
+                .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
+            let bypass_rls: bool = entered
+                .try_get(1)
+                .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
+            // A role that is a superuser, or skips row security, fences
+            // nothing: refuse rather than run guest SQL as it.
+            if superuser || bypass_rls {
+                return Err(DatabaseRpcError::ConnectionFailed(format!(
+                    "the guest role {role} is a superuser or has BYPASSRLS, so it confines \
+                     nothing; guest SQL is refused"
+                )));
+            }
         }
 
         if is_fetch {
@@ -2629,7 +2683,7 @@ pub fn spawn_database_rpc_subscriber(
                 &req.sql,
                 &req.params,
                 req.is_fetch,
-                guest_role_for_query(),
+                guest_role_setting(),
             )
             .await;
 
@@ -3641,6 +3695,19 @@ mod controller_function_deny_tests {
     // because they share `super::*` access; the controller-side
     // function-deny tests above already pull in the parser, so this
     // saves a fresh mod.
+
+    #[test]
+    fn the_guest_role_setting_is_unset_a_role_or_invalid() {
+        use super::GuestRoleSetting as G;
+        assert_eq!(G::parse(None), G::Unset);
+        assert_eq!(G::parse(Some("")), G::Unset);
+        assert_eq!(G::parse(Some("   ")), G::Unset);
+        assert_eq!(G::parse(Some("talos_guest")), G::Role("talos_guest"));
+        assert_eq!(G::parse(Some(" talos_guest ")), G::Role("talos_guest"));
+        for bad in ["talos guest", "1abc", "a;b", "\"x\"", &"a".repeat(64)] {
+            assert_eq!(G::parse(Some(bad)), G::Invalid, "{bad:?}");
+        }
+    }
 
     #[test]
     fn role_identifier_validator_accepts_canonical_form() {

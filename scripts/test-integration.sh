@@ -62,6 +62,7 @@ WORK+=(
     # 20260925160000 privilege revoke are tested inside the crate, against the
     # MIGRATED database (the only lib item that needs one — hence its own kind).
     "lib-migrated|talos-rpc-subscribers|--lib guest_session::db_tests|guest SQL session cleanup + advisory/LO privileges [migrated]"
+    "lib-migrated|talos-rpc-subscribers|--lib guest_role_db_tests|guest SQL role: fenced, refused when unusable [migrated]"
 )
 for cat in ctrl ctrl-serial tc; do
     while IFS=$'\t' read -r crate bin; do
