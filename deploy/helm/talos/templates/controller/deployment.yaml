@@ -109,6 +109,17 @@ spec:
             - name: TALOS_MODULE_COMPILATION
               value: {{ $moduleCompilation | quote }}
             {{- end }}
+            # --- query_paginated's own login (docs/query-paginated-login.md) ---
+            # `auto` or `off`; anything else refuses to render, so a typo is
+            # caught here rather than by the tool refusing every call.
+            {{- if not (hasKey .Values.controller.env "TALOS_ADMIN_QUERY_LOGIN") }}
+            {{- $adminQueryLogin := lower (toString (.Values.controller.adminQueryLogin | default "off")) }}
+            {{- if not (has $adminQueryLogin (list "auto" "off")) }}
+            {{- fail (printf "controller.adminQueryLogin must be auto or off, not %q" $adminQueryLogin) }}
+            {{- end }}
+            - name: TALOS_ADMIN_QUERY_LOGIN
+              value: {{ $adminQueryLogin | quote }}
+            {{- end }}
             # --- Sigstore policy for the OCI catalog sync — ALWAYS emitted ---
             # The SAME three variables the worker Deployment renders, from the
             # SAME values block (`worker.sigstore`, which despite its prefix is

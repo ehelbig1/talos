@@ -11,6 +11,41 @@ connection (`DATABASE_URL`). On a deployment where that is a superuser, a
 statement that set the role back would be a superuser. The gate refuses every
 way of doing that the project knows of; this setting removes what is behind it.
 
+## Automatic, as part of every deployment (the default)
+
+The shipped compose files and Helm chart set `TALOS_ADMIN_QUERY_LOGIN=auto`
+(chart value `controller.adminQueryLogin`). At every start-up, right after
+migrations, the controller makes sure the login `talos_admin_query` is right,
+then runs the tool as it:
+
+* **The password is derived, not stored.** HKDF from the controller's KEK
+  (`TALOS_MASTER_KEY`), for this one purpose. Every replica computes the same
+  one, and no new secret has to be generated, stored or carried. Postgres
+  only ever receives its SCRAM verifier.
+* **It only changes the database when needed.** If the login already
+  connects with that password and passes the tool's checks, nothing changes.
+  Otherwise, in one transaction under an advisory lock (replicas starting
+  together take turns), the controller creates the login or repairs it:
+  password, LOGIN only, membership in `talos_admin_read`.
+* **A failure never moves the tool onto the controller's own connection.**
+  The tool keeps using the login and refuses calls while it does not work,
+  and the start-up log says why. The usual cause is that the controller's
+  database user may not create roles.
+* **To confirm it's working**, look for `query_paginated connects as its own
+  login (TALOS_ADMIN_QUERY_LOGIN=auto)` with `outcome` `created`, `repaired`
+  or `already in place`.
+* **Rotation follows the KEK.** After `rotate_master_key`, the next start-up
+  repairs the login with the new password. During a rolling restart,
+  controllers still on the old key refuse `query_paginated` until they
+  restart.
+* **To turn it off**, set `TALOS_ADMIN_QUERY_LOGIN=off` in `.env` (or
+  `controller.adminQueryLogin: off`) and the tool runs on the controller's
+  own connection. Optionally disable the login with `controller
+  admin-query-login disable`.
+* **An explicit `TALOS_ADMIN_QUERY_DATABASE_URL` wins over `auto`.** If you
+  ran the script below before, remove that line to let `auto` take over, or
+  keep it.
+
 ## Setting it up: one command
 
 From the repository checkout on the host that runs the stack:

@@ -153,7 +153,10 @@ services:
       # Database connection (internal network)
       DATABASE_URL: postgres://talos:${POSTGRES_PASSWORD}@postgres:5432/talos
       # query_paginated's own database login (docs/query-paginated-login.md).
-      # Blank = the tool runs on the controller's own connection.
+      # `auto`: the controller makes the login `talos_admin_query` at start-up,
+      # with a password derived from TALOS_MASTER_KEY (nothing to store); `off`
+      # leaves the tool on the controller's own connection. A URL below wins.
+      TALOS_ADMIN_QUERY_LOGIN: ${TALOS_ADMIN_QUERY_LOGIN:-auto}
       TALOS_ADMIN_QUERY_DATABASE_URL: ${TALOS_ADMIN_QUERY_DATABASE_URL:-}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       NATS_URL: nats://nats:4222
