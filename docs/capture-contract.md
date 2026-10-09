@@ -10,7 +10,8 @@ contract, the same way notifications are (`docs/notification-contract.md`):
   fixed, service-neutral `captured` shape;
 * the keeper reads that shape and never learns the service.
 
-Adapters today: `capture-home-assistant`.
+Adapters today: `capture-home-assistant` (a notification's reply box) and
+`capture-ntfy` (an inbox topic on an ntfy server).
 
 ## What an adapter returns
 
@@ -117,6 +118,25 @@ moment of the reply; a reply typed while the platform is off would be lost.
 Reading the history loses nothing for a day, with the token the notify
 adapter already uses. The cost is latency: a line arrives on the keeper's next
 run.
+
+## ntfy: an inbox topic
+
+ntfy has no reply box under a notification, so the owner publishes to an
+inbox topic instead: open the topic in the ntfy app and type, or share text
+to it from any app.
+
+* **The server is locked.** `auth-default-access: deny-all`; the owner's user
+  may read and write the inbox; the platform's user may only READ it (and
+  write the topics it sends to). `capture-ntfy` refuses to run without a
+  token: an inbox anyone can publish to would let anyone add to the list.
+* **The server keeps messages long enough.** The adapter reads the last 26
+  hours (`/<topic>/json?poll=1&since=<unix seconds>`); ntfy's default cache
+  is 12 hours, so set `cache-duration: 48h` and a `cache-file`.
+* **Ids** are ntfy's message ids (`phone:<id>`); a line read on two runs is
+  the same line.
+* A keepalive or other non-message event, or a line older than the window,
+  is counted in `ignored`. A line that is not JSON fails the node: a corrupt
+  answer is not a shorter list.
 
 ## Adding an adapter
 

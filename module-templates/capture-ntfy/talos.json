@@ -1,0 +1,72 @@
+{
+  "name": "capture-ntfy",
+  "version": "v1.0.0",
+  "display_name": "Capture: ntfy",
+  "description": "Read the lines the owner published to an inbox topic on an ntfy server (typed in the ntfy app, or shared to the topic from any app). OUTPUT (the same for every capture-* adapter, docs/capture-contract.md): {kind: \"captured\", source: \"phone\", captured: [{id, text}], count, ignored} — oldest first, at most 20, each text one line of at most 240 characters, `id` stable across runs (\"phone:<ntfy message id>\") so a keeper adds each line once. HOW: one GET of the topic's last 26 hours (/<topic>/json?poll=1&since=…); the server must keep messages that long (cache-duration 48h). It never publishes or deletes. A TOKEN IS REQUIRED: a capture topic anyone can publish to would let anyone put lines on your list, so this module refuses to run without AUTH_HEADER — and the server should deny anonymous access. COST: one request; a recorded day of twenty lines is measured in fixtures/. A refusal fails the node with the status, never the response body. GRANTS: installs with NO host and no secret: set your server's host with update_module_hosts and the token's exact path with update_module_secrets. WHAT A KEEPER SHOULD DO WITH IT: treat captured lines as additions only.",
+  "category": "Communication",
+  "capability_world": "http-node",
+  "block": {
+    "role": "reader",
+    "contract": "captured"
+  },
+  "allowed_hosts": [],
+  "allowed_methods": [
+    "GET"
+  ],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 20,
+    "bytes_per_item": 300,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 3.0
+  },
+  "config_schema": {
+    "type": "object",
+    "required": [
+      "SERVER_URL",
+      "TOPIC",
+      "AUTH_HEADER"
+    ],
+    "properties": {
+      "SERVER_URL": {
+        "type": "string",
+        "description": "The ntfy server's https:// address, with no path."
+      },
+      "TOPIC": {
+        "type": "string",
+        "description": "The inbox topic: 1 to 64 letters, digits, '_' or '-'."
+      },
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "Required. 'Bearer vault://ntfy/token' — an access token of a user who may READ the topic (ntfy token add <user>), stored in the vault."
+      },
+      "NOW_MS": {
+        "type": "integer",
+        "description": "For a rehearsal only: the clock in epoch milliseconds. Leave unset."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Lock the server",
+      "detail": "On your ntfy server set auth-default-access: deny-all and cache-duration: 48h."
+    },
+    {
+      "step": 2,
+      "title": "Two users",
+      "detail": "You, with read-write on the inbox topic (you publish to it from the app); and a user for this module with READ on the inbox topic only. Create that user's token: ntfy token add <user>, and store it in the vault yourself."
+    },
+    {
+      "step": 3,
+      "title": "Subscribe on the phone",
+      "detail": "In the ntfy app, add your server, log in, and subscribe to the inbox topic; type a line into it, or share text to it."
+    },
+    {
+      "step": 4,
+      "title": "Grant and wire",
+      "detail": "update_module_hosts with your server's host, update_module_secrets with the token path, then put this module before the node that keeps the lines."
+    }
+  ]
+}
