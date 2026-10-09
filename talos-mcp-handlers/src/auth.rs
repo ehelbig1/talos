@@ -532,10 +532,14 @@ fn refuse_unscoped_agent(agent: &AgentIdentity) -> Result<(), Response> {
 /// of these, so the counter and the log line live at ONE place — the
 /// middleware's single `match` — and a new refusal branch cannot forget
 /// either: [`McpAuthRefusal::outcome`] is an exhaustive match. The CALLER
-/// sees the same reply for `MissingToken`, `UnknownToken` and `InvalidToken`
-/// (a bare 401 — a reason-split reply would be a token-existence oracle),
-/// exactly as before 2026-09-13; the split exists for the OPERATOR, who reads
-/// `talos_mcp_auth_total{outcome}` and the `mcp_auth_refused` audit line.
+/// sees ONE reply for `UnknownToken`, `InvalidToken` and a malformed stored
+/// hash (a reason split among those is a token-existence oracle); the split
+/// exists for the OPERATOR, who reads `talos_mcp_auth_total{outcome}` and the
+/// `mcp_auth_refused` audit line. Since 2026-10-09 a `MissingToken` reply
+/// says what was wrong with the credential the request carried — that
+/// depends only on the request's own contents, so it is no oracle, and
+/// without it a client that sent a malformed header could not tell why it
+/// was refused (it read a bare 401 as "start an OAuth sign-in").
 /// Until then a guessed token produced NEITHER — the API-key and interactive
 /// login surfaces both counted and logged their refusals, and this one, the
 /// bearer MCP-1201 calls "long-lived … with no 2FA equivalent", did not.
@@ -545,8 +549,10 @@ enum McpAuthRefusal {
     /// or its defense-in-depth entry cap refused the request before any
     /// credential was read.
     RateLimited,
-    /// No `Authorization: Bearer` header and no `?token=` query parameter.
-    MissingToken,
+    /// No usable credential: no `Authorization: Bearer <token>` header (see
+    /// [`UnusableCredential`] for what the request carried instead) and no
+    /// `?token=` query parameter.
+    MissingToken(UnusableCredential),
     /// No active `mcp_agents` row carries this token's SHA-256 lookup hash —
     /// a guessed, mistyped or REVOKED token (`is_active = false` rows are
     /// filtered by the lookup, so a revoked token is unknown by construction).
@@ -567,13 +573,128 @@ enum McpAuthRefusal {
     Error(StatusCode),
 }
 
+/// What a request carried instead of a usable MCP agent credential. Told to
+/// the caller — it is about the request, not about any token Talos holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnusableCredential {
+    /// No `Authorization` header at all.
+    Absent,
+    /// An `Authorization` header whose scheme is not `Bearer` (or that is
+    /// not valid text).
+    NotBearer,
+    /// `Authorization: Bearer` with nothing after it.
+    EmptyBearer,
+    /// A Talos API key (`talos_sk_…`) where an MCP agent token
+    /// (`talos_mcp_…`) belongs — refused by its prefix, before any lookup.
+    ApiKey,
+}
+
+impl UnusableCredential {
+    /// The reason the caller's reply and the log line carry.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Absent => "missing_credentials",
+            Self::NotBearer | Self::EmptyBearer => "malformed_authorization",
+            Self::ApiKey => "api_key_not_agent_token",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Absent => {
+                "Unauthorized: no MCP agent token. Send `Authorization: Bearer <talos_mcp_... token>`."
+            }
+            Self::NotBearer => {
+                "Unauthorized: the Authorization header is not `Bearer <token>`. Send \
+                 `Authorization: Bearer <talos_mcp_... token>`."
+            }
+            Self::EmptyBearer => {
+                "Unauthorized: the Authorization header says `Bearer` but carries no token."
+            }
+            Self::ApiKey => {
+                "Unauthorized: this is a Talos API key (talos_sk_...). /mcp takes an MCP agent \
+                 token (talos_mcp_...), which registering an MCP agent returns."
+            }
+        }
+    }
+
+    /// RFC 6750 §3.1: no `error` attribute when the request carried no
+    /// credentials, `invalid_request` when it carried a malformed one.
+    fn www_authenticate(self) -> &'static str {
+        match self {
+            Self::Absent => r#"Bearer realm="talos-mcp""#,
+            Self::NotBearer | Self::EmptyBearer => {
+                r#"Bearer realm="talos-mcp", error="invalid_request""#
+            }
+            Self::ApiKey => r#"Bearer realm="talos-mcp", error="invalid_token""#,
+        }
+    }
+}
+
+/// The token in an `Authorization: Bearer <token>` header. `Ok(None)` when
+/// there is no header; the auth-scheme is matched case-insensitively (RFC
+/// 9110 §11.1), so `bearer <token>` is read too.
+fn bearer_from_header(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, UnusableCredential> {
+    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let Ok(value) = value.to_str() else {
+        return Err(UnusableCredential::NotBearer);
+    };
+    let value = value.trim();
+    let (scheme, rest) = value
+        .split_once(|c: char| c.is_ascii_whitespace())
+        .unwrap_or((value, ""));
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Err(UnusableCredential::NotBearer);
+    }
+    let token = rest.trim();
+    if token.is_empty() {
+        return Err(UnusableCredential::EmptyBearer);
+    }
+    Ok(Some(token.to_string()))
+}
+
+/// A 401 the caller can read: a JSON-RPC error object whose `data.reason`
+/// names the refusal, and an RFC 6750 `WWW-Authenticate` challenge.
+fn unauthorized_reply(reason: &str, message: &str, challenge: &'static str) -> Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": { "code": -32001, "message": message, "data": { "reason": reason } },
+    });
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::WWW_AUTHENTICATE, challenge),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// The ONE reply for a token that was read and not accepted — unknown,
+/// invalid, or matched to a row whose stored hash is malformed. Identical for
+/// all three, so it says nothing about which tokens exist.
+fn token_refused_reply() -> Response {
+    unauthorized_reply(
+        "invalid_token",
+        "Unauthorized: the MCP agent token was not accepted. It may be mistyped or revoked; \
+         an API key (talos_sk_...) is not an MCP agent token.",
+        r#"Bearer realm="talos-mcp", error="invalid_token""#,
+    )
+}
+
 impl McpAuthRefusal {
     /// The label the counter records for this refusal — exhaustive, so a
     /// new variant must choose one.
     fn outcome(&self) -> McpAuthOutcome {
         match self {
             Self::RateLimited => McpAuthOutcome::RateLimited,
-            Self::MissingToken => McpAuthOutcome::MissingToken,
+            Self::MissingToken(_) => McpAuthOutcome::MissingToken,
             Self::UnknownToken => McpAuthOutcome::UnknownToken,
             Self::InvalidToken => McpAuthOutcome::InvalidToken,
             Self::UnscopedAgent(_) => McpAuthOutcome::UnscopedAgent,
@@ -581,13 +702,18 @@ impl McpAuthRefusal {
         }
     }
 
-    /// The reply the caller receives — what each site returned before the
-    /// refusals were funnelled through one type.
+    /// The reply the caller receives. Every 401 carries a body and a
+    /// challenge; the token outcomes share [`token_refused_reply`].
     fn into_reply(self) -> Result<Response, StatusCode> {
         match self {
             Self::RateLimited => Err(StatusCode::TOO_MANY_REQUESTS),
-            Self::MissingToken | Self::UnknownToken | Self::InvalidToken => {
-                Err(StatusCode::UNAUTHORIZED)
+            Self::MissingToken(why) => Ok(unauthorized_reply(
+                why.reason(),
+                why.message(),
+                why.www_authenticate(),
+            )),
+            Self::UnknownToken | Self::InvalidToken | Self::Error(StatusCode::UNAUTHORIZED) => {
+                Ok(token_refused_reply())
             }
             Self::UnscopedAgent(response) => Ok(response),
             Self::Error(status) => Err(status),
@@ -598,9 +724,12 @@ impl McpAuthRefusal {
 /// Record one refusal where an operator can see it: the counter (always)
 /// and the log (at a level chosen per reason). The limiter also moves
 /// `talos_rate_limit_hits_total{type="mcp_auth"}`, so the MCP limiter joins
-/// the four the 2026-09-11 burn-down wired. A missing token is DEBUG — an
-/// unauthenticated probe of `/mcp` carries nothing to guess with and the
-/// counter has it; an unknown or invalid token is WARN under `talos_audit`,
+/// the four the 2026-09-11 burn-down wired. A request with no credential at
+/// all is INFO (until 2026-10-09 DEBUG, which hid a client that was sending
+/// nothing; INFO keeps an unauthenticated probe below WARN); one with a
+/// MALFORMED `Authorization` header is WARN under `talos_audit` — somebody is
+/// trying to authenticate and getting the format wrong, which an operator
+/// can fix; an unknown or invalid token is WARN under `talos_audit`,
 /// the level `ApiKeyService::validate_key` uses for the same event; the
 /// unscoped-agent refusal already logged itself with the agent id inside
 /// [`refuse_unscoped_agent`], and every `Error` was logged with its cause at
@@ -613,11 +742,22 @@ fn report_mcp_auth_refusal(refusal: &McpAuthRefusal, ip: &str) {
             talos_metrics::record_rate_limit_hit(talos_metrics::RateLimitKind::McpAuth);
             tracing::warn!(ip = %ip, "MCP auth rate limit exceeded");
         }
-        McpAuthRefusal::MissingToken => {
-            tracing::debug!(
+        McpAuthRefusal::MissingToken(UnusableCredential::Absent) => {
+            tracing::info!(
                 ip = %ip,
                 reason = outcome.as_str(),
+                detail = UnusableCredential::Absent.reason(),
                 "MCP request carried no agent token"
+            );
+        }
+        McpAuthRefusal::MissingToken(why) => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "mcp_auth_refused",
+                reason = outcome.as_str(),
+                detail = why.reason(),
+                ip = %ip,
+                "MCP request carried no usable agent token"
             );
         }
         McpAuthRefusal::UnknownToken | McpAuthRefusal::InvalidToken => {
@@ -678,11 +818,7 @@ async fn authenticate_mcp_request(
     // 1. Extract Bearer Token from multiple sources:
     //    a) Authorization: Bearer <token> header (standard)
     //    b) ?token=<token> query parameter (for clients that can't set headers)
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .filter(|s| s.starts_with("Bearer "))
-        .map(|s| s[7..].trim().to_string());
+    let auth_header = bearer_from_header(headers);
 
     // Query-param token: supported for clients that cannot set HTTP headers
     // (e.g. SSE clients, browser EventSource).  The token value is extracted
@@ -698,10 +834,18 @@ async fn authenticate_mcp_request(
         })
     });
 
-    let token = match auth_header.or(query_token) {
-        Some(t) => t,
-        None => return Err(McpAuthRefusal::MissingToken),
+    // The header wins when it carries a token; a malformed or absent header
+    // falls back to `?token=` as before, and is the reason only when there
+    // is none.
+    let token = match (auth_header, query_token) {
+        (Ok(Some(token)), _) | (_, Some(token)) => token,
+        (Ok(None), None) => return Err(McpAuthRefusal::MissingToken(UnusableCredential::Absent)),
+        (Err(why), None) => return Err(McpAuthRefusal::MissingToken(why)),
     };
+    // An API key is never an agent token: say so, and look nothing up.
+    if token.starts_with(talos_api_keys::API_KEY_PREFIX) {
+        return Err(McpAuthRefusal::MissingToken(UnusableCredential::ApiKey));
+    }
 
     // 2. Compute SHA-256 lookup hash for efficient DB query
     let token_lookup_hash = hex::encode(Sha256::digest(token.as_bytes())).to_string();
@@ -953,6 +1097,25 @@ mod mcp_auth_refusal_tests {
             .expect("lazy pool")
     }
 
+    /// Status, `WWW-Authenticate` and JSON body of a reply.
+    async fn reply_parts(response: Response) -> (StatusCode, String, serde_json::Value) {
+        let status = response.status();
+        let challenge = response
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (
+            status,
+            challenge,
+            serde_json::from_slice(&bytes).expect("json body"),
+        )
+    }
+
     fn request(auth: Option<&str>) -> Request<axum::body::Body> {
         let mut b = Request::builder().method("POST").uri("/mcp");
         if let Some(a) = auth {
@@ -971,15 +1134,180 @@ mod mcp_auth_refusal_tests {
                 .await
                 .expect_err("no token must be refused");
         assert!(
-            matches!(refusal, McpAuthRefusal::MissingToken),
+            matches!(
+                refusal,
+                McpAuthRefusal::MissingToken(UnusableCredential::Absent)
+            ),
             "{refusal:?}"
         );
         assert_eq!(refusal.outcome(), McpAuthOutcome::MissingToken);
-        // The caller's reply is the bare 401 it always was.
-        assert_eq!(
-            refusal.into_reply().expect_err("a status, not a body"),
-            StatusCode::UNAUTHORIZED
+        // The caller is told what was wrong with ITS request.
+        let (status, challenge, body) =
+            reply_parts(refusal.into_reply().expect("a 401 with a body")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(challenge, r#"Bearer realm="talos-mcp""#);
+        assert_eq!(body["error"]["data"]["reason"], "missing_credentials");
+        assert_eq!(body["jsonrpc"], "2.0");
+    }
+
+    /// A header that is not `Bearer <token>` is refused before any database
+    /// read and named as malformed; with a `?token=` beside it the query
+    /// token is still used, as before (here it reaches the lookup, which this
+    /// pool cannot answer).
+    #[tokio::test]
+    async fn a_malformed_header_is_named_and_the_query_token_still_counts() {
+        let _g = LIMITER_TEST_LOCK.lock().await;
+        let pool = never_connecting_pool();
+        for (header, why) in [
+            ("talos_mcp_0123", UnusableCredential::NotBearer),
+            ("Basic dXNlcjpwYXNz", UnusableCredential::NotBearer),
+            ("Bearer", UnusableCredential::EmptyBearer),
+            ("Bearer    ", UnusableCredential::EmptyBearer),
+        ] {
+            let req = request(Some(header));
+            let refusal = authenticate_mcp_request(&pool, "203.0.113.14", req.headers(), req.uri())
+                .await
+                .expect_err("malformed");
+            assert!(
+                matches!(refusal, McpAuthRefusal::MissingToken(w) if w == why),
+                "{header:?}: {refusal:?}"
+            );
+            let (status, challenge, body) =
+                reply_parts(refusal.into_reply().expect("a 401 with a body")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                challenge,
+                r#"Bearer realm="talos-mcp", error="invalid_request""#
+            );
+            assert_eq!(body["error"]["data"]["reason"], "malformed_authorization");
+        }
+        let with_query = Request::builder()
+            .method("POST")
+            .uri("/mcp?token=talos_mcp_from_query")
+            .header(axum::http::header::AUTHORIZATION, "talos_mcp_no_scheme")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let refusal = authenticate_mcp_request(
+            &pool,
+            "203.0.113.14",
+            with_query.headers(),
+            with_query.uri(),
+        )
+        .await
+        .expect_err("the lookup cannot succeed");
+        assert!(
+            matches!(
+                refusal,
+                McpAuthRefusal::Error(StatusCode::INTERNAL_SERVER_ERROR)
+            ),
+            "the query token reached the lookup: {refusal:?}"
         );
+        MCP_AUTH_RATE_LIMITER
+            .get_or_init(DashMap::new)
+            .remove("203.0.113.14");
+    }
+
+    /// An API key in the header or the query is named as one, before any
+    /// database read (the pool cannot connect).
+    #[tokio::test]
+    async fn an_api_key_is_named_as_one_before_any_lookup() {
+        let _g = LIMITER_TEST_LOCK.lock().await;
+        let pool = never_connecting_pool();
+        let api_key = "talos_sk_0123abcd0123456789abcdef0123456789abcdef";
+        let by_header = request(Some(&format!("Bearer {api_key}")));
+        let by_query = Request::builder()
+            .method("POST")
+            .uri(format!("/mcp?token={api_key}"))
+            .body(axum::body::Body::empty())
+            .expect("request");
+        for req in [by_header, by_query] {
+            let refusal = authenticate_mcp_request(&pool, "203.0.113.15", req.headers(), req.uri())
+                .await
+                .expect_err("an API key");
+            assert!(
+                matches!(
+                    refusal,
+                    McpAuthRefusal::MissingToken(UnusableCredential::ApiKey)
+                ),
+                "{refusal:?}"
+            );
+            assert_eq!(refusal.outcome(), McpAuthOutcome::MissingToken);
+            let (status, challenge, body) =
+                reply_parts(refusal.into_reply().expect("a 401 with a body")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                challenge,
+                r#"Bearer realm="talos-mcp", error="invalid_token""#
+            );
+            assert_eq!(body["error"]["data"]["reason"], "api_key_not_agent_token");
+            assert!(!body.to_string().contains(api_key), "the key is not echoed");
+        }
+        MCP_AUTH_RATE_LIMITER
+            .get_or_init(DashMap::new)
+            .remove("203.0.113.15");
+    }
+
+    #[test]
+    fn the_bearer_header_is_read_case_insensitively_and_trimmed() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(bearer_from_header(&headers), Ok(None));
+        for (value, want) in [
+            ("Bearer talos_mcp_abc", Ok(Some("talos_mcp_abc"))),
+            ("bearer talos_mcp_abc", Ok(Some("talos_mcp_abc"))),
+            ("BEARER   talos_mcp_abc  ", Ok(Some("talos_mcp_abc"))),
+            ("Bearer\ttalos_mcp_abc", Ok(Some("talos_mcp_abc"))),
+            ("talos_mcp_abc", Err(UnusableCredential::NotBearer)),
+            ("Basic abc", Err(UnusableCredential::NotBearer)),
+            ("Bearertalos_mcp_abc", Err(UnusableCredential::NotBearer)),
+            ("Bearer", Err(UnusableCredential::EmptyBearer)),
+            (" Bearer  ", Err(UnusableCredential::EmptyBearer)),
+        ] {
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(value).expect("header"),
+            );
+            assert_eq!(
+                bearer_from_header(&headers),
+                want.map(|t| t.map(str::to_string)),
+                "{value:?}"
+            );
+        }
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_bytes(b"Bearer \xff\xfe").expect("opaque header"),
+        );
+        assert_eq!(
+            bearer_from_header(&headers),
+            Err(UnusableCredential::NotBearer)
+        );
+    }
+
+    /// The token outcomes share ONE reply, byte for byte: status, headers and
+    /// body say nothing about whether a token Talos holds was matched.
+    #[tokio::test]
+    async fn the_token_outcomes_are_indistinguishable_to_the_caller() {
+        let mut replies = Vec::new();
+        for refusal in [
+            McpAuthRefusal::UnknownToken,
+            McpAuthRefusal::InvalidToken,
+            McpAuthRefusal::Error(StatusCode::UNAUTHORIZED),
+        ] {
+            let response = refusal.into_reply().expect("a 401 with a body");
+            let headers: Vec<_> = response
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+                .collect();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            replies.push((status, headers, body));
+        }
+        assert!(replies.windows(2).all(|w| w[0] == w[1]), "{replies:?}");
+        let body: serde_json::Value = serde_json::from_slice(&replies[0].2).expect("json");
+        assert_eq!(body["error"]["data"]["reason"], "invalid_token");
+        assert_eq!(replies[0].0, StatusCode::UNAUTHORIZED);
     }
 
     /// An unreadable agent table is `Error`, never `UnknownToken`: "we could
@@ -1020,7 +1348,7 @@ mod mcp_auth_refusal_tests {
                     .await
                     .expect_err("no token");
             assert!(
-                matches!(refusal, McpAuthRefusal::MissingToken),
+                matches!(refusal, McpAuthRefusal::MissingToken(_)),
                 "request {i}: {refusal:?}"
             );
         }
@@ -1039,8 +1367,8 @@ mod mcp_auth_refusal_tests {
         limiter.remove("203.0.113.13");
     }
 
-    /// Every refusal names exactly one outcome and keeps the reply its site
-    /// returned before the funnel existed; together the refusals cover every
+    /// Every refusal names exactly one outcome and its reply status (a 401
+    /// carries a body since 2026-10-09); together the refusals cover every
     /// outcome except `Ok`.
     #[test]
     fn every_refusal_names_one_outcome_and_keeps_its_reply() {
@@ -1056,19 +1384,29 @@ mod mcp_auth_refusal_tests {
                 Err(StatusCode::TOO_MANY_REQUESTS),
             ),
             (
-                McpAuthRefusal::MissingToken,
+                McpAuthRefusal::MissingToken(UnusableCredential::Absent),
                 McpAuthOutcome::MissingToken,
-                Err(StatusCode::UNAUTHORIZED),
+                Ok(StatusCode::UNAUTHORIZED),
+            ),
+            (
+                McpAuthRefusal::MissingToken(UnusableCredential::NotBearer),
+                McpAuthOutcome::MissingToken,
+                Ok(StatusCode::UNAUTHORIZED),
             ),
             (
                 McpAuthRefusal::UnknownToken,
                 McpAuthOutcome::UnknownToken,
-                Err(StatusCode::UNAUTHORIZED),
+                Ok(StatusCode::UNAUTHORIZED),
             ),
             (
                 McpAuthRefusal::InvalidToken,
                 McpAuthOutcome::InvalidToken,
-                Err(StatusCode::UNAUTHORIZED),
+                Ok(StatusCode::UNAUTHORIZED),
+            ),
+            (
+                McpAuthRefusal::Error(StatusCode::UNAUTHORIZED),
+                McpAuthOutcome::Error,
+                Ok(StatusCode::UNAUTHORIZED),
             ),
             (
                 unscoped(),

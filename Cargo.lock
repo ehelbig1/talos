@@ -8938,6 +8938,7 @@ dependencies = [
  "talos-admin-query-gate",
  "talos-advanced-repository",
  "talos-analytics-repository",
+ "talos-api-keys",
  "talos-audit-ledger",
  "talos-capability-world",
  "talos-child-run-ledger",
