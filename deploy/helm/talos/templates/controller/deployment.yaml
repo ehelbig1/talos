@@ -120,6 +120,18 @@ spec:
             - name: TALOS_ADMIN_QUERY_LOGIN
               value: {{ $adminQueryLogin | quote }}
             {{- end }}
+            # --- The role module SQL runs as (TALOS_RPC_GUEST_ROLE) ---
+            # Not rendered when empty; a value that is not a role name refuses
+            # to render, rather than reaching a controller that refuses it.
+            {{- if not (hasKey .Values.controller.env "TALOS_RPC_GUEST_ROLE") }}
+            {{- with .Values.controller.guestSqlRole }}
+            {{- if not (regexMatch "^[A-Za-z_][A-Za-z0-9_]{0,62}$" (toString .)) }}
+            {{- fail (printf "controller.guestSqlRole must be a Postgres role name, not %q" (toString .)) }}
+            {{- end }}
+            - name: TALOS_RPC_GUEST_ROLE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             # --- Sigstore policy for the OCI catalog sync — ALWAYS emitted ---
             # The SAME three variables the worker Deployment renders, from the
             # SAME values block (`worker.sigstore`, which despite its prefix is

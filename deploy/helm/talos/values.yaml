@@ -477,6 +477,15 @@ controller:
   # wins over either.
   adminQueryLogin: auto
 
+  # The role a `database`-world module's SQL runs as (TALOS_RPC_GUEST_ROLE,
+  # `SET LOCAL ROLE`). `talos_guest` (migration 20260522120000) holds no table
+  # grants, so module SQL reads nothing until an operator grants it a table.
+  # Each query is refused if the role cannot be entered or is a superuser or
+  # has BYPASSRLS. Empty: module SQL runs as the controller's database user,
+  # which under RUST_ENV=production the controller refuses to start with
+  # unless controller.env.TALOS_ALLOW_UNSCOPED_DB_SANDBOX acknowledges it.
+  guestSqlRole: talos_guest
+
   # ------------------------------------------------------------------
   # WORM audit-ledger persistence to S3 / MinIO with Object Lock.
   # ------------------------------------------------------------------
