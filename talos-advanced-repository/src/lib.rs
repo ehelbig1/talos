@@ -4825,6 +4825,42 @@ fn login_refusal(
 /// tool runs on the controller's pool, as before 2026-10-09.
 pub const ADMIN_QUERY_DATABASE_URL_VAR: &str = "TALOS_ADMIN_QUERY_DATABASE_URL";
 
+/// Whether the controller makes `query_paginated`'s own login itself, at
+/// start-up (`auto`), or leaves the tool on the pool unless
+/// [`ADMIN_QUERY_DATABASE_URL_VAR`] names a login (`off`, the default). The
+/// shipped compose files and chart set `auto`. An explicit URL wins over it.
+pub const ADMIN_QUERY_LOGIN_MODE_VAR: &str = "TALOS_ADMIN_QUERY_LOGIN";
+
+/// [`ADMIN_QUERY_LOGIN_MODE_VAR`], read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminQueryLoginMode {
+    /// Unset, empty or `off`.
+    Off,
+    /// `auto`: the controller derives the login's password from its KEK and
+    /// makes sure the login matches at every start-up.
+    Auto,
+    /// Anything else. The tool refuses every call rather than guess.
+    Invalid,
+}
+
+impl AdminQueryLoginMode {
+    /// Read `value` (case and surrounding space ignored).
+    #[must_use]
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("" | "off") => Self::Off,
+            Some("auto") => Self::Auto,
+            Some(_) => Self::Invalid,
+        }
+    }
+
+    /// Read [`ADMIN_QUERY_LOGIN_MODE_VAR`] from the environment.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var(ADMIN_QUERY_LOGIN_MODE_VAR).ok().as_deref())
+    }
+}
+
 /// The `application_name` the tool's own login connects with, so a DBA can
 /// tell its sessions apart.
 const ADMIN_QUERY_APPLICATION_NAME: &str = "talos_admin_query";
@@ -4916,6 +4952,13 @@ impl AdminQueryLogin {
             ));
         }
         Self::dedicated(options, statement_timeout_secs)
+    }
+
+    /// A setting that cannot be used, with why: every call is refused. For
+    /// the start-up step of [`ADMIN_QUERY_LOGIN_MODE_VAR`].
+    #[must_use]
+    pub fn unusable(why: &'static str) -> Self {
+        Self(LoginKind::Misconfigured(why))
     }
 
     /// Why the setting cannot be used, when it is set but unusable.
@@ -5064,8 +5107,10 @@ impl PaginatedSelectError {
              a superuser: CREATE ROLE talos_admin_query LOGIN PASSWORD '<password>' NOSUPERUSER \
              NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT; GRANT \
              {QUERY_PAGINATED_ROLE} TO talos_admin_query; it owns nothing, holds no grant of its \
-             own and belongs to no other role. Unsetting {ADMIN_QUERY_DATABASE_URL_VAR} runs the \
-             tool on the controller's own connection instead. See docs/query-paginated-login.md."
+             own and belongs to no other role. With {ADMIN_QUERY_LOGIN_MODE_VAR}=auto the \
+             controller makes and repairs it at start-up, and its log says why it could not. \
+             Unsetting both runs the tool on the controller's own connection instead. See \
+             docs/query-paginated-login.md."
         )
     }
 }
@@ -5815,6 +5860,24 @@ mod admin_query_login_tests {
         }
         let shown = format!("{:?}", AdminQueryLogin::from_url(Some(URL), false, 60));
         assert!(shown.contains("talos_admin_query"), "{shown}");
+    }
+
+    #[test]
+    fn the_mode_is_auto_off_or_refused() {
+        use super::AdminQueryLoginMode as M;
+        for (v, m) in [
+            (None, M::Off),
+            (Some(""), M::Off),
+            (Some("off"), M::Off),
+            (Some(" OFF "), M::Off),
+            (Some("auto"), M::Auto),
+            (Some("Auto"), M::Auto),
+            (Some("on"), M::Invalid),
+            (Some("true"), M::Invalid),
+            (Some("autoo"), M::Invalid),
+        ] {
+            assert_eq!(M::parse(v), m, "{v:?}");
+        }
     }
 
     #[test]

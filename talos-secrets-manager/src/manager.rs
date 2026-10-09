@@ -2065,6 +2065,46 @@ impl SecretsManager {
         Ok(MlContentMacKey(out))
     }
 
+    /// HKDF salt / domain-separation label for the password of
+    /// `query_paginated`'s own database login. Versioned like
+    /// [`Self::ML_CONTENT_KEY_LABEL`]: a new `/vN` is a new password.
+    const ADMIN_QUERY_LOGIN_LABEL: &[u8] = b"talos-admin-query-login/v1";
+    /// HKDF `info` for the same derivation — its single legitimate use.
+    const ADMIN_QUERY_LOGIN_INFO: &[u8] = b"postgres-login-password";
+
+    /// The password of `query_paginated`'s own database login when the
+    /// controller provisions it (`TALOS_ADMIN_QUERY_LOGIN=auto`): 32 bytes
+    /// derived from the KEK, as 64 lower-case hex characters.
+    ///
+    /// Derived rather than stored, so it needs no secret of its own and every
+    /// replica computes the same one. The same two rooted paths as
+    /// [`Self::ml_content_mac_key`]: HKDF from a local-material KEK, else HKDF
+    /// over the global active DEK (a KMS-backed KEK exports nothing). Rotating
+    /// the KEK (or, on the fallback, the DEK) changes it; the controller
+    /// re-provisions the login at its next start-up.
+    ///
+    /// Never logged, never serialised; the caller sends Postgres only a SCRAM
+    /// verifier of it.
+    pub async fn admin_query_login_password(&self) -> Result<Zeroizing<String>> {
+        let key = match self
+            .current_kek()?
+            .derive_purpose_key(Self::ADMIN_QUERY_LOGIN_LABEL, Self::ADMIN_QUERY_LOGIN_INFO)?
+        {
+            Some(key) => key,
+            None => {
+                let dek = self.get_active_dek().await?;
+                let hk =
+                    hkdf::Hkdf::<sha2::Sha256>::new(Some(Self::ADMIN_QUERY_LOGIN_LABEL), &dek.key);
+                let mut out = Zeroizing::new([0u8; 32]);
+                hk.expand(Self::ADMIN_QUERY_LOGIN_INFO, out.as_mut())
+                    // Unreachable: 32 bytes is always a valid HKDF-Expand length.
+                    .map_err(|_| anyhow!("HKDF expand for the admin query login failed"))?;
+                out
+            }
+        };
+        Ok(Zeroizing::new(hex::encode(key.as_slice())))
+    }
+
     /// Decrypt a `secrets.encrypted_value` blob, dispatching on the
     /// row's `encryption_format_version`. Centralises the v0/v1 fork
     /// so every read path uses the same logic.
@@ -6918,6 +6958,28 @@ mod aad_binding_tests {
         let e = SecretsError::MissingDek { key_id };
         assert!(e.to_string().contains(&key_id.to_string()));
         assert!(!e.user_facing_message().contains(&key_id.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod admin_query_login_password_tests {
+    //! The derived password of `query_paginated`'s own login: the same on
+    //! every call (so every replica agrees), hex, and separated from every
+    //! other derivation from the same KEK.
+    use super::SecretsManager;
+
+    #[tokio::test]
+    async fn the_password_is_stable_hex_and_its_own() {
+        let sm = SecretsManager::test_stub_for_cache();
+        let a = sm.admin_query_login_password().await.expect("derive");
+        let b = sm.admin_query_login_password().await.expect("derive again");
+        assert_eq!(*a, *b, "every replica derives the same password");
+        assert_eq!(a.len(), 64);
+        assert!(a
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        let ml = sm.ml_content_mac_key().await.expect("ml key");
+        assert_ne!(*a, hex::encode(ml.as_bytes()), "domain-separated");
     }
 }
 

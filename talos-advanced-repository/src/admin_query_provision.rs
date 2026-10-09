@@ -21,7 +21,8 @@
 //! `docs/engineering-log/packages/2026-10-09-query-paginated-login-setup.md`.
 
 use crate::{
-    is_plain_role_name, AdminQueryLogin, AdvancedRepository, PaginationMode, QUERY_PAGINATED_ROLE,
+    is_plain_role_name, AdminQueryLogin, AdminQueryLoginMode, AdvancedRepository, PaginationMode,
+    QUERY_PAGINATED_ROLE,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use hmac::{Hmac, Mac};
@@ -178,6 +179,9 @@ impl std::fmt::Debug for ProvisionedLogin {
 pub enum ProvisionError {
     /// The login name is not a plain lower-case identifier.
     LoginName,
+    /// The password is shorter than 32 characters or not ASCII letters and
+    /// digits only.
+    Password,
     /// `DATABASE_URL` cannot be turned into the login's URL.
     DatabaseUrl(&'static str),
     /// The login's URL would be refused by the tool (in production, no
@@ -197,6 +201,9 @@ impl std::fmt::Display for ProvisionError {
         match self {
             ProvisionError::LoginName => {
                 f.write_str("the login name is not a plain lower-case identifier")
+            }
+            ProvisionError::Password => {
+                f.write_str("the password is not 32 or more ASCII letters and digits")
             }
             ProvisionError::DatabaseUrl(why) => write!(f, "DATABASE_URL {why}"),
             ProvisionError::Misconfigured(why) => {
@@ -246,11 +253,95 @@ pub async fn provision_login(
     production: bool,
     statement_timeout_secs: u64,
 ) -> Result<ProvisionedLogin, ProvisionError> {
+    let password = generate_password();
+    provision_with_password(
+        pool,
+        database_url,
+        login,
+        &password,
+        production,
+        statement_timeout_secs,
+    )
+    .await
+}
+
+/// What [`ensure_login`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsuredLogin {
+    /// The login already connects with this password and passes the tool's
+    /// per-call checks: nothing was changed.
+    AlreadyInPlace,
+    /// The login was made (`created`) or repaired: password, attributes and
+    /// membership set again.
+    Provisioned { created: bool },
+}
+
+/// Make sure `login` connects with `password` and passes the tool's per-call
+/// checks, changing the database only when it does not — the start-up step
+/// of `TALOS_ADMIN_QUERY_LOGIN=auto`, where `password` is derived from the
+/// KEK and every replica holds the same one.
+///
+/// When something must change, the change is [`provision_login`]'s, under a
+/// transaction-scoped advisory lock, so replicas starting together take
+/// turns instead of racing on the same role. The URL is returned either way.
+pub async fn ensure_login(
+    pool: &PgPool,
+    database_url: &str,
+    login: &str,
+    password: &str,
+    production: bool,
+    statement_timeout_secs: u64,
+) -> Result<(Zeroizing<String>, EnsuredLogin), ProvisionError> {
     if !is_plain_role_name(login) {
         return Err(ProvisionError::LoginName);
     }
-    let password = generate_password();
-    let url = login_url(database_url, login, &password)?;
+    let url = login_url(database_url, login, password)?;
+    let tool_login = AdminQueryLogin::from_url(Some(&url), production, statement_timeout_secs);
+    if let Some(why) = tool_login.misconfigured() {
+        return Err(ProvisionError::Misconfigured(why));
+    }
+    let repo = AdvancedRepository::new(pool.clone()).with_admin_query_login(tool_login);
+    if repo
+        .execute_paginated_select("SELECT 1 AS ok", 1, PaginationMode::Offset { offset: 0 })
+        .await
+        .is_ok()
+    {
+        return Ok((url, EnsuredLogin::AlreadyInPlace));
+    }
+    let made = provision_with_password(
+        pool,
+        database_url,
+        login,
+        password,
+        production,
+        statement_timeout_secs,
+    )
+    .await?;
+    Ok((
+        made.url,
+        EnsuredLogin::Provisioned {
+            created: made.created,
+        },
+    ))
+}
+
+/// [`provision_login`] with a password the caller supplies (hex or other
+/// plain ASCII letters and digits, so SASLprep leaves it unchanged).
+async fn provision_with_password(
+    pool: &PgPool,
+    database_url: &str,
+    login: &str,
+    password: &str,
+    production: bool,
+    statement_timeout_secs: u64,
+) -> Result<ProvisionedLogin, ProvisionError> {
+    if !is_plain_role_name(login) {
+        return Err(ProvisionError::LoginName);
+    }
+    if password.len() < 32 || !password.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(ProvisionError::Password);
+    }
+    let url = login_url(database_url, login, password)?;
     let tool_login = AdminQueryLogin::from_url(Some(&url), production, statement_timeout_secs);
     if let Some(why) = tool_login.misconfigured() {
         return Err(ProvisionError::Misconfigured(why));
@@ -258,6 +349,14 @@ pub async fn provision_login(
     let salt = talos_random::bytes::<16>();
 
     let mut tx = pool.begin().await?;
+    // One provisioning of this login at a time, cluster-wide, until commit:
+    // two `ALTER ROLE`s on one role at once can fail one of them ("tuple
+    // concurrently updated"). The two-key form keeps clear of the single-key
+    // locks elsewhere.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('talos.admin_query_login'), hashtext($1))")
+        .bind(login)
+        .execute(&mut *tx)
+        .await?;
     let read_role: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1)")
             .bind(QUERY_PAGINATED_ROLE)
@@ -271,7 +370,7 @@ pub async fn provision_login(
             .bind(login)
             .fetch_one(&mut *tx)
             .await?;
-    for statement in provision_statements(login, &password, &salt, exists)? {
+    for statement in provision_statements(login, password, &salt, exists)? {
         // sql-safe: a plain lower-case role name checked above, the constant role name, and a SCRAM verifier made of base64 and `$:=` only (checked above); role DDL takes no bind parameters
         sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
             .execute(&mut *tx)
@@ -291,6 +390,138 @@ pub async fn provision_login(
         url,
         created: !exists,
     })
+}
+
+/// What the controller knows at start-up that decides `query_paginated`'s
+/// login (read from the environment by the caller).
+#[derive(Debug, Clone, Copy)]
+pub struct StartupInputs<'a> {
+    /// `TALOS_ADMIN_QUERY_DATABASE_URL` (or its `_FILE`) is set.
+    pub explicit_url_set: bool,
+    /// `TALOS_ADMIN_QUERY_LOGIN`.
+    pub mode: AdminQueryLoginMode,
+    /// The controller's own `DATABASE_URL`.
+    pub database_url: Option<&'a str>,
+    /// `config::is_production()`.
+    pub production: bool,
+    /// `DB_STATEMENT_TIMEOUT_SECS`.
+    pub statement_timeout_secs: u64,
+}
+
+/// How long start-up waits for an `auto` login to be made sure of. The step
+/// connects as the login once and, when needed, runs one short transaction;
+/// past this the controller starts anyway and the tool's calls say why.
+pub const ENSURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Which login `query_paginated` runs on, decided once at start-up:
+///
+/// * an explicit `TALOS_ADMIN_QUERY_DATABASE_URL`: that login;
+/// * else `TALOS_ADMIN_QUERY_LOGIN=auto`: `login` with the password
+///   `password` resolves to (the controller derives it from its KEK). The
+///   database is made to match ([`ensure_login`]; nothing changes when it
+///   already does) and the tool uses that login whatever the outcome: a
+///   login made at an earlier start-up keeps working, and one that does not
+///   work is refused per call. A failure here never moves the tool onto the
+///   pool;
+/// * else (`off`, unset): the pool.
+///
+/// Logs what it decided, never the URL or the password.
+pub async fn resolve_startup_login<F>(
+    pool: &PgPool,
+    inputs: StartupInputs<'_>,
+    login: &str,
+    password: F,
+) -> AdminQueryLogin
+where
+    F: std::future::Future<Output = anyhow::Result<Zeroizing<String>>>,
+{
+    use crate::{ADMIN_QUERY_DATABASE_URL_VAR as URL_VAR, ADMIN_QUERY_LOGIN_MODE_VAR as MODE_VAR};
+    if inputs.explicit_url_set {
+        if inputs.mode == AdminQueryLoginMode::Auto {
+            tracing::info!("{URL_VAR} is set, so {MODE_VAR}=auto is not used");
+        }
+        return AdminQueryLogin::from_env();
+    }
+    match inputs.mode {
+        AdminQueryLoginMode::Off => return AdminQueryLogin::from_env(),
+        AdminQueryLoginMode::Invalid => {
+            tracing::error!(
+                "{MODE_VAR} must be `auto` or `off`; query_paginated refuses every call until it is"
+            );
+            return AdminQueryLogin::unusable(
+                "TALOS_ADMIN_QUERY_LOGIN is neither `auto` nor `off`",
+            );
+        }
+        AdminQueryLoginMode::Auto => {}
+    }
+    let Some(database_url) = inputs.database_url.filter(|u| !u.is_empty()) else {
+        tracing::error!("{MODE_VAR}=auto needs DATABASE_URL; query_paginated refuses every call");
+        return AdminQueryLogin::unusable("TALOS_ADMIN_QUERY_LOGIN=auto needs DATABASE_URL");
+    };
+    let password = match password.await {
+        Ok(password) => password,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "{MODE_VAR}=auto: the login's password could not be derived; query_paginated \
+                 refuses every call"
+            );
+            return AdminQueryLogin::unusable(
+                "TALOS_ADMIN_QUERY_LOGIN=auto could not derive the login's password",
+            );
+        }
+    };
+    let ensured = tokio::time::timeout(
+        ENSURE_TIMEOUT,
+        ensure_login(
+            pool,
+            database_url,
+            login,
+            &password,
+            inputs.production,
+            inputs.statement_timeout_secs,
+        ),
+    )
+    .await;
+    let url = match ensured {
+        Ok(Ok((url, outcome))) => {
+            tracing::info!(
+                login,
+                outcome = match outcome {
+                    EnsuredLogin::AlreadyInPlace => "already in place",
+                    EnsuredLogin::Provisioned { created: true } => "created",
+                    EnsuredLogin::Provisioned { created: false } => "repaired",
+                },
+                "query_paginated connects as its own login ({MODE_VAR}=auto)"
+            );
+            url
+        }
+        failed => {
+            match failed {
+                Ok(Err(e)) => tracing::error!(
+                    error = %e,
+                    "{MODE_VAR}=auto: the login could not be made sure of; query_paginated uses \
+                     it anyway and refuses calls while it does not work"
+                ),
+                _ => tracing::error!(
+                    "{MODE_VAR}=auto: making sure of the login took longer than {}s; \
+                     query_paginated uses it anyway and refuses calls while it does not work",
+                    ENSURE_TIMEOUT.as_secs()
+                ),
+            }
+            match login_url(database_url, login, &password) {
+                Ok(url) => url,
+                Err(e) => {
+                    tracing::error!(error = %e, "{MODE_VAR}=auto");
+                    return AdminQueryLogin::unusable(
+                        "TALOS_ADMIN_QUERY_LOGIN=auto cannot build the login's URL from \
+                         DATABASE_URL",
+                    );
+                }
+            }
+        }
+    };
+    AdminQueryLogin::from_url(Some(&url), inputs.production, inputs.statement_timeout_secs)
 }
 
 /// Take LOGIN away from `login`, so a URL that was handed out stops working.

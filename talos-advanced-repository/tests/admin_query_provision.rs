@@ -234,3 +234,254 @@ async fn disabling_takes_login_away() {
     drop_login(&admin, &login).await;
     assert!(!disable_login(&admin, &login).await.expect("absent"));
 }
+
+// ── TALOS_ADMIN_QUERY_LOGIN=auto: ensure_login and the start-up decision ──
+
+use talos_advanced_repository::admin_query_provision::{
+    ensure_login, resolve_startup_login, EnsuredLogin, StartupInputs,
+};
+use talos_advanced_repository::{
+    AdminQueryLoginMode, AdvancedRepository, LoginRefusal, PaginatedSelectError, PaginationMode,
+};
+use zeroize::Zeroizing;
+
+/// A made-up 64-hex password, as `SecretsManager::admin_query_login_password`
+/// would derive one.
+fn derived_password() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+async fn verifier_of(admin: &Pool<Postgres>, login: &str) -> String {
+    sqlx::query_scalar("SELECT rolpassword FROM pg_authid WHERE rolname = $1")
+        .bind(login)
+        .fetch_one(admin)
+        .await
+        .expect("pg_authid")
+}
+
+/// The first start-up makes the login; the next changes nothing (the stored
+/// verifier, salt and all, is the same).
+#[tokio::test]
+async fn ensure_makes_the_login_once_then_changes_nothing() {
+    let Some(url) = url() else { return };
+    let _roles = ROLES.lock().await;
+    let admin = connect(&url).await;
+    let login = login_name();
+    let password = derived_password();
+
+    let (first_url, first) = ensure_login(&admin, &url, &login, &password, false, 60)
+        .await
+        .expect("first start-up");
+    assert_eq!(first, EnsuredLogin::Provisioned { created: true });
+    let stored = verifier_of(&admin, &login).await;
+    let (second_url, second) = ensure_login(&admin, &url, &login, &password, false, 60)
+        .await
+        .expect("second start-up");
+    assert_eq!(second, EnsuredLogin::AlreadyInPlace);
+    assert_eq!(
+        verifier_of(&admin, &login).await,
+        stored,
+        "no ALTER ROLE ran"
+    );
+    assert_eq!(first_url.as_str(), second_url.as_str());
+    assert!(can_log_in(&second_url).await);
+    drop_login(&admin, &login).await;
+}
+
+/// A login whose password or attributes drifted is put back.
+#[tokio::test]
+async fn ensure_repairs_a_login_that_drifted() {
+    let Some(url) = url() else { return };
+    let _roles = ROLES.lock().await;
+    let admin = connect(&url).await;
+    let login = login_name();
+    let password = derived_password();
+    ensure_login(&admin, &url, &login, &password, false, 60)
+        .await
+        .expect("made");
+    admin
+        .execute(sqlx::AssertSqlSafe(format!(
+            "ALTER ROLE {login} PASSWORD 'someone-else-set-this' CREATEDB"
+        )))
+        .await
+        .expect("drift");
+    let (repaired_url, outcome) = ensure_login(&admin, &url, &login, &password, false, 60)
+        .await
+        .expect("repaired");
+    assert_eq!(outcome, EnsuredLogin::Provisioned { created: false });
+    assert!(can_log_in(&repaired_url).await);
+    let createdb: bool = sqlx::query_scalar("SELECT rolcreatedb FROM pg_roles WHERE rolname = $1")
+        .bind(&login)
+        .fetch_one(&admin)
+        .await
+        .expect("pg_roles");
+    assert!(!createdb);
+    drop_login(&admin, &login).await;
+}
+
+/// Replicas starting at once each make sure of the same login; the advisory
+/// lock makes them take turns, so none fails.
+#[tokio::test]
+async fn replicas_starting_together_all_succeed() {
+    let Some(url) = url() else { return };
+    let _roles = ROLES.lock().await;
+    let admin = connect(&url).await;
+    let login = login_name();
+    let password = derived_password();
+    let mut replicas = Vec::new();
+    for _ in 0..8 {
+        let (url, login, password) = (url.clone(), login.clone(), password.clone());
+        replicas.push(tokio::spawn(async move {
+            let pool = connect(&url).await;
+            ensure_login(&pool, &url, &login, &password, false, 60)
+                .await
+                .map(|(_, outcome)| outcome)
+                .map_err(|e| e.to_string())
+        }));
+    }
+    let mut created = 0;
+    for replica in replicas {
+        match replica.await.expect("task") {
+            Ok(EnsuredLogin::Provisioned { created: true }) => created += 1,
+            Ok(_) => {}
+            Err(e) => panic!("a replica failed: {e}"),
+        }
+    }
+    assert_eq!(created, 1, "exactly one replica created the login");
+    drop_login(&admin, &login).await;
+}
+
+fn inputs(url: &str, mode: AdminQueryLoginMode) -> StartupInputs<'_> {
+    StartupInputs {
+        explicit_url_set: false,
+        mode,
+        database_url: Some(url),
+        production: false,
+        statement_timeout_secs: 60,
+    }
+}
+
+async fn session_user(repo: &AdvancedRepository) -> Result<String, PaginatedSelectError> {
+    let rows = repo
+        .execute_paginated_select(
+            "SELECT session_user::text AS s",
+            1,
+            PaginationMode::Offset { offset: 0 },
+        )
+        .await?;
+    Ok(sqlx::Row::try_get(&rows[0], "s").expect("s"))
+}
+
+/// `auto`, end to end: the tool's statements run with the login as their
+/// session user.
+#[tokio::test]
+async fn auto_runs_the_tool_on_its_own_login() {
+    let Some(url) = url() else { return };
+    let _roles = ROLES.lock().await;
+    let admin = connect(&url).await;
+    let login = login_name();
+    let password = derived_password();
+    let chosen = resolve_startup_login(
+        &admin,
+        inputs(&url, AdminQueryLoginMode::Auto),
+        &login,
+        async { Ok(Zeroizing::new(password.clone())) },
+    )
+    .await;
+    let repo = AdvancedRepository::new(admin.clone()).with_admin_query_login(chosen);
+    assert_eq!(session_user(&repo).await.expect("a call"), login);
+    drop_login(&admin, &login).await;
+}
+
+/// When `auto` cannot make the login right, the tool still uses it — and the
+/// per-call checks refuse — rather than running on the pool.
+#[tokio::test]
+async fn a_failed_auto_setup_never_runs_the_tool_on_the_pool() {
+    let Some(url) = url() else { return };
+    let _roles = ROLES.lock().await;
+    let admin = connect(&url).await;
+
+    // The login exists and belongs to another role: ensure reports it and does
+    // not strip it.
+    let login = login_name();
+    for sql in [
+        format!("CREATE ROLE {login} LOGIN"),
+        format!("GRANT pg_read_all_data TO {login}"),
+    ] {
+        admin
+            .execute(sqlx::AssertSqlSafe(sql))
+            .await
+            .expect("setup");
+    }
+    let password = derived_password();
+    let chosen = resolve_startup_login(
+        &admin,
+        inputs(&url, AdminQueryLoginMode::Auto),
+        &login,
+        async { Ok(Zeroizing::new(password.clone())) },
+    )
+    .await;
+    let repo = AdvancedRepository::new(admin.clone()).with_admin_query_login(chosen);
+    match session_user(&repo).await {
+        Err(PaginatedSelectError::LoginUnavailable { refusal, .. }) => {
+            assert_eq!(refusal, LoginRefusal::OtherMemberships)
+        }
+        other => panic!("expected the login refusal, got {other:?}"),
+    }
+    drop_login(&admin, &login).await;
+
+    // The password cannot be derived: refused, not the pool.
+    let chosen = resolve_startup_login(
+        &admin,
+        inputs(&url, AdminQueryLoginMode::Auto),
+        "qp_never",
+        async { Err(anyhow::anyhow!("no KEK")) },
+    )
+    .await;
+    let repo = AdvancedRepository::new(admin.clone()).with_admin_query_login(chosen);
+    assert!(matches!(
+        session_user(&repo).await,
+        Err(PaginatedSelectError::LoginUnavailable {
+            refusal: LoginRefusal::Misconfigured(_),
+            ..
+        })
+    ));
+}
+
+/// `off` is the pool; anything but `auto` or `off` is refused.
+#[tokio::test]
+async fn off_is_the_pool_and_an_unknown_mode_is_refused() {
+    let Some(url) = url() else { return };
+    let admin = connect(&url).await;
+    let pool_user: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(&admin)
+        .await
+        .expect("pool user");
+    let unused = async { Err(anyhow::anyhow!("not asked")) };
+    let chosen = resolve_startup_login(
+        &admin,
+        inputs(&url, AdminQueryLoginMode::Off),
+        "qp_never",
+        unused,
+    )
+    .await;
+    let repo = AdvancedRepository::new(admin.clone()).with_admin_query_login(chosen);
+    assert_eq!(session_user(&repo).await.expect("a call"), pool_user);
+
+    let unused = async { Err(anyhow::anyhow!("not asked")) };
+    let chosen = resolve_startup_login(
+        &admin,
+        inputs(&url, AdminQueryLoginMode::Invalid),
+        "qp_never",
+        unused,
+    )
+    .await;
+    let repo = AdvancedRepository::new(admin.clone()).with_admin_query_login(chosen);
+    assert!(matches!(
+        session_user(&repo).await,
+        Err(PaginatedSelectError::LoginUnavailable {
+            refusal: LoginRefusal::Misconfigured(_),
+            ..
+        })
+    ));
+}
