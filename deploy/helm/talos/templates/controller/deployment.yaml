@@ -262,6 +262,7 @@ spec:
             # is the control, so check 89(d)'s chart-parity leg is told so.
             {{- $secretKeys := list
                 "DATABASE_URL"
+                "TALOS_ADMIN_QUERY_DATABASE_URL"
                 "REDIS_URL"
                 "NATS_USER" "NATS_PASSWORD"
                 "NEO4J_USER" "NEO4J_PASSWORD"

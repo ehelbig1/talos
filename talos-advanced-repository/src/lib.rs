@@ -6,7 +6,7 @@
 /// methods and format the JSON-RPC response.
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{Connection, PgPool, Postgres, Row, Transaction};
 use talos_tenancy::TenantReadScope;
 use uuid::Uuid;
 
@@ -1383,11 +1383,23 @@ pub async fn run_retention_pass_from_config(
 
 pub struct AdvancedRepository {
     db_pool: PgPool,
+    admin_query_login: AdminQueryLogin,
 }
 
 impl AdvancedRepository {
     pub fn new(db_pool: PgPool) -> Self {
-        Self { db_pool }
+        Self {
+            db_pool,
+            admin_query_login: AdminQueryLogin::pool(),
+        }
+    }
+
+    /// The login `query_paginated` statements connect as
+    /// ([`AdminQueryLogin`]); without this call, the pool's.
+    #[must_use]
+    pub fn with_admin_query_login(mut self, login: AdminQueryLogin) -> Self {
+        self.admin_query_login = login;
+        self
     }
 
     // ── Scratch sessions ──────────────────────────────────────────────────────
@@ -4203,8 +4215,17 @@ impl AdvancedRepository {
     ///   the pool's role. The role is a boundary only behind the function gate
     ///   (`talos_admin_query_gate`): a statement that could call `set_config`
     ///   could set the role back (measured, 2026-10-08).
+    /// * With [`ADMIN_QUERY_DATABASE_URL_VAR`] set ([`AdminQueryLogin`]), the
+    ///   session behind that role is a login of its own, on a connection
+    ///   opened for this call, instead of the pool's (a superuser on the
+    ///   operator's deployment): a statement that set the role back would be
+    ///   that login, which may hold nothing but membership in the role. The
+    ///   login is checked on every call and the call is REFUSED
+    ///   ([`PaginatedSelectError::LoginUnavailable`]) when it cannot be used —
+    ///   never run on the pool instead.
     ///
-    /// See `docs/engineering-log/packages/2026-10-08-query-paginated-admin-read-role.md`.
+    /// See `docs/engineering-log/packages/2026-10-08-query-paginated-admin-read-role.md`
+    /// and `docs/engineering-log/packages/2026-10-09-query-paginated-own-login.md`.
     pub async fn execute_paginated_select(
         &self,
         validated_base_query: &str,
@@ -4238,84 +4259,93 @@ impl AdvancedRepository {
                 detail: "not a plain lower-case identifier".to_string(),
             });
         }
-        let mut conn = self.db_pool.acquire().await?;
-        // Before anything of the caller's runs, and before the first await
-        // that could be cancelled: whatever happens next, this connection
-        // does not go back to the pool.
-        conn.close_on_drop();
-        sqlx::query(PAGINATED_SELECT_BEGIN)
-            .execute(&mut *conn)
-            .await?;
-        // Enter the role, and read back what it is, in one round trip. Any
-        // failure here is the role's, not the caller's: refuse, and the
-        // connection (marked close-on-drop) is closed with the transaction.
-        // sql-safe: the role name, a plain lower-case identifier checked above (production: the constant QUERY_PAGINATED_ROLE)
-        let entered = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "SET LOCAL ROLE \"{role}\"; \
-             SELECT rolbypassrls, rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user"
-        )))
-        .fetch_one(&mut *conn)
-        .await;
-        let (bypass_rls, superuser): (bool, bool) = match entered {
-            Ok(row) => (row.try_get(0)?, row.try_get(1)?),
-            Err(e) => {
-                return Err(PaginatedSelectError::RoleUnavailable {
-                    role: role.to_string(),
-                    detail: e.to_string(),
-                })
+        match &self.admin_query_login.0 {
+            LoginKind::Pool => {
+                let mut conn = self.db_pool.acquire().await?;
+                // Before anything of the caller's runs, and before the first
+                // await that could be cancelled: whatever happens next, this
+                // connection does not go back to the pool.
+                conn.close_on_drop();
+                let rows = paginated_select_on(
+                    &mut conn,
+                    PAGINATED_SELECT_BEGIN,
+                    None,
+                    role,
+                    validated_base_query,
+                    page_size,
+                    mode,
+                )
+                .await;
+                // Closing ends the transaction and the session with it. A
+                // failure to say goodbye changes nothing the caller is owed:
+                // the connection is dropped either way.
+                if let Err(e) = conn.close().await {
+                    tracing::debug!(error = %e, "query_paginated: closing its connection failed");
+                }
+                rows
             }
-        };
-        if !bypass_rls || superuser {
-            return Err(PaginatedSelectError::RoleUnavailable {
-                role: role.to_string(),
-                detail: if superuser {
-                    "the role is a superuser".to_string()
-                } else {
-                    "the role lacks BYPASSRLS, so a cross-tenant read would silently miss rows"
-                        .to_string()
-                },
-            });
-        }
-        let rows = match mode {
-            PaginationMode::Cursor { column, after } => {
-                // The cursor `column` is already constrained to [a-zA-Z0-9_]
-                // by the calling handler; double-quoting handles reserved words.
-                let q = format!(
-                    "SELECT * FROM ({}) AS _paginated_subquery \
-                     WHERE CAST(\"{}\" AS text) > $2 ORDER BY \"{}\" ASC LIMIT $1",
-                    validated_base_query, column, column
+            LoginKind::Dedicated(login) => {
+                if login
+                    .options
+                    .get_username()
+                    .eq(self.db_pool.connect_options().get_username())
+                {
+                    return Err(PaginatedSelectError::LoginUnavailable {
+                        refusal: LoginRefusal::IsThePoolLogin,
+                        detail: "the configured user is the one the controller's pool connects as"
+                            .to_string(),
+                    });
+                }
+                let connect = sqlx::PgConnection::connect_with(&login.options);
+                let mut conn =
+                    match tokio::time::timeout(ADMIN_QUERY_CONNECT_TIMEOUT, connect).await {
+                        Ok(Ok(conn)) => conn,
+                        Ok(Err(e)) => {
+                            return Err(PaginatedSelectError::LoginUnavailable {
+                                refusal: LoginRefusal::Unreachable,
+                                detail: e.to_string(),
+                            })
+                        }
+                        Err(_) => {
+                            return Err(PaginatedSelectError::LoginUnavailable {
+                                refusal: LoginRefusal::Unreachable,
+                                detail: format!(
+                                    "no connection within {}s",
+                                    ADMIN_QUERY_CONNECT_TIMEOUT.as_secs()
+                                ),
+                            })
+                        }
+                    };
+                // The pool sets these per session when it connects; a
+                // connection of our own sets them for its one transaction.
+                let begin = format!(
+                    "{PAGINATED_SELECT_BEGIN}; \
+                     SET LOCAL statement_timeout = '{}s'; \
+                     SET LOCAL idle_in_transaction_session_timeout = '60s'",
+                    login.statement_timeout_secs
                 );
-                // sql-safe: caller-written SQL by design (the platform-admin query_paginated tool): the control is talos_admin_query_gate::validate_paginated_query (one parsed read, listed functions, public tables), and the handler in talos-mcp-handlers/src/advanced.rs restricts the cursor column to [A-Za-z0-9_]
-                sqlx::query(sqlx::AssertSqlSafe(q))
-                    .bind(page_size + 1)
-                    .bind(after)
-                    .fetch_all(&mut *conn)
-                    .await
+                let rows = paginated_select_on(
+                    &mut conn,
+                    &begin,
+                    Some(login.options.get_username()),
+                    role,
+                    validated_base_query,
+                    page_size,
+                    mode,
+                )
+                .await;
+                // Dropping the connection would close its socket too; closing
+                // tells the server first. Neither returns it anywhere.
+                if let Err(e) = conn.close().await {
+                    tracing::debug!(error = %e, "query_paginated: closing its own login's connection failed");
+                }
+                rows
             }
-            PaginationMode::Offset { offset } => {
-                // Generic paginator: the ORDER BY + any unique tiebreaker live in
-                // the caller-supplied, pre-validated `validated_base_query`. The
-                // Cursor mode above is the deterministic keyset path.
-                // allow-offset-no-tiebreaker: caller-owned ORDER BY in base query
-                let q = format!(
-                    "SELECT * FROM ({}) AS _paginated_subquery LIMIT $1 OFFSET $2",
-                    validated_base_query
-                );
-                // sql-safe: caller-written SQL by design (the platform-admin query_paginated tool): the control is talos_admin_query_gate::validate_paginated_query (one parsed read, listed functions, public tables), and the handler in talos-mcp-handlers/src/advanced.rs restricts the cursor column to [A-Za-z0-9_]
-                sqlx::query(sqlx::AssertSqlSafe(q))
-                    .bind(page_size + 1)
-                    .bind(offset)
-                    .fetch_all(&mut *conn)
-                    .await
-            }
-        };
-        // Closing ends the transaction and the session with it. A failure to
-        // say goodbye changes nothing the caller is owed: the rows are read,
-        // and the connection is dropped either way.
-        if let Err(e) = conn.close().await {
-            tracing::debug!(error = %e, "query_paginated: closing its connection failed");
+            LoginKind::Misconfigured(why) => Err(PaginatedSelectError::LoginUnavailable {
+                refusal: LoginRefusal::Misconfigured(why),
+                detail: format!("{ADMIN_QUERY_DATABASE_URL_VAR} {why}"),
+            }),
         }
-        Ok(rows?)
     }
 
     // ── advanced.rs MCP-handler support ────────────────────────────────────
@@ -4646,6 +4676,328 @@ fn is_plain_role_name(role: &str) -> bool {
         && role.len() <= 63
 }
 
+/// Run one `query_paginated` statement on `conn`: open the read-only
+/// transaction (`begin`), enter `role` and check it — and, when `login` names
+/// the tool's own login, check that login too — then run the statement. Any
+/// refusal returns before the caller's SQL is sent. The caller closes `conn`.
+async fn paginated_select_on(
+    conn: &mut sqlx::PgConnection,
+    begin: &str,
+    login: Option<&str>,
+    role: &str,
+    validated_base_query: &str,
+    page_size: i64,
+    mode: PaginationMode<'_>,
+) -> Result<Vec<sqlx::postgres::PgRow>, PaginatedSelectError> {
+    // sql-safe: BEGIN READ ONLY, then (on the tool's own login) two SET LOCALs whose only value is a u64 read from configuration
+    sqlx::raw_sql(sqlx::AssertSqlSafe(begin.to_string()))
+        .execute(&mut *conn)
+        .await?;
+    // Enter the role, and read back what it is — and what the session's login
+    // is — in one round trip. Any failure here is the role's, not the
+    // caller's: refuse, and the caller closes the connection.
+    let attributes = if login.is_some() {
+        ROLE_AND_LOGIN_ATTRIBUTES
+    } else {
+        ROLE_ATTRIBUTES
+    };
+    // sql-safe: the role name, a plain lower-case identifier checked by the caller (production: the constant QUERY_PAGINATED_ROLE)
+    let entered = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL ROLE \"{role}\"; {attributes}"
+    )))
+    .fetch_one(&mut *conn)
+    .await;
+    let row = match entered {
+        Ok(row) => row,
+        Err(e) => {
+            return Err(PaginatedSelectError::RoleUnavailable {
+                role: role.to_string(),
+                detail: e.to_string(),
+            })
+        }
+    };
+    let (bypass_rls, superuser): (bool, bool) = (row.try_get(0)?, row.try_get(1)?);
+    if !bypass_rls || superuser {
+        return Err(PaginatedSelectError::RoleUnavailable {
+            role: role.to_string(),
+            detail: if superuser {
+                "the role is a superuser".to_string()
+            } else {
+                "the role lacks BYPASSRLS, so a cross-tenant read would silently miss rows"
+                    .to_string()
+            },
+        });
+    }
+    if let Some(login) = login {
+        let refusal = login_refusal(
+            row.try_get(2)?,
+            row.try_get(3)?,
+            row.try_get(4)?,
+            row.try_get(5)?,
+        );
+        if let Some(refusal) = refusal {
+            return Err(PaginatedSelectError::LoginUnavailable {
+                detail: format!("login {login}: {refusal}"),
+                refusal,
+            });
+        }
+    }
+    let rows = match mode {
+        PaginationMode::Cursor { column, after } => {
+            // The cursor `column` is already constrained to [a-zA-Z0-9_]
+            // by the calling handler; double-quoting handles reserved words.
+            let q = format!(
+                "SELECT * FROM ({}) AS _paginated_subquery \
+                 WHERE CAST(\"{}\" AS text) > $2 ORDER BY \"{}\" ASC LIMIT $1",
+                validated_base_query, column, column
+            );
+            // sql-safe: caller-written SQL by design (the platform-admin query_paginated tool): the control is talos_admin_query_gate::validate_paginated_query (one parsed read, listed functions, public tables), and the handler in talos-mcp-handlers/src/advanced.rs restricts the cursor column to [A-Za-z0-9_]
+            sqlx::query(sqlx::AssertSqlSafe(q))
+                .bind(page_size + 1)
+                .bind(after)
+                .fetch_all(&mut *conn)
+                .await?
+        }
+        PaginationMode::Offset { offset } => {
+            // Generic paginator: the ORDER BY + any unique tiebreaker live in
+            // the caller-supplied, pre-validated `validated_base_query`. The
+            // Cursor mode above is the deterministic keyset path.
+            // allow-offset-no-tiebreaker: caller-owned ORDER BY in base query
+            let q = format!(
+                "SELECT * FROM ({}) AS _paginated_subquery LIMIT $1 OFFSET $2",
+                validated_base_query
+            );
+            // sql-safe: caller-written SQL by design (the platform-admin query_paginated tool): the control is talos_admin_query_gate::validate_paginated_query (one parsed read, listed functions, public tables), and the handler in talos-mcp-handlers/src/advanced.rs restricts the cursor column to [A-Za-z0-9_]
+            sqlx::query(sqlx::AssertSqlSafe(q))
+                .bind(page_size + 1)
+                .bind(offset)
+                .fetch_all(&mut *conn)
+                .await?
+        }
+    };
+    Ok(rows)
+}
+
+/// The role's attributes, read as the role (`current_user`).
+const ROLE_ATTRIBUTES: &str =
+    "SELECT rolbypassrls, rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user";
+
+/// The role's attributes, then the session's login (`session_user`): whether
+/// it is a superuser; whether it holds another attribute beyond LOGIN; whether
+/// it belongs to any role but this one; whether anything is owned by or
+/// granted directly to it (`pg_shdepend` records both, in every database of
+/// the cluster; an index lookup).
+const ROLE_AND_LOGIN_ATTRIBUTES: &str = "SELECT r.rolbypassrls, r.rolsuper, s.rolsuper, \
+     (s.rolcreatedb OR s.rolcreaterole OR s.rolreplication OR s.rolbypassrls), \
+     EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m \
+             WHERE m.member = s.oid AND m.roleid <> r.oid), \
+     EXISTS (SELECT 1 FROM pg_catalog.pg_shdepend d \
+             WHERE d.refclassid = 'pg_catalog.pg_authid'::regclass AND d.refobjid = s.oid) \
+     FROM pg_catalog.pg_roles r, pg_catalog.pg_roles s \
+     WHERE r.rolname = current_user AND s.rolname = session_user";
+
+/// Why the tool's own login may not be used, from what the database says of
+/// it; `None` when it is a login that holds nothing but membership in the
+/// role.
+fn login_refusal(
+    superuser: bool,
+    other_attributes: bool,
+    other_memberships: bool,
+    holds_objects_or_grants: bool,
+) -> Option<LoginRefusal> {
+    if superuser {
+        Some(LoginRefusal::Superuser)
+    } else if other_attributes {
+        Some(LoginRefusal::ExtraAttributes)
+    } else if other_memberships {
+        Some(LoginRefusal::OtherMemberships)
+    } else if holds_objects_or_grants {
+        Some(LoginRefusal::HoldsObjectsOrGrants)
+    } else {
+        None
+    }
+}
+
+/// The environment variable that gives `query_paginated` a database login of
+/// its own (a Postgres URL; `<VAR>_FILE` is read too). Unset or empty: the
+/// tool runs on the controller's pool, as before 2026-10-09.
+pub const ADMIN_QUERY_DATABASE_URL_VAR: &str = "TALOS_ADMIN_QUERY_DATABASE_URL";
+
+/// The `application_name` the tool's own login connects with, so a DBA can
+/// tell its sessions apart.
+const ADMIN_QUERY_APPLICATION_NAME: &str = "talos_admin_query";
+
+/// How long a call waits for its own login's connection (the pool's
+/// `acquire_timeout` is the same).
+const ADMIN_QUERY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The database login a `query_paginated` statement's session belongs to.
+///
+/// [`AdminQueryLogin::pool`] (the default): the controller's pool, whose
+/// session user is the pool's role. [`AdminQueryLogin::from_env`] with
+/// [`ADMIN_QUERY_DATABASE_URL_VAR`] set: a login of the tool's own, connected
+/// for each call. A value that is set but unusable is kept as such, and every
+/// call is refused — the tool never runs on the pool because its own login
+/// was misconfigured.
+///
+/// `Debug` names the user and database only: the connect options hold the
+/// password.
+#[derive(Clone)]
+pub struct AdminQueryLogin(LoginKind);
+
+#[derive(Clone)]
+enum LoginKind {
+    Pool,
+    Dedicated(Box<DedicatedLogin>),
+    Misconfigured(&'static str),
+}
+
+#[derive(Clone)]
+struct DedicatedLogin {
+    options: sqlx::postgres::PgConnectOptions,
+    statement_timeout_secs: u64,
+}
+
+impl AdminQueryLogin {
+    /// Run on the controller's pool.
+    #[must_use]
+    pub fn pool() -> Self {
+        Self(LoginKind::Pool)
+    }
+
+    /// Read [`ADMIN_QUERY_DATABASE_URL_VAR`] (or its `_FILE`), the deployment
+    /// mode and `DB_STATEMENT_TIMEOUT_SECS`, and say which login is in use —
+    /// never the URL, which holds a password.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let url = talos_config::read_env_or_file(ADMIN_QUERY_DATABASE_URL_VAR);
+        let login = Self::from_url(
+            url.as_deref(),
+            talos_config::is_production(),
+            talos_db::statement_timeout_secs(),
+        );
+        match &login.0 {
+            LoginKind::Pool => tracing::info!(
+                "query_paginated runs on the controller's pool ({ADMIN_QUERY_DATABASE_URL_VAR} unset)"
+            ),
+            LoginKind::Dedicated(_) => tracing::info!(
+                "query_paginated connects as its own login ({ADMIN_QUERY_DATABASE_URL_VAR} set)"
+            ),
+            LoginKind::Misconfigured(why) => tracing::error!(
+                "{ADMIN_QUERY_DATABASE_URL_VAR} {why}; query_paginated refuses every call until \
+                 it is fixed or unset"
+            ),
+        }
+        login
+    }
+
+    /// The login `url` names. `None` (or empty) is the pool. In production the
+    /// URL must pin a TLS-guaranteeing `sslmode`, as `DATABASE_URL` must.
+    #[must_use]
+    pub fn from_url(url: Option<&str>, production: bool, statement_timeout_secs: u64) -> Self {
+        let Some(url) = url.filter(|u| !u.is_empty()) else {
+            return Self::pool();
+        };
+        // sqlx parses any scheme into Postgres options (measured: `mysql://`
+        // parses), so the scheme is checked here. The parse error is not
+        // kept: it may quote the URL.
+        let postgres_scheme = ["postgres://", "postgresql://"]
+            .iter()
+            .any(|scheme| url.starts_with(scheme));
+        let parsed = url.parse::<sqlx::postgres::PgConnectOptions>();
+        let (true, Ok(options)) = (postgres_scheme, parsed) else {
+            return Self(LoginKind::Misconfigured("is not a Postgres connection URL"));
+        };
+        if production && !talos_db::db_url_tls_guaranteed(url) {
+            return Self(LoginKind::Misconfigured(
+                "must set sslmode=require (or verify-ca / verify-full) in production",
+            ));
+        }
+        Self::dedicated(options, statement_timeout_secs)
+    }
+
+    /// A login of the tool's own, from connect options (the tests build one
+    /// from their database URL).
+    #[must_use]
+    pub fn dedicated(
+        options: sqlx::postgres::PgConnectOptions,
+        statement_timeout_secs: u64,
+    ) -> Self {
+        Self(LoginKind::Dedicated(Box::new(DedicatedLogin {
+            options: options.application_name(ADMIN_QUERY_APPLICATION_NAME),
+            statement_timeout_secs: statement_timeout_secs.max(1),
+        })))
+    }
+}
+
+impl Default for AdminQueryLogin {
+    fn default() -> Self {
+        Self::pool()
+    }
+}
+
+impl std::fmt::Debug for AdminQueryLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            LoginKind::Pool => f.write_str("AdminQueryLogin::Pool"),
+            LoginKind::Dedicated(login) => f
+                .debug_struct("AdminQueryLogin::Dedicated")
+                .field("user", &login.options.get_username())
+                .field("database", &login.options.get_database())
+                .field("statement_timeout_secs", &login.statement_timeout_secs)
+                .finish_non_exhaustive(),
+            LoginKind::Misconfigured(why) => f
+                .debug_tuple("AdminQueryLogin::Misconfigured")
+                .field(why)
+                .finish(),
+        }
+    }
+}
+
+/// Why `query_paginated`'s own login was not used. Each says what is wrong in
+/// words of ours, never the database's or the URL's, so it may be shown to
+/// the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginRefusal {
+    /// [`ADMIN_QUERY_DATABASE_URL_VAR`] is set but cannot be used.
+    Misconfigured(&'static str),
+    /// No connection could be made as the login (refused, wrong password,
+    /// unreachable, timed out).
+    Unreachable,
+    /// The login is the user the controller's pool connects as.
+    IsThePoolLogin,
+    /// The login is a superuser.
+    Superuser,
+    /// The login has CREATEDB, CREATEROLE, REPLICATION or BYPASSRLS.
+    ExtraAttributes,
+    /// The login belongs to a role other than the tool's.
+    OtherMemberships,
+    /// The login owns an object, or holds a privilege granted to it directly.
+    HoldsObjectsOrGrants,
+}
+
+impl std::fmt::Display for LoginRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoginRefusal::Misconfigured(why) => write!(f, "the setting {why}"),
+            LoginRefusal::Unreachable => f.write_str("no connection could be made as it"),
+            LoginRefusal::IsThePoolLogin => {
+                f.write_str("it is the login the controller's own pool connects as")
+            }
+            LoginRefusal::Superuser => f.write_str("it is a superuser"),
+            LoginRefusal::ExtraAttributes => {
+                f.write_str("it has CREATEDB, CREATEROLE, REPLICATION or BYPASSRLS")
+            }
+            LoginRefusal::OtherMemberships => {
+                write!(f, "it belongs to a role other than {QUERY_PAGINATED_ROLE}")
+            }
+            LoginRefusal::HoldsObjectsOrGrants => {
+                f.write_str("it owns an object or holds a privilege granted to it directly")
+            }
+        }
+    }
+}
+
 /// Why `execute_paginated_select` did not return rows.
 #[derive(Debug)]
 pub enum PaginatedSelectError {
@@ -4658,6 +5010,16 @@ pub enum PaginatedSelectError {
         role: String,
         /// What went wrong, for the server log (may carry the database's
         /// message; not for the caller).
+        detail: String,
+    },
+    /// The tool's own login ([`AdminQueryLogin`]) could not be used. Nothing
+    /// of the caller's ran, and it did not run on the pool instead. See
+    /// [`PaginatedSelectError::login_remedy`].
+    LoginUnavailable {
+        /// What is wrong, safe to show the caller.
+        refusal: LoginRefusal,
+        /// For the server log (may carry the database's message; not for the
+        /// caller).
         detail: String,
     },
     /// The database refused or failed the statement.
@@ -4673,8 +5035,25 @@ impl PaginatedSelectError {
             "query_paginated runs its SQL as the database role {role}, and this database cannot \
              use it (the role is missing, the pool's role is not a member of it, or it lacks \
              BYPASSRLS). As a superuser: CREATE ROLE {role} NOLOGIN NOINHERIT BYPASSRLS (or \
-             ALTER ROLE {role} BYPASSRLS); GRANT {role} TO <the controller's database role>; then \
-             the GRANT statements in migrations/20261008200000_talos_admin_read_role.sql."
+             ALTER ROLE {role} BYPASSRLS); GRANT {role} TO <the login query_paginated connects \
+             as: the user in {ADMIN_QUERY_DATABASE_URL_VAR}, or the controller's database role \
+             when that is unset>; then the GRANT statements in \
+             migrations/20261008200000_talos_admin_read_role.sql."
+        )
+    }
+
+    /// What the operator must do so the tool can be used, for a
+    /// [`PaginatedSelectError::LoginUnavailable`].
+    #[must_use]
+    pub fn login_remedy(refusal: LoginRefusal) -> String {
+        format!(
+            "query_paginated connects as its own database login ({ADMIN_QUERY_DATABASE_URL_VAR}), \
+             and that login cannot be used: {refusal}. The login is made for this tool alone, as \
+             a superuser: CREATE ROLE talos_admin_query LOGIN PASSWORD '<password>' NOSUPERUSER \
+             NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT; GRANT \
+             {QUERY_PAGINATED_ROLE} TO talos_admin_query; it owns nothing, holds no grant of its \
+             own and belongs to no other role. Unsetting {ADMIN_QUERY_DATABASE_URL_VAR} runs the \
+             tool on the controller's own connection instead. See docs/query-paginated-login.md."
         )
     }
 }
@@ -4685,6 +5064,9 @@ impl std::fmt::Display for PaginatedSelectError {
             PaginatedSelectError::RoleUnavailable { role, detail } => {
                 write!(f, "query_paginated role {role} unavailable: {detail}")
             }
+            PaginatedSelectError::LoginUnavailable { refusal, detail } => {
+                write!(f, "query_paginated login unavailable ({refusal}): {detail}")
+            }
             PaginatedSelectError::Database(e) => write!(f, "{e}"),
         }
     }
@@ -4693,7 +5075,8 @@ impl std::fmt::Display for PaginatedSelectError {
 impl std::error::Error for PaginatedSelectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            PaginatedSelectError::RoleUnavailable { .. } => None,
+            PaginatedSelectError::RoleUnavailable { .. }
+            | PaginatedSelectError::LoginUnavailable { .. } => None,
             PaginatedSelectError::Database(e) => Some(e),
         }
     }
@@ -5327,6 +5710,135 @@ mod child_reference_shape_tests {
         assert!(
             scan.protection_for(child).is_some(),
             "…while the DECISION accessor still holds it back — the two must not converge"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admin_query_login_tests {
+    use super::{login_refusal, AdminQueryLogin, LoginKind, LoginRefusal, PaginatedSelectError};
+
+    const URL: &str = "postgres://talos_admin_query:s3cret-pw@db.internal:5432/talos";
+
+    #[test]
+    fn unset_or_empty_is_the_pool() {
+        for url in [None, Some("")] {
+            assert!(matches!(
+                AdminQueryLogin::from_url(url, true, 60).0,
+                LoginKind::Pool
+            ));
+        }
+    }
+
+    #[test]
+    fn a_url_is_a_login_of_its_own_with_the_timeout_and_application_name() {
+        let LoginKind::Dedicated(login) = AdminQueryLogin::from_url(Some(URL), false, 45).0 else {
+            panic!("expected a dedicated login");
+        };
+        assert_eq!(login.options.get_username(), "talos_admin_query");
+        assert_eq!(login.options.get_database(), Some("talos"));
+        assert_eq!(
+            login.options.get_application_name(),
+            Some("talos_admin_query")
+        );
+        assert_eq!(login.statement_timeout_secs, 45);
+    }
+
+    /// `SET LOCAL statement_timeout = '0s'` would switch the timeout off.
+    #[test]
+    fn a_zero_timeout_is_never_sent() {
+        let LoginKind::Dedicated(login) = AdminQueryLogin::from_url(Some(URL), false, 0).0 else {
+            panic!("expected a dedicated login");
+        };
+        assert_eq!(login.statement_timeout_secs, 1);
+    }
+
+    #[test]
+    fn production_refuses_a_url_that_does_not_pin_tls() {
+        assert!(matches!(
+            AdminQueryLogin::from_url(Some(URL), true, 60).0,
+            LoginKind::Misconfigured(why) if why.contains("sslmode")
+        ));
+        let tls = format!("{URL}?sslmode=verify-full");
+        assert!(matches!(
+            AdminQueryLogin::from_url(Some(&tls), true, 60).0,
+            LoginKind::Dedicated(_)
+        ));
+    }
+
+    /// Set but unusable is refused, never treated as unset (which would run
+    /// the tool on the pool); and what is kept of it does not quote the URL.
+    #[test]
+    fn an_unparseable_url_is_misconfigured_and_not_quoted() {
+        for bad in [
+            "mysql://talos_admin_query:s3cret-pw@db/talos",
+            "talos_admin_query:s3cret-pw@db/talos",
+            "postgres://talos_admin_query:s3cret-pw@db:notaport/talos",
+        ] {
+            let login = AdminQueryLogin::from_url(Some(bad), false, 60);
+            let LoginKind::Misconfigured(why) = login.0 else {
+                panic!("expected misconfigured for {bad}");
+            };
+            assert!(!why.contains("s3cret"), "{why}");
+        }
+        assert!(matches!(
+            AdminQueryLogin::from_url(
+                Some(&URL.replace("postgres://", "postgresql://")),
+                false,
+                60
+            )
+            .0,
+            LoginKind::Dedicated(_)
+        ));
+    }
+
+    #[test]
+    fn debug_never_shows_the_password() {
+        for login in [
+            AdminQueryLogin::from_url(Some(URL), false, 60),
+            AdminQueryLogin::from_url(Some("mysql://u:s3cret-pw@h/d"), false, 60),
+        ] {
+            let shown = format!("{login:?}");
+            assert!(!shown.contains("s3cret"), "{shown}");
+        }
+        let shown = format!("{:?}", AdminQueryLogin::from_url(Some(URL), false, 60));
+        assert!(shown.contains("talos_admin_query"), "{shown}");
+    }
+
+    #[test]
+    fn a_login_is_refused_for_the_first_thing_it_holds() {
+        assert_eq!(login_refusal(false, false, false, false), None);
+        assert_eq!(
+            login_refusal(true, true, true, true),
+            Some(LoginRefusal::Superuser)
+        );
+        assert_eq!(
+            login_refusal(false, true, true, true),
+            Some(LoginRefusal::ExtraAttributes)
+        );
+        assert_eq!(
+            login_refusal(false, false, true, true),
+            Some(LoginRefusal::OtherMemberships)
+        );
+        assert_eq!(
+            login_refusal(false, false, false, true),
+            Some(LoginRefusal::HoldsObjectsOrGrants)
+        );
+    }
+
+    /// The caller is told what is wrong in our words; the database's text
+    /// stays in `detail`, for the log.
+    #[test]
+    fn the_remedy_carries_the_refusal_and_not_the_detail() {
+        let message = PaginatedSelectError::login_remedy(LoginRefusal::Superuser);
+        assert!(message.contains("it is a superuser"), "{message}");
+        assert!(
+            message.contains("TALOS_ADMIN_QUERY_DATABASE_URL"),
+            "{message}"
+        );
+        assert!(
+            message.contains("GRANT talos_admin_read TO talos_admin_query"),
+            "{message}"
         );
     }
 }

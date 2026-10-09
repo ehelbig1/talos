@@ -1699,6 +1699,10 @@ bootstrapSecret:
     # Postgres + Redis URIs (full connection strings)
     DATABASE_URL: ""
     REDIS_URL: ""
+    # Optional — a database login of its own for the platform-admin
+    # query_paginated tool (docs/query-paginated-login.md). Blank = the tool
+    # runs on the controller's DATABASE_URL connection.
+    TALOS_ADMIN_QUERY_DATABASE_URL: ""
     # NATS basic auth — the CONTROLLER credential (unrestricted).
     NATS_USER: ""
     NATS_PASSWORD: ""

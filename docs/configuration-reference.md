@@ -66,6 +66,7 @@ value, log presence only.
 |---|---|---|---|---|
 | `DATABASE_URL` | required | controller | Primary Postgres DSN; pool creation | 🔒 (embeds credentials) |
 | `DATABASE_READ_REPLICA_URL` | none (optional) | controller | Read-replica DSN; falls back to primary if unset (`talos-db`) | 🔒 |
+| `TALOS_ADMIN_QUERY_DATABASE_URL` | none (optional) | controller | A database login of its own for the platform-admin `query_paginated` tool (also `_FILE`): each call connects as it and runs as `talos_admin_read`, so no superuser session sits behind the caller's SQL. Unset = the controller's `DATABASE_URL` connection. Set but unusable (not a `postgres://` URL, no TLS-guaranteeing `sslmode` in production, the pool's own user, a superuser, a login holding anything beyond membership in the role) = every call refused, never run on the pool. See `docs/query-paginated-login.md` (`talos-advanced-repository`) | 🔒 (embeds credentials) |
 | `DB_MAX_CONNECTIONS` | `30` | controller | Postgres pool max connections | |
 | `DB_READ_REPLICA_MAX_CONNECTIONS` | `20` | controller | Replica pool max connections | |
 | `DB_STATEMENT_TIMEOUT_SECS` | `60` | controller | Per-statement timeout applied to the pool | |
