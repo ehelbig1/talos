@@ -1164,7 +1164,9 @@ pub fn host_sleep_brief(
         .iter()
         .filter(|r| r.at >= from && r.at <= now)
         .collect();
-    let asleep: f64 = seen.iter().map(|r| r.gap_secs).sum();
+    // `fold` from 0.0, not `sum()`: the sum of no floats is NEGATIVE zero,
+    // and a quiet day read "asleep_hours: -0.0" on its first live report.
+    let asleep: f64 = seen.iter().fold(0.0, |total, r| total + r.gap_secs);
     let longest = seen.iter().map(|r| r.gap_secs).fold(0.0_f64, f64::max);
     serde_json::json!({
         "window_hours": window_hours,
@@ -4200,6 +4202,13 @@ mod resume_settle_tests {
             brief["last_resume_at"],
             (now - Duration::minutes(10)).to_rfc3339()
         );
+        // A window with no resume in it reads zero, not negative zero.
+        let quiet = host_sleep_brief(now - Duration::days(400), 24);
+        assert_eq!(quiet["resumes"], 0, "{quiet}");
+        for field in ["asleep_secs", "asleep_hours", "longest_secs"] {
+            assert_eq!(quiet[field].to_string(), "0.0", "{field}: {quiet}");
+        }
+        assert_eq!(quiet["last_resume_at"], serde_json::Value::Null);
         // It has not been watching for the whole day, and says so. (Another
         // test in this binary may have started the watch earlier, so only the
         // direction is asserted when it did.)
