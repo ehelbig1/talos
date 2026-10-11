@@ -1613,8 +1613,19 @@ mod oauth_repair_tests {
         );
         assert_eq!(resolver.refresh_calls(), 1, "one attempt, then stop");
         assert!(
-            err.contains("re-authorised"),
-            "operator must be told a human is needed; got: {err}"
+            err.contains("re-authorise the integration"),
+            "operator must be told a human may be needed; got: {err}"
+        );
+        // `false` from the refresh does not say WHY there is no new token, so
+        // the sentence must not claim one cause: an unreachable token endpoint
+        // (a host that just woke) reads the same as a revoked grant here.
+        assert!(
+            err.contains("refused it") && err.contains("could not be reached"),
+            "both causes are named; got: {err}"
+        );
+        assert!(
+            !err.contains("most likely"),
+            "the failure does not guess which cause it was; got: {err}"
         );
         // The original provider error survives — the enrichment adds context,
         // it does not replace the diagnosis.
