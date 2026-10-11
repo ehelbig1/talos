@@ -1943,6 +1943,16 @@ pub struct TalosMetrics {
     /// protocol can explain.
     pub scheduler_readiness_holds_total: Counter,
 
+    /// Scheduler polls held after a resume: a gap of 45 s or more between
+    /// polls (host suspended, VM paused), then the on-time polls waited for
+    /// before dispatch starts again. 0 forever on a host that never sleeps.
+    pub scheduler_resume_holds_total: Counter,
+
+    /// Seconds this process observed it was NOT running, summed over every
+    /// gap the scheduler saw. The rate of this over a day is the fraction of
+    /// the day the host was asleep.
+    pub host_suspended_seconds_total: Counter,
+
     /// 1 when the scheduler has GIVEN UP waiting for the fleet to become
     /// visible and is dispatching without that evidence; 0 while the barrier
     /// is functioning normally.
@@ -3435,6 +3445,26 @@ impl TalosMetrics {
         // scheduler that never started.
         scheduler_readiness_holds_total.inc_by(0.0);
 
+        let scheduler_resume_holds_total = Counter::new(
+            "talos_scheduler_resume_holds_total",
+            "Scheduler poll iterations held after a resume: the poll that saw \
+             a gap of 45 s or more since the previous one (the host was \
+             suspended or its VM paused) and the on-time polls it then waits \
+             for before dispatching. A hold advances no schedule state.",
+        )?;
+        registry.register(Box::new(scheduler_resume_holds_total.clone()))?;
+        // 0 forever on a host that never sleeps; exported so that reads as
+        // "never resumed", not "no scheduler".
+        scheduler_resume_holds_total.inc_by(0.0);
+
+        let host_suspended_seconds_total = Counter::new(
+            "talos_host_suspended_seconds_total",
+            "Seconds this controller process observed it was not running, \
+             summed over every gap of 45 s or more between scheduler polls.",
+        )?;
+        registry.register(Box::new(host_suspended_seconds_total.clone()))?;
+        host_suspended_seconds_total.inc_by(0.0);
+
         let scheduler_readiness_degraded = IntGauge::new(
             "talos_scheduler_readiness_degraded",
             "1 when the scheduler has given up waiting for the worker fleet to \
@@ -4398,6 +4428,8 @@ impl TalosMetrics {
             rank_training_fetches_total,
             rank_training_lookback_shortfall_days,
             scheduler_readiness_holds_total,
+            scheduler_resume_holds_total,
+            host_suspended_seconds_total,
             scheduler_readiness_degraded,
             rate_limit_hits_total,
             privileged_op_total,

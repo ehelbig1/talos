@@ -811,14 +811,23 @@ impl ParallelWorkflowEngine {
 
                 if !refreshed {
                     // Enrich the failure the operator will read in
-                    // `get_execution_status`, naming re-authorisation as
-                    // the likely remedy. The provider/account is NOT named
+                    // `get_execution_status`. `false` does not say WHY the
+                    // refresh produced no new token, and until 2026-10-11
+                    // this sentence claimed it did ("was refused — most
+                    // likely needs to be re-authorised"): on a host that had
+                    // just woken from sleep the token endpoint was simply
+                    // unreachable, the next run succeeded, and the operator
+                    // had been told to re-authorise a working integration.
+                    // The sentence now names both causes and which one a
+                    // single occurrence points to. The provider/account is NOT named
                     // here: for gmail / google_calendar the vault path's
                     // provider_key IS the user's e-mail address, and this
                     // string is persisted to `workflow_executions`.
                     outcome = Err(format!(
-                        "{original_message} (OAuth credential refresh was refused — the \
-                             integration most likely needs to be re-authorised; not retried)"
+                        "{original_message} (the OAuth credential could not be refreshed: \
+                             the provider refused it, or its token endpoint could not be reached; \
+                             not retried. Once, after the host was asleep or offline, is expected; \
+                             if the next run fails the same way, re-authorise the integration)"
                     )
                     .into());
                 } else {
@@ -1604,8 +1613,19 @@ mod oauth_repair_tests {
         );
         assert_eq!(resolver.refresh_calls(), 1, "one attempt, then stop");
         assert!(
-            err.contains("re-authorised"),
-            "operator must be told a human is needed; got: {err}"
+            err.contains("re-authorise the integration"),
+            "operator must be told a human may be needed; got: {err}"
+        );
+        // `false` from the refresh does not say WHY there is no new token, so
+        // the sentence must not claim one cause: an unreachable token endpoint
+        // (a host that just woke) reads the same as a revoked grant here.
+        assert!(
+            err.contains("refused it") && err.contains("could not be reached"),
+            "both causes are named; got: {err}"
+        );
+        assert!(
+            !err.contains("most likely"),
+            "the failure does not guess which cause it was; got: {err}"
         );
         // The original provider error survives — the enrichment adds context,
         // it does not replace the diagnosis.

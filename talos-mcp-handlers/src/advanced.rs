@@ -3288,6 +3288,13 @@ async fn handle_agent_session_start(
         crate::modules::catalog_drift_brief(&rows)
     });
 
+    // How long this host was not running in the last day, as the scheduler
+    // saw it. A laptop that slept explains a late or failed scheduled run
+    // before any workflow does, and nothing else in the brief says so.
+    // Process memory, not a database read, so it has no failure to record;
+    // `null` = the scheduler has not polled yet.
+    outcome.report["host_sleep"] = talos_scheduler::host_sleep_brief(chrono::Utc::now(), 24);
+
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&outcome.report).unwrap_or_default(),
