@@ -982,6 +982,205 @@ pub const DEFAULT_SCHEDULER_READINESS_TIMEOUT_SECS: u64 =
 /// is safe and why the one-way latch it replaced was not.
 pub const DEFAULT_SCHEDULER_READINESS_MAX_HOLDS: usize = 20;
 
+/// A poll that starts at least this long after the previous one FINISHED did
+/// not merely run late: nothing in this process ran in between. The host was
+/// suspended, or the VM it runs in was paused. Three poll intervals (45 s):
+/// a busy poll, a slow database and a GC pause are all far below it, and a
+/// laptop lid closing is far above.
+pub const RESUME_GAP_SECS: f64 = 3.0 * SCHEDULER_POLL_INTERVAL_SECS as f64;
+
+/// How many polls the scheduler waits after a resume before it dispatches
+/// again. Override via `SCHEDULER_RESUME_SETTLE_POLLS`; `0` turns the hold off.
+///
+/// **Why a resume is not a reason to dispatch at once.** Measured 2026-10-09 →
+/// 10-11 on the reference deployment, a laptop: the lid was closed for 45 h 41
+/// min, during which macOS woke the machine 201 times for 15 minutes in total
+/// (median 2 s, longest 29 s). The poll timer was overdue at every one of
+/// those wake-ups, so each dispatched the whole backlog — the `catchup`
+/// ceiling bounded how many, not whether — into a host that went back to sleep
+/// two seconds later with no network up. 36 scheduled runs failed in three
+/// days in five shapes (a node that started and never reported, a host that
+/// "could not be reached", a result rejected as 29 minutes old, a model that
+/// timed out, a token refresh that could not connect), runs per day fell from
+/// about 440 to about 130, and every failure sampled sat inside one of those
+/// windows.
+///
+/// So after a gap the scheduler wants evidence that the host is STAYING up:
+/// this many further polls arriving on time, i.e. `2 × 15 s = 30 s` of
+/// continuous running, longer than the longest wake-up measured. The poll
+/// that sees the gap holds; each on-time poll after it counts one down; the
+/// poll that reaches zero dispatches. A hold opens no transaction, so no
+/// schedule is advanced and none is lost — the backlog then drains as a
+/// `catchup` batch under the backlog ceiling, exactly as before.
+///
+/// **It cannot wedge a healthy scheduler.** It holds only on a measured gap,
+/// and a host that is up produces none: after the configured number of
+/// on-time polls dispatch resumes, and stays resumed until the next gap. A
+/// clock that steps forward once (NTP, a VM migrated live) costs one 30 s
+/// hold. The gap is wall-clock, because a paused VM's monotonic clock does
+/// not move; a clock stepped BACKWARDS reads as no gap.
+pub const DEFAULT_SCHEDULER_RESUME_SETTLE_POLLS: usize = 2;
+
+/// The most `SCHEDULER_RESUME_SETTLE_POLLS` is honoured as: five minutes of
+/// polls. A larger value would be a way to stop the scheduler by typo.
+pub const MAX_SCHEDULER_RESUME_SETTLE_POLLS: usize = 20;
+
+/// What one poll does about a resume. See [`decide_resume_settle`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SettleDecision {
+    /// No gap, and nothing left to wait for.
+    Dispatch,
+    /// Hold this poll. `resumed_after_secs` is set on the poll that SAW the
+    /// gap (and is how long the process was not running); `remaining` is how
+    /// many more on-time polls are wanted before dispatch.
+    Hold {
+        remaining: usize,
+        resumed_after_secs: Option<f64>,
+    },
+}
+
+/// Decide one poll, from the wall-clock gap since the previous poll finished
+/// (`None` on the first poll of the process), how many on-time polls were
+/// still wanted, and the configured settle length. Returns the decision and
+/// the new count. Pure, so the whole sequence is unit-tested without a clock.
+#[must_use]
+pub fn decide_resume_settle(
+    gap_secs: Option<f64>,
+    remaining: usize,
+    settle_polls: usize,
+) -> (SettleDecision, usize) {
+    if settle_polls == 0 {
+        return (SettleDecision::Dispatch, 0);
+    }
+    if let Some(gap) = gap_secs.filter(|g| *g >= RESUME_GAP_SECS) {
+        // A gap during a settle starts the settle again: the host slept again.
+        return (
+            SettleDecision::Hold {
+                remaining: settle_polls,
+                resumed_after_secs: Some(gap),
+            },
+            settle_polls,
+        );
+    }
+    match remaining {
+        0 => (SettleDecision::Dispatch, 0),
+        1 => (SettleDecision::Dispatch, 0),
+        n => (
+            SettleDecision::Hold {
+                remaining: n - 1,
+                resumed_after_secs: None,
+            },
+            n - 1,
+        ),
+    }
+}
+
+/// `SCHEDULER_RESUME_SETTLE_POLLS`, clamped. A value that is not a number is
+/// said once and the default used: the default holds, which is the direction
+/// that cannot lose a run.
+fn resume_settle_polls() -> usize {
+    let raw = talos_config::get_env("SCHEDULER_RESUME_SETTLE_POLLS", "");
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return DEFAULT_SCHEDULER_RESUME_SETTLE_POLLS;
+    }
+    match raw.parse::<usize>() {
+        Ok(n) => n.min(MAX_SCHEDULER_RESUME_SETTLE_POLLS),
+        Err(_) => {
+            tracing::warn!(
+                target: "talos_scheduler",
+                event_kind = "scheduler_resume_settle_config_unreadable",
+                "SCHEDULER_RESUME_SETTLE_POLLS is not a whole number; using the default                  ({DEFAULT_SCHEDULER_RESUME_SETTLE_POLLS})"
+            );
+            DEFAULT_SCHEDULER_RESUME_SETTLE_POLLS
+        }
+    }
+}
+
+/// One resume this process observed: when, and how long it had not been running.
+#[derive(Debug, Clone, Copy)]
+struct ObservedResume {
+    at: chrono::DateTime<chrono::Utc>,
+    gap_secs: f64,
+}
+
+/// The resumes this process has seen, newest last, and when it started
+/// looking. In memory only: a restart forgets them, and the report says since
+/// when it has been watching rather than claiming a full day it did not see.
+struct ResumeLedger {
+    watching_since: Option<chrono::DateTime<chrono::Utc>>,
+    resumes: std::collections::VecDeque<ObservedResume>,
+}
+
+/// Enough for a weekend of two-second wake-ups (201 were measured in 46 h).
+const RESUME_LEDGER_CAP: usize = 1024;
+
+static RESUME_LEDGER: std::sync::Mutex<ResumeLedger> = std::sync::Mutex::new(ResumeLedger {
+    watching_since: None,
+    resumes: std::collections::VecDeque::new(),
+});
+
+fn ledger() -> std::sync::MutexGuard<'static, ResumeLedger> {
+    // A poisoned ledger is still a ledger: it only ever holds plain numbers.
+    RESUME_LEDGER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn note_watching(now: chrono::DateTime<chrono::Utc>) {
+    let mut l = ledger();
+    if l.watching_since.is_none() {
+        l.watching_since = Some(now);
+    }
+}
+
+fn record_resume(at: chrono::DateTime<chrono::Utc>, gap_secs: f64) {
+    let mut l = ledger();
+    if l.resumes.len() == RESUME_LEDGER_CAP {
+        l.resumes.pop_front();
+    }
+    l.resumes.push_back(ObservedResume { at, gap_secs });
+}
+
+/// How long this host was not running in the `window_hours` before `now`, as
+/// the scheduler observed it — for the session brief, so a late or failed run
+/// can be read against "the host was asleep" before a workflow is blamed.
+///
+/// `observed_since` is when this process began watching; when that is inside
+/// the window the figures cover only part of it, and `covers_whole_window`
+/// says so. `null` means the scheduler has not polled yet.
+#[must_use]
+pub fn host_sleep_brief(
+    now: chrono::DateTime<chrono::Utc>,
+    window_hours: i64,
+) -> serde_json::Value {
+    let l = ledger();
+    let Some(since) = l.watching_since else {
+        return serde_json::Value::Null;
+    };
+    let from = now - chrono::Duration::hours(window_hours);
+    let seen: Vec<&ObservedResume> = l
+        .resumes
+        .iter()
+        .filter(|r| r.at >= from && r.at <= now)
+        .collect();
+    let asleep: f64 = seen.iter().map(|r| r.gap_secs).sum();
+    let longest = seen.iter().map(|r| r.gap_secs).fold(0.0_f64, f64::max);
+    serde_json::json!({
+        "window_hours": window_hours,
+        "resumes": seen.len(),
+        "asleep_secs": asleep.round(),
+        "asleep_hours": (asleep / 360.0).round() / 10.0,
+        "longest_secs": longest.round(),
+        "last_resume_at": seen.last().map(|r| r.at.to_rfc3339()),
+        "observed_since": since.to_rfc3339(),
+        "covers_whole_window": since <= from,
+        "note": "Gaps of 45 s or more between scheduler polls: the host was suspended or its VM \
+                 paused. Scheduled runs are held for 30 s after each one. A run that failed or \
+                 ran late near a resume is the host, not the workflow.",
+    })
+}
+
 impl SchedulerService {
     pub fn new(
         db_pool: PgPool,
@@ -1257,9 +1456,28 @@ impl SchedulerService {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SCHEDULER_POLL_INTERVAL_SECS));
 
+        // RESUME SETTLE. See [`DEFAULT_SCHEDULER_RESUME_SETTLE_POLLS`]: a
+        // poll that starts long after the previous one finished means the
+        // host was not running, and a host that just woke is given 30 s to
+        // show it is staying awake before anything is dispatched into it.
+        let settle_polls = resume_settle_polls();
+        let mut settle_remaining: usize = 0;
+        let mut previous_poll_ended: Option<std::time::SystemTime> = None;
+        note_watching(chrono::Utc::now());
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    let gap_secs = previous_poll_ended
+                        .and_then(|ended| std::time::SystemTime::now().duration_since(ended).ok())
+                        .map(|gap| gap.as_secs_f64());
+                    let (settle, remaining) = decide_resume_settle(gap_secs, settle_remaining, settle_polls);
+                    settle_remaining = remaining;
+                    if let SettleDecision::Hold { remaining, resumed_after_secs } = settle {
+                        note_resume_hold(remaining, resumed_after_secs);
+                        previous_poll_ended = Some(std::time::SystemTime::now());
+                        continue;
+                    }
                     // Re-check every tick. Cheap (an in-memory count) and
                     // non-blocking: a poll held here advances no schedule
                     // state, so the same schedules are still due next tick.
@@ -1272,12 +1490,14 @@ impl SchedulerService {
                         if self.fleet_is_visible() {
                             self.note_fleet_visible();
                         } else if !self.hold_or_degrade() {
+                            previous_poll_ended = Some(std::time::SystemTime::now());
                             continue;
                         }
                     }
                     if let Err(e) = self.poll_and_trigger().await {
                         tracing::error!("Scheduler poll error: {}", e);
                     }
+                    previous_poll_ended = Some(std::time::SystemTime::now());
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
@@ -1958,6 +2178,38 @@ enum HoldDecision {
     /// An earlier poll already gave up; proceed without re-counting or
     /// re-logging every 15 s.
     AlreadyDegraded,
+}
+
+/// Count and say one resume hold. The poll that saw the gap records the
+/// resume (for the session brief and the suspended-seconds counter) and says
+/// how long the host was away; the on-time polls after it only count.
+fn note_resume_hold(remaining: usize, resumed_after_secs: Option<f64>) {
+    if let Some(m) = talos_metrics::global() {
+        m.scheduler_resume_holds_total.inc();
+    }
+    match resumed_after_secs {
+        None => tracing::debug!(
+            target: "talos_scheduler",
+            event_kind = "scheduler_dispatch_held_after_resume",
+            remaining,
+            "Scheduler: still settling after a resume"
+        ),
+        Some(gap) => {
+            record_resume(chrono::Utc::now(), gap);
+            if let Some(m) = talos_metrics::global() {
+                m.host_suspended_seconds_total.inc_by(gap);
+            }
+            tracing::info!(
+                target: "talos_scheduler",
+                event_kind = "scheduler_host_resumed",
+                suspended_secs = gap.round(),
+                settle_polls = remaining,
+                "Scheduler: this process was not running for {gap:.0} s (host suspended or VM paused). \
+                 Holding dispatch for {remaining} poll(s) so runs are not started into a host that is \
+                 about to sleep again; due schedules are NOT advanced and NOT lost."
+            );
+        }
+    }
 }
 
 /// The state transition inside [`SchedulerService::hold_or_degrade`], split out
@@ -3827,6 +4079,132 @@ mod startup_herd_tests {
              EXPECTED_RECORD_SITES does not enumerate — an unenumerated site is \
              one this test cannot protect"
         );
+    }
+}
+
+#[cfg(test)]
+mod resume_settle_tests {
+    use super::{
+        decide_resume_settle, host_sleep_brief, record_resume, SettleDecision,
+        DEFAULT_SCHEDULER_RESUME_SETTLE_POLLS, RESUME_GAP_SECS, SCHEDULER_POLL_INTERVAL_SECS,
+    };
+
+    const SETTLE: usize = DEFAULT_SCHEDULER_RESUME_SETTLE_POLLS;
+    const ON_TIME: Option<f64> = Some(SCHEDULER_POLL_INTERVAL_SECS as f64);
+
+    /// Drive a sequence of poll gaps and return, per poll, whether it dispatched.
+    fn drive(gaps: &[Option<f64>], settle_polls: usize) -> Vec<bool> {
+        let mut remaining = 0;
+        gaps.iter()
+            .map(|gap| {
+                let (decision, next) = decide_resume_settle(*gap, remaining, settle_polls);
+                remaining = next;
+                decision == SettleDecision::Dispatch
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_host_that_stays_up_is_never_held() {
+        // The first poll of a process has no previous poll, and is not a resume.
+        let gaps = [
+            None,
+            ON_TIME,
+            ON_TIME,
+            Some(20.0),
+            Some(RESUME_GAP_SECS - 0.1),
+            ON_TIME,
+        ];
+        assert_eq!(drive(&gaps, SETTLE), vec![true; gaps.len()]);
+    }
+
+    #[test]
+    fn a_resume_holds_until_the_host_has_stayed_up_thirty_seconds() {
+        // Poll, sleep an hour, wake and stay awake.
+        let gaps = [ON_TIME, Some(3600.0), ON_TIME, ON_TIME, ON_TIME];
+        assert_eq!(drive(&gaps, SETTLE), [true, false, false, true, true]);
+        // The poll that saw the gap says how long; the next only counts down.
+        let (seen, remaining) = decide_resume_settle(Some(3600.0), 0, SETTLE);
+        assert_eq!(
+            seen,
+            SettleDecision::Hold {
+                remaining: SETTLE,
+                resumed_after_secs: Some(3600.0)
+            }
+        );
+        let (next, _) = decide_resume_settle(ON_TIME, remaining, SETTLE);
+        assert_eq!(
+            next,
+            SettleDecision::Hold {
+                remaining: SETTLE - 1,
+                resumed_after_secs: None
+            }
+        );
+        // Exactly the threshold is a resume.
+        assert_eq!(
+            drive(&[ON_TIME, Some(RESUME_GAP_SECS)], SETTLE),
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn a_weekend_of_two_second_wake_ups_dispatches_nothing() {
+        // What 2026-10-10 looked like: every poll the process managed to run
+        // came after another stretch asleep, and the longest wake-up (29 s)
+        // fits one on-time poll before the next sleep.
+        let mut gaps: Vec<Option<f64>> = vec![ON_TIME];
+        for i in 0..201 {
+            gaps.push(Some(600.0 + f64::from(i)));
+            if i % 50 == 25 {
+                gaps.push(ON_TIME); // a long wake-up: one poll on time, then asleep again
+            }
+        }
+        let dispatched = drive(&gaps, SETTLE);
+        assert!(dispatched[0], "the poll before the lid closed");
+        assert!(
+            dispatched[1..].iter().all(|d| !d),
+            "a run was started into a sleeping host"
+        );
+        // The lid opens: two on-time polls, then the backlog drains.
+        gaps.extend([ON_TIME, ON_TIME, ON_TIME]);
+        let dispatched = drive(&gaps, SETTLE);
+        assert_eq!(dispatched[dispatched.len() - 3..], [false, true, true]);
+    }
+
+    #[test]
+    fn the_settle_length_is_configurable_and_zero_turns_it_off() {
+        let gaps = [ON_TIME, Some(3600.0), ON_TIME, ON_TIME, ON_TIME, ON_TIME];
+        assert_eq!(drive(&gaps, 0), vec![true; 6], "0 never holds");
+        assert_eq!(drive(&gaps, 1), [true, false, true, true, true, true]);
+        assert_eq!(drive(&gaps, 4), [true, false, false, false, false, true]);
+        // A clock stepped backwards reads as no gap at the call site (None).
+        assert_eq!(drive(&[ON_TIME, None, ON_TIME], SETTLE), [true, true, true]);
+    }
+
+    #[test]
+    fn the_brief_counts_only_what_this_process_saw_inside_the_window() {
+        use chrono::{Duration, TimeZone, Utc};
+        // The ledger is one per process; use a time no other test writes near.
+        let now = Utc.with_ymd_and_hms(2031, 3, 4, 12, 0, 0).unwrap();
+        super::note_watching(now - Duration::hours(3));
+        record_resume(now - Duration::hours(30), 9_999.0); // outside the window
+        record_resume(now - Duration::hours(2), 3_600.0);
+        record_resume(now - Duration::minutes(10), 1_800.0);
+        record_resume(now + Duration::hours(1), 5.0); // after `now`
+        let brief = host_sleep_brief(now, 24);
+        assert_eq!(brief["resumes"], 2, "{brief}");
+        assert_eq!(brief["asleep_secs"], 5_400.0, "{brief}");
+        assert_eq!(brief["asleep_hours"], 1.5, "{brief}");
+        assert_eq!(brief["longest_secs"], 3_600.0, "{brief}");
+        assert_eq!(
+            brief["last_resume_at"],
+            (now - Duration::minutes(10)).to_rfc3339()
+        );
+        // It has not been watching for the whole day, and says so. (Another
+        // test in this binary may have started the watch earlier, so only the
+        // direction is asserted when it did.)
+        assert!(brief["observed_since"].is_string(), "{brief}");
+        assert!(brief["covers_whole_window"].is_boolean(), "{brief}");
     }
 }
 
