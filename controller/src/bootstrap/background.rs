@@ -4170,6 +4170,19 @@ pub(crate) fn spawn_integration_renewal_tasks(
         // Event sync task will be started after Redis/NATS are initialized
     }
 
+    // ---------- Start Jira webhook refresh task ----------
+    // A Jira dynamic webhook expires 30 days after it is created or
+    // refreshed. Only a deployment with an Atlassian client can hold one.
+    if services.atlassian_integration_service.is_configured() {
+        let refresh_service = services.atlassian_integration_service.clone();
+        let jira_refresh_shutdown = bg_shutdown_rx.clone();
+        spawn_supervised(BackgroundTask::JiraWebhookRefresh, async move {
+            atlassian::push_scheduler::webhook_refresh_task(refresh_service, jira_refresh_shutdown)
+                .await
+        });
+        tracing::info!("Jira webhook refresh task started (runs every hour)");
+    }
+
     // ---------- Start OAuth proactive token refresh task ----------
     {
         let cred_service_bg = oauth_credential_service.clone();
@@ -6402,7 +6415,8 @@ mod task_supervision_wiring_tests {
     /// 2026-09-21: the `talos.results.*` observer moved to
     /// `talos-job-result-observer`, which supervises itself (40 here).
     /// 2026-09-22: the advisory-database age sampler (41).
-    const EXPECTED_SUPERVISED: usize = 41;
+    /// 2026-10-12: the Jira webhook refresh loop (42).
+    const EXPECTED_SUPERVISED: usize = 42;
 
     /// The remaining bare `tokio::spawn` calls in THIS file, deliberately
     /// unwrapped because each is a one-shot whose death is bounded to one

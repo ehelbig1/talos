@@ -228,6 +228,93 @@ impl BindWorkflowRefusal {
     }
 }
 
+/// A channel an integration created (or already had) at its owner's request.
+/// Like [`PushChannelRow`], it carries an identity and a label and nothing a
+/// push is authenticated with.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionedChannel {
+    pub integration: &'static str,
+    /// The id `list_push_channels` and `set_push_channel_workflow` name it by.
+    pub channel_id: Uuid,
+    pub display_name: String,
+    /// When the provider stops delivering unless the channel is refreshed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// False when the caller already had this channel and nothing was asked
+    /// of the provider.
+    pub created: bool,
+}
+
+/// What kind of refusal a create or delete met. Closed, so the tool that
+/// reports one maps each kind to a protocol code once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionRefusalKind {
+    /// No provisioner is wired for the named integration.
+    UnknownIntegration,
+    /// The caller, or the deployment's operator, has to change something
+    /// first (reconnect the account, set an address, name the connection).
+    Refused,
+    /// No such connection or channel for this user ("not yours" is the same
+    /// answer).
+    NotFound,
+    /// The provider or the database did not answer; trying again may work.
+    Unavailable,
+}
+
+/// Why a channel was not created or deleted. `message` is written by the
+/// integration FOR THE CALLER: it names what to do and never carries an
+/// upstream error body, a token or a query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionRefusal {
+    pub kind: ProvisionRefusalKind,
+    pub message: String,
+}
+
+impl ProvisionRefusal {
+    #[must_use]
+    pub fn new(kind: ProvisionRefusalKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProvisionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for ProvisionRefusal {}
+
+/// An integration whose channels are created by asking the provider, on
+/// behalf of one of the caller's own connections.
+///
+/// Separate from [`PushChannelInventory`] on purpose: an inventory holds a
+/// bare pool so that it CANNOT create a channel and can be built whether or
+/// not the integration is configured. A provisioner holds the integration's
+/// service (its credentials and its HTTP client) and is wired only where that
+/// service exists.
+#[async_trait::async_trait]
+pub trait PushChannelProvisioner: Send + Sync {
+    /// The same name the integration's inventory answers to.
+    fn integration_name(&self) -> &'static str;
+
+    /// Create the channel for one of this user's connections. `target` names
+    /// the connection when the user has more than one; what it is (a site id,
+    /// a mailbox) is the integration's business. Creating a channel that
+    /// already exists returns it with `created: false`.
+    async fn create_channel(
+        &self,
+        user_id: Uuid,
+        target: Option<&str>,
+    ) -> Result<ProvisionedChannel, ProvisionRefusal>;
+
+    /// Delete one of this user's channels, at the provider and here.
+    async fn delete_channel(&self, user_id: Uuid, channel_id: Uuid)
+        -> Result<(), ProvisionRefusal>;
+}
+
 /// The set of inventories wired into this process, as one injectable value.
 ///
 /// A newtype over the `Vec<Arc<dyn …>>` rather than the bare vec, following the
@@ -238,6 +325,7 @@ impl BindWorkflowRefusal {
 #[derive(Clone, Default)]
 pub struct PushChannelInventorySet {
     inventories: Vec<Arc<dyn PushChannelInventory>>,
+    provisioners: Vec<Arc<dyn PushChannelProvisioner>>,
 }
 
 impl std::fmt::Debug for PushChannelInventorySet {
@@ -258,7 +346,58 @@ impl std::fmt::Debug for PushChannelInventorySet {
 impl PushChannelInventorySet {
     #[must_use]
     pub fn new(inventories: Vec<Arc<dyn PushChannelInventory>>) -> Self {
-        Self { inventories }
+        Self {
+            inventories,
+            provisioners: Vec::new(),
+        }
+    }
+
+    /// Add the integrations whose channels can be created and deleted through
+    /// this set. Without one, [`Self::create_channel`] and
+    /// [`Self::delete_channel`] answer `UnknownIntegration`.
+    #[must_use]
+    pub fn with_provisioners(mut self, provisioners: Vec<Arc<dyn PushChannelProvisioner>>) -> Self {
+        self.provisioners = provisioners;
+        self
+    }
+
+    fn provisioner(
+        &self,
+        integration: &str,
+    ) -> Result<&Arc<dyn PushChannelProvisioner>, ProvisionRefusal> {
+        self.provisioners
+            .iter()
+            .find(|p| p.integration_name() == integration)
+            .ok_or_else(|| {
+                ProvisionRefusal::new(
+                    ProvisionRefusalKind::UnknownIntegration,
+                    "Channels of this integration cannot be created or deleted here.",
+                )
+            })
+    }
+
+    /// Create a channel through the provisioner that speaks for `integration`.
+    pub async fn create_channel(
+        &self,
+        integration: &str,
+        user_id: Uuid,
+        target: Option<&str>,
+    ) -> Result<ProvisionedChannel, ProvisionRefusal> {
+        self.provisioner(integration)?
+            .create_channel(user_id, target)
+            .await
+    }
+
+    /// Delete a channel through the provisioner that speaks for `integration`.
+    pub async fn delete_channel(
+        &self,
+        integration: &str,
+        user_id: Uuid,
+        channel_id: Uuid,
+    ) -> Result<(), ProvisionRefusal> {
+        self.provisioner(integration)?
+            .delete_channel(user_id, channel_id)
+            .await
     }
 
     #[must_use]
@@ -593,6 +732,81 @@ mod tests {
         };
         assert!(!survey.has_nothing_to_report());
         assert!(survey.dangling().is_empty());
+    }
+
+    struct OneChannel(Uuid);
+
+    #[async_trait::async_trait]
+    impl PushChannelProvisioner for OneChannel {
+        fn integration_name(&self) -> &'static str {
+            "probe"
+        }
+        async fn create_channel(
+            &self,
+            _user_id: Uuid,
+            target: Option<&str>,
+        ) -> Result<ProvisionedChannel, ProvisionRefusal> {
+            Ok(ProvisionedChannel {
+                integration: "probe",
+                channel_id: self.0,
+                display_name: target.unwrap_or("only").to_string(),
+                expires_at: None,
+                created: true,
+            })
+        }
+        async fn delete_channel(
+            &self,
+            _user_id: Uuid,
+            channel_id: Uuid,
+        ) -> Result<(), ProvisionRefusal> {
+            if channel_id == self.0 {
+                Ok(())
+            } else {
+                Err(ProvisionRefusal::new(
+                    ProvisionRefusalKind::NotFound,
+                    "No such channel.",
+                ))
+            }
+        }
+    }
+
+    /// A create or delete goes to the provisioner named, and an integration
+    /// with none says so rather than doing nothing.
+    #[tokio::test]
+    async fn a_create_or_delete_goes_to_the_named_provisioner_or_is_refused() {
+        let id = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        let set =
+            PushChannelInventorySet::new(vec![]).with_provisioners(vec![Arc::new(OneChannel(id))]);
+
+        let made = set
+            .create_channel("probe", user, Some("site"))
+            .await
+            .expect("create");
+        assert_eq!((made.channel_id, made.display_name.as_str()), (id, "site"));
+        assert_eq!(set.delete_channel("probe", user, id).await, Ok(()));
+        assert_eq!(
+            set.delete_channel("probe", user, Uuid::new_v4())
+                .await
+                .unwrap_err()
+                .kind,
+            ProvisionRefusalKind::NotFound
+        );
+        assert_eq!(
+            set.create_channel("gcal", user, None)
+                .await
+                .unwrap_err()
+                .kind,
+            ProvisionRefusalKind::UnknownIntegration
+        );
+        assert_eq!(
+            PushChannelInventorySet::default()
+                .delete_channel("probe", user, id)
+                .await
+                .unwrap_err()
+                .kind,
+            ProvisionRefusalKind::UnknownIntegration
+        );
     }
 
     /// The row that crosses this boundary must not carry the push token or the

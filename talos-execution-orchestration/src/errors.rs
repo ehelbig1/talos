@@ -168,7 +168,40 @@ impl OrchestrationError {
             Self::DispatchFailed(_) | Self::Database(_) | Self::Internal(_) => -32000,
         }
     }
+
+    /// Why a workflow bound to an inbound push (a Google Calendar watch
+    /// channel, a Jira webhook) was not started, as one of a CLOSED set of
+    /// words for the audit row.
+    ///
+    /// The error's own text goes to the server log only: it can carry a
+    /// schema name or a query. Every push integration records the same words,
+    /// so a reader of the shared audit log learns one vocabulary. The two
+    /// reasons a caller produces without an error of this type are the
+    /// constants beside this method.
+    #[must_use]
+    pub fn push_refusal_reason(&self) -> &'static str {
+        match self {
+            Self::WorkflowNotFound(_) => "workflow_not_found",
+            Self::WorkflowNotLive(..) | Self::WorkflowDisabled(_) | Self::WorkflowArchived(_) => {
+                "workflow_not_live"
+            }
+            Self::ExecutionPaused(_) => "execution_paused",
+            Self::AuthorizationDenied(_) => "authorization_denied",
+            Self::ConcurrencyLimitExceeded(_) => "concurrency_limit",
+            Self::InvalidArgument(_) | Self::ValidationFailed(_) => "input_refused",
+            _ => PUSH_REFUSAL_TRIGGER_FAILED,
+        }
+    }
 }
+
+/// [`OrchestrationError::push_refusal_reason`]'s word for a start that failed
+/// for a reason the caller cannot act on, and the word a push handler records
+/// for an outcome that is not a start.
+pub const PUSH_REFUSAL_TRIGGER_FAILED: &str = "trigger_failed";
+
+/// The word a push handler records when this process wired no trigger
+/// service, so a binding that silently starts nothing says why.
+pub const PUSH_REFUSAL_TRIGGER_SERVICE_NOT_WIRED: &str = "trigger_service_not_wired";
 
 #[cfg(test)]
 mod tests {
@@ -224,5 +257,73 @@ mod tests {
             OrchestrationError::ExecutionNotFound(Uuid::nil()).jsonrpc_code(),
             "archived and absent must not share a code"
         );
+    }
+
+    /// The audit row's reason is one of a closed set of words, never the
+    /// error's own text.
+    #[test]
+    fn a_refused_push_start_is_one_of_a_closed_set_of_words() {
+        let id = Uuid::nil();
+        for (error, reason) in [
+            (
+                OrchestrationError::WorkflowNotFound(id),
+                "workflow_not_found",
+            ),
+            (
+                OrchestrationError::WorkflowDisabled(id),
+                "workflow_not_live",
+            ),
+            (
+                OrchestrationError::WorkflowNotLive(id, "archived"),
+                "workflow_not_live",
+            ),
+            (
+                OrchestrationError::WorkflowArchived(id),
+                "workflow_not_live",
+            ),
+            (
+                OrchestrationError::ExecutionPaused(talos_metrics::PauseRefusal::Paused),
+                "execution_paused",
+            ),
+            (
+                OrchestrationError::AuthorizationDenied("budget".into()),
+                "authorization_denied",
+            ),
+            (
+                OrchestrationError::ConcurrencyLimitExceeded("3 of 3".into()),
+                "concurrency_limit",
+            ),
+            (
+                OrchestrationError::InvalidArgument("SELECT secret FROM t".into()),
+                "input_refused",
+            ),
+            (
+                OrchestrationError::ValidationFailed("$.jira_push".into()),
+                "input_refused",
+            ),
+            (
+                OrchestrationError::Internal(anyhow::anyhow!(
+                    "relation \"workflows\" does not exist"
+                )),
+                PUSH_REFUSAL_TRIGGER_FAILED,
+            ),
+            (
+                OrchestrationError::DispatchFailed("nats down".into()),
+                PUSH_REFUSAL_TRIGGER_FAILED,
+            ),
+        ] {
+            let said = error.push_refusal_reason();
+            assert_eq!(said, reason);
+            assert!(
+                said.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{said}"
+            );
+        }
+        for word in [
+            PUSH_REFUSAL_TRIGGER_FAILED,
+            PUSH_REFUSAL_TRIGGER_SERVICE_NOT_WIRED,
+        ] {
+            assert!(word.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+        }
     }
 }

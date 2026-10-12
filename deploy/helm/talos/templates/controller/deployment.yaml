@@ -364,6 +364,12 @@ spec:
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/slack/callback"
             - name: ATLASSIAN_REDIRECT_URI
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/atlassian/callback"
+            # Where Jira delivers webhooks: the same host as the redirect URI
+            # above, because Atlassian requires a webhook URL to share the
+            # app's base URL. The path (/api/atlassian/webhook) is the
+            # controller's own.
+            - name: ATLASSIAN_WEBHOOK_BASE_URL
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}"
             - name: MICROSOFT_365_REDIRECT_URI
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/microsoft-365/callback"
             - name: OKTA_REDIRECT_URI

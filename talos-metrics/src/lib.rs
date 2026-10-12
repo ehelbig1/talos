@@ -3564,7 +3564,7 @@ impl TalosMetrics {
                  path=scheduler_poll counts deferred POLLS, not schedules (the due rows \
                  are never claimed, so they fire on resume); webhook and gmail_push \
                  requests answered 503 so the sender redelivers (gcal_push and gcp_push \
-                 likewise, since package BG); trigger / retry / replay / mcp_entry / \
+                 likewise, since package BG; jira_push since 2026-10-12); trigger / retry / replay / mcp_entry / \
                  graphql_test / handoff the operator-invoked entry gates; continuation an \
                  approval or suspension resume refused BEFORE the gate is resolved or the \
                  suspension claimed, so it can be repeated; row_creation the \

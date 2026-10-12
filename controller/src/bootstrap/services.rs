@@ -846,6 +846,16 @@ pub(crate) async fn build_platform_services(
         });
     }
 
+    // ---------- Initialize Atlassian (Jira) integration service ----------
+    let atlassian_integration_service = std::sync::Arc::new(
+        atlassian::AtlassianIntegrationService::new(db_pool.clone())
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to initialize Atlassian integration service: {}", e)
+            })?
+            .with_credentials_service(oauth_credential_service.clone()),
+    );
+    tracing::info!("Atlassian integration service initialized");
+
     // ---------- Push-channel inventories (operator surfaces) ----------
     //
     // Built UNCONDITIONALLY, and deliberately not from the watch SERVICES: each
@@ -858,6 +868,11 @@ pub(crate) async fn build_platform_services(
     // All THREE integrations are enrolled even though `google_calendar` has zero
     // channels on the reference fleet: a survey that silently covers two of
     // three is the misleading-report class one level up.
+    //
+    // Jira's registrations are enrolled the same way (a pool-only inventory).
+    // CREATING or deleting one is a different thing: it needs the Atlassian
+    // service — the connection's token and the HTTP client — so that goes in
+    // as a PROVISIONER, built from the service, beside the inventories.
     let push_channel_inventories = Some(std::sync::Arc::new(
         talos_push_channel_inventory::PushChannelInventorySet::new(vec![
             std::sync::Arc::new(
@@ -871,18 +886,14 @@ pub(crate) async fn build_platform_services(
             std::sync::Arc::new(
                 google_cloud::watch_channel_service::GcpPushChannelInventory::new(db_pool.clone()),
             ),
-        ]),
+            std::sync::Arc::new(atlassian::push::JiraPushChannelInventory::new(
+                db_pool.clone(),
+            )),
+        ])
+        .with_provisioners(vec![std::sync::Arc::new(
+            atlassian::push::JiraPushProvisioner::new(atlassian_integration_service.clone()),
+        )]),
     ));
-
-    // ---------- Initialize Atlassian (Jira) integration service ----------
-    let atlassian_integration_service = std::sync::Arc::new(
-        atlassian::AtlassianIntegrationService::new(db_pool.clone())
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to initialize Atlassian integration service: {}", e)
-            })?
-            .with_credentials_service(oauth_credential_service.clone()),
-    );
-    tracing::info!("Atlassian integration service initialized");
 
     // ---------- Initialize Gmail API client ----------
     let gmail_api_client = std::sync::Arc::new(gmail::GmailApiClient::new());
@@ -2075,6 +2086,9 @@ pub(crate) fn build_schema_and_services(
         .data(oauth_credential_service.clone())
         // Gmail integration service — used by connectOAuthIntegration (provider="gmail").
         .data(gmail_integration_service.clone())
+        // Atlassian integration service — the Settings disconnect removes a
+        // Jira connection's webhooks through it before the token is revoked.
+        .data(services.atlassian_integration_service.clone())
         .data(module_execution_service.clone())
         .data(worker_shared_key.clone())
         .data(worker_manager.clone())

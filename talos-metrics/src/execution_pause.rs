@@ -58,6 +58,9 @@ pub enum PauseGatePath {
     /// A GCP Pub/Sub push whose watch is bound to a module, answered 503
     /// before the dispatch task starts.
     GcpPush,
+    /// A Jira (Atlassian) webhook delivery that matched a registration bound
+    /// to a workflow, answered 503 before the delivery is recorded as handled.
+    JiraPush,
     /// The row-creation chokepoint (`create_execution_under_concurrency_limit`
     /// and its batch twin) refusing a start that an entry gate admitted a
     /// moment earlier — the flag was set in between — or one whose caller has
@@ -82,6 +85,7 @@ impl PauseGatePath {
         Self::Continuation,
         Self::GcalPush,
         Self::GcpPush,
+        Self::JiraPush,
         Self::RowCreation,
     ];
     #[must_use]
@@ -99,6 +103,7 @@ impl PauseGatePath {
             Self::Continuation => "continuation",
             Self::GcalPush => "gcal_push",
             Self::GcpPush => "gcp_push",
+            Self::JiraPush => "jira_push",
             Self::RowCreation => "row_creation",
         }
     }

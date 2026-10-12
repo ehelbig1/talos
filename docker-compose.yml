@@ -797,6 +797,11 @@ services:
       ATLASSIAN_CLIENT_ID: ${ATLASSIAN_CLIENT_ID:-}
       ATLASSIAN_CLIENT_SECRET: ${ATLASSIAN_CLIENT_SECRET:-}
       ATLASSIAN_REDIRECT_URI: ${ATLASSIAN_REDIRECT_URI:-http://localhost:8000/api/atlassian/callback}
+      # The https:// address Jira delivers webhooks to (create_jira_push_channel).
+      # Scheme and host only. Blank = the ngrok tunnel when the `public`
+      # profile is on; with neither, creating a Jira push channel is refused
+      # and says to set this. See docs/jira-push-setup.md.
+      ATLASSIAN_WEBHOOK_BASE_URL: ${ATLASSIAN_WEBHOOK_BASE_URL:-}
       # Microsoft 365 OAuth Configuration (an Entra ID app registration).
       # MICROSOFT_365_TENANT blank = `common`.
       MICROSOFT_365_CLIENT_ID: ${MICROSOFT_365_CLIENT_ID:-}

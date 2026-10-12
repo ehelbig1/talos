@@ -46,7 +46,9 @@ pub use cancel::{CancelBroadcast, CancelOutcome, EngineStop};
 pub use count_memory_write_nodes::count_memory_write_nodes;
 pub use crash_recovery::{recover_stuck_executions, RecoveryDeps};
 pub use deep_merge::deep_merge;
-pub use errors::OrchestrationError;
+pub use errors::{
+    OrchestrationError, PUSH_REFUSAL_TRIGGER_FAILED, PUSH_REFUSAL_TRIGGER_SERVICE_NOT_WIRED,
+};
 pub use input::{ReplayInput, ReplayWithInputInput, RetryInput, TriggerInput};
 pub use outcome::{
     ExecutionOutcome, ExecutionStatus, InputValidationReport, TriggerMetadata, TriggerOutcome,

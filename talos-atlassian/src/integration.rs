@@ -19,7 +19,7 @@ use std::sync::LazyLock;
 /// Build-failure fall-back panics via .expect() so a misconfigured
 /// rustls/TLS stack surfaces loudly at startup rather than
 /// indefinitely-retrying refresh tasks.
-static REFRESH_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+pub(crate) static REFRESH_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     talos_http_utils::trusted_client::build_integration_client(std::time::Duration::from_secs(15))
 });
 use uuid::Uuid;
@@ -85,6 +85,11 @@ const REQUESTED_SCOPES: &[&str] = &[
     // Granular scopes — write (comments, transitions)
     "write:comment:jira",
     "write:issue:jira",
+    // Classic scope — register, refresh and delete the dynamic webhook that
+    // lets Jira push issue changes (`crate::push`). Appended last; a
+    // connection made before this was requested does not hold it and must
+    // be connected again before a webhook can be registered.
+    "manage:jira-webhook",
 ];
 
 /// The full originally-requested scope set, space-joined — the fallback
@@ -96,34 +101,101 @@ pub(crate) fn requested_scope_fallback() -> String {
 // ── Service ──────────────────────────────────────────────────────────────
 
 pub struct AtlassianIntegrationService {
-    db_pool: Pool<Postgres>,
+    pub(crate) db_pool: Pool<Postgres>,
     client_id: Option<String>,
     client_secret: Option<String>,
     redirect_uri: Option<String>,
-    credentials_service: Option<Arc<OAuthCredentialService>>,
+    pub(crate) credentials_service: Option<Arc<OAuthCredentialService>>,
+    /// Where the Jira webhook API is reached. Unset in production (the
+    /// constant `https://api.atlassian.com`); a test points it at a stand-in.
+    pub(crate) api_base_url: std::sync::OnceLock<String>,
+    /// The public base a webhook URL is built from, when a test states it.
+    /// Unset in production, where it is read from the environment.
+    pub(crate) webhook_base_url: std::sync::OnceLock<String>,
+    /// Serializes webhook registration per `(user, site)` across the fleet.
+    pub(crate) push_locks:
+        talos_integration_helpers::state_store::CreateLockMap<(uuid::Uuid, String)>,
 }
 
 impl AtlassianIntegrationService {
     pub fn new(db_pool: Pool<Postgres>) -> Result<Self> {
-        Ok(Self {
+        Ok(Self::with_client(
             db_pool,
             // MCP-710 (2026-05-13): empty-env class — see GmailIntegrationService.
-            client_id: std::env::var("ATLASSIAN_CLIENT_ID")
+            std::env::var("ATLASSIAN_CLIENT_ID")
                 .ok()
                 .filter(|v| !v.is_empty()),
-            client_secret: std::env::var("ATLASSIAN_CLIENT_SECRET")
+            std::env::var("ATLASSIAN_CLIENT_SECRET")
                 .ok()
                 .filter(|v| !v.is_empty()),
-            redirect_uri: std::env::var("ATLASSIAN_REDIRECT_URI")
+            std::env::var("ATLASSIAN_REDIRECT_URI")
                 .ok()
                 .filter(|v| !v.is_empty()),
+        ))
+    }
+
+    /// The one constructor every field goes through.
+    fn with_client(
+        db_pool: Pool<Postgres>,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        redirect_uri: Option<String>,
+    ) -> Self {
+        Self {
+            db_pool,
+            client_id,
+            client_secret,
+            redirect_uri,
             credentials_service: None,
-        })
+            api_base_url: std::sync::OnceLock::new(),
+            webhook_base_url: std::sync::OnceLock::new(),
+            push_locks: talos_integration_helpers::state_store::CreateLockMap::new(),
+        }
     }
 
     pub fn with_credentials_service(mut self, svc: Arc<OAuthCredentialService>) -> Self {
         self.credentials_service = Some(svc);
         self
+    }
+
+    /// A service with stated OAuth client values instead of the
+    /// environment's, for tests: the environment is shared by every test in a
+    /// binary. Nothing in the controller calls this.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_client_for_tests(
+        db_pool: Pool<Postgres>,
+        client_id: &str,
+        client_secret: &str,
+        redirect_uri: &str,
+    ) -> Self {
+        Self::with_client(
+            db_pool,
+            Some(client_id.to_string()),
+            Some(client_secret.to_string()),
+            Some(redirect_uri.to_string()),
+        )
+    }
+
+    /// Point the Jira webhook API calls at another origin, and state the
+    /// public base a webhook URL is built from. Tests only: neither value can
+    /// come from a request, and nothing in the controller calls this.
+    #[doc(hidden)]
+    pub fn with_push_endpoints_for_tests(&self, api_base_url: &str, webhook_base_url: &str) {
+        let _ = self.api_base_url.set(api_base_url.to_string());
+        let _ = self.webhook_base_url.set(webhook_base_url.to_string());
+    }
+
+    /// The pool this service reads and writes through.
+    #[must_use]
+    pub fn pool(&self) -> &Pool<Postgres> {
+        &self.db_pool
+    }
+
+    /// The app's client secret, which Atlassian signs each webhook delivery
+    /// with. `None` when Atlassian is not configured.
+    pub(crate) fn client_secret(&self) -> Option<&str> {
+        self.client_secret.as_deref()
     }
 
     pub fn is_configured(&self) -> bool {
@@ -438,6 +510,24 @@ impl AtlassianIntegrationService {
         .await
         .context("Failed to look up Atlassian integration for disconnect")?;
 
+        // The connection's webhooks go first: deleting one at Atlassian needs
+        // the token the next step removes. Best effort — a webhook that
+        // could not be deleted there expires on its own, and the rows are
+        // removed here either way.
+        if let Some(cid) = cloud_id.as_deref() {
+            if let Err(e) = self
+                .remove_push_registrations_for_connection(user_id, cid)
+                .await
+            {
+                tracing::warn!(
+                    user_id = %user_id,
+                    integration_id = %integration_id,
+                    error = %e,
+                    "Atlassian disconnect: the connection's Jira webhooks could not all be removed"
+                );
+            }
+        }
+
         if let (Some(cid), Some(cred_svc)) = (cloud_id.as_deref(), &self.credentials_service) {
             if let Err(e) = cred_svc.revoke_and_cleanup(user_id, "atlassian", cid).await {
                 tracing::warn!(
@@ -645,23 +735,16 @@ mod tests {
     /// Fully-configured service with injected (non-env) credentials so tests
     /// don't race on process-global env vars.
     fn configured_service() -> AtlassianIntegrationService {
-        AtlassianIntegrationService {
-            db_pool: unreachable_pool(),
-            client_id: Some("test-client-id".to_string()),
-            client_secret: Some("test-client-secret".to_string()),
-            redirect_uri: Some("https://talos.example/api/atlassian/callback".to_string()),
-            credentials_service: None,
-        }
+        AtlassianIntegrationService::with_client(
+            unreachable_pool(),
+            Some("test-client-id".to_string()),
+            Some("test-client-secret".to_string()),
+            Some("https://talos.example/api/atlassian/callback".to_string()),
+        )
     }
 
     fn unconfigured_service() -> AtlassianIntegrationService {
-        AtlassianIntegrationService {
-            db_pool: unreachable_pool(),
-            client_id: None,
-            client_secret: None,
-            redirect_uri: None,
-            credentials_service: None,
-        }
+        AtlassianIntegrationService::with_client(unreachable_pool(), None, None, None)
     }
 
     /// Full anyhow context chain as one string, for asserting which layer
@@ -681,8 +764,22 @@ mod tests {
             requested_scope_fallback(),
             "read:jira-work write:jira-work read:jira-user offline_access \
              read:issue:jira read:issue-details:jira read:project:jira \
-             read:jql:jira read:user:jira write:comment:jira write:issue:jira"
+             read:jql:jira read:user:jira write:comment:jira write:issue:jira \
+             manage:jira-webhook"
         );
+    }
+
+    /// Registering a dynamic webhook needs `manage:jira-webhook` (and
+    /// `read:jira-work`, which the connect already asked for). Without it in
+    /// the authorize request no connection can ever register one.
+    #[tokio::test]
+    async fn the_connect_asks_for_the_scopes_a_webhook_needs() {
+        let svc = configured_service();
+        let req = svc.authorize_request().expect("configured service");
+        for needed in ["manage:jira-webhook", "read:jira-work", "offline_access"] {
+            assert!(req.scopes.contains(&needed), "{needed} is not requested");
+        }
+        assert_eq!(crate::push::WEBHOOK_SCOPE, "manage:jira-webhook");
     }
 
     // ── OAuthIntegration contract ────────────────────────────────────

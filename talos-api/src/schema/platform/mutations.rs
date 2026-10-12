@@ -462,6 +462,36 @@ impl PlatformMutations {
             return Ok(true);
         }
 
+        // A Jira connection's webhooks go before its token: deleting one at
+        // Atlassian needs the token the revoke below removes. Best effort,
+        // like the revoke: the connection is already hidden, a webhook that
+        // could not be deleted there expires on its own, and the rows are
+        // removed here either way.
+        if provider.id == talos_atlassian::push::INTEGRATION_NAME {
+            if let Some(cloud_id) = outcome.provider_key.as_deref() {
+                match ctx.data::<std::sync::Arc<talos_atlassian::AtlassianIntegrationService>>() {
+                    Ok(svc) => {
+                        if let Err(e) = svc
+                            .remove_push_registrations_for_connection(*user_id, cloud_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                provider = %provider.id,
+                                error = %e,
+                                "disconnect: the connection's Jira webhooks could not all be removed"
+                            );
+                        }
+                    }
+                    Err(_) => tracing::error!(
+                        provider = %provider.id,
+                        "disconnect: AtlassianIntegrationService not present in schema data — \
+                         the connection's Jira webhooks were NOT removed; wire it into the \
+                         schema builder"
+                    ),
+                }
+            }
+        }
+
         if let Some(provider_key) = outcome.provider_key.as_deref() {
             match talos_integrations::provider_config::revoke_provider_for(
                 provider,
