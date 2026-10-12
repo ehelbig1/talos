@@ -11,6 +11,7 @@ use uuid::Uuid;
 pub mod admin;
 pub mod api;
 pub mod handlers;
+pub mod provision;
 pub mod scheduler;
 pub mod watch;
 pub mod watch_channel_service;

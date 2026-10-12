@@ -310,6 +310,28 @@ pub trait PushChannelProvisioner: Send + Sync {
         target: Option<&str>,
     ) -> Result<ProvisionedChannel, ProvisionRefusal>;
 
+    /// Create the channel on one RESOURCE of a connection — one calendar of
+    /// an account — for an integration whose connection holds more than one
+    /// thing to watch. `resource: None` is the integration's default.
+    ///
+    /// The default is for an integration whose channel covers the whole
+    /// connection: it REFUSES a resource rather than create a channel on
+    /// something other than what the caller named.
+    async fn create_channel_on(
+        &self,
+        user_id: Uuid,
+        target: Option<&str>,
+        resource: Option<&str>,
+    ) -> Result<ProvisionedChannel, ProvisionRefusal> {
+        match resource {
+            None => self.create_channel(user_id, target).await,
+            Some(_) => Err(ProvisionRefusal::new(
+                ProvisionRefusalKind::Refused,
+                "A channel of this integration covers the whole connection; it takes no resource.",
+            )),
+        }
+    }
+
     /// Delete one of this user's channels, at the provider and here.
     async fn delete_channel(&self, user_id: Uuid, channel_id: Uuid)
         -> Result<(), ProvisionRefusal>;
@@ -385,6 +407,20 @@ impl PushChannelInventorySet {
     ) -> Result<ProvisionedChannel, ProvisionRefusal> {
         self.provisioner(integration)?
             .create_channel(user_id, target)
+            .await
+    }
+
+    /// Create a channel on one resource of a connection, through the
+    /// provisioner that speaks for `integration`.
+    pub async fn create_channel_on(
+        &self,
+        integration: &str,
+        user_id: Uuid,
+        target: Option<&str>,
+        resource: Option<&str>,
+    ) -> Result<ProvisionedChannel, ProvisionRefusal> {
+        self.provisioner(integration)?
+            .create_channel_on(user_id, target, resource)
             .await
     }
 
@@ -798,6 +834,23 @@ mod tests {
                 .unwrap_err()
                 .kind,
             ProvisionRefusalKind::UnknownIntegration
+        );
+        // A provisioner that did not say it can watch one resource of a
+        // connection refuses one, and does not create the channel it WOULD
+        // have made on the whole connection.
+        assert_eq!(
+            set.create_channel_on("probe", user, Some("site"), Some("one-calendar"))
+                .await
+                .unwrap_err()
+                .kind,
+            ProvisionRefusalKind::Refused
+        );
+        assert_eq!(
+            set.create_channel_on("probe", user, Some("site"), None)
+                .await
+                .expect("no resource is the plain create")
+                .channel_id,
+            id
         );
         assert_eq!(
             PushChannelInventorySet::default()

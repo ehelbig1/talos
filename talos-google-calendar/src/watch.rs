@@ -97,7 +97,7 @@ pub struct WatchChannelRow {
 }
 
 impl WatchChannelRow {
-    fn to_watch_channel(&self, user_id: Uuid) -> WatchChannel {
+    pub(crate) fn to_watch_channel(&self, user_id: Uuid) -> WatchChannel {
         WatchChannel {
             id: self.id,
             integration_id: self.integration_id,
@@ -288,6 +288,18 @@ pub async fn bind_channel_workflow(
     Ok(row.to_watch_channel(user_id))
 }
 
+/// Can Google deliver a calendar change to this address? It delivers over
+/// the internet to `https://`, so plain http and this machine's own name are
+/// refused before an API call is spent on a channel nothing could reach. The
+/// one home of the rule: the create that bails on it and the provisioning
+/// path that words the refusal ask the same question.
+#[must_use]
+pub fn webhook_url_is_deliverable(webhook_url: &str) -> bool {
+    webhook_url.starts_with("https://")
+        && !webhook_url.contains("localhost")
+        && !webhook_url.contains("127.0.0.1")
+}
+
 /// Resolve `(integration_id) -> user_id` once up-front. Every gcal
 /// integration row has exactly one owning user; we need that user
 /// before we can write to integration_state.
@@ -329,10 +341,7 @@ impl GoogleCalendarService {
         // call — the API would reject with a generic 400, and our
         // caller would see "Failed to ..." with no hint about the
         // fix. A precise message here saves hours of head-scratching.
-        if !webhook_url.starts_with("https://")
-            || webhook_url.contains("localhost")
-            || webhook_url.contains("127.0.0.1")
-        {
+        if !webhook_url_is_deliverable(webhook_url) {
             anyhow::bail!(
                 "Webhook URL must be a publicly-reachable HTTPS endpoint \
                  (got: {}). In dev: run `make ngrok` to start a tunnel, \
@@ -969,7 +978,11 @@ impl GoogleCalendarService {
         let mut google_stop_error: Option<String> = None;
         if let Some(integration) = integration_obj {
             let access_token = self.get_access_token(&integration).await?;
-            let api_client = GoogleCalendarApiClient::new();
+            // The same client create and renew use: Google's, unless a test
+            // pointed this service at a stand-in. Until 2026-10-12 a stop
+            // built Google's own client, so a test that stopped a channel
+            // called Google with its test token.
+            let api_client = self.watch_api_client();
             if let Err(e) = api_client
                 .stop_watch(&access_token, &row.channel_id, &row.resource_id)
                 .await
@@ -1156,7 +1169,7 @@ impl GoogleCalendarService {
         Ok(())
     }
 
-    async fn find_channel_by_integration_and_calendar(
+    pub(crate) async fn find_channel_by_integration_and_calendar(
         &self,
         user_id: Uuid,
         integration_id: Uuid,

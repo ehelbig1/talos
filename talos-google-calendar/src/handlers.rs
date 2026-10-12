@@ -379,12 +379,9 @@ pub async fn create_watch_handler(
             // gcal-webhook-URL constructor needs the same fix.
             // MCP-1155: canonical `get_base_url()` (empty-env + open-
             // redirect-misconfig defense in one helper).
-            let webhook_url = req.webhook_url.unwrap_or_else(|| {
-                format!(
-                    "{}/api/google-calendar/webhook",
-                    talos_public_url::public_base_url_or(talos_config::get_base_url)
-                )
-            });
+            let webhook_url = req
+                .webhook_url
+                .unwrap_or_else(crate::provision::default_webhook_url);
 
             match service
                 .create_watch_channel(req.integration_id, &req.calendar_id, &webhook_url, None)
