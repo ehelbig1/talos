@@ -128,7 +128,8 @@ fn modify_one(
         timeout_ms: Some(10000),
     };
 
-    let resp = talos::core::http::fetch(&req).map_err(|_| "network_error".to_string())?;
+    // The KIND of failure stays in the message (see docs/building-blocks.md).
+    let resp = talos::core::http::fetch(&req).map_err(|e| format!("network_error ({e:?})"))?;
     if resp.status == 401 {
         return Err("unauthorized".to_string());
     }

@@ -315,9 +315,9 @@ pub fn run(input: String) -> Result<String, String> {
                 result.reason = Some(format!("{} answered {}", host_of(&base), resp.status));
                 verdict.failed += 1;
             }
-            Err(_) => {
+            Err(e) => {
                 result.status = "failed";
-                result.reason = Some(format!("{} could not be reached", host_of(&base)));
+                result.reason = Some(format!("{} could not be reached ({e:?})", host_of(&base)));
                 verdict.failed += 1;
             }
         }

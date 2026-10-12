@@ -449,8 +449,15 @@ pub fn run(input: String) -> Result<String, String> {
         body: ha_body(&n, reply)?,
         timeout_ms: Some(cfg.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000)),
     };
-    let resp = talos::core::http::fetch(&req)
-        .map_err(|_| format!("home-assistant: {} could not be reached", host_of(&base)))?;
+    // The KIND of failure stays in the message: the platform retries a
+    // timeout or a network error and does not retry a refused host, and it
+    // can only tell them apart by this word.
+    let resp = talos::core::http::fetch(&req).map_err(|e| {
+        format!(
+            "home-assistant: {} could not be reached ({e:?})",
+            host_of(&base)
+        )
+    })?;
     if !(200..300).contains(&resp.status) {
         return Err(format!("home-assistant: {} answered {}", host_of(&base), resp.status));
     }
