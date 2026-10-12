@@ -24,7 +24,10 @@ use super::watch::GmailWatchRow;
 use anyhow::{bail, Context, Result};
 use redis::AsyncCommands;
 use std::sync::Arc;
-use talos_continuation_trigger::{trigger_continuation_workflow, TriggerSourceKind};
+use talos_execution_orchestration::{
+    ExecutionOrchestrationService, ExecutionOrigin, TriggerInput, TriggerOutcome,
+    PUSH_REFUSAL_TRIGGER_FAILED, PUSH_REFUSAL_TRIGGER_SERVICE_NOT_WIRED,
+};
 use talos_module_executions::{LogLevel, ModuleExecutionService, TriggerType};
 use talos_registry::ModuleRegistry;
 use talos_secrets_manager::SecretsManager;
@@ -118,6 +121,10 @@ pub struct GmailDispatchContext {
     /// which the worker refuses under `required`. `None` keeps the inline
     /// envelope path (byte-identical to pre-M4).
     pub sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle>,
+    /// The trigger service a watch's bound WORKFLOW is started through, as
+    /// the watch's own user. `None` in a process that wired none: a bound
+    /// workflow is then not started, and the audit log says why.
+    pub orchestration: Option<Arc<ExecutionOrchestrationService>>,
 }
 
 /// Dispatch one WASM job per newly-added message in the history
@@ -234,17 +241,162 @@ pub(crate) async fn dispatch_history_entries(
     Ok(())
 }
 
-/// Trigger one full workflow execution for a push whose watch row is
-/// workflow-bound. Unlike the module path (one job per message), this
-/// fires the workflow ONCE per history page carrying new messages — the
-/// workflow re-fetches its own mail, so the trigger input is minimal
-/// (`{source, email_address, history_id}`) and carries no message bodies.
+/// At most this many message ids travel in one trigger input.
+const MAX_PUSH_MESSAGE_IDS: usize = 50;
+
+/// What a workflow bound to a Gmail watch is started with: WHICH mailbox
+/// changed and the ids of the new messages. No sender, subject, snippet or
+/// label — a trigger input is stored with its execution, and the workflow
+/// reads the mail itself with its own grants (which is also what lets the
+/// same workflow run from a schedule as a catch-up). The same shape as
+/// `calendar_push`.
 ///
-/// Dispatch goes through `trigger_continuation_workflow`, which runs the
-/// workflow-authorization gate + effective-actor resolution, creates the
-/// execution row, builds the engine (with the resolved actor's tier), and
-/// dispatches over NATS. Errors here never abort the push — the caller
-/// logs and still advances the cursor, exactly as for the module path.
+/// An id is taken only when it looks like one (Gmail's are short hex
+/// strings): the ids come from Google's reply, and a stored trigger input is
+/// not somewhere for an arbitrary string to land.
+pub(crate) fn gmail_push_trigger_input(
+    integration_id: Uuid,
+    channel_uuid: Uuid,
+    email_address: &str,
+    message_ids: &[&str],
+) -> serde_json::Value {
+    let plain =
+        |id: &&&str| (1..=128).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric());
+    let ids: Vec<&&str> = message_ids.iter().filter(plain).collect();
+    serde_json::json!({
+        "gmail_push": {
+            "integration_id": integration_id,
+            "channel_id": channel_uuid,
+            "email_address": email_address,
+            "changed": message_ids.len(),
+            "message_ids": ids.iter().take(MAX_PUSH_MESSAGE_IDS).collect::<Vec<_>>(),
+            "truncated": ids.len() > MAX_PUSH_MESSAGE_IDS || ids.len() < message_ids.len(),
+        }
+    })
+}
+
+/// What became of the workflow a push's watch is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundWorkflowStart {
+    /// The trigger service created this execution.
+    Started(Uuid),
+    /// Nothing was started; the word is one of the trigger service's closed
+    /// set (`OrchestrationError::push_refusal_reason`) and is what the audit
+    /// row carries.
+    NotStarted(&'static str),
+}
+
+/// Start the workflow a Gmail watch is bound to, as the watch's own user,
+/// through the trigger service — so ownership, liveness, the execution pause,
+/// the actor's budget and ceilings, the input schema and the concurrency
+/// limit all apply, exactly as for a start the owner makes by hand.
+///
+/// A start that is refused is RECORDED and not retried: the history cursor
+/// advances whatever happens here, so these messages will not start the
+/// workflow again. One WARN under `talos_audit` and one row in the channel
+/// audit log (`workflow_not_started`) with the reason; the error's own text
+/// goes to the server log only. A successful start writes no audit row — it
+/// is an execution.
+///
+/// `pub` so the path is driven by a database test without a dispatch bus.
+pub async fn start_bound_workflow(
+    pool: &sqlx::PgPool,
+    orchestration: Option<&Arc<ExecutionOrchestrationService>>,
+    user_id: Uuid,
+    row: &GmailWatchRow,
+    workflow_id: Uuid,
+    message_ids: &[&str],
+) -> BoundWorkflowStart {
+    let outcome = match orchestration {
+        None => Err(PUSH_REFUSAL_TRIGGER_SERVICE_NOT_WIRED),
+        Some(service) => match service
+            .trigger(TriggerInput {
+                workflow_id,
+                user_id,
+                trigger_input: gmail_push_trigger_input(
+                    row.integration_id,
+                    row.id,
+                    &row.email_address,
+                    message_ids,
+                ),
+                trigger_agent_id: None,
+                inject_memory_context: false,
+                origin: ExecutionOrigin::PushChannel {
+                    integration: super::watch::GMAIL_INTEGRATION_NAME,
+                    channel_id: row.id,
+                },
+                validate_only: false,
+                dry_run: false,
+                wait_ms: None,
+            })
+            .await
+        {
+            Ok(TriggerOutcome::Dispatched(started)) => Ok(started.execution_id),
+            // Not reachable with `validate_only: false`; named so it is never read as a start.
+            Ok(TriggerOutcome::ValidatedOnly(_)) => Err(PUSH_REFUSAL_TRIGGER_FAILED),
+            Err(e) => {
+                tracing::warn!(
+                    channel_uuid = %row.id,
+                    %workflow_id,
+                    %user_id,
+                    error = %e,
+                    "gmail push: the bound workflow was not started"
+                );
+                Err(e.push_refusal_reason())
+            }
+        },
+    };
+    match outcome {
+        Ok(execution_id) => {
+            tracing::info!(
+                event_kind = "gmail_push_started_workflow",
+                channel_uuid = %row.id,
+                %workflow_id,
+                %execution_id,
+                changed = message_ids.len(),
+                "gmail push started its bound workflow"
+            );
+            BoundWorkflowStart::Started(execution_id)
+        }
+        Err(reason) => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "gmail_push_workflow_not_started",
+                channel_uuid = %row.id,
+                %workflow_id,
+                %user_id,
+                reason,
+                "gmail push: bound workflow not started; these messages will not start it again"
+            );
+            if let Err(e) = talos_integration_helpers::audit::insert_channel_audit(
+                pool,
+                talos_integration_helpers::audit::ChannelAuditEvent {
+                    integration_id: Some(row.integration_id),
+                    user_id,
+                    event_type: "workflow_not_started",
+                    target: Some(&row.email_address),
+                    success: false,
+                    error_message: Some(reason),
+                    metadata: serde_json::json!({
+                        "channel_uuid": row.id.to_string(),
+                        "workflow_id": workflow_id,
+                        "changed": message_ids.len(),
+                    }),
+                },
+            )
+            .await
+            {
+                tracing::warn!(channel_uuid = %row.id, error = %e, "gmail workflow_not_started audit log insert failed");
+            }
+            BoundWorkflowStart::NotStarted(reason)
+        }
+    }
+}
+
+/// A push whose watch row is workflow-bound starts that workflow ONCE per
+/// history page carrying new messages (the module path dispatches one job per
+/// message). Errors here never abort the push — the caller still advances the
+/// cursor, exactly as for the module path.
 async fn dispatch_to_workflow(
     ctx: &GmailDispatchContext,
     user_id: Uuid,
@@ -265,48 +417,35 @@ async fn dispatch_to_workflow(
 
     // Redelivery guard. Pub/Sub is at-least-once, and two concurrent
     // deliveries of the same push both read the pre-advance cursor — so
-    // advancing the cursor alone does NOT prevent a duplicate trigger.
-    // Reuse the module path's atomic SETNX dedup: it claims each message_id
-    // (24h TTL) and returns only the freshly-claimed ones, so at most one
-    // delivery fires the workflow for a given message set. When Redis is
-    // unavailable we trigger anyway (better to duplicate than drop —
-    // matching the module path); the target workflow re-fetches its own
-    // mail and should be idempotent (e.g. fetch-unread-then-archive).
-    if let Some(ref redis) = ctx.redis {
-        match deduplicate_messages(redis, &messages, &row.email_address).await {
+    // advancing the cursor alone does NOT prevent a duplicate start. Reuse
+    // the module path's atomic SETNX dedup: it claims each message_id (24h
+    // TTL) and returns only the freshly-claimed ones, so at most one delivery
+    // starts the workflow for a given message, and the trigger names only the
+    // messages no earlier delivery named. When Redis is unavailable we start
+    // anyway with every message on the page (better to duplicate than drop —
+    // matching the module path); the workflow reads its own mail and should
+    // be safe to run twice.
+    let fresh: Vec<&super::api::HistoryMessageRef> = match ctx.redis {
+        Some(ref redis) => match deduplicate_messages(redis, &messages, &row.email_address).await {
             Ok(fresh) if fresh.is_empty() => {
                 tracing::debug!(
                     channel_uuid = %row.id,
                     workflow_id = %workflow_id,
-                    "gmail dispatch: all messages already seen (redelivery); skipping workflow trigger"
+                    "gmail dispatch: all messages already seen (redelivery); not starting the workflow"
                 );
                 return Ok(());
             }
-            Ok(_) => {}
+            Ok(fresh) => fresh,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     channel_uuid = %row.id,
-                    "gmail dispatch: Redis dedup failed; triggering workflow anyway (may duplicate)"
+                    "gmail dispatch: Redis dedup failed; starting the workflow anyway (may duplicate)"
                 );
+                messages
             }
-        }
-    }
-
-    // `trigger_continuation_workflow` builds a real engine, which needs a
-    // SecretsManager. The dispatch context makes it optional (dev/bootstrap
-    // stacks). When absent we log + no-op rather than run a workflow with no
-    // secret access; the cursor still advances upstream.
-    let secrets_manager = match ctx.secrets_manager.clone() {
-        Some(sm) => sm,
-        None => {
-            tracing::warn!(
-                channel_uuid = %row.id,
-                workflow_id = %workflow_id,
-                "gmail dispatch: workflow trigger requires a SecretsManager (none configured); skipping — cursor still advances"
-            );
-            return Ok(());
-        }
+        },
+        None => messages,
     };
 
     // Precedence visibility: if BOTH bindings are present, make it obvious in
@@ -320,58 +459,17 @@ async fn dispatch_to_workflow(
         );
     }
 
-    // Minimal trigger input. The workflow re-fetches its own mail via the
-    // gmail catalog modules, so no message ids/bodies are needed here.
-    let payload = serde_json::json!({
-        "source": "gmail_push",
-        "email_address": row.email_address,
-        "history_id": row.history_id,
-    });
-
-    tracing::info!(
-        channel_uuid = %row.id,
-        workflow_id = %workflow_id,
-        history_id = %row.history_id,
-        "gmail dispatch: triggering workflow for inbound push"
-    );
-
-    // `source_id` = the watch channel UUID; surfaces in the workflow's
-    // trigger input as `gmail_channel_id` with `triggered_by: "gmail_push"`.
-    match trigger_continuation_workflow(
+    let ids: Vec<&str> = fresh.iter().map(|m| m.id.as_str()).collect();
+    start_bound_workflow(
         &ctx.db_pool,
-        ctx.registry.clone(),
-        Some(ctx.nats.clone()),
-        secrets_manager,
+        ctx.orchestration.as_ref(),
         user_id,
+        row,
         workflow_id,
-        &payload,
-        row.id,
-        TriggerSourceKind::GmailPush,
+        &ids,
     )
-    .await
-    {
-        Some(execution_id) => {
-            tracing::info!(
-                channel_uuid = %row.id,
-                workflow_id = %workflow_id,
-                execution_id = %execution_id,
-                "✅ gmail push triggered workflow execution"
-            );
-            Ok(())
-        }
-        None => {
-            // trigger_continuation_workflow fails CLOSED (auth-gate denial,
-            // actor not runnable, missing workflow, DB error) and logs the
-            // specific reason internally. Surface a generic marker here;
-            // don't abort the push — the cursor still advances.
-            tracing::warn!(
-                channel_uuid = %row.id,
-                workflow_id = %workflow_id,
-                "gmail dispatch: workflow trigger produced no execution (denied by auth gate or setup failure)"
-            );
-            Ok(())
-        }
-    }
+    .await;
+    Ok(())
 }
 
 async fn dispatch_single_message(
@@ -760,6 +858,67 @@ mod tests {
             updated_at_ms: 0,
             renewed_from: None,
         }
+    }
+
+    /// A workflow is started with WHICH mailbox changed and the ids of the
+    /// new messages, and nothing else: fifty at most, and only strings that
+    /// look like a Gmail id.
+    #[test]
+    fn the_trigger_names_the_mailbox_and_message_ids_and_nothing_else() {
+        let (integration, channel) = (Uuid::new_v4(), Uuid::new_v4());
+        let input = gmail_push_trigger_input(
+            integration,
+            channel,
+            "u@example.com",
+            &["18c2f3a4b5d6e7f8", "18c2f3a4b5d6e7f9"],
+        );
+        assert_eq!(
+            input,
+            serde_json::json!({
+                "gmail_push": {
+                    "integration_id": integration,
+                    "channel_id": channel,
+                    "email_address": "u@example.com",
+                    "changed": 2,
+                    "message_ids": ["18c2f3a4b5d6e7f8", "18c2f3a4b5d6e7f9"],
+                    "truncated": false,
+                }
+            })
+        );
+
+        // Not an id: dropped, and the trigger says it is not the whole set.
+        let odd = gmail_push_trigger_input(
+            integration,
+            channel,
+            "u@example.com",
+            &["18c2f3a4b5d6e7f8", "Subject: quarterly numbers", "", "a b"],
+        );
+        assert_eq!(
+            odd["gmail_push"]["message_ids"],
+            serde_json::json!(["18c2f3a4b5d6e7f8"])
+        );
+        assert_eq!(odd["gmail_push"]["changed"], 4);
+        assert_eq!(odd["gmail_push"]["truncated"], true);
+
+        // Fifty at most, and it says so.
+        let many: Vec<String> = (0..60).map(|i| format!("18c2f3a4b5d6e{i:03}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let capped = gmail_push_trigger_input(integration, channel, "u@example.com", &many);
+        assert_eq!(
+            capped["gmail_push"]["message_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_PUSH_MESSAGE_IDS
+        );
+        assert_eq!(capped["gmail_push"]["changed"], 60);
+        assert_eq!(capped["gmail_push"]["truncated"], true);
+        let exactly: Vec<&str> = many[..MAX_PUSH_MESSAGE_IDS].to_vec();
+        assert_eq!(
+            gmail_push_trigger_input(integration, channel, "u@example.com", &exactly)["gmail_push"]
+                ["truncated"],
+            false
+        );
     }
 
     #[test]

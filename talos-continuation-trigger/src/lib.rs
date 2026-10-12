@@ -53,11 +53,6 @@ pub fn resolution_deferred_message(reason: talos_metrics::PauseRefusal) -> Strin
 pub enum TriggerSourceKind {
     ApprovalGate,
     WorkflowSuspension,
-    /// A Gmail push notification (Pub/Sub) whose watch row carries a
-    /// bound `workflow_id`. `source_id` is the watch channel UUID; the
-    /// triggered workflow re-fetches its own mail, so the trigger
-    /// payload only carries `{source, email_address, history_id}`.
-    GmailPush,
 }
 
 impl TriggerSourceKind {
@@ -65,14 +60,12 @@ impl TriggerSourceKind {
         match self {
             TriggerSourceKind::ApprovalGate => "approval_gate",
             TriggerSourceKind::WorkflowSuspension => "workflow_suspension",
-            TriggerSourceKind::GmailPush => "gmail_push",
         }
     }
     fn id_field(self) -> &'static str {
         match self {
             TriggerSourceKind::ApprovalGate => "approval_gate_id",
             TriggerSourceKind::WorkflowSuspension => "suspension_id",
-            TriggerSourceKind::GmailPush => "gmail_channel_id",
         }
     }
 }
@@ -105,7 +98,7 @@ pub async fn trigger_continuation_workflow(
 ) -> Option<String> {
     let repo = Arc::new(AdvancedRepository::new(db_pool.clone()));
     let execution_id = Uuid::new_v4();
-    let mut trigger_payload = serde_json::json!({
+    let trigger_payload = serde_json::json!({
         source_kind.id_field(): source_id.to_string(),
         "payload": payload,
         "triggered_by": source_kind.triggered_by(),
@@ -178,10 +171,9 @@ pub async fn trigger_continuation_workflow(
     };
     // The NARROW lifecycle gate. It sits ABOVE the authorization gate for the
     // same reason the not-visible arm does: it is the cheapest refusal and the
-    // most categorical. This path covers approval-gate resumes, suspension
-    // resumes AND the Gmail push-notification workflow branch
-    // (`talos_gmail::dispatch::dispatch_to_workflow`), which reaches a stored
-    // workflow by bound id and had no lifecycle check of any kind.
+    // most categorical. This path covers approval-gate resumes and suspension
+    // resumes. (Until 2026-10-12 a Gmail push started its bound workflow here
+    // too; a push is a fresh start and now goes through the trigger service.)
     if !talos_workflow_liveness::is_not_retired(&workflow_status) {
         talos_metrics::record_dispatch_refusal(
             talos_workflow_liveness::dispatch::DispatchPath::Continuation,
@@ -289,46 +281,10 @@ pub async fn trigger_continuation_workflow(
         }
     };
 
-    // Tier 2: grounding for push-triggered NEW executions. Inject curated actor
-    // memory when this is a GmailPush (a FRESH execution) whose target workflow
-    // is ACTOR-BOUND (`workflow_actor_id` — the binding, never the user-default
-    // actor, matching the scheduler's contamination-safe rule) and not opted
-    // out. RESUMES (`ApprovalGate` / `WorkflowSuspension`) NEVER inject: their
-    // pre-suspension half already ran with its own context, so re-injecting
-    // would be duplicate/incorrect. Auth has passed above, so a bound actor here
-    // is validated + active. Curated scope keeps transient `working` memory out
-    // of the trace; `insert_queued_execution` below additionally DLP-redacts the
-    // stored payload. No relevance hint on a push event → recency-based recall.
-    let mut lifted_actor_context = None;
-    if matches!(source_kind, TriggerSourceKind::GmailPush) {
-        if let Some(bound_actor) = workflow_actor_id {
-            let opted_out = serde_json::from_str::<serde_json::Value>(&graph_json)
-                .ok()
-                .and_then(|v| v.get("inject_memory").and_then(|b| b.as_bool()))
-                == Some(false);
-            if !opted_out {
-                talos_actor_memory_service::inject_actor_context_into_input(
-                    &workflow_repo_for_auth,
-                    &mut trigger_payload,
-                    Some(bound_actor),
-                    true,
-                    10,
-                    None,
-                    Some(execution_id),
-                    talos_actor_memory_service::MemoryScope::Curated,
-                )
-                .await;
-            }
-        }
-    }
-    // The decrypted context reaches the ENGINE as a property below, never
-    // the stored payload: `input_data` is plaintext, and the engine strips
-    // every engine-authored key at the trigger seed anyway.
-    if let Some(ctx) = talos_workflow_engine_core::reserved_keys::lift_actor_context_for_storage(
-        &mut trigger_payload,
-    ) {
-        lifted_actor_context = Some(ctx);
-    }
+    // A RESUME never injects actor memory: the pre-suspension half of the run
+    // already ran with its own context, so injecting again would be duplicate
+    // or wrong. `trigger_payload` is the three keys built above and nothing
+    // else, so there is no engine-authored key on it to keep out of storage.
 
     // 1. Create execution record (queued; transitions to running in the spawn
     //    below). Package CK: the row carries the gate-resolved actor the engine
@@ -480,15 +436,8 @@ pub async fn trigger_continuation_workflow(
     // Phase D2: bind the gate-resolved actor so the resumed half of the run
     // executes at the same tier (and with the same `__memory_write__`
     // capability) as the pre-suspension half.
-    let mut engine_opts = EngineOpts::for_run(workflow_id, graph_json.clone())
+    let engine_opts = EngineOpts::for_run(workflow_id, graph_json.clone())
         .with_effective_actor(effective_actor_id, workflow_actor_id);
-    // Tier 2: the injected `__actor_context__` (GmailPush path above), lifted
-    // off the stored payload, goes onto the engine so per-node `needs_memory`
-    // gating applies and it reaches deeper LLM nodes, not just the root —
-    // matching the scheduler / direct-trigger lift.
-    if lifted_actor_context.is_some() {
-        engine_opts = engine_opts.with_actor_context(lifted_actor_context);
-    }
     let mut engine = match for_workflow(registry, secrets_manager, actor_repo, user_id, engine_opts)
         .await
     {

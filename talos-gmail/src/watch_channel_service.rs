@@ -227,8 +227,7 @@ impl PushChannelInventory for GmailPushChannelInventory {
                         .then(|| r.module_id.and_then(|id| names.get(&id).cloned()))
                         .flatten(),
                     module_binding: binding,
-                    // This integration's channels start a module, never a workflow.
-                    workflow_id: None,
+                    workflow_id: r.workflow_id,
                     created_at: DateTime::<Utc>::from_timestamp_millis(r.created_at_ms),
                     last_event_at: DateTime::<Utc>::from_timestamp_millis(r.updated_at_ms),
                     recent_failure: None,
@@ -238,6 +237,24 @@ impl PushChannelInventory for GmailPushChannelInventory {
 
         attach_recent_failures_to_rows(&self.pool, user_id, &mut out).await;
         Ok(out)
+    }
+
+    async fn bind_workflow(
+        &self,
+        user_id: Uuid,
+        channel_id: Uuid,
+        workflow_id: Option<Uuid>,
+    ) -> Result<(), talos_push_channel_inventory::BindWorkflowRefusal> {
+        use super::watch::BindWorkflowRefusal as Local;
+        use talos_push_channel_inventory::BindWorkflowRefusal as Shared;
+        super::watch::bind_channel_workflow(&self.pool, user_id, channel_id, workflow_id)
+            .await
+            .map(|_| ())
+            .map_err(|refusal| match refusal {
+                Local::ChannelNotFound => Shared::ChannelNotFound,
+                Local::WorkflowNotBindable => Shared::WorkflowNotBindable,
+                Local::Unreadable => Shared::Unreadable,
+            })
     }
 }
 

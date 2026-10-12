@@ -369,7 +369,14 @@ carries a `module_id` the caller supplies, two rules are not optional:
   path that rewrites the row, the start made as the channel's own user, and a
   refused start recorded with a reason
   (`OrchestrationError::push_refusal_reason`, one vocabulary for every
-  integration). Jira does the same since 2026-10-12 (`talos_atlassian::push`).
+  integration). Jira does the same since 2026-10-12 (`talos_atlassian::push`),
+  and so does Gmail (`talos_gmail::dispatch::start_bound_workflow`; its
+  trigger carries message ids only). Gmail's row could name a workflow before
+  that date and started it through `talos-continuation-trigger`, which is for
+  RESUMING a run and does not ask whether the workflow is switched on: a push
+  is a fresh start and goes through the trigger service. Where a create also
+  accepts the workflow (Gmail), the create asks the same ownership question
+  as the bind, and a create that names none leaves the binding alone.
 * **When the provider gives the app ONE webhook URL** (Jira: "only a single
   URL per app"), neither auth shape in step 2 can carry the user: the URL
   cannot hold a per-user token, and the provider signs with one key for
