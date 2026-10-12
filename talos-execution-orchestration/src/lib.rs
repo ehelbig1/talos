@@ -49,7 +49,8 @@ pub use deep_merge::deep_merge;
 pub use errors::OrchestrationError;
 pub use input::{ReplayInput, ReplayWithInputInput, RetryInput, TriggerInput};
 pub use outcome::{
-    DryRunResult, ExecutionOutcome, ExecutionStatus, TriggerMetadata, TriggerOutcome, TriggerType,
+    ExecutionOutcome, ExecutionStatus, InputValidationReport, TriggerMetadata, TriggerOutcome,
+    TriggerType,
 };
 
 use std::sync::Arc;

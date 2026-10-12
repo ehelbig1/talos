@@ -1376,14 +1376,15 @@ async fn start_bound_workflow(
                 ),
                 trigger_agent_id: None,
                 inject_memory_context: false,
+                validate_only: false,
                 dry_run: false,
                 wait_ms: None,
             })
             .await
         {
             Ok(TriggerOutcome::Dispatched(started)) => Ok(started.execution_id),
-            // Not reachable with `dry_run: false`; named so it is never read as a start.
-            Ok(TriggerOutcome::DryRun(_)) => Err("trigger_failed"),
+            // Not reachable with `validate_only: false`; named so it is never read as a start.
+            Ok(TriggerOutcome::ValidatedOnly(_)) => Err("trigger_failed"),
             Err(e) => {
                 tracing::warn!(
                     channel = %channel_uuid,

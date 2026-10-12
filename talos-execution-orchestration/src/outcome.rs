@@ -2,7 +2,7 @@
 //!
 //! `retry`, `replay`, `replay_with_input` return `ExecutionOutcome`
 //! directly — they always dispatch (or fail with a typed error).
-//! `trigger` returns `TriggerOutcome` so the dry-run validation path
+//! `trigger` returns `TriggerOutcome` so the validate-only path
 //! can surface schema + errors without dispatching.
 
 use serde_json::Value;
@@ -87,7 +87,7 @@ impl TriggerType {
 }
 
 /// Outcome of a trigger call. Distinct from `ExecutionOutcome` because
-/// the trigger surface supports a dry-run validation mode that
+/// the trigger surface supports a validate-only mode that
 /// returns schema + errors without dispatching anything.
 pub enum TriggerOutcome {
     /// The trigger dispatched normally; the dispatched execution's
@@ -96,14 +96,14 @@ pub enum TriggerOutcome {
     /// The caller passed `validate_input=true`; the validation result
     /// is reported here without dispatching. `schema` is `None` when
     /// the workflow has no input_schema attached.
-    DryRun(DryRunResult),
+    ValidatedOnly(InputValidationReport),
 }
 
-/// Schema-validation report returned from the dry-run path. Mirrors
+/// Schema-validation report returned from the validate-only path. Mirrors
 /// the historical `mcp_text` body the inline handler emitted; the
 /// protocol layer is responsible for choosing the JSON-RPC vs
 /// GraphQL vs HTTP wire shape.
-pub struct DryRunResult {
+pub struct InputValidationReport {
     pub workflow_id: Uuid,
     pub schema: Option<Value>,
     pub errors: Vec<String>,

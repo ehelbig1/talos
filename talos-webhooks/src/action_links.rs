@@ -247,6 +247,7 @@ pub async fn action_link_apply(
             trigger_input: context.payload.clone(),
             trigger_agent_id: None,
             inject_memory_context: false,
+            validate_only: false,
             dry_run: false,
             wait_ms: None,
         })
@@ -281,9 +282,9 @@ pub async fn action_link_apply(
                 ),
             )
         }
-        // `dry_run: false` never yields a dry-run report. Treated as a
+        // `validate_only: false` never yields a validation report. Treated as a
         // refusal before any execution: nothing ran.
-        Ok(TriggerOutcome::DryRun(_)) => {
+        Ok(TriggerOutcome::ValidatedOnly(_)) => {
             release(&repo, &context).await;
             something_went_wrong()
         }

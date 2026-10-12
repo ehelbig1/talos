@@ -117,6 +117,7 @@ impl WorkflowsMutations {
                 trigger_input: serde_json::json!({}),
                 trigger_agent_id: actor_id,
                 inject_memory_context: false,
+                validate_only: false,
                 dry_run: false,
                 wait_ms: None,
             })
@@ -164,11 +165,11 @@ impl WorkflowsMutations {
 
         let dispatched = match outcome {
             talos_execution_orchestration::TriggerOutcome::Dispatched(o) => o,
-            // Unreachable with dry_run: false — defensive arm.
-            talos_execution_orchestration::TriggerOutcome::DryRun(_) => {
+            // Unreachable with validate_only: false — defensive arm.
+            talos_execution_orchestration::TriggerOutcome::ValidatedOnly(_) => {
                 tracing::error!(
                     workflow_id = %workflow_id,
-                    "trigger_workflow: service returned DryRun for a non-dry-run trigger"
+                    "trigger_workflow: service returned ValidatedOnly for a trigger that did not ask for it"
                 );
                 return Err(
                     async_graphql::Error::new("Internal error during trigger").extend_safe()

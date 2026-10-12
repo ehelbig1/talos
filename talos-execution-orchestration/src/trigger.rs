@@ -43,7 +43,8 @@ use crate::errors::OrchestrationError;
 use crate::failure_webhook::dispatch_failure_webhook;
 use crate::input::TriggerInput;
 use crate::outcome::{
-    DryRunResult, ExecutionOutcome, ExecutionStatus, TriggerMetadata, TriggerOutcome, TriggerType,
+    ExecutionOutcome, ExecutionStatus, InputValidationReport, TriggerMetadata, TriggerOutcome,
+    TriggerType,
 };
 use crate::ExecutionOrchestrationService;
 
@@ -165,12 +166,16 @@ impl ExecutionOrchestrationService {
     /// caller's responsibility to render — keeps protocol shape out
     /// of this crate.
     ///
-    /// Returns `TriggerOutcome::DryRun(_)` when the caller passed
-    /// `dry_run = true` AND the workflow has an input_schema; the
-    /// service performs validation and reports schema + errors
-    /// without dispatching. `dry_run = true` on a workflow with no
-    /// schema returns `DryRun` with `schema = None` and empty errors,
-    /// matching the pre-extraction "operator hint" behaviour.
+    /// Returns `TriggerOutcome::ValidatedOnly(_)` when the caller passed
+    /// `validate_only = true`: the input is checked against the workflow's
+    /// input schema and the schema and errors are reported. Nothing is
+    /// started. A workflow with no schema reports `schema = None` and no
+    /// errors.
+    ///
+    /// `dry_run = true` is a different thing: the run IS started, and the
+    /// worker mocks its non-GET HTTP requests, webhook sends and messaging
+    /// publishes. Until 2026-10-12 the two travelled as one boolean, so a
+    /// caller asking for a dry run was given a validation report and no run.
     #[allow(clippy::too_many_lines)]
     pub async fn trigger(&self, input: TriggerInput) -> Result<TriggerOutcome, OrchestrationError> {
         let TriggerInput {
@@ -179,6 +184,7 @@ impl ExecutionOrchestrationService {
             trigger_input: input_payload_arg,
             trigger_agent_id,
             inject_memory_context,
+            validate_only,
             dry_run,
             wait_ms,
         } = input;
@@ -264,7 +270,7 @@ impl ExecutionOrchestrationService {
             workflow_id,
             user_id,
             &input_payload_arg,
-            dry_run,
+            validate_only,
         )
         .await;
         if let Some(outcome) = decide_input_schema_outcome(validation, workflow_id)? {
@@ -916,7 +922,7 @@ impl ExecutionOrchestrationService {
 /// Map the input-schema check onto the trigger's control flow.
 ///
 /// * `Ok(None)` — proceed to dispatch.
-/// * `Ok(Some(TriggerOutcome::DryRun(_)))` — return the dry-run result.
+/// * `Ok(Some(TriggerOutcome::ValidatedOnly(_)))` — return the dry-run result.
 /// * `Err(_)` — REFUSE. Three of the six variants land here.
 ///
 /// This lives OUTSIDE `trigger()` on purpose. Inlined in an async method
@@ -950,11 +956,13 @@ pub(crate) fn decide_input_schema_outcome(
         // was deleted mid-trigger. Answer the way step 2 would have — never
         // "it declares no schema".
         Check::WorkflowNotFound => Err(OrchestrationError::WorkflowNotFound(workflow_id)),
-        Check::DryRun { schema, errors } => Ok(Some(TriggerOutcome::DryRun(DryRunResult {
-            workflow_id,
-            schema,
-            errors,
-        }))),
+        Check::ValidateOnly { schema, errors } => {
+            Ok(Some(TriggerOutcome::ValidatedOnly(InputValidationReport {
+                workflow_id,
+                schema,
+                errors,
+            })))
+        }
     }
 }
 
@@ -982,12 +990,12 @@ mod trigger_input_gate_tests {
     }
     fn dry_run(
         r: Result<Option<TriggerOutcome>, OrchestrationError>,
-    ) -> crate::outcome::DryRunResult {
+    ) -> crate::outcome::InputValidationReport {
         match r {
-            Ok(Some(TriggerOutcome::DryRun(d))) => d,
-            Ok(Some(_)) => panic!("expected a DryRun outcome"),
-            Ok(None) => panic!("expected a DryRun outcome, got proceed"),
-            Err(e) => panic!("expected a DryRun outcome, got refusal: {e}"),
+            Ok(Some(TriggerOutcome::ValidatedOnly(d))) => d,
+            Ok(Some(_)) => panic!("expected a ValidatedOnly outcome"),
+            Ok(None) => panic!("expected a ValidatedOnly outcome, got proceed"),
+            Err(e) => panic!("expected a ValidatedOnly outcome, got refusal: {e}"),
         }
     }
 
@@ -1064,7 +1072,7 @@ mod trigger_input_gate_tests {
         let wf = Uuid::new_v4();
         // Schema present + errors: REPORTED, not raised.
         let d = dry_run(decide_input_schema_outcome(
-            Check::DryRun {
+            Check::ValidateOnly {
                 schema: Some(serde_json::json!({"type": "object"})),
                 errors: vec!["nope".into()],
             },
@@ -1077,7 +1085,7 @@ mod trigger_input_gate_tests {
         // Schema DEFINITELY absent: still the pre-existing "operator hint"
         // shape — valid, no schema, no errors.
         let d = dry_run(decide_input_schema_outcome(
-            Check::DryRun {
+            Check::ValidateOnly {
                 schema: None,
                 errors: vec![],
             },
