@@ -3662,7 +3662,7 @@ impl WorkflowValidationService {
     ///
     /// `validate_only=true` requests dry-run mode — the result is returned
     /// even when validation fails, instead of short-circuiting. The caller
-    /// (handler) shapes the dry-run JSON response from [`InputSchemaCheck::DryRun`].
+    /// (handler) shapes the dry-run JSON response from [`InputSchemaCheck::ValidateOnly`].
     ///
     /// **This gate fails CLOSED.** A read that does not come back with a
     /// definite answer yields [`InputSchemaCheck::Unreadable`] or
@@ -3694,7 +3694,7 @@ impl WorkflowValidationService {
     /// `validate_only=true` requests dry-run mode — the result is returned
     /// even when validation fails, instead of short-circuiting. The caller
     /// (handler) shapes the dry-run JSON response from
-    /// [`InputSchemaCheck::DryRun`]. Dry-run does NOT soften the two
+    /// [`InputSchemaCheck::ValidateOnly`]. Dry-run does NOT soften the two
     /// refusals: a dry run that answers "valid, no schema" for a schema it
     /// could not read tells the operator the payload is safe to send, which
     /// is the same lie one step earlier.
@@ -3746,14 +3746,14 @@ impl WorkflowValidationService {
 
         match (input_schema, validate_only) {
             (None, false) => InputSchemaCheck::NoSchema,
-            (None, true) => InputSchemaCheck::DryRun {
+            (None, true) => InputSchemaCheck::ValidateOnly {
                 schema: None,
                 errors: vec![],
             },
             (Some(schema), validate_only) => {
                 let errors = validate_input_against_schema(&schema, trigger_input);
                 if validate_only {
-                    InputSchemaCheck::DryRun {
+                    InputSchemaCheck::ValidateOnly {
                         schema: Some(schema),
                         errors,
                     }
@@ -3770,7 +3770,7 @@ impl WorkflowValidationService {
 /// Trigger-time outcome of [`WorkflowValidationService::check_trigger_input`].
 ///
 /// The variants split into "continue" (NoSchema, Valid), "block" (Invalid,
-/// Unreadable, WorkflowNotFound), and "early-return-with-result" (DryRun)
+/// Unreadable, WorkflowNotFound), and "early-return-with-result" (ValidateOnly)
 /// buckets — the handler picks a JSON-RPC response shape per bucket.
 ///
 /// Only ONE variant means "dispatch without validating", and it is reachable
@@ -3802,7 +3802,7 @@ pub enum InputSchemaCheck {
     /// `validate_input=true` was supplied — return the validation result
     /// instead of dispatching. `schema` is `None` when no schema is set
     /// (the dry-run still reports valid=true with a "no schema" hint).
-    DryRun {
+    ValidateOnly {
         schema: Option<serde_json::Value>,
         errors: Vec<String>,
     },
@@ -7960,7 +7960,7 @@ mod trigger_input_failclosed_tests {
         );
     }
 
-    /// Dry-run does not soften the refusal. Answering `DryRun{schema:None,
+    /// Dry-run does not soften the refusal. Answering `ValidateOnly{schema:None,
     /// errors:[]}` renders as "valid — no schema", i.e. advice to send the
     /// payload, for a schema we never saw.
     #[test]
@@ -8004,11 +8004,11 @@ mod trigger_input_failclosed_tests {
     fn a_definite_absence_still_gives_the_dry_run_operator_hint() {
         match WorkflowValidationService::decide_trigger_input(exists_no_schema(), &json!({}), true)
         {
-            InputSchemaCheck::DryRun { schema, errors } => {
+            InputSchemaCheck::ValidateOnly { schema, errors } => {
                 assert!(schema.is_none());
                 assert!(errors.is_empty());
             }
-            other => panic!("expected the pre-existing DryRun hint, got {other:?}"),
+            other => panic!("expected the pre-existing ValidateOnly hint, got {other:?}"),
         }
     }
 
@@ -8039,11 +8039,11 @@ mod trigger_input_failclosed_tests {
             &json!({}),
             true,
         ) {
-            InputSchemaCheck::DryRun { schema, errors } => {
+            InputSchemaCheck::ValidateOnly { schema, errors } => {
                 assert!(schema.is_some());
                 assert!(!errors.is_empty(), "the dry run must REPORT the failure");
             }
-            other => panic!("expected DryRun, got {other:?}"),
+            other => panic!("expected ValidateOnly, got {other:?}"),
         }
     }
 

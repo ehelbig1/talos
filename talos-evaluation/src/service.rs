@@ -336,6 +336,7 @@ impl EvaluationService {
             // arm and (b) its budget/ceiling govern the run.
             trigger_agent_id: Some(input.actor_id),
             inject_memory_context: inject_memory,
+            validate_only: false,
             dry_run: false,
             // Dispatch async and poll to a TRUE terminal state ourselves (below).
             // The orchestration sync-wait caps at 30s and returns a non-terminal
@@ -351,9 +352,9 @@ impl EvaluationService {
             .map_err(|e| EvaluationError::Orchestration(safe_orch(&e)))?;
         let exec = match outcome {
             TriggerOutcome::Dispatched(o) => o,
-            TriggerOutcome::DryRun(_) => {
+            TriggerOutcome::ValidatedOnly(_) => {
                 return Err(EvaluationError::Orchestration(
-                    "unexpected dry-run outcome".into(),
+                    "unexpected validate-only outcome".into(),
                 ))
             }
         };

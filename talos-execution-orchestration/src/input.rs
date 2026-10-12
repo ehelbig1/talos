@@ -33,6 +33,12 @@ pub struct TriggerInput {
     pub trigger_input: Value,
     pub trigger_agent_id: Option<Uuid>,
     pub inject_memory_context: bool,
+    /// Check `trigger_input` against the workflow's input schema, report the
+    /// result and start NOTHING ([`crate::TriggerOutcome::ValidatedOnly`]).
+    pub validate_only: bool,
+    /// Start the run with the worker mocking its outbound side effects
+    /// (non-GET HTTP, webhook sends, messaging publishes). Has no bearing on
+    /// whether a run is started; that is `validate_only`.
     pub dry_run: bool,
     pub wait_ms: Option<u64>,
 }

@@ -274,7 +274,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "input": { "type": "object", "description": "Optional input data passed to the first node(s)" },
                     "actor_id": { "type": "string", "description": "Optional UUID of the runtime actor triggering this workflow. When set, enforces the actor's execution budget (max_executions_per_hour, max_executions_total) and records provenance on the execution record for traceability." },
                     "trigger_type": { "type": "string", "enum": ["actor_dispatch", "agent_dispatch", "manual", "webhook", "scheduled", "api"], "description": "Identifies who or what triggered this execution. Strictly validated — unknown values are rejected with an error. Use actor_dispatch for new code (canonical value). agent_dispatch is a deprecated backward-compatible alias for actor_dispatch — both are accepted but actor_dispatch is preferred. Defaults to actor_dispatch when actor_id is set, manual otherwise. Used in provenance and the actor action log." },
-                    "validate_input": { "type": "boolean", "description": "If true, validate the 'input' against the workflow's declared input schema and return the result without dispatching an execution. Returns valid=true/false, the list of errors, and the schema. Use this to verify input before spending an execution slot. Default: false." },
+                    "validate_input": { "type": "boolean", "description": "If true, validate the 'input' against the workflow's declared input schema and return the result WITHOUT starting an execution: the reply carries started=false, valid=true/false, the list of errors, and the schema. Use this to verify input before spending an execution slot. Independent of dry_run; when both are true, validate_input wins and nothing is started. Default: false." },
                     "wait_ms": { "type": "integer", "description": "Wait up to N milliseconds for the execution to complete and return the full per-node trace inline (same as get_execution_status with detail: true). Max 30000. Use wait_ms: 3000 for fast workflows to collapse trigger + trace into one call. If the timeout elapses before completion, falls back to the normal execution_id response." },
                     "inject_memory_context": {
                         "type": "boolean",
@@ -290,7 +290,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "dry_run": {
                         "type": "boolean",
-                        "description": "When true, non-GET HTTP requests, webhook sends, and messaging publishes are mocked with success responses. GET requests still execute normally for data fetching. Useful for testing workflow logic without side effects."
+                        "description": "When true, the execution IS started (a real execution row, a real execution_id) and its non-GET HTTP requests, webhook sends, and messaging publishes are mocked with success responses. GET requests still execute normally for data fetching. Nothing else is mocked: LLM calls, memory writes, the email, GraphQL, database, object-storage and file host calls and streaming HTTP all run for real. The reply's JSON block carries dry_run=true. To check the input without starting anything, use validate_input instead."
                     }
                 },
                 "required": ["workflow_id"]
@@ -2968,22 +2968,18 @@ async fn handle_trigger_workflow(
 
     let outcome = state
         .execution_orchestration_service
-        .trigger(talos_execution_orchestration::TriggerInput {
+        .trigger(trigger_request(
             workflow_id,
             user_id,
             trigger_input,
             trigger_agent_id,
             inject_memory_context,
-            // The orchestration service's `dry_run` field carries the
-            // engine-level dry-run flag (no-op nodes); `validate_input`
-            // is the schema-only dry-run that returns early. Service
-            // honours both via the `dry_run` field (it gates both
-            // behaviours); the `validate_input` flag is conveyed via
-            // the same boolean so the schema validator routes to the
-            // DryRun outcome variant.
-            dry_run: dry_run || validate_only,
+            TriggerFlags {
+                validate_input: validate_only,
+                dry_run,
+            },
             wait_ms,
-        })
+        ))
         .await;
 
     let outcome = match outcome {
@@ -2992,28 +2988,8 @@ async fn handle_trigger_workflow(
     };
 
     match outcome {
-        talos_execution_orchestration::TriggerOutcome::DryRun(dry) => {
-            let body = match dry.schema {
-                Some(s) => serde_json::json!({
-                    "validate_input": true,
-                    "workflow_id": dry.workflow_id.to_string(),
-                    "valid": dry.errors.is_empty(),
-                    "errors": dry.errors,
-                    "schema": s,
-                    "note": if dry.errors.is_empty() {
-                        "Input is valid. Remove validate_input or set it to false to dispatch the execution."
-                    } else {
-                        "Input failed validation. Fix the errors above before triggering."
-                    },
-                }),
-                None => serde_json::json!({
-                    "validate_input": true,
-                    "workflow_id": dry.workflow_id.to_string(),
-                    "valid": true,
-                    "errors": [],
-                    "note": "No input schema is set for this workflow. Use set_workflow_input_schema to declare one. Any input is accepted.",
-                }),
-            };
+        talos_execution_orchestration::TriggerOutcome::ValidatedOnly(report) => {
+            let body = validate_only_reply(&report, dry_run);
             mcp_text(
                 req_id,
                 &serde_json::to_string_pretty(&body).unwrap_or_default(),
@@ -3048,32 +3024,243 @@ async fn handle_trigger_workflow(
             }
             // Sync-wait timed out OR async dispatch — return the
             // pollable execution_id with the historical message text.
+            let started = started_line(dry_run);
             if let Some(wait) = wait_ms.filter(|w| *w > 0) {
                 crate::utils::mcp_text_with_json(
                     req_id,
                     &format!(
-                        "Workflow triggered.\nExecution ID: {}\nStatus: still running after {}ms wait.\n\nThe workflow has not completed yet. Use get_execution_status(execution_id: \"{}\", detail: true) to check when it finishes with full node-by-node output.",
+                        "{started}\nExecution ID: {}\nStatus: still running after {}ms wait.\n\nThe workflow has not completed yet. Use get_execution_status(execution_id: \"{}\", detail: true) to check when it finishes with full node-by-node output.",
                         exec.execution_id, wait, exec.execution_id
                     ),
-                    serde_json::json!({
-                        "execution_id": exec.execution_id.to_string(),
-                        "status": "running",
-                    }),
+                    started_json(exec.execution_id, dry_run),
                 )
             } else {
                 crate::utils::mcp_text_with_json(
                     req_id,
                     &format!(
-                        "Workflow triggered.\nExecution ID: {}\nStatus: running\n\nUse get_execution_status(execution_id: \"{}\") to check results.\nAfter several runs, use compare_executions(view: \"delta\", workflow_id: \"{}\") to see how outputs are changing across executions.",
+                        "{started}\nExecution ID: {}\nStatus: running\n\nUse get_execution_status(execution_id: \"{}\") to check results.\nAfter several runs, use compare_executions(view: \"delta\", workflow_id: \"{}\") to see how outputs are changing across executions.",
                         exec.execution_id, exec.execution_id, workflow_id
                     ),
-                    serde_json::json!({
-                        "execution_id": exec.execution_id.to_string(),
-                        "status": "running",
-                    }),
+                    started_json(exec.execution_id, dry_run),
                 )
             }
         }
+    }
+}
+
+/// `trigger_workflow`'s two run-mode flags, as the caller sent them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TriggerFlags {
+    /// Check the input and start nothing.
+    validate_input: bool,
+    /// Start the run with outbound side effects mocked.
+    dry_run: bool,
+}
+
+/// The service request for a `trigger_workflow` call.
+///
+/// Two flags, two fields. Until 2026-10-12 the handler sent
+/// `dry_run: dry_run || validate_input` in the one field the service had, and
+/// the service read that field as "validate only": `dry_run: true` alone
+/// returned a validation report and started nothing.
+fn trigger_request(
+    workflow_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    trigger_input: serde_json::Value,
+    trigger_agent_id: Option<uuid::Uuid>,
+    inject_memory_context: bool,
+    flags: TriggerFlags,
+    wait_ms: Option<u64>,
+) -> talos_execution_orchestration::TriggerInput {
+    talos_execution_orchestration::TriggerInput {
+        workflow_id,
+        user_id,
+        trigger_input,
+        trigger_agent_id,
+        inject_memory_context,
+        validate_only: flags.validate_input,
+        dry_run: flags.dry_run,
+        wait_ms,
+    }
+}
+
+/// The reply to `trigger_workflow(validate_input: true)`: the input was
+/// checked and NOTHING was started, in words and as `started: false`.
+///
+/// `dry_run_also_requested` is the caller's `dry_run` flag. Both flags set
+/// still starts nothing, and the note says which one to drop.
+fn validate_only_reply(
+    report: &talos_execution_orchestration::InputValidationReport,
+    dry_run_also_requested: bool,
+) -> serde_json::Value {
+    let valid = report.errors.is_empty();
+    let outcome = match (&report.schema, valid) {
+        (None, _) => {
+            "No input schema is set for this workflow, so any input is accepted. Use \
+             set_workflow_input_schema to declare one."
+        }
+        (Some(_), true) => "The input is valid.",
+        (Some(_), false) => "The input failed validation. Fix the errors before triggering.",
+    };
+    let next = if dry_run_also_requested {
+        "validate_input and dry_run were both set: validate_input wins. Remove validate_input \
+         to start a dry run (a real run whose non-GET HTTP requests, webhook sends and \
+         messaging publishes are mocked)."
+    } else {
+        "Remove validate_input, or set it to false, to start the run."
+    };
+    let mut body = serde_json::json!({
+        "validate_input": true,
+        "started": false,
+        "workflow_id": report.workflow_id.to_string(),
+        "valid": valid,
+        "errors": report.errors,
+        "note": format!("No execution was started: validate_input only checks the input. {outcome} {next}"),
+    });
+    if let Some(schema) = &report.schema {
+        body["schema"] = schema.clone();
+    }
+    body
+}
+
+/// The first line of the reply to a trigger that started a run.
+fn started_line(dry_run: bool) -> &'static str {
+    if dry_run {
+        "Workflow triggered as a DRY RUN: the execution below is real, and its non-GET HTTP \
+         requests, webhook sends and messaging publishes are mocked."
+    } else {
+        "Workflow triggered."
+    }
+}
+
+/// The machine-readable half of that reply. `dry_run` is present only on a
+/// dry run, so an ordinary trigger's block is unchanged.
+fn started_json(execution_id: uuid::Uuid, dry_run: bool) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "execution_id": execution_id.to_string(),
+        "status": "running",
+    });
+    if dry_run {
+        body["dry_run"] = serde_json::Value::Bool(true);
+    }
+    body
+}
+
+#[cfg(test)]
+mod trigger_reply_tests {
+    use super::{started_json, started_line, trigger_request, validate_only_reply, TriggerFlags};
+    use talos_execution_orchestration::InputValidationReport;
+    use talos_workflow_validation::{InputSchemaCheck, WorkflowValidationService};
+    use uuid::Uuid;
+
+    fn report(schema: Option<serde_json::Value>, errors: &[&str]) -> InputValidationReport {
+        InputValidationReport {
+            workflow_id: Uuid::nil(),
+            schema,
+            errors: errors.iter().map(|e| (*e).to_string()).collect(),
+        }
+    }
+
+    fn request(validate_input: bool, dry_run: bool) -> talos_execution_orchestration::TriggerInput {
+        trigger_request(
+            Uuid::nil(),
+            Uuid::nil(),
+            serde_json::json!({}),
+            None,
+            false,
+            TriggerFlags {
+                validate_input,
+                dry_run,
+            },
+            None,
+        )
+    }
+
+    /// What the service does with the request's `validate_only`: the input
+    /// check either lets the run proceed or answers without starting one.
+    fn starts_a_run(request: &talos_execution_orchestration::TriggerInput) -> bool {
+        let no_schema: Result<Option<Option<serde_json::Value>>, String> = Ok(Some(None));
+        match WorkflowValidationService::decide_trigger_input(
+            no_schema,
+            &request.trigger_input,
+            request.validate_only,
+        ) {
+            InputSchemaCheck::NoSchema => true,
+            InputSchemaCheck::ValidateOnly { .. } => false,
+            other => panic!("unexpected input check: {other:?}"),
+        }
+    }
+
+    /// The defect: `dry_run: true` alone was sent to the service as "validate
+    /// only", so it started nothing.
+    #[test]
+    fn a_dry_run_starts_a_run_and_asks_the_worker_to_mock() {
+        let dry = request(false, true);
+        assert!(!dry.validate_only);
+        assert!(dry.dry_run);
+        assert!(starts_a_run(&dry), "dry_run alone must start a run");
+    }
+
+    #[test]
+    fn validate_input_starts_nothing_with_or_without_dry_run() {
+        let validate = request(true, false);
+        assert!(validate.validate_only);
+        assert!(!validate.dry_run);
+        assert!(!starts_a_run(&validate));
+
+        assert!(!starts_a_run(&request(true, true)));
+        assert!(starts_a_run(&request(false, false)));
+    }
+
+    #[test]
+    fn a_reply_that_started_nothing_says_so() {
+        let reply = validate_only_reply(&report(None, &[]), false);
+        assert_eq!(reply["started"], false);
+        assert_eq!(reply["validate_input"], true);
+        assert_eq!(reply["valid"], true);
+        let note = reply["note"].as_str().expect("note");
+        assert!(note.starts_with("No execution was started"), "{note}");
+        assert!(reply.get("schema").is_none());
+
+        let invalid = validate_only_reply(
+            &report(
+                Some(serde_json::json!({"type": "object"})),
+                &["missing 'to'"],
+            ),
+            false,
+        );
+        assert_eq!(invalid["valid"], false);
+        assert_eq!(invalid["started"], false);
+        assert_eq!(invalid["errors"], serde_json::json!(["missing 'to'"]));
+        assert!(invalid["schema"].is_object());
+    }
+
+    #[test]
+    fn both_flags_start_nothing_and_the_note_names_the_one_to_drop() {
+        let reply = validate_only_reply(&report(None, &[]), true);
+        assert_eq!(reply["started"], false);
+        let note = reply["note"].as_str().expect("note");
+        assert!(note.contains("validate_input wins"), "{note}");
+        assert!(
+            note.contains("Remove validate_input to start a dry run"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_started_dry_run_is_marked_and_an_ordinary_trigger_is_unchanged() {
+        let id = Uuid::from_u128(1);
+        assert_eq!(started_line(false), "Workflow triggered.");
+        assert!(started_line(true).contains("DRY RUN"));
+        assert!(started_line(true).contains("the execution below is real"));
+        assert_eq!(
+            started_json(id, false),
+            serde_json::json!({"execution_id": id.to_string(), "status": "running"})
+        );
+        assert_eq!(
+            started_json(id, true),
+            serde_json::json!({"execution_id": id.to_string(), "status": "running", "dry_run": true})
+        );
     }
 }
 
