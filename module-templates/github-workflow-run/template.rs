@@ -303,7 +303,10 @@ pub fn run(input: String) -> Result<String, String> {
         body: Vec::new(),
         timeout_ms,
     };
-    let resp = talos::core::http::fetch(&req).map_err(|_| "api.github.com could not be reached".to_string())?;
+    // The KIND of failure stays in the message: the platform retries a
+    // timeout or a network error and does not retry a refused host, and it
+    // can only tell them apart by this word.
+    let resp = talos::core::http::fetch(&req).map_err(|e| format!("api.github.com could not be reached ({e:?})"))?;
     if !(200..300).contains(&resp.status) {
         return Err(format!("api.github.com answered {}", resp.status));
     }
@@ -470,6 +473,26 @@ mod tests {
         let mut c = config();
         c["GATE_JOB"] = json!(gate);
         c
+    }
+
+    /// A run that could not reach the API says WHICH way it failed. The
+    /// platform retries a timeout or a network error and does not retry a
+    /// refused host, and the message is all it has to tell them apart: with
+    /// the kind left out, one network blip failed the workflow unretried and
+    /// raised an alert about the alerting.
+    #[test]
+    fn a_failure_to_reach_the_api_names_its_kind() {
+        use talos::core::http::Error;
+        for (error, kind) in [
+            (Error::Networkerror, "networkerror"),
+            (Error::Timeout, "timeout"),
+            (Error::Forbiddenhost, "forbiddenhost"),
+        ] {
+            host::http::respond_with(move |_| Err(error));
+            let said = read(config()).unwrap_err();
+            assert!(said.starts_with("api.github.com could not be reached ("), "{said}");
+            assert!(said.to_lowercase().contains(kind), "{said}");
+        }
     }
 
     #[test]

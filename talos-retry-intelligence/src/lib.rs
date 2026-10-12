@@ -592,6 +592,33 @@ mod tests {
         );
     }
 
+    /// What a catalog module says when a request did not reach its host. The
+    /// kind in the brackets is the only thing that tells a blip from a
+    /// refusal: without it the text is `unknown`, which is not retried
+    /// (observed 2026-10-12: unreachable polls failed a workflow four times
+    /// in an hour and raised an alert each time).
+    #[test]
+    fn a_module_that_names_the_http_failure_kind_is_classified_by_it() {
+        let reached = |kind: &str| {
+            classify_error(&format!(
+                "Job failed: execution failure: Component returned error: \
+                 api.github.com could not be reached ({kind})"
+            ))
+        };
+        assert_eq!(reached("Networkerror"), "network_transient");
+        assert_eq!(reached("Error::Networkerror"), "network_transient");
+        assert_eq!(reached("Timeout"), "timeout");
+        assert_eq!(reached("Forbiddenhost"), "capability_denied");
+        assert!(is_transient_error_type(&reached("Networkerror")));
+        assert!(is_transient_error_type(&reached("Timeout")));
+        assert!(!is_transient_error_type(&reached("Forbiddenhost")));
+        assert_eq!(
+            classify_error("Component returned error: api.github.com could not be reached"),
+            "unknown",
+            "the message with the kind left out, as it was"
+        );
+    }
+
     #[test]
     fn transient_classification() {
         assert!(is_transient_error_type("rate_limit"));

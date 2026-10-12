@@ -370,8 +370,11 @@ pub fn run(input: String) -> Result<String, String> {
         body: ntfy_body(topic, &n)?,
         timeout_ms: Some(cfg.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000)),
     };
+    // The KIND of failure stays in the message: the platform retries a
+    // timeout or a network error and does not retry a refused host, and it
+    // can only tell them apart by this word.
     let resp = talos::core::http::fetch(&req)
-        .map_err(|_| format!("ntfy: {} could not be reached", host_of(&base)))?;
+        .map_err(|e| format!("ntfy: {} could not be reached ({e:?})", host_of(&base)))?;
     if !(200..300).contains(&resp.status) {
         return Err(format!("ntfy: {} answered {}", host_of(&base), resp.status));
     }
@@ -440,6 +443,25 @@ mod tests {
             body["actions"][1],
             json!({ "action": "view", "label": "Open list", "url": "https://talos.example.test/list", "clear": true })
         );
+    }
+
+    /// A send that could not reach the server says WHICH way it failed: the
+    /// platform retries a timeout or a network error, and the message is all
+    /// it has to go on. With the kind left out, a notification lost to one
+    /// network blip was never retried.
+    #[test]
+    fn a_failure_to_reach_the_server_names_its_kind() {
+        use talos::core::http::Error;
+        for (error, kind) in [
+            (Error::Networkerror, "networkerror"),
+            (Error::Timeout, "timeout"),
+            (Error::Forbiddenhost, "forbiddenhost"),
+        ] {
+            host::http::respond_with(move |_| Err(error));
+            let said = send(config(), json!({ "notification": note() })).unwrap_err();
+            assert!(said.starts_with("ntfy: ntfy.example.test could not be reached ("), "{said}");
+            assert!(said.to_lowercase().contains(kind), "{said}");
+        }
     }
 
     #[test]
