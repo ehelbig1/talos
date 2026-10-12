@@ -10,7 +10,11 @@ T="$(mktemp -d)"
 completed=""
 on_exit() {
     local st=$?
-    rm -rf "$T"
+    # Cleaning up is not the verdict. A leftover temp directory must not fail
+    # a test whose checks all passed: on a loaded CI runner (2026-10-12) this
+    # `rm` lost a race with git still writing under `.git/objects`, and under
+    # `set -e` that became exit 1.
+    rm -rf "$T" 2>/dev/null || true
     if [[ -z "$completed" ]]; then
         echo "✗ ci-changed-areas test stopped before its last check (status $st)" >&2
         exit 1
@@ -19,7 +23,9 @@ on_exit() {
 }
 trap on_exit EXIT
 
-g() { git -C "$T" -c user.name=test -c user.email=test@example.test -c commit.gpgsign=false "$@"; }
+# No background git work in the throwaway repository: `gc.auto` and
+# `maintenance.auto` off, so nothing is still writing when it is removed.
+g() { git -C "$T" -c user.name=test -c user.email=test@example.test -c commit.gpgsign=false -c gc.auto=0 -c maintenance.auto=false "$@"; }
 g init -q -b main
 : > "$T/README.md"; g add -A; g commit -q -m base
 BASE="$(g rev-parse HEAD)"
