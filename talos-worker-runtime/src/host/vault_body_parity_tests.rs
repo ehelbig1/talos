@@ -236,9 +236,22 @@ async fn the_weak_marker_is_for_a_failure_that_was_the_last_thing_the_module_did
         failed.is_err(),
         "the control must fail host-side: {failed:?}"
     );
+    // Which kind depends on how the call failed, and that is not this test's
+    // to fix: a 1 ms deadline, a refused connect, or the per-host circuit
+    // breaker, which is process-wide and which the other tests in this file
+    // trip by failing calls to the same address. Each is a host-side failure
+    // with a weak kind; the property is that there IS a marker.
+    let is_weak_marker = |marker: &str| {
+        [
+            " [after_host_failure=late]",
+            " [after_host_failure=unreachable]",
+            " [after_host_failure=breaker]",
+        ]
+        .contains(&marker)
+    };
     let marker = weak_marker_for(&c);
     assert!(
-        marker == " [after_host_failure=late]" || marker == " [after_host_failure=unreachable]",
+        is_weak_marker(&marker),
         "a failed fetch followed by nothing: {marker:?} (latched {:?})",
         latched(&c)
     );
@@ -261,7 +274,8 @@ async fn the_weak_marker_is_for_a_failure_that_was_the_last_thing_the_module_did
     )
     .await;
     assert!(failed.is_err());
-    assert_eq!(weak_marker_for(&c), marker);
+    let again = weak_marker_for(&c);
+    assert!(is_weak_marker(&again), "{again:?}");
 }
 
 /// A call the allowlist refuses is the case that must never read as "try
