@@ -11,6 +11,7 @@ use talos_tenancy::TenantReadScope;
 use uuid::Uuid;
 
 pub mod admin_query_provision;
+pub mod row_json;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Row DTOs

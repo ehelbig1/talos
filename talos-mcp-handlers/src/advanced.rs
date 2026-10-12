@@ -181,7 +181,13 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 encryption_keys, oauth_accounts, refresh_tokens, secrets, secret_audit_log, api_keys \
                 and others). \
                 Queries are NOT automatically user-scoped — admin queries see all tenants' data. \
-                Supports optional cursor-based pagination for efficient large-offset queries.",
+                Supports optional cursor-based pagination for efficient large-offset queries. \
+                Values: a SQL NULL is null and nothing else is. numeric is returned as a string \
+                holding the exact decimal; timestamptz as RFC 3339; timestamp, date and time as \
+                ISO 8601 with no offset; interval as {months, days, microseconds}; arrays of \
+                text, integers, floats, booleans, uuids and timestamptz as JSON arrays. A column \
+                of any other type (inet, bytea, ranges, ...) refuses the query with an error \
+                naming the column and its type: cast it, e.g. col::text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -912,7 +918,6 @@ async fn handle_query_paginated(
 
     match rows {
         Ok(rows) => {
-            use sqlx::{Column, Row};
             let has_more = rows.len() as i64 > page_size;
             let display_rows: Vec<&sqlx::postgres::PgRow> = if has_more {
                 rows.iter().take(page_size as usize).collect()
@@ -920,41 +925,27 @@ async fn handle_query_paginated(
                 rows.iter().collect()
             };
 
-            let result_rows: Vec<serde_json::Value> = display_rows
+            // One value per column, by the column's own type. A present
+            // value is never `null`; a type with no rendering refuses the
+            // query and names the column (`row_json`).
+            let encoded: Result<Vec<serde_json::Value>, _> = display_rows
                 .iter()
                 .map(|row| {
-                    let columns = row.columns();
-                    let mut obj = serde_json::Map::new();
-                    for col in columns {
-                        let name = col.name().to_string();
-                        // Try common types; fall back to text representation
-                        let val: serde_json::Value =
-                            if let Ok(v) = row.try_get::<String, _>(col.name()) {
-                                serde_json::Value::String(v)
-                            } else if let Ok(v) = row.try_get::<i64, _>(col.name()) {
-                                serde_json::json!(v)
-                            } else if let Ok(v) = row.try_get::<i32, _>(col.name()) {
-                                serde_json::json!(v)
-                            } else if let Ok(v) = row.try_get::<f64, _>(col.name()) {
-                                serde_json::json!(v)
-                            } else if let Ok(v) = row.try_get::<bool, _>(col.name()) {
-                                serde_json::json!(v)
-                            } else if let Ok(v) = row.try_get::<uuid::Uuid, _>(col.name()) {
-                                serde_json::Value::String(v.to_string())
-                            } else if let Ok(v) =
-                                row.try_get::<chrono::DateTime<chrono::Utc>, _>(col.name())
-                            {
-                                serde_json::Value::String(v.to_rfc3339())
-                            } else if let Ok(v) = row.try_get::<serde_json::Value, _>(col.name()) {
-                                v
-                            } else {
-                                serde_json::Value::Null
-                            };
-                        obj.insert(name, val);
-                    }
-                    serde_json::Value::Object(obj)
+                    talos_advanced_repository::row_json::row_to_json(row)
+                        .map(serde_json::Value::Object)
                 })
                 .collect();
+            let result_rows = match encoded {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(
+                        column = %e.column(),
+                        column_type = %e.type_name(),
+                        "query_paginated: a column it cannot return"
+                    );
+                    return mcp_error(req_id, -32602, &unreturnable_column_message(&e));
+                }
+            };
 
             let row_count = result_rows.len();
 
@@ -1066,6 +1057,53 @@ async fn handle_query_paginated(
                 "Query execution failed. Ensure the SQL syntax is valid.",
             )
         }
+    }
+}
+
+/// What the caller is told when a `query_paginated` column cannot be returned.
+///
+/// The column name and type are the caller's own query's; no row value is in
+/// the sentence.
+fn unreturnable_column_message(e: &talos_advanced_repository::row_json::RowJsonError) -> String {
+    use talos_advanced_repository::row_json::RowJsonError;
+    match e {
+        RowJsonError::UnsupportedType { column, type_name } => format!(
+            "query_paginated cannot return column '{column}': its type is {type_name}, which has \
+             no JSON rendering here. Cast it in the query, for example {column}::text. Nothing \
+             was returned, rather than a null in place of a value that is present."
+        ),
+        RowJsonError::Undecodable { column, type_name } => format!(
+            "query_paginated could not decode a value in column '{column}' ({type_name}). Cast \
+             it in the query, for example {column}::text. Nothing was returned, rather than a \
+             null in place of a value that is present."
+        ),
+    }
+}
+
+#[cfg(test)]
+mod unreturnable_column_tests {
+    use super::unreturnable_column_message;
+    use talos_advanced_repository::row_json::RowJsonError;
+
+    #[test]
+    fn the_refusal_names_the_column_its_type_and_the_cast() {
+        let unsupported = unreturnable_column_message(&RowJsonError::UnsupportedType {
+            column: "address".to_string(),
+            type_name: "INET".to_string(),
+        });
+        assert!(unsupported.contains("column 'address'"), "{unsupported}");
+        assert!(unsupported.contains("INET"), "{unsupported}");
+        assert!(unsupported.contains("address::text"), "{unsupported}");
+
+        let undecodable = unreturnable_column_message(&RowJsonError::Undecodable {
+            column: "amount".to_string(),
+            type_name: "NUMERIC".to_string(),
+        });
+        assert!(
+            undecodable.contains("column 'amount' (NUMERIC)"),
+            "{undecodable}"
+        );
+        assert!(undecodable.contains("amount::text"), "{undecodable}");
     }
 }
 
