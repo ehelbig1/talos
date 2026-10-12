@@ -97,13 +97,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
             "name": "list_workflows",
-            "description": "List workflows owned by the current user. Returns id, name, status, type, tags, node/edge counts, and last execution time. Supports pagination and filtering by status, type, and tag.",
+            "description": "List workflows owned by the current user. Returns id, name, status, type, tags, node/edge counts, and last execution time. Supports pagination and filtering by status, type, and tag. To list the workflows that actually RUN, pass runs: true: `status: \"active\"` means PUBLISHED, and a draft with an enabled schedule runs too, so it leaves those out.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "limit": { "type": "number", "description": "Max number of workflows to return (default: 50, max: 200)" },
                     "offset": { "type": "number", "description": "Offset for pagination (default: 0)" },
-                    "status": { "type": "string", "description": "Filter by workflow status: 'draft', 'active', 'archived' (the schema enum from migration 20260318000000)" },
+                    "status": { "type": "string", "description": "Filter by workflow status: 'draft', 'active', 'archived' (the schema enum from migration 20260318000000). 'active' means published; it is NOT 'everything that runs' (see runs)." },
+                    "runs": { "type": "boolean", "description": "When true, list only workflows the platform runs: not archived, not disabled, and with a way to start — an enabled schedule, an enabled webhook trigger, or a run in the last 7 days (which is how a workflow started by a push channel, an action link or another workflow is found). Includes drafts. Combines with status, type and tag. Default false." },
                     "type": { "type": "string", "description": "Filter by workflow_type: 'production', 'test', 'internal', 'template'" },
                     "tag": { "type": "string", "description": "Filter to workflows that have this tag" }
                 },
@@ -1168,6 +1169,13 @@ async fn handle_list_workflows(
         },
     };
 
+    // A wrong type is refused: read as `false` it would return the whole
+    // list where the caller asked for the workflows that run.
+    let runs_only = match crate::utils::validate_optional_bool(args, "runs", false, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
     // N-K cont.: same treatment for `type` filter (and MCP-346 wrong-type
     // rejection mirroring the status filter above).
     const VALID_TYPES: &[&str] = &["production", "test", "internal", "template"];
@@ -1220,6 +1228,7 @@ async fn handle_list_workflows(
             status_filter.as_deref(),
             type_filter.as_deref(),
             tag_filter.as_deref(),
+            runs_only,
             limit,
             offset,
         )
@@ -1280,7 +1289,7 @@ async fn handle_list_workflows(
     // MCP-64 (2026-05-07): emit canonical `count` alongside legacy `total`
     // so envelope tooling that keys on `count` can read this surface
     // without a per-tool special-case.
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "workflows": workflows,
         "count": workflows.len(),
         "total": total,
@@ -1288,6 +1297,17 @@ async fn handle_list_workflows(
         "offset": offset,
         "has_more": offset + limit < total,
     });
+    // Say what the filter meant, so `total` is not read as "every workflow".
+    if runs_only {
+        result["filter"] = serde_json::json!({
+            "runs": true,
+            "meaning": format!(
+                "not archived, not disabled, and with a way to start: an enabled schedule, an \
+                 enabled webhook trigger, or a run in the last {} days. Drafts are included.",
+                talos_workflow_repository::RUNS_RECENT_DAYS
+            ),
+        });
+    }
 
     mcp_text(
         req_id,

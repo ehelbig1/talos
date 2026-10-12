@@ -11,6 +11,17 @@ use talos_tenancy::TenantReadScope;
 use uuid::Uuid;
 
 pub mod admin_query_provision;
+
+/// Workflows with at least one enabled schedule, counted two ways by
+/// [`AdvancedRepository::get_active_workflows_with_schedule_count`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledWorkflowCounts {
+    /// Every workflow that is not archived. A DRAFT with an enabled schedule
+    /// is dispatched from its draft graph, so it is counted.
+    pub not_archived: i64,
+    /// The subset whose status is `active` (published).
+    pub active: i64,
+}
 pub mod row_json;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3163,7 +3174,17 @@ impl AdvancedRepository {
     /// question "how many of my active workflows are actually scheduled?" —
     /// the previously-published `active_workflows` field misleadingly counted
     /// every status='active' workflow regardless of schedule attachment.
-    pub async fn get_active_workflows_with_schedule_count(&self, user_id: Uuid) -> Result<i64> {
+    ///
+    /// Returns both populations from ONE statement, so they cannot disagree:
+    /// every workflow that is not archived and has an enabled schedule
+    /// (`not_archived`), and the subset of those whose status is `active`
+    /// (`active`). Until 2026-10-12 only the first was returned, printed
+    /// beside `active_workflows` under a note that called it a subset of
+    /// that count; with ten scheduled drafts it read 27 beside 17.
+    pub async fn get_active_workflows_with_schedule_count(
+        &self,
+        user_id: Uuid,
+    ) -> Result<ScheduledWorkflowCounts> {
         // Pre-fix this filtered `w.status = 'active'`, which excluded
         // workflows in `status='draft'` even though the scheduler
         // happily fires them and they're producing executions every
@@ -3179,8 +3200,9 @@ impl AdvancedRepository {
         // an enabled schedule attached?"
         // RFC 0005 S3: self-scope (workflows RLS backstop).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
-        let n = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(DISTINCT w.id) \
+        let row = sqlx::query(
+            "SELECT COUNT(DISTINCT w.id) AS not_archived, \
+                    COUNT(DISTINCT w.id) FILTER (WHERE w.status = 'active') AS active \
              FROM workflows w \
              JOIN workflow_schedules s ON s.workflow_id = w.id \
              WHERE w.user_id = $1 \
@@ -3192,7 +3214,10 @@ impl AdvancedRepository {
         .await
         .context("get_active_workflows_with_schedule_count")?;
         tx.commit().await?;
-        Ok(n)
+        Ok(ScheduledWorkflowCounts {
+            not_archived: row.try_get("not_archived")?,
+            active: row.try_get("active")?,
+        })
     }
 
     /// Workflows that ran ≥3 times in the last 60 days but have no active

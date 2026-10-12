@@ -501,12 +501,13 @@ impl SessionBriefService {
         // — distinct from `active_wf_count` (every status='active' workflow) and
         // `active_schedule_count` (schedule-row count; a workflow can have several).
         // This is the field most callers think `active_workflows` means.
-        let active_workflows_with_schedule: Option<i64> = readings.record(
-            "schedule_health.workflows_with_active_schedules",
-            self.advanced_repo
-                .get_active_workflows_with_schedule_count(user_id)
-                .await,
-        );
+        let scheduled_workflows: Option<talos_advanced_repository::ScheduledWorkflowCounts> =
+            readings.record(
+                "schedule_health.workflows_with_active_schedules",
+                self.advanced_repo
+                    .get_active_workflows_with_schedule_count(user_id)
+                    .await,
+            );
 
         // Unknown unless both counts were read.
         let no_schedule_warning: Option<bool> = match (active_wf_count, active_schedule_count) {
@@ -807,9 +808,16 @@ impl SessionBriefService {
                 // intuitive "how many active workflows are actually scheduled"
                 // count.
                 "active_workflows": active_wf_count,
-                // Distinct count of active workflows that have at least one enabled
-                // workflow_schedules row. Always ≤ active_workflows.
-                "workflows_with_active_schedules": active_workflows_with_schedule,
+                // Every workflow that is NOT ARCHIVED and has an enabled
+                // schedule. A scheduled DRAFT runs (from its draft graph), so
+                // this can be LARGER than `active_workflows`. Until 2026-10-12
+                // the note beside it called it a subset of that count, and it
+                // read 27 beside 17.
+                "workflows_with_active_schedules": scheduled_workflows.map(|c| c.not_archived),
+                // The part of the count above whose status is `active`: the
+                // one that IS a subset of `active_workflows`. From the same
+                // statement, so the two cannot disagree.
+                "active_workflows_with_active_schedules": scheduled_workflows.map(|c| c.active),
                 // Total count of enabled `workflow_schedules` rows. May exceed
                 // workflows_with_active_schedules if a workflow has multiple
                 // schedules attached (e.g. weekday morning + weekend evening).
@@ -820,7 +828,8 @@ impl SessionBriefService {
                 "no_schedule_warning": no_schedule_warning,
                 "field_meanings": {
                     "active_workflows": "All workflows with status='active' (includes manual-trigger / webhook-only workflows). Not 'workflows that have a schedule'.",
-                    "workflows_with_active_schedules": "Active workflows that have ≥1 enabled schedule attached.",
+                    "workflows_with_active_schedules": "Workflows that are not archived (active OR draft) with ≥1 enabled schedule. A draft with an enabled schedule runs, so this can be larger than active_workflows. list_workflows(runs: true) lists workflows that run.",
+                    "active_workflows_with_active_schedules": "The subset of workflows_with_active_schedules whose status is 'active'. Always ≤ active_workflows.",
                     "active_schedules": "Total enabled schedule rows. ≥ workflows_with_active_schedules when workflows have multiple schedules."
                 },
             },
@@ -1317,6 +1326,7 @@ mod unreadable_platform_tests {
             "/schedule_health/active_workflows",
             "/schedule_health/active_schedules",
             "/schedule_health/workflows_with_active_schedules",
+            "/schedule_health/active_workflows_with_active_schedules",
             "/schedule_health/no_schedule_warning",
             "/pinned_modules/present",
             "/pinned_modules/needs_restore",
