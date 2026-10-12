@@ -21,6 +21,9 @@ export interface WatchChannelSummary {
   has_sync_token: boolean;
   module_id: string | null;
   module_name: string | null;
+  // The workflow a change on this calendar starts. The backend omits the
+  // field when none is bound.
+  workflow_id?: string | null;
   last_message_number: number;
   updated_at: string;
   // Present iff the most recent renewal attempt failed. The
@@ -90,7 +93,13 @@ async function fetchIntegrations(): Promise<IntegrationInfo[]> {
   return (body.data ?? []).filter((i) => i.is_active);
 }
 
-export type PendingAction = "renew" | "test" | "stop" | null;
+export type PendingAction = "renew" | "test" | "stop" | "bind" | null;
+
+export interface BindWorkflowVars {
+  channelUuid: string;
+  /** `null` clears the binding. */
+  workflowId: string | null;
+}
 
 /**
  * Queries + per-row mutations for the panel. `onFlash` fires after a
@@ -228,7 +237,62 @@ export function useWatchChannels({
     },
   });
 
+  const bindWorkflowMutation = useMutation({
+    mutationFn: async ({
+      channelUuid,
+      workflowId,
+    }: BindWorkflowVars): Promise<void> => {
+      const res = await authedFetch(
+        `/api/google-calendar/watch-channels/${channelUuid}/workflow`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workflow_id: workflowId }),
+        },
+      );
+      const body: ApiResponse<unknown> = await res.json();
+      if (!body.success)
+        throw new Error(body.error ?? "The workflow was not bound");
+    },
+    onMutate: async ({ channelUuid, workflowId }) => {
+      await qc.cancelQueries({ queryKey: CHANNELS_KEY });
+      const prev = qc.getQueryData<WatchChannelSummary[]>(CHANNELS_KEY);
+      qc.setQueryData<WatchChannelSummary[]>(CHANNELS_KEY, (old) =>
+        (old ?? []).map((ch) =>
+          ch.channel_uuid === channelUuid
+            ? { ...ch, workflow_id: workflowId }
+            : ch,
+        ),
+      );
+      return { prev };
+    },
+    // A refusal puts the row back to what the server holds, so the picker
+    // never shows a binding that was not made.
+    onError: (err, _vars, ctx) => {
+      if (ctx?.prev) qc.setQueryData(CHANNELS_KEY, ctx.prev);
+      toast.error(
+        sanitizeErrorMessage(err instanceof Error ? err.message : String(err)),
+      );
+    },
+    onSuccess: (_data, { channelUuid, workflowId }) => {
+      onFlash(channelUuid);
+      toast.success(
+        workflowId
+          ? "Workflow bound — a change on this calendar starts it"
+          : "Workflow binding cleared",
+      );
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: CHANNELS_KEY });
+    },
+  });
+
   const pendingFor = (channelUuid: string): PendingAction => {
+    if (
+      bindWorkflowMutation.isPending &&
+      bindWorkflowMutation.variables?.channelUuid === channelUuid
+    )
+      return "bind";
     if (renewMutation.isPending && renewMutation.variables === channelUuid)
       return "renew";
     if (testMutation.isPending && testMutation.variables === channelUuid)
@@ -244,6 +308,7 @@ export function useWatchChannels({
     renewMutation,
     testMutation,
     stopMutation,
+    bindWorkflowMutation,
     pendingFor,
   };
 }

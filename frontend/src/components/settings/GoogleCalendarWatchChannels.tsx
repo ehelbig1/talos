@@ -26,6 +26,8 @@
 
 import React, { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import type { WorkflowsQuery } from "@/generated/graphql";
+import { useWorkflowsQuery } from "@/generated/graphql";
 import { Calendar as CalendarIcon } from "lucide-react";
 import { useRowFlash } from "./watch-channels/useRowFlash";
 import {
@@ -53,8 +55,15 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
     renewMutation,
     testMutation,
     stopMutation,
+    bindWorkflowMutation,
     pendingFor,
   } = useWatchChannels({ onFlash: triggerFlash });
+  // The owner's workflows, for the per-row picker. `undefined` until loaded:
+  // the picker then shows a bound channel's id rather than "None".
+  const { data: workflows } = useWorkflowsQuery(undefined, {
+    select: (d: WorkflowsQuery) =>
+      d.workflows.map((w) => ({ id: w.id, name: w.name })),
+  });
   const channels = channelsQuery.data ?? [];
   const integrations = integrationsQuery.data ?? [];
 
@@ -131,7 +140,7 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
         <WatchPanelEmptyState
           icon={<CalendarIcon size={20} />}
           title="No watch channels yet"
-          description="A watch channel lets Talos receive real-time push notifications when events change on a calendar. Bind one to a WASM module (via the workflow builder) to dispatch jobs per event, or leave it unbound to keep the sync token fresh for other integrations."
+          description="A watch channel lets Talos receive real-time push notifications when events change on a calendar. Pick a workflow on its row to start that workflow on every change, bind a WASM module (via the workflow builder) to dispatch a job per event, or leave it unbound to keep the sync token fresh for other integrations."
           ctaLabel="Create your first watch channel"
           onCreate={() => setCreateOpen(true)}
         />
@@ -140,6 +149,10 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
           channels={channels}
           flashedAt={flashedAt}
           pendingFor={pendingFor}
+          workflows={workflows}
+          onBindWorkflow={(channelUuid, workflowId) =>
+            bindWorkflowMutation.mutate({ channelUuid, workflowId })
+          }
           onTest={(uuid) => testMutation.mutate(uuid)}
           onRenew={(uuid) => renewMutation.mutate(uuid)}
           onStop={(uuid) => stopMutation.mutate(uuid)}
