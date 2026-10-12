@@ -248,7 +248,7 @@ export_yaml_workflow(workflow_id: <daily-brief>)
 export to understand the workflow have to mentally filter the noise. Also makes
 diffs across exports noisier than they need to be.
 
-**Why:** The serializer uses default `serde_yaml` settings without
+**Why:** The serializer uses its YAML crate's default settings (`serde_yaml` when this was written; `serde-saphyr` since 2026-10-12) without
 `#[serde(skip_serializing_if = "Option::is_none")]` on the optional fields.
 
 **Fix shape:** Add `#[serde(skip_serializing_if = "Option::is_none")]` to the

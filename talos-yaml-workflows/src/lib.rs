@@ -4,7 +4,7 @@
 //! `WorkflowSettings`) lives in `talos-workflow-types` so downstream
 //! tooling (CI linters, IDE plugins) can consume the schema without
 //! depending on the controller binary. The functions in this module
-//! cover the controller-side concerns: `serde_yaml` parsing, `anyhow`-
+//! cover the controller-side concerns: YAML parsing (`serde-saphyr`), `anyhow`-
 //! flavoured validation errors, and graph-JSON ↔ YAML conversion.
 //!
 //! Inherent methods on `YamlWorkflow` are not possible because the type
@@ -41,11 +41,19 @@ fn max_yaml_bytes() -> usize {
 /// before returning.
 ///
 /// MCP-500: rejects inputs larger than `TALOS_MAX_YAML_BYTES` (default
-/// 1 MiB) before invoking the parser. `serde_yaml` has no built-in
-/// DoS protection — without an up-front cap, an authenticated user
-/// submitting a YAML-bomb manifest could exhaust the controller's
-/// memory during parse. The size check runs in O(1) ahead of the
-/// parser's O(n) work, so the cap is the cheap-fail boundary.
+/// 1 MiB) before invoking the parser. Without an up-front cap, an
+/// authenticated user submitting a YAML-bomb manifest could exhaust the
+/// controller's memory during parse. The size check runs in O(1) ahead of
+/// the parser's O(n) work, so the cap is the cheap-fail boundary. (The
+/// parser, `serde-saphyr`, also budgets what one document may expand to;
+/// this cap is ours and does not depend on it.)
+///
+/// The parser was `serde_yaml` until 2026-10-12. That crate is deprecated
+/// and parses with `unsafe-libyaml`, a machine translation of C to unsafe
+/// Rust whose repository is archived (RUSTSEC-2024-0449): this function
+/// hands it text a user wrote. `serde-saphyr` parses in safe Rust.
+/// `a_document_in_the_old_export_format_still_imports` pins that a file an
+/// earlier release exported is read to the same values.
 pub fn parse_yaml(yaml: &str) -> Result<YamlWorkflow> {
     let cap = max_yaml_bytes();
     if yaml.len() > cap {
@@ -56,14 +64,32 @@ pub fn parse_yaml(yaml: &str) -> Result<YamlWorkflow> {
             cap
         );
     }
-    let workflow: YamlWorkflow = serde_yaml::from_str(yaml)?;
+    let workflow: YamlWorkflow = serde_saphyr::from_str_with_options(yaml, parse_options())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     validate(&workflow)?;
     Ok(workflow)
 }
 
+/// How workflow YAML is read.
+///
+/// * `strict_booleans`: only `true` and `false` are booleans. The parser's
+///   default also reads `yes`, `no`, `on` and `off` as booleans (YAML 1.1);
+///   `serde_yaml` did not, and it WROTE such strings unquoted — so with the
+///   default, a config value `"yes"` in a file an earlier release exported
+///   would come back as `true`.
+/// * `with_snippet: false`: a parse error names a line and a column and does
+///   not quote the document. The text is a user's workflow, config values
+///   included, and this error is both returned and logged.
+fn parse_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        strict_booleans: true,
+        with_snippet: false,
+    }
+}
+
 /// Serialize a workflow to YAML string.
 pub fn to_yaml(workflow: &YamlWorkflow) -> Result<String> {
-    Ok(serde_yaml::to_string(workflow)?)
+    Ok(serde_saphyr::to_string(workflow)?)
 }
 
 /// Validate the workflow definition for structural correctness.
@@ -324,6 +350,213 @@ nodes:
             err.to_string().contains("empty"),
             "expected empty-id error, got {}",
             err
+        );
+    }
+
+    /// A file exported before the parser changed (2026-10-12) must still
+    /// import, to the same values and the same JSON types. This document is
+    /// in the style `serde_yaml` 0.9 wrote: block mappings, sequences at the
+    /// parent's indent, single quotes around strings that would otherwise
+    /// read as another type, `|` for text with line breaks.
+    #[test]
+    fn a_document_in_the_old_export_format_still_imports() {
+        let exported = r#"name: nightly-report
+description: 'Runs at 02:00: reads, composes, sends'
+capabilities:
+- report
+- email
+nodes:
+- id: fetch
+  module: http-get
+  capability_world: http-node
+  config:
+    URL: https://api.example.test/v3/items?limit=50&sort=-updated
+    AUTH_HEADER: Bearer vault://example/token
+    SCHEDULE: 0 2 * * 1-5
+    MAX_RESULTS: 50
+    RATIO: 0.25
+    DRY_RUN: false
+    LABEL: 'true'
+    ANSWER: yes
+    SWITCH: off
+    ZIP: '02134'
+    NOTHING: null
+    EMPTY: ''
+    TAGS:
+    - a
+    - 'b: c'
+    NESTED:
+      depth: 2
+      on: yes
+    max_fuel: 4000000
+  retry_count: 2
+- id: compose
+  module: inline
+  rust_code: |
+    pub fn run(input: String) -> Result<String, String> {
+        // a "quoted" word, a colon: and a # that is not a comment
+        Ok(input)
+    }
+  continue_on_error: true
+  skip_condition: input.items.len() == 0
+edges:
+- from: fetch
+  to: compose
+"#;
+        let wf = parse_yaml(exported).expect("an old export imports");
+        assert_eq!(wf.name, "nightly-report");
+        assert_eq!(wf.description, "Runs at 02:00: reads, composes, sends");
+        assert_eq!(wf.capabilities, ["report", "email"]);
+        assert_eq!((wf.nodes.len(), wf.edges.len()), (2, 1));
+
+        let fetch = &wf.nodes[0];
+        assert_eq!(
+            (fetch.id.as_str(), fetch.module.as_str(), fetch.retry_count),
+            ("fetch", "http-get", 2)
+        );
+        assert_eq!(fetch.capability_world.as_deref(), Some("http-node"));
+        let expected = serde_json::json!({
+            "URL": "https://api.example.test/v3/items?limit=50&sort=-updated",
+            "AUTH_HEADER": "Bearer vault://example/token",
+            "SCHEDULE": "0 2 * * 1-5",
+            "MAX_RESULTS": 50,
+            "RATIO": 0.25,
+            "DRY_RUN": false,
+            // Quoted, so a string: not the boolean and not the number.
+            "LABEL": "true",
+            // Unquoted, as the old exporter wrote them: still strings.
+            "ANSWER": "yes",
+            "SWITCH": "off",
+            "ZIP": "02134",
+            "NOTHING": null,
+            "EMPTY": "",
+            "TAGS": ["a", "b: c"],
+            // YAML 1.2, as before: `yes` is a string, not a boolean.
+            "NESTED": {"depth": 2, "on": "yes"},
+            "max_fuel": 4_000_000,
+        });
+        assert_eq!(serde_json::Value::Object(fetch.config.clone()), expected);
+
+        let compose = &wf.nodes[1];
+        assert_eq!(
+            compose.rust_code.as_deref(),
+            Some(
+                "pub fn run(input: String) -> Result<String, String> {\n    // a \"quoted\" word, a colon: and a # that is not a comment\n    Ok(input)\n}\n"
+            )
+        );
+        assert!(compose.continue_on_error);
+        assert_eq!(
+            compose.skip_condition.as_deref(),
+            Some("input.items.len() == 0")
+        );
+
+        // What this release exports, this release imports to the same thing.
+        let again = parse_yaml(&to_yaml(&wf).expect("export")).expect("import");
+        assert_eq!(
+            serde_json::to_value(&again).expect("json"),
+            serde_json::to_value(&wf).expect("json")
+        );
+    }
+
+    /// A string that looks like another type goes out and comes back a string.
+    #[test]
+    fn strings_that_look_like_other_types_survive_a_round_trip() {
+        let looks = [
+            "yes",
+            "no",
+            "on",
+            "off",
+            "y",
+            "n",
+            "Yes",
+            "ON",
+            "true",
+            "false",
+            "True",
+            "null",
+            "~",
+            "",
+            "123",
+            "0123",
+            "1e3",
+            "0x1f",
+            "-5",
+            "3.14",
+            ".inf",
+            "2026-10-12",
+            " leading",
+            "trailing ",
+            "a: b",
+            "- item",
+            "# not a comment",
+            "*alias",
+            "&anchor",
+            "{braces}",
+            "[brackets]",
+            "multi\nline",
+            "tab\there",
+            "quote's \"both\"",
+            "@at",
+            "%pct",
+        ];
+        let mut config = serde_json::Map::new();
+        for (i, s) in looks.iter().enumerate() {
+            config.insert(format!("K{i:02}"), serde_json::json!(s));
+        }
+        let wf = YamlWorkflow {
+            name: "looks".to_string(),
+            description: "yes".to_string(),
+            capabilities: vec!["no".to_string(), "123".to_string()],
+            nodes: vec![YamlNode {
+                id: "n1".to_string(),
+                module: "echo".to_string(),
+                capability_world: None,
+                rust_code: None,
+                js_code: None,
+                python_code: None,
+                config: config.clone(),
+                node_type: None,
+                retry_count: 0,
+                continue_on_error: false,
+                skip_condition: None,
+                version: None,
+            }],
+            edges: vec![],
+            settings: WorkflowSettings::default(),
+        };
+        let back = parse_yaml(&to_yaml(&wf).expect("export")).expect("import");
+        assert_eq!(back.description, "yes");
+        assert_eq!(back.capabilities, ["no", "123"]);
+        for (key, value) in &config {
+            assert_eq!(back.nodes[0].config.get(key), Some(value), "{key}");
+        }
+    }
+
+    /// A parse error says where, and does not quote the document: it is
+    /// returned and logged, and the document is a user's config.
+    #[test]
+    fn a_parse_error_does_not_quote_the_document() {
+        let err = parse_yaml("name: x\nnodes:\n- id: a\n  config:\n    TOKEN: sk-do-not-echo-this\n   bad: [unclosed\n")
+            .expect_err("malformed")
+            .to_string();
+        assert!(!err.contains("sk-do-not-echo-this"), "{err}");
+        assert!(!err.is_empty());
+    }
+
+    /// Our size cap is checked before the parser runs; a large but ordinary
+    /// document under it is still read.
+    #[test]
+    fn a_large_ordinary_document_is_read() {
+        let mut yaml = String::from("name: big\nnodes:\n");
+        for i in 0..2000 {
+            yaml.push_str(&format!(
+                "- id: n{i}\n  module: echo\n  config:\n    A: {i}\n    B: text {i}\n"
+            ));
+        }
+        assert!(yaml.len() < DEFAULT_MAX_YAML_BYTES);
+        assert_eq!(
+            parse_yaml(&yaml).expect("a large document").nodes.len(),
+            2000
         );
     }
 

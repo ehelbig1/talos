@@ -12,7 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-serde_yaml.workspace = true
+serde-saphyr.workspace = true
 
 [lints]
 workspace = true
