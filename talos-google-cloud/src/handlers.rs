@@ -1134,8 +1134,23 @@ mod pubsub_tests {
     /// absent one — which is why the status is a 503 deferral. The ABSENT
     /// (`Ok(None)`) case needs a migrated database with no matching row and is
     /// NOT covered here; do not read this test as covering both.
+    /// Held by the tests that reach the handler's unreadable-lookup arm.
+    ///
+    /// That arm increments `google_push_deferred_total{gcp,
+    /// watch_lookup_unreadable}` on the process-global registry, and the
+    /// label set is the handler's, not a test's to choose. Two tests reach
+    /// it; one of them asserts the series moved by exactly one. Run in
+    /// parallel, the other's increment landed between that test's two reads
+    /// and it failed about two runs in three under plain `cargo test`
+    /// (measured 2026-10-12: 7 of 12), while passing in CI, which runs one
+    /// process per test. Only these two take turns; the rest of the binary
+    /// still runs in parallel. An async mutex, because it is held across the
+    /// handler's await.
+    static UNREADABLE_LOOKUP_SERIES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn a_verified_push_for_no_watch_is_not_counted_as_accepted() {
+        let _series = UNREADABLE_LOOKUP_SERIES.lock().await;
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let accepted = || {
             talos_metrics::global()
@@ -1193,6 +1208,7 @@ mod pubsub_tests {
         // reaches find_by_push_token which ERRORS against the dead pool
         // → step 3 defers with 503 so Pub/Sub redelivers. dispatch is None →
         // nothing is published either way.
+        let _series = UNREADABLE_LOOKUP_SERIES.lock().await;
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let deferred = || {
             talos_metrics::global()
