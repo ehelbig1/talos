@@ -1,5 +1,6 @@
-use talos_sdk_macros::talos_module;
+use serde::Deserialize;
 use serde_json::Value;
+use talos_sdk_macros::talos_module;
 
 // send-html-email — the input-driven HTML email sender for the two-node
 // compose -> send delivery pattern (docs/delivery-node-pattern.md).
@@ -27,21 +28,37 @@ fn run(input: String) -> Result<String, String> {
     use talos::core::http::{Method, Request};
     use talos::core::logging::{self, Level};
 
-    let root: Value = serde_json::from_str(&input)
-        .map_err(|e| format!("Invalid JSON input: {}", e))?;
-
-    let config = root.get("config").cloned().unwrap_or(Value::Null);
+    // Typed, not `serde_json::Value`: the input carries the whole composed
+    // message, and a `Value` tree of it cost about 200 fuel per byte of body
+    // (measured 2026-10-12: a 30 KB message used 6.2M fuel and could not be
+    // sent under the default limit). The fields this module does not read are
+    // skipped by the parser, never built.
+    let root: Root =
+        serde_json::from_str(&input).map_err(|e| format!("Invalid JSON input: {}", e))?;
+    let Root {
+        config,
+        input: upstream,
+        subject: root_subject,
+        html: root_html,
+        skip: root_skip,
+    } = root;
+    let upstream = upstream.unwrap_or_default();
 
     // Auth + recipient come from node config.
-    let auth_header = str_field(&config, "AUTH_HEADER")
+    let auth_header = config
+        .auth_header
+        .0
         .ok_or("Missing AUTH_HEADER in config (a Bearer value, e.g. a vault:// token reference)")?;
-    let to = str_field(&config, "TO").ok_or("Missing TO in config")?;
-    let from = str_field(&config, "FROM").unwrap_or_else(|| "me".to_string());
-    let dry_run = config.get("DRY_RUN").and_then(|v| v.as_bool()).unwrap_or(false);
+    let to = config.to.0.ok_or("Missing TO in config")?;
+    let from = config.from.0.unwrap_or_else(|| "me".to_string());
+    let dry_run = config.dry_run == Some(Value::Bool(true));
 
     // The composer said there is nothing to send. Checked before the content,
-    // because a composer that skips usually returns no content at all.
-    if upstream_skips(&root) {
+    // because a composer that skips usually returns no content at all. Only
+    // the boolean `true` skips: a string "true" or a 1 is not the composer's
+    // contract and is not read as one.
+    let skips = |flag: &Option<Value>| *flag == Some(Value::Bool(true));
+    if skips(&upstream.skip) || skips(&root_skip) {
         let out = serde_json::json!({
             "sent": false,
             "skipped": true,
@@ -51,10 +68,21 @@ fn run(input: String) -> Result<String, String> {
         return serde_json::to_string(&out).map_err(|e| format!("serialize error: {}", e));
     }
 
-    // Content comes from the upstream node's output ({subject, html}); a config
-    // fallback lets the module run stand-alone in a sandbox test.
-    let subject = pick(&root, "subject").unwrap_or_else(|| "(no subject)".to_string());
-    let html = pick(&root, "html").unwrap_or_default();
+    // Content comes from the upstream node's output first (`input`), then
+    // node config (a stand-alone sandbox run), then the root — robust to how
+    // the engine nests the compose node's output.
+    let subject = upstream
+        .subject
+        .0
+        .or(config.subject.0)
+        .or(root_subject.0)
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let html = upstream
+        .html
+        .0
+        .or(config.html.0)
+        .or(root_html.0)
+        .unwrap_or_default();
 
     // Never a blank email. Checked ahead of DRY_RUN too, so a rehearsal fails
     // the same way the real send would.
@@ -76,10 +104,20 @@ fn run(input: String) -> Result<String, String> {
     // mojibake. ASCII subjects pass through byte-identical.
     let subject_header = encode_subject(&subject);
 
-    let raw_message = format!(
-        "From: {}\r\nTo: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n{}",
-        from, to, subject_header, html
-    );
+    // The message, built once. The body is copied here and nowhere else.
+    let mut raw_message: Vec<u8> = Vec::with_capacity(html.len() + 256);
+    for part in [
+        "From: ",
+        from.as_str(),
+        "\r\nTo: ",
+        to.as_str(),
+        "\r\nSubject: ",
+        subject_header.as_str(),
+        "\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n",
+        html.as_str(),
+    ] {
+        raw_message.extend_from_slice(part.as_bytes());
+    }
 
     if dry_run {
         let out = serde_json::json!({
@@ -92,10 +130,13 @@ fn run(input: String) -> Result<String, String> {
         return serde_json::to_string(&out).map_err(|e| format!("serialize error: {}", e));
     }
 
-    let encoded = base64url_encode(raw_message.as_bytes());
-    let send_payload = serde_json::json!({ "raw": encoded });
-    let send_body =
-        serde_json::to_vec(&send_payload).map_err(|e| format!("serialize send payload: {}", e))?;
+    // `{"raw":"<base64url>"}`, written straight into the request body. The
+    // base64url alphabet has no character JSON escapes, so this is the same
+    // bytes `serde_json` would produce without a second pass over them.
+    let mut send_body: Vec<u8> = Vec::with_capacity(raw_message.len() / 3 * 4 + 16);
+    send_body.extend_from_slice(b"{\"raw\":\"");
+    base64url_encode_into(&raw_message, &mut send_body);
+    send_body.extend_from_slice(b"\"}");
 
     logging::log(Level::Info, &format!("Sending HTML email to: {}", to));
 
@@ -136,32 +177,102 @@ fn run(input: String) -> Result<String, String> {
     serde_json::to_string(&out).map_err(|e| format!("serialize error: {}", e))
 }
 
-// `skip: true` in the upstream node's output (root["input"]) or, for a
-// stand-alone run, at the root. Only the boolean `true` skips: a string
-// "true" or a 1 is not the composer's contract and is not read as one.
-fn upstream_skips(root: &Value) -> bool {
-    let flag = |v: &Value| v.get("skip").and_then(|s| s.as_bool()) == Some(true);
-    root.get("input").map(flag).unwrap_or(false) || flag(root)
+// The whole input: `{config, input, …}`. `input` is the upstream node's
+// output; `subject` / `html` / `skip` are also read at the root, where a
+// stand-alone run or a flattened payload puts them.
+#[derive(Deserialize, Default)]
+struct Root {
+    #[serde(default)]
+    config: Config,
+    #[serde(default)]
+    input: Option<Content>,
+    #[serde(default)]
+    subject: Text,
+    #[serde(default)]
+    html: Text,
+    #[serde(default)]
+    skip: Option<Value>,
 }
 
-// Read a string field from a JSON object.
-fn str_field(v: &Value, key: &str) -> Option<String> {
-    v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+#[derive(Deserialize, Default)]
+struct Config {
+    #[serde(rename = "AUTH_HEADER", default)]
+    auth_header: Text,
+    #[serde(rename = "TO", default)]
+    to: Text,
+    #[serde(rename = "FROM", default)]
+    from: Text,
+    #[serde(rename = "DRY_RUN", default)]
+    dry_run: Option<Value>,
+    #[serde(default)]
+    subject: Text,
+    #[serde(default)]
+    html: Text,
 }
 
-// Pick `key` from the upstream output first (root["input"]), then node config,
-// then the root — robust to how the engine nests the compose node's output.
-fn pick(root: &Value, key: &str) -> Option<String> {
-    root.get("input")
-        .and_then(|i| i.get(key))
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            root.get("config")
-                .and_then(|c| c.get(key))
-                .and_then(|v| v.as_str())
-        })
-        .or_else(|| root.get(key).and_then(|v| v.as_str()))
-        .map(|s| s.to_string())
+#[derive(Deserialize, Default)]
+struct Content {
+    #[serde(default)]
+    subject: Text,
+    #[serde(default)]
+    html: Text,
+    #[serde(default)]
+    skip: Option<Value>,
+}
+
+// A field that is a string, or is treated as absent. A number, an object or a
+// null where a string belongs is not this module's input and reads as "not
+// given" (as `Value::as_str` did), never as a parse failure of the whole
+// payload. Whatever it holds instead is skipped, not built.
+#[derive(Default)]
+struct Text(Option<String>);
+
+impl<'de> Deserialize<'de> for Text {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct TextVisitor;
+        impl<'de> serde::de::Visitor<'de> for TextVisitor {
+            type Value = Text;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Text, E> {
+                Ok(Text(Some(v.to_string())))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Text, E> {
+                Ok(Text(Some(v)))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Text, E> {
+                Ok(Text(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Text, E> {
+                Ok(Text(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Text, E> {
+                Ok(Text(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Text, E> {
+                Ok(Text(None))
+            }
+            fn visit_unit<E>(self) -> Result<Text, E> {
+                Ok(Text(None))
+            }
+            fn visit_none<E>(self) -> Result<Text, E> {
+                Ok(Text(None))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Text, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(Text(None))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Text, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(Text(None))
+            }
+        }
+        deserializer.deserialize_any(TextVisitor)
+    }
 }
 
 fn reject_crlf(val: &str, field: &str) -> Result<(), String> {
@@ -225,25 +336,36 @@ fn base64_standard(input: &[u8]) -> String {
     out
 }
 
-// base64url (no padding) for the Gmail messages.send `raw` field.
-fn base64url_encode(input: &[u8]) -> String {
-    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(A[((n >> 18) & 63) as usize] as char);
-        out.push(A[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(A[((n >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(A[(n & 63) as usize] as char);
-        }
+// base64url (no padding) for the Gmail messages.send `raw` field, appended to
+// `out` as bytes. Three input bytes at a time, four table lookups, no
+// per-character `String::push`.
+fn base64url_encode_into(input: &[u8], out: &mut Vec<u8>) {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut chunks = input.chunks_exact(3);
+    for chunk in &mut chunks {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[2] as u32;
+        out.extend_from_slice(&[
+            A[((n >> 18) & 63) as usize],
+            A[((n >> 12) & 63) as usize],
+            A[((n >> 6) & 63) as usize],
+            A[(n & 63) as usize],
+        ]);
     }
-    out
+    match *chunks.remainder() {
+        [b0] => {
+            let n = (b0 as u32) << 16;
+            out.extend_from_slice(&[A[((n >> 18) & 63) as usize], A[((n >> 12) & 63) as usize]]);
+        }
+        [b0, b1] => {
+            let n = ((b0 as u32) << 16) | ((b1 as u32) << 8);
+            out.extend_from_slice(&[
+                A[((n >> 18) & 63) as usize],
+                A[((n >> 12) & 63) as usize],
+                A[((n >> 6) & 63) as usize],
+            ]);
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +488,54 @@ mod tests {
         send(config(), json!({ "subject": "Café ☕", "html": "<p>b</p>" })).unwrap();
         let message = sent_message();
         assert!(message.contains("Subject: =?UTF-8?B?"), "{message}");
+    }
+
+    /// RFC 4648 section 10's vectors, unpadded: every remainder length.
+    #[test]
+    fn the_encoder_matches_the_published_vectors() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg"),
+            ("fo", "Zm8"),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg"),
+            ("fooba", "Zm9vYmE"),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            let mut out = Vec::new();
+            base64url_encode_into(plain.as_bytes(), &mut out);
+            assert_eq!(String::from_utf8(out).unwrap(), encoded, "{plain}");
+        }
+        // The two characters that differ from standard base64.
+        let mut out = Vec::new();
+        base64url_encode_into(&[0xfb, 0xff, 0xfe], &mut out);
+        assert_eq!(out, b"-__-");
+    }
+
+    /// The composer's other fields are skipped, whatever they hold, and a
+    /// field of the wrong type where a string belongs reads as absent.
+    #[test]
+    fn fields_the_module_does_not_read_do_not_disturb_it() {
+        host::http::respond(200, r#"{"id":"x"}"#);
+        let v = send(
+            config(),
+            json!({
+                "subject": "s",
+                "html": "<p>b</p>",
+                "notification": { "title": "t", "actions": [1, 2, { "deep": [null] }] },
+                "__action_links_report__": { "minted": 2 },
+                "rows": [[1, 2], [3, 4]],
+            }),
+        )
+        .unwrap();
+        assert_eq!(v["sent"], json!(true));
+        assert!(sent_message().ends_with("\r\n\r\n<p>b</p>"));
+
+        // `subject` as an object is "no subject given", not a parse failure.
+        let mut dry = config();
+        dry["DRY_RUN"] = json!(true);
+        let v = send(dry, json!({ "subject": { "text": "s" }, "html": "<p>b</p>" })).unwrap();
+        assert_eq!(v["subject"], json!("(no subject)"));
     }
 
     /// The platform retries a timeout or a network error, and the message is

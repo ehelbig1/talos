@@ -1,0 +1,15 @@
+[
+  {
+    "method": "POST",
+    "url_contains": "gmail.googleapis.com/gmail/v1/users/me/messages/send",
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "id": "made-up-message-id",
+      "threadId": "made-up-thread-id",
+      "labelIds": ["SENT"]
+    }
+  }
+]
