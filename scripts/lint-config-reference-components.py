@@ -244,20 +244,101 @@ COMMENT_LINE = re.compile(r"(?m)^\s*//.*$")
 
 
 def load_sources(root):
-    r = sh(["git", "ls-files", "*.rs"], root)
-    if r.returncode != 0:
+    """The production `.rs` files of the WORKING TREE: every tracked file, and
+    every file git does not track yet and does not ignore. Returns the sources
+    and the list of the second kind.
+
+    Until 2026-10-12 this read tracked files only. A crate written and not yet
+    `git add`ed was invisible, so its environment read was reported as read by
+    "nothing" and the row that documents it as a lie — on a tree whose only
+    fault was that nothing had been staged. `cargo tree`, which names the
+    crates each binary links, reads the working tree; the two halves of one
+    check disagreed about which tree they were looking at.
+
+    What CI checks out has no untracked files, so there this is the same set
+    as before. Locally the untracked files are NAMED in the summary line
+    ([`untracked_note`]): a green run that depended on a file nobody adds is a
+    red run in CI, and the line is what says so."""
+    tracked = sh(["git", "ls-files", "*.rs"], root)
+    untracked = sh(["git", "ls-files", "--others", "--exclude-standard", "*.rs"], root)
+    if tracked.returncode != 0 or untracked.returncode != 0:
         print("✗ git ls-files failed", file=sys.stderr)
         sys.exit(2)
     out = {}
-    for p in r.stdout.split():
-        if is_test_path(p):
-            continue
-        try:
-            with open(os.path.join(root, p), encoding="utf-8", errors="ignore") as fh:
-                out[p] = COMMENT_LINE.sub("", fh.read())
-        except OSError:
-            continue
-    return out
+    not_added = []
+    for listing, is_untracked in ((tracked.stdout, False), (untracked.stdout, True)):
+        for p in listing.splitlines():
+            if not p or is_test_path(p):
+                continue
+            try:
+                with open(os.path.join(root, p), encoding="utf-8", errors="ignore") as fh:
+                    out[p] = COMMENT_LINE.sub("", fh.read())
+            except OSError:
+                continue
+            if is_untracked:
+                not_added.append(p)
+    return out, sorted(not_added)
+
+
+def untracked_note(not_added):
+    """What the summary line says about files git does not track yet. Empty
+    when there are none, so a clean tree's line is the one it always was."""
+    if not not_added:
+        return ""
+    shown = ", ".join(not_added[:5])
+    more = f" and {len(not_added) - 5} more" if len(not_added) > 5 else ""
+    return (
+        f"; read {len(not_added)} .rs file(s) git does not track yet ({shown}{more})"
+        " — `git add` them, CI sees only what is committed"
+    )
+
+
+def self_test():
+    """`load_sources` over a throwaway repository: a tracked file, a file not
+    yet added, an ignored file and an untracked test file."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as root:
+        def git(*args):
+            r = subprocess.run(
+                ["git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", *args],
+                cwd=root, capture_output=True, text=True,
+            )
+            assert r.returncode == 0, r.stderr
+        def write(rel, text):
+            path = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        git("init", "-q")
+        write("committed/src/lib.rs", '// a comment\nlet a = std::env::var("COMMITTED_KNOB");\n')
+        write(".gitignore", "scratch/\n")
+        git("add", "-A")
+        git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "one")
+        write("new-crate/src/lib.rs", 'let b = std::env::var("NEW_CRATE_KNOB");\n')
+        write("new-crate/tests/it.rs", 'let c = std::env::var("TEST_ONLY_KNOB");\n')
+        write("scratch/src/lib.rs", 'let d = std::env::var("IGNORED_KNOB");\n')
+
+        sources, not_added = load_sources(root)
+        assert set(sources) == {"committed/src/lib.rs", "new-crate/src/lib.rs"}, sorted(sources)
+        assert not_added == ["new-crate/src/lib.rs"], not_added
+        # The read in the file nobody has added is a read: this is the case
+        # that was reported as read by "nothing".
+        assert "NEW_CRATE_KNOB" in sources["new-crate/src/lib.rs"]
+        assert "a comment" not in sources["committed/src/lib.rs"]
+
+        # Once added it is no longer called out; it is still read.
+        git("add", "new-crate/src/lib.rs")
+        sources, not_added = load_sources(root)
+        assert "new-crate/src/lib.rs" in sources and not_added == [], not_added
+
+    assert untracked_note([]) == ""
+    one = untracked_note(["a/src/lib.rs"])
+    assert "1 .rs file(s) git does not track yet (a/src/lib.rs)" in one and "git add" in one, one
+    many = untracked_note([f"c{i}/src/lib.rs" for i in range(8)])
+    assert "8 .rs file(s)" in many and "and 3 more" in many and "c5/" not in many, many
+    print("ok")
 
 
 def parse_rows(root):
@@ -310,6 +391,9 @@ def accessors(sources):
 
 
 def main():
+    if "--self-test" in sys.argv:
+        self_test()
+        return
     argv = [a for a in sys.argv[1:] if not a.startswith("--")]
     report = "--report" in sys.argv
     root = os.path.abspath(argv[0] if argv else ".")
@@ -318,7 +402,7 @@ def main():
     if not ctl or not wrk:
         print("✗ cargo tree resolved an empty crate set — the check would pass over nothing", file=sys.stderr)
         sys.exit(2)
-    sources = load_sources(root)
+    sources, not_added = load_sources(root)
     if len(sources) < 100:
         print(f"✗ only {len(sources)} production .rs files found — wrong root?", file=sys.stderr)
         sys.exit(2)
@@ -409,7 +493,7 @@ def main():
     findings.extend(undoc)
     for f in findings:
         print(f)
-    print(f"  checked {len(rows) - skipped} row(s) ({skipped} out of range); {n_reads} distinct env reads in production code; worker tree {len(wrk)} crates, controller tree {len(ctl)}; {len(findings)} finding(s)")
+    print(f"  checked {len(rows) - skipped} row(s) ({skipped} out of range); {n_reads} distinct env reads in production code; worker tree {len(wrk)} crates, controller tree {len(ctl)}; {len(findings)} finding(s){untracked_note(not_added)}")
     sys.exit(1 if findings else 0)
 
 

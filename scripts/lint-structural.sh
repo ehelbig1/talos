@@ -9157,6 +9157,13 @@ bold "▶ check 89: a configuration-reference Component cell must not claim a pr
 # inspector and its host-side env reads run only in the worker — so `worker`
 # rows read there stay `worker`, and `both` rows whose only worker-side
 # evidence is a shared crate PASS (a stated false-negative direction).
+# The production `.rs` set is the WORKING TREE (2026-10-12): tracked files
+# and files git does not track yet and does not ignore. It was tracked files
+# only, so a new crate's environment read was "read by nothing" until
+# `git add`, while `cargo tree` (which reads the working tree) already listed
+# the crate. Under CI the two sets are the same. Locally the summary line
+# NAMES each untracked file read, because a pass that rests on a file nobody
+# adds is a failure in CI.
 # Measured on pristine main after #834: 117 findings (115 "worker cannot read
 # it", 1 crate-named row read by the controller bin, 1 `controller` row the
 # worker bin reads), 0 on the fixed tree; mutation-proved in both arms.
