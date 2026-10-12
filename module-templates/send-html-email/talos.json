@@ -2,7 +2,7 @@
   "name": "send-html-email",
   "version": "v1.0.0",
   "display_name": "Send HTML Email (Gmail)",
-  "description": "Delivery-pattern HTML email sender. Reads {html, subject} from the upstream node's output, RFC 2047-encodes non-ASCII subjects, and POSTs an HTML message to the Gmail API using a Bearer token (a vault:// reference in AUTH_HEADER is resolved host-side). DRY_RUN gates the send. `skip: true` from the upstream node sends nothing; an input with no `html` is an error, never a blank email. Pair with a compose node (memory, no network) per the two-node delivery pattern.",
+  "description": "Delivery-pattern HTML email sender. Reads {html, subject} from the upstream node's output, RFC 2047-encodes non-ASCII subjects, and POSTs an HTML message to the Gmail API using a Bearer token (a vault:// reference in AUTH_HEADER is resolved host-side). DRY_RUN gates the send. `skip: true` from the upstream node sends nothing; an input with no `html` is an error, never a blank email. Costs about 55 fuel per byte of `html`; the default limit is sized for a message of up to 60 KB, so set the node's `max_fuel` higher for a longer one. Pair with a compose node (memory, no network) per the two-node delivery pattern.",
   "category": "Communication",
   "capability_world": "http-node",
   "block": {"role": "sender"},
@@ -12,6 +12,13 @@
   ],
   "requires_secrets": ["oauth/gmail/*"],
   "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 1,
+    "bytes_per_item": 60000,
+    "fuel_per_byte": 55,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 1.5
+  },
   "config_schema": {
     "type": "object",
     "required": ["AUTH_HEADER", "TO"],
