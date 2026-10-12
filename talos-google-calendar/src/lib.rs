@@ -75,6 +75,9 @@ pub struct WatchChannel {
     pub verification_token: String,
     pub is_active: bool,
     pub module_id: Option<Uuid>, // WASM module to execute when webhook arrives
+    /// The workflow a change on this calendar starts, when the owner bound one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -96,6 +99,7 @@ impl std::fmt::Debug for WatchChannel {
             .field("verification_token", &"[REDACTED]")
             .field("is_active", &self.is_active)
             .field("module_id", &self.module_id)
+            .field("workflow_id", &self.workflow_id)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish()

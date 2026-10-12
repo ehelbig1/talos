@@ -89,10 +89,23 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_push_channels",
-            "description": "List every push channel (Gmail watch, Google Calendar watch, Google Cloud Pub/Sub subscription) you own, with its WASM module binding CLASSIFIED. A push channel may bind a module — one inbound event, one dispatched module job — and until 2026-09-08 nothing validated that binding at create time and no operator surface ever read it back, so a channel bound to a module that no longer exists looked healthy while EVERY push to it failed at module load. `module_binding` is four-valued: none (binds no module — pushes are acked and nothing runs), bound, missing (THE FINDING: every push fails), unreadable (the module lookup did not answer — a statement about the query, not about the channel). Returns no push token and no push endpoint; the owning user gets the endpoint from the create response and the per-integration REST list. Deliberately separate from list_workflow_triggers, which is keyed by WORKFLOW: a push channel binds a MODULE and has no workflow.",
+            "description": "List every push channel (Gmail watch, Google Calendar watch, Google Cloud Pub/Sub subscription) you own, with its WASM module binding CLASSIFIED. A push channel may bind a module — one inbound event, one dispatched module job — and until 2026-09-08 nothing validated that binding at create time and no operator surface ever read it back, so a channel bound to a module that no longer exists looked healthy while EVERY push to it failed at module load. `module_binding` is four-valued: none (binds no module — pushes run no module; see `workflow_id`), bound, missing (THE FINDING: every push fails), unreadable (the module lookup did not answer — a statement about the query, not about the channel). Returns no push token and no push endpoint; the owning user gets the endpoint from the create response and the per-integration REST list. Deliberately separate from list_workflow_triggers, which is keyed by WORKFLOW. A Google Calendar channel may ALSO start a workflow (set_push_channel_workflow); a row then carries `workflow_id`, independent of `module_binding`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "set_push_channel_workflow",
+            "description": "Bind the workflow a push on one of your push channels starts, or clear the binding (workflow_id: null). Supported for Google Calendar watch channels (integration: \"gcal\"): when the calendar changes, the workflow is started once through the same gates as trigger_workflow (the execution pause, whether the workflow is live, its actor's budget and ceilings, its input schema, its concurrency limit). Its trigger input is `{calendar_push: {integration_id, channel_id, calendar_id, changed, event_ids, truncated}}` — event IDS only, at most 50; no title, time or guest travels in the trigger, so the workflow reads the calendar itself. A start that is refused is not retried (the channel's sync position has already moved): it is recorded in the calendar audit log with a reason, so write the workflow to be safe to run again and give it a schedule as a catch-up. The binding survives the channel's weekly renewal, but a renewal gives the channel a NEW channel_id: read list_push_channels again before changing a binding. The workflow must be your own.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "integration": { "type": "string", "description": "The channel's integration, as list_push_channels names it. Only \"gcal\" channels can start a workflow." },
+                    "channel_id": { "type": "string", "description": "The channel's id, from list_push_channels." },
+                    "workflow_id": { "type": ["string", "null"], "description": "The workflow to start, or null to clear the binding." }
+                },
+                "required": ["integration", "channel_id", "workflow_id"]
             }
         }),
         serde_json::json!({

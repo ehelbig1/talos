@@ -88,6 +88,12 @@ pub struct WatchChannelRow {
     /// 2026-10-08, so those keep the exact bytes they had.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewed_from: Option<Uuid>,
+    /// The workflow a change on this calendar starts, when the owner bound
+    /// one ([`bind_channel_workflow`]). Absent from every row written before
+    /// 2026-10-12 and from a row with no binding, so those keep the exact
+    /// bytes they had. A renewal carries it to the row that replaces this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<Uuid>,
 }
 
 impl WatchChannelRow {
@@ -109,6 +115,7 @@ impl WatchChannelRow {
             verification_token: user_id.to_string(),
             is_active: true, // rows in integration_state are live by definition
             module_id: self.module_id,
+            workflow_id: self.workflow_id,
             created_at: DateTime::<Utc>::from_timestamp_millis(self.created_at_ms)
                 .unwrap_or_else(Utc::now),
             updated_at: DateTime::<Utc>::from_timestamp_millis(self.updated_at_ms)
@@ -165,6 +172,120 @@ fn advanced_message_number(
 fn decode_row(entry: &StoredEntry) -> Result<WatchChannelRow> {
     serde_json::from_str(&entry.value)
         .context("failed to decode gcal watch channel JSON from integration_state")
+}
+
+/// Why a workflow could not be bound to a watch channel.
+///
+/// The caller is told ONE thing for "no such workflow" and "not yours" (an
+/// enumeration oracle otherwise); the operator's log line tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindWorkflowRefusal {
+    /// No such channel for this user (never created, stopped, or replaced by
+    /// a renewal — list the channels again).
+    ChannelNotFound,
+    /// The workflow does not exist for this user.
+    WorkflowNotBindable,
+    /// The workflow or the channel could not be read. Nothing was changed.
+    Unreadable,
+}
+
+impl BindWorkflowRefusal {
+    #[must_use]
+    pub fn user_facing_message(self) -> &'static str {
+        match self {
+            Self::ChannelNotFound => "No such watch channel. List your channels again: a renewal gives a channel a new id.",
+            Self::WorkflowNotBindable => "No such workflow.",
+            Self::Unreadable => "The binding could not be checked, so nothing was changed. Try again.",
+        }
+    }
+}
+
+impl std::fmt::Display for BindWorkflowRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.user_facing_message())
+    }
+}
+impl std::error::Error for BindWorkflowRefusal {}
+
+/// Bind the workflow a change on this channel's calendar starts, or clear the
+/// binding (`None`).
+///
+/// * The workflow must be one `user_id` owns — asked of the SAME repository
+///   read the trigger path uses, so "bindable" and "this user may start it"
+///   cannot drift apart. The trigger checks ownership again at every push;
+///   this check is what stops a binding that could never fire.
+/// * Only the binding changes, under the row lock: a concurrent message-number
+///   or sync-token write is never reverted, and a channel a concurrent stop
+///   deleted is not re-created. `updated_at_ms` is left alone — it is what the
+///   inventory shows as the channel's last EVENT, and a binding is not one.
+/// * A free function over the pool, so the owner-facing REST handler and the
+///   operator inventory (which holds no service handle) bind the same way.
+pub async fn bind_channel_workflow(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    channel_uuid: Uuid,
+    workflow_id: Option<Uuid>,
+) -> std::result::Result<WatchChannel, BindWorkflowRefusal> {
+    if let Some(workflow_id) = workflow_id {
+        let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
+        match repo.get_workflow(workflow_id, user_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!(
+                    target: "talos_audit",
+                    event_kind = "gcal_watch_workflow_binding_refused",
+                    %user_id,
+                    %workflow_id,
+                    "refusing to bind a watch channel to a workflow this user does not own"
+                );
+                return Err(BindWorkflowRefusal::WorkflowNotBindable);
+            }
+            Err(e) => {
+                tracing::error!(%user_id, %workflow_id, error = %e, "gcal watch binding: workflow read failed");
+                return Err(BindWorkflowRefusal::Unreadable);
+            }
+        }
+    }
+
+    let store = ChannelStore::new(pool.clone(), GCAL_INTEGRATION_NAME, CHANNEL_KEY_PREFIX);
+    let mut bound: Option<WatchChannelRow> = None;
+    let outcome = store
+        .update_existing(user_id, channel_uuid, |entry| {
+            let mut row = decode_row(entry)?;
+            row.workflow_id = workflow_id;
+            let update = replace_with(&row)?;
+            bound = Some(row);
+            Ok(update)
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!(%user_id, channel = %channel_uuid, error = %e, "gcal watch binding: channel update failed");
+            BindWorkflowRefusal::Unreadable
+        })?;
+    let row = match (outcome, bound) {
+        (UpdateOutcome::Absent, _) | (_, None) => return Err(BindWorkflowRefusal::ChannelNotFound),
+        (_, Some(row)) => row,
+    };
+
+    // A durable record of what a push on this calendar will start. Losing it
+    // is a visibility loss, not a correctness one, so it does not fail the bind.
+    if let Err(e) = insert_channel_audit(
+        pool,
+        ChannelAuditEvent {
+            integration_id: Some(row.integration_id),
+            user_id,
+            event_type: if workflow_id.is_some() { "workflow_bound" } else { "workflow_unbound" },
+            target: Some(&row.calendar_id),
+            success: true,
+            error_message: None,
+            metadata: serde_json::json!({ "channel_uuid": row.id.to_string(), "workflow_id": workflow_id }),
+        },
+    )
+    .await
+    {
+        tracing::warn!(channel = %row.id, error = %e, "gcal workflow binding audit log insert failed");
+    }
+    Ok(row.to_watch_channel(user_id))
 }
 
 /// Resolve `(integration_id) -> user_id` once up-front. Every gcal
@@ -292,6 +413,8 @@ impl GoogleCalendarService {
             calendar_id,
             webhook_url,
             module_id,
+            // A first create binds no workflow; `bind_channel_workflow` does.
+            None,
             None,
             None,
         )
@@ -317,6 +440,11 @@ impl GoogleCalendarService {
         calendar_id: &str,
         webhook_url: &str,
         module_id: Option<Uuid>,
+        // The workflow the replaced row started; `None` for a first create.
+        // A required argument so a renewal cannot forget the binding: a
+        // channel that silently stops starting its workflow a week after it
+        // was bound is the failure this is here to make impossible.
+        workflow_id: Option<Uuid>,
         preserved_sync_token: Option<String>,
         // The row a renewal is replacing; `None` for a first create.
         renewed_from: Option<Uuid>,
@@ -380,6 +508,7 @@ impl GoogleCalendarService {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             renewed_from,
+            workflow_id,
         };
 
         self.upsert_channel_row(user_id, &row).await.map_err(|e| {
@@ -436,6 +565,7 @@ impl GoogleCalendarService {
                     "resource_id": row.resource_id,
                     "expiration": row.expiration_ms,
                     "module_id": row.module_id,
+                    "workflow_id": row.workflow_id,
                     "preserved_sync_token": preserved_sync_token.is_some(),
                 }),
             },
@@ -617,6 +747,7 @@ impl GoogleCalendarService {
         let calendar_id = old_row.calendar_id.clone();
         let webhook_url = old_row.webhook_url.clone();
         let module_id = old_row.module_id;
+        let workflow_id = old_row.workflow_id;
         let sync_token = old_row.sync_token.clone();
         let old_google_channel_id = old_row.channel_id.clone();
         self.delete_channel_row(user_id, old_row.id).await?;
@@ -632,6 +763,7 @@ impl GoogleCalendarService {
                 &calendar_id,
                 &webhook_url,
                 module_id,
+                workflow_id,
                 sync_token,
                 Some(channel_id),
             )
@@ -796,7 +928,9 @@ impl GoogleCalendarService {
             })?;
         let access_token = self.get_access_token(&integration_obj).await?;
 
-        let api_client = GoogleCalendarApiClient::new();
+        // The same client the create/renew paths use: Google's, unless a test
+        // pointed this service at a stand-in.
+        let api_client = self.watch_api_client();
         let (events, new_sync_token) = api_client
             .sync_events(&access_token, &row.calendar_id, row.sync_token.as_deref())
             .await
@@ -1123,6 +1257,77 @@ mod hot_path_tests {
         assert_eq!(read.renewed_from, Some(replaced));
     }
 
+    /// The same for `workflow_id`: a row written before the field existed
+    /// reads back with no binding, a row with no binding is written exactly
+    /// as it was, and a binding survives the round trip.
+    #[test]
+    fn a_row_without_a_workflow_reads_back_and_is_written_unchanged() {
+        let before = serde_json::json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "integration_id": "22222222-2222-4222-8222-222222222222",
+            "calendar_id": "primary",
+            "channel_id": "33333333-3333-4333-8333-333333333333",
+            "resource_id": "resource-1",
+            "webhook_url": "https://hooks.example.com/api/google-calendar/webhook",
+            "expiration_ms": 1_800_000_000_000_i64,
+            "sync_token": "tok",
+            "module_id": null,
+            "last_message_number": 7,
+            "created_at_ms": 1_700_000_000_000_i64,
+            "updated_at_ms": 1_700_000_000_000_i64
+        });
+        let row: WatchChannelRow = serde_json::from_value(before.clone()).expect("an old row");
+        assert_eq!(row.workflow_id, None);
+        assert_eq!(serde_json::to_value(&row).expect("serialize"), before);
+        assert_eq!(row.to_watch_channel(Uuid::nil()).workflow_id, None);
+
+        let workflow = Uuid::new_v4();
+        let bound = WatchChannelRow {
+            workflow_id: Some(workflow),
+            ..row
+        };
+        let written = serde_json::to_value(&bound).expect("serialize");
+        assert_eq!(written["workflow_id"], serde_json::json!(workflow));
+        let read: WatchChannelRow = serde_json::from_value(written).expect("a bound row");
+        assert_eq!(read.workflow_id, Some(workflow));
+        assert_eq!(
+            read.to_watch_channel(Uuid::nil()).workflow_id,
+            Some(workflow)
+        );
+    }
+
+    /// Source pin: a renewal hands the replaced row's workflow to the row that
+    /// replaces it. Dropped, a channel would stop starting its workflow at its
+    /// first weekly renewal, with nothing failing.
+    #[test]
+    fn a_renewal_carries_the_workflow_binding() {
+        let src = include_str!("watch.rs");
+        let body = &src[src.find("pub async fn renew_watch_channel").unwrap()..];
+        let body = &body[..body.find("\n    pub async fn ").unwrap()];
+        assert!(body.contains("let workflow_id = old_row.workflow_id;"));
+        let call = &body[body.find("create_fresh_watch_channel_locked(").unwrap()..];
+        let call = &call[..call.find(".await").unwrap()];
+        assert!(call.contains("workflow_id,"), "{call}");
+    }
+
+    /// The caller cannot tell "no such workflow" from "not yours".
+    #[test]
+    fn a_binding_refusal_does_not_say_whose_the_workflow_is() {
+        let said = BindWorkflowRefusal::WorkflowNotBindable.user_facing_message();
+        assert_eq!(said, "No such workflow.");
+        for r in [
+            BindWorkflowRefusal::ChannelNotFound,
+            BindWorkflowRefusal::WorkflowNotBindable,
+            BindWorkflowRefusal::Unreadable,
+        ] {
+            let m = r.user_facing_message().to_lowercase();
+            assert!(
+                !m.contains("owner") && !m.contains("another user") && !m.contains("permission"),
+                "{m}"
+            );
+        }
+    }
+
     fn row(last: i64) -> WatchChannelRow {
         WatchChannelRow {
             id: Uuid::nil(),
@@ -1138,6 +1343,7 @@ mod hot_path_tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             renewed_from: None,
+            workflow_id: None,
         }
     }
 

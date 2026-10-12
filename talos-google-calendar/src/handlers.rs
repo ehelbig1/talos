@@ -10,6 +10,9 @@ use axum::{
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use talos_execution_orchestration::{
+    ExecutionOrchestrationService, OrchestrationError, TriggerInput, TriggerOutcome,
+};
 use talos_integration_helpers::api_json::ApiJson;
 use talos_module_executions::{LogLevel, ModuleExecutionService, TriggerType};
 use talos_registry::ModuleRegistry;
@@ -467,6 +470,9 @@ pub async fn webhook_notification_handler(
     // RFC 0010 P3 (M4): the shared claim-based-sealing handle, layered as an
     // Extension by the controller. `None` when sealing is off or unconfigured.
     Extension(sealing_handle): Extension<Option<talos_integration_helpers::ModuleSealingHandle>>,
+    // The shared trigger service, layered on the app: a channel bound to a
+    // WORKFLOW starts it through the same gates as any other trigger.
+    Extension(orchestration): Extension<Option<Arc<ExecutionOrchestrationService>>>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     // Explicitly annotate types to help compiler
@@ -599,6 +605,10 @@ pub async fn webhook_notification_handler(
     let channel_uuid = watch.id;
     let module_id = watch.module_id;
     let integration_uuid = watch.integration_id;
+    let bound_workflow = watch.workflow_id.map(|workflow_id| BoundWorkflow {
+        workflow_id,
+        calendar_id: watch.calendar_id.clone(),
+    });
 
     // The deployment-wide execution pause (package BG). HERE — before the
     // message-number dedup below and before the spawned task that advances the
@@ -606,11 +616,15 @@ pub async fn webhook_notification_handler(
     // notification as handled: a 503 after them would be retried by Google
     // and then skipped as a duplicate, i.e. DROPPED. Google retries a 503 with
     // exponential backoff, so the notification is deferred, not dropped (the
-    // operator's decision, 2026-09-14). Only a watch bound to a module starts
-    // work; the `sync` handshake starts none.
+    // operator's decision, 2026-09-14). Only a watch bound to a module or a
+    // workflow starts work; the `sync` handshake starts none.
     let pause = talos_execution_pause::push_admission(
         &service.db_pool,
-        gcal_webhook_starts_work(module_id, resource_state.as_deref()),
+        gcal_webhook_starts_work(
+            module_id,
+            bound_workflow.as_ref().map(|b| b.workflow_id),
+            resource_state.as_deref(),
+        ),
         talos_execution_pause::PauseGatePath::GcalPush,
     )
     .await;
@@ -666,6 +680,7 @@ pub async fn webhook_notification_handler(
     let secrets_clone = secrets_manager.clone();
     let worker_mgr_clone = worker_manager.clone();
     let sealing_clone = sealing_handle.clone();
+    let orchestration_clone = orchestration.clone();
 
     tokio::spawn(async move {
         if is_initial_sync {
@@ -697,6 +712,8 @@ pub async fn webhook_notification_handler(
             secrets_clone,
             worker_mgr_clone,
             sealing_clone,
+            bound_workflow,
+            orchestration_clone,
         )
         .await
         {
@@ -846,6 +863,62 @@ pub async fn renew_watch_channel_handler(
                     success: false,
                     data: None,
                     error: Some("Failed to renew watch channel".to_string()),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BindWorkflowRequest {
+    /// The workflow a change on this calendar starts; `null` clears the binding.
+    pub workflow_id: Option<Uuid>,
+}
+
+/// PUT /api/google-calendar/watch-channels/:channel_uuid/workflow
+///
+/// Bind (or clear) the workflow a change on this channel's calendar starts.
+/// Behind session auth; the workflow must be the caller's own. "No such
+/// workflow" and "not yours" are one answer.
+pub async fn bind_workflow_handler(
+    State(service): State<Arc<GoogleCalendarService>>,
+    Extension(user_id): Extension<Uuid>,
+    Path(channel_uuid): Path<Uuid>,
+    ApiJson(req): ApiJson<BindWorkflowRequest>,
+) -> impl IntoResponse {
+    use crate::watch::BindWorkflowRefusal;
+    match crate::watch::bind_channel_workflow(
+        &service.db_pool,
+        user_id,
+        channel_uuid,
+        req.workflow_id,
+    )
+    .await
+    {
+        Ok(ch) => Json(ApiResponse {
+            success: true,
+            data: Some(serde_json::json!({
+                "channel_uuid": ch.id,
+                "calendar_id": ch.calendar_id,
+                "workflow_id": ch.workflow_id,
+            })),
+            error: None,
+        })
+        .into_response(),
+        Err(refusal) => {
+            let status = match refusal {
+                BindWorkflowRefusal::ChannelNotFound | BindWorkflowRefusal::WorkflowNotBindable => {
+                    StatusCode::NOT_FOUND
+                }
+                BindWorkflowRefusal::Unreadable => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (
+                status,
+                Json(ApiResponse::<serde_json::Value> {
+                    success: false,
+                    data: None,
+                    error: Some(refusal.user_facing_message().to_string()),
                 }),
             )
                 .into_response()
@@ -1193,9 +1266,177 @@ pub async fn client_config_handler(
 /// execution pause. Pure, so the rule is unit-tested.
 pub(crate) fn gcal_webhook_starts_work(
     module_id: Option<Uuid>,
+    workflow_id: Option<Uuid>,
     resource_state: Option<&str>,
 ) -> bool {
-    module_id.is_some() && resource_state != Some("sync")
+    (module_id.is_some() || workflow_id.is_some()) && resource_state != Some("sync")
+}
+
+/// The workflow a watch channel starts, with the calendar it watches.
+#[derive(Debug, Clone)]
+pub struct BoundWorkflow {
+    pub workflow_id: Uuid,
+    pub calendar_id: String,
+}
+
+/// Most changed-event ids handed to a workflow in one start. A calendar that
+/// changed more than this in one push says so (`truncated`); the workflow
+/// reads the calendar itself for anything it needs.
+const MAX_PUSH_EVENT_IDS: usize = 50;
+
+/// What a workflow bound to a watch channel is started with: that this
+/// calendar changed, how much, and which events — BY ID ONLY.
+///
+/// No title, time, guest or description travels in the trigger. A trigger
+/// input is stored with its execution and shown wherever an execution is; the
+/// workflow reads what it needs from the calendar with its own grants, which
+/// is also what makes it safe to start the same workflow from a schedule (no
+/// push, no ids) as a catch-up.
+///
+/// An id is passed on only when it is a plain event id (letters, digits and
+/// `_`, at most 1024 characters): it may end up in a request path downstream.
+pub(crate) fn calendar_push_trigger_input(
+    integration_id: Uuid,
+    channel_uuid: Uuid,
+    calendar_id: &str,
+    events: &[Value],
+) -> Value {
+    let plain = |id: &&str| {
+        (5..=1024).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    let ids: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e.get("id").and_then(Value::as_str))
+        .filter(plain)
+        .collect();
+    serde_json::json!({
+        "calendar_push": {
+            "integration_id": integration_id,
+            "channel_id": channel_uuid,
+            "calendar_id": calendar_id,
+            "changed": events.len(),
+            "event_ids": ids.iter().take(MAX_PUSH_EVENT_IDS).collect::<Vec<_>>(),
+            "truncated": ids.len() > MAX_PUSH_EVENT_IDS || ids.len() < events.len(),
+        }
+    })
+}
+
+/// Why a bound workflow was not started, as a closed set of words for the
+/// audit row. The error itself goes to the server log only: it can carry a
+/// schema name or a query.
+fn trigger_refusal_reason(e: &OrchestrationError) -> &'static str {
+    match e {
+        OrchestrationError::WorkflowNotFound(_) => "workflow_not_found",
+        OrchestrationError::WorkflowNotLive(..)
+        | OrchestrationError::WorkflowDisabled(_)
+        | OrchestrationError::WorkflowArchived(_) => "workflow_not_live",
+        OrchestrationError::ExecutionPaused(_) => "execution_paused",
+        OrchestrationError::AuthorizationDenied(_) => "authorization_denied",
+        OrchestrationError::ConcurrencyLimitExceeded(_) => "concurrency_limit",
+        OrchestrationError::InvalidArgument(_) | OrchestrationError::ValidationFailed(_) => {
+            "input_refused"
+        }
+        _ => "trigger_failed",
+    }
+}
+
+/// Start the workflow a watch channel is bound to, once for this push.
+///
+/// Through [`ExecutionOrchestrationService::trigger`] — the platform pause,
+/// the workflow's ownership and liveness, its actor's budget and ceilings, its
+/// input schema and its concurrency limit all apply, exactly as for
+/// `trigger_workflow`. `user_id` is the one the channel's signed token
+/// attested to, so a channel can only ever start its own user's workflow.
+///
+/// A start that is refused is NOT retried: the sync token has already moved
+/// past these changes. It is recorded — a WARN and a row in the calendar audit
+/// log with a reason from a closed set — because a binding that silently
+/// starts nothing is the failure nobody would otherwise see. The workflow is
+/// expected to read the calendar and to be safe to run again (a catch-up).
+async fn start_bound_workflow(
+    pool: &sqlx::PgPool,
+    orchestration: Option<&Arc<ExecutionOrchestrationService>>,
+    user_id: Uuid,
+    integration_id: Uuid,
+    channel_uuid: Uuid,
+    bound: &BoundWorkflow,
+    events: &[Value],
+) {
+    let outcome = match orchestration {
+        None => Err("trigger_service_not_wired"),
+        Some(service) => match service
+            .trigger(TriggerInput {
+                workflow_id: bound.workflow_id,
+                user_id,
+                trigger_input: calendar_push_trigger_input(
+                    integration_id,
+                    channel_uuid,
+                    &bound.calendar_id,
+                    events,
+                ),
+                trigger_agent_id: None,
+                inject_memory_context: false,
+                dry_run: false,
+                wait_ms: None,
+            })
+            .await
+        {
+            Ok(TriggerOutcome::Dispatched(started)) => Ok(started.execution_id),
+            // Not reachable with `dry_run: false`; named so it is never read as a start.
+            Ok(TriggerOutcome::DryRun(_)) => Err("trigger_failed"),
+            Err(e) => {
+                tracing::warn!(
+                    channel = %channel_uuid,
+                    workflow_id = %bound.workflow_id,
+                    %user_id,
+                    error = %e,
+                    "gcal push: the bound workflow was not started"
+                );
+                Err(trigger_refusal_reason(&e))
+            }
+        },
+    };
+    match outcome {
+        Ok(execution_id) => tracing::info!(
+            event_kind = "gcal_push_started_workflow",
+            channel = %channel_uuid,
+            workflow_id = %bound.workflow_id,
+            %execution_id,
+            changed = events.len(),
+            "gcal push started its bound workflow"
+        ),
+        Err(reason) => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "gcal_push_workflow_not_started",
+                channel = %channel_uuid,
+                workflow_id = %bound.workflow_id,
+                %user_id,
+                reason,
+                "gcal push: bound workflow not started; these changes will not start it again"
+            );
+            if let Err(e) = talos_integration_helpers::audit::insert_channel_audit(
+                pool,
+                talos_integration_helpers::audit::ChannelAuditEvent {
+                    integration_id: Some(integration_id),
+                    user_id,
+                    event_type: "workflow_not_started",
+                    target: Some(&bound.calendar_id),
+                    success: false,
+                    error_message: Some(reason),
+                    metadata: serde_json::json!({
+                        "channel_uuid": channel_uuid.to_string(),
+                        "workflow_id": bound.workflow_id,
+                        "changed": events.len(),
+                    }),
+                },
+            )
+            .await
+            {
+                tracing::warn!(channel = %channel_uuid, error = %e, "gcal workflow_not_started audit log insert failed");
+            }
+        }
+    }
 }
 
 pub async fn process_webhook_events(
@@ -1216,6 +1457,9 @@ pub async fn process_webhook_events(
     // `Some` → register plaintext for a worker claim; `None` → inline WSK
     // envelope (byte-identical to pre-M4). Borrowed per-event inside the loop.
     sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle>,
+    // The workflow this channel starts, and the service that starts it.
+    bound_workflow: Option<BoundWorkflow>,
+    orchestration: Option<Arc<ExecutionOrchestrationService>>,
 ) -> Result<()> {
     tracing::debug!("🔄 Processing webhook events for channel {}", channel_uuid);
 
@@ -1235,6 +1479,21 @@ pub async fn process_webhook_events(
         events.len(),
         channel_uuid
     );
+
+    // 1b. A channel bound to a workflow starts it, once, for this batch.
+    //     Independent of a module binding: a channel may have either or both.
+    if let Some(bound) = bound_workflow.as_ref() {
+        start_bound_workflow(
+            &service.db_pool,
+            orchestration.as_ref(),
+            user_id,
+            integration_uuid,
+            channel_uuid,
+            bound,
+            &events,
+        )
+        .await;
+    }
 
     // 2. If no module_id, we're done (just synced for audit/history)
     let module_uuid = match module_id {
@@ -2203,6 +2462,130 @@ fn filter_events(events: &[Value], config: &Value) -> Vec<Value> {
 }
 
 #[cfg(test)]
+mod calendar_push_trigger_tests {
+    use super::{calendar_push_trigger_input, trigger_refusal_reason, MAX_PUSH_EVENT_IDS};
+    use serde_json::json;
+    use talos_execution_orchestration::OrchestrationError;
+    use uuid::Uuid;
+
+    /// What a bound workflow is started with: that the calendar changed, how
+    /// much, and the events by id. Nothing a calendar event SAYS is in it.
+    #[test]
+    fn the_trigger_names_changed_events_by_id_and_carries_none_of_their_content() {
+        let (integration, channel) = (Uuid::new_v4(), Uuid::new_v4());
+        let events = vec![
+            json!({"id": "evt1abc", "summary": "Performance review: Sam", "description": "private",
+                   "attendees": [{"email": "sam@corp.example"}], "location": "Room 4",
+                   "start": {"dateTime": "2026-10-14T10:00:00-04:00"}}),
+            json!({"id": "evt2abc_20261014T160000Z", "status": "cancelled"}),
+        ];
+        let input = calendar_push_trigger_input(integration, channel, "primary", &events);
+        assert_eq!(
+            input,
+            json!({"calendar_push": {
+                "integration_id": integration, "channel_id": channel, "calendar_id": "primary",
+                "changed": 2, "event_ids": ["evt1abc", "evt2abc_20261014T160000Z"], "truncated": false,
+            }})
+        );
+        let text = input.to_string();
+        for leaked in [
+            "Performance",
+            "private",
+            "sam@corp.example",
+            "Room 4",
+            "2026-10-14T10",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} travelled in the trigger");
+        }
+    }
+
+    /// An id that is not a plain event id is not passed on (it may reach a
+    /// request path downstream), and the trigger says the list is short.
+    #[test]
+    fn an_id_that_is_not_plain_is_left_out_and_the_list_is_marked_short() {
+        let events = vec![
+            json!({"id": "evt1abc"}),
+            json!({"id": "abc/../../users/me"}),
+            json!({"id": "abc?alt=media"}),
+            json!({"id": "ab"}),
+            json!({"id": 7}),
+            json!({"summary": "no id"}),
+        ];
+        let input = calendar_push_trigger_input(Uuid::nil(), Uuid::nil(), "primary", &events);
+        let push = &input["calendar_push"];
+        assert_eq!(push["event_ids"], json!(["evt1abc"]));
+        assert_eq!(
+            (push["changed"].as_u64(), push["truncated"].as_bool()),
+            (Some(6), Some(true))
+        );
+    }
+
+    #[test]
+    fn at_most_fifty_ids_travel_and_more_is_said() {
+        let many: Vec<_> = (0..MAX_PUSH_EVENT_IDS + 3)
+            .map(|i| json!({"id": format!("event{i:04}")}))
+            .collect();
+        let push = calendar_push_trigger_input(Uuid::nil(), Uuid::nil(), "primary", &many);
+        let push = &push["calendar_push"];
+        assert_eq!(
+            push["event_ids"].as_array().unwrap().len(),
+            MAX_PUSH_EVENT_IDS
+        );
+        assert_eq!(
+            (push["changed"].as_u64(), push["truncated"].as_bool()),
+            (Some(53), Some(true))
+        );
+        let exact: Vec<_> = (0..MAX_PUSH_EVENT_IDS)
+            .map(|i| json!({"id": format!("event{i:04}")}))
+            .collect();
+        assert_eq!(
+            calendar_push_trigger_input(Uuid::nil(), Uuid::nil(), "primary", &exact)
+                ["calendar_push"]["truncated"],
+            false
+        );
+        assert_eq!(
+            calendar_push_trigger_input(Uuid::nil(), Uuid::nil(), "primary", &[])["calendar_push"]
+                ["truncated"],
+            false
+        );
+    }
+
+    /// The audit row's reason is one of a closed set of words, never the
+    /// error's own text.
+    #[test]
+    fn a_refused_start_is_recorded_as_one_of_a_closed_set_of_reasons() {
+        let id = Uuid::nil();
+        for (error, reason) in [
+            (
+                OrchestrationError::WorkflowNotFound(id),
+                "workflow_not_found",
+            ),
+            (
+                OrchestrationError::WorkflowDisabled(id),
+                "workflow_not_live",
+            ),
+            (
+                OrchestrationError::InvalidArgument("SELECT secret FROM t".into()),
+                "input_refused",
+            ),
+            (
+                OrchestrationError::Internal(anyhow::anyhow!(
+                    "relation \"workflows\" does not exist"
+                )),
+                "trigger_failed",
+            ),
+        ] {
+            let said = trigger_refusal_reason(&error);
+            assert_eq!(said, reason);
+            assert!(
+                said.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{said}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod execution_pause_predicate_tests {
     use super::gcal_webhook_starts_work;
     use uuid::Uuid;
@@ -2210,12 +2593,33 @@ mod execution_pause_predicate_tests {
     #[test]
     fn only_a_module_bound_non_sync_notification_starts_work() {
         let m = Some(Uuid::new_v4());
-        assert!(gcal_webhook_starts_work(m, Some("exists")));
-        assert!(gcal_webhook_starts_work(m, None));
+        assert!(gcal_webhook_starts_work(m, None, Some("exists")));
+        assert!(gcal_webhook_starts_work(m, None, None));
         assert!(
-            !gcal_webhook_starts_work(m, Some("sync")),
+            !gcal_webhook_starts_work(m, None, Some("sync")),
             "the handshake runs nothing"
         );
-        assert!(!gcal_webhook_starts_work(None, Some("exists")), "unbound");
+        assert!(
+            !gcal_webhook_starts_work(None, None, Some("exists")),
+            "unbound"
+        );
+    }
+
+    /// A channel bound to a WORKFLOW starts work too, so it consults the
+    /// execution pause exactly as a module-bound one does. Left out of the
+    /// predicate, a paused deployment would answer Google 200, advance the
+    /// sync token, and have the trigger refuse — the change dropped, where a
+    /// 503 would have deferred it.
+    #[test]
+    fn a_workflow_bound_non_sync_notification_starts_work() {
+        let w = Some(Uuid::new_v4());
+        assert!(gcal_webhook_starts_work(None, w, Some("exists")));
+        assert!(gcal_webhook_starts_work(None, w, None));
+        assert!(gcal_webhook_starts_work(
+            Some(Uuid::new_v4()),
+            w,
+            Some("exists")
+        ));
+        assert!(!gcal_webhook_starts_work(None, w, Some("sync")));
     }
 }

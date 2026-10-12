@@ -139,6 +139,12 @@ pub struct PushChannelRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub module_name: Option<String>,
     pub module_binding: ModuleBinding,
+    /// The WORKFLOW a push on this channel starts, when the owner bound one.
+    /// Separate from the module binding: a channel may have either, both or
+    /// neither, and `module_binding: none` alone does not mean a push on it
+    /// starts nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,6 +185,47 @@ pub trait PushChannelInventory: Send + Sync {
     /// failed — a per-channel classification failure is
     /// [`ModuleBinding::Unreadable`] instead, and is not an error.
     async fn list_channels(&self, user_id: Uuid) -> anyhow::Result<Vec<PushChannelRow>>;
+
+    /// Bind (or, with `None`, clear) the workflow a push on one of this
+    /// user's channels starts. An integration whose channels cannot start a
+    /// workflow keeps this default and says so.
+    async fn bind_workflow(
+        &self,
+        _user_id: Uuid,
+        _channel_id: Uuid,
+        _workflow_id: Option<Uuid>,
+    ) -> Result<(), BindWorkflowRefusal> {
+        Err(BindWorkflowRefusal::NotSupported)
+    }
+}
+
+/// Why a workflow was not bound to a push channel. One closed set for every
+/// integration, so the tool that reports it words each case once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindWorkflowRefusal {
+    /// No inventory is wired for the named integration.
+    UnknownIntegration,
+    /// This integration's channels cannot start a workflow.
+    NotSupported,
+    /// No such channel for this user.
+    ChannelNotFound,
+    /// No such workflow for this user ("not yours" is the same answer).
+    WorkflowNotBindable,
+    /// The channel or the workflow could not be read; nothing was changed.
+    Unreadable,
+}
+
+impl BindWorkflowRefusal {
+    #[must_use]
+    pub fn user_facing_message(self) -> &'static str {
+        match self {
+            Self::UnknownIntegration => "No such push integration here. list_push_channels names the ones surveyed.",
+            Self::NotSupported => "Channels of this integration cannot start a workflow.",
+            Self::ChannelNotFound => "No such push channel. List your channels again: a renewal gives a channel a new id.",
+            Self::WorkflowNotBindable => "No such workflow.",
+            Self::Unreadable => "The binding could not be checked, so nothing was changed. Try again.",
+        }
+    }
 }
 
 /// The set of inventories wired into this process, as one injectable value.
@@ -250,6 +297,27 @@ impl PushChannelInventorySet {
                 .then_with(|| a.channel_id.cmp(&b.channel_id))
         });
         survey
+    }
+
+    /// Bind (or clear) the workflow a push on `channel_id` starts, through
+    /// the inventory that speaks for `integration`.
+    pub async fn bind_workflow(
+        &self,
+        integration: &str,
+        user_id: Uuid,
+        channel_id: Uuid,
+        workflow_id: Option<Uuid>,
+    ) -> Result<(), BindWorkflowRefusal> {
+        let Some(inventory) = self
+            .inventories
+            .iter()
+            .find(|i| i.integration_name() == integration)
+        else {
+            return Err(BindWorkflowRefusal::UnknownIntegration);
+        };
+        inventory
+            .bind_workflow(user_id, channel_id, workflow_id)
+            .await
     }
 }
 
@@ -411,6 +479,7 @@ mod tests {
             module_id,
             module_name: None,
             module_binding: binding,
+            workflow_id: None,
             created_at: None,
             last_event_at: None,
             recent_failure: None,

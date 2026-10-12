@@ -361,6 +361,13 @@ carries a `module_id` the caller supplies, two rules are not optional:
   `talos_registry::module_visibility::visible_module_names` and classify with
   `classify_module_binding`, which takes the lookup's OWN `Result` — a
   `.unwrap_or_default()` here renders a pool timeout as "the module is gone".
+* **A channel may also start a WORKFLOW** (Google Calendar today:
+  `set_push_channel_workflow`, `watch::bind_channel_workflow`). The binding is
+  a field on the channel row, separate from the module binding; the push
+  starts the workflow through the trigger service with event ids only. An
+  integration that adds this follows that shape: the binding carried by every
+  path that rewrites the row, the start made as the channel's own user, and a
+  refused start recorded with a reason.
 
 Why both: until 2026-09-08 all three integrations copied the caller's
 `module_id` straight into the row and the first thing that ever read it was

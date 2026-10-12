@@ -3463,6 +3463,10 @@ pub(crate) fn build_router(
             post(google_calendar::handlers::test_watch_channel_handler),
         )
         .route(
+            "/api/google-calendar/watch-channels/{channel_uuid}/workflow",
+            axum::routing::put(google_calendar::handlers::bind_workflow_handler),
+        )
+        .route(
             "/api/google-calendar/watch-channels/{channel_uuid}",
             axum::routing::delete(google_calendar::handlers::stop_watch_channel_handler),
         )
