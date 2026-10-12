@@ -137,5 +137,8 @@ tracing.workspace = true
 uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 talos-worker-runtime = { path = "../talos-worker-runtime" }
 
+[dev-dependencies]
+talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils" }
+
 [lints]
 workspace = true

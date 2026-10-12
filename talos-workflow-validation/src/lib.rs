@@ -4755,6 +4755,366 @@ pub fn build_test_assertions(
     (assertions, all_passed)
 }
 
+/// How a failed node was kept from failing its run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureHandling {
+    /// The node has `continue_on_error`; its children received the failure
+    /// envelope and ran.
+    ContinueOnError,
+    /// The node has an error edge; only that branch ran.
+    ErrorEdge,
+    /// The node's stored output carries an error marker and neither engine
+    /// envelope above.
+    ReportedInOutput,
+}
+
+impl FailureHandling {
+    /// The value in a `continued_failures` entry's `handling` field.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContinueOnError => "continue_on_error",
+            Self::ErrorEdge => "error_edge",
+            Self::ReportedInOutput => "reported_in_output",
+        }
+    }
+}
+
+/// A node that failed in a run that went on without it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuedFailure {
+    /// The node's label, as the run's output is keyed.
+    pub node: String,
+    pub handling: FailureHandling,
+    /// `talos_retry_intelligence::classify_error` over the node's error.
+    pub error_class: String,
+    /// The node's error, at most [`CONTINUED_FAILURE_MESSAGE_MAX`] bytes.
+    pub message: String,
+}
+
+impl ContinuedFailure {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "node": self.node,
+            "handling": self.handling.as_str(),
+            "error_class": self.error_class,
+            "message": self.message,
+        })
+    }
+}
+
+/// The longest error text a [`ContinuedFailure`] carries.
+pub const CONTINUED_FAILURE_MESSAGE_MAX: usize = 240;
+
+/// The most entries [`continued_failures`] returns; a graph has at most a few
+/// hundred nodes, and a reader needs the first few names.
+pub const CONTINUED_FAILURES_MAX: usize = 32;
+
+/// The nodes of a run that failed while the run itself went on.
+///
+/// `output` is a run's output keyed by node label: what `test_workflow`
+/// returns and what `workflow_executions.output_data` stores. A run reaches
+/// `completed` past a failed node in two ways the author asked for —
+/// `continue_on_error` and an error edge — and until 2026-10-12 nothing in a
+/// test result said so: `passed` compared the run's status with `completed`.
+/// A phone notification that ran out of fuel under `continue_on_error` was a
+/// passing test.
+///
+/// Whether a node's output reports an error is asked of the one classifier,
+/// [`talos_workflow_engine_core::reserved_keys::output_reports_error`].
+/// Entries are sorted by node label and capped at [`CONTINUED_FAILURES_MAX`].
+/// Only top-level node outputs are read: a failure inside a loop body or a
+/// sub-workflow shows as that node's own output, not as an entry here.
+pub fn continued_failures(output: &serde_json::Value) -> Vec<ContinuedFailure> {
+    use talos_workflow_engine_core::reserved_keys;
+    let Some(nodes) = output.as_object() else {
+        return Vec::new();
+    };
+    let mut failures: Vec<ContinuedFailure> = nodes
+        .iter()
+        // `__trigger_input__`, `__node_timings__`: the engine's own entries.
+        .filter(|(label, _)| !label.starts_with("__"))
+        .filter(|(_, node_output)| reserved_keys::output_reports_error(node_output))
+        .map(|(label, node_output)| {
+            let handling = if node_output
+                .get(reserved_keys::CONTINUED)
+                .is_some_and(|v| v.as_bool() == Some(true))
+            {
+                FailureHandling::ContinueOnError
+            } else if node_output.get("failed_node").is_some() {
+                FailureHandling::ErrorEdge
+            } else {
+                FailureHandling::ReportedInOutput
+            };
+            let reason = reserved_keys::error_reason(node_output).unwrap_or_default();
+            let mut end = reason.len().min(CONTINUED_FAILURE_MESSAGE_MAX);
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            ContinuedFailure {
+                node: label.clone(),
+                handling,
+                error_class: talos_retry_intelligence::classify_error(&reason),
+                message: reason[..end].to_string(),
+            }
+        })
+        .collect();
+    failures.sort_by(|a, b| a.node.cmp(&b.node));
+    failures.truncate(CONTINUED_FAILURES_MAX);
+    failures
+}
+
+/// What a `test_workflow` run amounted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestVerdict {
+    /// Every assertion held and no node failed.
+    Passed,
+    /// Every assertion held, and at least one node failed and was continued
+    /// past ([`continued_failures`]).
+    PassedWithFailures,
+    /// An assertion did not hold.
+    Failed,
+}
+
+impl TestVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::PassedWithFailures => "passed_with_failures",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn decide(assertions_held: bool, continued_failure_count: usize) -> Self {
+        match (assertions_held, continued_failure_count) {
+            (false, _) => Self::Failed,
+            (true, 0) => Self::Passed,
+            (true, _) => Self::PassedWithFailures,
+        }
+    }
+
+    /// The `passed` boolean of a `test_workflow` result.
+    ///
+    /// `passed_with_failures` is `false` unless the caller said a continued
+    /// failure is expected (`allow_continued_failures`): a boolean a reader
+    /// glances at must not say `true` over a node that did not do its work.
+    pub const fn passed(self, allow_continued_failures: bool) -> bool {
+        match self {
+            Self::Passed => true,
+            Self::PassedWithFailures => allow_continued_failures,
+            Self::Failed => false,
+        }
+    }
+}
+
+/// A `test_workflow` run, judged: the caller's assertions, the nodes that
+/// failed along the way, and the verdict the two add up to.
+#[derive(Debug, Clone)]
+pub struct TestReport {
+    pub verdict: TestVerdict,
+    /// See [`TestVerdict::passed`].
+    pub passed: bool,
+    /// [`build_test_assertions`]' entries, then one named
+    /// `no_continued_failures`.
+    pub assertions: Vec<serde_json::Value>,
+    pub continued_failures: Vec<ContinuedFailure>,
+}
+
+/// Judge a `test_workflow` run. The one place `passed` is decided.
+#[allow(clippy::too_many_arguments)]
+pub fn build_test_report(
+    actual_status: &str,
+    expected_status: &str,
+    duration_ms: u64,
+    assert_max_duration_ms: Option<u64>,
+    output_json: &serde_json::Value,
+    assert_output_contains: Option<&serde_json::Map<String, serde_json::Value>>,
+    allow_continued_failures: bool,
+) -> TestReport {
+    let (mut assertions, assertions_held) = build_test_assertions(
+        actual_status,
+        expected_status,
+        duration_ms,
+        assert_max_duration_ms,
+        output_json,
+        assert_output_contains,
+    );
+    let continued_failures = continued_failures(output_json);
+    let nodes: Vec<&str> = continued_failures.iter().map(|f| f.node.as_str()).collect();
+    assertions.push(serde_json::json!({
+        "name": "no_continued_failures",
+        "expected": if allow_continued_failures {
+            "any (allow_continued_failures)"
+        } else {
+            "no node failed"
+        },
+        "actual": nodes,
+        "passed": allow_continued_failures || nodes.is_empty(),
+    }));
+    let verdict = TestVerdict::decide(assertions_held, continued_failures.len());
+    TestReport {
+        verdict,
+        passed: verdict.passed(allow_continued_failures),
+        assertions,
+        continued_failures,
+    }
+}
+
+#[cfg(test)]
+mod continued_failure_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The envelope `handle_node_failure` commits for `continue_on_error`.
+    fn continued(message: &str) -> serde_json::Value {
+        json!({"__error": true, "error_message": message, "__continued": true})
+    }
+
+    #[test]
+    fn a_node_that_failed_and_was_continued_past_is_named() {
+        let output = json!({
+            "compose": {"subject": "Your morning", "notification": {"title": "t"}},
+            "notify": continued("Component returned error: fuel exhausted"),
+            "send": {"sent": true},
+        });
+        let failures = continued_failures(&output);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].node, "notify");
+        assert_eq!(failures[0].handling, FailureHandling::ContinueOnError);
+        assert_eq!(failures[0].error_class, "fuel_exhaustion");
+        assert_eq!(
+            failures[0].to_json(),
+            json!({
+                "node": "notify",
+                "handling": "continue_on_error",
+                "error_class": "fuel_exhaustion",
+                "message": "Component returned error: fuel exhausted",
+            })
+        );
+    }
+
+    #[test]
+    fn the_three_ways_a_failure_is_stored_are_told_apart_and_sorted() {
+        let output = json!({
+            "z_handled": {"__error": true, "error_message": "connection refused", "failed_node": "z_handled"},
+            "a_continued": continued("timed out"),
+            "m_reported": {"__error": "upstream 502"},
+        });
+        let failures = continued_failures(&output);
+        let seen: Vec<(&str, FailureHandling, &str)> = failures
+            .iter()
+            .map(|f| (f.node.as_str(), f.handling, f.error_class.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a_continued", FailureHandling::ContinueOnError, "timeout"),
+                (
+                    "m_reported",
+                    FailureHandling::ReportedInOutput,
+                    "network_transient"
+                ),
+                ("z_handled", FailureHandling::ErrorEdge, "network_transient"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_healthy_run_and_a_failed_one_name_nobody() {
+        // Explicit success markers are not failures (the shared classifier).
+        let healthy = json!({
+            "a": {"__error": false, "rows": 3},
+            "b": {"__error": null},
+            "c": {"__error": ""},
+            "d": "a bare string",
+            "__node_timings__": {"__error": true},
+        });
+        assert!(continued_failures(&healthy).is_empty());
+        // A run that failed stores `{"error": …}`, not a node map.
+        assert!(continued_failures(&json!({"error": "node 'x' failed: boom"})).is_empty());
+        assert!(continued_failures(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn a_long_error_is_cut_on_a_character_and_the_list_is_capped() {
+        let long = "é".repeat(CONTINUED_FAILURE_MESSAGE_MAX);
+        let failures = continued_failures(&json!({"n": continued(&long)}));
+        assert_eq!(failures[0].message.len(), CONTINUED_FAILURE_MESSAGE_MAX);
+        assert!(failures[0].message.chars().all(|c| c == 'é'));
+
+        let many: serde_json::Map<String, serde_json::Value> = (0..CONTINUED_FAILURES_MAX + 5)
+            .map(|i| (format!("n{i:03}"), continued("boom")))
+            .collect();
+        assert_eq!(
+            continued_failures(&serde_json::Value::Object(many)).len(),
+            CONTINUED_FAILURES_MAX
+        );
+    }
+
+    #[test]
+    fn passed_is_true_over_a_continued_failure_only_when_the_caller_allowed_it() {
+        assert_eq!(TestVerdict::decide(true, 0), TestVerdict::Passed);
+        assert_eq!(
+            TestVerdict::decide(true, 1),
+            TestVerdict::PassedWithFailures
+        );
+        assert_eq!(TestVerdict::decide(false, 0), TestVerdict::Failed);
+        assert_eq!(TestVerdict::decide(false, 3), TestVerdict::Failed);
+
+        assert!(TestVerdict::Passed.passed(false));
+        assert!(!TestVerdict::PassedWithFailures.passed(false));
+        assert!(TestVerdict::PassedWithFailures.passed(true));
+        assert!(!TestVerdict::Failed.passed(true));
+        assert_eq!(
+            TestVerdict::PassedWithFailures.as_str(),
+            "passed_with_failures"
+        );
+    }
+
+    #[test]
+    fn a_completed_run_past_a_failed_node_does_not_pass_unless_allowed() {
+        let output = json!({
+            "compose": {"subject": "s"},
+            "notify": continued("fuel exhausted"),
+        });
+        let strict = build_test_report("completed", "completed", 10, None, &output, None, false);
+        assert_eq!(strict.verdict, TestVerdict::PassedWithFailures);
+        assert!(!strict.passed);
+        assert_eq!(strict.continued_failures.len(), 1);
+        let last = strict
+            .assertions
+            .last()
+            .expect("the continued-failure entry");
+        assert_eq!(last["name"], "no_continued_failures");
+        assert_eq!(last["actual"], json!(["notify"]));
+        assert_eq!(last["passed"], false);
+
+        let allowed = build_test_report("completed", "completed", 10, None, &output, None, true);
+        assert_eq!(allowed.verdict, TestVerdict::PassedWithFailures);
+        assert!(allowed.passed);
+        assert_eq!(allowed.assertions.last().expect("entry")["passed"], true);
+
+        // The same run with nothing failed is a plain pass, and its
+        // assertion list says the property was checked.
+        let clean = build_test_report(
+            "completed",
+            "completed",
+            10,
+            None,
+            &json!({"compose": {"subject": "s"}, "notify": {"sent": true}}),
+            None,
+            false,
+        );
+        assert_eq!(clean.verdict, TestVerdict::Passed);
+        assert!(clean.passed);
+        assert_eq!(clean.assertions.last().expect("entry")["actual"], json!([]));
+
+        // An assertion that did not hold is `failed` whatever was allowed.
+        let failed = build_test_report("failed", "completed", 10, None, &output, None, true);
+        assert_eq!(failed.verdict, TestVerdict::Failed);
+        assert!(!failed.passed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

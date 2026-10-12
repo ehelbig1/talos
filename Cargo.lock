@@ -9077,6 +9077,7 @@ dependencies = [
  "talos-workflow-creation-helpers",
  "talos-workflow-engine",
  "talos-workflow-engine-core",
+ "talos-workflow-engine-test-utils",
  "talos-workflow-job-protocol",
  "talos-workflow-liveness",
  "talos-workflow-manifest",
