@@ -4777,6 +4777,12 @@ impl TalosRuntime {
                 )
             })?;
 
+        // Whether the module makes another host call after an HTTP call fails
+        // host-side: read when it returns an error, to bound the weak
+        // `[after_host_failure=…]` marker (`host_failure_suffix`). Taken here,
+        // before the store is moved into the timeout closure below.
+        let acted_since_net_failure = store.data().acted_since_network_failure_handle();
+
         // Clone the stderr capture Arc before the store is moved into the timeout closure.
         // After the closure completes (or times out), we read any panic message written to
         // WASI stderr and attach it to trap errors for actionable diagnostics.
@@ -4786,7 +4792,6 @@ impl TalosRuntime {
         // with the cause the host already knew. See
         // `TalosContext::last_network_reason`.
         let net_reason_arc = store.data().network_reason_handle();
-        let acted_since_net_failure = store.data().acted_since_network_failure_handle();
 
         // Call the exported `run` function with automatic timeout enforcement.
         let input_str = input.to_string();
