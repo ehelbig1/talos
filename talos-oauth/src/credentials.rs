@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
+use talos_workflow_engine_core::ForcedRefresh;
 use uuid::Uuid;
 
 use crate::GOOGLE_CLOUD_TIER_PROVIDERS;
@@ -59,6 +60,90 @@ pub fn access_token_vault_path(provider: &str, user_id: Uuid, provider_key: &str
         "oauth/{}/{}/{}/access_token",
         provider, user_id, provider_key
     )
+}
+
+/// Which way a token refresh failed.
+///
+/// The refresh path has three ways to fail that ask different things of a
+/// person, and until 2026-10-12 a caller could not tell them apart: every
+/// one was an `anyhow` error with a sentence in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshFailureKind {
+    /// The provider answered and REFUSED: `invalid_grant`, or a credential
+    /// already marked as needing re-authorisation. The only kind that means
+    /// the connection must be reconnected, and the only one that marks it.
+    RefusedByProvider,
+    /// The token endpoint could not be reached, or answered 5xx / 429. The
+    /// grant is not at fault.
+    ProviderUnreachable,
+    /// Anything else: an unreadable credential row, missing client
+    /// configuration, another 4xx, an unparseable response.
+    Failed,
+}
+
+impl RefreshFailureKind {
+    /// A stable token for logs and replies.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RefusedByProvider => "refused_by_provider",
+            Self::ProviderUnreachable => "provider_unreachable",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// The engine-facing outcome of a forced refresh that failed this way.
+    pub const fn forced_refresh(self) -> ForcedRefresh {
+        match self {
+            Self::RefusedByProvider => ForcedRefresh::RefusedByProvider,
+            Self::ProviderUnreachable => ForcedRefresh::ProviderUnreachable,
+            Self::Failed => ForcedRefresh::Failed,
+        }
+    }
+}
+
+/// What a refresh that could not reach the token endpoint says. One
+/// constant, because `talos_integration_helpers::looks_like_oauth_failure`
+/// reads renewal failures as text and must not take this one for a refusal
+/// (it is pinned there by a test that names this sentence).
+pub const TOKEN_ENDPOINT_UNREACHABLE: &str =
+    "Token refresh could not reach the provider's token endpoint";
+
+/// The classified failure the refresh path attaches to its error, read back
+/// with [`refresh_failure_kind`]. The message is status-shaped and never
+/// holds a token or a response body.
+#[derive(Debug)]
+struct RefreshFailure {
+    kind: RefreshFailureKind,
+    message: String,
+}
+
+impl RefreshFailure {
+    fn refused(message: &str) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            kind: RefreshFailureKind::RefusedByProvider,
+            message: message.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for RefreshFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RefreshFailure {}
+
+/// Which way a failed refresh failed. An error the refresh path did not
+/// classify (a database read, a missing client secret) is
+/// [`RefreshFailureKind::Failed`]: never a refusal, so it never tells a
+/// person to reconnect something that works.
+pub fn refresh_failure_kind(error: &anyhow::Error) -> RefreshFailureKind {
+    // `anyhow` looks through every layer of context for the type, whether it
+    // was the error itself or attached as context to another one.
+    error
+        .downcast_ref::<RefreshFailure>()
+        .map_or(RefreshFailureKind::Failed, |failure| failure.kind)
 }
 
 impl OAuthCredentialService {
@@ -824,7 +909,10 @@ impl OAuthCredentialService {
     ///
     /// Errors are absorbed (logged + counted) rather than propagated: the
     /// caller's decision is binary and already encoded in the return value.
-    pub async fn force_refresh_oauth_tokens_in_batch(&self, vault_paths: &[String]) -> bool {
+    pub async fn force_refresh_oauth_tokens_in_batch(
+        &self,
+        vault_paths: &[String],
+    ) -> ForcedRefresh {
         // Same cap as the predictive batch: distinct credentials parallelize
         // safely behind their per-credential mutexes, and 8 bounds the burst
         // we can aim at a provider's token endpoint.
@@ -840,7 +928,7 @@ impl OAuthCredentialService {
             .cloned()
             .collect();
 
-        let outcomes: Vec<bool> = stream::iter(targets)
+        let outcomes: Vec<ForcedRefresh> = stream::iter(targets)
         .map(|vp| async move {
             match self.refresh_oauth_token_forced(&vp).await {
                 Ok(true) => {
@@ -851,7 +939,7 @@ impl OAuthCredentialService {
                         outcome = "repaired",
                         "OAuth credential re-refreshed after an auth failure — retrying the node once"
                     );
-                    true
+                    ForcedRefresh::Refreshed
                 }
                 Ok(false) => {
                     record_reactive_refresh("not_refreshed");
@@ -862,7 +950,7 @@ impl OAuthCredentialService {
                         "Auth failure on an OAuth credential that has no refresh path — \
                          not retrying (the 401 is not a token-staleness problem)"
                     );
-                    false
+                    ForcedRefresh::NothingToRefresh
                 }
                 Err(e) => {
                     record_reactive_refresh("refresh_failed");
@@ -870,16 +958,44 @@ impl OAuthCredentialService {
                     // refresh path (`Token refresh failed (HTTP 400)`), never
                     // a token, a refresh token, or a response body — the body
                     // is length-logged only at its own call site above.
-                    tracing::error!(
-                        target: "talos_oauth_refresh",
-                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&vp),
-                        outcome = "refresh_failed",
-                        error = %e,
-                        "OAuth credential refresh REFUSED by the provider after an auth \
-                         failure — the grant is most likely revoked or expired and the \
-                         integration must be re-authorised by a human. Not retrying."
-                    );
-                    false
+                    // The line says which way it failed. Until 2026-10-12
+                    // every failure was logged as "REFUSED by the provider …
+                    // most likely revoked", including a token endpoint that
+                    // could not be reached from a host that had just woken.
+                    let kind = refresh_failure_kind(&e);
+                    let outcome = kind.forced_refresh();
+                    match kind {
+                        RefreshFailureKind::RefusedByProvider => tracing::error!(
+                            target: "talos_oauth_refresh",
+                            vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&vp),
+                            outcome = "refresh_failed",
+                            failure = kind.as_str(),
+                            error = %e,
+                            "OAuth credential refresh REFUSED by the provider after an auth \
+                             failure — the grant is revoked or expired and the integration \
+                             must be re-authorised by a human. Not retrying."
+                        ),
+                        RefreshFailureKind::ProviderUnreachable => tracing::warn!(
+                            target: "talos_oauth_refresh",
+                            vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&vp),
+                            outcome = "refresh_failed",
+                            failure = kind.as_str(),
+                            error = %e,
+                            "OAuth credential refresh could not reach the provider's token \
+                             endpoint after an auth failure — the grant is not at fault and \
+                             the next run will try again. Not retrying."
+                        ),
+                        RefreshFailureKind::Failed => tracing::error!(
+                            target: "talos_oauth_refresh",
+                            vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&vp),
+                            outcome = "refresh_failed",
+                            failure = kind.as_str(),
+                            error = %e,
+                            "OAuth credential refresh failed after an auth failure, and not \
+                             by the provider refusing the grant. Not retrying."
+                        ),
+                    }
+                    outcome
                 }
             }
         })
@@ -887,7 +1003,7 @@ impl OAuthCredentialService {
         .collect()
         .await;
 
-        outcomes.into_iter().any(|refreshed| refreshed)
+        ForcedRefresh::of_all(outcomes)
     }
 
     /// Given a vault:// path like `oauth/{provider}/{user_id}/{provider_key}/access_token`,
@@ -974,7 +1090,9 @@ impl OAuthCredentialService {
         // token-endpoint call cannot succeed until the user re-links, which
         // clears the stamp. Refuse without the round trip.
         if needs_reauth_at.is_some() {
-            anyhow::bail!("credential needs re-authorization (the provider revoked the grant)");
+            return Err(RefreshFailure::refused(
+                "credential needs re-authorization (the provider revoked the grant)",
+            ));
         }
 
         // Decision: refresh when the token is (a) within the threshold of
@@ -1126,10 +1244,16 @@ impl OAuthCredentialService {
                 ("refresh_token", refresh_token.as_str()),
             ]),
         };
-        let resp = request
-            .send()
-            .await
-            .context("Token refresh request failed")?;
+        // A request that got no answer is NOT a refusal: nothing is wrong
+        // with the grant, and nothing is marked for reconnect. The reqwest
+        // error is kept in the chain for the log; it names the endpoint's
+        // host and never a token.
+        let resp = request.send().await.map_err(|e| {
+            anyhow::Error::new(e).context(RefreshFailure {
+                kind: RefreshFailureKind::ProviderUnreachable,
+                message: TOKEN_ENDPOINT_UNREACHABLE.to_string(),
+            })
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1158,11 +1282,24 @@ impl OAuthCredentialService {
                     event_kind = "oauth_grant_revoked",
                     "OAuth refresh refused with invalid_grant; credential needs re-authorization"
                 );
-                anyhow::bail!("Token refresh refused: the grant was revoked; re-link required");
+                return Err(RefreshFailure::refused(
+                    "Token refresh refused: the grant was revoked; re-link required",
+                ));
             }
             // SECURITY: Log body length only — error bodies may echo client_secret or refresh_token.
             tracing::error!(provider, %status, body_len = body.len(), "OAuth token refresh failed");
-            anyhow::bail!("Token refresh failed (HTTP {})", status);
+            // A 5xx (or a 429) is the provider failing to answer, not the
+            // provider refusing this grant. Any other status without
+            // `invalid_grant` is a failure of the request itself.
+            let kind = if status.is_server_error() || status.as_u16() == 429 {
+                RefreshFailureKind::ProviderUnreachable
+            } else {
+                RefreshFailureKind::Failed
+            };
+            return Err(anyhow::Error::new(RefreshFailure {
+                kind,
+                message: format!("Token refresh failed (HTTP {status})"),
+            }));
         }
 
         #[derive(serde::Deserialize)]
@@ -1546,3 +1683,60 @@ pub(crate) fn refresh_error_is_revoked_grant(body: &str) -> bool {
 #[cfg(test)]
 #[path = "credentials_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod refresh_failure_kind_tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_is_read_back_as_the_kind_it_was_raised_with() {
+        let refused = RefreshFailure::refused("Token refresh refused");
+        assert_eq!(
+            refresh_failure_kind(&refused),
+            RefreshFailureKind::RefusedByProvider
+        );
+
+        // Wrapped the way the request path wraps a transport error.
+        let unreachable = anyhow::anyhow!("dns error").context(RefreshFailure {
+            kind: RefreshFailureKind::ProviderUnreachable,
+            message: TOKEN_ENDPOINT_UNREACHABLE.to_string(),
+        });
+        assert_eq!(
+            refresh_failure_kind(&unreachable),
+            RefreshFailureKind::ProviderUnreachable
+        );
+        assert_eq!(unreachable.to_string(), TOKEN_ENDPOINT_UNREACHABLE);
+        // And still found under further context.
+        assert_eq!(
+            refresh_failure_kind(&unreachable.context("refreshing before dispatch")),
+            RefreshFailureKind::ProviderUnreachable
+        );
+    }
+
+    /// An error nothing classified is never a refusal: a refusal tells a
+    /// person to reconnect.
+    #[test]
+    fn an_unclassified_error_is_failed_never_refused() {
+        let plain = anyhow::anyhow!("connection pool timed out");
+        assert_eq!(refresh_failure_kind(&plain), RefreshFailureKind::Failed);
+    }
+
+    #[test]
+    fn each_kind_maps_to_its_engine_outcome() {
+        assert_eq!(
+            RefreshFailureKind::RefusedByProvider.forced_refresh(),
+            ForcedRefresh::RefusedByProvider
+        );
+        assert_eq!(
+            RefreshFailureKind::ProviderUnreachable.forced_refresh(),
+            ForcedRefresh::ProviderUnreachable
+        );
+        assert_eq!(
+            RefreshFailureKind::Failed.forced_refresh(),
+            ForcedRefresh::Failed
+        );
+        assert!(!RefreshFailureKind::ProviderUnreachable
+            .forced_refresh()
+            .refreshed());
+    }
+}

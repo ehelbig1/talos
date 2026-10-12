@@ -288,9 +288,12 @@ impl SecretsResolver for ControllerSecretsResolver {
             .await;
     }
 
-    async fn force_refresh_vault_paths(&self, paths: &[String]) -> bool {
+    async fn force_refresh_vault_paths(
+        &self,
+        paths: &[String],
+    ) -> talos_workflow_engine_core::ForcedRefresh {
         if paths.is_empty() {
-            return false;
+            return talos_workflow_engine_core::ForcedRefresh::NothingToRefresh;
         }
         // Routed through the SAME `OAuthCredentialService` as the predictive
         // path, so a reactive repair is still a vault write on the audited
