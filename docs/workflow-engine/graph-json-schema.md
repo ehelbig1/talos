@@ -172,6 +172,28 @@ So a typo in a `skip_condition` that gates a send FIRES the send. Syntax is
 rejected at authoring time on every MCP write path; an unbound name is not
 visible until eval, which is what `test_condition` is for.
 
+An edge `condition` that fails to evaluate is RECORDED on the run. The edge's
+source node gets an engine-authored key on its output:
+
+```jsonc
+"__edge_condition_errors__": [
+  { "target": "apply", "condition": "hold.held == true",
+    "error": "Variable not found: hold (line 1, position 1)" }
+]
+```
+
+The key is absent when every condition evaluated (a condition that evaluates
+`false` leaves nothing), a module's own copy is removed, and at most 16 edges
+are listed per node. `test_workflow` and `get_execution_status` list these
+edges as `edge_condition_errors`, and a `test_workflow` run that has one does
+not pass.
+
+An edge condition is evaluated against its SOURCE node's output only, so the
+ARITY RULE above does not apply to it: a node's name is never a variable
+there. `hold.held == true` on an edge out of `hold` names nothing; the field
+is `held`. `add_edge`, `add_edge_to_workflow` and `validate_workflow` warn
+when an edge condition reads a variable that is the name of a node.
+
 Nodes whose `type` is NOT a resolvable module id (not a UUID, no
 `data.moduleId` fallback) and whose `kind` is also absent are
 silently skipped — the engine treats them as presentation-only

@@ -484,7 +484,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_workflow",
-            "description": "Execute a workflow synchronously and run assertions against the result. Returns pass/fail with detailed assertion results. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound workflows run with the same __actor_context__ payload they would receive in production. BUDGET: a rehearsal is a real execution and counts toward the actor's budget; the reply's `actor_budget` block shows each cap the actor's policy sets (limit, used, remaining) and carries a `warning` once any cap is 80% spent — in `suspend` mode a start refused on the hourly cap suspends the actor.",
+            "description": "Execute a workflow synchronously and run assertions against the result. Returns `verdict`, `passed`, `continued_failures` and the assertion results. `verdict` is one of: `passed` (every assertion held and no node failed), `passed_with_failures` (every assertion held, but at least one node failed and the run went on past it, through continue_on_error or an error edge, or an edge condition could not be evaluated), `failed` (an assertion did not hold). `edge_condition_errors` lists each edge whose condition ERRORED as {source, target, condition, error}: such an edge is not taken, exactly like one whose condition was false, so its target is skipped while the run still completes; it always makes `passed` false. `continued_failures` lists those nodes as {node, handling, error_class, message}; handling is continue_on_error, error_edge or reported_in_output. `passed` is true only for the verdict `passed`, unless allow_continued_failures is true, in which case `passed_with_failures` is also true. A run can reach status `completed` with a node that did not do its work, so read `verdict`, not the status. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound workflows run with the same __actor_context__ payload they would receive in production. BUDGET: a rehearsal is a real execution and counts toward the actor's budget; the reply's `actor_budget` block shows each cap the actor's policy sets (limit, used, remaining) and carries a `warning` once any cap is 80% spent — in `suspend` mode a start refused on the hourly cap suspends the actor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -494,6 +494,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "assert_status": { "type": "string", "description": "Expected execution status (default: 'completed')" },
                     "assert_max_duration_ms": { "type": "number", "description": "Maximum allowed duration in milliseconds" },
                     "assert_output_contains": { "type": "object", "description": "Key-value pairs that must exist in the output" },
+                    "allow_continued_failures": { "type": "boolean", "description": "Default false: a node that failed and was continued past (continue_on_error or an error edge) makes `passed` false. Pass true when the test exercises a failure path on purpose; the nodes are still listed in `continued_failures` and the verdict is still `passed_with_failures`." },
                     "dry_run": { "type": "boolean", "description": "When true, non-GET HTTP requests, webhook sends, and messaging publishes are mocked. Useful for testing workflow logic without side effects." },
                     "actor_id": { "type": "string", "description": "Optional UUID of an actor to run the test as. Overrides the workflow's bound actor_id for both engine identity (memory writes / tier ceiling) and __actor_context__ injection. Validated for ownership + non-terminal status; budget and capability-ceiling checks are skipped (test path)." },
                     "inject_memory_context": { "type": "boolean", "description": "When actor_id is set, controls whether the actor's recent working/episodic memories are injected into the input as __actor_context__ (default: false). Pass true only when the memories are known to be non-sensitive — they appear inline in the execution trace once injected." },
@@ -3738,7 +3739,7 @@ async fn handle_test_workflow_draft(
         "is_draft": true,
         "next_step": "get_execution_status",
         "message": format!(
-            "Draft workflow triggered. Execution ID: {}. Running the DRAFT graph, not the published version — use get_execution_status to check results.",
+            "Draft workflow triggered. Execution ID: {}. Running the DRAFT graph, not the published version — use get_execution_status to check results. A run can reach status 'completed' past a node that failed (continue_on_error, an error edge): get_execution_status lists those nodes under continued_failures.",
             exec_id
         ),
     });
@@ -8425,6 +8426,18 @@ async fn handle_test_workflow(
         }
     };
 
+    // A wrong type is refused, as for the assertions above: read as `false`
+    // it would fail a test the caller meant to allow.
+    let allow_continued_failures = match crate::utils::validate_optional_bool(
+        args,
+        "allow_continued_failures",
+        false,
+        &req_id,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return Some(resp),
+    };
+
     // Load workflow record for actor_id; also get graph from active version or draft.
     let test_wf_record = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(r)) => r,
@@ -8777,22 +8790,37 @@ async fn handle_test_workflow(
         }
     };
 
-    let (assertions, all_passed) = talos_workflow_validation::build_test_assertions(
+    // `passed` is decided in one place. A run that reached `completed` past a
+    // node that failed (`continue_on_error`, an error edge) is
+    // `passed_with_failures`, and `passed` is false unless the caller allowed it.
+    let report = talos_workflow_validation::build_test_report(
         &actual_status,
         &assert_status,
         duration_ms,
         assert_max_duration_ms,
         &output_json,
         assert_output_contains.as_ref(),
+        allow_continued_failures,
     );
 
     // Shape only the RETURNED output (assertions above already ran against the
     // full `output_json`). 'full' is byte-identical.
     let shaped_output = output_shape.apply(&output_json, &terminal_nodes);
     let mut test_result = serde_json::json!({
-        "passed": all_passed,
+        "passed": report.passed,
+        "verdict": report.verdict.as_str(),
+        "continued_failures": report
+            .continued_failures
+            .iter()
+            .map(talos_workflow_validation::ContinuedFailure::to_json)
+            .collect::<Vec<_>>(),
+        "edge_condition_errors": report
+            .edge_condition_errors
+            .iter()
+            .map(talos_workflow_validation::EdgeConditionError::to_json)
+            .collect::<Vec<_>>(),
         "execution_id": exec_id.to_string(),
-        "assertions": assertions,
+        "assertions": report.assertions,
         "duration_ms": duration_ms,
         "output": shaped_output,
     });
@@ -11209,8 +11237,13 @@ async fn handle_add_edge_to_workflow(
             obj.insert("condition".to_string(), serde_json::json!(cond));
             obj.insert(
                 "note".to_string(),
-                serde_json::json!("Edge follows only when the Rhai condition returns true against the source node output. Trigger the workflow and call get_execution_status to verify branching."),
+                serde_json::json!("Edge follows only when the Rhai condition returns true against the source node output: that output's top-level fields are the variables. A condition that errors when the workflow runs is not taken, and the error is recorded on the source node's output under __edge_condition_errors__. Trigger the workflow and call get_execution_status to verify branching."),
             );
+            if let Some(warning) =
+                crate::graph::edge_condition_warning(&graph, &source, &target, cond)
+            {
+                obj.insert("warning".to_string(), serde_json::json!(warning));
+            }
         }
     }
     mcp_text(

@@ -454,6 +454,122 @@ impl ErrorClass {
     }
 }
 
+/// What went wrong, in words an owner reads on a phone, for an
+/// [`ErrorClass::class`]. A clause that completes "… could not run: ".
+///
+/// The alert title used to carry [`ErrorClass::label`]: "workflow
+/// 'talos-ci-watch' failed: unclassified failure (node 'read')" was read as
+/// "a pull request failed and Talos could not classify why". It was the
+/// watcher itself failing to reach its source. The label stays the stable
+/// operator vocabulary (`severity_raw` carries the class); this is the
+/// sentence. No error text is in it: the raw error is in the alert's details.
+#[must_use]
+pub fn plain_cause(class: &str) -> &'static str {
+    match class {
+        "network" => "a service it calls could not be reached",
+        "timeout" => "it ran out of time",
+        "auth" => "a service it calls refused its credentials",
+        "llm" => "the language model did not answer",
+        "fuel_exhausted" => "a step used up its compute budget before finishing",
+        "missing_config" => "a step is missing a setting it needs",
+        "missing_secret" => "a credential it needs could not be read",
+        "contract" => "a step received data in a shape it does not accept",
+        "signature" => "a message between Talos's own services failed its signature check",
+        "result_stale" => "a step's result arrived too late to be trusted",
+        "stale" => "it stopped reporting and was cleaned up",
+        "circuit_open" => {
+            "a service it calls has been failing, and Talos stopped calling it for a while"
+        }
+        "cancelled" => "it was cancelled while a call was in flight",
+        "egress_denied" => "a step tried to call a host it is not allowed to call",
+        "egress_tier" => "a step tried to send data off this machine, which its actor may not do",
+        "egress_budget" => "it made more outbound calls than one run is allowed",
+        "ssrf_blocked" => "a step tried to call a private or local address",
+        "insecure_scheme" => "a step tried to call a plain http:// address",
+        "capability_world" => "a step tried something its module is not permitted to do",
+        "method_denied" => "a step used an HTTP method its module is not allowed to use",
+        "write_ceiling" => "a step tried to change something its actor may only read",
+        "introspection_denied" => "a step tried a GraphQL introspection query, which is refused",
+        "invalid_url" => "a step was given an address that is not a valid URL",
+        "request_cap" => "a step tried to send more than a request may carry",
+        "response_cap" => "a service answered with more than a response may carry",
+        "approval_denied" => "a person declined the approval it asked for",
+        _ => UNRECOGNISED_CAUSE,
+    }
+}
+
+/// [`plain_cause`] for a class it has no sentence for, `other` included.
+pub const UNRECOGNISED_CAUSE: &str =
+    "the cause was not recognised (the error is in the alert's details)";
+
+/// Longest purpose a title carries, in characters.
+const MAX_PURPOSE_CHARS: usize = 90;
+
+/// What a workflow is for, from its description: the first sentence, without
+/// its full stop, at most [`MAX_PURPOSE_CHARS`] characters. `None` for an
+/// empty description.
+#[must_use]
+pub fn purpose_from_description(description: &str) -> Option<String> {
+    let first_line = description.lines().find(|l| !l.trim().is_empty())?.trim();
+    let sentence = first_line
+        .split_once(". ")
+        .map_or(first_line, |(first, _)| first)
+        .trim_end_matches('.')
+        .trim();
+    if sentence.is_empty() {
+        return None;
+    }
+    let mut purpose: String = sentence.chars().take(MAX_PURPOSE_CHARS).collect();
+    if sentence.chars().count() > MAX_PURPOSE_CHARS {
+        purpose.push('…');
+    }
+    Some(purpose)
+}
+
+/// How many attempts the dispatcher made, read from its own closing line
+/// (`Job failed after {n} attempts: …`). `None` when the failure was not a
+/// retried dispatch, or the count is not a plausible one.
+#[must_use]
+pub fn attempts_made(msg: &str) -> Option<u32> {
+    let rest = &msg[msg.find("Job failed after ")? + "Job failed after ".len()..];
+    let (count, after) = rest.split_once(' ')?;
+    if !after.starts_with("attempts") {
+        return None;
+    }
+    count.parse::<u32>().ok().filter(|n| (2..=100).contains(n))
+}
+
+/// The title of the alert for a failed run.
+///
+/// It leads with what the workflow is FOR and says it "could not run", then
+/// the cause in plain words ([`plain_cause`]); the workflow's name and the
+/// node come second. Every argument is already redacted by the caller, and no
+/// error text is passed in at all.
+#[must_use]
+pub fn failure_title(
+    workflow_name: &str,
+    purpose: Option<&str>,
+    class: &ErrorClass,
+    node: Option<&str>,
+    attempts: Option<u32>,
+) -> String {
+    let cause = plain_cause(class.class);
+    let tried = attempts.map_or_else(String::new, |n| format!(", after {n} attempts"));
+    let place = match node {
+        Some(n) => format!("workflow '{workflow_name}', node '{n}'"),
+        None => format!("workflow '{workflow_name}'"),
+    };
+    match purpose {
+        Some(purpose) => format!("{purpose} — could not run: {cause}{tried} ({place})"),
+        None => match node {
+            Some(n) => {
+                format!("Workflow '{workflow_name}' could not run: {cause}{tried} (node '{n}')")
+            }
+            None => format!("Workflow '{workflow_name}' could not run: {cause}{tried}"),
+        },
+    }
+}
+
 /// Extract the failing node id from the engine's standard error shape
 /// (`… node 'NAME' failed …`). Bounded to the repository's key-segment
 /// budget; returns `None` for workflow-level failures.
@@ -612,7 +728,8 @@ pub async fn reconcile_tick(pool: &Pool<Postgres>) -> anyhow::Result<TickStats> 
             "SELECT e.id, e.completed_at, e.status, e.user_id, e.org_id, \
                     e.workflow_id, e.error_message, \
                     e.provenance->>'trigger_type' AS trigger_type, \
-                    w.name AS workflow_name \
+                    w.name AS workflow_name, \
+                    w.description AS workflow_description \
              FROM workflow_executions e \
              LEFT JOIN workflows w ON w.id = e.workflow_id \
              WHERE e.status IN ('completed','failed') \
@@ -808,10 +925,20 @@ async fn process_failed_row(
     let excerpt_red = talos_dlp_provider::redact_str(&excerpt);
 
     let node_red = node.as_deref().map(talos_dlp_provider::redact_str);
-    let title = match &node_red {
-        Some(n) => format!("workflow '{name_red}' failed: {} (node '{n}')", ec.label),
-        None => format!("workflow '{name_red}' failed: {}", ec.label),
-    };
+    // Display-only, like the name; NULL for a deleted workflow or one with no
+    // description. Redacted before it reaches the title.
+    let description: Option<String> = row.try_get("workflow_description")?;
+    let purpose_red = description
+        .as_deref()
+        .and_then(purpose_from_description)
+        .map(|p| talos_dlp_provider::redact_str(&p));
+    let title = failure_title(
+        &name_red,
+        purpose_red.as_deref(),
+        &ec,
+        node_red.as_deref(),
+        attempts_made(&error_message),
+    );
 
     let alert = NewOpsAlert {
         source: SELF_ALERT_SOURCE.to_string(),
@@ -934,6 +1061,153 @@ mod tests {
              Job result signature verification failed: result_nonce is too old (907 s, max 300)",
         );
         assert_eq!(ec.class, "signature");
+    }
+
+    /// The observed alert (2026-10-12): "workflow 'talos-ci-watch' failed:
+    /// unclassified failure (node 'read')" was read as "a pull request failed
+    /// and Talos could not classify why". It was the watcher failing to reach
+    /// its source.
+    #[test]
+    fn the_title_says_the_workflow_itself_could_not_run_and_why() {
+        let unreachable = classify_execution_error(
+            "Scheduled workflow failed: node 'read' failed: Job failed after 3 attempts: \
+             execution failure: Component returned error: github: api.github.com could not be \
+             reached (networkerror)",
+        );
+        assert_eq!(unreachable.class, "network");
+        // With a description: what the workflow is for comes first.
+        assert_eq!(
+            failure_title(
+                "talos-ci-watch",
+                Some("Watches CI on main and reports a red build"),
+                &unreachable,
+                Some("read"),
+                Some(3),
+            ),
+            "Watches CI on main and reports a red build — could not run: a service it calls \
+             could not be reached, after 3 attempts (workflow 'talos-ci-watch', node 'read')"
+        );
+        // Without one, the name leads, and it still says "could not run".
+        assert_eq!(
+            failure_title("talos-ci-watch", None, &unreachable, Some("read"), Some(3)),
+            "Workflow 'talos-ci-watch' could not run: a service it calls could not be reached, \
+             after 3 attempts (node 'read')"
+        );
+        assert_eq!(
+            failure_title("talos-ci-watch", None, &unreachable, None, None),
+            "Workflow 'talos-ci-watch' could not run: a service it calls could not be reached"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_cause_says_so_in_words_and_carries_no_error_text() {
+        let raw = "something entirely novel exploded with secret-looking detail 12345";
+        let unknown = classify_execution_error(raw);
+        assert_eq!(unknown.class, "other");
+        let title = failure_title(
+            "pa-morning",
+            Some("Sends the morning message"),
+            &unknown,
+            None,
+            None,
+        );
+        assert_eq!(
+            title,
+            "Sends the morning message — could not run: the cause was not recognised (the error \
+             is in the alert's details) (workflow 'pa-morning')"
+        );
+        assert!(
+            !title.contains("exploded"),
+            "raw error text reached the title"
+        );
+        assert!(!title.contains("unclassified failure"));
+    }
+
+    /// Every class either classifier can produce has its own sentence; only
+    /// `other` falls to the unrecognised one.
+    #[test]
+    fn every_class_has_a_plain_cause() {
+        let mut classes: Vec<&'static str> = talos_reason_class::ALL
+            .iter()
+            .filter_map(|token| talos_reason_class::family(token))
+            .map(|family| classify_reason_class(family).class)
+            .collect();
+        for message in [
+            "approval was denied",
+            "WASM fuel exhausted",
+            "Missing TO in config",
+            "ForbiddenHost",
+            "signature verification failed",
+            "no upstream node produced a body",
+            "request timed out",
+            "Gmail API returned HTTP 401",
+            "NetworkError",
+            "LLM returned nothing",
+            "execution stale",
+        ] {
+            classes.push(classify_execution_error(message).class);
+        }
+        classes.sort_unstable();
+        classes.dedup();
+        assert!(
+            classes.len() >= 20,
+            "only {} classes reached: {classes:?}",
+            classes.len()
+        );
+        for class in classes {
+            assert_ne!(class, "other", "a probe message fell through to `other`");
+            assert_ne!(
+                plain_cause(class),
+                UNRECOGNISED_CAUSE,
+                "{class} has no plain cause"
+            );
+        }
+        assert_eq!(plain_cause("other"), UNRECOGNISED_CAUSE);
+        assert_eq!(plain_cause("a_class_added_later"), UNRECOGNISED_CAUSE);
+    }
+
+    #[test]
+    fn the_purpose_is_the_descriptions_first_sentence_and_bounded() {
+        assert_eq!(
+            purpose_from_description("Watches CI on main. Reports a red build to the phone.")
+                .as_deref(),
+            Some("Watches CI on main")
+        );
+        assert_eq!(
+            purpose_from_description("\n  Sends the morning message.\nSecond line.").as_deref(),
+            Some("Sends the morning message")
+        );
+        // A version number is not a sentence end.
+        assert_eq!(
+            purpose_from_description("Reads v1.2 of the feed").as_deref(),
+            Some("Reads v1.2 of the feed")
+        );
+        assert_eq!(purpose_from_description("   \n "), None);
+        assert_eq!(purpose_from_description("."), None);
+        let long = "é".repeat(200);
+        let purpose = purpose_from_description(&long).expect("a purpose");
+        assert_eq!(purpose.chars().count(), MAX_PURPOSE_CHARS + 1);
+        assert!(purpose.ends_with('…'));
+    }
+
+    #[test]
+    fn attempts_are_read_from_the_dispatchers_closing_line_only() {
+        assert_eq!(
+            attempts_made("node 'read' failed: Job failed after 3 attempts: x"),
+            Some(3)
+        );
+        // One attempt is not "after N attempts" worth saying.
+        assert_eq!(attempts_made("Job failed after 1 attempts: x"), None);
+        assert_eq!(
+            attempts_made("Job failed after 2 liveness re-dispatch(es): x"),
+            None
+        );
+        assert_eq!(attempts_made("Job failed after many attempts"), None);
+        assert_eq!(
+            attempts_made("Job failed after 4000000000 attempts: x"),
+            None
+        );
+        assert_eq!(attempts_made("timed out"), None);
     }
 
     #[test]

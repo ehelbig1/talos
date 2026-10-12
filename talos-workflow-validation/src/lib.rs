@@ -2903,6 +2903,16 @@ pub fn validate_prepared_with_children(
             }
         }
 
+        // ── Edge conditions that name a node ─────────────────────────────
+        for finding in edge_conditions_naming_a_node(&graph) {
+            issues.push(ValidationIssue {
+                severity: ValidationSeverity::Warning,
+                message: finding.message(),
+                node_id: Some(finding.source.clone()),
+                category: "edge-condition".into(),
+            });
+        }
+
         // Durability advisory (crash-recovery audit): collected inside the
         // template block below, surfaced as a Warning after it.
         let mut side_effecting_node_ids: Vec<String> = Vec::new();
@@ -4753,6 +4763,727 @@ pub fn build_test_assertions(
     }
 
     (assertions, all_passed)
+}
+
+/// An edge whose condition reads a variable named like a node of the graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeConditionNamesNode {
+    pub source: String,
+    pub target: String,
+    pub condition: String,
+    /// The node names the condition reads as variables, in the order
+    /// evaluation reaches them.
+    pub names: Vec<String>,
+}
+
+impl EdgeConditionNamesNode {
+    /// The warning an author is shown, at authoring time and by
+    /// `validate_workflow`.
+    pub fn message(&self) -> String {
+        let names = self
+            .names
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "The condition on edge {source} -> {target} (`{condition}`) reads {names}, which is \
+             the name of a node, not a variable. An edge condition is evaluated against the \
+             SOURCE node's output, and that output's top-level fields are the variables: write \
+             `held == true`, not `{source}.held == true`. Nothing binds a node's name, so the \
+             expression errors when the workflow runs; an edge whose condition errors is not \
+             taken, and {target} is skipped unless another edge feeds it. The run still \
+             completes: the error is recorded on {source}'s output under \
+             `__edge_condition_errors__`. If {source}'s output really has a top-level field with \
+             that name, this warning does not apply. Check with test_condition against a real \
+             output of {source} (its `variables_in_scope` lists what is bound).",
+            source = self.source,
+            target = self.target,
+            condition = self.condition,
+        )
+    }
+}
+
+/// The most edges [`edge_conditions_naming_a_node`] probes in one graph. Each
+/// probe is a handful of sandboxed evaluations.
+pub const EDGE_CONDITION_PROBE_MAX: usize = 256;
+
+/// The condition of one edge, checked for variables that are node names.
+///
+/// `node_names` is every node id and label of the graph. The condition is
+/// probed against an EMPTY output, through the engine's own scope
+/// (`talos_engine::rhai_helpers::unbound_condition_variables`), so the names
+/// every run binds (`is_error`, `error_message`, `ctx`, `inputs`,
+/// `inputs_degraded`, `degraded_inputs`) are never reported. An unbound name
+/// that is not a node's is not reported either: against an empty output every
+/// field the source really returns is unbound, and warning on those would be
+/// a warning on every conditional edge.
+pub fn edge_condition_names_a_node(
+    source: &str,
+    target: &str,
+    condition: &str,
+    node_names: &HashSet<&str>,
+) -> Option<EdgeConditionNamesNode> {
+    let names: Vec<String> =
+        talos_engine::rhai_helpers::unbound_condition_variables(condition, &serde_json::json!({}))
+            .into_iter()
+            .filter(|name| node_names.contains(name.as_str()))
+            .collect();
+    (!names.is_empty()).then(|| EdgeConditionNamesNode {
+        source: source.to_string(),
+        target: target.to_string(),
+        condition: condition.to_string(),
+        names,
+    })
+}
+
+/// Every node id and label in `graph`: what an author might write where a
+/// field name belongs.
+pub fn graph_node_names(graph: &serde_json::Value) -> HashSet<&str> {
+    graph
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|node| {
+            [
+                node.get("id").and_then(|v| v.as_str()),
+                node.get("data")
+                    .and_then(|d| d.get("label"))
+                    .and_then(|v| v.as_str()),
+            ]
+        })
+        .flatten()
+        .collect()
+}
+
+/// [`edge_condition_names_a_node`] over every conditional edge of `graph`,
+/// at most [`EDGE_CONDITION_PROBE_MAX`] of them.
+pub fn edge_conditions_naming_a_node(graph: &serde_json::Value) -> Vec<EdgeConditionNamesNode> {
+    let node_names = graph_node_names(graph);
+    graph
+        .get("edges")
+        .and_then(|e| e.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|edge| {
+            let condition = edge.get("condition").and_then(|v| v.as_str())?.trim();
+            (!condition.is_empty()).then_some((edge, condition))
+        })
+        .take(EDGE_CONDITION_PROBE_MAX)
+        .filter_map(|(edge, condition)| {
+            edge_condition_names_a_node(
+                edge.get("source").and_then(|v| v.as_str()).unwrap_or(""),
+                edge.get("target").and_then(|v| v.as_str()).unwrap_or(""),
+                condition,
+                &node_names,
+            )
+        })
+        .collect()
+}
+
+/// An edge whose condition could not be evaluated when a run reached it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeConditionError {
+    /// The node whose output the condition was evaluated against, as the
+    /// run's output is keyed.
+    pub source: String,
+    pub target: String,
+    pub condition: String,
+    pub error: String,
+}
+
+impl EdgeConditionError {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "source": self.source,
+            "target": self.target,
+            "condition": self.condition,
+            "error": self.error,
+        })
+    }
+}
+
+/// The edges of a run whose conditions ERRORED, read from the record the
+/// engine writes on each source node's output
+/// ([`talos_workflow_engine_core::reserved_keys::EDGE_CONDITION_ERRORS`]).
+///
+/// `output` is a run's output keyed by node. An errored condition is not
+/// taken, exactly like a false one, and the run completes; this is the list
+/// that tells the two apart. Sorted by source then target; at most
+/// [`CONTINUED_FAILURES_MAX`] entries.
+pub fn edge_condition_errors(output: &serde_json::Value) -> Vec<EdgeConditionError> {
+    use talos_workflow_engine_core::reserved_keys::EDGE_CONDITION_ERRORS;
+    let Some(nodes) = output.as_object() else {
+        return Vec::new();
+    };
+    let text = |entry: &serde_json::Value, key: &str| {
+        entry
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut errors: Vec<EdgeConditionError> = nodes
+        .iter()
+        .filter(|(label, _)| !label.starts_with("__"))
+        .filter_map(|(label, node_output)| {
+            Some((label, node_output.get(EDGE_CONDITION_ERRORS)?.as_array()?))
+        })
+        .flat_map(|(label, entries)| {
+            entries.iter().map(move |entry| EdgeConditionError {
+                source: label.clone(),
+                target: text(entry, "target"),
+                condition: text(entry, "condition"),
+                error: text(entry, "error"),
+            })
+        })
+        .collect();
+    errors.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+    errors.truncate(CONTINUED_FAILURES_MAX);
+    errors
+}
+
+/// How a failed node was kept from failing its run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureHandling {
+    /// The node has `continue_on_error`; its children received the failure
+    /// envelope and ran.
+    ContinueOnError,
+    /// The node has an error edge; only that branch ran.
+    ErrorEdge,
+    /// The node's stored output carries an error marker and neither engine
+    /// envelope above.
+    ReportedInOutput,
+}
+
+impl FailureHandling {
+    /// The value in a `continued_failures` entry's `handling` field.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContinueOnError => "continue_on_error",
+            Self::ErrorEdge => "error_edge",
+            Self::ReportedInOutput => "reported_in_output",
+        }
+    }
+}
+
+/// A node that failed in a run that went on without it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuedFailure {
+    /// The node's label, as the run's output is keyed.
+    pub node: String,
+    pub handling: FailureHandling,
+    /// `talos_retry_intelligence::classify_error` over the node's error.
+    pub error_class: String,
+    /// The node's error, at most [`CONTINUED_FAILURE_MESSAGE_MAX`] bytes.
+    pub message: String,
+}
+
+impl ContinuedFailure {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "node": self.node,
+            "handling": self.handling.as_str(),
+            "error_class": self.error_class,
+            "message": self.message,
+        })
+    }
+}
+
+/// The longest error text a [`ContinuedFailure`] carries.
+pub const CONTINUED_FAILURE_MESSAGE_MAX: usize = 240;
+
+/// The most entries [`continued_failures`] returns; a graph has at most a few
+/// hundred nodes, and a reader needs the first few names.
+pub const CONTINUED_FAILURES_MAX: usize = 32;
+
+/// The nodes of a run that failed while the run itself went on.
+///
+/// `output` is a run's output keyed by node label: what `test_workflow`
+/// returns and what `workflow_executions.output_data` stores. A run reaches
+/// `completed` past a failed node in two ways the author asked for —
+/// `continue_on_error` and an error edge — and until 2026-10-12 nothing in a
+/// test result said so: `passed` compared the run's status with `completed`.
+/// A phone notification that ran out of fuel under `continue_on_error` was a
+/// passing test.
+///
+/// Whether a node's output reports an error is asked of the one classifier,
+/// [`talos_workflow_engine_core::reserved_keys::output_reports_error`].
+/// Entries are sorted by node label and capped at [`CONTINUED_FAILURES_MAX`].
+/// Only top-level node outputs are read: a failure inside a loop body or a
+/// sub-workflow shows as that node's own output, not as an entry here.
+pub fn continued_failures(output: &serde_json::Value) -> Vec<ContinuedFailure> {
+    use talos_workflow_engine_core::reserved_keys;
+    let Some(nodes) = output.as_object() else {
+        return Vec::new();
+    };
+    let mut failures: Vec<ContinuedFailure> = nodes
+        .iter()
+        // `__trigger_input__`, `__node_timings__`: the engine's own entries.
+        .filter(|(label, _)| !label.starts_with("__"))
+        .filter(|(_, node_output)| reserved_keys::output_reports_error(node_output))
+        .map(|(label, node_output)| {
+            let handling = if node_output
+                .get(reserved_keys::CONTINUED)
+                .is_some_and(|v| v.as_bool() == Some(true))
+            {
+                FailureHandling::ContinueOnError
+            } else if node_output.get("failed_node").is_some() {
+                FailureHandling::ErrorEdge
+            } else {
+                FailureHandling::ReportedInOutput
+            };
+            let reason = reserved_keys::error_reason(node_output).unwrap_or_default();
+            let mut end = reason.len().min(CONTINUED_FAILURE_MESSAGE_MAX);
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            ContinuedFailure {
+                node: label.clone(),
+                handling,
+                error_class: talos_retry_intelligence::classify_error(&reason),
+                message: reason[..end].to_string(),
+            }
+        })
+        .collect();
+    failures.sort_by(|a, b| a.node.cmp(&b.node));
+    failures.truncate(CONTINUED_FAILURES_MAX);
+    failures
+}
+
+/// What a `test_workflow` run amounted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestVerdict {
+    /// Every assertion held and no node failed.
+    Passed,
+    /// Every assertion held, and at least one node failed and was continued
+    /// past ([`continued_failures`]) or an edge condition could not be
+    /// evaluated ([`edge_condition_errors`]).
+    PassedWithFailures,
+    /// An assertion did not hold.
+    Failed,
+}
+
+impl TestVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::PassedWithFailures => "passed_with_failures",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn decide(assertions_held: bool, failure_count: usize) -> Self {
+        match (assertions_held, failure_count) {
+            (false, _) => Self::Failed,
+            (true, 0) => Self::Passed,
+            (true, _) => Self::PassedWithFailures,
+        }
+    }
+
+    /// The `passed` boolean of a `test_workflow` result.
+    ///
+    /// `passed_with_failures` is `false` unless the caller said a continued
+    /// failure is expected (`allow_continued_failures`): a boolean a reader
+    /// glances at must not say `true` over a node that did not do its work.
+    pub const fn passed(self, allow_continued_failures: bool) -> bool {
+        match self {
+            Self::Passed => true,
+            Self::PassedWithFailures => allow_continued_failures,
+            Self::Failed => false,
+        }
+    }
+}
+
+/// A `test_workflow` run, judged: the caller's assertions, the nodes that
+/// failed along the way, and the verdict the two add up to.
+#[derive(Debug, Clone)]
+pub struct TestReport {
+    pub verdict: TestVerdict,
+    /// See [`TestVerdict::passed`].
+    pub passed: bool,
+    /// [`build_test_assertions`]' entries, then `no_continued_failures` and
+    /// `no_edge_condition_errors`.
+    pub assertions: Vec<serde_json::Value>,
+    pub continued_failures: Vec<ContinuedFailure>,
+    /// Edges whose conditions errored ([`edge_condition_errors`]).
+    pub edge_condition_errors: Vec<EdgeConditionError>,
+}
+
+/// Judge a `test_workflow` run. The one place `passed` is decided.
+#[allow(clippy::too_many_arguments)]
+pub fn build_test_report(
+    actual_status: &str,
+    expected_status: &str,
+    duration_ms: u64,
+    assert_max_duration_ms: Option<u64>,
+    output_json: &serde_json::Value,
+    assert_output_contains: Option<&serde_json::Map<String, serde_json::Value>>,
+    allow_continued_failures: bool,
+) -> TestReport {
+    let (mut assertions, assertions_held) = build_test_assertions(
+        actual_status,
+        expected_status,
+        duration_ms,
+        assert_max_duration_ms,
+        output_json,
+        assert_output_contains,
+    );
+    let continued_failures = continued_failures(output_json);
+    let nodes: Vec<&str> = continued_failures.iter().map(|f| f.node.as_str()).collect();
+    assertions.push(serde_json::json!({
+        "name": "no_continued_failures",
+        "expected": if allow_continued_failures {
+            "any (allow_continued_failures)"
+        } else {
+            "no node failed"
+        },
+        "actual": nodes,
+        "passed": allow_continued_failures || nodes.is_empty(),
+    }));
+    // An edge condition that errored is never what a test meant to exercise:
+    // `allow_continued_failures` does not excuse it.
+    let edge_condition_errors = edge_condition_errors(output_json);
+    let errored_edges: Vec<String> = edge_condition_errors
+        .iter()
+        .map(|e| format!("{} -> {}", e.source, e.target))
+        .collect();
+    assertions.push(serde_json::json!({
+        "name": "no_edge_condition_errors",
+        "expected": "every edge condition evaluated",
+        "actual": errored_edges,
+        "passed": errored_edges.is_empty(),
+    }));
+    let verdict = TestVerdict::decide(
+        assertions_held,
+        continued_failures.len() + edge_condition_errors.len(),
+    );
+    TestReport {
+        verdict,
+        passed: verdict.passed(allow_continued_failures) && edge_condition_errors.is_empty(),
+        assertions,
+        continued_failures,
+        edge_condition_errors,
+    }
+}
+
+#[cfg(test)]
+mod edge_condition_tests {
+    use super::*;
+    use serde_json::json;
+    use talos_workflow_engine_core::reserved_keys::{
+        edge_condition_error_entry, EDGE_CONDITION_ERRORS,
+    };
+
+    fn graph(condition: &str) -> serde_json::Value {
+        json!({
+            "nodes": [
+                {"id": "hold", "data": {"label": "Hold this time"}},
+                {"id": "apply", "data": {"label": "apply"}},
+            ],
+            "edges": [{"source": "hold", "target": "apply", "condition": condition}],
+        })
+    }
+
+    fn prepared(graph: &serde_json::Value) -> PreparedValidation {
+        PreparedValidation {
+            workflow_id: Uuid::nil(),
+            graph_json: graph.to_string(),
+            existing_modules: HashSet::new(),
+            templates: Vec::new(),
+            installed_secrets: HashMap::new(),
+            has_actor: true,
+            history: Err("not read in this test".to_string()),
+        }
+    }
+
+    /// The observed edge: the source node is `hold` and the condition was
+    /// written `hold.held == true`.
+    #[test]
+    fn a_condition_that_names_its_source_node_is_found() {
+        let findings = edge_conditions_naming_a_node(&graph("hold.held == true"));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].source, "hold");
+        assert_eq!(findings[0].target, "apply");
+        assert_eq!(findings[0].names, ["hold"]);
+        let message = findings[0].message();
+        assert!(message.contains("edge hold -> apply"), "{message}");
+        assert!(
+            message.contains("`hold`, which is the name of a node"),
+            "{message}"
+        );
+        assert!(message.contains("__edge_condition_errors__"), "{message}");
+        assert!(message.contains("test_condition"), "{message}");
+    }
+
+    #[test]
+    fn a_condition_over_output_fields_is_not_warned_about() {
+        // Unbound against an empty output, and not a node's name: every
+        // legitimate condition looks like this, so it is not a finding.
+        for sound in [
+            "held == true",
+            "count > 0 && status == \"ok\"",
+            "is_error",
+            "ctx.len() > 0",
+            "!inputs_degraded",
+        ] {
+            assert!(
+                edge_conditions_naming_a_node(&graph(sound)).is_empty(),
+                "{sound} was reported"
+            );
+        }
+        // An unconditional edge and an empty condition are not probed.
+        assert!(edge_conditions_naming_a_node(&graph("   ")).is_empty());
+        assert!(edge_conditions_naming_a_node(&json!({"nodes": [], "edges": [{}]})).is_empty());
+    }
+
+    #[test]
+    fn any_node_of_the_graph_counts_and_a_label_counts_as_a_name() {
+        let graph = json!({
+            "nodes": [
+                {"id": "n1", "data": {"label": "classify"}},
+                {"id": "n2", "data": {"label": "send"}},
+            ],
+            "edges": [{"source": "n1", "target": "n2", "condition": "classify.urgent == true"}],
+        });
+        let findings = edge_conditions_naming_a_node(&graph);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].names, ["classify"]);
+    }
+
+    #[test]
+    fn validate_workflow_reports_it_as_an_edge_condition_warning() {
+        let result = validate_prepared(prepared(&graph("hold.held == true")));
+        let warnings: Vec<&ValidationIssue> = result
+            .issues
+            .iter()
+            .filter(|i| i.category == "edge-condition")
+            .collect();
+        assert_eq!(warnings.len(), 1, "{:?}", result.issues);
+        assert_eq!(warnings[0].severity, ValidationSeverity::Warning);
+        assert_eq!(warnings[0].node_id.as_deref(), Some("hold"));
+
+        let sound = validate_prepared(prepared(&graph("held == true")));
+        assert!(sound.issues.iter().all(|i| i.category != "edge-condition"));
+    }
+
+    #[test]
+    fn a_runs_errored_conditions_are_read_from_the_engines_record() {
+        let output = json!({
+            "hold": {
+                "held": true,
+                EDGE_CONDITION_ERRORS: [edge_condition_error_entry(
+                    "apply",
+                    "hold.held == true",
+                    "Variable not found: hold (line 1, position 1)",
+                )],
+            },
+            "notify": {"sent": true},
+            "__node_timings__": {EDGE_CONDITION_ERRORS: [{"target": "x"}]},
+        });
+        assert_eq!(
+            edge_condition_errors(&output),
+            [EdgeConditionError {
+                source: "hold".into(),
+                target: "apply".into(),
+                condition: "hold.held == true".into(),
+                error: "Variable not found: hold (line 1, position 1)".into(),
+            }]
+        );
+        assert!(edge_condition_errors(&json!({"hold": {"held": true}})).is_empty());
+        assert!(edge_condition_errors(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn a_run_with_an_errored_condition_does_not_pass_even_when_failures_are_allowed() {
+        let output = json!({
+            "hold": {
+                "held": true,
+                EDGE_CONDITION_ERRORS: [edge_condition_error_entry("apply", "hold.held", "x")],
+            },
+        });
+        for allow in [false, true] {
+            let report = build_test_report("completed", "completed", 5, None, &output, None, allow);
+            assert_eq!(report.verdict, TestVerdict::PassedWithFailures);
+            assert!(!report.passed, "allow_continued_failures = {allow}");
+            assert_eq!(report.edge_condition_errors.len(), 1);
+            let entry = report
+                .assertions
+                .iter()
+                .find(|a| a["name"] == "no_edge_condition_errors")
+                .expect("the entry");
+            assert_eq!(entry["actual"], json!(["hold -> apply"]));
+            assert_eq!(entry["passed"], false);
+        }
+    }
+}
+
+#[cfg(test)]
+mod continued_failure_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn assertion<'a>(report: &'a TestReport, name: &str) -> &'a serde_json::Value {
+        report
+            .assertions
+            .iter()
+            .find(|a| a["name"] == name)
+            .unwrap_or_else(|| panic!("no assertion named {name}"))
+    }
+
+    /// The envelope `handle_node_failure` commits for `continue_on_error`.
+    fn continued(message: &str) -> serde_json::Value {
+        json!({"__error": true, "error_message": message, "__continued": true})
+    }
+
+    #[test]
+    fn a_node_that_failed_and_was_continued_past_is_named() {
+        let output = json!({
+            "compose": {"subject": "Your morning", "notification": {"title": "t"}},
+            "notify": continued("Component returned error: fuel exhausted"),
+            "send": {"sent": true},
+        });
+        let failures = continued_failures(&output);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].node, "notify");
+        assert_eq!(failures[0].handling, FailureHandling::ContinueOnError);
+        assert_eq!(failures[0].error_class, "fuel_exhaustion");
+        assert_eq!(
+            failures[0].to_json(),
+            json!({
+                "node": "notify",
+                "handling": "continue_on_error",
+                "error_class": "fuel_exhaustion",
+                "message": "Component returned error: fuel exhausted",
+            })
+        );
+    }
+
+    #[test]
+    fn the_three_ways_a_failure_is_stored_are_told_apart_and_sorted() {
+        let output = json!({
+            "z_handled": {"__error": true, "error_message": "connection refused", "failed_node": "z_handled"},
+            "a_continued": continued("timed out"),
+            "m_reported": {"__error": "upstream 502"},
+        });
+        let failures = continued_failures(&output);
+        let seen: Vec<(&str, FailureHandling, &str)> = failures
+            .iter()
+            .map(|f| (f.node.as_str(), f.handling, f.error_class.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a_continued", FailureHandling::ContinueOnError, "timeout"),
+                (
+                    "m_reported",
+                    FailureHandling::ReportedInOutput,
+                    "network_transient"
+                ),
+                ("z_handled", FailureHandling::ErrorEdge, "network_transient"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_healthy_run_and_a_failed_one_name_nobody() {
+        // Explicit success markers are not failures (the shared classifier).
+        let healthy = json!({
+            "a": {"__error": false, "rows": 3},
+            "b": {"__error": null},
+            "c": {"__error": ""},
+            "d": "a bare string",
+            "__node_timings__": {"__error": true},
+        });
+        assert!(continued_failures(&healthy).is_empty());
+        // A run that failed stores `{"error": …}`, not a node map.
+        assert!(continued_failures(&json!({"error": "node 'x' failed: boom"})).is_empty());
+        assert!(continued_failures(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn a_long_error_is_cut_on_a_character_and_the_list_is_capped() {
+        let long = "é".repeat(CONTINUED_FAILURE_MESSAGE_MAX);
+        let failures = continued_failures(&json!({"n": continued(&long)}));
+        assert_eq!(failures[0].message.len(), CONTINUED_FAILURE_MESSAGE_MAX);
+        assert!(failures[0].message.chars().all(|c| c == 'é'));
+
+        let many: serde_json::Map<String, serde_json::Value> = (0..CONTINUED_FAILURES_MAX + 5)
+            .map(|i| (format!("n{i:03}"), continued("boom")))
+            .collect();
+        assert_eq!(
+            continued_failures(&serde_json::Value::Object(many)).len(),
+            CONTINUED_FAILURES_MAX
+        );
+    }
+
+    #[test]
+    fn passed_is_true_over_a_continued_failure_only_when_the_caller_allowed_it() {
+        assert_eq!(TestVerdict::decide(true, 0), TestVerdict::Passed);
+        assert_eq!(
+            TestVerdict::decide(true, 1),
+            TestVerdict::PassedWithFailures
+        );
+        assert_eq!(TestVerdict::decide(false, 0), TestVerdict::Failed);
+        assert_eq!(TestVerdict::decide(false, 3), TestVerdict::Failed);
+
+        assert!(TestVerdict::Passed.passed(false));
+        assert!(!TestVerdict::PassedWithFailures.passed(false));
+        assert!(TestVerdict::PassedWithFailures.passed(true));
+        assert!(!TestVerdict::Failed.passed(true));
+        assert_eq!(
+            TestVerdict::PassedWithFailures.as_str(),
+            "passed_with_failures"
+        );
+    }
+
+    #[test]
+    fn a_completed_run_past_a_failed_node_does_not_pass_unless_allowed() {
+        let output = json!({
+            "compose": {"subject": "s"},
+            "notify": continued("fuel exhausted"),
+        });
+        let strict = build_test_report("completed", "completed", 10, None, &output, None, false);
+        assert_eq!(strict.verdict, TestVerdict::PassedWithFailures);
+        assert!(!strict.passed);
+        assert_eq!(strict.continued_failures.len(), 1);
+        let entry = assertion(&strict, "no_continued_failures");
+        assert_eq!(entry["actual"], json!(["notify"]));
+        assert_eq!(entry["passed"], false);
+
+        let allowed = build_test_report("completed", "completed", 10, None, &output, None, true);
+        assert_eq!(allowed.verdict, TestVerdict::PassedWithFailures);
+        assert!(allowed.passed);
+        assert_eq!(assertion(&allowed, "no_continued_failures")["passed"], true);
+
+        // The same run with nothing failed is a plain pass, and its
+        // assertion list says the property was checked.
+        let clean = build_test_report(
+            "completed",
+            "completed",
+            10,
+            None,
+            &json!({"compose": {"subject": "s"}, "notify": {"sent": true}}),
+            None,
+            false,
+        );
+        assert_eq!(clean.verdict, TestVerdict::Passed);
+        assert!(clean.passed);
+        assert_eq!(
+            assertion(&clean, "no_continued_failures")["actual"],
+            json!([])
+        );
+        assert_eq!(
+            assertion(&clean, "no_edge_condition_errors")["passed"],
+            true
+        );
+
+        // An assertion that did not hold is `failed` whatever was allowed.
+        let failed = build_test_report("failed", "completed", 10, None, &output, None, true);
+        assert_eq!(failed.verdict, TestVerdict::Failed);
+        assert!(!failed.passed);
+    }
 }
 
 #[cfg(test)]
