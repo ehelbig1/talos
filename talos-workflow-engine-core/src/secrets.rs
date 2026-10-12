@@ -258,7 +258,9 @@ pub trait GithubInstallationTokenProvider: Send + Sync {
 /// (Phase D — dynamic secret minting).
 ///
 /// Injected into a [`SecretsResolver`] so a module secret path of the form
-/// `gcp/impersonated/<service_account_email>/access_token` resolves to a
+/// `gcp/impersonated/<service_account_email>/access_token` (or
+/// `.../<service_account_email>/as/<connection key>/access_token`, which
+/// names the Google Cloud connection to mint from) resolves to a
 /// freshly-minted ~10-minute impersonated token instead of a static vault
 /// secret. Like [`GithubInstallationTokenProvider`], it lives in this
 /// low-level crate so the resolver can hold a `dyn` reference without a
@@ -279,13 +281,20 @@ pub trait GcpImpersonationTokenProvider: Send + Sync {
     ///   Google permits it to impersonate `service_account_email` (the
     ///   caller holds `iam.serviceAccountTokenCreator` on that SA); a fresh
     ///   short-lived token.
-    /// * `Ok(None)` — no full-tier consent owned by `user_id`, or minting is
-    ///   not permitted; the secret is simply not injected, so the module
-    ///   fails closed on the missing secret.
+    /// * `Ok(None)` — there is no ONE consent to mint from: `user_id` owns no
+    ///   full-tier consent, owns several and `connection` names none, or
+    ///   `connection` names one that is not an active consent of `user_id`.
+    ///   The secret is simply not injected, so the module fails closed on
+    ///   the missing secret.
     /// * `Err` — a consent exists but the mint call itself failed.
+    ///
+    /// `connection` is the key of the Google Cloud connection to mint from.
+    /// An implementation must never choose between several consents itself:
+    /// a token minted from the wrong account acts as the wrong person.
     async fn impersonated_token(
         &self,
         service_account_email: &str,
+        connection: Option<Uuid>,
         user_id: Uuid,
     ) -> Result<Option<String>, BoxError>;
 }

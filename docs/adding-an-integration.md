@@ -292,7 +292,11 @@ layers.
 
 Two secret paths are **minted at dispatch**, not stored: `github_app:<owner>`
 (RFC 0008) and `gcp/impersonated/<sa_email>/access_token` (Phase D — a
-short-lived impersonated GCP service-account token). Both partition out of the
+short-lived impersonated GCP service-account token; the form
+`gcp/impersonated/<sa_email>/as/<connection key>/access_token` names which of
+the user's Google Cloud connections mints it, and is required once there is
+more than one). The path's two forms have one parser and one writer,
+`talos_workflow_job_protocol::{parse_gcp_impersonated_path, gcp_impersonated_path}`. Both partition out of the
 vault lookup in `ControllerSecretsResolver::resolve_by_paths`; the underlying
 broad credential is host-reserved (`is_controller_internal_vault_path`) and
 never reaches a guest.

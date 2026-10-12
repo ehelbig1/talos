@@ -168,6 +168,20 @@ In the workflow builder:
 
    (substitute your real `$RUNNER_SA`). The controller resolves this path
    by minting a fresh ~10-minute token per dispatch.
+   **If you have connected more than one Google account for
+   impersonation**, the path must say which one mints the token:
+
+   ```
+   AUTH_HEADER = Bearer vault://gcp/impersonated/<service account email>/as/<connection key>/access_token
+   ```
+
+   `list_connections` shows this reference, ready to copy, on each
+   impersonation connection (`mint_reference`). With one connection the
+   short form above keeps working. With several, a path that names none
+   mints nothing and the module fails on the missing secret: Talos never
+   picks an account for you, because a token minted from the wrong account
+   acts as the wrong person in someone else's project. A path that names a
+   connection that is not yours, or is disconnected, also mints nothing.
 3. Grant the module `allowed_secrets: ["gcp/impersonated/*"]` so it is
    permitted to resolve the minted-token path — nothing else in the
    `gcp/*` namespace is exposed to it, and the broad `google_cloud_full`

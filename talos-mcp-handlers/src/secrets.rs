@@ -88,7 +88,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_connections",
-            "description": "List the services you have connected (Gmail, Google Calendar, Google Health, Google Cloud, Slack, Jira, bank accounts through Plaid) with the `vault://` reference a workflow node uses for each one's credential. For every connection: the service, the account it is (an address, a bank name), when it was connected, `vault_reference` (put this string in a node's config where the module expects a token — a header value or a JSON body field; the worker resolves it at the outbound call and the module never holds the value), `allowed_secrets` (the exact vault paths to grant the module), and `stored` (whether the credential is in the vault right now; null if that could not be read). A bank connection also lists the two application credentials its requests need. `module_readable: false` marks a credential modules can never read (it is used by the controller only). Read-only, your own connections only, and no secret value is ever returned. Use this instead of reading provider keys out of the database when wiring a module to a connected account.",
+            "description": "List the services you have connected (Gmail, Google Calendar, Google Health, Google Cloud, Slack, Jira, bank accounts through Plaid) with the `vault://` reference a workflow node uses for each one's credential. For every connection: the service, the account it is (an address, a bank name), when it was connected, `vault_reference` (put this string in a node's config where the module expects a token — a header value or a JSON body field; the worker resolves it at the outbound call and the module never holds the value), `allowed_secrets` (the exact vault paths to grant the module), and `stored` (whether the credential is in the vault right now; null if that could not be read). A bank connection also lists the two application credentials its requests need. `module_readable: false` marks a credential modules can never read (it is used by the controller only); for a Google Cloud impersonation connection that entry carries `mint_reference` instead, the reference a node uses to get a short-lived token for one service account minted from THAT connection (replace `{service_account_email}`; with more than one such connection a reference that names none mints nothing). Read-only, your own connections only, and no secret value is ever returned. Use this instead of reading provider keys out of the database when wiring a module to a connected account.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -1211,9 +1211,28 @@ mod connection_reference_tests {
         assert_eq!(out["module_readable"], false);
         assert_eq!(out["vault_reference"], serde_json::Value::Null);
         assert!(out.get("allowed_secrets").is_none());
+        // What it offers instead: the reference that mints a service-account
+        // token from THIS connection, by its key. It is not a path to the
+        // broad credential, and it parses as a mint path naming this key.
+        let mint = out["mint_reference"].as_str().unwrap();
+        assert_eq!(
+            mint,
+            format!("vault://gcp/impersonated/{{service_account_email}}/as/{key}/access_token")
+        );
+        let target = talos_workflow_job_protocol::parse_gcp_impersonated_path(
+            mint.strip_prefix("vault://").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(target.connection, Some(uuid::Uuid::parse_str(key).unwrap()));
+        assert!(
+            !talos_workflow_job_protocol::is_controller_internal_vault_path(
+                mint.strip_prefix("vault://").unwrap()
+            )
+        );
         // Control: the read tier of the same provider is a normal reference.
         let read = rendered_connection(&row("gcp", Some(key), Some("read")), USER, None);
         assert_eq!(read["module_readable"], true);
+        assert!(read.get("mint_reference").is_none());
         assert!(read["vault_reference"]
             .as_str()
             .unwrap()
