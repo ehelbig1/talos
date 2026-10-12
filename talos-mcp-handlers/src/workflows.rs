@@ -2856,6 +2856,10 @@ async fn handle_add_node_to_workflow(
             // expected_items / bytes_per_item / safety_multiplier / optional
             // llm_output_bytes — NOT a single number).
             "applied_max_fuel": applied_max_fuel,
+            "applied_max_fuel_note": "the MODULE's default budget, shared by every node that \
+                 uses this module: it is what get_module_info shows. It is NOT this node's budget \
+                 when node_max_fuel_override is set, and it is expected to differ from \
+                 configured_max_fuel then. Read configured_max_fuel for this node.",
             // Node-level `config.max_fuel` override as persisted into the
             // node's graph-JSON `data` (null when the caller supplied none).
             "node_max_fuel_override": node_max_fuel_override,

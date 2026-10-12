@@ -2730,7 +2730,19 @@ async fn handle_update_node_config(
                                 .message_suffix(),
                         );
 
-                        return mcp_text(req_id, &msg);
+                        return mcp_text_with_json(
+                            req_id,
+                            &msg,
+                            update_node_config_block(
+                                wf_id,
+                                action,
+                                Some(node_id),
+                                Some(serde_json::json!({
+                                    "removed_edges": removed_edges,
+                                    "reconnected": reconnected,
+                                })),
+                            ),
+                        );
                 }
             }
         }
@@ -2897,9 +2909,83 @@ async fn handle_update_node_config(
         }
     }
 
-    match machine_block {
-        Some(mb) => mcp_text_with_json(req_id, &msg, mb),
-        None => mcp_text(req_id, &msg),
+    // Always a JSON block beside the prose, as the other write tools answer.
+    // Until 2026-10-12 only `update_config` (and a warning) carried one, so a
+    // caller could not tell from the reply's shape which action had run.
+    mcp_text_with_json(
+        req_id,
+        &msg,
+        update_node_config_block(
+            wf_id,
+            action,
+            args.get("node_id").and_then(|v| v.as_str()),
+            machine_block,
+        ),
+    )
+}
+
+/// The JSON block every `update_node_config` reply carries:
+/// `{updated, workflow_id, action, node_id?}` plus the action's own fields
+/// (`dropped_keys`, `warning`, `secret_access_blocked`, …). The action's
+/// fields are laid over the base, so an existing reader of `dropped_keys`
+/// sees it where it was.
+fn update_node_config_block(
+    workflow_id: uuid::Uuid,
+    action: &str,
+    node_id: Option<&str>,
+    action_fields: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut block = serde_json::json!({
+        "updated": true,
+        "workflow_id": workflow_id.to_string(),
+        "action": action,
+    });
+    if let (Some(obj), Some(node_id)) = (block.as_object_mut(), node_id) {
+        obj.insert("node_id".to_string(), serde_json::json!(node_id));
+    }
+    if let (Some(obj), Some(serde_json::Value::Object(fields))) =
+        (block.as_object_mut(), action_fields)
+    {
+        obj.extend(fields);
+    }
+    block
+}
+
+#[cfg(test)]
+mod update_node_config_block_tests {
+    use super::update_node_config_block;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    #[test]
+    fn every_action_gets_the_same_base_and_keeps_its_own_fields() {
+        let wf = Uuid::from_u128(3);
+        // An action that had no block at all before.
+        assert_eq!(
+            update_node_config_block(wf, "merge_config", Some("send"), None),
+            json!({ "updated": true, "workflow_id": wf.to_string(), "action": "merge_config", "node_id": "send" })
+        );
+        // `update_config` keeps `dropped_keys` and `hint` where they were.
+        assert_eq!(
+            update_node_config_block(
+                wf,
+                "update_config",
+                Some("send"),
+                Some(json!({ "dropped_keys": ["TO"], "hint": "use merge_config" })),
+            ),
+            json!({
+                "updated": true,
+                "workflow_id": wf.to_string(),
+                "action": "update_config",
+                "node_id": "send",
+                "dropped_keys": ["TO"],
+                "hint": "use merge_config",
+            })
+        );
+        // An action with no node (remove_edge).
+        let block = update_node_config_block(wf, "remove_edge", None, None);
+        assert!(block.get("node_id").is_none());
+        assert_eq!(block["action"], "remove_edge");
     }
 }
 
