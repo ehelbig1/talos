@@ -1887,6 +1887,63 @@ async fn handle_tail_worker_logs(
     )
 }
 
+/// What `get_node_output` says when an execution stored no node outputs.
+///
+/// Until 2026-10-12 it said "Execution has no output data yet" whatever the
+/// status. For a run that FAILED that is wrong twice: there is nothing still
+/// to come, and the thing the caller needs is the error. A failed run stores
+/// its error, not its nodes' outputs, so the reply says so and names where
+/// the error is. No error text is repeated here.
+fn no_node_output_message(status: &str, execution_id: Uuid) -> String {
+    let see = format!("get_execution_status(execution_id: \"{execution_id}\", detail: true)");
+    match status {
+        "failed" => format!(
+            "This execution FAILED, so it stored no node outputs: a failed run records its \
+             error instead. {see} shows the error and which node failed."
+        ),
+        "cancelled" => format!(
+            "This execution was cancelled and stored no node outputs. {see} shows how far it got."
+        ),
+        "running" | "queued" | "resuming" => format!(
+            "This execution is still {status} and has stored no output yet. Poll {see} until \
+             it finishes."
+        ),
+        "waiting" => format!(
+            "This execution is waiting (an approval or a wait node) and has stored no output \
+             yet. {see} shows what it is waiting for."
+        ),
+        other => format!(
+            "This execution is {other} and stored no node outputs. {see} shows its per-node trace."
+        ),
+    }
+}
+
+#[cfg(test)]
+mod no_node_output_message_tests {
+    use super::no_node_output_message;
+    use uuid::Uuid;
+
+    #[test]
+    fn a_failed_run_is_not_described_as_not_finished_yet() {
+        let id = Uuid::from_u128(5);
+        let failed = no_node_output_message("failed", id);
+        assert!(failed.starts_with("This execution FAILED"), "{failed}");
+        assert!(!failed.contains("yet"), "{failed}");
+        assert!(failed.contains("get_execution_status"), "{failed}");
+        assert!(failed.contains(&id.to_string()), "{failed}");
+    }
+
+    #[test]
+    fn each_status_gets_its_own_sentence() {
+        let id = Uuid::nil();
+        assert!(no_node_output_message("running", id).contains("still running"));
+        assert!(no_node_output_message("queued", id).contains("still queued"));
+        assert!(no_node_output_message("waiting", id).contains("waiting"));
+        assert!(no_node_output_message("cancelled", id).contains("was cancelled"));
+        assert!(no_node_output_message("completed", id).contains("is completed"));
+    }
+}
+
 async fn handle_get_node_output(
     req_id: Option<serde_json::Value>,
     args: &Value,
@@ -1924,7 +1981,13 @@ async fn handle_get_node_output(
 
     let data = match exec.output_data {
         Some(d) => d,
-        None => return mcp_error(req_id, -32000, "Execution has no output data yet"),
+        None => {
+            return mcp_error(
+                req_id,
+                -32000,
+                &no_node_output_message(&exec.status, exec_id),
+            )
+        }
     };
 
     // MCP-109 (2026-05-08): apply the same UUID-resolution path that
