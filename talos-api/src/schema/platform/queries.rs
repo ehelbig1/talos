@@ -412,6 +412,7 @@ impl PlatformQueries {
                 "JIRA" => IntegrationService::Jira,
                 "GOOGLE_CLOUD" => IntegrationService::GoogleCloud,
                 "GOOGLE_HEALTH" => IntegrationService::GoogleHealth,
+                "GOOGLE_CALENDAR_WRITE" => IntegrationService::GoogleCalendarWrite,
                 "PLAID" => IntegrationService::Plaid,
                 "MICROSOFT_365" => IntegrationService::Microsoft365,
                 // Safety: PROVIDERS is a compile-time constant; unknown values should not appear.

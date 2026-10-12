@@ -201,6 +201,7 @@ pub(crate) const GOOGLE_CLOUD_TIER_PROVIDERS: &[&str] =
 pub(crate) const GOOGLE_REVOKE_PROVIDERS: &[&str] = &[
     "gmail",
     "google_calendar",
+    "google_calendar_write",
     "google_health",
     "google_cloud",
     "google_cloud_write",
@@ -212,8 +213,12 @@ pub(crate) const GOOGLE_REVOKE_PROVIDERS: &[&str] = &[
 /// strings for vault-path isolation, one OAuth client. The refresh match in
 /// `credentials.rs` is keyed on this list, so a provider added here refreshes;
 /// `shared_client_providers_refresh_and_revoke` pins that each also revokes.
-pub(crate) const GOOGLE_SHARED_CLIENT_PROVIDERS: &[&str] =
-    &["gmail", "google_calendar", "google_health"];
+pub(crate) const GOOGLE_SHARED_CLIENT_PROVIDERS: &[&str] = &[
+    "gmail",
+    "google_calendar",
+    "google_calendar_write",
+    "google_health",
+];
 
 /// The shared Google OAuth client: `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`,
 /// each falling back to its legacy `GMAIL_*` spelling. Empty is unset (a helm
@@ -1885,6 +1890,7 @@ mod revoke_provider_coverage_tests {
         for p in [
             "gmail",
             "google_calendar",
+            "google_calendar_write",
             "google_health",
             "google_cloud",
             "google_cloud_write",
@@ -1905,7 +1911,12 @@ mod revoke_provider_coverage_tests {
     /// leave a live grant on health data at Google.
     #[test]
     fn shared_client_providers_refresh_and_revoke() {
-        for p in ["gmail", "google_calendar", "google_health"] {
+        for p in [
+            "gmail",
+            "google_calendar",
+            "google_calendar_write",
+            "google_health",
+        ] {
             assert!(
                 super::GOOGLE_SHARED_CLIENT_PROVIDERS.contains(&p),
                 "{p} missing from GOOGLE_SHARED_CLIENT_PROVIDERS (refresh match key)"

@@ -89,6 +89,7 @@ export type Enable2FaInput = {
 export type IntegrationService =
   | "GMAIL"
   | "GOOGLE_CALENDAR"
+  | "GOOGLE_CALENDAR_WRITE"
   | "GOOGLE_CLOUD"
   | "GOOGLE_HEALTH"
   | "JIRA"

@@ -660,6 +660,7 @@ export type GrantCapabilityCeilingInput = {
 export enum IntegrationService {
   Gmail = "GMAIL",
   GoogleCalendar = "GOOGLE_CALENDAR",
+  GoogleCalendarWrite = "GOOGLE_CALENDAR_WRITE",
   GoogleCloud = "GOOGLE_CLOUD",
   GoogleHealth = "GOOGLE_HEALTH",
   Jira = "JIRA",

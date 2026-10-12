@@ -5,6 +5,7 @@
 import {
   Building2,
   Calendar,
+  CalendarPlus,
   HeartPulse,
   Landmark,
   LayoutGrid,
@@ -39,6 +40,7 @@ export interface GithubInstallation {
 const ICON_MAP: Record<string, LucideIcon> = {
   Building2,
   Calendar,
+  CalendarPlus,
   HeartPulse,
   Landmark,
   Mail,

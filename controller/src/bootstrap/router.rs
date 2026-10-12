@@ -2618,6 +2618,7 @@ pub(crate) fn build_router(
     let google_cloud_write_service = services.google_cloud_write_service.clone();
     let google_cloud_full_service = services.google_cloud_full_service.clone();
     let google_health_service = services.google_health_service.clone();
+    let google_calendar_write_service = services.google_calendar_write_service.clone();
     let microsoft_365_service = services.microsoft_365_service.clone();
     let plaid_connect_service = services.plaid_connect_service.clone();
     let github_connect_service = services.github_connect_service.clone();
@@ -2926,6 +2927,35 @@ pub(crate) fn build_router(
         .layer(from_fn(rest_auth_middleware))
         .layer(from_fn(rest_cookie_csrf_gate))
         .layer(Extension(auth_service.clone()))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
+    // Google Calendar (add events) connect — behind session auth, same stack
+    // as Google Health's. Listing and disconnecting are the generic
+    // serviceIntegrations paths.
+    let google_calendar_write_connect_route = Router::new()
+        .route(
+            "/api/google-calendar-write/connect",
+            get(google_calendar_write::handlers::connect_handler),
+        )
+        .with_state(google_calendar_write_service.clone())
+        .layer(from_fn(rest_auth_middleware))
+        .layer(from_fn(rest_cookie_csrf_gate))
+        .layer(Extension(auth_service.clone()))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(api_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
+    // Google Calendar (add events) OAuth callback — NO auth middleware, for
+    // the same reason as Google Health's below: the state token and the
+    // browser-binding cookie authenticate it.
+    let google_calendar_write_callback_route = Router::new()
+        .route(
+            "/api/google-calendar-write/callback",
+            get(google_calendar_write::handlers::callback_handler),
+        )
+        .with_state(google_calendar_write_service.clone())
         .layer(from_fn(rate_limit::rate_limit_middleware))
         .layer(Extension(api_limiter.clone()))
         .layer(Extension(whitelist.clone()));
@@ -3869,6 +3899,8 @@ pub(crate) fn build_router(
         .merge(google_health_connect_route)
         .merge(plaid_connect_routes)
         .merge(google_health_callback_route)
+        .merge(google_calendar_write_connect_route)
+        .merge(google_calendar_write_callback_route)
         .merge(microsoft_365_connect_route)
         .merge(microsoft_365_callback_route)
         .merge(github_connect_route)

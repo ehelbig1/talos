@@ -118,6 +118,9 @@ impl World {
             "google_health" => {
                 "INSERT INTO google_health_integrations (user_id, provider_key, account_email) VALUES ($1, $2, $3)"
             }
+            "google_calendar_write" => {
+                "INSERT INTO google_calendar_write_integrations (user_id, provider_key, account_email) VALUES ($1, $2, $3)"
+            }
             _ => "INSERT INTO google_cloud_integrations (user_id, provider_key, account_email) VALUES ($1, $2, $3)",
         };
         sqlx::query(sql)
@@ -207,6 +210,71 @@ async fn gmail_and_another_integration_on_one_address_share_the_grant() {
 
     w.disconnect(user, "gmail", "Person@Example.test").await;
     assert_eq!(w.revoked(), vec!["refresh-gmail-Person@Example.test"]);
+}
+
+/// The write connection to Google Calendar sits beside the read one on the
+/// same account. Disconnecting it deletes ITS tokens and leaves the read
+/// connection working; and it is related to the user's Gmail connection by
+/// the address its own table records, so a write connection left alone with
+/// Gmail still does not revoke Gmail's grant. On a different account from
+/// Gmail, each revokes.
+#[tokio::test]
+async fn the_calendar_write_connection_shares_its_accounts_grant() {
+    let w = world().await;
+    let user = seed_user(&w.pool).await;
+    let account = Uuid::new_v4();
+    let key = account.to_string();
+    w.connect(user, "google_calendar", &key).await;
+    w.connect(user, "google_calendar_write", &key).await;
+
+    w.disconnect(user, "google_calendar_write", &key).await;
+    assert!(
+        w.revoked().is_empty(),
+        "a revoke here would end the read connection too: {:?}",
+        w.revoked()
+    );
+    assert_eq!(
+        w.vault_entries(user, "google_calendar_write", &key).await,
+        0
+    );
+    assert_eq!(w.vault_entries(user, "google_calendar", &key).await, 2);
+
+    // With Gmail on the same address, and the address recorded in the write
+    // connection's own table.
+    let other = seed_user(&w.pool).await;
+    let b = Uuid::new_v4();
+    w.connect(other, "gmail", "Person@Example.test").await;
+    w.connect(other, "google_calendar_write", &b.to_string())
+        .await;
+    w.record_account(other, "google_calendar_write", b, "person@example.test")
+        .await;
+    w.disconnect(other, "google_calendar_write", &b.to_string())
+        .await;
+    assert!(w.revoked().is_empty(), "Gmail is on the same account");
+
+    // On a DIFFERENT account from the user's Gmail: neither withholds the
+    // other's revoke. This is the case that needs the write connection's
+    // address to be read from its own table — a connection that cannot be
+    // placed would withhold the Gmail revoke.
+    let third = seed_user(&w.pool).await;
+    let c = Uuid::new_v4();
+    w.connect(third, "gmail", "one@example.test").await;
+    w.connect(third, "google_calendar_write", &c.to_string())
+        .await;
+    w.record_account(third, "google_calendar_write", c, "alone@example.test")
+        .await;
+    w.disconnect(third, "gmail", "one@example.test").await;
+    assert_eq!(w.revoked(), vec!["refresh-gmail-one@example.test"]);
+    // And now alone on its account: its disconnect is the grant's end.
+    w.disconnect(third, "google_calendar_write", &c.to_string())
+        .await;
+    assert_eq!(
+        w.revoked(),
+        vec![
+            "refresh-gmail-one@example.test".to_string(),
+            format!("refresh-google_calendar_write-{c}")
+        ]
+    );
 }
 
 /// The control for every withholding case: connections on DIFFERENT Google

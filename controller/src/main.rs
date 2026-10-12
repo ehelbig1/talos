@@ -63,6 +63,7 @@ mod dlp;
 mod execution_repository;
 mod gmail;
 mod google_calendar;
+mod google_calendar_write;
 mod google_cloud;
 mod google_health;
 mod graph_rag;
@@ -195,6 +196,8 @@ struct PlatformServices {
     google_cloud_write_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
     google_cloud_full_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
     google_health_service: std::sync::Arc<google_health::GoogleHealthService>,
+    google_calendar_write_service:
+        std::sync::Arc<google_calendar_write::GoogleCalendarWriteService>,
     microsoft_365_service: std::sync::Arc<microsoft_365::Microsoft365Service>,
     plaid_connect_service: std::sync::Arc<talos_plaid_connect::PlaidConnectService>,
     github_connect_service: std::sync::Arc<talos_github_connect::GithubConnectService>,
