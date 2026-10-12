@@ -38,6 +38,9 @@ import { cn } from "@/lib/utils";
 // present — on a fresh session that was NONE, and the cookie-CSRF gate on
 // REST mutations refused the panel's first POST/DELETE.
 import { authedFetch } from "./watch-channels/api";
+import { WorkflowBindingSelect } from "./watch-channels/WorkflowBindingSelect";
+import type { WorkflowsQuery } from "@/generated/graphql";
+import { useWorkflowsQuery } from "@/generated/graphql";
 
 interface GmailWatchSummary {
   channel_uuid: string;
@@ -49,6 +52,9 @@ interface GmailWatchSummary {
   expiration: string;
   module_id: string | null;
   module_name: string | null;
+  // The workflow new mail in this mailbox starts. When set, it is started
+  // INSTEAD of the module.
+  workflow_id?: string | null;
   updated_at: string;
   recent_failure?: {
     error_message: string;
@@ -420,7 +426,70 @@ export function GmailWatchChannels(): React.ReactElement | null {
     onSettled: () => qc.invalidateQueries({ queryKey: WATCHES_KEY }),
   });
 
-  const pendingFor = (ch: string): "renew" | "test" | "stop" | null => {
+  // The owner's workflows, for the per-row picker. `undefined` until loaded:
+  // the picker then shows a bound watch's id rather than "None".
+  const { data: workflows } = useWorkflowsQuery(undefined, {
+    select: (d: WorkflowsQuery) =>
+      d.workflows.map((w) => ({ id: w.id, name: w.name })),
+  });
+
+  const bindWorkflowMutation = useMutation({
+    mutationFn: async ({
+      ch,
+      workflowId,
+    }: {
+      ch: string;
+      workflowId: string | null;
+    }) => {
+      const res = await authedFetch(
+        `/api/gmail/watch-channels/${ch}/workflow`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workflow_id: workflowId }),
+        },
+      );
+      const body: ApiResponse<unknown> = await res.json();
+      if (!body.success)
+        throw new Error(body.error ?? "The workflow was not bound");
+    },
+    onMutate: async ({ ch, workflowId }) => {
+      await qc.cancelQueries({ queryKey: WATCHES_KEY });
+      const prev = qc.getQueryData<GmailWatchSummary[]>(WATCHES_KEY);
+      qc.setQueryData<GmailWatchSummary[]>(WATCHES_KEY, (old) =>
+        (old ?? []).map((w) =>
+          w.channel_uuid === ch ? { ...w, workflow_id: workflowId } : w,
+        ),
+      );
+      return { prev };
+    },
+    // A refusal puts the row back to what the server holds, so the picker
+    // never shows a binding that was not made.
+    onError: (err, _v, ctx) => {
+      if (ctx?.prev) qc.setQueryData(WATCHES_KEY, ctx.prev);
+      toast.error(
+        sanitizeErrorMessage(err instanceof Error ? err.message : String(err)),
+      );
+    },
+    onSuccess: (_d, { ch, workflowId }) => {
+      triggerFlash(ch);
+      toast.success(
+        workflowId
+          ? "Workflow bound — new mail in this mailbox starts it"
+          : "Workflow binding cleared",
+      );
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: WATCHES_KEY }),
+  });
+
+  const pendingFor = (
+    ch: string,
+  ): "renew" | "test" | "stop" | "bind" | null => {
+    if (
+      bindWorkflowMutation.isPending &&
+      bindWorkflowMutation.variables?.ch === ch
+    )
+      return "bind";
     if (renewMutation.isPending && renewMutation.variables === ch)
       return "renew";
     if (testMutation.isPending && testMutation.variables === ch) return "test";
@@ -582,6 +651,9 @@ export function GmailWatchChannels(): React.ReactElement | null {
                 <th className="text-left px-4 py-2.5 font-semibold">Account</th>
                 <th className="text-left px-4 py-2.5 font-semibold">Labels</th>
                 <th className="text-left px-4 py-2.5 font-semibold">Module</th>
+                <th className="text-left px-4 py-2.5 font-semibold">
+                  Workflow
+                </th>
                 <th className="text-left px-4 py-2.5 font-semibold">Expires</th>
                 <th className="text-left px-4 py-2.5 font-semibold">Status</th>
                 <th className="text-right px-4 py-2.5 font-semibold">
@@ -629,6 +701,25 @@ export function GmailWatchChannels(): React.ReactElement | null {
                           (no module bound)
                         </span>
                       )}
+                      {w.module_name && w.workflow_id && (
+                        <div className="text-[10px] text-muted-foreground mt-0.5">
+                          not run while a workflow is bound
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <WorkflowBindingSelect
+                        channelLabel={w.email_address}
+                        value={w.workflow_id}
+                        workflows={workflows}
+                        disabled={cur !== null}
+                        onChange={(workflowId) =>
+                          bindWorkflowMutation.mutate({
+                            ch: w.channel_uuid,
+                            workflowId,
+                          })
+                        }
+                      />
                     </td>
                     <td className="px-4 py-3 text-foreground">
                       {formatExpiration(w.expiration)}

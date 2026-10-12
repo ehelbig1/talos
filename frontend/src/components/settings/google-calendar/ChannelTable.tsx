@@ -3,6 +3,7 @@
  *   - Test   — read-only OAuth probe (no state change)
  *   - Renew  — forces rotation, with optimistic expiration bump
  *   - Stop   — tears down + removes row, with optimistic removal
+ * and, per row, the workflow a change on the calendar starts.
  */
 
 import React from "react";
@@ -13,6 +14,8 @@ import {
   RecentFailureBadge,
   WatchChannelStatusBadge,
 } from "../watch-channels/WatchChannelStatusBadge";
+import type { WorkflowOption } from "../watch-channels/WorkflowBindingSelect";
+import { WorkflowBindingSelect } from "../watch-channels/WorkflowBindingSelect";
 import type { PendingAction, WatchChannelSummary } from "./useWatchChannels";
 import { formatExpiration } from "./useWatchChannels";
 
@@ -20,6 +23,8 @@ export function ChannelTable({
   channels,
   flashedAt,
   pendingFor,
+  workflows,
+  onBindWorkflow,
   onTest,
   onRenew,
   onStop,
@@ -27,6 +32,9 @@ export function ChannelTable({
   channels: WatchChannelSummary[];
   flashedAt: Record<string, number>;
   pendingFor: (channelUuid: string) => PendingAction;
+  /** The owner's workflows; `undefined` while loading. */
+  workflows: WorkflowOption[] | undefined;
+  onBindWorkflow: (channelUuid: string, workflowId: string | null) => void;
   onTest: (channelUuid: string) => void;
   onRenew: (channelUuid: string) => void;
   onStop: (channelUuid: string) => void;
@@ -38,6 +46,7 @@ export function ChannelTable({
           <tr>
             <th className="text-left px-4 py-2.5 font-semibold">Calendar</th>
             <th className="text-left px-4 py-2.5 font-semibold">Module</th>
+            <th className="text-left px-4 py-2.5 font-semibold">Workflow</th>
             <th className="text-left px-4 py-2.5 font-semibold">Expires</th>
             <th className="text-left px-4 py-2.5 font-semibold">Status</th>
             <th className="text-right px-4 py-2.5 font-semibold">Actions</th>
@@ -71,9 +80,20 @@ export function ChannelTable({
                     <span className="text-foreground">{ch.module_name}</span>
                   ) : (
                     <span className="text-xs text-muted-foreground italic">
-                      (no module bound — sync only)
+                      (no module bound)
                     </span>
                   )}
+                </td>
+                <td className="px-4 py-3">
+                  <WorkflowBindingSelect
+                    channelLabel={ch.calendar_id}
+                    value={ch.workflow_id}
+                    workflows={workflows}
+                    disabled={currentAction !== null}
+                    onChange={(workflowId) =>
+                      onBindWorkflow(ch.channel_uuid, workflowId)
+                    }
+                  />
                 </td>
                 <td className="px-4 py-3 text-foreground">
                   {formatExpiration(ch.expiration)}
@@ -135,7 +155,7 @@ export function ChannelTable({
                       onClick={() => {
                         if (
                           window.confirm(
-                            `Stop watch channel for ${ch.calendar_id}? Any module bound to this channel will stop receiving webhook events until you recreate it.`,
+                            `Stop watch channel for ${ch.calendar_id}? A module or workflow bound to this channel will stop being started by calendar changes until you recreate it.`,
                           )
                         ) {
                           onStop(ch.channel_uuid);
