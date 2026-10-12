@@ -209,6 +209,87 @@ async fn fetch_all_without_a_marker_is_not_refused_for_a_secret_lookup() {
     assert_ne!(latched(&c), Some(reason_class::SECRET_LOOKUP));
 }
 
+// ── the weak marker's bound, on a real context ──────────────────────────────
+
+fn weak_marker_for(c: &TalosContext) -> String {
+    crate::runtime::host_failure_suffix(
+        &c.network_reason_handle(),
+        &c.acted_since_network_failure_handle(),
+        "Component returned error: failed",
+    )
+}
+
+/// A module that returns a bare error straight after an HTTP call that failed
+/// host-side gets the weak marker; one that did something else first does
+/// not. Driven through the production `fetch` (a 1 ms deadline against an
+/// address nothing answers) and the `host_call` hook every host function
+/// starts with.
+#[tokio::test]
+async fn the_weak_marker_is_for_a_failure_that_was_the_last_thing_the_module_did() {
+    let mut c = bare();
+    let failed = <TalosContext as wit_http::Host>::fetch(
+        &mut c,
+        post_req(br#"{"a":"b"}"#.to_vec(), Some(JSON)),
+    )
+    .await;
+    assert!(
+        failed.is_err(),
+        "the control must fail host-side: {failed:?}"
+    );
+    // Which kind depends on how the call failed, and that is not this test's
+    // to fix: a 1 ms deadline, a refused connect, or the per-host circuit
+    // breaker, which is process-wide and which the other tests in this file
+    // trip by failing calls to the same address. Each is a host-side failure
+    // with a weak kind; the property is that there IS a marker.
+    let is_weak_marker = |marker: &str| {
+        [
+            " [after_host_failure=late]",
+            " [after_host_failure=unreachable]",
+            " [after_host_failure=breaker]",
+        ]
+        .contains(&marker)
+    };
+    let marker = weak_marker_for(&c);
+    assert!(
+        is_weak_marker(&marker),
+        "a failed fetch followed by nothing: {marker:?} (latched {:?})",
+        latched(&c)
+    );
+
+    // Logging the failure it is about to return is not "something else".
+    c.host_call("logging::log");
+    c.host_call("json::parse");
+    assert_eq!(weak_marker_for(&c), marker);
+
+    // Reading memory is. The latch still holds the stale class; the marker
+    // is withheld.
+    c.host_call("agent-memory::get");
+    assert!(latched(&c).is_some(), "the latch is not what changed");
+    assert_eq!(weak_marker_for(&c), "");
+
+    // A NEW failure starts the watch again.
+    let failed = <TalosContext as wit_http::Host>::fetch(
+        &mut c,
+        post_req(br#"{"a":"b"}"#.to_vec(), Some(JSON)),
+    )
+    .await;
+    assert!(failed.is_err());
+    let again = weak_marker_for(&c);
+    assert!(is_weak_marker(&again), "{again:?}");
+}
+
+/// A call the allowlist refuses is the case that must never read as "try
+/// again": its weak marker is `denied`.
+#[tokio::test]
+async fn a_refused_host_is_marked_denied_not_unreachable() {
+    let mut c = bare();
+    let mut request = post_req(br#"{"a":"b"}"#.to_vec(), Some(JSON));
+    request.url = "https://not-allowed.example.test/r".to_string();
+    let refused = <TalosContext as wit_http::Host>::fetch(&mut c, request).await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(weak_marker_for(&c), " [after_host_failure=denied]");
+}
+
 // ── webhook::send ────────────────────────────────────────────────────────────
 
 fn hook(body: &str, content_type: Option<&str>) -> wit_webhook::WebhookRequest {

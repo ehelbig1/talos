@@ -47,6 +47,9 @@ serde_json.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["serde", "v4"] }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
+# Zero-dependency leaf: the vocabulary of the weak `[after_host_failure=…]`
+# marker, shared with the controller-side classifiers that read it.
+talos-reason-class = { path = "../talos-reason-class" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-secrets = { path = "../talos-secrets" }
 talos-memory = { path = "../talos-memory" }
