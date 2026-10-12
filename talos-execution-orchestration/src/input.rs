@@ -33,6 +33,9 @@ pub struct TriggerInput {
     pub trigger_input: Value,
     pub trigger_agent_id: Option<Uuid>,
     pub inject_memory_context: bool,
+    /// What is starting this run, recorded on the execution
+    /// (`talos_workflow_repository::origin`). Required, so every caller says.
+    pub origin: talos_workflow_repository::ExecutionOrigin,
     /// Check `trigger_input` against the workflow's input schema, report the
     /// result and start NOTHING ([`crate::TriggerOutcome::ValidatedOnly`]).
     pub validate_only: bool,

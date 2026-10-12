@@ -3678,14 +3678,17 @@ impl AdvancedRepository {
         }
         sqlx::query(
             "INSERT INTO workflow_executions \
-                (id, workflow_id, user_id, status, input_data, started_at, actor_id) \
-             VALUES ($1, $2, $3, 'queued', $4::jsonb, NOW(), $5)",
+                (id, workflow_id, user_id, status, input_data, started_at, actor_id, provenance) \
+             VALUES ($1, $2, $3, 'queued', $4::jsonb, NOW(), $5, $6)",
         )
         .bind(exec_id)
         .bind(wf_id)
         .bind(user_id)
         .bind(&scrubbed)
         .bind(actor_id)
+        // What started this row: this insert has one caller, the
+        // continuation trigger.
+        .bind(talos_workflow_repository::ExecutionOrigin::Continuation.stamp(None))
         .execute(&mut *tx)
         .await
         .context("insert_queued_execution")?;

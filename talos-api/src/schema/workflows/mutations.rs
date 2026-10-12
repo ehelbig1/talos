@@ -117,6 +117,7 @@ impl WorkflowsMutations {
                 trigger_input: serde_json::json!({}),
                 trigger_agent_id: actor_id,
                 inject_memory_context: false,
+                origin: talos_execution_orchestration::ExecutionOrigin::Api,
                 validate_only: false,
                 dry_run: false,
                 wait_ms: None,

@@ -50,10 +50,13 @@ pub use errors::{
     OrchestrationError, PUSH_REFUSAL_TRIGGER_FAILED, PUSH_REFUSAL_TRIGGER_SERVICE_NOT_WIRED,
 };
 pub use input::{ReplayInput, ReplayWithInputInput, RetryInput, TriggerInput};
+// What started a run. Its home is the repository that stores it; re-exported
+// so a caller of `trigger` needs one crate.
 pub use outcome::{
     ExecutionOutcome, ExecutionStatus, InputValidationReport, TriggerMetadata, TriggerOutcome,
     TriggerType,
 };
+pub use talos_workflow_repository::ExecutionOrigin;
 
 use std::sync::Arc;
 

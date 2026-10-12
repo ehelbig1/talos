@@ -184,6 +184,7 @@ impl ExecutionOrchestrationService {
             trigger_input: input_payload_arg,
             trigger_agent_id,
             inject_memory_context,
+            origin,
             validate_only,
             dry_run,
             wait_ms,
@@ -415,12 +416,16 @@ impl ExecutionOrchestrationService {
             talos_workflow_repository::ExecutionPriority::Normal,
             talos_workflow_repository::ExecutionPriority::declared_in_graph,
         );
-        let trigger_provenance = trigger_agent_id.map(|a| {
+        // `actor_id` + `trigger_type` are written only for an explicit actor,
+        // as before: a run with none still has no `trigger_type`, and every
+        // reader that defaults a missing one sees what it saw. What started
+        // the run is recorded for EVERY run, beside them, under its own key.
+        let trigger_provenance = Some(origin.stamp(trigger_agent_id.map(|a| {
             serde_json::json!({
                 "actor_id": a,
                 "trigger_type": trigger_type_str,
             })
-        });
+        })));
         // Atomic concurrency-check + INSERT in one transaction.
         // Pre-r296 these were two separate SQL calls with a TOCTOU
         // window: two parallel triggers could both pass the count

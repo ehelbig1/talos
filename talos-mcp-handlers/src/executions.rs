@@ -24,7 +24,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_executions",
-            "description": "List recent executions for ONE workflow (workflow_id required) with status, time, and error info. For a cross-workflow listing use list_recent_executions instead.",
+            "description": "List recent executions for ONE workflow (workflow_id required) with status, time, and error info. For a cross-workflow listing use list_recent_executions instead. Each row carries `started_by`: {kind, id?, integration?}, where kind is one of schedule (id = the schedule), webhook (id = the trigger), manual (trigger_workflow), api (the web UI or a GraphQL caller), test (test_workflow), test_draft, call_workflow, bulk_trigger, trigger_as_actors, enqueue, continuation, action_link (id = the link), push_channel (id = the channel, with its integration), actor_dispatch, handoff, replay (id = the execution replayed), chain, evaluation, or not_recorded for a row that says nothing about how it started (never assumed to be manual); and `is_test`, true for a run test_workflow made. A dry run is not marked on the row: get_execution_status shows a `dry_run` block for one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -37,7 +37,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_recent_executions",
-            "description": "List recent workflow executions across all workflows for the current user, with optional status filter.",
+            "description": "List recent workflow executions across all workflows for the current user, with optional status filter. Each row carries `started_by`: {kind, id?, integration?}, where kind is one of schedule (id = the schedule), webhook (id = the trigger), manual (trigger_workflow), api (the web UI or a GraphQL caller), test (test_workflow), test_draft, call_workflow, bulk_trigger, trigger_as_actors, enqueue, continuation, action_link (id = the link), push_channel (id = the channel, with its integration), actor_dispatch, handoff, replay (id = the execution replayed), chain, evaluation, or not_recorded for a row that says nothing about how it started (never assumed to be manual); and `is_test`, true for a run test_workflow made. A dry run is not marked on the row: get_execution_status shows a `dry_run` block for one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1035,6 +1035,9 @@ async fn handle_list_executions(
                 "workflow_id": r.workflow_id,
                 "status": r.status,
                 "started_at": r.started_at.map(|t| t.to_rfc3339()),
+                // What started the run, and whether `test_workflow` ran it.
+                "started_by": r.started_by.to_json(),
+                "is_test": r.is_test,
             });
             if let Some(map) = obj.as_object_mut() {
                 if let Some(ref c) = r.completed_at {
@@ -1183,6 +1186,8 @@ async fn handle_list_recent_executions(
                 "workflow_name": r.workflow_name,
                 "started_at": r.started_at.map(|t| t.to_rfc3339()),
                 "priority": r.priority,
+                "started_by": r.started_by.to_json(),
+                "is_test": r.is_test,
             });
             if let Some(ref c) = r.completed_at {
                 if let Some(map) = obj.as_object_mut() {

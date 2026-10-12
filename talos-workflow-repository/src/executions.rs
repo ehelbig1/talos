@@ -873,8 +873,9 @@ impl WorkflowRepository {
         let admit_slice = &exec_ids[..admit_count];
         sqlx::query(
             "INSERT INTO workflow_executions \
-             (id, workflow_id, user_id, status, started_at, workflow_version_id, actor_id) \
-             SELECT eid, $2, $3, 'queued', NOW(), $4, $5 \
+             (id, workflow_id, user_id, status, started_at, workflow_version_id, actor_id, \
+              provenance) \
+             SELECT eid, $2, $3, 'queued', NOW(), $4, $5, $6 \
              FROM UNNEST($1::uuid[]) AS eid",
         )
         .bind(admit_slice)
@@ -882,6 +883,9 @@ impl WorkflowRepository {
         .bind(user_id)
         .bind(version_id)
         .bind(actor_id)
+        // What started these rows: this insert has one caller,
+        // `enqueue_workflow`.
+        .bind(crate::origin::ExecutionOrigin::Enqueue.stamp(None))
         .execute(&mut *tx)
         .await?;
 

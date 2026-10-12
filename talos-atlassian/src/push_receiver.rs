@@ -696,6 +696,11 @@ pub async fn run_planned_starts(
                     trigger_input: jira_push_trigger_input(start),
                     trigger_agent_id: None,
                     inject_memory_context: false,
+                    // What started the run: this registration's push.
+                    origin: talos_execution_orchestration::ExecutionOrigin::PushChannel {
+                        integration: crate::push::INTEGRATION_NAME,
+                        channel_id: start.registration_id,
+                    },
                     validate_only: false,
                     dry_run: false,
                     wait_ms: None,

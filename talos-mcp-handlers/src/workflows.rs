@@ -3103,6 +3103,7 @@ fn trigger_request(
         trigger_input,
         trigger_agent_id,
         inject_memory_context,
+        origin: talos_execution_orchestration::ExecutionOrigin::Manual,
         validate_only: flags.validate_input,
         dry_run: flags.dry_run,
         wait_ms,
@@ -3565,7 +3566,7 @@ async fn handle_test_workflow_draft(
             None,
             priority,
             draft_row_actor,
-            None,
+            Some(&talos_workflow_repository::ExecutionOrigin::TestDraft.stamp(None)),
         )
         .await
     {
@@ -5851,7 +5852,7 @@ async fn handle_call_workflow(
             // trigger and also skipped the atomic actor-budget backstop that
             // `trigger_workflow` has always run.
             effective_actor,
-            None,
+            Some(&talos_workflow_repository::ExecutionOrigin::CallWorkflow.stamp(None)),
             None,
             None,
             talos_workflow_repository::InitialExecutionStatus::Running,
@@ -7229,7 +7230,7 @@ async fn handle_bulk_trigger_workflow(
                 // batch's own budget accounting atomic — with `None` the
                 // twenty rows were created with no budget backstop at all.
                 effective_actor,
-                None,
+                Some(&talos_workflow_repository::ExecutionOrigin::BulkTrigger.stamp(None)),
                 None,
                 None,
                 talos_workflow_repository::InitialExecutionStatus::Running,
@@ -7702,7 +7703,7 @@ async fn handle_trigger_workflow_as_actors(
                 version_id,
                 talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json),
                 Some(actor_id),
-                None,
+                Some(&talos_workflow_repository::ExecutionOrigin::TriggerAsActors.stamp(None)),
                 None,
                 None,
                 talos_workflow_repository::InitialExecutionStatus::Running,
