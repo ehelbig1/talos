@@ -330,6 +330,8 @@ impl wit_webhook::Host for TalosContext {
                 url = %url,
                 "Dry-run: intercepted webhook send"
             );
+            self.dry_run_ledger
+                .record(crate::dry_run::StubbedSurface::Webhook);
             return Ok(wit_webhook::WebhookResponse {
                 status: 200,
                 body: serde_json::json!({

@@ -5783,6 +5783,90 @@ fn check_result_worker_id_shape(worker_id: &str) -> Result<(), VerifyError> {
     })
 }
 
+/// The key under which a worker reports, on a module's output, the outbound
+/// calls a DRY RUN answered with a stub instead of making:
+/// `{"stubbed_calls": <n>, "by_surface": {"http": 2, "webhook": 1}}`.
+///
+/// Worker-authored and set-or-REMOVE (`talos_worker_runtime::dry_run`): on a
+/// dry run it is written whatever the module returned, zero included; on an
+/// ordinary run it is removed. It rides inside the signed `output_payload`,
+/// so it needs no wire field of its own.
+pub const DRY_RUN_REPORT_KEY: &str = "__dry_run__";
+
+/// The value a worker writes under [`DRY_RUN_REPORT_KEY`]: the calls it
+/// answered with a stub, in total and by host surface. The one writer of the
+/// shape; [`read_dry_run_report`] is the one reader.
+#[must_use]
+pub fn dry_run_report<'a>(
+    by_surface: impl IntoIterator<Item = (&'a str, u32)>,
+) -> serde_json::Value {
+    let mut total: u64 = 0;
+    let by_surface: serde_json::Map<String, serde_json::Value> = by_surface
+        .into_iter()
+        .map(|(surface, count)| {
+            total = total.saturating_add(u64::from(count));
+            (surface.to_string(), serde_json::json!(count))
+        })
+        .collect();
+    serde_json::json!({ "stubbed_calls": total, "by_surface": by_surface })
+}
+
+/// The dry-run report on one node's output, as `(stubbed_calls, by_surface)`,
+/// or `None` when the output carries none.
+///
+/// A value of another shape under the key is not a report: the stub RESPONSE
+/// a module is handed carries `"__dry_run__": true`, and an output the worker
+/// did not stamp may hold anything.
+#[must_use]
+pub fn read_dry_run_report(
+    node_output: &serde_json::Value,
+) -> Option<(u64, serde_json::Map<String, serde_json::Value>)> {
+    let report = node_output.get(DRY_RUN_REPORT_KEY)?.as_object()?;
+    Some((
+        report.get("stubbed_calls")?.as_u64()?,
+        report.get("by_surface")?.as_object()?.clone(),
+    ))
+}
+
+#[cfg(test)]
+mod dry_run_report_tests {
+    use super::{dry_run_report, read_dry_run_report, DRY_RUN_REPORT_KEY};
+    use serde_json::json;
+
+    #[test]
+    fn what_the_worker_writes_is_what_the_controller_reads() {
+        let report = dry_run_report([("http", 2), ("webhook", 1)]);
+        assert_eq!(
+            report,
+            json!({ "stubbed_calls": 3, "by_surface": { "http": 2, "webhook": 1 } })
+        );
+        let output = json!({ "sent": true, DRY_RUN_REPORT_KEY: report });
+        let (stubbed, by_surface) = read_dry_run_report(&output).expect("a report");
+        assert_eq!(stubbed, 3);
+        assert_eq!(by_surface.get("http"), Some(&json!(2)));
+
+        // Nothing stubbed is still a report.
+        let none = json!({ DRY_RUN_REPORT_KEY: dry_run_report(std::iter::empty()) });
+        assert_eq!(read_dry_run_report(&none).map(|r| r.0), Some(0));
+    }
+
+    #[test]
+    fn another_shape_under_the_key_is_not_a_report() {
+        for not_a_report in [
+            json!({ DRY_RUN_REPORT_KEY: true }),
+            json!({ DRY_RUN_REPORT_KEY: { "stubbed_calls": "many", "by_surface": {} } }),
+            json!({ DRY_RUN_REPORT_KEY: { "stubbed_calls": 1 } }),
+            json!({ "sent": true }),
+            json!("a bare string"),
+        ] {
+            assert!(
+                read_dry_run_report(&not_a_report).is_none(),
+                "{not_a_report}"
+            );
+        }
+    }
+}
+
 /// WASM fuel one job spent, measured by the worker and carried OUT OF BAND
 /// on [`JobResult::fuel`] / [`PipelineStepResult::fuel`].
 ///

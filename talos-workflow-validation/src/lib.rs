@@ -4765,6 +4765,133 @@ pub fn build_test_assertions(
     (assertions, all_passed)
 }
 
+/// One node's dry-run report: what its outbound calls were answered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DryRunNode {
+    /// The node, as the run's output is keyed.
+    pub node: String,
+    /// Calls the worker answered with a stub instead of making.
+    pub stubbed_calls: u64,
+    /// The same count by host surface (`http`, `webhook`, `messaging`, …).
+    pub by_surface: serde_json::Map<String, serde_json::Value>,
+}
+
+impl DryRunNode {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "node": self.node,
+            "stubbed_calls": self.stubbed_calls,
+            "by_surface": self.by_surface,
+        })
+    }
+}
+
+/// What a dry run does not stub, for the reply that reports what it did.
+pub const DRY_RUN_NOT_MOCKED: &str = "A dry run answers these with a stub: non-GET HTTP requests, \
+     webhook sends, messaging publishes and agent invoke/send. It does NOT stub the email, \
+     GraphQL, database, object-storage, file or streaming-HTTP host calls, memory writes or LLM \
+     calls: those run for real. A node listed with stubbed_calls 0 had nothing stubbed, so \
+     whatever it did, it did.";
+
+/// The dry-run reports of a run's module nodes, read from the record the
+/// worker stamps on each output
+/// ([`talos_workflow_job_protocol::DRY_RUN_REPORT_KEY`]).
+///
+/// `output` is a run's output keyed by node. Under a dry run a send node's
+/// own output says `sent: true`; this is the list that says the send was a
+/// stub. Every module node that ran under the dry run is listed, including
+/// those with nothing stubbed. Sorted by node, at most
+/// 200 entries.
+///
+/// Stated limits: a node whose output is not a JSON object carries no
+/// report and is not listed; a system node that passes a module's output
+/// through unchanged carries that module's report.
+pub fn dry_run_nodes(output: &serde_json::Value) -> Vec<DryRunNode> {
+    const MAX_NODES: usize = 200;
+    let Some(nodes) = output.as_object() else {
+        return Vec::new();
+    };
+    let mut reports: Vec<DryRunNode> = nodes
+        .iter()
+        .filter(|(label, _)| !label.starts_with("__"))
+        .filter_map(|(label, node_output)| {
+            let (stubbed_calls, by_surface) =
+                talos_workflow_job_protocol::read_dry_run_report(node_output)?;
+            Some(DryRunNode {
+                node: label.clone(),
+                stubbed_calls,
+                by_surface,
+            })
+        })
+        .collect();
+    reports.sort_by(|a, b| a.node.cmp(&b.node));
+    reports.truncate(MAX_NODES);
+    reports
+}
+
+/// The `dry_run` block of a `test_workflow(dry_run: true)` reply.
+pub fn dry_run_block(output: &serde_json::Value) -> serde_json::Value {
+    let nodes = dry_run_nodes(output);
+    let stubbed: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n.stubbed_calls > 0)
+        .map(|n| n.node.as_str())
+        .collect();
+    serde_json::json!({
+        "requested": true,
+        "nodes_with_stubbed_calls": stubbed,
+        "nodes": nodes.iter().map(DryRunNode::to_json).collect::<Vec<_>>(),
+        "not_mocked": DRY_RUN_NOT_MOCKED,
+    })
+}
+
+#[cfg(test)]
+mod dry_run_report_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The observed output: under a dry run a send node returned `sent: true`
+    /// with an empty `message_id`, and nothing said the call was a stub.
+    #[test]
+    fn a_stubbed_send_is_named_and_a_node_with_nothing_stubbed_reads_zero() {
+        let output = json!({
+            "compose": { "subject": "s", "__dry_run__": { "stubbed_calls": 0, "by_surface": {} } },
+            "send": {
+                "sent": true,
+                "message_id": "",
+                "__dry_run__": { "stubbed_calls": 1, "by_surface": { "http": 1 } },
+            },
+            "collect": { "items": [] },
+            "__node_timings__": { "__dry_run__": { "stubbed_calls": 9, "by_surface": {} } },
+        });
+        let nodes = dry_run_nodes(&output);
+        let seen: Vec<(&str, u64)> = nodes
+            .iter()
+            .map(|n| (n.node.as_str(), n.stubbed_calls))
+            .collect();
+        assert_eq!(seen, [("compose", 0), ("send", 1)]);
+
+        let block = dry_run_block(&output);
+        assert_eq!(block["requested"], true);
+        assert_eq!(block["nodes_with_stubbed_calls"], json!(["send"]));
+        assert_eq!(block["nodes"][1]["by_surface"], json!({ "http": 1 }));
+        assert!(block["not_mocked"].as_str().unwrap().contains("email"));
+    }
+
+    #[test]
+    fn a_report_of_the_wrong_shape_is_not_read_as_one() {
+        // The stub RESPONSE carries `"__dry_run__": true`; that is not a
+        // report, and an output the worker did not stamp has none.
+        let output = json!({
+            "a": { "__dry_run__": true },
+            "b": { "__dry_run__": { "stubbed_calls": "many" } },
+            "c": "a bare string",
+        });
+        assert!(dry_run_nodes(&output).is_empty());
+        assert_eq!(dry_run_block(&json!(null))["nodes"], json!([]));
+    }
+}
+
 /// An edge whose condition reads a variable named like a node of the graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeConditionNamesNode {

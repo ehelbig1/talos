@@ -599,6 +599,11 @@ pub struct TalosContext {
     /// are mocked with success responses instead of executing real network calls.
     /// GET requests still execute normally for data fetching.
     pub dry_run: bool,
+
+    /// The calls this execution answered with a dry-run stub, by host
+    /// surface. Every stub site records here; the runtime stamps the count
+    /// onto the module's output (`crate::dry_run`).
+    pub dry_run_ledger: crate::dry_run::DryRunLedger,
 }
 
 impl WasiView for TalosContext {
@@ -1792,6 +1797,7 @@ impl TalosContext {
             host_diag_sink: None,
             inference_wait: None,
             dry_run: false,
+            dry_run_ledger: crate::dry_run::DryRunLedger::default(),
             actor_id: None,
             // Stamped from the constructor arg so the SSRF resolver's
             // `local_egress_only` decision (built above) and the host-fn

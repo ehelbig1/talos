@@ -489,6 +489,8 @@ impl wit_http::Host for TalosContext {
                     url = %req.url,
                     "Dry-run: intercepted non-GET request (pre-network)"
                 );
+                self.dry_run_ledger
+                    .record(crate::dry_run::StubbedSurface::Http);
                 let mock_body = serde_json::to_vec(&serde_json::json!({
                     "__dry_run__": true,
                     "intercepted_method": dry_method,
@@ -1844,6 +1846,7 @@ impl wit_http::Host for TalosContext {
 
         let self_http_client = self.http_client.clone();
         let dry_run = self.dry_run;
+        let dry_run_ledger = self.dry_run_ledger.clone();
         // The execution's cancellation flag, cloned into every entry future:
         // the moved futures have no `self`, and a cancel arriving mid-batch
         // must stop the entries that have not been sent yet.
@@ -1887,6 +1890,7 @@ impl wit_http::Host for TalosContext {
                 let batch_budget = batch_budget.clone();
                 let self_http_client = self_http_client.clone();
                 let cancelled_flag = cancelled_flag.clone();
+                let dry_run_ledger = dry_run_ledger.clone();
                 async move {
                     // Tag every future with its INPUT index: buffer_unordered
                     // yields in COMPLETION order, and the WIT contract
@@ -1920,6 +1924,7 @@ impl wit_http::Host for TalosContext {
                         url = %url_str,
                         "Dry-run: intercepted non-GET request in fetch_all"
                     );
+                    dry_run_ledger.record(crate::dry_run::StubbedSurface::Http);
                     let mock_body = serde_json::to_vec(&serde_json::json!({
                         "__dry_run__": true,
                         "intercepted_method": method.as_str(),

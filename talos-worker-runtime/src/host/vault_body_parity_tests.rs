@@ -305,6 +305,71 @@ async fn webhook_dry_run_does_not_resolve_the_body() {
     assert_ne!(latched(&c), Some(reason_class::SECRET_LOOKUP));
 }
 
+// ── what a dry run stubbed is counted, by surface ───────────────────────────
+
+fn stubbed(c: &TalosContext) -> Vec<(&'static str, u32)> {
+    c.dry_run_ledger
+        .snapshot()
+        .into_iter()
+        .map(|(surface, count)| (surface.as_str(), count))
+        .collect()
+}
+
+/// Until 2026-10-12 a stubbed send answered the module with a success and
+/// left no trace of having been a stub: the node's output said `sent: true`.
+/// Every stub site now records itself, and the runtime stamps the count onto
+/// the output (`crate::dry_run`).
+#[tokio::test]
+async fn a_dry_run_counts_each_call_it_answered_with_a_stub() {
+    let mut c = bare();
+    c.dry_run = true;
+    assert!(stubbed(&c).is_empty());
+
+    // One non-GET `fetch`.
+    let r = <TalosContext as wit_http::Host>::fetch(
+        &mut c,
+        post_req(br#"{"a":"b"}"#.to_vec(), Some(JSON)),
+    )
+    .await;
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(stubbed(&c), [("http", 1)]);
+
+    // Two entries of a `fetch_all`: each is its own stubbed call. A refused
+    // entry is not a stubbed one.
+    let out = <TalosContext as wit_http::Host>::fetch_all(
+        &mut c,
+        vec![
+            post_req(br#"{"a":"b"}"#.to_vec(), Some(JSON)),
+            post_req(json_body(UNGRANTED_MARKER), Some(JSON)),
+            post_req(br#"{"c":"d"}"#.to_vec(), Some(JSON)),
+        ],
+    )
+    .await;
+    assert_eq!(out.iter().filter(|r| r.is_ok()).count(), 2, "{out:?}");
+    assert_eq!(stubbed(&c), [("http", 3)]);
+
+    // A webhook send is a different surface.
+    let r =
+        <TalosContext as wit_webhook::Host>::send(&mut c, hook(r#"{"a":"b"}"#, Some(JSON))).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(stubbed(&c), [("http", 3), ("webhook", 1)]);
+}
+
+/// The control: outside a dry run nothing is a stub, so nothing is counted,
+/// whatever becomes of the call.
+#[tokio::test]
+async fn an_ordinary_run_counts_no_stubs() {
+    let mut c = bare();
+    let _ = <TalosContext as wit_http::Host>::fetch(
+        &mut c,
+        post_req(br#"{"a":"b"}"#.to_vec(), Some(JSON)),
+    )
+    .await;
+    let _ =
+        <TalosContext as wit_webhook::Host>::send(&mut c, hook(r#"{"a":"b"}"#, Some(JSON))).await;
+    assert!(stubbed(&c).is_empty(), "{:?}", stubbed(&c));
+}
+
 // ── graphql::execute ────────────────────────────────────────────────────────
 
 fn gql(variables: Option<&str>) -> wit_graphql::Request {

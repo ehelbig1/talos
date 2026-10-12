@@ -117,6 +117,8 @@ impl wit_messaging::Host for TalosContext {
                     payload_len = payload.len(),
                     "Dry-run: intercepted messaging publish"
                 );
+                self.dry_run_ledger
+                    .record(crate::dry_run::StubbedSurface::Messaging);
                 return Ok(());
             }
 
@@ -214,6 +216,8 @@ impl wit_messaging::Host for TalosContext {
                 payload_len = msg.payload.len(),
                 "Dry-run: intercepted messaging publish_with_headers"
             );
+            self.dry_run_ledger
+                .record(crate::dry_run::StubbedSurface::Messaging);
             return Ok(());
         }
 

@@ -4733,6 +4733,9 @@ impl TalosRuntime {
         // with the cause the host already knew. See
         // `TalosContext::last_network_reason`.
         let net_reason_arc = store.data().network_reason_handle();
+        // Kept past the store for the same reason: the output is stamped
+        // with what this run stubbed after the module has returned.
+        let dry_run_ledger = store.data().dry_run_ledger.clone();
 
         // Call the exported `run` function with automatic timeout enforcement.
         let input_str = input.to_string();
@@ -5028,6 +5031,10 @@ impl TalosRuntime {
                 );
             }
         }
+
+        // On a dry run, say on the output what was answered by a stub; on an
+        // ordinary run, remove a module's own copy of that key.
+        crate::dry_run::stamp_output(&mut out_json, dry_run, &dry_run_ledger);
 
         span.set_attribute_int("output_size_bytes", output_str.len() as i64);
         span.set_attribute_bool("cache_hit", metrics.cache_hit);

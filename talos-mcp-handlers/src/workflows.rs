@@ -495,7 +495,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "assert_max_duration_ms": { "type": "number", "description": "Maximum allowed duration in milliseconds" },
                     "assert_output_contains": { "type": "object", "description": "Key-value pairs that must exist in the output" },
                     "allow_continued_failures": { "type": "boolean", "description": "Default false: a node that failed and was continued past (continue_on_error or an error edge) makes `passed` false. Pass true when the test exercises a failure path on purpose; the nodes are still listed in `continued_failures` and the verdict is still `passed_with_failures`." },
-                    "dry_run": { "type": "boolean", "description": "When true, non-GET HTTP requests, webhook sends, and messaging publishes are mocked. Useful for testing workflow logic without side effects." },
+                    "dry_run": { "type": "boolean", "description": "When true, non-GET HTTP requests, webhook sends, messaging publishes and agent invoke/send are answered by a stub instead of being made. A stubbed call answers its module with a success, so a send node's own output still says it sent: the reply's `dry_run` block lists each module node with how many of its calls were stubbed (`nodes_with_stubbed_calls`, and per node `stubbed_calls` / `by_surface`), and each node's output carries the same record under `__dry_run__`. NOT stubbed, and run for real: the email, GraphQL, database, object-storage, file and streaming-HTTP host calls, memory writes and LLM calls. A node listed with stubbed_calls 0 had nothing stubbed." },
                     "actor_id": { "type": "string", "description": "Optional UUID of an actor to run the test as. Overrides the workflow's bound actor_id for both engine identity (memory writes / tier ceiling) and __actor_context__ injection. Validated for ownership + non-terminal status; budget and capability-ceiling checks are skipped (test path)." },
                     "inject_memory_context": { "type": "boolean", "description": "When actor_id is set, controls whether the actor's recent working/episodic memories are injected into the input as __actor_context__ (default: false). Pass true only when the memories are known to be non-sensitive — they appear inline in the execution trace once injected." },
                     "max_context_memories": { "type": "integer", "description": "Maximum number of working/episodic memories to inject when inject_memory_context=true (default: 10, max: 50)." },
@@ -8827,6 +8827,13 @@ async fn handle_test_workflow(
     annotate_unpersisted_status(&mut test_result, status_persisted);
     if let Some(budget) = actor_budget_block(&state.db_pool, effective_test_actor).await {
         test_result["actor_budget"] = budget;
+    }
+    // A stubbed send answers its module with a success, so the node's own
+    // output says `sent: true`. This block is what says it was a stub, and
+    // what a dry run does not stub at all. Read from the FULL output, like
+    // the assertions.
+    if dry_run {
+        test_result["dry_run"] = talos_workflow_validation::dry_run_block(&output_json);
     }
 
     Some(mcp_text(
