@@ -124,6 +124,46 @@ impl WorkflowRecord {
     }
 }
 
+/// How recently a workflow must have run to count as one that runs, with no
+/// schedule or webhook of its own (a push channel, an action link, another
+/// workflow or a person starts it).
+pub const RUNS_RECENT_DAYS: i32 = 7;
+
+/// The predicate for "a workflow the platform runs", over `workflows w`.
+///
+/// `list_workflows(status: "active")` answers "is it published", and that is
+/// not the question. A DRAFT with an enabled schedule is dispatched from its
+/// draft graph, so on the reference fleet 27 workflows had an enabled schedule
+/// while 17 were `active` (measured 2026-10-12): a third of what ran was
+/// missing from the listing an operator reaches for.
+///
+/// A workflow runs when it is DISPATCHABLE (not archived and not paused; the
+/// shared predicate, `talos_workflow_liveness::dispatchable_sql`) and has a
+/// way to start: an enabled schedule, an enabled webhook trigger, or a run in
+/// the last [`RUNS_RECENT_DAYS`] days. The third arm is how a workflow bound
+/// to a push channel is found: that binding lives in integration state, which
+/// SQL cannot filter on.
+///
+/// Fixed text and constants only. Each `EXISTS` is served by an existing
+/// index: `workflow_schedules(workflow_id)` (unique),
+/// `webhook_triggers(workflow_id)`, `workflow_executions(workflow_id,
+/// started_at DESC)`.
+#[must_use]
+pub fn runs_sql() -> String {
+    format!(
+        "({dispatchable} AND ( \
+            EXISTS (SELECT 1 FROM workflow_schedules s \
+                    WHERE s.workflow_id = w.id AND s.is_enabled = true) \
+            OR EXISTS (SELECT 1 FROM webhook_triggers t \
+                       WHERE t.workflow_id = w.id AND t.enabled = true) \
+            OR EXISTS (SELECT 1 FROM workflow_executions e \
+                       WHERE e.workflow_id = w.id \
+                         AND e.started_at > NOW() - make_interval(days => {RUNS_RECENT_DAYS})) \
+         ))",
+        dispatchable = talos_workflow_liveness::dispatchable_sql(Some("w")),
+    )
+}
+
 impl WorkflowRepository {
     /// Open a write transaction scoped to the creator's **personal org**
     /// (RFC 0006 org-pin / RFC 0005 S3). Resolves that org in Rust so the
@@ -227,12 +267,17 @@ impl WorkflowRepository {
     }
 
     /// Paginated workflow listing with status + type filters.
+    ///
+    /// `runs_only` keeps the workflows the platform runs: see
+    /// [`runs_sql`]. It is a different question from `status_filter`, and the
+    /// two combine with AND.
     pub async fn list_workflows_paginated(
         &self,
         user_id: Uuid,
         status_filter: Option<&str>,
         type_filter: Option<&str>,
         tag_filter: Option<&str>,
+        runs_only: bool,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<WorkflowSummary>, i64)> {
@@ -279,6 +324,10 @@ impl WorkflowRepository {
             conditions.push(c);
         }
         if let Some(ref c) = tag_clause {
+            conditions.push(c);
+        }
+        let runs_clause = runs_only.then(runs_sql);
+        if let Some(ref c) = runs_clause {
             conditions.push(c);
         }
 
