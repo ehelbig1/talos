@@ -1,0 +1,118 @@
+# __NAME__ integration (Google) — what is left
+
+`scripts/new-integration.py --google` wrote this crate, its migration and the
+controller shim, in the shape every Google connection has: the SHARED Google
+OAuth client, the shared account-key derivation, and `account_email` on the
+row. This file lists what it did not do. Delete it when the list is done. The
+full guide is `docs/adding-an-integration.md`; `talos-google-calendar-write`
+is the finished example this was generated from.
+
+A new Google scope set is a NEW connection (this crate), not a wider existing
+one: every module granted `oauth/<provider>/…` holds whatever scopes that
+connection carries.
+
+## In this crate
+
+- [ ] `cargo fmt -p talos-__ID__`: where a line wraps depends on the names
+      just substituted into it.
+- [ ] `src/lib.rs`: every `SCAFFOLD:` comment — the crate header (what the
+      connection is for) and `REQUIRED_SCOPE`. `the_scope_was_filled_in`
+      fails until the scope is real. Ask for the narrowest scope that does
+      the job; the consent is refused if it comes back without exactly it.
+- [ ] Read `migrations/__MIGRATION__` and keep or change it before it is
+      applied anywhere. It already grants the table to `talos_admin_read`
+      (it holds which account is connected, never a token); withhold it
+      instead if that is wrong for this table
+      (`talos-advanced-repository/tests/admin_read_role_grants.rs` fails
+      until one or the other is done).
+
+## Wiring in the controller
+
+- [ ] `controller/Cargo.toml`: `talos-__ID__ = { path = "../talos-__ID__" }`.
+- [ ] `controller/src/main.rs`: `mod __SNAKE__;` and a
+      `__SNAKE___service: std::sync::Arc<__SNAKE__::__PASCAL__Service>` field
+      beside `google_calendar_write_service`.
+- [ ] `controller/src/bootstrap/services.rs`: build it the way
+      `google_calendar_write_service` is built
+      (`__PASCAL__Service::new(db_pool.clone()).with_credentials_service(oauth_credential_service.clone())`).
+- [ ] `controller/src/bootstrap/router.rs`: two routes, copied from the
+      `google_calendar_write_*_route` pair —
+      `/api/__ID__/connect` behind `rest_auth_middleware` + `rest_cookie_csrf_gate`,
+      and `/api/__ID__/callback` with NO session auth (rate-limited only),
+      then merge both.
+
+## The shared Google grant (each of these fails quietly if missed)
+
+Google keeps ONE grant per (account, OAuth client), and a revoke ends all of
+it. Talos therefore has to know that this connection is Google's, and whose
+account it is.
+
+- [ ] `talos-oauth/src/lib.rs`: add `"__SNAKE__"` to
+      `GOOGLE_SHARED_CLIENT_PROVIDERS` (left out, the token is never
+      refreshed: the connection works for an hour) and to
+      `GOOGLE_REVOKE_PROVIDERS`. The two coverage tests beside them list the
+      providers by name; add it there too.
+- [ ] `talos-oauth/src/credentials.rs`, `active_google_connections`: a
+      `WHEN c.provider = '__SNAKE__' THEN (SELECT lower(w.account_email) FROM
+      __SNAKE___integrations w WHERE w.user_id = c.user_id AND
+      w.provider_key::text = c.provider_key ORDER BY w.updated_at DESC LIMIT
+      1)` arm. Without it this connection's account is unknown, and a
+      connection that cannot be placed WITHHOLDS the revoke of every other
+      Google disconnect the user makes.
+- [ ] `controller/tests/google_disconnect_shared_grant_tests.rs`: the insert
+      arm for `"__SNAKE__"` and a test like
+      `the_calendar_write_connection_shares_its_accounts_grant`.
+- [ ] Register the redirect URI (`…/api/__ID__/callback`) on the shared
+      Google OAuth client, and add the scope to its consent screen.
+
+## Settings page
+
+- [ ] `talos-integrations/src/provider_config.rs`: a `PROVIDERS` entry
+      (`id: "__ID__"`, `graphql_enum: "__UPPER__"`,
+      `oauth_hosts: &["accounts.google.com"]`,
+      `env_vars: &["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"]`,
+      `redirect_path: "/api/__ID__/callback"`,
+      `db_table: "__SNAKE___integrations"`,
+      `account_identifier_column: "COALESCE(t.account_email, '__NAME__')"`,
+      `account_identifier_join: None`,
+      `extra_where: "AND t.is_active = true"`,
+      `disconnect_is_soft_delete: true`,
+      `provider_key_column: "provider_key"`,
+      `credential_provider: "__SNAKE__"`, `tier_column: None`,
+      `account_email_column: Some("account_email")`), and its id in the
+      Google list of the test beside it.
+- [ ] `talos-api/src/schema/types.rs`: a `__PASCAL__` variant on
+      `IntegrationService`, with its arms in `platform/queries.rs`
+      (`"__UPPER__" => IntegrationService::__PASCAL__`) and
+      `platform/mutations.rs`.
+- [ ] `cd frontend && npm run codegen` and commit `schema.graphql` and
+      `src/generated/*`; give the provider an icon in
+      `frontend/src/components/settings/integrations/types.ts`.
+
+## Configuration (lints 89 and 97 fail until these exist)
+
+The client id and secret are the shared `GOOGLE_CLIENT_ID` /
+`GOOGLE_CLIENT_SECRET`; this connection adds one variable.
+
+- [ ] `docs/configuration-reference.md`: a row for `__UPPER___REDIRECT_URI`
+      (Component `talos-__ID__`).
+- [ ] `docker-compose.yml` controller `environment:` and the chart's
+      controller deployment: `__UPPER___REDIRECT_URI`.
+
+## Lints and tests
+
+- [ ] `scripts/lint-structural.sh`, check 49: add `talos-__ID__/src` to the
+      integration crate list.
+- [ ] A controller DB test of the connect flow against a loopback provider,
+      modelled on `controller/tests/google_calendar_write_connect_tests.rs`:
+      tokens stored under the user who started the flow at the
+      `__SNAKE__` path, a URL minted in one browser refused in another, a
+      consent without the scope stores nothing, reconnect updates the row.
+- [ ] `make lint` and the crate's tests pass. (Check 89 reads files git does
+      not track yet and names them in its summary line; `git add` the crate
+      before pushing.)
+- [ ] A setup page (`docs/__ID__-setup.md`): the scope, and the redirect URI
+      to register on the shared client.
+- [ ] A module that uses the token declares its `allowed_methods` and is
+      granted the exact token path. If the scope allows more than the module
+      should do, say so in the setup page.

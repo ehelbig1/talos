@@ -133,6 +133,19 @@ a shared file (steps 5–8, configuration, lints, tests). The crate's
 scopes and account lookup. CI builds the scaffold on every Rust change
 (`make test-integration-scaffold`), so it tracks the crates it uses.
 
+**A new Google scope set: `--google`.** A Google connection is not the generic
+shape: it has no OAuth client of its own (the shared one,
+`talos_oauth::shared_google_client`), its account key is the derivation every
+Google connection shares, and its row records `account_email`, because a
+Google revoke ends the account's whole grant and a disconnect has to know
+which connections are one account. `scripts/new-integration.py <id> "<Display
+Name>" --google` writes that shape (generated from
+`talos-google-calendar-write`) with one required scope to fill in, and its
+`SCAFFOLD.md` lists the Google-specific shared edits — the two provider lists
+and the SQL arm in `talos-oauth` that fail quietly when missed. A new scope
+set is a new connection, never a wider existing one: every module granted
+`oauth/<provider>/…` holds whatever scopes that connection carries.
+
 1. **New crate** `talos-<provider>` (workspace member). Depend on `talos-oauth`,
    `talos-http-utils`, `talos-http-body`, `sqlx`, `uuid`, `anyhow`, `async-trait`.
 
