@@ -121,6 +121,7 @@ talos-integration-helpers = { path = "../talos-integration-helpers" }
 talos-google-calendar = { path = "../talos-google-calendar" }
 talos-gmail = { path = "../talos-gmail" }
 talos-google-cloud = { path = "../talos-google-cloud" }
+talos-google-calendar-write = { path = "../talos-google-calendar-write" }
 talos-google-health = { path = "../talos-google-health" }
 talos-microsoft-365 = { path = "../talos-microsoft-365" }
 talos-plaid-connect = { path = "../talos-plaid-connect" }

@@ -755,6 +755,10 @@ services:
       # Google Health connect (Pixel Watch / Fitbit readings). Issued under the
       # shared Google client above; this URI must be listed on that client.
       GOOGLE_HEALTH_REDIRECT_URI: ${GOOGLE_HEALTH_REDIRECT_URI:-http://localhost:8000/api/google-health/callback}
+      # Google Calendar (add events) connect: the write connection, separate
+      # from the read-only one above. Issued under the shared Google client;
+      # this URI must be listed on that client.
+      GOOGLE_CALENDAR_WRITE_REDIRECT_URI: ${GOOGLE_CALENDAR_WRITE_REDIRECT_URI:-http://localhost:8000/api/google-calendar-write/callback}
       # OAuth - Okta
       OKTA_DOMAIN: ${OKTA_DOMAIN:-}
       OKTA_CLIENT_ID: ${OKTA_CLIENT_ID:-}

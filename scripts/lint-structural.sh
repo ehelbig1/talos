@@ -3763,12 +3763,13 @@ INTEG_CLIENT_VIOLATIONS=0
 # 2026-07-19 (L7): they also carry Bearer/token credentials to configurable or
 # fixed hosts, so a dropped redirect(none()) there is the same leak class.
 # talos-google-health added 2026-10-02 with the crate; talos-microsoft-365
-# 2026-10-08 likewise.
+# 2026-10-08 and talos-google-calendar-write 2026-10-11 likewise.
 integ_client_matches=$(grep -rnE 'reqwest::Client::builder\(\)' \
     talos-gmail/src talos-google-calendar/src talos-slack/src \
     talos-atlassian/src talos-oauth/src talos-github/src \
     talos-google-cloud/src talos-integration-helpers/src \
-    talos-google-health/src talos-microsoft-365/src 2>/dev/null \
+    talos-google-health/src talos-microsoft-365/src \
+    talos-google-calendar-write/src 2>/dev/null \
     | grep -vE '/tests/|_tests\.rs' || true)
 if [ -n "$integ_client_matches" ]; then
     while IFS= read -r line; do

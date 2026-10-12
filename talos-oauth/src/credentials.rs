@@ -708,6 +708,10 @@ impl OAuthCredentialService {
                             SELECT lower(g.account_email) FROM google_calendar_integrations g
                              WHERE g.user_id = c.user_id AND g.oauth_account_id::text = c.provider_key
                              ORDER BY g.updated_at DESC LIMIT 1)
+                        WHEN c.provider = 'google_calendar_write' THEN (
+                            SELECT lower(w.account_email) FROM google_calendar_write_integrations w
+                             WHERE w.user_id = c.user_id AND w.provider_key::text = c.provider_key
+                             ORDER BY w.updated_at DESC LIMIT 1)
                         WHEN c.provider = 'google_health' THEN (
                             SELECT lower(h.account_email) FROM google_health_integrations h
                              WHERE h.user_id = c.user_id AND h.provider_key::text = c.provider_key

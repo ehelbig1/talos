@@ -1848,6 +1848,7 @@ dependencies = [
  "talos-github-repository",
  "talos-gmail",
  "talos-google-calendar",
+ "talos-google-calendar-write",
  "talos-google-cloud",
  "talos-google-health",
  "talos-graph-rag",
@@ -8553,6 +8554,30 @@ dependencies = [
  "talos-workflow-job-protocol",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "talos-google-calendar-write"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "reqwest",
+ "serde",
+ "sha2 0.11.0",
+ "sqlx",
+ "talos-config",
+ "talos-dlp-provider",
+ "talos-http-body",
+ "talos-http-utils",
+ "talos-oauth",
+ "talos-text-util",
+ "tokio",
+ "tracing",
+ "urlencoding",
  "uuid",
 ]
 

@@ -1621,6 +1621,7 @@ pub enum IntegrationService {
     Jira,
     GoogleCloud,
     GoogleHealth,
+    GoogleCalendarWrite,
     Plaid,
     // Named explicitly: the derived name would be `MICROSOFT365`, and the
     // provider registry says `MICROSOFT_365`.

@@ -618,6 +618,15 @@ pub(crate) async fn build_platform_services(
             .with_credentials_service(oauth_credential_service.clone()),
     );
 
+    // ---------- Initialize Google Calendar (add events) connection ----------
+    // OAuth only, and a connection of its own beside the read-only Google
+    // Calendar integration: the one write scope lives in its own vault
+    // namespace, and the event is added by a sandboxed module.
+    let google_calendar_write_service = std::sync::Arc::new(
+        google_calendar_write::GoogleCalendarWriteService::new(db_pool.clone())
+            .with_credentials_service(oauth_credential_service.clone()),
+    );
+
     // ---------- Initialize Microsoft 365 connection ----------
     // OAuth only, like Google Health: the mailbox and calendar are read by
     // sandboxed modules with a vault:// reference.
@@ -1367,6 +1376,7 @@ pub(crate) async fn build_platform_services(
         google_cloud_write_service,
         google_cloud_full_service,
         google_health_service,
+        google_calendar_write_service,
         microsoft_365_service,
         plaid_connect_service,
         github_connect_service,

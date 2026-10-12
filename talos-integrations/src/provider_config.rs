@@ -283,6 +283,30 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         account_email_column: Some("account_email"),
     },
     IntegrationProviderConfig {
+        id: "google-calendar-write",
+        display_name: "Google Calendar (add events)",
+        description: "Let a workflow add an event to a calendar you own",
+        icon: "CalendarPlus",
+        color: "#4285F4",
+        graphql_enum: "GOOGLE_CALENDAR_WRITE",
+        oauth_hosts: &["accounts.google.com"],
+        // The shared Google client, as Google Calendar.
+        env_vars: &["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+        redirect_path: "/api/google-calendar-write/callback",
+        db_table: "google_calendar_write_integrations",
+        // No join: alias `t`, and never NULL (see google-health above).
+        account_identifier_column: "COALESCE(t.account_email, 'Google Calendar (add events)')",
+        account_identifier_join: None,
+        extra_where: "AND t.is_active = true",
+        disconnect_is_soft_delete: true,
+        provider_key_column: "provider_key",
+        // Its own namespace: a grant on `oauth/google_calendar/…` (the
+        // read-only connection) does not name these tokens.
+        credential_provider: "google_calendar_write",
+        tier_column: None,
+        account_email_column: Some("account_email"),
+    },
+    IntegrationProviderConfig {
         id: "microsoft-365",
         display_name: "Microsoft 365",
         description: "Read Outlook mail and calendar from a work or school account",
@@ -402,7 +426,13 @@ mod tests {
     /// connections after a hard-delete has removed the row.
     #[test]
     fn every_google_provider_names_its_account_address_column() {
-        for id in ["google-calendar", "gmail", "gcp", "google-health"] {
+        for id in [
+            "google-calendar",
+            "google-calendar-write",
+            "gmail",
+            "gcp",
+            "google-health",
+        ] {
             let p = PROVIDERS.iter().find(|p| p.id == id).expect(id);
             assert!(
                 p.account_email_column.is_some(),
@@ -438,6 +468,33 @@ mod tests {
             Some("google_health")
         );
         assert_eq!(p.redirect_path, "/api/google-health/callback");
+    }
+
+    /// The write connection to Google Calendar is a provider of its own: its
+    /// tokens are stored, listed and revoked under `google_calendar_write`,
+    /// never under the read connection's `google_calendar`.
+    #[test]
+    fn google_calendar_write_is_its_own_provider_and_not_the_read_connection() {
+        let p = PROVIDERS
+            .iter()
+            .find(|p| p.id == "google-calendar-write")
+            .expect("google-calendar-write provider must exist");
+        let read = PROVIDERS
+            .iter()
+            .find(|p| p.id == "google-calendar")
+            .expect("google-calendar provider must exist");
+        assert_eq!(p.graphql_enum, "GOOGLE_CALENDAR_WRITE");
+        assert_eq!(p.db_table, "google_calendar_write_integrations");
+        assert_ne!(p.db_table, read.db_table);
+        assert_ne!(p.credential_provider, read.credential_provider);
+        assert!(p.account_identifier_join.is_none());
+        assert!(p.disconnect_is_soft_delete && p.extra_where.contains("t.is_active = true"));
+        assert_eq!(p.provider_key_column, "provider_key");
+        assert_eq!(
+            revoke_provider_for(p, None).as_deref(),
+            Some("google_calendar_write")
+        );
+        assert_eq!(p.redirect_path, "/api/google-calendar-write/callback");
     }
 
     /// The same for Microsoft 365, whose tokens are stored under

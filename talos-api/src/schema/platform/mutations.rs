@@ -398,6 +398,7 @@ impl PlatformMutations {
             IntegrationService::Jira => "JIRA",
             IntegrationService::GoogleCloud => "GOOGLE_CLOUD",
             IntegrationService::GoogleHealth => "GOOGLE_HEALTH",
+            IntegrationService::GoogleCalendarWrite => "GOOGLE_CALENDAR_WRITE",
             IntegrationService::Plaid => "PLAID",
             IntegrationService::Microsoft365 => "MICROSOFT_365",
         };
