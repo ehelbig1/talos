@@ -515,9 +515,13 @@ impl AtlassianIntegrationService {
         // could not be deleted there expires on its own, and the rows are
         // removed here either way.
         if let Some(cid) = cloud_id.as_deref() {
-            if let Err(e) = self
-                .remove_push_registrations_for_connection(user_id, cid)
-                .await
+            // Boxed: this future holds the whole webhook-removal call chain
+            // (token, HTTP, rows), and inlined into its callers it made the
+            // disconnect handler's future too deep for the compiler to lay
+            // out under the optimized `docker` profile ("queries overflow
+            // the depth limit"). A boxed future is one pointer to its caller.
+            if let Err(e) =
+                Box::pin(self.remove_push_registrations_for_connection(user_id, cid)).await
             {
                 tracing::warn!(
                     user_id = %user_id,
