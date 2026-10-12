@@ -24,18 +24,15 @@ use uuid::Uuid;
 
 use crate::OAuthCredentialService;
 use talos_secrets_manager::SecretsManager;
+// The `gcp/impersonated/...` mint path (Phase D) has ONE home for its two
+// forms; this file only asks it what a path means.
+use talos_workflow_job_protocol::{
+    parse_gcp_impersonated_path, GCP_IMPERSONATED_PREFIX, GCP_IMPERSONATED_SUFFIX,
+};
 
 /// Secret-path scheme that resolves to a GitHub App installation token
 /// (RFC 0008 B4): `github_app:<owner>`.
 const GITHUB_APP_SCHEME: &str = "github_app:";
-
-/// Secret-path prefix that resolves to a minted GCP impersonated
-/// service-account access token (Phase D):
-/// `gcp/impersonated/<service_account_email>/access_token`.
-const GCP_IMPERSONATED_PREFIX: &str = "gcp/impersonated/";
-/// Required suffix — only `.../access_token` is a mint target (guards a
-/// typo'd path from being silently treated as a mintable secret).
-const GCP_IMPERSONATED_SUFFIX: &str = "/access_token";
 
 /// Process-wide GitHub App installation-token provider, injected once at
 /// controller startup via [`set_github_installation_token_provider`]. The App is
@@ -119,22 +116,6 @@ impl ControllerSecretsResolver {
 
 fn boxed(err: impl std::fmt::Display) -> BoxError {
     err.to_string().into()
-}
-
-/// Extract the impersonation target (service-account email) from a
-/// `gcp/impersonated/<sa_email>/access_token` path, or `None` if the path
-/// isn't a well-formed mint target. SA emails never contain `/`, so the
-/// segment between the fixed prefix and suffix is exactly the target; a `/`
-/// inside it (extra path segments) or an empty target is rejected so a
-/// malformed path can never be silently treated as a mintable secret.
-fn parse_impersonation_target(path: &str) -> Option<&str> {
-    let inner = path
-        .strip_prefix(GCP_IMPERSONATED_PREFIX)?
-        .strip_suffix(GCP_IMPERSONATED_SUFFIX)?;
-    if inner.is_empty() || inner.contains('/') {
-        return None;
-    }
-    Some(inner)
 }
 
 #[async_trait]
@@ -226,13 +207,20 @@ impl SecretsResolver for ControllerSecretsResolver {
             match (GCP_IMPERSONATION_PROVIDER.get(), user_id) {
                 (Some(provider), Some(uid)) => {
                     for path in gcp_impersonated_paths {
-                        let Some(sa_email) = parse_impersonation_target(&path) else {
+                        let Some(target) = parse_gcp_impersonated_path(&path) else {
                             tracing::warn!(
                                 "malformed gcp/impersonated path; not injected (fail closed)"
                             );
                             continue;
                         };
-                        match provider.impersonated_token(sa_email, uid).await {
+                        match provider
+                            .impersonated_token(
+                                target.service_account_email,
+                                target.connection,
+                                uid,
+                            )
+                            .await
+                        {
                             // Key by the full requested path: that's what the
                             // module reads via get_secret(...), and what its
                             // `gcp/impersonated/*` allowed_secrets grant covers.
@@ -240,7 +228,8 @@ impl SecretsResolver for ControllerSecretsResolver {
                                 out.insert(path.clone(), token);
                             }
                             Ok(None) => tracing::warn!(
-                                "no google_cloud_full consent / impersonation not permitted for this user; gcp impersonated token not injected (module fails closed)"
+                                named_connection = target.connection.is_some(),
+                                "no single google_cloud_full consent to mint from for this user (none, several with none named, or the named one is not theirs); gcp impersonated token not injected (module fails closed)"
                             ),
                             Err(e) => tracing::error!(
                                 error = %e,
@@ -302,45 +291,5 @@ impl SecretsResolver for ControllerSecretsResolver {
         self.oauth_service()
             .force_refresh_oauth_tokens_in_batch(paths)
             .await
-    }
-}
-
-#[cfg(test)]
-mod impersonation_path_tests {
-    use super::parse_impersonation_target;
-
-    #[test]
-    fn extracts_well_formed_sa_email() {
-        assert_eq!(
-            parse_impersonation_target(
-                "gcp/impersonated/talos-runner@sandbox.iam.gserviceaccount.com/access_token"
-            ),
-            Some("talos-runner@sandbox.iam.gserviceaccount.com")
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_targets() {
-        // Empty target.
-        assert_eq!(
-            parse_impersonation_target("gcp/impersonated//access_token"),
-            None
-        );
-        // Extra path segments (a `/` inside the "email") — never a real SA,
-        // and would let a crafted path smuggle structure into the mint call.
-        assert_eq!(
-            parse_impersonation_target("gcp/impersonated/a/b/access_token"),
-            None
-        );
-        // Wrong suffix — only `.../access_token` is a mint target.
-        assert_eq!(
-            parse_impersonation_target("gcp/impersonated/sa@x.com/refresh_token"),
-            None
-        );
-        // Not the impersonation namespace at all.
-        assert_eq!(
-            parse_impersonation_target("oauth/google_cloud_full/u/k/access_token"),
-            None
-        );
     }
 }

@@ -78,6 +78,23 @@ pub fn rendered_connection(
         out["note"] = Value::String(
             "This credential is used by the controller only; no module can read it.".to_string(),
         );
+        // What a module CAN be given from it: a short-lived token for one
+        // service account, minted from THIS connection. The reference names
+        // the connection, so a second Google account never changes whose
+        // consent a workflow runs on.
+        if let Some(key) = row
+            .provider_key
+            .as_deref()
+            .and_then(|k| Uuid::parse_str(k).ok())
+        {
+            out["mint_reference"] = Value::String(format!(
+                "vault://{}",
+                talos_workflow_job_protocol::gcp_impersonated_path(
+                    "{service_account_email}",
+                    Some(key)
+                )
+            ));
+        }
         return out;
     }
     out["module_readable"] = Value::Bool(true);

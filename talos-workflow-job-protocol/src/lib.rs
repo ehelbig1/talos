@@ -2869,6 +2869,136 @@ pub fn is_disallowed_sql_function(name: &str) -> bool {
             .any(|family| lower.starts_with(family))
 }
 
+/// Where a minted GCP impersonated service-account token is requested
+/// (Phase D). A module names one of these paths; nothing is stored under it.
+pub const GCP_IMPERSONATED_PREFIX: &str = "gcp/impersonated/";
+/// Only `.../access_token` is a mint target, so a typo'd path is never
+/// silently treated as a mintable secret.
+pub const GCP_IMPERSONATED_SUFFIX: &str = "/access_token";
+/// The segment that precedes the connection a mint is made from.
+const GCP_IMPERSONATED_VIA: &str = "as";
+
+/// What a `gcp/impersonated/...` path asks for: which service account, and
+/// (when it says) which of the requesting user's Google Cloud connections the
+/// token is minted from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcpImpersonationTarget<'a> {
+    pub service_account_email: &'a str,
+    /// The connection's key. `None` leaves the choice to the minter, which
+    /// may only make it when the user has exactly one such connection.
+    pub connection: Option<uuid::Uuid>,
+}
+
+/// Read a mint path. Two forms, and nothing else:
+///
+/// * `gcp/impersonated/<sa_email>/access_token`
+/// * `gcp/impersonated/<sa_email>/as/<connection key>/access_token`
+///
+/// A service-account email holds no `/`, so the segments are exact. The
+/// connection key must be a UUID written the one canonical way (lower-case,
+/// hyphenated): a path is compared and granted as text, and two spellings of
+/// one key would be two paths for one credential.
+#[must_use]
+pub fn parse_gcp_impersonated_path(path: &str) -> Option<GcpImpersonationTarget<'_>> {
+    let inner = path
+        .strip_prefix(GCP_IMPERSONATED_PREFIX)?
+        .strip_suffix(GCP_IMPERSONATED_SUFFIX)?;
+    let mut parts = inner.split('/');
+    let service_account_email = parts.next().filter(|sa| !sa.is_empty())?;
+    let connection = match (parts.next(), parts.next(), parts.next()) {
+        (None, _, _) => None,
+        (Some(GCP_IMPERSONATED_VIA), Some(key), None) => {
+            let parsed = uuid::Uuid::parse_str(key).ok()?;
+            if parsed.hyphenated().to_string() != key {
+                return None;
+            }
+            Some(parsed)
+        }
+        _ => return None,
+    };
+    Some(GcpImpersonationTarget {
+        service_account_email,
+        connection,
+    })
+}
+
+/// Write a mint path: the inverse of [`parse_gcp_impersonated_path`].
+#[must_use]
+pub fn gcp_impersonated_path(
+    service_account_email: &str,
+    connection: Option<uuid::Uuid>,
+) -> String {
+    match connection {
+        None => format!("{GCP_IMPERSONATED_PREFIX}{service_account_email}{GCP_IMPERSONATED_SUFFIX}"),
+        Some(key) => format!(
+            "{GCP_IMPERSONATED_PREFIX}{service_account_email}/{GCP_IMPERSONATED_VIA}/{}{GCP_IMPERSONATED_SUFFIX}",
+            key.hyphenated()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod gcp_impersonated_path_tests {
+    use super::{gcp_impersonated_path, parse_gcp_impersonated_path, GcpImpersonationTarget};
+
+    const SA: &str = "talos-runner@sandbox.iam.gserviceaccount.com";
+    const KEY: &str = "63012854-b3ac-dc54-301c-7b5cc9aff819";
+
+    #[test]
+    fn both_forms_are_read_and_written_the_same_way() {
+        let key = uuid::Uuid::parse_str(KEY).unwrap();
+        let plain = format!("gcp/impersonated/{SA}/access_token");
+        let named = format!("gcp/impersonated/{SA}/as/{KEY}/access_token");
+        assert_eq!(
+            parse_gcp_impersonated_path(&plain),
+            Some(GcpImpersonationTarget {
+                service_account_email: SA,
+                connection: None
+            })
+        );
+        assert_eq!(
+            parse_gcp_impersonated_path(&named),
+            Some(GcpImpersonationTarget {
+                service_account_email: SA,
+                connection: Some(key)
+            })
+        );
+        assert_eq!(gcp_impersonated_path(SA, None), plain);
+        assert_eq!(gcp_impersonated_path(SA, Some(key)), named);
+    }
+
+    #[test]
+    fn anything_else_is_not_a_mint_target() {
+        for bad in [
+            // No target, extra segments, the wrong suffix, another namespace.
+            "gcp/impersonated//access_token".to_string(),
+            "gcp/impersonated/a/b/access_token".to_string(),
+            format!("gcp/impersonated/{SA}/refresh_token"),
+            "oauth/google_cloud_full/u/k/access_token".to_string(),
+            // A connection segment that is not `as/<key>` exactly.
+            format!("gcp/impersonated/{SA}/as/access_token"),
+            format!("gcp/impersonated/{SA}/as//access_token"),
+            format!("gcp/impersonated/{SA}/via/{KEY}/access_token"),
+            format!("gcp/impersonated/{SA}/as/{KEY}/extra/access_token"),
+            format!("gcp/impersonated//as/{KEY}/access_token"),
+            // A key that is not a UUID, or is one spelled another way: upper
+            // case, without hyphens, braced. One key, one path.
+            format!("gcp/impersonated/{SA}/as/not-a-key/access_token"),
+            format!(
+                "gcp/impersonated/{SA}/as/{}/access_token",
+                KEY.to_uppercase()
+            ),
+            format!(
+                "gcp/impersonated/{SA}/as/{}/access_token",
+                KEY.replace('-', "")
+            ),
+            format!("gcp/impersonated/{SA}/as/{{{KEY}}}/access_token"),
+        ] {
+            assert_eq!(parse_gcp_impersonated_path(&bad), None, "{bad}");
+        }
+    }
+}
+
 /// True iff `path` is consumed by a controller-internal subsystem (LLM
 /// client cache, OAuth refresh loop) rather than by any WASM module's
 /// `allowed_secrets` grant. Used by the orphaned-secrets hygiene check

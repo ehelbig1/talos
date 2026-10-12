@@ -10,7 +10,11 @@
 //! 1. The requesting user holds a **`google_cloud_full`** consent — a broad
 //!    `cloud-platform` token that is **host-reserved** (never handed to a
 //!    guest; see `is_controller_internal_vault_path`). It is used ONLY here,
-//!    controller-side, as the bearer for the mint call.
+//!    controller-side, as the bearer for the mint call. A user may hold
+//!    several (one per Google account). Which one a mint uses is never
+//!    chosen here: the request names it, or the user has exactly one
+//!    ([`choose_consent`]). A token minted from the wrong account acts as
+//!    the wrong person, in someone else's project.
 //! 2. The mint calls `iamcredentials.generateAccessToken` to impersonate
 //!    `<sa_email>`, returning a token that lives ~10 minutes and is bounded by
 //!    the SA's OWN IAM roles (mint scope `cloud-platform` ∩ the SA's granted
@@ -95,7 +99,7 @@ fn sa_project(sa_email: &str) -> Option<&str> {
 /// refreshes + reads the broad token) plus a pool to resolve the user's
 /// full-tier `provider_key`.
 ///
-/// A short-TTL cache keyed by `(user_id, sa_email)` serves a live token across
+/// A short-TTL cache keyed by `(user_id, connection, sa_email)` serves a live token across
 /// repeated dispatches (a poll-until-done loop re-dispatches the node every
 /// iteration — without the cache each iteration would re-mint, plus a DB
 /// lookup and a vault read). Mirrors the GitHub App installation-token cache
@@ -105,7 +109,80 @@ fn sa_project(sa_email: &str) -> Option<&str> {
 pub struct GcpImpersonationService {
     db_pool: Pool<Postgres>,
     full_tier: Arc<GoogleCloudIntegrationService>,
-    cache: DashMap<(Uuid, String), CachedMint>,
+    cache: DashMap<(Uuid, Option<Uuid>, String), CachedMint>,
+}
+
+/// What a cached token is filed under. The connection is part of the key: a
+/// token minted from one account is never served to a request that names
+/// another, or that names none.
+fn mint_cache_key(
+    user_id: Uuid,
+    connection: Option<Uuid>,
+    sa_email: &str,
+) -> (Uuid, Option<Uuid>, String) {
+    (user_id, connection, sa_email.to_string())
+}
+
+/// Most full-tier consents read for one user. Far above what one person
+/// connects; it bounds the read, and reaching it is treated as "several".
+const MAX_CONSENTS_READ: i64 = 16;
+
+/// Which consent a mint is made from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentChoice {
+    /// Mint from this connection.
+    Use(Uuid),
+    /// The user has no active full-tier consent.
+    NoConsent,
+    /// The user has several and the request names none. Nothing is minted:
+    /// picking one would let whichever account was touched last answer.
+    SeveralAndNoneNamed,
+    /// The request names a connection that is not an active full-tier
+    /// consent of this user (another user's, a disconnected one, a typo).
+    NamedIsNotTheirs,
+}
+
+/// Decide which of `active` (the requesting user's own active full-tier
+/// connection keys) a mint uses, given the connection the request `named`.
+///
+/// The only way to a [`ConsentChoice::Use`] is a key that is IN `active`:
+/// named and present, or unnamed and the only one. `active` is read under the
+/// requesting user's id, so a key from anywhere else can never be chosen.
+#[must_use]
+pub fn choose_consent(active: &[Uuid], named: Option<Uuid>) -> ConsentChoice {
+    match (named, active) {
+        (Some(key), _) if active.contains(&key) => ConsentChoice::Use(key),
+        (Some(_), _) => ConsentChoice::NamedIsNotTheirs,
+        (None, []) => ConsentChoice::NoConsent,
+        (None, [only]) => ConsentChoice::Use(*only),
+        (None, _) => ConsentChoice::SeveralAndNoneNamed,
+    }
+}
+
+/// The keys of `user_id`'s active full-tier connections, in a fixed order.
+///
+/// Tenancy: filtered on `user_id`. This is the list [`choose_consent`]
+/// chooses from, so it is what keeps one user's request off another user's
+/// consent.
+///
+/// # Errors
+/// When the rows cannot be read. An unreadable list is an error, never an
+/// empty one: "no consent" and "could not look" are different answers.
+pub async fn active_full_tier_connections(
+    pool: &Pool<Postgres>,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT provider_key FROM google_cloud_integrations \
+         WHERE user_id = $1 AND tier = 'full' AND is_active = TRUE \
+         ORDER BY provider_key LIMIT $2",
+    )
+    .bind(user_id)
+    .bind(MAX_CONSENTS_READ)
+    .fetch_all(pool)
+    .await
+    .context("Failed to look up full-tier GCP consents")?;
+    Ok(rows.into_iter().map(|(key,)| key).collect())
 }
 
 impl GcpImpersonationService {
@@ -126,23 +203,6 @@ impl GcpImpersonationService {
         if self.cache.len() > CACHE_SWEEP_THRESHOLD {
             self.cache.retain(|_, v| v.expires_at_unix > now_unix);
         }
-    }
-
-    /// The user's active full-tier `provider_key`, or `None` if they have not
-    /// consented to the full tier. (`google_cloud_integrations` holds at most
-    /// one active `tier='full'` row per user — the same account may also hold
-    /// read/write rows.)
-    async fn full_tier_provider_key(&self, user_id: Uuid) -> Result<Option<Uuid>> {
-        let row: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT provider_key FROM google_cloud_integrations \
-             WHERE user_id = $1 AND tier = 'full' AND is_active = TRUE \
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.db_pool)
-        .await
-        .context("Failed to look up full-tier GCP consent")?;
-        Ok(row.map(|(pk,)| pk))
     }
 
     /// Call `iamcredentials.generateAccessToken` to impersonate `sa_email`.
@@ -233,10 +293,11 @@ impl GcpImpersonationTokenProvider for GcpImpersonationService {
     async fn impersonated_token(
         &self,
         service_account_email: &str,
+        connection: Option<Uuid>,
         user_id: Uuid,
     ) -> Result<Option<String>, BoxError> {
         let now = chrono::Utc::now().timestamp();
-        let cache_key = (user_id, service_account_email.to_string());
+        let cache_key = mint_cache_key(user_id, connection, service_account_email);
 
         // Cache hit: a still-fresh token for this (user, SA) — skip the DB
         // lookup, vault read, and mint entirely. This is what keeps a
@@ -247,14 +308,30 @@ impl GcpImpersonationTokenProvider for GcpImpersonationService {
             }
         }
 
-        // No full-tier consent → not injected (fail closed). This is Ok(None),
-        // not Err: it's an expected "user hasn't opted in" state, not a fault.
-        let Some(provider_key) = self
-            .full_tier_provider_key(user_id)
+        // No ONE consent to mint from → not injected (fail closed). This is
+        // Ok(None), not Err: these are states of the user's connections, not
+        // faults. Each is logged with what to do about it, and no key.
+        let active = active_full_tier_connections(&self.db_pool, user_id)
             .await
-            .map_err(|e| -> BoxError { e.to_string().into() })?
-        else {
-            return Ok(None);
+            .map_err(|e| -> BoxError { e.to_string().into() })?;
+        let provider_key = match choose_consent(&active, connection) {
+            ConsentChoice::Use(key) => key,
+            ConsentChoice::NoConsent => return Ok(None),
+            ConsentChoice::SeveralAndNoneNamed => {
+                tracing::warn!(
+                    %user_id,
+                    consents = active.len(),
+                    "gcp impersonation: this user has several Google Cloud connections and the path names none; nothing minted. Use gcp/impersonated/<service account>/as/<connection key>/access_token (list_connections shows each connection's key)"
+                );
+                return Ok(None);
+            }
+            ConsentChoice::NamedIsNotTheirs => {
+                tracing::warn!(
+                    %user_id,
+                    "gcp impersonation: the path names a connection that is not an active Google Cloud (full) connection of this user; nothing minted"
+                );
+                return Ok(None);
+            }
         };
 
         // Read (refresh-if-needed) the broad host-reserved cloud-platform
@@ -340,5 +417,83 @@ mod sa_project_tests {
         // Garbage / no domain.
         assert_eq!(sa_project("not-an-email"), None);
         assert_eq!(sa_project("a@b.com"), None);
+    }
+}
+
+#[cfg(test)]
+mod choose_consent_tests {
+    use super::{choose_consent, ConsentChoice};
+    use uuid::Uuid;
+
+    fn key(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn a_cached_token_belongs_to_the_connection_it_was_minted_from() {
+        use super::mint_cache_key;
+        let (user, sa) = (key(7), "reader@p.iam.gserviceaccount.com");
+        let named = mint_cache_key(user, Some(key(1)), sa);
+        // Another connection, no connection, another user, another account: each its own entry.
+        for other in [
+            mint_cache_key(user, Some(key(2)), sa),
+            mint_cache_key(user, None, sa),
+            mint_cache_key(key(8), Some(key(1)), sa),
+            mint_cache_key(user, Some(key(1)), "other@p.iam.gserviceaccount.com"),
+        ] {
+            assert_ne!(named, other);
+        }
+        assert_eq!(named, mint_cache_key(user, Some(key(1)), sa));
+    }
+
+    #[test]
+    fn one_consent_and_no_name_is_that_consent() {
+        // The single-account user: exactly what happened before this choice existed.
+        assert_eq!(choose_consent(&[key(1)], None), ConsentChoice::Use(key(1)));
+        assert_eq!(choose_consent(&[], None), ConsentChoice::NoConsent);
+    }
+
+    #[test]
+    fn several_consents_and_no_name_mints_nothing() {
+        // Never the first, the last or the newest: an unnamed request with a
+        // choice to make gets no token, whatever the order of the list.
+        for active in [
+            vec![key(1), key(2)],
+            vec![key(2), key(1)],
+            vec![key(1), key(2), key(3)],
+        ] {
+            assert_eq!(
+                choose_consent(&active, None),
+                ConsentChoice::SeveralAndNoneNamed,
+                "{active:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_consent_is_used_only_if_it_is_one_of_the_users_own() {
+        let mine = [key(1), key(2)];
+        assert_eq!(
+            choose_consent(&mine, Some(key(2))),
+            ConsentChoice::Use(key(2))
+        );
+        assert_eq!(
+            choose_consent(&mine, Some(key(1))),
+            ConsentChoice::Use(key(1))
+        );
+        // Another user's key, a disconnected one, a typo: not in the list, so not used.
+        assert_eq!(
+            choose_consent(&mine, Some(key(9))),
+            ConsentChoice::NamedIsNotTheirs
+        );
+        // Naming a wrong key never falls back to "the only one".
+        assert_eq!(
+            choose_consent(&[key(1)], Some(key(9))),
+            ConsentChoice::NamedIsNotTheirs
+        );
+        assert_eq!(
+            choose_consent(&[], Some(key(9))),
+            ConsentChoice::NamedIsNotTheirs
+        );
     }
 }
