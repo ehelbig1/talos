@@ -243,6 +243,77 @@ pub const MEMORY_WRITE: &str = "__memory_write__";
 ///   "ceiling": "readonly"}`.
 pub const MEMORY_WRITE_REFUSED: &str = "__memory_write_refused__";
 
+/// ENGINE-AUTHORED record, written onto a node's committed output, of every
+/// outgoing edge whose `condition` could not be EVALUATED.
+///
+/// A condition that errors (an unbound variable is the usual one) is treated
+/// as "branch not taken": the edge resolves inactive and its child is skipped
+/// when nothing else feeds it. That rule is deliberate and unchanged. What
+/// was missing is any trace of it on the run: the child was recorded as
+/// skipped for `no_active_input`, exactly as after a condition that evaluated
+/// `false`, the run finished `completed`, and the only evidence was a counter
+/// and a WARN carrying no execution id. Observed 2026-10-10: an edge written
+/// `hold.held == true` (the scope binds the source's output FIELDS, so the
+/// name is `held`) silently never ran its target.
+///
+/// Like every engine-authored key it is set-or-REMOVE: a module that emits
+/// its own copy has it removed when the node's successors are released.
+///
+/// Value shape: an array, at most [`EDGE_CONDITION_ERRORS_MAX`] entries, of
+/// `{"target": <child label>, "condition": <expression>, "error": <the
+/// evaluator's message>}`, the two strings bounded by
+/// [`EDGE_CONDITION_ERROR_TEXT_MAX`]. Absent when every condition evaluated.
+pub const EDGE_CONDITION_ERRORS: &str = "__edge_condition_errors__";
+
+/// Hard cap on [`EDGE_CONDITION_ERRORS`] entries for one node.
+pub const EDGE_CONDITION_ERRORS_MAX: usize = 16;
+
+/// Longest `condition` / `error` string an [`EDGE_CONDITION_ERRORS`] entry
+/// carries, in bytes.
+pub const EDGE_CONDITION_ERROR_TEXT_MAX: usize = 240;
+
+/// One [`EDGE_CONDITION_ERRORS`] entry. `condition` and `error` are cut to
+/// [`EDGE_CONDITION_ERROR_TEXT_MAX`] bytes on a character boundary.
+pub fn edge_condition_error_entry(target: &str, condition: &str, error: &str) -> serde_json::Value {
+    fn bounded(text: &str) -> &str {
+        let mut end = text.len().min(EDGE_CONDITION_ERROR_TEXT_MAX);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    }
+    serde_json::json!({
+        "target": target,
+        "condition": bounded(condition),
+        "error": bounded(error),
+    })
+}
+
+/// Apply the [`EDGE_CONDITION_ERRORS`] record to a node's committed output,
+/// set-or-REMOVE. `entries` beyond [`EDGE_CONDITION_ERRORS_MAX`] are dropped.
+///
+/// Returns `false` when there were entries and `output` is not an object, so
+/// there was nowhere to write them: the caller says so rather than losing the
+/// record silently.
+pub fn apply_edge_condition_errors(
+    output: &mut serde_json::Value,
+    mut entries: Vec<serde_json::Value>,
+) -> bool {
+    let Some(obj) = output.as_object_mut() else {
+        return entries.is_empty();
+    };
+    if entries.is_empty() {
+        obj.remove(EDGE_CONDITION_ERRORS);
+    } else {
+        entries.truncate(EDGE_CONDITION_ERRORS_MAX);
+        obj.insert(
+            EDGE_CONDITION_ERRORS.to_string(),
+            serde_json::Value::Array(entries),
+        );
+    }
+    true
+}
+
 /// Per-node config key that OPTS a send node into idempotent retries. When
 /// present and truthy the engine stamps a stable idempotency key onto the
 /// dispatch (see [`resolve_idempotency_key`]); the worker then emits that key as

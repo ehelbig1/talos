@@ -12,7 +12,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
             "name": "get_execution_status",
-            "description": "Check the status and results of a workflow execution. Pass detail: true (default) to get the full per-node trace including status, duration, output, and retries for every node.",
+            "description": "Check the status and results of a workflow execution. Pass detail: true (default) to get the full per-node trace including status, duration, output, and retries for every node. A run can reach status 'completed' past a node that failed (continue_on_error, or an error edge): in both modes those nodes are listed under `continued_failures` as {node, handling, error_class, message}; the field is absent when no stored node output reports a failure. An edge whose condition could not be evaluated is not taken, like one whose condition was false, and its target is skipped: those edges are listed under `edge_condition_errors` as {source, target, condition, error}, absent when every condition evaluated.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -899,6 +899,26 @@ async fn handle_get_execution_status(
                      Prefer hmac-sign / fetch-with-bearer (Tier 1) to keep keys host-side."
                         .to_string(),
                 ),
+            );
+        }
+        // The polling path reads `status` and stops. A `completed` run with a
+        // node that did not do its work says so here.
+        let continued =
+            continued_failures_block(exec.output_data.as_ref(), &std::collections::HashMap::new());
+        if !continued.is_empty() {
+            map.insert(
+                "continued_failures".to_string(),
+                serde_json::Value::Array(continued),
+            );
+        }
+        let errored_edges = edge_condition_errors_block(
+            exec.output_data.as_ref(),
+            &std::collections::HashMap::new(),
+        );
+        if !errored_edges.is_empty() {
+            map.insert(
+                "edge_condition_errors".to_string(),
+                serde_json::Value::Array(errored_edges),
             );
         }
         if has_output {
@@ -5686,6 +5706,131 @@ async fn handle_get_execution_comparison_report(
 
 // ── shared trace builder ─────────────────────────────────────────────────────
 
+/// The nodes of a stored run that failed while the run went on, for the
+/// `continued_failures` field of `get_execution_status` and the trace.
+///
+/// `output_data` is keyed by node label on some paths and by node UUID on
+/// others; a UUID key is resolved to its label through `node_labels` and kept
+/// as `node_id`. Empty when nothing failed or no output is stored: the field
+/// is added to a reply only when this is non-empty.
+pub(crate) fn continued_failures_block(
+    output_data: Option<&serde_json::Value>,
+    node_labels: &std::collections::HashMap<Uuid, String>,
+) -> Vec<serde_json::Value> {
+    let Some(output) = output_data else {
+        return Vec::new();
+    };
+    talos_workflow_validation::continued_failures(output)
+        .iter()
+        .map(|failure| {
+            let mut entry = failure.to_json();
+            if let Ok(node_id) = failure.node.parse::<Uuid>() {
+                entry["node_id"] = serde_json::json!(failure.node);
+                if let Some(label) = node_labels.get(&node_id) {
+                    entry["node"] = serde_json::json!(label);
+                }
+            }
+            entry
+        })
+        .collect()
+}
+
+/// The edges of a stored run whose conditions errored, for the
+/// `edge_condition_errors` field of `get_execution_status` and the trace. A
+/// UUID-keyed source is named by its label, as in
+/// [`continued_failures_block`]. Empty when every condition evaluated.
+pub(crate) fn edge_condition_errors_block(
+    output_data: Option<&serde_json::Value>,
+    node_labels: &std::collections::HashMap<Uuid, String>,
+) -> Vec<serde_json::Value> {
+    let Some(output) = output_data else {
+        return Vec::new();
+    };
+    talos_workflow_validation::edge_condition_errors(output)
+        .iter()
+        .map(|error| {
+            let mut entry = error.to_json();
+            if let Ok(node_id) = error.source.parse::<Uuid>() {
+                entry["source_node_id"] = serde_json::json!(error.source);
+                if let Some(label) = node_labels.get(&node_id) {
+                    entry["source"] = serde_json::json!(label);
+                }
+            }
+            entry
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod continued_failures_block_tests {
+    use super::continued_failures_block;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    #[test]
+    fn a_uuid_key_is_named_by_its_label_and_a_label_key_is_kept() {
+        let node_id = Uuid::from_u128(7);
+        let labels = std::collections::HashMap::from([(node_id, "notify".to_string())]);
+        let failed =
+            json!({"__error": true, "error_message": "fuel exhausted", "__continued": true});
+        let by_uuid = json!({ node_id.to_string(): failed.clone(), "compose": {"ok": true} });
+        assert_eq!(
+            continued_failures_block(Some(&by_uuid), &labels),
+            vec![json!({
+                "node": "notify",
+                "node_id": node_id.to_string(),
+                "handling": "continue_on_error",
+                "error_class": "fuel_exhaustion",
+                "message": "fuel exhausted",
+            })]
+        );
+        let by_label = json!({ "notify": failed });
+        assert_eq!(
+            continued_failures_block(Some(&by_label), &labels),
+            vec![json!({
+                "node": "notify",
+                "handling": "continue_on_error",
+                "error_class": "fuel_exhaustion",
+                "message": "fuel exhausted",
+            })]
+        );
+    }
+
+    #[test]
+    fn an_errored_edge_is_listed_with_its_source_named() {
+        use super::edge_condition_errors_block;
+        let node_id = Uuid::from_u128(9);
+        let labels = std::collections::HashMap::from([(node_id, "hold".to_string())]);
+        let output = json!({ node_id.to_string(): {
+            "held": true,
+            "__edge_condition_errors__": [
+                {"target": "apply", "condition": "hold.held == true", "error": "Variable not found: hold"}
+            ],
+        }});
+        assert_eq!(
+            edge_condition_errors_block(Some(&output), &labels),
+            vec![json!({
+                "source": "hold",
+                "source_node_id": node_id.to_string(),
+                "target": "apply",
+                "condition": "hold.held == true",
+                "error": "Variable not found: hold",
+            })]
+        );
+        assert!(
+            edge_condition_errors_block(Some(&json!({"hold": {"held": true}})), &labels).is_empty()
+        );
+        assert!(edge_condition_errors_block(None, &labels).is_empty());
+    }
+
+    #[test]
+    fn nothing_stored_and_nothing_failed_add_no_field() {
+        let labels = std::collections::HashMap::new();
+        assert!(continued_failures_block(None, &labels).is_empty());
+        assert!(continued_failures_block(Some(&json!({"a": {"ok": true}})), &labels).is_empty());
+    }
+}
+
 /// Builds the full per-node trace JSON string for an execution.
 /// Called by get_execution_trace, get_execution_status(detail: true), and trigger_workflow(wait_ms).
 pub async fn build_execution_trace_json(
@@ -6121,6 +6266,18 @@ pub async fn build_execution_trace_json(
     // this stamp that reads as "the workflow ran no nodes", which is a
     // statement about the workflow rather than about retention.
     let mut result = result;
+    // A run reaches `completed` past a node that failed (`continue_on_error`,
+    // an error edge). Named at the top, beside the status that hides it.
+    let continued = continued_failures_block(output_data.as_ref(), &node_label_map);
+    if !continued.is_empty() {
+        result["continued_failures"] = serde_json::Value::Array(continued);
+    }
+    // An edge whose condition ERRORED is not taken, like a false one; this is
+    // the only place the two are told apart on a finished run.
+    let errored_edges = edge_condition_errors_block(output_data.as_ref(), &node_label_map);
+    if !errored_edges.is_empty() {
+        result["edge_condition_errors"] = serde_json::Value::Array(errored_edges);
+    }
     readings.attach(&mut result);
     stamp_archived(&mut result, archived_at);
 
