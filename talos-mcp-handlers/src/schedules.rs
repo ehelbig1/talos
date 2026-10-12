@@ -91,7 +91,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "create_schedule",
             "description": "Create a cron schedule for a workflow. The workflow will be triggered automatically according to the cron expression. \
-                CONSTRAINT: each workflow can have at most one schedule. If the workflow already has one, this call returns an error — call list_schedules + delete_schedule first to replace it.",
+                CONSTRAINT: each workflow can have at most one schedule. If the workflow already has one, this call returns an error — use update_schedule to change when it fires.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -101,6 +101,20 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "timezone": { "type": "string", "description": "IANA timezone (default: UTC)" }
                 },
                 "required": ["workflow_id", "cron_expression"]
+            }
+        }),
+        serde_json::json!({
+            "name": "update_schedule",
+            "description": "Change when an existing schedule fires: its cron expression, its timezone, or both. The schedule keeps its id, its paused or enabled state and its history; nothing is deleted, so there is no window in which the workflow has no schedule. Give at least one of cron_expression and timezone; the one left out keeps its stored value. The next fire time is recomputed from now, for a paused schedule too. Only the caller's own schedules can be changed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "schedule_id": { "type": "string", "description": "UUID of the schedule to change (from list_schedules)" },
+                    "cron_expression": { "type": "string", "description": "New cron expression (5 or 6 space-separated fields). `cron` is accepted as an alias. Omit to keep the current one." },
+                    "cron": { "type": "string", "description": "Alias for `cron_expression`." },
+                    "timezone": { "type": "string", "description": "New IANA timezone. Omit to keep the current one." }
+                },
+                "required": ["schedule_id"]
             }
         }),
         serde_json::json!({
@@ -178,6 +192,7 @@ pub async fn dispatch(
     let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
     match name {
         "create_schedule" => Some(handle_create_schedule(req_id, args, state, user_id).await),
+        "update_schedule" => Some(handle_update_schedule(req_id, args, state, user_id).await),
         "list_schedules" => Some(handle_list_schedules(req_id, args, state, user_id).await),
         "pause_schedule" => Some(handle_pause_schedule(req_id, args, state, user_id).await),
         "resume_schedule" => Some(handle_resume_schedule(req_id, args, state, user_id).await),
@@ -246,48 +261,11 @@ async fn handle_create_schedule(
             Err(resp) => return resp,
         };
 
-    // Validate cron expression — parse with the same croner library the scheduler uses
-    // so storage and execution agree on validity. Field-count pre-check is kept as a
-    // fast first gate; parse validation catches semantic errors (invalid ranges, etc.).
-    let field_count = cron_expression.split_whitespace().count();
-    if !(5..=6).contains(&field_count) {
-        return mcp_error(
-            req_id,
-            -32602,
-            "Invalid cron expression: must have 5 or 6 space-separated fields",
-        );
+    if let Err(msg) = validate_schedule_cron(&cron_expression) {
+        return mcp_error(req_id, -32602, &msg);
     }
-
-    if let Err(e) = talos_scheduler::validate_cron(&cron_expression) {
-        return mcp_error(req_id, -32602, &e);
-    }
-
-    // MCP-195 (2026-05-08): validate timezone against the IANA database
-    // before persisting. Pre-fix the handler accepted any string
-    // (e.g. "Mars/Olympus_Mons"), persisted the schedule, and
-    // `calculate_next_trigger` returned None when the chrono_tz parse
-    // failed — which the scheduler loop interprets as "never run". The
-    // operator saw a success response but the schedule silently never
-    // fired. The validate_timezone helper has lived in talos-scheduler
-    // since the crate was extracted; this just calls it. Mirrors the
-    // existing validate_cron call above.
-    if let Err(e) = talos_scheduler::validate_timezone(&timezone) {
-        return mcp_error(
-            req_id,
-            -32602,
-            &format!(
-                "{e}. Use an IANA timezone identifier like 'UTC', 'America/New_York', or 'Europe/London'."
-            ),
-        );
-    }
-
-    // Enforce a minimum schedule interval of 60 seconds (one trigger per minute at most).
-    // This prevents resource exhaustion from expressions like `* * * * * *` (every second)
-    // or `* * * * *` (every minute) across many workflows simultaneously.
-    const MIN_INTERVAL_SECS: u64 = 60;
-    if let Err(e) = talos_scheduler::validate_cron_min_interval(&cron_expression, MIN_INTERVAL_SECS)
-    {
-        return mcp_error(req_id, -32602, &e);
+    if let Err(msg) = validate_schedule_timezone(&timezone) {
+        return mcp_error(req_id, -32602, &msg);
     }
 
     // Verify workflow ownership
@@ -359,14 +337,181 @@ async fn handle_create_schedule(
                         &format!(
                             "A schedule already exists for workflow {}. Each workflow can have \
                              at most one schedule. Call list_schedules to find the existing one, \
-                             then delete_schedule to remove it before creating a new one (or \
-                             update the cron_expression via the scheduler UI).",
+                             then update_schedule to change when it fires.",
                             workflow_id
                         ),
                     );
                 }
             }
             mcp_error(req_id, -32000, "Failed to create schedule")
+        }
+    }
+}
+
+/// Enforce a minimum schedule interval of 60 seconds (one trigger per minute
+/// at most). This prevents resource exhaustion from expressions like
+/// `* * * * * *` (every second) across many workflows simultaneously.
+const MIN_SCHEDULE_INTERVAL_SECS: u64 = 60;
+
+/// Every check a cron expression passes before it is stored, by
+/// `create_schedule` and `update_schedule` alike. The error is the sentence
+/// the caller is shown.
+///
+/// Parsed with the same croner library the scheduler uses, so storage and
+/// execution agree on validity. The field-count check is a fast first gate;
+/// the parse catches semantic errors (invalid ranges, etc.).
+fn validate_schedule_cron(cron_expression: &str) -> Result<(), String> {
+    let field_count = cron_expression.split_whitespace().count();
+    if !(5..=6).contains(&field_count) {
+        return Err("Invalid cron expression: must have 5 or 6 space-separated fields".to_string());
+    }
+    talos_scheduler::validate_cron(cron_expression)?;
+    talos_scheduler::validate_cron_min_interval(cron_expression, MIN_SCHEDULE_INTERVAL_SECS)
+}
+
+/// The timezone check, shared the same way.
+///
+/// MCP-195 (2026-05-08): before this the handler accepted any string
+/// (e.g. "Mars/Olympus_Mons"), persisted the schedule, and
+/// `calculate_next_trigger` returned None when the chrono_tz parse failed —
+/// which the scheduler loop reads as "never run".
+fn validate_schedule_timezone(timezone: &str) -> Result<(), String> {
+    talos_scheduler::validate_timezone(timezone).map_err(|e| {
+        format!(
+            "{e}. Use an IANA timezone identifier like 'UTC', 'America/New_York', or 'Europe/London'."
+        )
+    })
+}
+
+/// What `update_schedule` was asked to change, validated.
+#[derive(Debug, PartialEq, Eq)]
+struct ScheduleChange {
+    cron_expression: Option<String>,
+    timezone: Option<String>,
+}
+
+/// Read and validate `update_schedule`'s `cron_expression` / `cron` and
+/// `timezone`. At least one must be given; a value that is given must pass
+/// the same checks `create_schedule` applies. The error is the sentence the
+/// caller is shown.
+fn parse_schedule_change(args: &Value) -> Result<ScheduleChange, String> {
+    let cron_expression = match crate::utils::arg_or_alias(args, "cron_expression", "cron") {
+        None => None,
+        Some(v) => match v.as_str() {
+            Some(c) if c.len() > 256 => {
+                return Err("cron_expression must be ≤ 256 characters".to_string())
+            }
+            Some(c) if !c.trim().is_empty() => Some(c.trim().to_string()),
+            Some(_) => return Err("cron_expression must not be empty".to_string()),
+            None => {
+                return Err(format!(
+                    "cron_expression must be a string, got {}",
+                    crate::utils::json_type_name(v)
+                ))
+            }
+        },
+    };
+    let timezone = match args.get("timezone").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => match v.as_str() {
+            Some(t) if t.len() > 64 => return Err("timezone must be ≤ 64 characters".to_string()),
+            Some(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+            Some(_) => return Err("timezone must not be empty".to_string()),
+            None => {
+                return Err(format!(
+                    "timezone must be a string, got {}",
+                    crate::utils::json_type_name(v)
+                ))
+            }
+        },
+    };
+    if cron_expression.is_none() && timezone.is_none() {
+        return Err(
+            "Nothing to change: give cron_expression, timezone, or both. To pause or resume \
+             a schedule use pause_schedule / resume_schedule."
+                .to_string(),
+        );
+    }
+    if let Some(cron) = &cron_expression {
+        validate_schedule_cron(cron)?;
+    }
+    if let Some(timezone) = &timezone {
+        validate_schedule_timezone(timezone)?;
+    }
+    Ok(ScheduleChange {
+        cron_expression,
+        timezone,
+    })
+}
+
+async fn handle_update_schedule(
+    req_id: Option<serde_json::Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let schedule_id = match crate::utils::require_uuid(args, "schedule_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let change = match parse_schedule_change(args) {
+        Ok(change) => change,
+        Err(msg) => return mcp_error(req_id, -32602, &msg),
+    };
+
+    let sched_repo = talos_schedule_repo::ScheduleRepository::new(state.db_pool.clone());
+    let updated = sched_repo
+        .update_timing(
+            schedule_id,
+            user_id,
+            change.cron_expression.as_deref(),
+            change.timezone.as_deref(),
+            |cron, timezone| talos_scheduler::calculate_next_trigger(cron, timezone).ok(),
+        )
+        .await;
+    match updated {
+        Ok(talos_schedule_repo::ScheduleTimingUpdate::Updated(timing)) => {
+            let upcoming: Vec<String> = talos_scheduler::calculate_next_n_triggers(
+                &timing.cron_expression,
+                &timing.timezone,
+                3,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.to_rfc3339())
+            .collect();
+            mcp_text(
+                req_id,
+                &serde_json::to_string_pretty(&serde_json::json!({
+                    "updated": true,
+                    "schedule_id": schedule_id.to_string(),
+                    "workflow_id": timing.workflow_id.to_string(),
+                    "cron_expression": timing.cron_expression,
+                    "cron_description": describe_cron(&timing.cron_expression),
+                    "timezone": timing.timezone,
+                    "previous": {
+                        "cron_expression": timing.previous_cron_expression,
+                        "timezone": timing.previous_timezone,
+                    },
+                    "enabled": timing.is_enabled,
+                    "next_trigger_at": timing.next_trigger_at.to_rfc3339(),
+                    "upcoming_triggers": upcoming,
+                }))
+                .unwrap_or_default(),
+            )
+        }
+        Ok(talos_schedule_repo::ScheduleTimingUpdate::NotFound) => {
+            mcp_denied(req_id, -32000, "Schedule not found or access denied")
+        }
+        Ok(talos_schedule_repo::ScheduleTimingUpdate::NoNextTrigger) => mcp_error(
+            req_id,
+            -32602,
+            "That cron expression and timezone have no next fire time, so the schedule was \
+             left unchanged.",
+        ),
+        Err(e) => {
+            tracing::error!("update_schedule failed: {}", e);
+            mcp_error(req_id, -32000, "Failed to update schedule")
         }
     }
 }
@@ -884,6 +1029,80 @@ mod tests {
     fn a_single_failure_never_renders_as_a_hundred_percent() {
         assert_eq!(super::rolling_success_rate_pct(1999, 2000), Some(99.9));
         assert_eq!(super::rolling_success_rate_pct(1, 2000), Some(0.1));
+    }
+}
+
+#[cfg(test)]
+mod schedule_change_tests {
+    use super::{parse_schedule_change, ScheduleChange};
+    use serde_json::json;
+
+    #[test]
+    fn either_field_alone_or_both_are_a_change() {
+        assert_eq!(
+            parse_schedule_change(&json!({ "cron_expression": "  10 9 * * *  " })),
+            Ok(ScheduleChange {
+                cron_expression: Some("10 9 * * *".to_string()),
+                timezone: None,
+            })
+        );
+        // `cron` is the key list_schedules renders the value under.
+        assert_eq!(
+            parse_schedule_change(&json!({ "cron": "10 9 * * *", "timezone": "Europe/London" })),
+            Ok(ScheduleChange {
+                cron_expression: Some("10 9 * * *".to_string()),
+                timezone: Some("Europe/London".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_schedule_change(&json!({ "timezone": "America/New_York", "cron": null })),
+            Ok(ScheduleChange {
+                cron_expression: None,
+                timezone: Some("America/New_York".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn nothing_to_change_is_refused_and_points_at_pause_and_resume() {
+        let said = parse_schedule_change(&json!({ "schedule_id": "x" })).unwrap_err();
+        assert!(said.starts_with("Nothing to change"), "{said}");
+        assert!(said.contains("pause_schedule"), "{said}");
+    }
+
+    #[test]
+    fn a_value_that_is_given_passes_the_checks_create_schedule_applies() {
+        for (args, expected) in [
+            (
+                json!({ "cron_expression": "9 * *" }),
+                "5 or 6 space-separated fields",
+            ),
+            (
+                json!({ "cron_expression": "* * * * * *" }),
+                "seconds are not allowed",
+            ),
+            (
+                json!({ "cron_expression": 7 }),
+                "must be a string, got number",
+            ),
+            (json!({ "cron_expression": "   " }), "must not be empty"),
+            (
+                json!({ "timezone": "Mars/Olympus_Mons" }),
+                "IANA timezone identifier",
+            ),
+            (json!({ "timezone": 7 }), "must be a string, got number"),
+            (
+                json!({ "cron_expression": "10 9 * * *", "timezone": "" }),
+                "must not be empty",
+            ),
+        ] {
+            let said = parse_schedule_change(&args).unwrap_err();
+            assert!(said.contains(expected), "{args}: {said}");
+        }
+        let long = "1 ".repeat(200);
+        assert!(parse_schedule_change(&json!({ "cron_expression": long }))
+            .unwrap_err()
+            .contains("256"));
     }
 }
 

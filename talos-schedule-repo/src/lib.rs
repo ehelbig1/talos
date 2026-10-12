@@ -49,6 +49,31 @@ pub struct ScheduleHealthRow {
     pub workflow_name: String,
 }
 
+/// What [`ScheduleRepository::update_timing`] did.
+#[derive(Debug)]
+pub enum ScheduleTimingUpdate {
+    /// The row was written.
+    Updated(ScheduleTiming),
+    /// No schedule with that id belongs to the caller. Nothing was written.
+    NotFound,
+    /// The merged cron and timezone have no next fire time. Nothing was
+    /// written.
+    NoNextTrigger,
+}
+
+/// A schedule's timing after [`ScheduleRepository::update_timing`], with what
+/// it was before.
+#[derive(Debug)]
+pub struct ScheduleTiming {
+    pub workflow_id: Uuid,
+    pub previous_cron_expression: String,
+    pub previous_timezone: String,
+    pub cron_expression: String,
+    pub timezone: String,
+    pub is_enabled: bool,
+    pub next_trigger_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl ScheduleRepository {
     pub fn new(db_pool: PgPool) -> Self {
         Self { db_pool }
@@ -130,6 +155,79 @@ impl ScheduleRepository {
         .execute(&self.db_pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Change WHEN an existing schedule fires: its cron expression, its
+    /// timezone, or both. `None` keeps the stored value.
+    ///
+    /// One transaction: the row is read `FOR UPDATE` scoped to its owner, the
+    /// new pair is merged with the stored one, `next_trigger` computes the
+    /// next fire time for the merged pair, and the row is written. A tick of
+    /// the scheduler cannot claim the row between the read and the write.
+    ///
+    /// `next_trigger` returning `None` means the merged pair has no next fire
+    /// time. Nothing is written then ([`ScheduleTimingUpdate::NoNextTrigger`]):
+    /// a schedule stored with a NULL `next_trigger_at` is one the due-claim
+    /// query never selects, so it would be saved and never run.
+    ///
+    /// `is_enabled` and `last_triggered_at` are not touched. The next fire
+    /// time is recomputed for a paused schedule too, so that resuming it does
+    /// not fire at the old time.
+    pub async fn update_timing<F>(
+        &self,
+        schedule_id: Uuid,
+        user_id: Uuid,
+        cron_expression: Option<&str>,
+        timezone: Option<&str>,
+        next_trigger: F,
+    ) -> Result<ScheduleTimingUpdate>
+    where
+        F: FnOnce(&str, &str) -> Option<chrono::DateTime<chrono::Utc>>,
+    {
+        let mut tx = self.db_pool.begin().await?;
+        let Some(row) = sqlx::query(
+            "SELECT workflow_id, cron_expression, timezone, is_enabled \
+             FROM workflow_schedules WHERE id = $1 AND user_id = $2 FOR UPDATE",
+        )
+        .bind(schedule_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(ScheduleTimingUpdate::NotFound);
+        };
+        let stored_cron: String = row.try_get("cron_expression")?;
+        let stored_timezone: Option<String> = row.try_get("timezone")?;
+        let cron = cron_expression.unwrap_or(&stored_cron).to_string();
+        let timezone = timezone
+            .map(str::to_string)
+            .or(stored_timezone.clone())
+            .unwrap_or_else(|| "UTC".to_string());
+        let Some(next_trigger_at) = next_trigger(&cron, &timezone) else {
+            return Ok(ScheduleTimingUpdate::NoNextTrigger);
+        };
+        sqlx::query(
+            "UPDATE workflow_schedules \
+             SET cron_expression = $1, timezone = $2, next_trigger_at = $3, updated_at = NOW() \
+             WHERE id = $4 AND user_id = $5",
+        )
+        .bind(&cron)
+        .bind(&timezone)
+        .bind(next_trigger_at)
+        .bind(schedule_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ScheduleTimingUpdate::Updated(ScheduleTiming {
+            workflow_id: row.try_get("workflow_id")?,
+            previous_cron_expression: stored_cron,
+            previous_timezone: stored_timezone.unwrap_or_else(|| "UTC".to_string()),
+            cron_expression: cron,
+            timezone,
+            is_enabled: row.try_get("is_enabled")?,
+            next_trigger_at,
+        }))
     }
 
     /// Delete a schedule scoped to user.
