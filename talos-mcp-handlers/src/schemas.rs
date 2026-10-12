@@ -130,6 +130,28 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "create_gcal_watch_channel",
+            "description": "Watch one calendar of one of your own Google Calendar connections, so Google tells this deployment within seconds when that calendar changes (an invitation arriving, an event moved or cancelled). It starts nothing by itself: bind a workflow with set_push_channel_workflow (integration: \"gcal\"). Creating one for a calendar that is already watched returns the existing channel untouched. Refused, with what to do, when: you have no Google Calendar connection; you have more than one and named none (the refusal lists your own connection ids); this deployment has no public https address Google can reach; or Google refused the connection's credentials (reconnect it). Talos renews the channel about weekly; a renewal keeps its bindings and gives it a NEW channel_id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "integration_id": { "type": "string", "description": "The Google Calendar connection to watch. Optional when you have exactly one." },
+                    "calendar_id": { "type": "string", "description": "The calendar to watch, as Google names it. Default \"primary\"." }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "delete_gcal_watch_channel",
+            "description": "Stop and delete one of your own Google Calendar watch channels, with its module and workflow bindings. If Google cannot be told, the channel is still deleted here and anything Google still sends for it is ignored. A renewal gives a channel a new channel_id, so read list_push_channels first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel_id": { "type": "string", "description": "The channel's id, from list_push_channels (integration \"gcal\")." }
+                },
+                "required": ["channel_id"]
+            }
+        }),
+        serde_json::json!({
             "name": "get_session_context",
             "description": "Get a compact context payload of top workflows for the current session. Designed to fit under 800 tokens for LLM system prompts.",
             "inputSchema": {

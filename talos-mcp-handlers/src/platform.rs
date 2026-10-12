@@ -275,6 +275,12 @@ pub async fn dispatch(
         "delete_jira_push_channel" => {
             Some(handle_delete_jira_push_channel(req_id, args, state, user_id).await)
         }
+        "create_gcal_watch_channel" => {
+            Some(handle_create_gcal_watch_channel(req_id, args, state, user_id).await)
+        }
+        "delete_gcal_watch_channel" => {
+            Some(handle_delete_gcal_watch_channel(req_id, args, state, user_id).await)
+        }
         "set_concurrency_limit" => {
             Some(handle_set_concurrency_limit(req_id, args, state, user_id).await)
         }
@@ -2847,6 +2853,173 @@ async fn handle_delete_jira_push_channel(
             &serde_json::to_string_pretty(&serde_json::json!({
                 "channel_id": channel_id,
                 "effect": "The channel is deleted. Jira no longer starts anything through it.",
+            }))
+            .unwrap_or_default(),
+        ),
+        Err(refusal) => mcp_error(
+            req_id,
+            provision_refusal_code(refusal.kind),
+            &refusal.message,
+        ),
+    }
+}
+
+/// The name Google Calendar's watch channels are listed, bound, created and
+/// deleted under (`talos_google_calendar::watch::GCAL_INTEGRATION_NAME`; the
+/// integration crate sits above this one, as for Jira).
+const GCAL_PUSH_INTEGRATION: &str = "gcal";
+
+/// An optional string argument that names something: absent and `null` are
+/// "not given"; anything that is not a short non-empty string is refused
+/// rather than read as "not given".
+fn optional_name_arg<'a>(
+    args: &'a serde_json::Value,
+    field: &str,
+    max_len: usize,
+) -> Result<Option<&'a str>, String> {
+    match args.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() && s.len() <= max_len => {
+            Ok(Some(s.trim()))
+        }
+        Some(_) => Err(format!("Invalid '{field}'")),
+    }
+}
+
+#[cfg(test)]
+mod optional_name_arg_tests {
+    use super::optional_name_arg;
+    use serde_json::json;
+
+    /// Absent and null are "not given". Anything else that is not a short
+    /// non-empty string is the caller's mistake and is said to be, never
+    /// read as "not given": a channel made on the default connection when
+    /// the caller named one that did not parse is the wrong channel.
+    #[test]
+    fn what_is_not_a_name_is_refused_not_dropped() {
+        assert_eq!(optional_name_arg(&json!({}), "calendar_id", 254), Ok(None));
+        assert_eq!(
+            optional_name_arg(&json!({ "calendar_id": null }), "calendar_id", 254),
+            Ok(None)
+        );
+        assert_eq!(
+            optional_name_arg(&json!({ "calendar_id": " primary " }), "calendar_id", 254),
+            Ok(Some("primary"))
+        );
+        for bad in [
+            json!(7),
+            json!(""),
+            json!("   "),
+            json!(["primary"]),
+            json!(true),
+        ] {
+            assert_eq!(
+                optional_name_arg(&json!({ "calendar_id": bad }), "calendar_id", 254),
+                Err("Invalid 'calendar_id'".to_string())
+            );
+        }
+        assert_eq!(
+            optional_name_arg(
+                &json!({ "integration_id": "x".repeat(65) }),
+                "integration_id",
+                64
+            ),
+            Err("Invalid 'integration_id'".to_string())
+        );
+        assert!(optional_name_arg(
+            &json!({ "integration_id": "x".repeat(64) }),
+            "integration_id",
+            64
+        )
+        .is_ok());
+    }
+}
+
+/// `create_gcal_watch_channel` — watch one calendar of one of the caller's
+/// own Google Calendar connections. Thin: parse, ask the set, word the
+/// outcome. Which connection is the caller's, whether Google can deliver
+/// here, the call to Google and the row all live in the integration crate,
+/// behind the set.
+async fn handle_create_gcal_watch_channel(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let integration_id = match optional_name_arg(args, "integration_id", 64) {
+        Ok(v) => v,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    let calendar_id = match optional_name_arg(args, "calendar_id", 254) {
+        Ok(v) => v,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    let Some(set) = state.push_channels.as_ref() else {
+        return mcp_error(
+            req_id,
+            -32000,
+            "This controller wired no push-channel set, so no channel can be created here.",
+        );
+    };
+    match set
+        .create_channel_on(GCAL_PUSH_INTEGRATION, user_id, integration_id, calendar_id)
+        .await
+    {
+        Ok(channel) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "channel": channel,
+                "effect": if channel.created {
+                    "Google will now tell this deployment when this calendar changes. Nothing \
+                     starts until a workflow is bound."
+                } else {
+                    "This calendar already had a watch channel; nothing was changed."
+                },
+                "next": "Bind the workflow to start with set_push_channel_workflow \
+                         (integration: \"gcal\", this channel_id).",
+                "note": "Talos renews the channel before it expires (about weekly). A renewal \
+                         keeps the binding and gives the channel a NEW channel_id: read \
+                         list_push_channels again before changing or deleting it.",
+            }))
+            .unwrap_or_default(),
+        ),
+        Err(refusal) => mcp_error(
+            req_id,
+            provision_refusal_code(refusal.kind),
+            &refusal.message,
+        ),
+    }
+}
+
+/// `delete_gcal_watch_channel` — stop one of the caller's own Google Calendar
+/// watch channels, at Google and here. Thin, like its sibling above.
+async fn handle_delete_gcal_watch_channel(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let channel_id = match crate::utils::require_uuid(args, "channel_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let Some(set) = state.push_channels.as_ref() else {
+        return mcp_error(
+            req_id,
+            -32000,
+            "This controller wired no push-channel set, so no channel can be deleted here.",
+        );
+    };
+    match set
+        .delete_channel(GCAL_PUSH_INTEGRATION, user_id, channel_id)
+        .await
+    {
+        Ok(()) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "channel_id": channel_id,
+                "effect": "The channel is stopped and deleted, with its bindings. Changes to \
+                           this calendar no longer start anything through it.",
             }))
             .unwrap_or_default(),
         ),

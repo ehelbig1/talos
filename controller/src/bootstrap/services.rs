@@ -856,45 +856,6 @@ pub(crate) async fn build_platform_services(
     );
     tracing::info!("Atlassian integration service initialized");
 
-    // ---------- Push-channel inventories (operator surfaces) ----------
-    //
-    // Built UNCONDITIONALLY, and deliberately not from the watch SERVICES: each
-    // inventory holds a bare pool, so it cannot create a watch (and cannot race
-    // the create lock), and it can be built whether or not that integration's
-    // push RECEIVER is wired. That matters — a watch ROW survives
-    // `GCP_PUBSUB_AUDIENCE` being unset, and a channel invisible to the operator
-    // because a receiver env var is absent is exactly the failure this reports.
-    //
-    // All THREE integrations are enrolled even though `google_calendar` has zero
-    // channels on the reference fleet: a survey that silently covers two of
-    // three is the misleading-report class one level up.
-    //
-    // Jira's registrations are enrolled the same way (a pool-only inventory).
-    // CREATING or deleting one is a different thing: it needs the Atlassian
-    // service — the connection's token and the HTTP client — so that goes in
-    // as a PROVISIONER, built from the service, beside the inventories.
-    let push_channel_inventories = Some(std::sync::Arc::new(
-        talos_push_channel_inventory::PushChannelInventorySet::new(vec![
-            std::sync::Arc::new(
-                gmail::watch_channel_service::GmailPushChannelInventory::new(db_pool.clone()),
-            ),
-            std::sync::Arc::new(
-                google_calendar::watch_channel_service::GcalPushChannelInventory::new(
-                    db_pool.clone(),
-                ),
-            ),
-            std::sync::Arc::new(
-                google_cloud::watch_channel_service::GcpPushChannelInventory::new(db_pool.clone()),
-            ),
-            std::sync::Arc::new(atlassian::push::JiraPushChannelInventory::new(
-                db_pool.clone(),
-            )),
-        ])
-        .with_provisioners(vec![std::sync::Arc::new(
-            atlassian::push::JiraPushProvisioner::new(atlassian_integration_service.clone()),
-        )]),
-    ));
-
     // ---------- Initialize Gmail API client ----------
     let gmail_api_client = std::sync::Arc::new(gmail::GmailApiClient::new());
     tracing::info!("Gmail API client initialized");
@@ -964,6 +925,54 @@ pub(crate) async fn build_platform_services(
             return Err(e);
         }
     }
+
+    // ---------- Push-channel inventories (operator surfaces) ----------
+    //
+    // Built UNCONDITIONALLY, and deliberately not from the watch SERVICES: each
+    // inventory holds a bare pool, so it cannot create a watch (and cannot race
+    // the create lock), and it can be built whether or not that integration's
+    // push RECEIVER is wired. That matters — a watch ROW survives
+    // `GCP_PUBSUB_AUDIENCE` being unset, and a channel invisible to the operator
+    // because a receiver env var is absent is exactly the failure this reports.
+    //
+    // All THREE integrations are enrolled even though `google_calendar` has zero
+    // channels on the reference fleet: a survey that silently covers two of
+    // three is the misleading-report class one level up.
+    //
+    // Jira's registrations are enrolled the same way (a pool-only inventory).
+    // CREATING or deleting one is a different thing: it needs the Atlassian
+    // service — the connection's token and the HTTP client — so that goes in
+    // as a PROVISIONER, built from the service, beside the inventories.
+    let push_channel_inventories = Some(std::sync::Arc::new(
+        talos_push_channel_inventory::PushChannelInventorySet::new(vec![
+            std::sync::Arc::new(
+                gmail::watch_channel_service::GmailPushChannelInventory::new(db_pool.clone()),
+            ),
+            std::sync::Arc::new(
+                google_calendar::watch_channel_service::GcalPushChannelInventory::new(
+                    db_pool.clone(),
+                ),
+            ),
+            std::sync::Arc::new(
+                google_cloud::watch_channel_service::GcpPushChannelInventory::new(db_pool.clone()),
+            ),
+            std::sync::Arc::new(atlassian::push::JiraPushChannelInventory::new(
+                db_pool.clone(),
+            )),
+        ])
+        .with_provisioners(vec![
+            std::sync::Arc::new(atlassian::push::JiraPushProvisioner::new(
+                atlassian_integration_service.clone(),
+            )),
+            // Google Calendar's watch channels are created the same way: the
+            // create asks Google, so it needs the service. (That is why this
+            // set is built after the calendar service, not beside the
+            // Atlassian one.)
+            std::sync::Arc::new(google_calendar::provision::GcalPushProvisioner::new(
+                google_calendar_service.clone(),
+            )),
+        ]),
+    ));
 
     // ---------- Initialize Webhook Deduplication ----------
     // The retention window is NOT set here (package CI): it is per format, and

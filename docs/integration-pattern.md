@@ -390,7 +390,12 @@ carries a `module_id` the caller supplies, two rules are not optional:
   names registrations on more than one tenant of the provider as ambiguous —
   start nothing and record why. A channel created by asking the provider
   implements `PushChannelProvisioner`, beside (not instead of) the pool-only
-  inventory.
+  inventory. Google Calendar's does too (`talos_google_calendar::provision`,
+  behind `create_gcal_watch_channel`): where a connection holds more than one
+  thing to watch (a calendar of an account) the provisioner implements
+  `create_channel_on`, whose default refuses a resource rather than ignore
+  it. A create through a provisioner hands back a channel that already
+  exists as it is; it never re-points a binding.
 
 Why both: until 2026-09-08 all three integrations copied the caller's
 `module_id` straight into the row and the first thing that ever read it was
