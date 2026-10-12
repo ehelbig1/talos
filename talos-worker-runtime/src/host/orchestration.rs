@@ -312,6 +312,8 @@ impl wit_agent_orchestration::Host for TalosContext {
         }
         if self.dry_run {
             tracing::info!(target_agent = %msg.target, "Dry-run: intercepted agent invoke");
+            self.dry_run_ledger
+                .record(crate::dry_run::StubbedSurface::AgentOrchestration);
             return Ok(wit_agent_orchestration::AgentResponse {
                 source: msg.target,
                 payload: r#"{"__dry_run__":true}"#.to_string(),
@@ -493,6 +495,8 @@ impl wit_agent_orchestration::Host for TalosContext {
         }
         if self.dry_run {
             tracing::info!(target_agent = %msg.target, "Dry-run: intercepted agent send");
+            self.dry_run_ledger
+                .record(crate::dry_run::StubbedSurface::AgentOrchestration);
             return Ok(());
         }
 
@@ -752,6 +756,14 @@ mod agent_gate_parity_tests {
             .expect("dry-run invoke is mocked");
         assert!(r.payload.contains("__dry_run__"));
         assert!(ctx.send(msg()).await.is_ok());
+        // Both were answered by a stub, and both are counted as one.
+        let stubbed = |ctx: &TalosContext| {
+            ctx.dry_run_ledger
+                .snapshot()
+                .get(&crate::dry_run::StubbedSurface::AgentOrchestration)
+                .copied()
+        };
+        assert_eq!(stubbed(&ctx), Some(2));
 
         ctx.messaging_publish_count.store(
             MAX_MESSAGING_PUBLISHES_PER_EXECUTION,
@@ -765,5 +777,7 @@ mod agent_gate_parity_tests {
             ctx.send(msg()).await,
             Err(wit_agent_orchestration::Error::InvocationFailed)
         ));
+        // A refused call is not a stubbed one.
+        assert_eq!(stubbed(&ctx), Some(2));
     }
 }

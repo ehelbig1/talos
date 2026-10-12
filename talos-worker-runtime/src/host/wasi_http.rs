@@ -393,6 +393,8 @@ pub(crate) fn gated_handle(
             host = %admitted.host,
             "Dry-run: intercepted mutating wasi:http request (pre-network)"
         );
+        ctx.dry_run_ledger
+            .record(crate::dry_run::StubbedSurface::WasiHttp);
         return Ok(ctx
             .table
             .push(dry_run_response(&target.method, &admitted.host))?);

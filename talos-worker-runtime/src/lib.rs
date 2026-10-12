@@ -13,6 +13,7 @@ pub mod bindings;
 pub mod cancel_registry;
 pub mod circuit_breaker;
 pub mod context;
+pub mod dry_run;
 pub mod epoch_budget;
 pub mod error_sanitize;
 pub mod expose_fallback;

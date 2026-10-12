@@ -12,7 +12,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
             "name": "get_execution_status",
-            "description": "Check the status and results of a workflow execution. Pass detail: true (default) to get the full per-node trace including status, duration, output, and retries for every node. A run can reach status 'completed' past a node that failed (continue_on_error, or an error edge): in both modes those nodes are listed under `continued_failures` as {node, handling, error_class, message}; the field is absent when no stored node output reports a failure. An edge whose condition could not be evaluated is not taken, like one whose condition was false, and its target is skipped: those edges are listed under `edge_condition_errors` as {source, target, condition, error}, absent when every condition evaluated.",
+            "description": "Check the status and results of a workflow execution. Pass detail: true (default) to get the full per-node trace including status, duration, output, and retries for every node. A run can reach status 'completed' past a node that failed (continue_on_error, or an error edge): in both modes those nodes are listed under `continued_failures` as {node, handling, error_class, message}; the field is absent when no stored node output reports a failure. An edge whose condition could not be evaluated is not taken, like one whose condition was false, and its target is skipped: those edges are listed under `edge_condition_errors` as {source, target, condition, error}, absent when every condition evaluated. A run that was a DRY RUN carries a `dry_run` block: which nodes had outbound calls answered by a stub (`nodes_with_stubbed_calls`, and per node `stubbed_calls` / `by_surface`) and what a dry run does not stub. It is absent for an ordinary run.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -920,6 +920,9 @@ async fn handle_get_execution_status(
                 "edge_condition_errors".to_string(),
                 serde_json::Value::Array(errored_edges),
             );
+        }
+        if let Some(dry_run) = dry_run_block_of(exec.output_data.as_ref()) {
+            map.insert("dry_run".to_string(), dry_run);
         }
         if has_output {
             map.insert(
@@ -5735,6 +5738,19 @@ pub(crate) fn continued_failures_block(
         .collect()
 }
 
+/// The `dry_run` block of `get_execution_status`, or `None` for a run whose
+/// stored node outputs carry no dry-run report (which is every run that was
+/// not a dry run). Its presence is how a stored run is told from a rehearsal.
+pub(crate) fn dry_run_block_of(
+    output_data: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let output = output_data?;
+    if talos_workflow_validation::dry_run_nodes(output).is_empty() {
+        return None;
+    }
+    Some(talos_workflow_validation::dry_run_block(output))
+}
+
 /// The edges of a stored run whose conditions errored, for the
 /// `edge_condition_errors` field of `get_execution_status` and the trace. A
 /// UUID-keyed source is named by its label, as in
@@ -5821,6 +5837,18 @@ mod continued_failures_block_tests {
             edge_condition_errors_block(Some(&json!({"hold": {"held": true}})), &labels).is_empty()
         );
         assert!(edge_condition_errors_block(None, &labels).is_empty());
+    }
+
+    #[test]
+    fn a_dry_run_is_told_from_an_ordinary_run_by_its_stored_output() {
+        use super::dry_run_block_of;
+        let dry = json!({
+            "send": { "sent": true, "__dry_run__": { "stubbed_calls": 1, "by_surface": { "http": 1 } } },
+        });
+        let block = dry_run_block_of(Some(&dry)).expect("a dry run");
+        assert_eq!(block["nodes_with_stubbed_calls"], json!(["send"]));
+        assert!(dry_run_block_of(Some(&json!({ "send": { "sent": true } }))).is_none());
+        assert!(dry_run_block_of(None).is_none());
     }
 
     #[test]
@@ -6277,6 +6305,11 @@ pub async fn build_execution_trace_json(
     let errored_edges = edge_condition_errors_block(output_data.as_ref(), &node_label_map);
     if !errored_edges.is_empty() {
         result["edge_condition_errors"] = serde_json::Value::Array(errored_edges);
+    }
+    // A dry run's node outputs carry what was answered by a stub. Present
+    // only for a run that was one.
+    if let Some(dry_run) = dry_run_block_of(output_data.as_ref()) {
+        result["dry_run"] = dry_run;
     }
     readings.attach(&mut result);
     stamp_archived(&mut result, archived_at);
