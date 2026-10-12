@@ -89,7 +89,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_push_channels",
-            "description": "List every push channel (Gmail watch, Google Calendar watch, Google Cloud Pub/Sub subscription) you own, with its WASM module binding CLASSIFIED. A push channel may bind a module — one inbound event, one dispatched module job — and until 2026-09-08 nothing validated that binding at create time and no operator surface ever read it back, so a channel bound to a module that no longer exists looked healthy while EVERY push to it failed at module load. `module_binding` is four-valued: none (binds no module — pushes run no module; see `workflow_id`), bound, missing (THE FINDING: every push fails), unreadable (the module lookup did not answer — a statement about the query, not about the channel). Returns no push token and no push endpoint; the owning user gets the endpoint from the create response and the per-integration REST list. Deliberately separate from list_workflow_triggers, which is keyed by WORKFLOW. A Google Calendar channel may ALSO start a workflow (set_push_channel_workflow); a row then carries `workflow_id`, independent of `module_binding`.",
+            "description": "List every push channel (Gmail watch, Google Calendar watch, Google Cloud Pub/Sub subscription, Jira webhook) you own, with its WASM module binding CLASSIFIED. A push channel may bind a module — one inbound event, one dispatched module job — and until 2026-09-08 nothing validated that binding at create time and no operator surface ever read it back, so a channel bound to a module that no longer exists looked healthy while EVERY push to it failed at module load. `module_binding` is four-valued: none (binds no module — pushes run no module; see `workflow_id`), bound, missing (THE FINDING: every push fails), unreadable (the module lookup did not answer — a statement about the query, not about the channel). Returns no push token and no push endpoint; the owning user gets the endpoint from the create response and the per-integration REST list. Deliberately separate from list_workflow_triggers, which is keyed by WORKFLOW. A Google Calendar channel may ALSO start a workflow (set_push_channel_workflow); a row then carries `workflow_id`, independent of `module_binding`. A Jira webhook (integration \"atlassian\", made with create_jira_push_channel) binds no module at all: its `module_binding` is always none and `workflow_id` is the only thing a delivery starts. Its `display_name` is the Jira site's name, `last_event_at` its last delivery, and `recent_failure` a refresh that failed (the webhook stops delivering when it expires).",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -97,15 +97,36 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "set_push_channel_workflow",
-            "description": "Bind the workflow a push on one of your push channels starts, or clear the binding (workflow_id: null). Supported for Google Calendar watch channels (integration: \"gcal\"): when the calendar changes, the workflow is started once through the same gates as trigger_workflow (the execution pause, whether the workflow is live, its actor's budget and ceilings, its input schema, its concurrency limit). Its trigger input is `{calendar_push: {integration_id, channel_id, calendar_id, changed, event_ids, truncated}}` — event IDS only, at most 50; no title, time or guest travels in the trigger, so the workflow reads the calendar itself. A start that is refused is not retried (the channel's sync position has already moved): it is recorded in the calendar audit log with a reason, so write the workflow to be safe to run again and give it a schedule as a catch-up. The binding survives the channel's weekly renewal, but a renewal gives the channel a NEW channel_id: read list_push_channels again before changing a binding. The workflow must be your own.",
+            "description": "Bind the workflow a push on one of your push channels starts, or clear the binding (workflow_id: null). Supported for Google Calendar watch channels (integration: \"gcal\"): when the calendar changes, the workflow is started once through the same gates as trigger_workflow (the execution pause, whether the workflow is live, its actor's budget and ceilings, its input schema, its concurrency limit). Its trigger input is `{calendar_push: {integration_id, channel_id, calendar_id, changed, event_ids, truncated}}` — event IDS only, at most 50; no title, time or guest travels in the trigger, so the workflow reads the calendar itself. A start that is refused is not retried (the channel's sync position has already moved): it is recorded in the calendar audit log with a reason, so write the workflow to be safe to run again and give it a schedule as a catch-up. The binding survives the channel's weekly renewal, but a renewal gives the channel a NEW channel_id: read list_push_channels again before changing a binding. The workflow must be your own. Also supported for Jira webhooks (integration: \"atlassian\", from create_jira_push_channel): when an issue assigned to you is created or changes, the workflow is started once per delivery through the same gates, as you. Its trigger input is `{jira_push: {cloud_id, webhook_id, event, issue_key}}` — identifiers only; `event` and `issue_key` are present only when they are a plain event name and a plain key (PROJ-123), and no summary, field or user name ever travels in the trigger, so the workflow reads Jira itself. A Jira delivery is a wake-up: a start that is refused is recorded (event `jira_workflow_not_started`, with a reason) and not retried, and a change that takes a ticket AWAY from you is not delivered, so give the workflow a schedule as a catch-up. A Jira channel keeps its channel_id for its whole life.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "integration": { "type": "string", "description": "The channel's integration, as list_push_channels names it. Only \"gcal\" channels can start a workflow." },
+                    "integration": { "type": "string", "description": "The channel's integration, as list_push_channels names it. \"gcal\" and \"atlassian\" channels can start a workflow." },
                     "channel_id": { "type": "string", "description": "The channel's id, from list_push_channels." },
                     "workflow_id": { "type": ["string", "null"], "description": "The workflow to start, or null to clear the binding." }
                 },
                 "required": ["integration", "channel_id", "workflow_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "create_jira_push_channel",
+            "description": "Register a Jira webhook for one of your own Jira connections, so Jira tells this deployment within seconds when an issue assigned to you is created or changes (status, assignee, priority or due date). It starts nothing by itself: bind a workflow with set_push_channel_workflow (integration: \"atlassian\"). Creating one for a connection that already has one returns the existing channel. Refused, with what to do, when: the connection was made before Talos asked for the `manage:jira-webhook` permission (disconnect and connect Jira again); this deployment has no https:// address Jira can reach (the operator sets ATLASSIAN_WEBHOOK_BASE_URL); or you have more than one Jira connection and named none. Talos refreshes the webhook before Atlassian's 30-day expiry and shows a failed refresh in list_push_channels. If the Atlassian app is not public, Atlassian delivers only when the registering user is the app's owner. See docs/jira-push-setup.md.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cloud_id": { "type": "string", "description": "The Jira site (Atlassian cloud id) to watch. Optional when you have exactly one Jira connection." }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "delete_jira_push_channel",
+            "description": "Delete one of your own Jira push channels: the webhook is deleted at Atlassian and the channel here, with its workflow binding. If Atlassian cannot be reached the channel is still deleted here; the webhook then expires at Atlassian on its own and its deliveries start nothing. Disconnecting the Jira connection does this for you.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel_id": { "type": "string", "description": "The channel's id, from list_push_channels (integration \"atlassian\")." }
+                },
+                "required": ["channel_id"]
             }
         }),
         serde_json::json!({

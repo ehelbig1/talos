@@ -59,6 +59,9 @@ tower-cookies.workspace = true
 # deployable bin). Schema files reference it as `talos_worker_runtime::…`.
 talos-worker-runtime = { path = "../talos-worker-runtime" }
 talos-google-calendar = { path = "../talos-google-calendar" }
+# The Settings disconnect deletes a Jira connection's webhooks before its
+# token is removed (the delete at Atlassian needs that token).
+talos-atlassian = { path = "../talos-atlassian" }
 talos-integrations = { path = "../talos-integrations" }
 talos-plaid-connect = { path = "../talos-plaid-connect" }
 talos-llm = { path = "../talos-llm" }

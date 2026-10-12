@@ -367,7 +367,23 @@ carries a `module_id` the caller supplies, two rules are not optional:
   starts the workflow through the trigger service with event ids only. An
   integration that adds this follows that shape: the binding carried by every
   path that rewrites the row, the start made as the channel's own user, and a
-  refused start recorded with a reason.
+  refused start recorded with a reason
+  (`OrchestrationError::push_refusal_reason`, one vocabulary for every
+  integration). Jira does the same since 2026-10-12 (`talos_atlassian::push`).
+* **When the provider gives the app ONE webhook URL** (Jira: "only a single
+  URL per app"), neither auth shape in step 2 can carry the user: the URL
+  cannot hold a per-user token, and the provider signs with one key for
+  everyone. The owner is then whoever REGISTERED the upstream id the delivery
+  names, so the registration needs a table of its own keyed by that id
+  (`atlassian_webhook_registrations`) rather than a per-user
+  `integration_state` row. Three rules follow, and `talos_atlassian` is the
+  reference: verify the provider's signature before the body is read and
+  before any query; map a delivery to its owner only through the registration
+  row, never through a field of the request; and treat an upstream id that
+  names registrations on more than one tenant of the provider as ambiguous —
+  start nothing and record why. A channel created by asking the provider
+  implements `PushChannelProvisioner`, beside (not instead of) the pool-only
+  inventory.
 
 Why both: until 2026-09-08 all three integrations copied the caller's
 `module_id` straight into the row and the first thing that ever read it was

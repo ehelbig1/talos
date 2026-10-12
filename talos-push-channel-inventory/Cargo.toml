@@ -23,5 +23,9 @@ serde_json.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
 
+[dev-dependencies]
+# The provisioner-routing test awaits the async trait.
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [lints]
 workspace = true

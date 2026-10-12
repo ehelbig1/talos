@@ -269,6 +269,12 @@ pub async fn dispatch(
         "set_push_channel_workflow" => {
             Some(handle_set_push_channel_workflow(req_id, args, state, user_id).await)
         }
+        "create_jira_push_channel" => {
+            Some(handle_create_jira_push_channel(req_id, args, state, user_id).await)
+        }
+        "delete_jira_push_channel" => {
+            Some(handle_delete_jira_push_channel(req_id, args, state, user_id).await)
+        }
         "set_concurrency_limit" => {
             Some(handle_set_concurrency_limit(req_id, args, state, user_id).await)
         }
@@ -2741,6 +2747,114 @@ async fn handle_set_push_channel_workflow(
             };
             mcp_error(req_id, code, refusal.user_facing_message())
         }
+    }
+}
+
+/// The name Jira's registrations are listed, bound, created and deleted
+/// under. The integration crate sits above this one, so the name is stated
+/// here and the set answers `UnknownIntegration` if nothing is wired for it.
+const JIRA_PUSH_INTEGRATION: &str = "atlassian";
+
+/// The protocol code for each kind of create/delete refusal, in one place.
+fn provision_refusal_code(kind: talos_push_channel_inventory::ProvisionRefusalKind) -> i32 {
+    use talos_push_channel_inventory::ProvisionRefusalKind as K;
+    match kind {
+        K::UnknownIntegration | K::Refused => -32602,
+        K::NotFound => -32001,
+        K::Unavailable => -32000,
+    }
+}
+
+/// `create_jira_push_channel` — register a Jira webhook for one of the
+/// caller's own Jira connections. Thin: parse, ask the set, word the outcome.
+/// Which connection is the caller's, whether it may register, the call to
+/// Atlassian and the row all live in the integration crate, behind the set.
+async fn handle_create_jira_push_channel(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let cloud_id = match args.get("cloud_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() && s.len() <= 64 => {
+            Some(s.trim())
+        }
+        Some(_) => return mcp_error(req_id, -32602, "Invalid 'cloud_id'"),
+    };
+    let Some(set) = state.push_channels.as_ref() else {
+        return mcp_error(
+            req_id,
+            -32000,
+            "This controller wired no push-channel set, so no channel can be created here.",
+        );
+    };
+    match set
+        .create_channel(JIRA_PUSH_INTEGRATION, user_id, cloud_id)
+        .await
+    {
+        Ok(channel) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "channel": channel,
+                "effect": if channel.created {
+                    "Jira will now tell this deployment when an issue assigned to you on this \
+                     site is created or changes. Nothing starts until a workflow is bound."
+                } else {
+                    "This connection already had a push channel; nothing was changed."
+                },
+                "next": "Bind the workflow to start with set_push_channel_workflow \
+                         (integration: \"atlassian\", this channel_id).",
+                "note": "Talos refreshes the webhook before it expires (30 days). If the \
+                         Atlassian app is not public, Atlassian delivers only when the user \
+                         who registered the webhook is the app's owner.",
+            }))
+            .unwrap_or_default(),
+        ),
+        Err(refusal) => mcp_error(
+            req_id,
+            provision_refusal_code(refusal.kind),
+            &refusal.message,
+        ),
+    }
+}
+
+/// `delete_jira_push_channel` — delete one of the caller's own Jira push
+/// channels, at Atlassian and here. Thin, like its sibling above.
+async fn handle_delete_jira_push_channel(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let channel_id = match crate::utils::require_uuid(args, "channel_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let Some(set) = state.push_channels.as_ref() else {
+        return mcp_error(
+            req_id,
+            -32000,
+            "This controller wired no push-channel set, so no channel can be deleted here.",
+        );
+    };
+    match set
+        .delete_channel(JIRA_PUSH_INTEGRATION, user_id, channel_id)
+        .await
+    {
+        Ok(()) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "channel_id": channel_id,
+                "effect": "The channel is deleted. Jira no longer starts anything through it.",
+            }))
+            .unwrap_or_default(),
+        ),
+        Err(refusal) => mcp_error(
+            req_id,
+            provision_refusal_code(refusal.kind),
+            &refusal.message,
+        ),
     }
 }
 

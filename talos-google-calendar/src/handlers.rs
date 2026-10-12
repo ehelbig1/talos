@@ -10,9 +10,7 @@ use axum::{
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use talos_execution_orchestration::{
-    ExecutionOrchestrationService, OrchestrationError, TriggerInput, TriggerOutcome,
-};
+use talos_execution_orchestration::{ExecutionOrchestrationService, TriggerInput, TriggerOutcome};
 use talos_integration_helpers::api_json::ApiJson;
 use talos_module_executions::{LogLevel, ModuleExecutionService, TriggerType};
 use talos_registry::ModuleRegistry;
@@ -1321,25 +1319,6 @@ pub(crate) fn calendar_push_trigger_input(
     })
 }
 
-/// Why a bound workflow was not started, as a closed set of words for the
-/// audit row. The error itself goes to the server log only: it can carry a
-/// schema name or a query.
-fn trigger_refusal_reason(e: &OrchestrationError) -> &'static str {
-    match e {
-        OrchestrationError::WorkflowNotFound(_) => "workflow_not_found",
-        OrchestrationError::WorkflowNotLive(..)
-        | OrchestrationError::WorkflowDisabled(_)
-        | OrchestrationError::WorkflowArchived(_) => "workflow_not_live",
-        OrchestrationError::ExecutionPaused(_) => "execution_paused",
-        OrchestrationError::AuthorizationDenied(_) => "authorization_denied",
-        OrchestrationError::ConcurrencyLimitExceeded(_) => "concurrency_limit",
-        OrchestrationError::InvalidArgument(_) | OrchestrationError::ValidationFailed(_) => {
-            "input_refused"
-        }
-        _ => "trigger_failed",
-    }
-}
-
 /// Start the workflow a watch channel is bound to, once for this push.
 ///
 /// Through [`ExecutionOrchestrationService::trigger`] — the platform pause,
@@ -1363,7 +1342,7 @@ async fn start_bound_workflow(
     events: &[Value],
 ) {
     let outcome = match orchestration {
-        None => Err("trigger_service_not_wired"),
+        None => Err(talos_execution_orchestration::PUSH_REFUSAL_TRIGGER_SERVICE_NOT_WIRED),
         Some(service) => match service
             .trigger(TriggerInput {
                 workflow_id: bound.workflow_id,
@@ -1384,7 +1363,9 @@ async fn start_bound_workflow(
         {
             Ok(TriggerOutcome::Dispatched(started)) => Ok(started.execution_id),
             // Not reachable with `validate_only: false`; named so it is never read as a start.
-            Ok(TriggerOutcome::ValidatedOnly(_)) => Err("trigger_failed"),
+            Ok(TriggerOutcome::ValidatedOnly(_)) => {
+                Err(talos_execution_orchestration::PUSH_REFUSAL_TRIGGER_FAILED)
+            }
             Err(e) => {
                 tracing::warn!(
                     channel = %channel_uuid,
@@ -1393,7 +1374,9 @@ async fn start_bound_workflow(
                     error = %e,
                     "gcal push: the bound workflow was not started"
                 );
-                Err(trigger_refusal_reason(&e))
+                // The closed set of words is the trigger service's own, so
+                // every push integration records the same ones.
+                Err(e.push_refusal_reason())
             }
         },
     };
@@ -2464,7 +2447,7 @@ fn filter_events(events: &[Value], config: &Value) -> Vec<Value> {
 
 #[cfg(test)]
 mod calendar_push_trigger_tests {
-    use super::{calendar_push_trigger_input, trigger_refusal_reason, MAX_PUSH_EVENT_IDS};
+    use super::{calendar_push_trigger_input, MAX_PUSH_EVENT_IDS};
     use serde_json::json;
     use talos_execution_orchestration::OrchestrationError;
     use uuid::Uuid;
@@ -2576,7 +2559,7 @@ mod calendar_push_trigger_tests {
                 "trigger_failed",
             ),
         ] {
-            let said = trigger_refusal_reason(&error);
+            let said = error.push_refusal_reason();
             assert_eq!(said, reason);
             assert!(
                 said.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),

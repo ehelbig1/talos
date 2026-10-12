@@ -11,7 +11,12 @@ talos-http-utils = { path = "../talos-http-utils" }
 anyhow.workspace = true
 async-trait.workspace = true
 axum = { workspace = true, features = ["json"] }
+# The delivery JWT's header is read before the library is asked anything
+# (push_jwt).
+base64.workspace = true
 chrono.workspace = true
+# Verifies the HMAC JWT Atlassian sends with each webhook delivery.
+jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -19,8 +24,22 @@ sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-
 # MCP-1021: route FRONTEND_URL through the canonical validated helper
 # (rejects ? and # in addition to /; the inline validator only checked /).
 talos-config = { path = "../talos-config" }
+# A webhook delivery starts its bound workflow through the shared trigger
+# service, after consulting the execution pause.
+talos-execution-orchestration = { path = "../talos-execution-orchestration" }
+talos-execution-pause = { path = "../talos-execution-pause" }
 talos-http-body = { path = "../talos-http-body" }
+# The shared audit writer, the renewal loop and the fleet create lock.
+talos-integration-helpers = { path = "../talos-integration-helpers" }
 talos-oauth = { path = "../talos-oauth" }
+talos-public-url = { path = "../talos-public-url" }
+talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
+talos-task-supervision = { path = "../talos-task-supervision" }
+talos-workflow-repository = { path = "../talos-workflow-repository" }
+thiserror.workspace = true
+# The receiver answers Atlassian first and runs the starts in a task; the
+# refresh loop takes the controller's shutdown receiver.
+tokio = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace = true
 urlencoding.workspace = true
 uuid.workspace = true
@@ -28,7 +47,7 @@ uuid.workspace = true
 [dev-dependencies]
 # `#[tokio::test]` for the OAuth-callback ordering tests — sqlx's
 # `connect_lazy` requires a Tokio runtime even for never-connected pools.
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
 
 [lints]
 workspace = true

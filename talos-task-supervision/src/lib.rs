@@ -155,6 +155,10 @@ background_tasks! {
     GcpCreateLockSweep          => "gcp_create_lock_sweep",
     GcalChannelRenewal          => "gcal_channel_renewal",
     GcalRateLimitCleanup        => "gcal_rate_limit_cleanup",
+    // Hourly refresh of the Jira dynamic webhooks Talos registered (they
+    // expire 30 days after creation or refresh), and the sweep of handled
+    // delivery ids (2026-10-12).
+    JiraWebhookRefresh          => "jira_webhook_refresh",
     WasmLogSubscriber           => "wasm_log_subscriber",
     // The PLAIN-subscribe half of the `wasm.log.*` relay (2026-09-20): the
     // variant above is the queue-group half that persists.

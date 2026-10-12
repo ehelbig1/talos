@@ -3410,6 +3410,33 @@ pub(crate) fn build_router(
         .layer(Extension(api_limiter.clone()))
         .layer(Extension(whitelist.clone()));
 
+    // Jira webhook receiver (PUBLIC — no session auth). Atlassian allows one
+    // webhook URL per app, so this is one fixed address for every user; a
+    // delivery is authenticated by the JWT Atlassian signs with the app's
+    // client secret, and mapped to its owner by the webhook id Talos
+    // registered. The handler verifies the token BEFORE it reads the body, so
+    // the body cap below bounds what an AUTHENTICATED delivery may send; the
+    // handler holds the same constant. Rate-limited like the other webhook
+    // routes. The trigger service it starts workflows through is the
+    // app-level `Extension` layered below.
+    //
+    // The path is the crate's constant (`/api/atlassian/webhook`), not a
+    // literal: the URL a registration hands Atlassian is built from the same
+    // constant, so the two cannot drift. `/api` already has its nginx
+    // location (lint check 2 reads literals and so does not see this one).
+    let atlassian_webhook_route = Router::new()
+        .route(
+            atlassian::push::WEBHOOK_PATH,
+            post(atlassian::push_receiver::webhook_handler),
+        )
+        .with_state(atlassian_integration_service.clone())
+        .layer(DefaultBodyLimit::max(
+            atlassian::push_receiver::JIRA_WEBHOOK_MAX_BODY_BYTES,
+        ))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(webhook_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
     // Briefing HTML endpoint — authenticated, returns latest morning briefing as HTML.
     // MCP-680: SecretsManager Extension lets the handler decrypt
     // `output_data_enc` on production deploys (handler returned 404 for
@@ -3946,6 +3973,7 @@ pub(crate) fn build_router(
     let app = app
         .merge(atlassian_integration_routes)
         .merge(atlassian_callback_route)
+        .merge(atlassian_webhook_route)
         // Briefing HTML endpoint — authenticated, returns latest morning briefing as HTML
         .merge(briefing_routes)
         // Integration provider registry — public, returns static metadata + config status
