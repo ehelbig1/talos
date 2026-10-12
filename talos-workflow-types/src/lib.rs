@@ -6,7 +6,7 @@
 //! schema without depending on the controller binary.
 //!
 //! Parsing and per-call-site error wrapping stay in the controller —
-//! those need `anyhow`, `serde_yaml`, and surface-specific error
+//! those need `anyhow`, a YAML parser, and surface-specific error
 //! semantics (GraphQL `safe_err` vs MCP JSON-RPC `-32602`). One
 //! exception lives here: **pure type-level invariants** — caps and
 //! validators that constrain values stored on these types and that
@@ -560,7 +560,7 @@ mod tests {
             skip_condition: None,
             version: None,
         };
-        let yaml = serde_yaml::to_string(&node).unwrap();
+        let yaml = serde_saphyr::to_string(&node).unwrap();
         // Required + populated fields stay
         assert!(yaml.contains("id: test-node"));
         assert!(yaml.contains("module: echo"));
@@ -597,8 +597,8 @@ mod tests {
             skip_condition: None,
             version: None,
         };
-        let yaml = serde_yaml::to_string(&original).unwrap();
-        let back: YamlNode = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_saphyr::to_string(&original).unwrap();
+        let back: YamlNode = serde_saphyr::from_str(&yaml).unwrap();
         assert_eq!(back.id, "n");
         assert_eq!(back.module, "m");
         assert!(back.capability_world.is_none());
@@ -622,7 +622,7 @@ continue_on_error: false
 skip_condition: null
 version: null
 "#;
-        let back: YamlNode = serde_yaml::from_str(yaml).unwrap();
+        let back: YamlNode = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(back.id, "n");
         assert!(back.capability_world.is_none());
         assert_eq!(back.retry_count, 0);
@@ -637,14 +637,14 @@ version: null
             condition: None,
             edge_type: None,
         };
-        let yaml = serde_yaml::to_string(&edge).unwrap();
+        let yaml = serde_saphyr::to_string(&edge).unwrap();
         assert!(yaml.contains("from: a"));
         assert!(yaml.contains("to: b"));
         assert!(!yaml.contains("condition"));
         assert!(!yaml.contains("type"));
 
         let settings = WorkflowSettings::default();
-        let yaml = serde_yaml::to_string(&settings).unwrap();
+        let yaml = serde_saphyr::to_string(&settings).unwrap();
         assert!(!yaml.contains("execution_timeout_secs"));
         assert!(!yaml.contains("priority"));
         assert!(!yaml.contains("concurrency_limit"));
