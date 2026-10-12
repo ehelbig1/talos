@@ -59,6 +59,9 @@ pub struct GcpWatchSummary {
     ///                  used to be `.unwrap_or_default()`, which
     ///                  produced precisely that.
     pub module_binding: ModuleBinding,
+    /// The workflow a verified push on this channel starts, when one is bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_push_received: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -126,6 +129,7 @@ pub async fn list_for_user(
                 .module_id
                 .and_then(|id| module_name_by_id.get(&id).cloned()),
             module_binding: classify_module_binding(r.module_id, &module_names),
+            workflow_id: r.workflow_id,
             last_push_received: r
                 .last_push_received_ms
                 .and_then(DateTime::<Utc>::from_timestamp_millis),
@@ -271,8 +275,7 @@ impl PushChannelInventory for GcpPushChannelInventory {
                         .then(|| r.module_id.and_then(|id| names.get(&id).cloned()))
                         .flatten(),
                     module_binding: binding,
-                    // This integration's channels start a module, never a workflow.
-                    workflow_id: None,
+                    workflow_id: r.workflow_id,
                     created_at: DateTime::<Utc>::from_timestamp_millis(r.created_at_ms),
                     last_event_at: r
                         .last_push_received_ms
@@ -284,6 +287,24 @@ impl PushChannelInventory for GcpPushChannelInventory {
 
         attach_recent_failures_to_rows(&self.pool, user_id, &mut out).await;
         Ok(out)
+    }
+
+    async fn bind_workflow(
+        &self,
+        user_id: Uuid,
+        channel_id: Uuid,
+        workflow_id: Option<Uuid>,
+    ) -> Result<(), talos_push_channel_inventory::BindWorkflowRefusal> {
+        use super::watch::BindWorkflowRefusal as Local;
+        use talos_push_channel_inventory::BindWorkflowRefusal as Shared;
+        super::watch::bind_channel_workflow(&self.pool, user_id, channel_id, workflow_id)
+            .await
+            .map(|_| ())
+            .map_err(|refusal| match refusal {
+                Local::ChannelNotFound => Shared::ChannelNotFound,
+                Local::WorkflowNotBindable => Shared::WorkflowNotBindable,
+                Local::Unreadable => Shared::Unreadable,
+            })
     }
 }
 

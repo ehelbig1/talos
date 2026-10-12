@@ -89,6 +89,15 @@ pub struct GcpWatchRow {
     /// `idx_str_1`, never the raw value.
     pub push_token: String,
     pub module_id: Option<Uuid>,
+    /// The workflow a verified push on this channel starts, when the owner
+    /// bound one ([`bind_channel_workflow`]). Independent of `module_id`: a
+    /// channel may have either, both or neither, and with both, both run.
+    /// Absent from every row written before 2026-10-12 and from a row with
+    /// no binding, so those keep the exact bytes they had. Nothing replaces
+    /// this row (there is no renewal), and the one path that rewrites it,
+    /// the push stamp, re-encodes the row it decoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<Uuid>,
     /// Epoch ms of the most recent verified push. `None` until the
     /// first push lands.
     pub last_push_received_ms: Option<i64>,
@@ -109,6 +118,7 @@ impl std::fmt::Debug for GcpWatchRow {
             .field("expected_sa_email", &self.expected_sa_email)
             .field("push_token", &"[REDACTED]")
             .field("module_id", &self.module_id)
+            .field("workflow_id", &self.workflow_id)
             .field("last_push_received_ms", &self.last_push_received_ms)
             .field("created_at_ms", &self.created_at_ms)
             .field("updated_at_ms", &self.updated_at_ms)
@@ -294,6 +304,8 @@ impl GcpWatchService {
             expected_sa_email,
             push_token,
             module_id,
+            // A create binds no workflow; `bind_channel_workflow` does.
+            workflow_id: None,
             last_push_received_ms: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -550,6 +562,143 @@ fn push_stamped_row(mut row: GcpWatchRow, now_ms: i64) -> Option<GcpWatchRow> {
     })
 }
 
+/// Why a workflow could not be bound to a Google Cloud push channel.
+///
+/// The caller is told ONE thing for "no such workflow" and "not yours" (an
+/// enumeration oracle otherwise); the operator's log line tells them apart.
+/// The same three cases, in the same words, as Google Calendar's and Gmail's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindWorkflowRefusal {
+    /// No such channel for this user.
+    ChannelNotFound,
+    /// The workflow does not exist for this user.
+    WorkflowNotBindable,
+    /// The workflow or the channel could not be read. Nothing was changed.
+    Unreadable,
+}
+
+impl BindWorkflowRefusal {
+    #[must_use]
+    pub fn user_facing_message(self) -> &'static str {
+        match self {
+            Self::ChannelNotFound => "No such push channel. List your channels again.",
+            Self::WorkflowNotBindable => "No such workflow.",
+            Self::Unreadable => {
+                "The binding could not be checked, so nothing was changed. Try again."
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn status_code(self) -> axum::http::StatusCode {
+        match self {
+            Self::ChannelNotFound | Self::WorkflowNotBindable => axum::http::StatusCode::NOT_FOUND,
+            Self::Unreadable => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+impl std::fmt::Display for BindWorkflowRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.user_facing_message())
+    }
+}
+impl std::error::Error for BindWorkflowRefusal {}
+
+/// Bind the workflow a verified push on this channel starts, or clear the
+/// binding (`None`).
+///
+/// * The workflow must be one `user_id` owns — asked of the SAME repository
+///   read the trigger path uses, so "bindable" and "this user may start it"
+///   cannot drift apart. The trigger checks ownership again at every push;
+///   this check is what stops a binding that could never fire.
+/// * Only the binding changes, under the row lock: a concurrent push stamp is
+///   never reverted, and a channel a concurrent stop deleted is not
+///   re-created. `updated_at_ms` and the push stamp are left alone — a
+///   binding is not a push.
+/// * A free function over the pool, so the owner-facing REST handler and the
+///   operator inventory (which holds no service handle) bind the same way.
+pub async fn bind_channel_workflow(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    channel_uuid: Uuid,
+    workflow_id: Option<Uuid>,
+) -> std::result::Result<GcpWatchRow, BindWorkflowRefusal> {
+    if let Some(workflow_id) = workflow_id {
+        let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
+        match repo.get_workflow(workflow_id, user_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!(
+                    target: "talos_audit",
+                    event_kind = "gcp_channel_workflow_binding_refused",
+                    %user_id,
+                    %workflow_id,
+                    "refusing to bind a google_cloud push channel to a workflow this user does not own"
+                );
+                return Err(BindWorkflowRefusal::WorkflowNotBindable);
+            }
+            Err(e) => {
+                tracing::error!(%user_id, %workflow_id, error = %e, "gcp channel binding: workflow read failed");
+                return Err(BindWorkflowRefusal::Unreadable);
+            }
+        }
+    }
+
+    let store = ChannelStore::new(
+        pool.clone(),
+        GOOGLE_CLOUD_INTEGRATION_NAME,
+        WATCH_KEY_PREFIX,
+    );
+    let mut bound: Option<GcpWatchRow> = None;
+    let outcome = store
+        .update_existing(user_id, channel_uuid, |entry| {
+            let mut row = decode_row(entry)?;
+            row.workflow_id = workflow_id;
+            let (value, ttl_seconds, slots) = row_write(&row)?;
+            bound = Some(row);
+            Ok(RowUpdate::Replace {
+                value,
+                ttl_seconds,
+                slots,
+            })
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!(%user_id, channel = %channel_uuid, error = %e, "gcp channel binding: channel update failed");
+            BindWorkflowRefusal::Unreadable
+        })?;
+    let row = match (outcome, bound) {
+        (UpdateOutcome::Absent, _) | (_, None) => return Err(BindWorkflowRefusal::ChannelNotFound),
+        (_, Some(row)) => row,
+    };
+
+    // A durable record of what a push on this channel will start. Losing it
+    // is a visibility loss, not a correctness one, so it does not fail the
+    // bind. Never the push token.
+    if let Err(e) = insert_channel_audit(
+        pool,
+        ChannelAuditEvent {
+            integration_id: Some(row.integration_id),
+            user_id,
+            event_type: if workflow_id.is_some() {
+                "workflow_bound"
+            } else {
+                "workflow_unbound"
+            },
+            target: Some(&row.expected_sa_email),
+            success: true,
+            error_message: None,
+            metadata: serde_json::json!({ "channel_uuid": row.id.to_string(), "workflow_id": workflow_id }),
+        },
+    )
+    .await
+    {
+        tracing::warn!(channel = %row.id, error = %e, "gcp workflow binding audit log insert failed");
+    }
+    Ok(row)
+}
+
 /// List every google_cloud watch row a user owns, from a bare pool.
 ///
 /// The pool is all this read needs, so it is a free function rather than a
@@ -629,6 +778,7 @@ mod tests {
             expected_sa_email: "talos-gcp-pusher@my-proj.iam.gserviceaccount.com".into(),
             push_token: mint_push_token(),
             module_id: Some(Uuid::new_v4()),
+            workflow_id: None,
             last_push_received_ms: Some(1_700_000_000_000),
             created_at_ms: 1_699_000_000_000,
             updated_at_ms: 1_700_000_000_000,
@@ -646,6 +796,66 @@ mod tests {
         assert_eq!(decoded.push_token, row.push_token);
         assert_eq!(decoded.expected_sa_email, row.expected_sa_email);
         assert_eq!(decoded.last_push_received_ms, row.last_push_received_ms);
+    }
+
+    /// The stored row is a storage format. A row written before
+    /// `workflow_id` existed reads back with no binding, a row with no
+    /// binding is written exactly as it was, and a binding survives the
+    /// round trip.
+    #[test]
+    fn a_row_without_a_workflow_reads_back_and_is_written_unchanged() {
+        let before = serde_json::json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "integration_id": "22222222-2222-4222-8222-222222222222",
+            "display_name": "prod alerts",
+            "expected_sa_email": "pusher@example-project.iam.gserviceaccount.com",
+            "push_token": "not-a-real-token",
+            "module_id": null,
+            "last_push_received_ms": null,
+            "created_at_ms": 1_700_000_000_000_i64,
+            "updated_at_ms": 1_700_000_000_000_i64
+        });
+        let row: GcpWatchRow = serde_json::from_value(before.clone()).expect("an old row");
+        assert_eq!(row.workflow_id, None);
+        assert_eq!(serde_json::to_value(&row).expect("serialize"), before);
+
+        let workflow = Uuid::new_v4();
+        let bound = GcpWatchRow {
+            workflow_id: Some(workflow),
+            ..row
+        };
+        let written = serde_json::to_value(&bound).expect("serialize");
+        assert_eq!(written["workflow_id"], serde_json::json!(workflow));
+        let read: GcpWatchRow = serde_json::from_value(written).expect("a bound row");
+        assert_eq!(read.workflow_id, Some(workflow));
+        // And it is not what a debug print of the row hides.
+        assert!(format!("{read:?}").contains(&workflow.to_string()));
+        assert!(!format!("{read:?}").contains("not-a-real-token"));
+    }
+
+    /// The caller cannot tell "no such workflow" from "not yours".
+    #[test]
+    fn a_binding_refusal_does_not_say_whose_the_workflow_is() {
+        assert_eq!(
+            BindWorkflowRefusal::WorkflowNotBindable.user_facing_message(),
+            "No such workflow."
+        );
+        for r in [
+            BindWorkflowRefusal::ChannelNotFound,
+            BindWorkflowRefusal::WorkflowNotBindable,
+            BindWorkflowRefusal::Unreadable,
+        ] {
+            let m = r.user_facing_message().to_lowercase();
+            assert!(
+                !m.contains("owner") && !m.contains("another user") && !m.contains("permission"),
+                "{m}"
+            );
+        }
+        // A read that failed is not "no such workflow": the caller may retry.
+        assert_eq!(
+            BindWorkflowRefusal::Unreadable.status_code(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
@@ -688,6 +898,7 @@ mod tests {
             expected_sa_email: "sa@p.iam.gserviceaccount.com".into(),
             push_token: "t".into(),
             module_id: Some(Uuid::from_u128(9)),
+            workflow_id: Some(Uuid::from_u128(11)),
             last_push_received_ms: Some(1_000),
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -697,6 +908,9 @@ mod tests {
         let stamped = push_stamped_row(row.clone(), now).expect("due");
         assert_eq!(stamped.last_push_received_ms, Some(now));
         assert_eq!(stamped.module_id, row.module_id);
+        // The stamp is the one path that rewrites a row: it keeps the
+        // workflow binding the row had.
+        assert_eq!(stamped.workflow_id, Some(Uuid::from_u128(11)));
         let fresh = GcpWatchRow {
             last_push_received_ms: None,
             ..row

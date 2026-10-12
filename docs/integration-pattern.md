@@ -377,6 +377,10 @@ carries a `module_id` the caller supplies, two rules are not optional:
   is a fresh start and goes through the trigger service. Where a create also
   accepts the workflow (Gmail), the create asks the same ownership question
   as the bind, and a create that names none leaves the binding alone.
+  Google Cloud channels do the same (`talos_google_cloud::dispatch::
+  start_bound_workflow`): nothing replaces that row, so the path to carry
+  the binding through is the push stamp, and one delivery of an incident
+  state claims the start in Redis under a key of its own.
 * **When the provider gives the app ONE webhook URL** (Jira: "only a single
   URL per app"), neither auth shape in step 2 can carry the user: the URL
   cannot hold a per-user token, and the provider signs with one key for
