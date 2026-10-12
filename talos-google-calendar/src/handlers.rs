@@ -1355,6 +1355,10 @@ async fn start_bound_workflow(
                 ),
                 trigger_agent_id: None,
                 inject_memory_context: false,
+                origin: talos_execution_orchestration::ExecutionOrigin::PushChannel {
+                    integration: crate::watch::GCAL_INTEGRATION_NAME,
+                    channel_id: channel_uuid,
+                },
                 validate_only: false,
                 dry_run: false,
                 wait_ms: None,

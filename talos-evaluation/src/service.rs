@@ -336,6 +336,7 @@ impl EvaluationService {
             // arm and (b) its budget/ceiling govern the run.
             trigger_agent_id: Some(input.actor_id),
             inject_memory_context: inject_memory,
+            origin: talos_execution_orchestration::ExecutionOrigin::Evaluation,
             validate_only: false,
             dry_run: false,
             // Dispatch async and poll to a TRUE terminal state ourselves (below).

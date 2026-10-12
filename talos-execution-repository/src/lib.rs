@@ -276,6 +276,41 @@ pub struct ExecutionSummary {
     pub is_pinned: bool,
     pub priority: Option<String>,
     pub pin_note: Option<String>,
+    /// What started the run (`talos_workflow_repository::origin`). A row
+    /// that records nothing is `not_recorded`, never `manual`.
+    pub started_by: talos_workflow_repository::StartedBy,
+    /// The row's `is_test_execution` flag: `test_workflow` ran it.
+    pub is_test: bool,
+}
+
+impl ExecutionSummary {
+    /// One row of the three listings that share this projection
+    /// (`list_executions`, `list_recent_executions`, `list_pinned_executions`).
+    fn from_row(r: &sqlx::postgres::PgRow) -> Result<Self> {
+        let provenance: Option<serde_json::Value> = r.try_get::<Option<_>, _>("provenance")?;
+        let is_test: bool = r
+            .try_get::<Option<bool>, _>("is_test_execution")?
+            .unwrap_or(false);
+        Ok(Self {
+            id: r.try_get("id")?,
+            workflow_id: r.try_get("workflow_id")?,
+            workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
+            status: r.try_get("status")?,
+            started_at: r.try_get::<Option<_>, _>("started_at")?,
+            completed_at: r.try_get::<Option<_>, _>("completed_at")?,
+            error_message: r.try_get::<Option<_>, _>("error_message")?,
+            is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
+            priority: r.try_get::<Option<_>, _>("priority")?,
+            pin_note: r.try_get::<Option<_>, _>("pin_note")?,
+            started_by: talos_workflow_repository::started_by(
+                provenance.as_ref(),
+                is_test,
+                r.try_get::<Option<_>, _>("replayed_from_id")?,
+                r.try_get::<Option<_>, _>("triggered_by_module_execution_id")?,
+            ),
+            is_test,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1441,7 +1476,9 @@ impl ExecutionRepository {
         let rows = sqlx::query(
             "SELECT e.id, e.workflow_id, w.name AS workflow_name, e.status, \
                     e.started_at, e.completed_at, e.error_message, e.is_pinned, \
-                    e.priority, e.pin_note \
+                    e.priority, e.pin_note, \
+                    e.provenance, e.is_test_execution, e.replayed_from_id, \
+                    e.triggered_by_module_execution_id \
              FROM workflow_executions e \
              LEFT JOIN workflows w ON w.id = e.workflow_id \
              WHERE e.workflow_id = $1 AND e.user_id = $2 \
@@ -1455,21 +1492,8 @@ impl ExecutionRepository {
         .await?;
         tx.commit().await?;
 
-        rows.into_iter()
-            .map(|r| -> Result<ExecutionSummary> {
-                Ok(ExecutionSummary {
-                    id: r.try_get("id")?,
-                    workflow_id: r.try_get("workflow_id")?,
-                    workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
-                    status: r.try_get("status")?,
-                    started_at: r.try_get::<Option<_>, _>("started_at")?,
-                    completed_at: r.try_get::<Option<_>, _>("completed_at")?,
-                    error_message: r.try_get::<Option<_>, _>("error_message")?,
-                    is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
-                    priority: r.try_get::<Option<_>, _>("priority")?,
-                    pin_note: r.try_get::<Option<_>, _>("pin_note")?,
-                })
-            })
+        rows.iter()
+            .map(ExecutionSummary::from_row)
             .collect::<Result<Vec<_>>>()
     }
 
@@ -1549,7 +1573,9 @@ impl ExecutionRepository {
         let rows = sqlx::query(
             "SELECT e.id, e.workflow_id, w.name AS workflow_name, e.status, \
                     e.started_at, e.completed_at, e.error_message, e.is_pinned, \
-                    e.priority, e.pin_note \
+                    e.priority, e.pin_note, \
+                    e.provenance, e.is_test_execution, e.replayed_from_id, \
+                    e.triggered_by_module_execution_id \
              FROM workflow_executions e \
              LEFT JOIN workflows w ON w.id = e.workflow_id \
              WHERE e.user_id = $1 AND ($2::text IS NULL OR e.status = $2) \
@@ -1561,21 +1587,8 @@ impl ExecutionRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        rows.into_iter()
-            .map(|r| -> Result<ExecutionSummary> {
-                Ok(ExecutionSummary {
-                    id: r.try_get("id")?,
-                    workflow_id: r.try_get("workflow_id")?,
-                    workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
-                    status: r.try_get("status")?,
-                    started_at: r.try_get::<Option<_>, _>("started_at")?,
-                    completed_at: r.try_get::<Option<_>, _>("completed_at")?,
-                    error_message: r.try_get::<Option<_>, _>("error_message")?,
-                    is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
-                    priority: r.try_get::<Option<_>, _>("priority")?,
-                    pin_note: r.try_get::<Option<_>, _>("pin_note")?,
-                })
-            })
+        rows.iter()
+            .map(ExecutionSummary::from_row)
             .collect::<Result<Vec<_>>>()
     }
 
@@ -1584,7 +1597,9 @@ impl ExecutionRepository {
         let rows = sqlx::query(
             "SELECT e.id, e.workflow_id, w.name AS workflow_name, e.status, \
                     e.started_at, e.completed_at, e.error_message, e.is_pinned, \
-                    e.priority, e.pin_note \
+                    e.priority, e.pin_note, \
+                    e.provenance, e.is_test_execution, e.replayed_from_id, \
+                    e.triggered_by_module_execution_id \
              FROM workflow_executions e \
              LEFT JOIN workflows w ON w.id = e.workflow_id \
              WHERE e.user_id = $1 AND e.is_pinned = true \
@@ -1594,21 +1609,8 @@ impl ExecutionRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        rows.into_iter()
-            .map(|r| -> Result<ExecutionSummary> {
-                Ok(ExecutionSummary {
-                    id: r.try_get("id")?,
-                    workflow_id: r.try_get("workflow_id")?,
-                    workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
-                    status: r.try_get("status")?,
-                    started_at: r.try_get::<Option<_>, _>("started_at")?,
-                    completed_at: r.try_get::<Option<_>, _>("completed_at")?,
-                    error_message: r.try_get::<Option<_>, _>("error_message")?,
-                    is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
-                    priority: r.try_get::<Option<_>, _>("priority")?,
-                    pin_note: r.try_get::<Option<_>, _>("pin_note")?,
-                })
-            })
+        rows.iter()
+            .map(ExecutionSummary::from_row)
             .collect::<Result<Vec<_>>>()
     }
 
