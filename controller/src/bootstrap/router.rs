@@ -3152,6 +3152,10 @@ pub(crate) fn build_router(
                 post(gmail::handlers::test_watch_channel_handler),
             )
             .route(
+                "/api/gmail/watch-channels/{channel_uuid}/workflow",
+                axum::routing::put(gmail::handlers::bind_workflow_handler),
+            )
+            .route(
                 "/api/gmail/watch-channels/{channel_uuid}",
                 axum::routing::delete(gmail::handlers::stop_watch_channel_handler),
             )
@@ -3191,6 +3195,7 @@ pub(crate) fn build_router(
                         secrets_manager: Some(secrets_manager.clone()),
                         // RFC 0010 P3 (M4): shared claim-based-sealing handle.
                         sealing_handle: module_sealing_handle.clone(),
+                        orchestration: Some(execution_orchestration_service.clone()),
                     }),
                     _ => {
                         tracing::warn!(

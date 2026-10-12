@@ -174,6 +174,11 @@ pub enum CreateWatchError {
     /// `talos_integration_helpers::watch_binding`, shared with google_cloud.
     #[error(transparent)]
     ModuleBinding(#[from] ModuleBindingRefusal),
+    /// The `workflow_id` named is not one this user may bind. Until
+    /// 2026-10-12 a create copied the caller's `workflow_id` into the row
+    /// unread, and the first thing to ask whose it was was a push.
+    #[error(transparent)]
+    WorkflowBinding(#[from] BindWorkflowRefusal),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -183,6 +188,7 @@ impl CreateWatchError {
     pub fn status_code(&self) -> axum::http::StatusCode {
         match self {
             Self::ModuleBinding(r) => r.status_code(),
+            Self::WorkflowBinding(r) => r.status_code(),
             Self::Internal(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -194,6 +200,7 @@ impl CreateWatchError {
     pub fn user_facing_message(&self) -> String {
         match self {
             Self::ModuleBinding(r) => r.user_facing_message().to_string(),
+            Self::WorkflowBinding(r) => r.user_facing_message().to_string(),
             Self::Internal(_) => "Failed to create watch channel".to_string(),
         }
     }
@@ -202,9 +209,153 @@ impl CreateWatchError {
     pub fn event_kind(&self) -> &'static str {
         match self {
             Self::ModuleBinding(r) => r.event_kind(),
+            Self::WorkflowBinding(_) => "gmail_watch_workflow_binding_refused",
             Self::Internal(_) => "gmail_watch_create_failed",
         }
     }
+}
+
+/// Why a workflow could not be bound to a Gmail watch.
+///
+/// The caller is told ONE thing for "no such workflow" and "not yours" (an
+/// enumeration oracle otherwise); the operator's log line tells them apart.
+/// The same three cases, in the same words, as Google Calendar's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindWorkflowRefusal {
+    /// No such watch for this user (never created, stopped, or replaced by a
+    /// renewal — list the channels again).
+    ChannelNotFound,
+    /// The workflow does not exist for this user.
+    WorkflowNotBindable,
+    /// The workflow or the watch could not be read. Nothing was changed.
+    Unreadable,
+}
+
+impl BindWorkflowRefusal {
+    #[must_use]
+    pub fn user_facing_message(self) -> &'static str {
+        match self {
+            Self::ChannelNotFound => "No such watch channel. List your channels again: a renewal gives a channel a new id.",
+            Self::WorkflowNotBindable => "No such workflow.",
+            Self::Unreadable => "The binding could not be checked, so nothing was changed. Try again.",
+        }
+    }
+
+    #[must_use]
+    pub fn status_code(self) -> axum::http::StatusCode {
+        match self {
+            Self::ChannelNotFound | Self::WorkflowNotBindable => axum::http::StatusCode::NOT_FOUND,
+            Self::Unreadable => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+impl std::fmt::Display for BindWorkflowRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.user_facing_message())
+    }
+}
+impl std::error::Error for BindWorkflowRefusal {}
+
+/// Is `workflow_id` one `user_id` may bind a watch to?
+///
+/// Asked of the SAME repository read the trigger path uses, so "bindable" and
+/// "this user may start it" cannot drift apart. The trigger checks ownership
+/// again at every push; this check is what stops a binding that could never
+/// fire. The one home of the question for both writers of the binding: a
+/// create that names a workflow, and [`bind_channel_workflow`].
+async fn workflow_is_bindable(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    workflow_id: Uuid,
+) -> std::result::Result<(), BindWorkflowRefusal> {
+    let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
+    match repo.get_workflow(workflow_id, user_id).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "gmail_watch_workflow_binding_refused",
+                %user_id,
+                %workflow_id,
+                "refusing to bind a gmail watch to a workflow this user does not own"
+            );
+            Err(BindWorkflowRefusal::WorkflowNotBindable)
+        }
+        Err(e) => {
+            tracing::error!(%user_id, %workflow_id, error = %e, "gmail watch binding: workflow read failed");
+            Err(BindWorkflowRefusal::Unreadable)
+        }
+    }
+}
+
+/// Bind the workflow a new message in this watch's mailbox starts, or clear
+/// the binding (`None`).
+///
+/// * The workflow must be one `user_id` owns ([`workflow_is_bindable`]).
+/// * Only the binding changes, under the row lock: a concurrent cursor advance
+///   is never reverted, and a watch a concurrent stop deleted is not
+///   re-created. `updated_at_ms` is left alone — it is what the inventory
+///   shows as the channel's last EVENT, and a binding is not one.
+/// * A free function over the pool, so the owner-facing REST handler and the
+///   operator inventory (which holds no service handle) bind the same way.
+pub async fn bind_channel_workflow(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    channel_uuid: Uuid,
+    workflow_id: Option<Uuid>,
+) -> std::result::Result<GmailWatchRow, BindWorkflowRefusal> {
+    if let Some(workflow_id) = workflow_id {
+        workflow_is_bindable(pool, user_id, workflow_id).await?;
+    }
+
+    let store = ChannelStore::new(pool.clone(), GMAIL_INTEGRATION_NAME, WATCH_KEY_PREFIX);
+    let mut bound: Option<GmailWatchRow> = None;
+    let outcome = store
+        .update_existing(user_id, channel_uuid, |entry| {
+            let mut row = decode_row(entry)?;
+            row.workflow_id = workflow_id;
+            let (value, ttl_seconds, slots) = row_write(&row)?;
+            bound = Some(row);
+            Ok(RowUpdate::Replace {
+                value,
+                ttl_seconds,
+                slots,
+            })
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!(%user_id, channel = %channel_uuid, error = %e, "gmail watch binding: channel update failed");
+            BindWorkflowRefusal::Unreadable
+        })?;
+    let row = match (outcome, bound) {
+        (UpdateOutcome::Absent, _) | (_, None) => return Err(BindWorkflowRefusal::ChannelNotFound),
+        (_, Some(row)) => row,
+    };
+
+    // A durable record of what a push on this mailbox will start. Losing it
+    // is a visibility loss, not a correctness one, so it does not fail the bind.
+    if let Err(e) = insert_channel_audit(
+        pool,
+        ChannelAuditEvent {
+            integration_id: Some(row.integration_id),
+            user_id,
+            event_type: if workflow_id.is_some() {
+                "workflow_bound"
+            } else {
+                "workflow_unbound"
+            },
+            target: Some(&row.email_address),
+            success: true,
+            error_message: None,
+            metadata: serde_json::json!({ "channel_uuid": row.id.to_string(), "workflow_id": workflow_id }),
+        },
+    )
+    .await
+    {
+        tracing::warn!(channel = %row.id, error = %e, "gmail workflow binding audit log insert failed");
+    }
+    Ok(row)
 }
 
 /// List every gmail watch row a user owns, from a bare pool.
@@ -305,6 +456,9 @@ impl GmailWatchService {
     /// Create a new watch, or re-point an existing one at a different
     /// module. Exactly one watch exists per mailbox at any time.
     ///
+    /// `workflow_id`, when given, must be the caller's own and is bound; when
+    /// absent an existing watch keeps the workflow it had.
+    ///
     /// `pub` since 2026-09-08 so the module-binding gate can be driven
     /// directly: this create calls Google's `users.watch`, so the refusal is
     /// the only part of it observable without the network, and it is the part
@@ -324,6 +478,12 @@ impl GmailWatchService {
         // meanwhile would take a live watch off the air rather than stop a new
         // one being created wrong (#777's resume argument).
         check_module_binding(&self.pool, user_id, module_id, GMAIL_INTEGRATION_NAME).await?;
+        // The workflow binding too, and for the same reason. A renewal carries
+        // the binding it found and does not re-ask: the trigger asks at every
+        // push, so a workflow that stopped being this user's starts nothing.
+        if let Some(workflow_id) = workflow_id {
+            workflow_is_bindable(&self.pool, user_id, workflow_id).await?;
+        }
 
         let guard = self.acquire_lock(user_id, integration_id).await?;
 
@@ -354,7 +514,14 @@ impl GmailWatchService {
                 .update_existing(user_id, existing.id, |entry| {
                     let mut row = decode_row(entry)?;
                     row.module_id = module_id;
-                    row.workflow_id = workflow_id;
+                    // A create that names a workflow binds it. One that names
+                    // none leaves the binding alone: the settings page
+                    // re-points a MODULE through this path and sends no
+                    // workflow, and until 2026-10-12 that cleared a workflow
+                    // binding with nothing said. `bind_channel_workflow` clears.
+                    if workflow_id.is_some() {
+                        row.workflow_id = workflow_id;
+                    }
                     row.updated_at_ms = now_ms;
                     let (value, ttl_seconds, slots) = row_write(&row)?;
                     rebound = Some(row);
@@ -1037,6 +1204,48 @@ mod tests {
         assert_eq!(advanced.workflow_id, Some(Uuid::from_u128(7)));
         assert!(advanced_row(row(10), 10, 99).is_none());
         assert!(advanced_row(row(10), 9, 99).is_none());
+    }
+
+    /// The caller cannot tell "no such workflow" from "not yours", from the
+    /// bind or from a create that names a workflow.
+    #[test]
+    fn a_binding_refusal_does_not_say_whose_the_workflow_is() {
+        let said = BindWorkflowRefusal::WorkflowNotBindable.user_facing_message();
+        assert_eq!(said, "No such workflow.");
+        assert_eq!(
+            CreateWatchError::from(BindWorkflowRefusal::WorkflowNotBindable).user_facing_message(),
+            said
+        );
+        for r in [
+            BindWorkflowRefusal::ChannelNotFound,
+            BindWorkflowRefusal::WorkflowNotBindable,
+            BindWorkflowRefusal::Unreadable,
+        ] {
+            let m = r.user_facing_message().to_lowercase();
+            assert!(
+                !m.contains("owner") && !m.contains("another user") && !m.contains("permission"),
+                "{m}"
+            );
+        }
+        // A read that failed is not "no such workflow": the caller may retry.
+        assert_eq!(
+            BindWorkflowRefusal::Unreadable.status_code(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// Source pin: a renewal hands the replaced row's workflow to the row that
+    /// replaces it. Dropped, a watch would stop starting its workflow at its
+    /// first weekly renewal, with nothing failing.
+    #[test]
+    fn a_renewal_carries_the_workflow_binding() {
+        let src = include_str!("watch.rs");
+        let body = &src[src.find("pub async fn renew_watch").unwrap()..];
+        let body = &body[..body.find("\n    pub async fn ").unwrap()];
+        assert!(body.contains("let workflow_id = old.workflow_id;"));
+        let call = &body[body.find("create_fresh_watch_locked(").unwrap()..];
+        let call = &call[..call.find(".await").unwrap()];
+        assert!(call.contains("workflow_id,"), "{call}");
     }
 
     /// The hot path must not read → upsert (resurrects a stopped watch,

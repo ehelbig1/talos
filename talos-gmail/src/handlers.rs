@@ -361,9 +361,10 @@ pub struct CreateGmailWatchRequest {
     pub label_ids: Option<Vec<String>>,
     #[serde(default)]
     pub module_id: Option<Uuid>,
-    /// Optional bound workflow. When set, an inbound push triggers a
-    /// full workflow execution instead of a single module job. Takes
-    /// precedence over `module_id` when both are supplied.
+    /// Optional bound workflow, which must be the caller's own. When set, an
+    /// inbound push starts that workflow instead of a single module job
+    /// (it takes precedence over `module_id` when both are supplied). Absent,
+    /// an existing watch keeps the workflow it had.
     #[serde(default)]
     pub workflow_id: Option<Uuid>,
 }
@@ -425,6 +426,47 @@ pub async fn create_watch_channel_handler(
             )
                 .into_response()
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BindWorkflowRequest {
+    /// The workflow a new message in this mailbox starts; `null` clears it.
+    pub workflow_id: Option<Uuid>,
+}
+
+/// PUT /api/gmail/watch-channels/:uuid/workflow
+///
+/// Bind (or clear) the workflow this watch starts. The same function the MCP
+/// tool `set_push_channel_workflow` reaches through the inventory.
+pub async fn bind_workflow_handler(
+    State(service): State<Arc<GmailWatchService>>,
+    Extension(user_id): Extension<Uuid>,
+    Path(channel_uuid): Path<Uuid>,
+    ApiJson(req): ApiJson<BindWorkflowRequest>,
+) -> impl IntoResponse {
+    match super::watch::bind_channel_workflow(&service.pool, user_id, channel_uuid, req.workflow_id)
+        .await
+    {
+        Ok(row) => Json(ApiResponse {
+            success: true,
+            data: Some(serde_json::json!({
+                "channel_uuid": row.id,
+                "email_address": row.email_address,
+                "workflow_id": row.workflow_id,
+            })),
+            error: None,
+        })
+        .into_response(),
+        Err(refusal) => (
+            refusal.status_code(),
+            Json(ApiResponse::<serde_json::Value> {
+                success: false,
+                data: None,
+                error: Some(refusal.user_facing_message().to_string()),
+            }),
+        )
+            .into_response(),
     }
 }
 
