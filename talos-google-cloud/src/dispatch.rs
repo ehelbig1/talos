@@ -14,12 +14,16 @@
 //! GCP (e.g. to fetch resource metadata) resolves the token itself at
 //! execution time. Plaintext tokens never cross controller → NATS.
 
-use super::watch::GcpWatchRow;
+use super::watch::{GcpWatchRow, GOOGLE_CLOUD_INTEGRATION_NAME};
 use super::GoogleCloudIntegrationService;
 use anyhow::{bail, Context, Result};
 use redis::AsyncCommands;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use talos_execution_orchestration::{
+    ExecutionOrchestrationService, ExecutionOrigin, TriggerInput, TriggerOutcome,
+    PUSH_REFUSAL_TRIGGER_FAILED, PUSH_REFUSAL_TRIGGER_SERVICE_NOT_WIRED,
+};
 use talos_module_executions::{LogLevel, ModuleExecutionService, TriggerType};
 use talos_registry::ModuleRegistry;
 use talos_secrets_manager::SecretsManager;
@@ -106,6 +110,234 @@ fn dedup_key(watch_uuid: Uuid, incident_id: &str, state: &str, pubsub_message_id
         incident_id
     };
     format!("gcp:processed:{}:{}:{}", watch_uuid, dedup_id, state)
+}
+
+/// Redis key that lets ONE delivery of an incident/state transition start
+/// the channel's bound workflow. A key of its own, so the module dispatch's
+/// claim on the same transition does not stop the workflow or the reverse.
+fn workflow_dedup_key(
+    watch_uuid: Uuid,
+    incident_id: &str,
+    state: &str,
+    pubsub_message_id: &str,
+) -> String {
+    let dedup_id = if incident_id.is_empty() {
+        pubsub_message_id
+    } else {
+        incident_id
+    };
+    format!("gcp:workflow-started:{}:{}:{}", watch_uuid, dedup_id, state)
+}
+
+/// An identifier as it may travel in a stored trigger input: short, and made
+/// only of the characters Google's own ids and resource names use. Anything
+/// else is left out rather than carried — the fields come from a push body.
+fn plain_id<'a>(value: &'a str, max: usize, extra: &[u8]) -> Option<&'a str> {
+    (!value.is_empty()
+        && value.len() <= max
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b)))
+    .then_some(value)
+}
+
+/// What a workflow bound to a Google Cloud push channel is started with:
+/// WHICH incident changed and to what state, as identifiers. No policy name,
+/// summary, documentation, metric value or resource label — a trigger input
+/// is stored with its execution. `condition_name` is the condition's resource
+/// path (`projects/…/alertPolicies/…/conditions/…`), which names the alert
+/// policy the workflow can read with its own grants. Each field is present
+/// only when it is a plain identifier. The same shape as `calendar_push` and
+/// `gmail_push`.
+pub(crate) fn gcp_push_trigger_input(
+    integration_id: Uuid,
+    channel_uuid: Uuid,
+    incident: &JsonValue,
+    incident_id: &str,
+    state: &str,
+    pubsub_message_id: &str,
+) -> JsonValue {
+    let project_id = str_or_num(incident, "scoping_project_id");
+    let condition_name = incident
+        .get("condition")
+        .map(|c| str_or_num(c, "name"))
+        .unwrap_or_default();
+    let mut push = serde_json::json!({
+        "integration_id": integration_id,
+        "channel_id": channel_uuid,
+    });
+    if let Some(obj) = push.as_object_mut() {
+        for (key, value) in [
+            ("incident_id", plain_id(incident_id, 128, b"._-")),
+            ("state", plain_id(state, 32, b"_")),
+            ("project_id", plain_id(&project_id, 64, b"-")),
+            ("condition_name", plain_id(&condition_name, 256, b"/_-")),
+            ("message_id", plain_id(pubsub_message_id, 128, b"_-")),
+        ] {
+            if let Some(value) = value {
+                obj.insert(key.to_string(), JsonValue::String(value.to_string()));
+            }
+        }
+    }
+    serde_json::json!({ "gcp_push": push })
+}
+
+/// What became of the workflow a push's channel is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundWorkflowStart {
+    /// The trigger service created this execution.
+    Started(Uuid),
+    /// Another delivery of the same incident/state transition already
+    /// started it. Nothing was attempted and nothing is recorded.
+    AlreadyStarted,
+    /// Nothing was started; the word is one of the trigger service's closed
+    /// set (`OrchestrationError::push_refusal_reason`) and is what the audit
+    /// row carries.
+    NotStarted(&'static str),
+}
+
+/// What a push says, for the bound-workflow start.
+pub struct PushedIncident<'a> {
+    pub incident: &'a JsonValue,
+    pub incident_id: &'a str,
+    pub state: &'a str,
+    pub pubsub_message_id: &'a str,
+}
+
+/// Start the workflow a Google Cloud push channel is bound to, as the
+/// channel's own user, through the trigger service — so ownership, liveness,
+/// the execution pause, the actor's budget and ceilings, the input schema and
+/// the concurrency limit all apply, exactly as for a start the owner makes by
+/// hand.
+///
+/// Pub/Sub delivers at least once, so one delivery claims the transition in
+/// Redis first; with no Redis, or when it does not answer, the workflow is
+/// started anyway (a second run beats a dropped incident, as on the module
+/// path). A start that is refused is RECORDED and not retried: the push has
+/// been acknowledged. One WARN under `talos_audit` and one row in the channel
+/// audit log (`workflow_not_started`) with the reason; the error's own text
+/// goes to the server log only. A successful start writes no audit row — it
+/// is an execution.
+///
+/// `pub` so the path is driven by a database test without a dispatch bus.
+pub async fn start_bound_workflow(
+    pool: &sqlx::PgPool,
+    orchestration: Option<&Arc<ExecutionOrchestrationService>>,
+    redis: Option<&Arc<redis::Client>>,
+    user_id: Uuid,
+    row: &GcpWatchRow,
+    workflow_id: Uuid,
+    pushed: &PushedIncident<'_>,
+) -> BoundWorkflowStart {
+    if let Some(redis) = redis {
+        let key = workflow_dedup_key(
+            row.id,
+            pushed.incident_id,
+            pushed.state,
+            pushed.pubsub_message_id,
+        );
+        match reserve_dedup(redis, &key).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    channel_uuid = %row.id,
+                    %workflow_id,
+                    "gcp push: this incident transition already started the bound workflow; acking"
+                );
+                return BoundWorkflowStart::AlreadyStarted;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                channel_uuid = %row.id,
+                "gcp push: Redis dedup failed; starting the workflow anyway (may duplicate)"
+            ),
+        }
+    }
+
+    let outcome = match orchestration {
+        None => Err(PUSH_REFUSAL_TRIGGER_SERVICE_NOT_WIRED),
+        Some(service) => match service
+            .trigger(TriggerInput {
+                workflow_id,
+                user_id,
+                trigger_input: gcp_push_trigger_input(
+                    row.integration_id,
+                    row.id,
+                    pushed.incident,
+                    pushed.incident_id,
+                    pushed.state,
+                    pushed.pubsub_message_id,
+                ),
+                trigger_agent_id: None,
+                inject_memory_context: false,
+                origin: ExecutionOrigin::PushChannel {
+                    integration: GOOGLE_CLOUD_INTEGRATION_NAME,
+                    channel_id: row.id,
+                },
+                validate_only: false,
+                dry_run: false,
+                wait_ms: None,
+            })
+            .await
+        {
+            Ok(TriggerOutcome::Dispatched(started)) => Ok(started.execution_id),
+            // Not reachable with `validate_only: false`; named so it is never read as a start.
+            Ok(TriggerOutcome::ValidatedOnly(_)) => Err(PUSH_REFUSAL_TRIGGER_FAILED),
+            Err(e) => {
+                tracing::warn!(
+                    channel_uuid = %row.id,
+                    %workflow_id,
+                    %user_id,
+                    error = %e,
+                    "gcp push: the bound workflow was not started"
+                );
+                Err(e.push_refusal_reason())
+            }
+        },
+    };
+    match outcome {
+        Ok(execution_id) => {
+            tracing::info!(
+                event_kind = "gcp_push_started_workflow",
+                channel_uuid = %row.id,
+                %workflow_id,
+                %execution_id,
+                "gcp push started its bound workflow"
+            );
+            BoundWorkflowStart::Started(execution_id)
+        }
+        Err(reason) => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "gcp_push_workflow_not_started",
+                channel_uuid = %row.id,
+                %workflow_id,
+                %user_id,
+                reason,
+                "gcp push: bound workflow not started; this incident transition will not start it again"
+            );
+            if let Err(e) = talos_integration_helpers::audit::insert_channel_audit(
+                pool,
+                talos_integration_helpers::audit::ChannelAuditEvent {
+                    integration_id: Some(row.integration_id),
+                    user_id,
+                    event_type: "workflow_not_started",
+                    target: Some(&row.expected_sa_email),
+                    success: false,
+                    error_message: Some(reason),
+                    metadata: serde_json::json!({
+                        "channel_uuid": row.id.to_string(),
+                        "workflow_id": workflow_id,
+                    }),
+                },
+            )
+            .await
+            {
+                tracing::warn!(channel_uuid = %row.id, error = %e, "gcp workflow_not_started audit log insert failed");
+            }
+            BoundWorkflowStart::NotStarted(reason)
+        }
+    }
 }
 
 /// Dispatch ONE Cloud Monitoring incident to the watch's bound module.
@@ -591,6 +823,99 @@ mod tests {
         let wu = Uuid::nil();
         let k = dedup_key(wu, "", "closed", "msg-99");
         assert_eq!(k, format!("gcp:processed:{}:msg-99:closed", wu));
+    }
+
+    /// The workflow's claim on an incident transition is not the module's:
+    /// a channel with both starts both.
+    #[test]
+    fn the_workflow_claim_is_a_key_of_its_own() {
+        let wu = Uuid::nil();
+        assert_eq!(
+            workflow_dedup_key(wu, "inc-42", "open", "msg-99"),
+            format!("gcp:workflow-started:{wu}:inc-42:open")
+        );
+        assert_eq!(
+            workflow_dedup_key(wu, "", "closed", "msg-99"),
+            format!("gcp:workflow-started:{wu}:msg-99:closed")
+        );
+        assert_ne!(
+            workflow_dedup_key(wu, "inc-42", "open", "msg-99"),
+            dedup_key(wu, "inc-42", "open", "msg-99")
+        );
+    }
+
+    /// A workflow is started with WHICH incident changed and to what state,
+    /// as identifiers, and with nothing the incident says.
+    #[test]
+    fn the_trigger_names_the_incident_and_carries_nothing_it_says() {
+        let (integration, channel) = (Uuid::new_v4(), Uuid::new_v4());
+        let incident = json!({
+            "incident_id": "0.abc123def456",
+            "state": "open",
+            "scoping_project_id": "example-project-1",
+            "policy_name": "Checkout latency over budget",
+            "summary": "p99 latency for checkout is above 2s",
+            "documentation": { "content": "page the payments on-call" },
+            "resource": { "labels": { "instance_id": "1234567890" } },
+            "condition": {
+                "name": "projects/example-project-1/alertPolicies/111/conditions/222",
+                "displayName": "p99 above 2s"
+            },
+            "url": "https://console.cloud.google.com/monitoring/alerting/incidents/0.abc123def456"
+        });
+        let input = gcp_push_trigger_input(
+            integration,
+            channel,
+            &incident,
+            "0.abc123def456",
+            "open",
+            "9876543210",
+        );
+        assert_eq!(
+            input,
+            json!({
+                "gcp_push": {
+                    "integration_id": integration,
+                    "channel_id": channel,
+                    "incident_id": "0.abc123def456",
+                    "state": "open",
+                    "project_id": "example-project-1",
+                    "condition_name": "projects/example-project-1/alertPolicies/111/conditions/222",
+                    "message_id": "9876543210",
+                }
+            })
+        );
+        let text = input.to_string();
+        for said in ["latency", "payments", "instance_id", "console.cloud", "p99"] {
+            assert!(!text.contains(said), "the trigger carries `{said}`: {text}");
+        }
+    }
+
+    /// A field that is not a plain identifier is left out, not carried.
+    #[test]
+    fn a_field_that_is_not_an_identifier_is_left_out() {
+        let incident = json!({
+            "scoping_project_id": "a project with spaces",
+            "condition": { "name": "projects/p/alertPolicies/1/conditions/2?x=<script>" }
+        });
+        let input = gcp_push_trigger_input(
+            Uuid::nil(),
+            Uuid::nil(),
+            &incident,
+            "an incident: with text",
+            &"x".repeat(33),
+            "",
+        );
+        assert_eq!(
+            input,
+            json!({ "gcp_push": { "integration_id": Uuid::nil(), "channel_id": Uuid::nil() } })
+        );
+        assert_eq!(plain_id("open", 32, b"_"), Some("open"));
+        assert_eq!(
+            plain_id(&"x".repeat(32), 32, b"_"),
+            Some("x".repeat(32).as_str())
+        );
+        assert_eq!(plain_id("", 32, b"_"), None);
     }
 
     #[test]

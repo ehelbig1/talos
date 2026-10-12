@@ -537,6 +537,48 @@ pub async fn create_watch_channel_handler(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BindWorkflowRequest {
+    /// The workflow a verified push on this channel starts; `null` clears it.
+    pub workflow_id: Option<Uuid>,
+}
+
+/// PUT /api/gcp/watch-channels/:uuid/workflow
+///
+/// Bind (or clear) the workflow this channel starts. The same function the
+/// MCP tool `set_push_channel_workflow` reaches through the inventory. The
+/// reply never carries the push token.
+pub async fn bind_workflow_handler(
+    State(service): State<Arc<GcpWatchService>>,
+    Extension(user_id): Extension<Uuid>,
+    Path(channel_uuid): Path<Uuid>,
+    ApiJson(req): ApiJson<BindWorkflowRequest>,
+) -> impl IntoResponse {
+    match super::watch::bind_channel_workflow(&service.pool, user_id, channel_uuid, req.workflow_id)
+        .await
+    {
+        Ok(row) => Json(ApiResponse {
+            success: true,
+            data: Some(serde_json::json!({
+                "channel_uuid": row.id,
+                "display_name": row.display_name,
+                "workflow_id": row.workflow_id,
+            })),
+            error: None,
+        })
+        .into_response(),
+        Err(refusal) => (
+            refusal.status_code(),
+            Json(ApiResponse::<serde_json::Value> {
+                success: false,
+                data: None,
+                error: Some(refusal.user_facing_message().to_string()),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /api/gcp/watch-channels/{uuid}/test
 ///
 /// Read-only probe: a single `projects:search` (page_size=1) against
@@ -723,11 +765,19 @@ use talos_integration_helpers::google_jwt::{
     PubsubPushEnvelope, PushIntegration,
 };
 
-/// Whether a verified GCP push would START work: a dispatch context is wired
-/// and the watch is bound to a module. Only such a push consults the
-/// execution pause. Pure, so the rule is unit-tested.
-pub(crate) fn gcp_push_starts_work(has_dispatch: bool, module_id: Option<uuid::Uuid>) -> bool {
-    has_dispatch && module_id.is_some()
+/// Whether a verified GCP push would START work: the watch is bound to a
+/// module and a dispatch context is wired, or it is bound to a workflow. Only
+/// such a push consults the execution pause. Pure, so the rule is unit-tested.
+///
+/// A workflow-bound watch asks whatever is wired: a start refused by the
+/// pause AFTER the push was acknowledged is a dropped incident, where a 503
+/// here is a redelivery.
+pub(crate) fn gcp_push_starts_work(
+    has_dispatch: bool,
+    module_id: Option<uuid::Uuid>,
+    workflow_id: Option<uuid::Uuid>,
+) -> bool {
+    (has_dispatch && module_id.is_some()) || workflow_id.is_some()
 }
 
 pub struct PubsubHandlerState {
@@ -741,6 +791,13 @@ pub struct PubsubHandlerState {
     /// recorded (liveness) but no WASM job is published — useful for
     /// bootstrap/dev without a worker pool.
     pub dispatch: Option<GcpDispatchContext>,
+    /// The trigger service a channel's bound WORKFLOW is started through, as
+    /// the channel's own user. `None` in a process that wired none: a bound
+    /// workflow is then not started, and the audit log says why.
+    pub orchestration: Option<Arc<talos_execution_orchestration::ExecutionOrchestrationService>>,
+    /// Lets one delivery of an incident transition start the bound workflow.
+    /// `None`: every delivery starts it.
+    pub redis: Option<Arc<redis::Client>>,
 }
 
 /// POST /api/gcp/pubsub/{watch_token}
@@ -869,7 +926,7 @@ pub async fn pubsub_push_handler(
     //     subscription's retention (7 days by default) loses what ages out.
     let pause = talos_execution_pause::push_admission(
         &state.watch_service.pool,
-        gcp_push_starts_work(state.dispatch.is_some(), row.module_id),
+        gcp_push_starts_work(state.dispatch.is_some(), row.module_id, row.workflow_id),
         talos_execution_pause::PauseGatePath::GcpPush,
     )
     .await;
@@ -885,10 +942,31 @@ pub async fn pubsub_push_handler(
     // 6. Record liveness + dispatch off the hot path; ack immediately.
     let svc = Arc::clone(&state.watch_service);
     let dispatch_ctx = state.dispatch.clone();
+    let orchestration = state.orchestration.clone();
+    let redis = state.redis.clone();
     let channel_uuid = row.id;
     tokio::spawn(async move {
         if let Err(e) = svc.record_push_received(user_id, channel_uuid).await {
             tracing::warn!(error = %e, "gcp pubsub: record_push_received failed");
+        }
+        // The bound workflow, when there is one. Independent of the module
+        // below: a channel may have either, both or neither.
+        if let Some(workflow_id) = row.workflow_id {
+            super::dispatch::start_bound_workflow(
+                &svc.pool,
+                orchestration.as_ref(),
+                redis.as_ref(),
+                user_id,
+                &row,
+                workflow_id,
+                &super::dispatch::PushedIncident {
+                    incident: &parsed.incident,
+                    incident_id: &parsed.incident_id,
+                    state: &parsed.state,
+                    pubsub_message_id: &pubsub_message_id,
+                },
+            )
+            .await;
         }
         if let Some(ref dispatch_ctx) = dispatch_ctx {
             if let Err(e) = dispatch_monitoring_incident(
@@ -966,14 +1044,19 @@ async fn audit_push_rejected(
 #[cfg(test)]
 mod pubsub_tests {
     #[test]
-    fn only_a_dispatchable_module_bound_push_starts_work() {
+    fn a_push_starts_work_when_a_module_can_run_or_a_workflow_is_bound() {
         let m = Some(uuid::Uuid::new_v4());
-        assert!(super::gcp_push_starts_work(true, m));
+        assert!(super::gcp_push_starts_work(true, m, None));
         assert!(
-            !super::gcp_push_starts_work(false, m),
+            !super::gcp_push_starts_work(false, m, None),
             "no dispatch context"
         );
-        assert!(!super::gcp_push_starts_work(true, None), "unbound");
+        assert!(!super::gcp_push_starts_work(true, None, None), "unbound");
+        // A bound workflow starts work with or without a module, and with or
+        // without the module dispatch context.
+        assert!(super::gcp_push_starts_work(false, None, m));
+        assert!(super::gcp_push_starts_work(true, None, m));
+        assert!(super::gcp_push_starts_work(false, m, m));
     }
 
     use super::*;
@@ -1036,6 +1119,8 @@ mod pubsub_tests {
             expected_audience: audience.to_string(),
             watch_service,
             dispatch,
+            orchestration: None,
+            redis: None,
         })
     }
 

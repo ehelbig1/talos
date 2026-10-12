@@ -3274,6 +3274,10 @@ pub(crate) fn build_router(
                 post(google_cloud::handlers::test_watch_channel_handler),
             )
             .route(
+                "/api/gcp/watch-channels/{channel_uuid}/workflow",
+                axum::routing::put(google_cloud::handlers::bind_workflow_handler),
+            )
+            .route(
                 "/api/gcp/watch-channels/{channel_uuid}",
                 axum::routing::delete(google_cloud::handlers::stop_watch_channel_handler),
             )
@@ -3330,6 +3334,8 @@ pub(crate) fn build_router(
             expected_audience: audience.clone(),
             watch_service: watch.clone(),
             dispatch: dispatch_ctx,
+            orchestration: Some(execution_orchestration_service.clone()),
+            redis: redis_client.clone(),
         });
         Some(
             Router::new()

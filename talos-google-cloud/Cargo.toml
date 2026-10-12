@@ -7,6 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# A verified push starts its bound workflow through the trigger service, as
+# for a Google Calendar channel and a Gmail watch.
+talos-execution-orchestration = { path = "../talos-execution-orchestration" }
 talos-execution-pause = { path = "../talos-execution-pause" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-public-url = { path = "../talos-public-url" }
@@ -38,6 +41,8 @@ talos-module-executions = { path = "../talos-module-executions" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-oauth = { path = "../talos-oauth" }
 talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
+# The workflow a channel is bound to is asked of the read the trigger uses.
+talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-registry = { path = "../talos-registry" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
