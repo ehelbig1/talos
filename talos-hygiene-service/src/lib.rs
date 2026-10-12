@@ -2868,6 +2868,7 @@ mod partial_report_disclosure_tests {
             module_id: Some(uuid::Uuid::new_v4()),
             module_name: None,
             module_binding: binding,
+            workflow_id: None,
             created_at: None,
             last_event_at: None,
             recent_failure: None,

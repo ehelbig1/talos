@@ -41,6 +41,9 @@ pub struct WatchChannelSummary {
     pub has_sync_token: bool,
     pub module_id: Option<Uuid>,
     pub module_name: Option<String>,
+    /// The workflow a change on this calendar starts, when one is bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<Uuid>,
     pub last_message_number: i64,
     pub updated_at: DateTime<Utc>,
     /// Populated when the most recent renewal attempt for this
@@ -296,6 +299,10 @@ fn project_row(
             .unwrap_or(false),
         module_id,
         module_name: module_id.and_then(|id| module_name_by_id.get(&id).cloned()),
+        workflow_id: v
+            .get("workflow_id")
+            .and_then(|m| m.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok()),
         last_message_number: v
             .get("last_message_number")
             .and_then(|x| x.as_i64())
@@ -415,6 +422,7 @@ impl PushChannelInventory for GcalPushChannelInventory {
                         .then(|| r.module_id.and_then(|id| names.get(&id).cloned()))
                         .flatten(),
                     module_binding: binding,
+                    workflow_id: r.workflow_id,
                     created_at: DateTime::<Utc>::from_timestamp_millis(r.created_at_ms),
                     last_event_at: DateTime::<Utc>::from_timestamp_millis(r.updated_at_ms),
                     // The gcal renewal-failure enrichment is a method on
@@ -427,6 +435,24 @@ impl PushChannelInventory for GcalPushChannelInventory {
                 }
             })
             .collect())
+    }
+
+    async fn bind_workflow(
+        &self,
+        user_id: Uuid,
+        channel_id: Uuid,
+        workflow_id: Option<Uuid>,
+    ) -> Result<(), talos_push_channel_inventory::BindWorkflowRefusal> {
+        use super::watch::BindWorkflowRefusal as Local;
+        use talos_push_channel_inventory::BindWorkflowRefusal as Shared;
+        super::watch::bind_channel_workflow(&self.pool, user_id, channel_id, workflow_id)
+            .await
+            .map(|_| ())
+            .map_err(|refusal| match refusal {
+                Local::ChannelNotFound => Shared::ChannelNotFound,
+                Local::WorkflowNotBindable => Shared::WorkflowNotBindable,
+                Local::Unreadable => Shared::Unreadable,
+            })
     }
 }
 

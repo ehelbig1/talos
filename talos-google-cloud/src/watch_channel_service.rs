@@ -271,6 +271,8 @@ impl PushChannelInventory for GcpPushChannelInventory {
                         .then(|| r.module_id.and_then(|id| names.get(&id).cloned()))
                         .flatten(),
                     module_binding: binding,
+                    // This integration's channels start a module, never a workflow.
+                    workflow_id: None,
                     created_at: DateTime::<Utc>::from_timestamp_millis(r.created_at_ms),
                     last_event_at: r
                         .last_push_received_ms

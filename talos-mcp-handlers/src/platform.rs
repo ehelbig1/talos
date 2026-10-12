@@ -266,6 +266,9 @@ pub async fn dispatch(
         "get_platform_info" => Some(handle_get_platform_info(req_id, state, agent).await),
         "get_public_url_status" => Some(handle_get_public_url_status(req_id)),
         "list_push_channels" => Some(handle_list_push_channels(req_id, state, user_id).await),
+        "set_push_channel_workflow" => {
+            Some(handle_set_push_channel_workflow(req_id, args, state, user_id).await)
+        }
         "set_concurrency_limit" => {
             Some(handle_set_concurrency_limit(req_id, args, state, user_id).await)
         }
@@ -2667,6 +2670,77 @@ mod fleet_report_tests {
         let report = assemble_fleet_report("1.0.0+aaaaaaa", &[], &exact);
         assert_eq!(workers(&report).len(), cap);
         assert_eq!(report["truncated"], false);
+    }
+}
+
+/// `set_push_channel_workflow` — bind (or clear) the workflow a push on one of
+/// this user's channels starts. Thin: parse, ask the inventory set, word the
+/// outcome. The ownership checks (the channel's and the workflow's) and the
+/// write live in the integration crate, behind the set.
+async fn handle_set_push_channel_workflow(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let Some(integration) = args
+        .get("integration")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 64)
+    else {
+        return mcp_error(req_id, -32602, "Invalid or missing 'integration'");
+    };
+    let channel_id = match crate::utils::require_uuid(args, "channel_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    // Required and strict: an absent or malformed workflow_id must not be
+    // read as "clear the binding".
+    if args.get("workflow_id").is_none() {
+        return mcp_error(
+            req_id,
+            -32602,
+            "Missing 'workflow_id' (a workflow id, or null to clear the binding)",
+        );
+    }
+    let workflow_id = match crate::utils::parse_optional_uuid_strict(args, "workflow_id", &req_id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let Some(set) = state.push_channels.as_ref() else {
+        return mcp_error(
+            req_id,
+            -32000,
+            "This controller wired no push-channel inventory, so no channel can be bound here.",
+        );
+    };
+    match set
+        .bind_workflow(integration, user_id, channel_id, workflow_id)
+        .await
+    {
+        Ok(()) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "integration": integration,
+                "channel_id": channel_id,
+                "workflow_id": workflow_id,
+                "effect": match workflow_id {
+                    Some(_) => "A push on this channel now starts this workflow, once per batch of changes, through the same gates as trigger_workflow.",
+                    None => "A push on this channel starts no workflow.",
+                },
+            }))
+            .unwrap_or_default(),
+        ),
+        Err(refusal) => {
+            use talos_push_channel_inventory::BindWorkflowRefusal as R;
+            let code = match refusal {
+                R::UnknownIntegration | R::NotSupported => -32602,
+                R::ChannelNotFound | R::WorkflowNotBindable => -32001,
+                R::Unreadable => -32000,
+            };
+            mcp_error(req_id, code, refusal.user_facing_message())
+        }
     }
 }
 
