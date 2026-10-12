@@ -18,6 +18,9 @@ serde_json.workspace = true
 # crates enter the dependency graph.
 talos-capability-world = { path = "../talos-capability-world" }
 talos-config = { path = "../talos-config" }
+# The Rhai condition scope has one home (`talos_engine::rhai_helpers`); the
+# edge-condition check asks it rather than keep a second scope builder.
+talos-engine = { path = "../talos-engine" }
 # Disabled-retry-protection check: classifies a node's most recent RECORDED
 # failure message with the SAME `classify_error` + `is_transient_error_type`
 # pair the dispatcher's smart-retry gate uses, so the finding's "a retry would

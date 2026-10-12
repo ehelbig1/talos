@@ -336,6 +336,122 @@ pub fn evaluate_condition_with_error(condition: &str, context: &JsonValue) -> Re
     })
 }
 
+/// How many unbound names [`unbound_condition_variables`] looks for before
+/// it stops. An expression is at most a few thousand characters; this bounds
+/// the number of evaluations, each of which the sandbox already caps.
+const UNBOUND_VARIABLE_PROBES: usize = 8;
+
+/// The variables `condition` reads that the scope built from `context` does
+/// not bind, in the order evaluation reaches them.
+///
+/// This asks the REAL evaluator against the REAL scope
+/// ([`build_condition_scope`], the one `test_condition` reports as
+/// `variables_in_scope`), so the answer cannot drift from what a run would
+/// do. It evaluates; when the failure is "variable not found" it records the
+/// name, binds it to an empty map so the same expression can get past it, and
+/// evaluates again, up to [`UNBOUND_VARIABLE_PROBES`] names.
+///
+/// Stated limits: it sees the names evaluation REACHES. `a || b` with `a`
+/// true never reads `b`, and an expression that fails for another reason
+/// (a type error, a missing function) stops the search with whatever was
+/// found. An empty result therefore means "none found", not "none exist".
+pub fn unbound_condition_variables(condition: &str, context: &JsonValue) -> Vec<String> {
+    let decoded = decode_html_entities(condition);
+    let condition = decoded.as_ref();
+    RHAI_ENGINE.with(|engine| {
+        let mut scope = build_condition_scope(context);
+        let mut unbound: Vec<String> = Vec::new();
+        for _ in 0..UNBOUND_VARIABLE_PROBES {
+            let Err(error) = engine.eval_with_scope::<Dynamic>(&mut scope, condition) else {
+                break;
+            };
+            let rhai::EvalAltResult::ErrorVariableNotFound(name, _) = *error else {
+                break;
+            };
+            if unbound.contains(&name) {
+                // Bound below and still "not found": a name the scope cannot
+                // hold. Stop rather than probe it again.
+                break;
+            }
+            scope.push(name.clone(), rhai::Map::new());
+            unbound.push(name);
+        }
+        unbound
+    })
+}
+
+#[cfg(test)]
+mod unbound_condition_variable_tests {
+    use super::{condition_scope_variables, unbound_condition_variables};
+    use serde_json::json;
+
+    #[test]
+    fn the_node_name_mistake_is_found_and_the_right_spelling_is_not() {
+        // The observed edge: the source node is `hold`, its output is
+        // `{"held": true}`, and the condition was written `hold.held == true`.
+        let output = json!({ "held": true });
+        assert_eq!(
+            unbound_condition_variables("hold.held == true", &output),
+            ["hold"]
+        );
+        assert!(unbound_condition_variables("held == true", &output).is_empty());
+        // The names it is checked against are the ones test_condition reports.
+        assert!(condition_scope_variables(&output).contains(&"held".to_string()));
+        assert!(!condition_scope_variables(&output).contains(&"hold".to_string()));
+    }
+
+    #[test]
+    fn every_unbound_name_evaluation_reaches_is_reported_in_order() {
+        assert_eq!(
+            unbound_condition_variables("a.x == 1 || b.y == 2 || c == 3", &json!({})),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn names_the_scope_always_binds_are_never_reported() {
+        let context = json!({});
+        for always in [
+            "is_error",
+            "inputs_degraded",
+            "ctx.len() >= 0",
+            "inputs.len() >= 0",
+        ] {
+            assert!(
+                unbound_condition_variables(always, &context).is_empty(),
+                "{always} is bound on every run"
+            );
+        }
+        assert!(unbound_condition_variables("error_message == \"\"", &context).is_empty());
+        assert!(unbound_condition_variables("degraded_inputs.len() == 0", &context).is_empty());
+    }
+
+    #[test]
+    fn another_kind_of_failure_stops_the_search_without_inventing_a_name() {
+        // A syntax error and a missing function are not unbound variables.
+        assert!(unbound_condition_variables("held ==", &json!({"held": true})).is_empty());
+        assert!(
+            unbound_condition_variables("no_such_function(held)", &json!({"held": true}))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_search_is_bounded() {
+        // More unbound names than probes, and few enough clauses to stay
+        // inside the sandbox's expression-depth limit.
+        let clauses = super::UNBOUND_VARIABLE_PROBES + 4;
+        let many = (0..clauses)
+            .map(|i| format!("v{i} == 1"))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        assert_eq!(
+            unbound_condition_variables(&many, &json!({})).len(),
+            super::UNBOUND_VARIABLE_PROBES
+        );
+    }
+}
+
 /// Evaluate a Rhai expression against a JSON context and return an `i64` result.
 ///
 /// Used by `retry_delay_expression` to compute custom backoff delays from error output.

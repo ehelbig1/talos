@@ -110,6 +110,31 @@ pub(crate) fn validate_skip_condition(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Authoring-time check of an edge `condition` against the graph it is being
+/// added to: the warning to return when the condition reads a variable that
+/// is the name of a node.
+///
+/// NEVER a rejection, as for [`dry_run_skip_condition`]. An edge condition
+/// that errors at run time is "branch not taken", so until 2026-10-12 an edge
+/// written `hold.held == true` (the scope binds the source output's FIELDS,
+/// so the name is `held`) was accepted here, never taken, and reported by
+/// nothing. `validate_workflow` raises the same finding from the same
+/// function (`talos_workflow_validation::edge_condition_names_a_node`).
+pub(crate) fn edge_condition_warning(
+    graph: &serde_json::Value,
+    source: &str,
+    target: &str,
+    condition: &str,
+) -> Option<String> {
+    talos_workflow_validation::edge_condition_names_a_node(
+        source,
+        target,
+        condition,
+        &talos_workflow_validation::graph_node_names(graph),
+    )
+    .map(|finding| finding.message())
+}
+
 /// Authoring-time dry run for a `skip_condition`, the sibling of
 /// [`dry_run_retry_condition`].
 ///
@@ -3345,13 +3370,20 @@ async fn handle_add_edge(
         .await
         .message_suffix();
 
-    mcp_text(
-        req_id,
-        &format!(
-            "Edge added: {} -> {} in workflow {}.{}",
-            source, target, wf_id, sync_note
+    let added = format!(
+        "Edge added: {} -> {} in workflow {}.{}",
+        source, target, wf_id, sync_note
+    );
+    // The edge is saved either way; the warning says the condition as written
+    // will not be taken.
+    match condition.and_then(|c| edge_condition_warning(&graph, &source, &target, c)) {
+        Some(warning) => crate::utils::mcp_text_with_json(
+            req_id,
+            &format!("{added}\n\nWARNING: {warning}"),
+            serde_json::json!({ "warning": warning }),
         ),
-    )
+        None => mcp_text(req_id, &added),
+    }
 }
 
 // ── remove_edge ─────────────────────────────────────────────────────────────

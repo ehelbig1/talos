@@ -558,3 +558,112 @@ async fn a_conditional_edge_out_of_a_self_skipped_node_is_not_evaluated() {
     );
     assert!(is_skipped(result_of(&engine, &ctx, "child")));
 }
+
+// ── A condition that ERRORS is not a condition that is false ────────
+
+/// The observed case (2026-10-10): the edge was written `hold.held == true`.
+/// An edge condition's scope is the source node's output FIELDS, so `hold`
+/// is unbound, the expression errors, and the edge is not taken. The run
+/// completes, the child is skipped, and until this record existed nothing on
+/// the run said the condition had failed rather than evaluated false.
+#[tokio::test]
+async fn an_edge_condition_that_errors_is_recorded_on_its_source_node() {
+    let (hold, apply, notify) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let graph = WorkflowGraphBuilder::new()
+        .add_module("hold", hold, None)
+        .add_module("apply", apply, None)
+        .add_module("notify", notify, None)
+        // `hold` is not a field of hold's output; `held` is.
+        .edge_condition("hold", "apply", "hold == true")
+        .edge_condition("hold", "notify", "held == true")
+        .build()
+        .expect("graph builds");
+
+    let mut engine = engine_for(&graph, &[hold, apply, notify]).await;
+    let dispatcher = RecordingDispatcher::new(Script {
+        outputs: HashMap::from([(hold, json!({ "held": true }))]),
+        ..Script::default()
+    });
+    let ctx = run(&mut engine, dispatcher.clone()).await;
+
+    // The routing rule is unchanged: an errored condition is "not taken".
+    let dispatched = dispatcher.dispatched();
+    assert!(!dispatched.contains(&apply), "an errored edge is not taken");
+    assert!(dispatched.contains(&notify), "the sound edge is taken");
+    assert!(is_skipped(result_of(&engine, &ctx, "apply")));
+
+    // What is new: the source node's output says which edge, and why.
+    let source = result_of(&engine, &ctx, "hold").expect("hold has output");
+    assert_eq!(
+        source["__edge_condition_errors__"],
+        json!([{
+            "target": "apply",
+            "condition": "hold == true",
+            "error": "unbound variable hold",
+        }]),
+        "got {source}"
+    );
+    // The node's own fields are untouched.
+    assert_eq!(source["held"], true);
+}
+
+/// The control: a condition that EVALUATES false leaves no record. The key's
+/// absence is what a healthy run looks like.
+#[tokio::test]
+async fn a_condition_that_evaluates_false_leaves_no_record() {
+    let (source, child) = (Uuid::new_v4(), Uuid::new_v4());
+    let graph = WorkflowGraphBuilder::new()
+        .add_module("source", source, None)
+        .add_module("child", child, None)
+        .edge_condition("source", "child", "held == true")
+        .build()
+        .expect("graph builds");
+
+    let mut engine = engine_for(&graph, &[source, child]).await;
+    let dispatcher = RecordingDispatcher::new(Script {
+        outputs: HashMap::from([(source, json!({ "held": false }))]),
+        ..Script::default()
+    });
+    let ctx = run(&mut engine, dispatcher.clone()).await;
+
+    assert!(is_skipped(result_of(&engine, &ctx, "child")));
+    let output = result_of(&engine, &ctx, "source").expect("source has output");
+    assert_eq!(
+        output,
+        &json!({ "held": false }),
+        "byte-identical to before"
+    );
+}
+
+/// The record is engine-authored. A module that returns its own copy cannot
+/// fabricate one, and cannot have its conditions read one.
+#[tokio::test]
+async fn a_module_cannot_author_the_edge_condition_error_record() {
+    let (source, child) = (Uuid::new_v4(), Uuid::new_v4());
+    let graph = WorkflowGraphBuilder::new()
+        .add_module("source", source, None)
+        .add_module("child", child, None)
+        .edge_condition("source", "child", "held == true")
+        .build()
+        .expect("graph builds");
+
+    let mut engine = engine_for(&graph, &[source, child]).await;
+    let dispatcher = RecordingDispatcher::new(Script {
+        outputs: HashMap::from([(
+            source,
+            json!({
+                "held": true,
+                "__edge_condition_errors__": [{ "target": "child", "error": "forged" }],
+            }),
+        )]),
+        ..Script::default()
+    });
+    let ctx = run(&mut engine, dispatcher.clone()).await;
+
+    assert!(dispatcher.dispatched().contains(&child));
+    let output = result_of(&engine, &ctx, "source").expect("source has output");
+    assert!(
+        output.get("__edge_condition_errors__").is_none(),
+        "a module-authored record survived: {output}"
+    );
+}
