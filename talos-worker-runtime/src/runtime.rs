@@ -2418,6 +2418,59 @@ pub(crate) fn last_network_reason_suffix(
     format!(" {}", crate::reason_class::marker(reason.class))
 }
 
+/// The marker to append to a module's error: the strong
+/// ` [reason_class=…]` when the error names the failure
+/// ([`last_network_reason_suffix`]), otherwise the WEAK
+/// ` [after_host_failure=…]` when the failed HTTP call was the last thing the
+/// module did with the outside world, otherwise nothing.
+///
+/// # What the weak marker is for
+///
+/// A module that returns `Err("failed")` after a DNS failure used to reach
+/// the controller as a failure of unknown cause: not retried, and shown to
+/// the operator as "unclassified". The host knew how the call had failed.
+///
+/// # The two bounds
+///
+/// The strong marker's bound (the error must name the WIT discriminant) is
+/// what stops `401 Unauthorized [reason_class=dns]` being retried, and it is
+/// untouched. The weak marker is bounded differently, twice:
+///
+/// 1. HERE: `acted_since_failure` must be false. The latch is cleared by a
+///    later HTTP success but by nothing else, so a module that swallowed a
+///    failed fetch, did other work and then failed still holds a stale class.
+///    Such a module has made a host call since, and gets no marker.
+/// 2. In the reader: every classifier consults the weak marker LAST, so text
+///    that any existing rule recognises classifies exactly as it did
+///    (`talos_reason_class::after_host_failure`).
+///
+/// A local-LLM timeout class is never rendered weakly: those classes carry
+/// their own retry caps, decided from the strong marker alone.
+pub(crate) fn host_failure_suffix(
+    latch: &std::sync::Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>>,
+    acted_since_failure: &std::sync::atomic::AtomicBool,
+    guest_error: &str,
+) -> String {
+    let strong = last_network_reason_suffix(latch, guest_error);
+    if !strong.is_empty() {
+        return strong;
+    }
+    let Some(reason) = *latch.lock().unwrap_or_else(|e| e.into_inner()) else {
+        return String::new();
+    };
+    if acted_since_failure.load(std::sync::atomic::Ordering::Relaxed) {
+        return String::new();
+    }
+    if reason.class.starts_with("inference-") {
+        return String::new();
+    }
+    talos_reason_class::family(reason.class)
+        .and_then(talos_reason_class::after_host_failure::AfterHostFailure::from_family)
+        .map_or_else(String::new, |kind| {
+            format!(" {}", talos_reason_class::after_host_failure::marker(kind))
+        })
+}
+
 /// The `execution_id` a pipeline step stamps on its `wasm.log.*` entries.
 ///
 /// MUST be the bare `workflow_executions.id`. The controller's log subscriber
@@ -4733,6 +4786,7 @@ impl TalosRuntime {
         // with the cause the host already knew. See
         // `TalosContext::last_network_reason`.
         let net_reason_arc = store.data().network_reason_handle();
+        let acted_since_net_failure = store.data().acted_since_network_failure_handle();
 
         // Call the exported `run` function with automatic timeout enforcement.
         let input_str = input.to_string();
@@ -4969,8 +5023,14 @@ impl TalosRuntime {
                 // `networkerror` token the class exists to explain — see
                 // `last_network_reason_suffix` for why the second condition
                 // is what bounds a stale latch.
+                //
+                // When the error does NOT carry the token, the weak
+                // `[after_host_failure=…]` marker is appended instead, and
+                // only if that failed call was the last thing the module did
+                // with the outside world: see `host_failure_suffix`.
                 let err_text = e.to_string();
-                let reason_suffix = last_network_reason_suffix(&net_reason_arc, &err_text);
+                let reason_suffix =
+                    host_failure_suffix(&net_reason_arc, &acted_since_net_failure, &err_text);
                 return Err(anyhow::anyhow!(
                     "Component returned error: {}{}",
                     e,
@@ -5679,6 +5739,7 @@ impl TalosRuntime {
             // now-transient-by-default token would retry a circuit-open or a
             // Tier-1 egress deny right here.
             let step_net_reason = store.data().network_reason_handle();
+            let step_acted_since_net_failure = store.data().acted_since_network_failure_handle();
             store.limiter(|ctx| ctx as &mut dyn wasmtime::ResourceLimiter);
             // M1: epoch interruption deadline — per-step. Cancellation must
             // not be PROTOCOL-DEPENDENT: a pipeline step gets the same
@@ -5779,7 +5840,11 @@ impl TalosRuntime {
                         "Pipeline step '{}' returned error: {}{}",
                         step.module_id,
                         err_text,
-                        last_network_reason_suffix(&step_net_reason, &err_text)
+                        host_failure_suffix(
+                            &step_net_reason,
+                            &step_acted_since_net_failure,
+                            &err_text
+                        )
                     );
                 }
             };
@@ -6697,6 +6762,121 @@ mod pipeline_step_retry_tests {
     }
 
     const WIT_NETWORKERROR: &str = r#"Component returned error: list fetch: Error { code: 2, name: "networkerror", message: "" }"#;
+
+    fn latched(
+        reason: Option<crate::reason_class::Reason>,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(reason))
+    }
+
+    /// The observed case (2026-10-12): a module returned a bare error after a
+    /// network failure, the class was `unknown`, and nothing retried it.
+    #[test]
+    fn a_bare_error_after_a_failed_call_carries_the_weak_marker() {
+        use crate::reason_class as rc;
+        let idle = std::sync::atomic::AtomicBool::new(false);
+        for (reason, weak) in [
+            (
+                rc::Reason::network(rc::DNS),
+                " [after_host_failure=unreachable]",
+            ),
+            (
+                rc::Reason::timeout(rc::TIMEOUT),
+                " [after_host_failure=late]",
+            ),
+            (
+                rc::Reason::forbidden_host(rc::ALLOWED_HOSTS),
+                " [after_host_failure=denied]",
+            ),
+            (
+                rc::Reason::network(rc::CIRCUIT_OPEN),
+                " [after_host_failure=breaker]",
+            ),
+            (
+                rc::Reason::invalid_url(rc::URL_PARSE),
+                " [after_host_failure=badurl]",
+            ),
+            (
+                rc::Reason::forbidden_host(rc::SECRET_LOOKUP),
+                " [after_host_failure=credential]",
+            ),
+        ] {
+            assert_eq!(
+                host_failure_suffix(
+                    &latched(Some(reason)),
+                    &idle,
+                    "Component returned error: failed"
+                ),
+                weak,
+                "class {}",
+                reason.class
+            );
+        }
+    }
+
+    /// The strong marker is unchanged and wins: an error that names the
+    /// failure gets `[reason_class=…]`, whatever else the module did.
+    #[test]
+    fn an_error_that_names_the_failure_keeps_the_strong_marker() {
+        use crate::reason_class as rc;
+        let latch = latched(Some(rc::Reason::network(rc::DNS)));
+        for acted in [false, true] {
+            assert_eq!(
+                host_failure_suffix(
+                    &latch,
+                    &std::sync::atomic::AtomicBool::new(acted),
+                    WIT_NETWORKERROR
+                ),
+                " [reason_class=dns]"
+            );
+        }
+    }
+
+    /// THE BOUND on the weak marker. The latch is cleared by a later HTTP
+    /// success and by nothing else, so a module that swallowed a failed fetch,
+    /// did other work and then failed still holds a stale class. It has acted
+    /// since, and its error is left alone.
+    #[test]
+    fn a_module_that_did_something_else_since_gets_no_weak_marker() {
+        use crate::reason_class as rc;
+        let latch = latched(Some(rc::Reason::network(rc::DNS)));
+        let acted = std::sync::atomic::AtomicBool::new(true);
+        for unrelated in [
+            "Component returned error: failed",
+            "Component returned error: business rule violated",
+            "Component returned error: invalid JSON at line 3",
+        ] {
+            assert_eq!(
+                host_failure_suffix(&latch, &acted, unrelated),
+                "",
+                "{unrelated}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_latched_a_cancellation_and_a_model_timeout_get_no_weak_marker() {
+        use crate::reason_class as rc;
+        let idle = std::sync::atomic::AtomicBool::new(false);
+        let bare = "Component returned error: failed";
+        assert_eq!(host_failure_suffix(&latched(None), &idle, bare), "");
+        // An abandoned call is not a cause.
+        assert_eq!(
+            host_failure_suffix(
+                &latched(Some(rc::Reason::network(rc::CANCELLED))),
+                &idle,
+                bare
+            ),
+            ""
+        );
+        // A local-LLM deadline carries its own retry caps, decided from the
+        // strong marker alone.
+        let model = rc::Reason {
+            class: rc::INFERENCE_IDLE_TIMEOUT,
+            wit: rc::WIT_LLM_TIMEOUT,
+        };
+        assert_eq!(host_failure_suffix(&latched(Some(model)), &idle, bare), "");
+    }
 
     #[test]
     fn suffix_is_empty_when_no_failure_is_latched() {

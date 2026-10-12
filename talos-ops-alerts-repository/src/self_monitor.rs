@@ -414,10 +414,26 @@ pub fn classify_execution_error(msg: &str) -> ErrorClass {
             severity_hint: "low",
         }
     } else {
-        ErrorClass {
-            class: "other",
-            label: "unclassified failure",
-            severity_hint: "medium",
+        // LAST, after every rule above: the worker's WEAK marker, stamped on
+        // an error that names nothing when the module's last call to the
+        // outside world was an HTTP call that failed host-side. Only the two
+        // kinds with an exact class here are read: a call that got no answer,
+        // and one that ran out of time. A refusal's weak marker does not say
+        // WHICH gate refused, and each gate has its own class and dedup key,
+        // so it stays `other` rather than guess one.
+        use talos_reason_class::after_host_failure::{self, AfterHostFailure};
+        match after_host_failure::parse(&m) {
+            Some(AfterHostFailure::Unreachable) => {
+                classify_reason_class(talos_reason_class::Family::Transport)
+            }
+            Some(AfterHostFailure::Late) => {
+                classify_reason_class(talos_reason_class::Family::Timeout)
+            }
+            _ => ErrorClass {
+                class: "other",
+                label: "unclassified failure",
+                severity_hint: "medium",
+            },
         }
     }
 }
@@ -1061,6 +1077,53 @@ mod tests {
              Job result signature verification failed: result_nonce is too old (907 s, max 300)",
         );
         assert_eq!(ec.class, "signature");
+    }
+
+    /// A module that says nothing after a network failure: the worker's weak
+    /// marker is what lets the alert say "could not be reached" instead of
+    /// "the cause was not recognised".
+    #[test]
+    fn a_bare_failure_with_the_weak_marker_is_named_and_never_outranks_the_text() {
+        use talos_reason_class::after_host_failure::{marker, AfterHostFailure as Kind};
+        let bare = |kind: Kind| {
+            classify_execution_error(&format!(
+                "node 'read' failed: Job failed after 3 attempts: execution failure: \
+                 Component returned error: failed {}",
+                marker(kind)
+            ))
+        };
+        assert_eq!(bare(Kind::Unreachable).class, "network");
+        assert_eq!(bare(Kind::Late).class, "timeout");
+        assert_eq!(
+            plain_cause(bare(Kind::Unreachable).class),
+            "a service it calls could not be reached"
+        );
+        // A refusal's weak marker does not say which gate; it stays `other`.
+        for kind in [
+            Kind::Denied,
+            Kind::BreakerOpen,
+            Kind::BadUrl,
+            Kind::Credential,
+        ] {
+            assert_eq!(bare(kind).class, "other", "{kind:?}");
+        }
+        // Text that says something classifies by what it says, whatever the
+        // marker beside it.
+        for kind in Kind::ALL {
+            let with =
+                |text: &str| classify_execution_error(&format!("{text} {}", marker(kind))).class;
+            assert_eq!(with("Gmail API returned HTTP 401"), "auth", "{kind:?}");
+            assert_eq!(with("WASM fuel exhausted"), "fuel_exhausted", "{kind:?}");
+            assert_eq!(with("approval was denied"), "approval_denied", "{kind:?}");
+        }
+        // The marker's own words are not prose to this classifier.
+        for kind in Kind::ALL {
+            assert_eq!(
+                classify_execution_error(&format!("x {}", kind.as_str())).class,
+                "other",
+                "{kind:?}"
+            );
+        }
     }
 
     /// The observed alert (2026-10-12): "workflow 'talos-ci-watch' failed:

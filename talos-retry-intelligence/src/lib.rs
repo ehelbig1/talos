@@ -372,7 +372,28 @@ pub fn classify_error(error_msg: &str) -> String {
         return "signature_failure".to_string();
     }
 
-    "unknown".to_string()
+    // LAST, and only here: the worker's WEAK marker. Nothing above recognised
+    // the message, and the worker says the module's last call to the outside
+    // world was an HTTP call that failed host-side
+    // (`talos_reason_class::after_host_failure`). A module that returns
+    // `Err("failed")` after a DNS failure used to be `unknown`: not retried.
+    //
+    // It is consulted after every rule on purpose. The strong
+    // `[reason_class=…]` marker may be read early because the worker stamps
+    // it only on text that names the failure; this one is stamped on text
+    // that names nothing, so a message that says `401` or `fuel exhausted`
+    // must have classified by what it says before this is ever reached.
+    use talos_reason_class::after_host_failure::{self, AfterHostFailure};
+    match after_host_failure::parse(&lower) {
+        Some(AfterHostFailure::Unreachable) => "network_transient",
+        Some(AfterHostFailure::Late) => "timeout",
+        Some(AfterHostFailure::Denied) => "capability_denied",
+        Some(AfterHostFailure::BreakerOpen) => "circuit_open",
+        Some(AfterHostFailure::BadUrl) => "invalid_url",
+        Some(AfterHostFailure::Credential) => "missing_secret",
+        None => "unknown",
+    }
+    .to_string()
 }
 
 /// Determine if an error type is typically transient (worth retrying).
@@ -590,6 +611,94 @@ mod tests {
             classify_error("something random [reason_class=not-a-real-token]"),
             "unknown"
         );
+    }
+
+    /// A module that says NOTHING useful. The worker attaches the weak
+    /// marker when the module's last call to the outside world was an HTTP
+    /// call that failed host-side; that marker is all there is to go on.
+    #[test]
+    fn a_bare_failure_is_classified_by_the_weak_marker() {
+        use talos_reason_class::after_host_failure::{marker, AfterHostFailure as Kind};
+        let bare = |kind: Kind| {
+            classify_error(&format!(
+                "Job failed: execution failure: Component returned error: failed {}",
+                marker(kind)
+            ))
+        };
+        // The observed case: a network error, then `Err("failed")`.
+        assert_eq!(bare(Kind::Unreachable), "network_transient");
+        assert!(is_transient_error_type(&bare(Kind::Unreachable)));
+        assert_eq!(bare(Kind::Late), "timeout");
+        assert!(is_transient_error_type(&bare(Kind::Late)));
+        // A refused host is NOT tried again, and neither are the rest.
+        assert_eq!(bare(Kind::Denied), "capability_denied");
+        assert_eq!(bare(Kind::BreakerOpen), "circuit_open");
+        assert_eq!(bare(Kind::BadUrl), "invalid_url");
+        assert_eq!(bare(Kind::Credential), "missing_secret");
+        for kind in [
+            Kind::Denied,
+            Kind::BreakerOpen,
+            Kind::BadUrl,
+            Kind::Credential,
+        ] {
+            assert!(
+                !is_transient_error_type(&bare(kind)),
+                "{kind:?} was retried"
+            );
+        }
+        // Without the marker the same text is what it was.
+        assert_eq!(
+            classify_error("Job failed: execution failure: Component returned error: failed"),
+            "unknown"
+        );
+    }
+
+    /// THE BOUND. The weak marker is stamped on text that names nothing, so
+    /// it must never outrank what a message says. `401 Unauthorized` after a
+    /// swallowed DNS failure is an auth failure, not a retry; before the
+    /// strong marker was paired with its token, this exact mis-attribution
+    /// retried a permanent error to exhaustion.
+    #[test]
+    fn the_weak_marker_never_outranks_what_the_message_says() {
+        use talos_reason_class::after_host_failure::{marker, AfterHostFailure as Kind};
+        for kind in Kind::ALL {
+            let with = |text: &str| classify_error(&format!("{text} {}", marker(kind)));
+            assert_eq!(with("401 Unauthorized"), "auth_failure", "{kind:?}");
+            assert_eq!(with("WASM fuel exhausted"), "fuel_exhaustion", "{kind:?}");
+            assert_eq!(with("404 Not Found"), "not_found", "{kind:?}");
+            assert_eq!(with("HTTP 429 Too Many Requests"), "rate_limit", "{kind:?}");
+            assert_eq!(
+                with(r#"fetch: Error { code: 3, name: "forbiddenhost", message: "" }"#),
+                "capability_denied",
+                "{kind:?}"
+            );
+        }
+        // And the strong marker still wins over the weak one beside it.
+        assert_eq!(
+            classify_error(&format!(
+                "failed [reason_class=allowed-hosts] {}",
+                marker(Kind::Unreachable)
+            )),
+            "capability_denied"
+        );
+    }
+
+    /// The marker's own words must match NO prose rule: read as prose, a
+    /// marker would classify the message by itself. Each kind alone, on text
+    /// no rule knows, lands only where its own arm puts it.
+    #[test]
+    fn the_weak_markers_words_are_inert_to_the_prose_rules() {
+        use talos_reason_class::after_host_failure::{AfterHostFailure as Kind, KEY};
+        // The key and each word, WITHOUT the brackets that make it a marker
+        // the parser accepts, classify as unknown.
+        assert_eq!(classify_error(&format!("x {KEY}")), "unknown");
+        for kind in Kind::ALL {
+            assert_eq!(
+                classify_error(&format!("x {}", kind.as_str())),
+                "unknown",
+                "{kind:?}"
+            );
+        }
     }
 
     /// What a catalog module says when a request did not reach its host. The

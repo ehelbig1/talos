@@ -47,6 +47,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod after_host_failure;
+
 /// Every token `talos_worker_runtime::reason_class` can stamp.
 ///
 /// HAND-MIRRORED from `talos_worker_runtime::reason_class::ALL`, in the same

@@ -10223,6 +10223,7 @@ dependencies = [
  "talos-local-inference",
  "talos-memory",
  "talos-random",
+ "talos-reason-class",
  "talos-redis",
  "talos-secrets",
  "talos-sigstore-policy",

@@ -12,16 +12,17 @@ serde.workspace = true
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 tracing.workspace = true
 uuid.workspace = true
+# A zero-dependency leaf. Two uses:
+#
+# * Production (since 2026-10-12): `classify_error`'s LAST arm reads the
+#   worker's weak `[after_host_failure=…]` marker through
+#   `talos_reason_class::after_host_failure::parse`, so the worker that writes
+#   the marker and this crate that reads it share one vocabulary.
+# * Tests: `HTTP_POLICY_DENIAL_CLASSES` is still a HAND mirror of the worker's
+#   closed `[reason_class=…]` token set, left as it was so the strong marker's
+#   arms are byte-identical; a token renamed upstream fails
+#   `the_hand_mirror_still_matches_the_shared_vocabulary` here.
+talos-reason-class = { path = "../talos-reason-class" }
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-# Drift pin only — deliberately NOT a production dependency.
-#
-# `HTTP_POLICY_DENIAL_CLASSES` above is a hand mirror of the worker's closed
-# token set, and this crate sits on the retry hot path, so its runtime
-# behaviour is left byte-identical. What the dev-dep buys is that a token
-# renamed upstream now fails a test HERE instead of silently ceasing to match
-# — see `the_hand_mirror_still_matches_the_shared_vocabulary`.
-talos-reason-class = { path = "../talos-reason-class" }

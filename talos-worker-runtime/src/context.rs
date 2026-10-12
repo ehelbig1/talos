@@ -518,6 +518,23 @@ pub struct TalosContext {
     /// closed.
     pub(crate) last_network_reason: Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>>,
 
+    /// Whether the module has made a host call since
+    /// [`Self::last_network_reason`] was last latched with a failure.
+    ///
+    /// `false` means the failed HTTP call is the LAST thing the module did
+    /// with the outside world before it returned. That is the one case in which
+    /// the runtime may attach the weak `[after_host_failure=…]` marker to an
+    /// error whose text does not name the failure
+    /// (`crate::runtime::host_failure_suffix`). A module that swallowed a
+    /// failed fetch, read memory or called a model, and then failed has
+    /// acted since, and gets no marker.
+    ///
+    /// Set in [`Self::host_call`], the one hook every host function calls
+    /// first; logging and the pure helpers do not set it
+    /// ([`Self::is_passive_host_call`]), because a module that logs the
+    /// failure it is about to return has not done anything else.
+    pub(crate) acted_since_network_failure: Arc<std::sync::atomic::AtomicBool>,
+
     /// Per-execution event emission counter for the events interface.
     pub(crate) event_emit_count: AtomicU64,
 
@@ -1724,6 +1741,7 @@ impl TalosContext {
             denial_ledger_count: AtomicU64::new(0),
             secret_use_recorded: std::collections::HashSet::new(),
             last_network_reason: Arc::new(std::sync::Mutex::new(None)),
+            acted_since_network_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             event_emit_count: AtomicU64::new(0),
             streams: StreamRegistry::new(),
             sse_connects_per_host: dashmap::DashMap::new(),
@@ -2117,6 +2135,20 @@ impl TalosContext {
     #[inline]
     pub(crate) fn host_call(&mut self, label: &'static str) {
         self.host_call_label = label;
+        if !Self::is_passive_host_call(label) {
+            self.acted_since_network_failure
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A host call that reaches nothing outside the worker and decides
+    /// nothing: logging, and the pure JSON / template / date helpers. Making
+    /// one after a failed HTTP call does not make that failure any less the
+    /// last thing the module did.
+    pub(crate) fn is_passive_host_call(label: &str) -> bool {
+        ["logging::", "json::", "templates::", "datetime::"]
+            .iter()
+            .any(|prefix| label.starts_with(prefix))
     }
 
     /// In a rehearsal (`http_replay` set) only `http::fetch` / `fetch_all` are
@@ -2292,6 +2324,13 @@ impl TalosContext {
             .last_network_reason
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // A failure starts the watch on what the module does next. The host
+        // call that failed has already set the flag in `host_call`, so it is
+        // cleared here, AFTER it.
+        if class.is_some() {
+            self.acted_since_network_failure
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         *guard = class;
     }
 
@@ -2316,6 +2355,12 @@ impl TalosContext {
         &self,
     ) -> Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>> {
         self.last_network_reason.clone()
+    }
+
+    /// Handle onto [`Self::acted_since_network_failure`], kept by the runtime
+    /// for the same reason.
+    pub(crate) fn acted_since_network_failure_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.acted_since_network_failure.clone()
     }
 
     /// Every policy-driven refusal in the worker — HTTP host allowlist,
