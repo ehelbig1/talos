@@ -1285,6 +1285,7 @@ pub(crate) const TOOL_GROUPS: &[(&str, &[&str])] = &[
         &[
             "list_schedules",
             "create_schedule",
+            "update_schedule",
             "pause_schedule",
             "resume_schedule",
             "delete_schedule",
