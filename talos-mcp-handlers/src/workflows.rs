@@ -490,7 +490,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "properties": {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow to test" },
                     "input": { "type": "object", "description": "Input payload for the workflow (default: {} — omit if the workflow takes no input)" },
-                    "timeout_secs": { "type": "number", "description": "Execution timeout in seconds (default: 30, max: 600). Workflows above 600s should use trigger_workflow + get_execution_status polling." },
+                    "timeout_secs": { "type": "number", "description": "How long to wait for the run before answering, in seconds (default: 30, max: 600). The request is held open for at most 45 seconds whatever is asked: an MCP client stops waiting at about a minute, and a reply that never arrives carries no execution_id. A run that has not finished by then is NOT stopped: the reply is {passed: false, status: \"running\", execution_id, assertions_evaluated: false} and get_execution_status(execution_id) shows how it ended. The run itself may take up to 600 seconds." },
                     "assert_status": { "type": "string", "description": "Expected execution status (default: 'completed')" },
                     "assert_max_duration_ms": { "type": "number", "description": "Maximum allowed duration in milliseconds" },
                     "assert_output_contains": { "type": "object", "description": "Key-value pairs that must exist in the output" },
@@ -8731,8 +8731,14 @@ async fn handle_test_workflow(
         }
     });
 
-    let wait_result =
-        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), spawn_handle).await;
+    // The request is held open for at most `TEST_SYNC_WAIT_CAP_SECS`,
+    // whatever `timeout_secs` asked for: see `test_sync_wait`.
+    let sync_wait = test_sync_wait(timeout_secs);
+    let wait_result = tokio::time::timeout(
+        std::time::Duration::from_secs(sync_wait.wait_secs),
+        spawn_handle,
+    )
+    .await;
 
     let duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -8764,18 +8770,7 @@ async fn handle_test_workflow(
             // `running` response so the caller can poll via
             // `get_execution_status` rather than interpreting this as
             // a failure. Assertions are skipped (no output yet).
-            let mut running_result = serde_json::json!({
-                "passed": false,
-                "status": "running",
-                "execution_id": exec_id.to_string(),
-                "duration_ms": duration_ms,
-                "hint": format!(
-                    "Workflow exceeded the {}s test sync-wait but is still running in the background. \
-                     Poll `get_execution_status` with the returned execution_id for the final result, \
-                     or raise `timeout_secs` (max 600) on future calls.",
-                    timeout_secs
-                ),
-            });
+            let mut running_result = test_still_running_reply(exec_id, duration_ms, sync_wait);
             if let Some(budget) = actor_budget_block(&state.db_pool, effective_test_actor).await {
                 running_result["actor_budget"] = budget;
             }
@@ -8833,6 +8828,129 @@ async fn handle_test_workflow(
         req_id.clone(),
         &serde_json::to_string_pretty(&test_result).unwrap_or_default(),
     ))
+}
+
+/// The longest `test_workflow` holds its request open, in seconds.
+///
+/// `timeout_secs` accepts up to 600, and until 2026-10-12 the handler blocked
+/// for all of it. An MCP client gives up at about 60 seconds with "Request
+/// timed out"; the run carried on and no execution id reached the caller.
+/// Below the client's limit with room for the reply to travel.
+pub(crate) const TEST_SYNC_WAIT_CAP_SECS: u64 = 45;
+
+// A client that stops at a minute must have room to receive the reply.
+const _: () = assert!(TEST_SYNC_WAIT_CAP_SECS < 60);
+
+/// How long `test_workflow` waits for a run before answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TestSyncWait {
+    /// What the caller asked for (`timeout_secs`).
+    pub requested_secs: u64,
+    /// What the handler waits: the request, or the cap when it is smaller.
+    pub wait_secs: u64,
+}
+
+impl TestSyncWait {
+    /// The wait was shortened by [`TEST_SYNC_WAIT_CAP_SECS`].
+    pub(crate) const fn capped(self) -> bool {
+        self.wait_secs < self.requested_secs
+    }
+}
+
+pub(crate) const fn test_sync_wait(requested_secs: u64) -> TestSyncWait {
+    TestSyncWait {
+        requested_secs,
+        wait_secs: if requested_secs < TEST_SYNC_WAIT_CAP_SECS {
+            requested_secs
+        } else {
+            TEST_SYNC_WAIT_CAP_SECS
+        },
+    }
+}
+
+/// The reply when the run has not finished inside the wait. The run is not
+/// stopped; the caller gets the id to poll and is told that no assertion was
+/// evaluated, so `passed: false` is not read as a failed test.
+pub(crate) fn test_still_running_reply(
+    execution_id: uuid::Uuid,
+    duration_ms: u64,
+    wait: TestSyncWait,
+) -> serde_json::Value {
+    let poll = format!("get_execution_status(execution_id: \"{execution_id}\")");
+    let hint = if wait.capped() {
+        format!(
+            "The run did not finish in {waited}s and is still running. test_workflow holds a \
+             request open for at most {cap}s (timeout_secs: {asked} was asked for), because a \
+             client stops waiting at about a minute and a reply that never arrives carries no \
+             execution_id. The run was NOT stopped and may take up to 600s. No assertion was \
+             evaluated: `passed` is false because there is no result yet, not because the test \
+             failed. Poll {poll} for how it ended.",
+            waited = wait.wait_secs,
+            cap = TEST_SYNC_WAIT_CAP_SECS,
+            asked = wait.requested_secs,
+        )
+    } else {
+        format!(
+            "The run did not finish in the {waited}s it was given (timeout_secs) and is still \
+             running in the background; it was NOT stopped. No assertion was evaluated: `passed` \
+             is false because there is no result yet, not because the test failed. Poll {poll} \
+             for how it ended, or pass a larger timeout_secs (the request is held for at most \
+             {cap}s).",
+            waited = wait.wait_secs,
+            cap = TEST_SYNC_WAIT_CAP_SECS,
+        )
+    };
+    serde_json::json!({
+        "passed": false,
+        "status": "running",
+        "execution_id": execution_id.to_string(),
+        "assertions_evaluated": false,
+        "duration_ms": duration_ms,
+        "waited_secs": wait.wait_secs,
+        "next_step": "get_execution_status",
+        "hint": hint,
+    })
+}
+
+#[cfg(test)]
+mod test_sync_wait_tests {
+    use super::{test_still_running_reply, test_sync_wait, TEST_SYNC_WAIT_CAP_SECS};
+    use uuid::Uuid;
+
+    #[test]
+    fn the_wait_is_what_was_asked_up_to_the_cap() {
+        assert_eq!(test_sync_wait(1).wait_secs, 1);
+        assert_eq!(test_sync_wait(30).wait_secs, 30);
+        assert!(!test_sync_wait(30).capped());
+        assert!(!test_sync_wait(TEST_SYNC_WAIT_CAP_SECS).capped());
+        // The observed call: timeout_secs 600, a client that gave up at ~60s.
+        let long = test_sync_wait(600);
+        assert_eq!(long.wait_secs, TEST_SYNC_WAIT_CAP_SECS);
+        assert_eq!(long.requested_secs, 600);
+        assert!(long.capped());
+    }
+
+    #[test]
+    fn a_run_that_is_still_going_answers_with_its_id_and_says_nothing_was_judged() {
+        let id = Uuid::from_u128(11);
+        for wait in [test_sync_wait(600), test_sync_wait(10)] {
+            let reply = test_still_running_reply(id, 45_010, wait);
+            assert_eq!(reply["execution_id"], id.to_string());
+            assert_eq!(reply["status"], "running");
+            assert_eq!(reply["passed"], false);
+            assert_eq!(reply["assertions_evaluated"], false);
+            assert_eq!(reply["waited_secs"], wait.wait_secs);
+            let hint = reply["hint"].as_str().expect("hint");
+            assert!(hint.contains("NOT stopped"), "{hint}");
+            assert!(hint.contains("not because the test failed"), "{hint}");
+            assert!(hint.contains(&id.to_string()), "{hint}");
+        }
+        let capped = test_still_running_reply(id, 0, test_sync_wait(600));
+        assert!(capped["hint"]
+            .as_str()
+            .unwrap()
+            .contains("timeout_secs: 600 was asked for"));
+    }
 }
 
 async fn handle_get_workflow_health(
