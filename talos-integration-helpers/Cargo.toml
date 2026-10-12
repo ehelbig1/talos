@@ -50,6 +50,10 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Drift pin only: `looks_like_oauth_failure` keeps a copy of the sentence the
+# refresh path writes when it cannot reach the provider, and a test holds the
+# copy to `talos_oauth::TOKEN_ENDPOINT_UNREACHABLE`.
+talos-oauth = { path = "../talos-oauth" }
 # `start_paused = true` in the renewal-scheduler test needs tokio's
 # test-util clock control.
 # `net` + `io-util`: google_jwt::tests serve a JWK set from a loopback socket.

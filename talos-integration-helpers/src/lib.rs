@@ -484,6 +484,15 @@ pub struct RenewalFailure {
 /// reconnect banner.
 pub fn looks_like_oauth_failure(err: &str) -> bool {
     let lowered = err.to_ascii_lowercase();
+    // A refresh that could not REACH the provider is not a refusal, and the
+    // word "refresh" in its text must not be read as one: until 2026-10-12 a
+    // renewal that failed on "Token refresh request failed" (a host that had
+    // just woken) put the reconnect banner on a working connection. The
+    // phrase is `talos_oauth::TOKEN_ENDPOINT_UNREACHABLE`, pinned to it by
+    // `the_unreachable_phrase_is_the_one_talos_oauth_writes`.
+    if lowered.contains(TOKEN_ENDPOINT_UNREACHABLE_LOWER) {
+        return false;
+    }
     const OAUTH_SIGNALS: &[&str] = &[
         "invalid_grant",
         "invalid grant",
@@ -501,9 +510,48 @@ pub fn looks_like_oauth_failure(err: &str) -> bool {
     OAUTH_SIGNALS.iter().any(|sig| lowered.contains(sig))
 }
 
+/// `talos_oauth::TOKEN_ENDPOINT_UNREACHABLE`, lowercased. A copy because
+/// `talos-oauth` is not a dependency of this crate's library; the two are
+/// held equal by a test.
+const TOKEN_ENDPOINT_UNREACHABLE_LOWER: &str =
+    "token refresh could not reach the provider's token endpoint";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 2026-10-11 case: the refresh could not connect, and the settings
+    /// page said reconnect.
+    #[test]
+    fn a_refresh_that_could_not_reach_the_provider_is_not_an_oauth_failure() {
+        for msg in [
+            "Token refresh could not reach the provider's token endpoint",
+            "renewal failed: Token refresh could not reach the provider's token endpoint: \
+             error sending request",
+        ] {
+            assert!(!looks_like_oauth_failure(msg), "{msg}");
+        }
+        // A refusal still is one, in the words the refresh path writes.
+        assert!(looks_like_oauth_failure(
+            "Token refresh refused: the grant was revoked; re-link required"
+        ));
+    }
+
+    /// The copy above must be the sentence the refresh path writes.
+    /// Reworded on one side only, a renewal that could not connect goes back
+    /// to showing the reconnect banner.
+    #[test]
+    fn the_unreachable_phrase_is_the_one_talos_oauth_writes() {
+        assert_eq!(
+            TOKEN_ENDPOINT_UNREACHABLE_LOWER,
+            talos_oauth::TOKEN_ENDPOINT_UNREACHABLE.to_lowercase()
+        );
+        // Without the exclusion that sentence WOULD match: it says "refresh".
+        assert!(TOKEN_ENDPOINT_UNREACHABLE_LOWER.contains("refresh"));
+        assert!(!looks_like_oauth_failure(
+            talos_oauth::TOKEN_ENDPOINT_UNREACHABLE
+        ));
+    }
 
     #[test]
     fn looks_like_oauth_failure_matches_real_error_shapes() {

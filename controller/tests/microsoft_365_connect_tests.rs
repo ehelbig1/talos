@@ -686,6 +686,10 @@ async fn a_refresh_is_form_encoded_and_stores_the_rotated_refresh_token() {
         .await
         .expect_err("a refused grant fails the refresh");
     assert!(err.to_string().contains("re-link"), "{err:#}");
+    assert_eq!(
+        talos_oauth::refresh_failure_kind(&err),
+        talos_oauth::RefreshFailureKind::RefusedByProvider
+    );
     let sent = w.fake.exchanges.lock().unwrap().clone();
     assert_eq!(
         sent[2].1.get("refresh_token").map(String::as_str),
@@ -701,10 +705,100 @@ async fn a_refresh_is_form_encoded_and_stores_the_rotated_refresh_token() {
     .unwrap();
     assert!(needs_reauth.is_some());
     // And no further call reaches the token endpoint until it is re-linked.
-    assert!(w
+    // That refusal, made without a round trip, is still a refusal.
+    let again = w
         .creds
         .refresh_oauth_token_if_needed(&vault_path)
         .await
-        .is_err());
+        .expect_err("a marked credential is refused");
+    assert_eq!(
+        talos_oauth::refresh_failure_kind(&again),
+        talos_oauth::RefreshFailureKind::RefusedByProvider
+    );
     assert_eq!(w.fake.exchanges.lock().unwrap().len(), 3);
+}
+
+/// A token endpoint that fails to answer is not a refusal of the grant.
+///
+/// Until 2026-10-12 a caller could not tell the two apart: a refresh that got
+/// a 503, or no connection at all, was logged as "REFUSED by the provider"
+/// and reported to the operator as needing re-authorisation. The connection
+/// was fine, and the next run succeeded.
+#[tokio::test]
+async fn a_token_endpoint_that_does_not_answer_is_not_a_refusal_and_marks_nothing() {
+    use talos_oauth::{refresh_failure_kind, RefreshFailureKind};
+    let answering = |status: u16, body: Value| Canned {
+        status,
+        token: body,
+        account: json!({}),
+    };
+    for (status, body, expected) in [
+        // The provider is failing: nothing is wrong with the grant.
+        (
+            503,
+            json!({"error": "temporarily_unavailable"}),
+            RefreshFailureKind::ProviderUnreachable,
+        ),
+        (
+            429,
+            json!({"error": "slow_down"}),
+            RefreshFailureKind::ProviderUnreachable,
+        ),
+        // The request itself was wrong (a misconfigured client). Not a
+        // refusal of the grant, and not an unreachable provider.
+        (
+            400,
+            json!({"error": "invalid_client"}),
+            RefreshFailureKind::Failed,
+        ),
+    ] {
+        let w = world(vec![
+            (
+                "code-a",
+                good("token-a", OBJECT_ID, "owner@contoso.example"),
+            ),
+            ("refresh-token-a", answering(status, body)),
+        ])
+        .await;
+        let alice = seed_user(&w.pool).await;
+        let (state, cookies, _) = start(&w, alice).await;
+        finish(&w, "code-a", &state, &cookies)
+            .await
+            .expect("connect");
+        let vault_path = format!("oauth/microsoft_365/{alice}/{OBJECT_ID}/access_token");
+
+        let err = w
+            .creds
+            .refresh_oauth_token_forced(&vault_path)
+            .await
+            .expect_err("the refresh fails");
+        assert_eq!(
+            refresh_failure_kind(&err),
+            expected,
+            "HTTP {status}: {err:#}"
+        );
+
+        // Only a refusal marks a connection for reconnect.
+        let needs_reauth: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT needs_reauth_at FROM integration_credentials \
+             WHERE user_id = $1 AND provider = 'microsoft_365'",
+        )
+        .bind(alice)
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+        assert!(
+            needs_reauth.is_none(),
+            "HTTP {status} marked the connection"
+        );
+
+        // The batch the engine calls reports the same thing.
+        assert_eq!(
+            w.creds
+                .force_refresh_oauth_tokens_in_batch(std::slice::from_ref(&vault_path))
+                .await,
+            expected.forced_refresh(),
+            "HTTP {status}"
+        );
+    }
 }

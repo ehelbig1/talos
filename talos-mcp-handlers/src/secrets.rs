@@ -918,13 +918,57 @@ async fn handle_normalize_secret_paths(
 /// embeds their own user_id. Returns a structured outcome so workflow
 /// authors debugging 401s have an observable signal for whether the
 /// refresh layer actually ran.
-/// The ONE caller-facing sentence for a failed manual OAuth refresh. Fixed
-/// text: the underlying error (DB / provider detail) goes to the log only.
-const OAUTH_REFRESH_FAILED_MESSAGE: &str =
-    "OAuth refresh failed. Common causes: (1) missing env vars \
-     (GOOGLE_CLIENT_ID/SECRET, ATLASSIAN_CLIENT_ID/SECRET); (2) the refresh_token is revoked \
-     (user needs to re-authorize); (3) the integration_credentials row is missing or marked \
-     is_active=false. Details are in the controller log (target talos_oauth_refresh).";
+/// The caller-facing sentence for a failed manual OAuth refresh, by which
+/// way it failed. Fixed text: the underlying error (DB / provider detail)
+/// goes to the log only.
+///
+/// Until 2026-10-12 there was ONE sentence listing three "common causes",
+/// among them a revoked token, whatever had happened; a token endpoint that
+/// could not be reached was therefore answered with "user needs to
+/// re-authorize".
+fn oauth_refresh_failed_message(kind: talos_oauth::RefreshFailureKind) -> &'static str {
+    use talos_oauth::RefreshFailureKind as Kind;
+    match kind {
+        Kind::RefusedByProvider => {
+            "OAuth refresh was REFUSED by the provider: the grant is revoked or expired. \
+             Re-authorise the connection (Settings, Integrations); refreshing again will not help."
+        }
+        Kind::ProviderUnreachable => {
+            "OAuth refresh could not reach the provider's token endpoint (or the provider \
+             answered with a server error). Nothing is wrong with the connection and it does NOT \
+             need re-authorising: try again shortly."
+        }
+        Kind::Failed => {
+            "OAuth refresh failed before the provider gave an answer about the grant. Common \
+             causes: (1) missing env vars (GOOGLE_CLIENT_ID/SECRET, ATLASSIAN_CLIENT_ID/SECRET); \
+             (2) the integration_credentials row is missing or marked is_active=false. Details \
+             are in the controller log (target talos_oauth_refresh)."
+        }
+    }
+}
+
+#[cfg(test)]
+mod oauth_refresh_failed_message_tests {
+    use super::oauth_refresh_failed_message;
+    use talos_oauth::RefreshFailureKind as Kind;
+
+    #[test]
+    fn only_a_refusal_tells_the_caller_to_reauthorise() {
+        let refused = oauth_refresh_failed_message(Kind::RefusedByProvider);
+        assert!(refused.contains("Re-authorise the connection"), "{refused}");
+
+        let unreachable = oauth_refresh_failed_message(Kind::ProviderUnreachable);
+        assert!(
+            unreachable.contains("does NOT need re-authorising"),
+            "{unreachable}"
+        );
+        assert!(!unreachable.contains("REFUSED"), "{unreachable}");
+
+        let failed = oauth_refresh_failed_message(Kind::Failed);
+        assert!(!failed.to_lowercase().contains("re-authori"), "{failed}");
+        assert!(failed.contains("controller log"), "{failed}");
+    }
+}
 
 async fn handle_refresh_oauth_token(
     req_id: Option<Value>,
@@ -998,15 +1042,18 @@ async fn handle_refresh_oauth_token(
             .to_string(),
         ),
         Err(e) => {
+            let kind = talos_oauth::refresh_failure_kind(&e);
             tracing::warn!(
                 target: "talos_oauth_refresh",
                 vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
+                failure = kind.as_str(),
                 error = %e,
                 "manual refresh_oauth_token failed"
             );
             // The error chain can carry database / provider text; it is logged
-            // above and never echoed to the caller.
-            mcp_error(req_id, -32000, OAUTH_REFRESH_FAILED_MESSAGE)
+            // above and never echoed to the caller. The KIND is not detail:
+            // it is which of three things the caller should do next.
+            mcp_error(req_id, -32000, oauth_refresh_failed_message(kind))
         }
     }
 }
@@ -1021,9 +1068,17 @@ mod oauth_refresh_message_tests {
         let at = src.find("async fn handle_refresh_oauth_token").unwrap();
         let body = &src[at..];
         let body = &body[..body.find("\n}\n").unwrap()];
-        assert!(body.contains("mcp_error(req_id, -32000, OAUTH_REFRESH_FAILED_MESSAGE)"));
+        assert!(body.contains("mcp_error(req_id, -32000, oauth_refresh_failed_message(kind))"));
         assert!(!body.contains(&format!("OAuth refresh failed: {}", "{}")));
-        assert!(!super::OAUTH_REFRESH_FAILED_MESSAGE.contains('{'));
+        // Each of the three sentences is fixed text: nothing is formatted in.
+        use talos_oauth::RefreshFailureKind as Kind;
+        for kind in [
+            Kind::RefusedByProvider,
+            Kind::ProviderUnreachable,
+            Kind::Failed,
+        ] {
+            assert!(!super::oauth_refresh_failed_message(kind).contains('{'));
+        }
     }
 }
 

@@ -800,34 +800,33 @@ impl ParallelWorkflowEngine {
                 );
 
                 // The retry is authorised ONLY by a refresh that actually
-                // stored a NEW token. `false` covers every non-recoverable
-                // case at once — a revoked grant (the token endpoint
-                // answers 400 invalid_grant), a provider with no refresh
-                // endpoint, a refresh that failed — so a dead grant retries
-                // zero times rather than "retries with a bound".
-                let refreshed = resolver
+                // stored a NEW token. Every other outcome — a revoked grant
+                // (the token endpoint answers 400 invalid_grant), a token
+                // endpoint that could not be reached, a provider with no
+                // refresh endpoint, a refresh that failed — retries zero
+                // times rather than "retries with a bound".
+                let refresh = resolver
                     .force_refresh_vault_paths(&repair_oauth_paths)
                     .await;
 
-                if !refreshed {
+                if let Some(why_not) = refresh.operator_note() {
                     // Enrich the failure the operator will read in
-                    // `get_execution_status`. `false` does not say WHY the
-                    // refresh produced no new token, and until 2026-10-11
-                    // this sentence claimed it did ("was refused — most
-                    // likely needs to be re-authorised"): on a host that had
-                    // just woken from sleep the token endpoint was simply
-                    // unreachable, the next run succeeded, and the operator
-                    // had been told to re-authorise a working integration.
-                    // The sentence now names both causes and which one a
-                    // single occurrence points to. The provider/account is NOT named
-                    // here: for gmail / google_calendar the vault path's
-                    // provider_key IS the user's e-mail address, and this
-                    // string is persisted to `workflow_executions`.
+                    // `get_execution_status` with WHICH way the refresh
+                    // produced no new token (`ForcedRefresh::operator_note`).
+                    // Until 2026-10-11 this sentence claimed a refusal for
+                    // every case ("was refused — most likely needs to be
+                    // re-authorised"): on a host that had just woken from
+                    // sleep the token endpoint was simply unreachable, the
+                    // next run succeeded, and the operator had been told to
+                    // re-authorise a working integration. From 2026-10-11 it
+                    // named both causes, because the resolver answered
+                    // `bool`; since 2026-10-12 the resolver says which.
+                    // The provider/account is NOT named here: for gmail /
+                    // google_calendar the vault path's provider_key IS the
+                    // user's e-mail address, and this string is persisted to
+                    // `workflow_executions`.
                     outcome = Err(format!(
-                        "{original_message} (the OAuth credential could not be refreshed: \
-                             the provider refused it, or its token endpoint could not be reached; \
-                             not retried. Once, after the host was asleep or offline, is expected; \
-                             if the next run fails the same way, re-authorise the integration)"
+                        "{original_message} (the OAuth credential could not be refreshed: {why_not})"
                     )
                     .into());
                 } else {
@@ -1374,18 +1373,27 @@ mod oauth_repair_tests {
     struct RepairResolver {
         /// `"resolve"` / `"force_refresh"`, in call order.
         log: Mutex<Vec<&'static str>>,
-        /// What `force_refresh_vault_paths` reports. `false` models a revoked
-        /// grant (the token endpoint answered 400 `invalid_grant`).
-        refresh_succeeds: bool,
+        /// What `force_refresh_vault_paths` reports.
+        refresh: talos_workflow_engine_core::ForcedRefresh,
         /// Paths the forced refresh was asked to repair.
         refresh_targets: Mutex<Vec<String>>,
     }
 
     impl RepairResolver {
+        /// `false` models a revoked grant (the token endpoint answered 400
+        /// `invalid_grant`).
         fn new(refresh_succeeds: bool) -> Arc<Self> {
+            use talos_workflow_engine_core::ForcedRefresh;
+            Self::reporting(if refresh_succeeds {
+                ForcedRefresh::Refreshed
+            } else {
+                ForcedRefresh::RefusedByProvider
+            })
+        }
+        fn reporting(refresh: talos_workflow_engine_core::ForcedRefresh) -> Arc<Self> {
             Arc::new(Self {
                 log: Mutex::new(Vec::new()),
-                refresh_succeeds,
+                refresh,
                 refresh_targets: Mutex::new(Vec::new()),
             })
         }
@@ -1421,13 +1429,16 @@ mod oauth_repair_tests {
                 .collect())
         }
 
-        async fn force_refresh_vault_paths(&self, paths: &[String]) -> bool {
+        async fn force_refresh_vault_paths(
+            &self,
+            paths: &[String],
+        ) -> talos_workflow_engine_core::ForcedRefresh {
             self.log.lock().expect("log mutex").push("force_refresh");
             self.refresh_targets
                 .lock()
                 .expect("targets mutex")
                 .extend(paths.iter().cloned());
-            self.refresh_succeeds
+            self.refresh
         }
     }
 
@@ -1465,6 +1476,25 @@ mod oauth_repair_tests {
         run_with_retry_count(script, refresh_succeeds, auth_header, None).await
     }
 
+    /// [`run`] with the forced refresh reporting a given outcome.
+    async fn run_reporting(
+        script: Vec<Result<serde_json::Value, String>>,
+        refresh: talos_workflow_engine_core::ForcedRefresh,
+        auth_header: Option<&str>,
+    ) -> (
+        Result<serde_json::Value, String>,
+        Arc<SequencedDispatcher>,
+        Arc<RepairResolver>,
+    ) {
+        run_with(
+            script,
+            RepairResolver::reporting(refresh),
+            auth_header,
+            None,
+        )
+        .await
+    }
+
     /// [`run`] with an explicit graph `retry_count` on the node.
     async fn run_with_retry_count(
         script: Vec<Result<serde_json::Value, String>>,
@@ -1476,10 +1506,29 @@ mod oauth_repair_tests {
         Arc<SequencedDispatcher>,
         Arc<RepairResolver>,
     ) {
+        run_with(
+            script,
+            RepairResolver::new(refresh_succeeds),
+            auth_header,
+            retry_count,
+        )
+        .await
+    }
+
+    /// The harness itself: one node, the scripted dispatcher, this resolver.
+    async fn run_with(
+        script: Vec<Result<serde_json::Value, String>>,
+        resolver: Arc<RepairResolver>,
+        auth_header: Option<&str>,
+        retry_count: Option<u32>,
+    ) -> (
+        Result<serde_json::Value, String>,
+        Arc<SequencedDispatcher>,
+        Arc<RepairResolver>,
+    ) {
         let node_id = Uuid::new_v4();
         let module_id = Uuid::new_v4();
         let dispatcher = SequencedDispatcher::new(script);
-        let resolver = RepairResolver::new(refresh_succeeds);
 
         let mut engine = ParallelWorkflowEngine::new();
         engine.set_user_id(Uuid::new_v4());
@@ -1614,22 +1663,73 @@ mod oauth_repair_tests {
         assert_eq!(resolver.refresh_calls(), 1, "one attempt, then stop");
         assert!(
             err.contains("re-authorise the integration"),
-            "operator must be told a human may be needed; got: {err}"
+            "operator must be told a human is needed; got: {err}"
         );
-        // `false` from the refresh does not say WHY there is no new token, so
-        // the sentence must not claim one cause: an unreachable token endpoint
-        // (a host that just woke) reads the same as a revoked grant here.
+        // The resolver said the provider REFUSED, so the sentence says that
+        // and only that.
         assert!(
-            err.contains("refused it") && err.contains("could not be reached"),
-            "both causes are named; got: {err}"
+            err.contains("the provider refused it") && !err.contains("could not be reached"),
+            "a refusal is described as a refusal; got: {err}"
         );
         assert!(
             !err.contains("most likely"),
-            "the failure does not guess which cause it was; got: {err}"
+            "the failure does not guess; got: {err}"
         );
         // The original provider error survives — the enrichment adds context,
         // it does not replace the diagnosis.
         assert!(err.contains("401"), "original error preserved; got: {err}");
+    }
+
+    /// The 2026-10-11 case: the host had just woken, the token endpoint could
+    /// not be reached, and the operator was told to re-authorise a working
+    /// integration. The node still fails and is still not retried; what
+    /// changes is what it says.
+    #[tokio::test]
+    async fn an_unreachable_token_endpoint_is_not_reported_as_a_refusal() {
+        use talos_workflow_engine_core::ForcedRefresh;
+        let (out, dispatcher, resolver) = run_reporting(
+            vec![Err(LIVE_401.to_string())],
+            ForcedRefresh::ProviderUnreachable,
+            Some(&bearer()),
+        )
+        .await;
+
+        let err = out.expect_err("no new credential, so the node fails");
+        assert_eq!(dispatcher.calls(), 1, "nothing to retry with");
+        assert_eq!(resolver.refresh_calls(), 1);
+        assert!(
+            err.contains("token endpoint could not be reached"),
+            "the cause is named; got: {err}"
+        );
+        assert!(
+            err.contains("does NOT need re-authorising"),
+            "the operator is told NOT to reconnect; got: {err}"
+        );
+        assert!(
+            !err.contains("refused"),
+            "an unreachable provider is not a refusal; got: {err}"
+        );
+        assert!(err.contains("401"), "original error preserved; got: {err}");
+    }
+
+    /// Every outcome but a new credential fails the node once, with its own
+    /// sentence.
+    #[tokio::test]
+    async fn every_outcome_without_a_new_credential_fails_once_and_says_which() {
+        use talos_workflow_engine_core::ForcedRefresh;
+        for outcome in [
+            ForcedRefresh::RefusedByProvider,
+            ForcedRefresh::ProviderUnreachable,
+            ForcedRefresh::Failed,
+            ForcedRefresh::NothingToRefresh,
+        ] {
+            let (out, dispatcher, _resolver) =
+                run_reporting(vec![Err(LIVE_401.to_string())], outcome, Some(&bearer())).await;
+            let err = out.expect_err("no new credential");
+            assert_eq!(dispatcher.calls(), 1, "{outcome:?} must not retry");
+            let note = outcome.operator_note().expect("a note");
+            assert!(err.contains(note), "{outcome:?}: {err}");
+        }
     }
 
     /// A second 401 after a provably-new token is not staleness. Stop, and say

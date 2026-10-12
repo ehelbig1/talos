@@ -8868,6 +8868,7 @@ dependencies = [
  "talos-integration-state",
  "talos-memory",
  "talos-metrics",
+ "talos-oauth",
  "talos-registry",
  "talos-secrets-manager",
  "talos-task-supervision",

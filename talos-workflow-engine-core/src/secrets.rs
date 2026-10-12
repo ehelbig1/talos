@@ -21,6 +21,92 @@ use uuid::Uuid;
 /// crate having to know about them.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// What a reactive credential refresh
+/// ([`SecretsResolver::force_refresh_vault_paths`]) amounted to.
+///
+/// Only [`Refreshed`](Self::Refreshed) authorises a retry. The others are
+/// separate because they ask different things of an operator: a refusal
+/// means a person has to re-authorise the connection; an unreachable
+/// provider means nothing is wrong with the connection and the next run will
+/// try again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedRefresh {
+    /// At least one path now holds a NEW credential.
+    Refreshed,
+    /// The provider REFUSED the refresh: the grant is revoked or expired.
+    /// The connection must be re-authorised by a person.
+    RefusedByProvider,
+    /// The provider's token endpoint could not be reached, or answered with
+    /// a server-side error. The connection is not at fault.
+    ProviderUnreachable,
+    /// The refresh was attempted and failed in some other way (a credential
+    /// row that could not be read, a response that could not be parsed).
+    Failed,
+    /// There was nothing refreshable among the paths: not an OAuth access
+    /// token, or a provider with no refresh endpoint.
+    NothingToRefresh,
+}
+
+impl ForcedRefresh {
+    /// Whether a NEW credential was stored, i.e. whether a retry is
+    /// authorised.
+    #[must_use]
+    pub const fn refreshed(self) -> bool {
+        matches!(self, Self::Refreshed)
+    }
+
+    /// The outcome of refreshing SEVERAL credentials, from each one's own.
+    ///
+    /// One new credential is enough to retry. Otherwise the outcome that
+    /// asks the most of a person wins: a refusal over an unreachable
+    /// provider over another failure.
+    #[must_use]
+    pub fn of_all(outcomes: impl IntoIterator<Item = Self>) -> Self {
+        let rank = |outcome: Self| match outcome {
+            Self::Refreshed => 4,
+            Self::RefusedByProvider => 3,
+            Self::ProviderUnreachable => 2,
+            Self::Failed => 1,
+            Self::NothingToRefresh => 0,
+        };
+        outcomes
+            .into_iter()
+            .max_by_key(|outcome| rank(*outcome))
+            .unwrap_or(Self::NothingToRefresh)
+    }
+
+    /// What to tell the operator when the refresh did not produce a new
+    /// credential, as a clause that follows "the OAuth credential could not
+    /// be refreshed: ". `None` for [`Refreshed`](Self::Refreshed).
+    ///
+    /// No provider or account is named: for some providers the vault path's
+    /// key IS the user's e-mail address, and this text is stored on the
+    /// execution.
+    #[must_use]
+    pub const fn operator_note(self) -> Option<&'static str> {
+        match self {
+            Self::Refreshed => None,
+            Self::RefusedByProvider => Some(
+                "the provider refused it, so the grant is revoked or expired; \
+                 re-authorise the integration. Not retried",
+            ),
+            Self::ProviderUnreachable => Some(
+                "the provider's token endpoint could not be reached, so nothing is wrong with \
+                 the integration itself and it does NOT need re-authorising; the next run will \
+                 try again. Not retried",
+            ),
+            Self::Failed => Some(
+                "the refresh failed before the provider gave an answer (the reason is in the \
+                 controller log, target talos_oauth_refresh). Not retried",
+            ),
+            Self::NothingToRefresh => Some(
+                "this credential has no refresh path, so the rejection is not a stale token. \
+                 Not retried",
+            ),
+        }
+    }
+}
+
 /// Resolves the secrets needed to dispatch a workflow node.
 ///
 /// # Method breakdown
@@ -116,26 +202,27 @@ pub trait SecretsResolver: Send + Sync {
     /// error-driven refresh recovers those, so this hook deliberately skips
     /// the expiry predicate.
     ///
-    /// Returns `true` **only when at least one path now holds a NEW
-    /// credential**. That return value is the caller's whole retry
-    /// authorisation:
+    /// Returns [`ForcedRefresh::Refreshed`] **only when at least one path now
+    /// holds a NEW credential**. That is the caller's whole retry
+    /// authorisation: a fresh credential was stored, retrying can succeed,
+    /// and re-resolving the paths is guaranteed to read the new value rather
+    /// than replay the one that just failed.
     ///
-    /// * `true`  — a fresh credential was stored; retrying can succeed, and
-    ///   re-resolving the paths is guaranteed to read the new value rather
-    ///   than replay the one that just failed.
-    /// * `false` — nothing was refreshed (the grant is revoked, the refresh
-    ///   itself failed, or there was nothing refreshable here). The caller
-    ///   **must not** retry: re-sending the same rejected credential is a
-    ///   guaranteed second failure and doubles load on the provider.
+    /// Every other outcome means nothing was refreshed and the caller **must
+    /// not** retry: re-sending the same rejected credential is a guaranteed
+    /// second failure and doubles load on the provider. They are told apart
+    /// because they ask different things of the operator: see
+    /// [`ForcedRefresh`]. Until 2026-10-12 this returned `bool`, and a token
+    /// endpoint that could not be reached read the same as a revoked grant.
     ///
-    /// Because a revoked grant can only ever produce `false`, a caller that
+    /// Because a revoked grant can never produce `Refreshed`, a caller that
     /// honours this contract cannot loop on one.
     ///
-    /// The default implementation refreshes nothing and returns `false`,
-    /// which is the correct fail-safe for any resolver whose backing store
-    /// holds only long-lived secrets.
-    async fn force_refresh_vault_paths(&self, _paths: &[String]) -> bool {
-        false
+    /// The default implementation refreshes nothing and returns
+    /// [`ForcedRefresh::NothingToRefresh`], which is the correct fail-safe
+    /// for any resolver whose backing store holds only long-lived secrets.
+    async fn force_refresh_vault_paths(&self, _paths: &[String]) -> ForcedRefresh {
+        ForcedRefresh::NothingToRefresh
     }
 }
 
@@ -201,4 +288,61 @@ pub trait GcpImpersonationTokenProvider: Send + Sync {
         service_account_email: &str,
         user_id: Uuid,
     ) -> Result<Option<String>, BoxError>;
+}
+
+#[cfg(test)]
+mod forced_refresh_tests {
+    use super::ForcedRefresh as F;
+
+    #[test]
+    fn only_a_new_credential_authorises_a_retry() {
+        assert!(F::Refreshed.refreshed());
+        for outcome in [
+            F::RefusedByProvider,
+            F::ProviderUnreachable,
+            F::Failed,
+            F::NothingToRefresh,
+        ] {
+            assert!(!outcome.refreshed(), "{outcome:?}");
+            assert!(outcome.operator_note().is_some(), "{outcome:?}");
+        }
+        assert_eq!(F::Refreshed.operator_note(), None);
+    }
+
+    #[test]
+    fn several_credentials_one_new_one_is_enough_and_a_refusal_outranks_a_blip() {
+        assert_eq!(F::of_all([]), F::NothingToRefresh);
+        assert_eq!(
+            F::of_all([F::ProviderUnreachable, F::Refreshed]),
+            F::Refreshed
+        );
+        assert_eq!(
+            F::of_all([F::ProviderUnreachable, F::RefusedByProvider, F::Failed]),
+            F::RefusedByProvider
+        );
+        assert_eq!(F::of_all([F::NothingToRefresh, F::Failed]), F::Failed);
+        assert_eq!(
+            F::of_all([F::Failed, F::ProviderUnreachable]),
+            F::ProviderUnreachable
+        );
+    }
+
+    /// The two sentences an operator acts on must not say each other's
+    /// thing: until 2026-10-11 an unreachable token endpoint was reported as
+    /// "refused, most likely needs to be re-authorised".
+    #[test]
+    fn an_unreachable_provider_is_not_described_as_needing_reauthorisation() {
+        let unreachable = F::ProviderUnreachable.operator_note().unwrap();
+        assert!(
+            unreachable.contains("does NOT need re-authorising"),
+            "{unreachable}"
+        );
+        assert!(!unreachable.contains("refused"), "{unreachable}");
+        let refused = F::RefusedByProvider.operator_note().unwrap();
+        assert!(
+            refused.contains("re-authorise the integration"),
+            "{refused}"
+        );
+        assert!(!refused.contains("could not be reached"), "{refused}");
+    }
 }

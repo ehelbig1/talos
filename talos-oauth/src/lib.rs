@@ -9,7 +9,9 @@ pub use connect_binding::{
     check_connect_binding, presented_connect_binding, BindingCheck, BrowserBinding,
     CONNECT_BINDING_COOKIE,
 };
-pub use credentials::OAuthCredentialService;
+pub use credentials::{
+    refresh_failure_kind, OAuthCredentialService, RefreshFailureKind, TOKEN_ENDPOINT_UNREACHABLE,
+};
 pub use flow::{
     begin_oauth_authorization, begin_oauth_authorization_with_subject, consume_oauth_state,
     issue_bound_state, peek_state_provider, AuthorizeRequest, ConsumedOAuthState,
