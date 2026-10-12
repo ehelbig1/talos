@@ -484,7 +484,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_workflow",
-            "description": "Execute a workflow synchronously and run assertions against the result. Returns `verdict`, `passed`, `continued_failures` and the assertion results. `verdict` is one of: `passed` (every assertion held and no node failed), `passed_with_failures` (every assertion held, but at least one node failed and the run went on past it, through continue_on_error or an error edge), `failed` (an assertion did not hold). `continued_failures` lists those nodes as {node, handling, error_class, message}; handling is continue_on_error, error_edge or reported_in_output. `passed` is true only for the verdict `passed`, unless allow_continued_failures is true, in which case `passed_with_failures` is also true. A run can reach status `completed` with a node that did not do its work, so read `verdict`, not the status. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound workflows run with the same __actor_context__ payload they would receive in production. BUDGET: a rehearsal is a real execution and counts toward the actor's budget; the reply's `actor_budget` block shows each cap the actor's policy sets (limit, used, remaining) and carries a `warning` once any cap is 80% spent — in `suspend` mode a start refused on the hourly cap suspends the actor.",
+            "description": "Execute a workflow synchronously and run assertions against the result. Returns `verdict`, `passed`, `continued_failures` and the assertion results. `verdict` is one of: `passed` (every assertion held and no node failed), `passed_with_failures` (every assertion held, but at least one node failed and the run went on past it, through continue_on_error or an error edge, or an edge condition could not be evaluated), `failed` (an assertion did not hold). `edge_condition_errors` lists each edge whose condition ERRORED as {source, target, condition, error}: such an edge is not taken, exactly like one whose condition was false, so its target is skipped while the run still completes; it always makes `passed` false. `continued_failures` lists those nodes as {node, handling, error_class, message}; handling is continue_on_error, error_edge or reported_in_output. `passed` is true only for the verdict `passed`, unless allow_continued_failures is true, in which case `passed_with_failures` is also true. A run can reach status `completed` with a node that did not do its work, so read `verdict`, not the status. Accepts the same actor_id + inject_memory_context controls as trigger_workflow so actor-bound workflows run with the same __actor_context__ payload they would receive in production. BUDGET: a rehearsal is a real execution and counts toward the actor's budget; the reply's `actor_budget` block shows each cap the actor's policy sets (limit, used, remaining) and carries a `warning` once any cap is 80% spent — in `suspend` mode a start refused on the hourly cap suspends the actor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -8623,6 +8623,11 @@ async fn handle_test_workflow(
             .iter()
             .map(talos_workflow_validation::ContinuedFailure::to_json)
             .collect::<Vec<_>>(),
+        "edge_condition_errors": report
+            .edge_condition_errors
+            .iter()
+            .map(talos_workflow_validation::EdgeConditionError::to_json)
+            .collect::<Vec<_>>(),
         "execution_id": exec_id.to_string(),
         "assertions": report.assertions,
         "duration_ms": duration_ms,
@@ -11041,8 +11046,13 @@ async fn handle_add_edge_to_workflow(
             obj.insert("condition".to_string(), serde_json::json!(cond));
             obj.insert(
                 "note".to_string(),
-                serde_json::json!("Edge follows only when the Rhai condition returns true against the source node output. Trigger the workflow and call get_execution_status to verify branching."),
+                serde_json::json!("Edge follows only when the Rhai condition returns true against the source node output: that output's top-level fields are the variables. A condition that errors when the workflow runs is not taken, and the error is recorded on the source node's output under __edge_condition_errors__. Trigger the workflow and call get_execution_status to verify branching."),
             );
+            if let Some(warning) =
+                crate::graph::edge_condition_warning(&graph, &source, &target, cond)
+            {
+                obj.insert("warning".to_string(), serde_json::json!(warning));
+            }
         }
     }
     mcp_text(

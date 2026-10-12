@@ -10463,6 +10463,7 @@ dependencies = [
  "serde_json",
  "talos-capability-world",
  "talos-config",
+ "talos-engine",
  "talos-retry-intelligence",
  "talos-text-util",
  "talos-workflow-engine-core",

@@ -19,7 +19,7 @@
 //! failure-and-success-routing block stays auditable in isolation.
 
 use std::collections::{HashMap, VecDeque};
-use talos_workflow_engine_core::reserved_keys::{error_reason, output_reports_error};
+use talos_workflow_engine_core::reserved_keys::{self, error_reason, output_reports_error};
 
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -678,20 +678,70 @@ impl ParallelWorkflowEngine {
         joins: &mut Joins,
         ready: &mut VecDeque<NodeIndex>,
     ) {
+        // The edge-condition error record is engine-authored: whatever the
+        // node itself returned under that key is removed BEFORE any condition
+        // is evaluated, so a module can neither fabricate a record nor have
+        // one read by its own conditions.
+        let finished_id = self.graph[finished_idx];
+        if how == Release::Succeeded {
+            if let Some(committed) = results.get_mut(&finished_id) {
+                reserved_keys::apply_edge_condition_errors(committed, Vec::new());
+            }
+        }
+
         // Decide every edge first, against an immutable view of the committed
         // output; the verdicts below then write skip envelopes into `results`.
+        let mut condition_errors: Vec<JsonValue> = Vec::new();
         let resolutions: Vec<(NodeIndex, EdgeResolution)> = {
-            let committed = results.get(&self.graph[finished_idx]);
+            let committed = results.get(&finished_id);
             self.graph
                 .edges_directed(finished_idx, Direction::Outgoing)
                 .map(|edge| {
-                    (
-                        edge.target(),
-                        self.resolve_edge(edge.weight(), how, committed),
-                    )
+                    let (resolution, error) = self.resolve_edge(edge.weight(), how, committed);
+                    if let Some(error) = error {
+                        let target_id = self.graph[edge.target()];
+                        let target = self
+                            .node_labels()
+                            .get(&target_id)
+                            .cloned()
+                            .unwrap_or_else(|| target_id.to_string());
+                        condition_errors.push(reserved_keys::edge_condition_error_entry(
+                            &target,
+                            edge.weight().condition.as_deref().unwrap_or_default(),
+                            &error,
+                        ));
+                    }
+                    (edge.target(), resolution)
                 })
                 .collect()
         };
+        // An edge whose condition could not be evaluated is not taken (the
+        // rule is unchanged); it is RECORDED on the node whose output it was
+        // evaluated against, where a false condition leaves nothing.
+        if !condition_errors.is_empty() {
+            // Sorted by target so the record does not depend on petgraph's
+            // edge order.
+            condition_errors.sort_by(|a, b| {
+                a["target"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(b["target"].as_str().unwrap_or_default())
+            });
+            let count = condition_errors.len();
+            let recorded = results.get_mut(&finished_id).is_some_and(|committed| {
+                reserved_keys::apply_edge_condition_errors(committed, condition_errors)
+            });
+            if !recorded {
+                tracing::warn!(
+                    target: "talos_workflow_engine",
+                    event_kind = "edge_condition_errors_unrecorded",
+                    node_id = %finished_id,
+                    count,
+                    "edge conditions could not be evaluated and the node's output is not an \
+                     object, so the record could not be written onto it"
+                );
+            }
+        }
 
         let mut to_skip: VecDeque<NodeIndex> = VecDeque::new();
         for (child, resolution) in resolutions {
@@ -737,15 +787,22 @@ impl ParallelWorkflowEngine {
         }
     }
 
-    /// How one outgoing edge resolves for a node that finished `how`.
+    /// How one outgoing edge resolves for a node that finished `how`, and
+    /// the evaluator's error when the edge has a condition that could not be
+    /// evaluated.
+    ///
+    /// A condition that errors resolves INACTIVE, exactly as one that
+    /// evaluates `false`: a failed expression means "branch not taken". The
+    /// second element is what tells the two apart for the caller, which
+    /// records it ([`reserved_keys::EDGE_CONDITION_ERRORS`]).
     fn resolve_edge(
         &self,
         edge: &EdgeLogic,
         how: Release,
         committed: Option<&JsonValue>,
-    ) -> EdgeResolution {
+    ) -> (EdgeResolution, Option<String>) {
         let error_edge = is_error_edge(edge);
-        match how {
+        let resolution = match how {
             Release::FailedToErrorEdges => {
                 if error_edge {
                     EdgeResolution::Active
@@ -763,28 +820,52 @@ impl ParallelWorkflowEngine {
             }
             Release::Succeeded => {
                 if error_edge {
-                    return EdgeResolution::Inactive;
+                    return (EdgeResolution::Inactive, None);
                 }
                 let Some(cond) = edge.condition.as_deref() else {
-                    return EdgeResolution::Active;
+                    return (EdgeResolution::Active, None);
                 };
                 let context = committed.map_or(&JsonValue::Null, |v| Self::unwrap_output(v));
-                if self.eval_bool_kinded(crate::condition_eval::ConditionKind::Edge, cond, context)
+                let output_keys = || {
+                    context
+                        .as_object()
+                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                };
+                match self.eval_condition(crate::condition_eval::ConditionKind::Edge, cond, context)
                 {
-                    EdgeResolution::Active
-                } else {
-                    tracing::info!(
-                        condition = %cond,
-                        output_keys = ?context
-                            .as_object()
-                            .map(|m| m.keys().cloned().collect::<Vec<_>>())
-                            .unwrap_or_default(),
-                        "Edge condition false — the edge will not carry output"
-                    );
-                    EdgeResolution::Inactive
+                    Ok(true) => EdgeResolution::Active,
+                    Ok(false) => {
+                        tracing::info!(
+                            condition = %cond,
+                            output_keys = ?output_keys(),
+                            "Edge condition false — the edge will not carry output"
+                        );
+                        EdgeResolution::Inactive
+                    }
+                    Err(error) => {
+                        // `eval_condition` already counted and warned. This
+                        // line is the one that says it was an ERROR and not
+                        // a `false`, beside the names that were in scope.
+                        tracing::info!(
+                            condition = %cond,
+                            output_keys = ?output_keys(),
+                            "Edge condition could not be evaluated — the edge will not carry output"
+                        );
+                        // The evaluator's message names positions and
+                        // identifiers; it is DLP-scrubbed all the same before
+                        // it is stored on the node's output.
+                        let error = self
+                            .redact_json(&JsonValue::String(error))
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        return (EdgeResolution::Inactive, Some(error));
+                    }
                 }
             }
-        }
+        };
+        (resolution, None)
     }
 
     /// The `FanIn` join mode of `idx`, or `None` for every other node kind
