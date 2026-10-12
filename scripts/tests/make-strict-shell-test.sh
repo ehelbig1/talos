@@ -124,7 +124,13 @@ printf 'exit 0\n' > "$T/up/scripts/preflight-disk.sh"
 printf 'exit 0\n' > "$T/up/scripts/verify-observability.sh"
 
 for MAKE_BIN in "${makes[@]}"; do
-    version="$("$MAKE_BIN" --version | head -1)"
+    # The whole output is read, then cut. `make --version | head -1` is a race
+    # under `pipefail`: when `head` exits before make has written everything,
+    # make gets a broken pipe, prints "write error: stdout" and exits 1, and
+    # `set -e` stops this test before its first check. It did, on a loaded CI
+    # runner (2026-10-12), on a change that touched no script.
+    version="$("$MAKE_BIN" --version)"
+    version="${version%%$'\n'*}"
     echo "── $MAKE_BIN ($version)"
 
     # run <target> [VAR=value …] — in $CWD, with -f $FILE when set. Never the

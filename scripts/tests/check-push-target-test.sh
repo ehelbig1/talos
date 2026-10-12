@@ -10,7 +10,11 @@ T="$(mktemp -d)"
 completed=""
 on_exit() {
     local st=$?
-    rm -rf "$T"
+    # Cleaning up is not the verdict. A leftover temp directory must not fail
+    # a test whose checks all passed: on a loaded CI runner (2026-10-12) this
+    # `rm` lost a race with git still writing under `.git/objects`, and under
+    # `set -e` that became exit 1.
+    rm -rf "$T" 2>/dev/null || true
     if [[ -z "$completed" ]]; then
         echo "✗ check-push-target test stopped before its last check (status $st)" >&2
         exit 1
@@ -28,7 +32,9 @@ printf '%s' "${FAKE_GH_OUT:-}"
 SHIM
 chmod +x "$T/bin/gh"
 
-g() { git -C "$T/repo" -c user.name=test -c user.email=test@example.test -c commit.gpgsign=false "$@"; }
+# No background git work in the throwaway repository: `gc.auto` and
+# `maintenance.auto` off, so nothing is still writing when it is removed.
+g() { git -C "$T/repo" -c user.name=test -c user.email=test@example.test -c commit.gpgsign=false -c gc.auto=0 -c maintenance.auto=false "$@"; }
 g init -q -b main
 g commit -q --allow-empty -m "the commit that merged"
 MERGED="$(g rev-parse HEAD)"
