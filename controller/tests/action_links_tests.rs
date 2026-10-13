@@ -101,6 +101,7 @@ async fn run_links_node(
     user: Uuid,
     targets: BTreeMap<String, Uuid>,
     compose_output: Value,
+    dry_run: bool,
 ) -> Value {
     let compose = Uuid::new_v4();
     let graph = WorkflowGraphBuilder::new()
@@ -118,6 +119,7 @@ async fn run_links_node(
 
     let mut engine = minimal_engine();
     engine.set_user_id(user);
+    engine.set_dry_run(dry_run);
     engine.set_module_fetcher(Arc::new(
         InMemoryModuleFetcher::new().with_module(compose, stub_artifact(compose)),
     ));
@@ -199,6 +201,7 @@ async fn the_node_mints_links_only_for_its_targets_and_passes_the_message_on() {
             // A module cannot author the report.
             ACTION_LINKS_REPORT: { "available": true, "minted": 999 },
         }),
+        false,
     )
     .await;
 
@@ -273,6 +276,67 @@ async fn the_node_mints_links_only_for_its_targets_and_passes_the_message_on() {
         .await
         .unwrap();
     assert!(!used, "a GET used the link up");
+}
+
+/// A dry run is a rehearsal, and a link starts a real workflow: with the real
+/// minter wired and a workflow the running user owns, a dry run through the
+/// node writes NO token row and its output carries no link.
+///
+/// The ordinary run beside it is the control, on the same graph and the same
+/// database: one request, one row.
+#[tokio::test]
+async fn a_dry_run_writes_no_token_row_and_returns_no_link() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let owner = create_test_user(&ctx.auth_service, "action_links_dry@example.com").await;
+    let list = create_test_workflow(&pool, owner, "al-dry-list").await;
+    let composed = || {
+        json!({
+            "html": "<a href=\"talos-action:done-1\">done</a> <a href=\"talos-action:keep-1\">keep</a>",
+            ACTION_LINKS_REQUEST: [
+                { "id": "done-1", "target": "list", "label": "Done", "payload": { "op": "done" } },
+                { "id": "keep-1", "target": "list", "label": "Keep", "payload": { "op": "keep" },
+                  "fallback": "mailto:me@example.com?subject=keep" },
+            ],
+        })
+    };
+    let targets = || BTreeMap::from([("list".to_string(), list)]);
+    let token_rows = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workflow_action_tokens")
+            .fetch_one(&pool)
+            .await
+            .expect("count tokens")
+    };
+
+    let output = run_links_node(&pool, owner, targets(), composed(), true).await;
+
+    assert_eq!(token_rows().await, 0, "a dry run wrote a token row");
+    assert!(
+        !output.to_string().contains("/action-links/"),
+        "a dry run returned a link: {output}"
+    );
+    assert!(output.get(ACTION_LINKS_REQUEST).is_none(), "{output}");
+    let html = output["html"].as_str().expect("html");
+    assert!(html.contains("href=\"#\">done<"), "{html}");
+    assert!(
+        html.contains("href=\"mailto:me@example.com?subject=keep\">keep<"),
+        "{html}"
+    );
+    let report = &output[ACTION_LINKS_REPORT];
+    assert_eq!(report["minted"], 0, "{report}");
+    assert_eq!(
+        report["not_minted"],
+        json!([
+            { "id": "done-1", "reason": "dry_run", "fell_back": false },
+            { "id": "keep-1", "reason": "dry_run", "fell_back": true },
+        ])
+    );
+
+    // The control: the same request, not a dry run.
+    let output = run_links_node(&pool, owner, targets(), composed(), false).await;
+    assert_eq!(token_rows().await, 2, "an ordinary run minted differently");
+    assert_eq!(output[ACTION_LINKS_REPORT]["minted"], 2, "{output}");
+    assert!(output.to_string().contains("/action-links/"), "{output}");
 }
 
 /// The store's own guarantees: a workflow that is not the minting user's is
