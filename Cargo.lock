@@ -1859,6 +1859,7 @@ dependencies = [
  "talos-execution-orchestration",
  "talos-execution-pause",
  "talos-execution-repository",
+ "talos-execution-result-collector",
  "talos-failure-analysis-service",
  "talos-github",
  "talos-github-connect",

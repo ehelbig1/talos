@@ -1,0 +1,204 @@
+//! A failed run's completed nodes can be read back (2026-10-13).
+//!
+//! A run failed at its sixth node, and `get_node_output` for the five that
+//! had completed answered "not found … available: [__trigger_input__]": a
+//! failed run stored its trigger and nothing else.
+//!
+//! Driven here against real rows, through the real finalizer (redaction,
+//! the size bound, encryption at rest) and the real handler (ownership, the
+//! label lookup): what `failure_output` builds is what a caller reads back.
+//! The engine's half (a failed run hands over its completed outputs) is
+//! `talos-workflow-engine/tests/partial_results_on_failure.rs`; a run driven
+//! through NATS is not available to this harness.
+//!
+//! `common` harness (a template clone per test), so the migrated-database
+//! job runs it.
+
+#[path = "common/mod.rs"]
+mod common;
+#[path = "common/mcp.rs"]
+mod mcp_common;
+
+use std::collections::HashMap;
+
+use mcp_common::{agent, error_message, mcp_state, text_json};
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+async fn seed_user(pool: &sqlx::PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, created_at, updated_at) \
+         VALUES ($1, $2, 'x', NOW(), NOW())",
+    )
+    .bind(id)
+    .bind(format!("failed-run-{id}@example.com"))
+    .execute(pool)
+    .await
+    .expect("seed user");
+    id
+}
+
+/// A three-node workflow and one RUNNING execution of it.
+async fn seed_running_execution(pool: &sqlx::PgPool, user_id: Uuid) -> Uuid {
+    let wf_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, name, module_uri, graph_json, status, is_enabled) \
+         VALUES ($1, $2, $3, 'test:failed-run', $4, 'active', true)",
+    )
+    .bind(wf_id)
+    .bind(user_id)
+    .bind(format!("failed-run-wf-{}", wf_id.simple()))
+    .bind(
+        json!({
+            "nodes": [
+                { "id": "n1", "type": "module", "data": { "label": "fetch" } },
+                { "id": "n2", "type": "module", "data": { "label": "compose" } },
+                { "id": "n3", "type": "module", "data": { "label": "send" } },
+            ],
+            "edges": [
+                { "source": "n1", "target": "n2" },
+                { "source": "n2", "target": "n3" },
+            ],
+        })
+        .to_string(),
+    )
+    .execute(pool)
+    .await
+    .expect("seed workflow");
+    // Every execution carries an actor.
+    let actor_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO actors (id, user_id, name, status) VALUES ($1, $2, $3, 'active')")
+        .bind(actor_id)
+        .bind(user_id)
+        .bind(format!("failed-run-actor-{}", actor_id.simple()))
+        .execute(pool)
+        .await
+        .expect("seed actor");
+    let exec_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflow_executions (id, workflow_id, user_id, actor_id, status, started_at) \
+         VALUES ($1, $2, $3, $4, 'running', NOW())",
+    )
+    .bind(exec_id)
+    .bind(wf_id)
+    .bind(user_id)
+    .bind(actor_id)
+    .execute(pool)
+    .await
+    .expect("seed execution");
+    exec_id
+}
+
+#[tokio::test]
+async fn the_outputs_of_the_nodes_that_completed_can_be_read_back_from_a_failed_run() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let owner = seed_user(&pool).await;
+    let stranger = seed_user(&pool).await;
+    let exec_id = seed_running_execution(&pool, owner).await;
+    let state = mcp_state(pool.clone()).await;
+
+    // What the engine kept of a run in which `fetch` and `compose` completed
+    // and `send` failed, keyed as the engine keys it.
+    let (n1, n2, trigger) = (
+        talos_workflow_engine_core::engine_node_uuid("n1"),
+        talos_workflow_engine_core::engine_node_uuid("n2"),
+        Uuid::new_v4(),
+    );
+    let partial: HashMap<Uuid, Value> = [
+        (trigger, json!({ "seed": true })),
+        (
+            n1,
+            json!({ "items": [1, 2, 3], "echoed": "Bearer ghp_abcdefghijklmnopqrstuvwx12" }),
+        ),
+        (n2, json!({ "subject": "Three items" })),
+    ]
+    .into_iter()
+    .collect();
+    let labels: HashMap<Uuid, String> = [
+        (trigger, "__trigger__".to_string()),
+        (n1, "fetch".to_string()),
+        (n2, "compose".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let stored = talos_execution_result_collector::failure_output(
+        &labels,
+        Some(partial),
+        Some(&json!({ "ticket": "ABC-12" })),
+    );
+    state
+        .workflow_repo
+        .mark_execution_failed(exec_id, "node 'send' failed: refused", Some(&stored))
+        .await
+        .expect("finalize as failed");
+
+    let status: String = sqlx::query_scalar("SELECT status FROM workflow_executions WHERE id = $1")
+        .bind(exec_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "failed");
+
+    let call = |node: &'static str, as_user: Uuid| {
+        let state = &state;
+        async move {
+            controller::mcp::executions::dispatch(
+                "get_node_output",
+                Some(json!(1)),
+                &json!({ "execution_id": exec_id.to_string(), "node_id": node }),
+                state,
+                agent(as_user),
+            )
+            .await
+            .expect("get_node_output is dispatched")
+        }
+    };
+
+    // By label and by graph id: the completed nodes' outputs.
+    for node in ["compose", "n2"] {
+        let body = text_json(&call(node, owner).await);
+        assert!(
+            body.to_string().contains("Three items"),
+            "{node}: the completed node's output was not returned: {body}"
+        );
+    }
+    let fetch = text_json(&call("fetch", owner).await).to_string();
+    assert!(fetch.contains("items"), "{fetch}");
+    assert!(
+        !fetch.contains("ghp_abcdefghijklmnopqrstuvwx12"),
+        "a completed node's output came back unredacted"
+    );
+
+    // The node that failed has none, and the reply says why.
+    let msg = error_message(&call("send", owner).await);
+    assert!(msg.contains("Nodes with a stored output: ["), "{msg}");
+    assert!(msg.contains("fetch") && msg.contains("compose"), "{msg}");
+    assert!(!msg.contains("__trigger_input__"), "{msg}");
+    assert!(
+        msg.contains("only the nodes that completed before the failure"),
+        "{msg}"
+    );
+
+    // Another user is told the run does not exist, and learns nothing else.
+    let denied = error_message(&call("compose", stranger).await);
+    assert!(denied.contains("not found or access denied"), "{denied}");
+    assert!(
+        !denied.contains("Three items") && !denied.contains("compose"),
+        "{denied}"
+    );
+
+    // A retry still finds the trigger where it always was.
+    let found = state
+        .execution_repo
+        .lookup_execution(exec_id, owner)
+        .await
+        .expect("read the execution");
+    let talos_execution_repository::ExecutionLookup::Live(row) = found else {
+        panic!("the execution was just finalized and is in the live table");
+    };
+    assert_eq!(
+        talos_execution_result_collector::extract_trigger_input(row.output_data.as_ref()),
+        json!({ "ticket": "ABC-12" })
+    );
+}
