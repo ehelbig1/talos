@@ -962,16 +962,27 @@ pub fn missing_secret_grants(required: &HashSet<String>, stored_paths: &[String]
         .iter()
         .filter(|grant| grant.as_str() != "*")
         .filter(|grant| talos_workflow_job_protocol::grant_reaches_minted_paths(grant).is_none())
-        .filter(|grant| {
-            let one = [(*grant).clone()];
-            !stored_paths
-                .iter()
-                .any(|path| talos_workflow_job_protocol::vault_path_permitted(&one, path))
-        })
+        .filter(|grant| !grant_has_a_stored_secret(grant, stored_paths))
         .cloned()
         .collect();
     missing.sort();
     missing
+}
+
+/// Whether at least one of `stored_paths` is permitted by the single grant
+/// entry `grant`: an exact path, a prefix (`oauth/gmail`) or a glob
+/// (`oauth/gmail/*`), judged by the one grant matcher
+/// (`vault_path_permitted`).
+///
+/// The ONE answer to "is something stored behind this grant". Every tool
+/// that reports a grant as missing asks it, so two of them cannot disagree
+/// about the same workflow: `create_workflow` ([`missing_secret_grants`])
+/// and `get_workflow_quickstart` ([`quickstart_secrets`]).
+pub fn grant_has_a_stored_secret(grant: &str, stored_paths: &[String]) -> bool {
+    let one = [grant.to_string()];
+    stored_paths
+        .iter()
+        .any(|path| talos_workflow_job_protocol::vault_path_permitted(&one, path))
 }
 
 /// The declared secret grants whose value is MINTED when a job is dispatched
@@ -1050,6 +1061,34 @@ pub fn quickstart_secret_entry(
         }),
         blocker,
     )
+}
+
+/// `get_workflow_quickstart`'s `secrets_status` (sorted by `key_path`) and
+/// the blockers it raises, for the grant entries a workflow's modules
+/// declare.
+///
+/// `stored_paths` is the key paths a dispatch for the caller can read, or
+/// `None` when they could not be read: then every entry is `provisioned:
+/// null` and nothing blocks. Each entry is judged by
+/// [`grant_has_a_stored_secret`], the same answer `create_workflow` gives.
+/// Until 2026-10-13 this tool asked whether a secret was stored at a path
+/// EQUAL to the grant entry, so a prefix or glob grant with its secret in
+/// place was reported unprovisioned and blocked `ready_to_run`.
+pub fn quickstart_secrets(
+    grants: &HashSet<String>,
+    stored_paths: Option<&[String]>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut sorted: Vec<&String> = grants.iter().collect();
+    sorted.sort();
+    let mut statuses = Vec::with_capacity(sorted.len());
+    let mut blockers = Vec::new();
+    for grant in sorted {
+        let provisioned = stored_paths.map(|stored| grant_has_a_stored_secret(grant, stored));
+        let (status, blocker) = quickstart_secret_entry(grant, provisioned);
+        statuses.push(status);
+        blockers.extend(blocker);
+    }
+    (statuses, blockers)
 }
 
 /// Inputs to [`build_create_workflow_response`]. Bundled in a single
@@ -3123,6 +3162,76 @@ mod tests {
         );
         // Nothing stored: every non-wildcard grant is missing.
         assert_eq!(missing_secret_grants(&required, &[]).len(), 4);
+    }
+
+    /// The defect: `get_workflow_quickstart` asked whether a secret was
+    /// stored at a path EQUAL to each grant entry. A prefix or glob grant
+    /// never is one, so a workflow whose secret was in place was reported
+    /// unprovisioned, with a blocker, while `create_workflow` said of the
+    /// same grants that nothing was missing.
+    #[test]
+    fn the_quickstart_judges_a_grant_as_create_workflow_does() {
+        let grants: HashSet<String> = [
+            "oauth/gmail/u/a@example.com/access_token", // exact, stored
+            "oauth/gmail",                              // prefix, satisfied
+            "oauth/gmail/*",                            // glob, satisfied
+            "oauth/slack/*",                            // glob, nothing stored
+            "plaid/secret",                             // exact, not stored
+            "plaid",                                    // prefix, satisfied
+            "gcp/impersonated/*",                       // minted: nothing to store
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let stored = vec![
+            "oauth/gmail/u/a@example.com/access_token".to_string(),
+            "plaid/client_id".to_string(),
+            // Not under `oauth/slack/`: a different separator is a different path.
+            "oauth/slack-archive/token".to_string(),
+        ];
+
+        let (statuses, blockers) = quickstart_secrets(&grants, Some(&stored));
+        let verdicts: Vec<(&str, Option<bool>)> = statuses
+            .iter()
+            .map(|s| (s["key_path"].as_str().unwrap(), s["provisioned"].as_bool()))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [
+                ("gcp/impersonated/*", None),
+                ("oauth/gmail", Some(true)),
+                ("oauth/gmail/*", Some(true)),
+                ("oauth/gmail/u/a@example.com/access_token", Some(true)),
+                ("oauth/slack/*", Some(false)),
+                ("plaid", Some(true)),
+                ("plaid/secret", Some(false)),
+            ],
+            "sorted by key path, each judged by the grant matcher"
+        );
+        let blocked: Vec<&str> = blockers
+            .iter()
+            .map(|b| b["key_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(blocked, ["oauth/slack/*", "plaid/secret"]);
+
+        // The two tools give ONE answer about the same grants.
+        assert_eq!(
+            blocked,
+            missing_secret_grants(&grants, &stored)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+
+        // Unread: no verdict for any entry, and nothing blocks.
+        let (statuses, blockers) = quickstart_secrets(&grants, None);
+        assert_eq!(statuses.len(), grants.len());
+        assert!(statuses.iter().all(|s| s["provisioned"].is_null()));
+        assert!(blockers.is_empty());
+
+        // Nothing stored: every grant that is not minted blocks.
+        let (_, blockers) = quickstart_secrets(&grants, Some(&[]));
+        assert_eq!(blockers.len(), grants.len() - 1);
     }
 
     /// The defect: a workflow whose module is granted a path that is MINTED

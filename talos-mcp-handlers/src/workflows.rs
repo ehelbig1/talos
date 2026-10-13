@@ -1917,7 +1917,7 @@ async fn handle_create_workflow(
             } else {
                 match state
                     .secrets_manager
-                    .list_user_secret_key_paths(user_id)
+                    .list_dispatch_readable_key_paths(user_id)
                     .await
                 {
                     Ok(stored) => Some(talos_workflow_creation_helpers::missing_secret_grants(
@@ -10927,10 +10927,11 @@ async fn handle_get_workflow_quickstart(
         }
     }
 
-    // Check which secrets are already provisioned (single batch query)
-    let mut secrets_status: Vec<serde_json::Value> = Vec::new();
-    let paths: Vec<String> = all_secret_paths.into_iter().collect();
-
+    // Which declared grants have a stored secret behind them: ONE read of the
+    // key paths (names only) a dispatch for this user can read, judged per
+    // grant by the helper `create_workflow` uses, so the two tools give one
+    // answer.
+    //
     // `provisioned` drives a BLOCKER and `blockers.is_empty()` drives
     // `ready_to_run`. An unread vault listing marked EVERY referenced secret
     // unprovisioned, so a workflow whose credentials are all in place reported
@@ -10938,34 +10939,24 @@ async fn handle_get_workflow_quickstart(
     // provision what they already have. Three-valued now: `provisioned: null`,
     // no fabricated blocker, and `ready_to_run` null rather than a verdict
     // computed from an unread field.
+    let mut secrets_status: Vec<serde_json::Value> = Vec::new();
     let mut readings = talos_measurement::Readings::new();
     let mut secrets_measured = true;
-    if !paths.is_empty() {
-        let provisioned_read = readings.record(
+    if !all_secret_paths.is_empty() {
+        let stored_paths = readings.record(
             "secrets_status",
             state
-                .workflow_repo
-                .get_provisioned_secrets(&paths, user_id)
+                .secrets_manager
+                .list_dispatch_readable_key_paths(user_id)
                 .await,
         );
-        secrets_measured = provisioned_read.is_some();
-        let provisioned_set: std::collections::HashSet<String> =
-            provisioned_read.unwrap_or_default().into_iter().collect();
-
-        for key_path in &paths {
-            let provisioned = secrets_measured.then(|| provisioned_set.contains(key_path));
-            let (status, blocker) =
-                talos_workflow_creation_helpers::quickstart_secret_entry(key_path, provisioned);
-            blockers.extend(blocker);
-            secrets_status.push(status);
-        }
-        // Sort for stable output
-        secrets_status.sort_by(|a, b| {
-            a.get("key_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .cmp(b.get("key_path").and_then(|v| v.as_str()).unwrap_or(""))
-        });
+        secrets_measured = stored_paths.is_some();
+        let (statuses, secret_blockers) = talos_workflow_creation_helpers::quickstart_secrets(
+            &all_secret_paths,
+            stored_paths.as_deref(),
+        );
+        secrets_status = statuses;
+        blockers.extend(secret_blockers);
     }
 
     let ready_to_run = if secrets_measured {

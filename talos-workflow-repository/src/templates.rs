@@ -412,37 +412,6 @@ impl WorkflowRepository {
         Ok(rows)
     }
 
-    // ── Secrets provisioning ──────────────────────────────────────────────
-
-    /// Return which of the provided secret key-paths are already provisioned.
-    pub async fn get_provisioned_secrets(
-        &self,
-        paths: &[String],
-        user_id: Uuid,
-    ) -> Result<Vec<String>> {
-        if paths.is_empty() {
-            return Ok(vec![]);
-        }
-        // MCP-676 (2026-05-13): canonical owner column is `owner_user_id`,
-        // NOT `user_id`. The `user_id` column is a 001_initial_schema
-        // leftover never written by any production code path; using it
-        // as the ownership predicate returned an empty Vec for every
-        // user regardless of secret count. Sibling fix to the
-        // controller `/metrics` user-stats endpoint that had the same
-        // copy-paste bug. The talos-secrets-manager INSERT path writes
-        // BOTH `created_by` AND `owner_user_id` to the creating user
-        // (verified at manager.rs:865 — `INSERT INTO secrets (..., created_by,
-        // owner_user_id, ...)`).
-        let provisioned: Vec<String> = sqlx::query_scalar(
-            "SELECT key_path FROM secrets WHERE key_path = ANY($1) AND owner_user_id = $2",
-        )
-        .bind(paths)
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await?;
-        Ok(provisioned)
-    }
-
     // ── Module export ──────────────────────────────────────────────────────
 
     /// Batch-fetch module metadata for export.
