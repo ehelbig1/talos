@@ -304,6 +304,13 @@ with `authentication_timeout=5s` (60 s is the default): the reading is that
 the backend is a half-opened connection the blocked test runtime can never
 finish opening. See `docs/engineering-log/packages/2026-10-06-ci-test-jobs.md`.
 
+That reading was observed directly on 2026-10-13, and the harness no longer
+waits it out: `TestDb::drop` waits a bounded second for its drop
+(`TEST_DB_DROP_WAIT`) instead of joining it. A test that leaves a task opening
+a connection costs that second, on any server; the 5 s setting stays as the
+bound on a drop nothing is waiting for. See
+`docs/engineering-log/packages/2026-10-13-test-db-teardown-bounded-wait.md`.
+
 **Build once was measured and not done.** A `cargo nextest archive` shared
 between shards would carry ~150 integration binaries, each statically linked
 against most of the workspace; the artifact is too large to upload and
