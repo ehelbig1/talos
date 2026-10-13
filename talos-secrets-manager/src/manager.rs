@@ -4432,15 +4432,27 @@ impl SecretsManager {
             .collect()
     }
 
-    /// True if a secret exists for the user at the given key_path. Used by
-    /// `import_platform_state` to count which referenced secrets are already
-    /// provisioned without ever fetching the value. Scoped via `created_by`
-    /// — the legacy `user_id` column was never populated by `create_secret`
-    /// or `upsert_secret`, so a `WHERE user_id = $2` filter would silently
-    /// report every modern secret as missing.
-    pub async fn secret_exists_by_path(&self, key_path: &str, user_id: Uuid) -> Result<bool> {
+    /// True if a dispatch for `user_id` can read a secret stored at exactly
+    /// `key_path`. Never fetches the value.
+    ///
+    /// The exact-path twin of [`Self::list_dispatch_readable_key_paths`], and
+    /// under the same ownership rule: the one [`Self::get_secrets_by_paths`]
+    /// reads with (the user's own secrets and the ownerless ones). A tool
+    /// that says "nothing is stored at this path" asks this, so it cannot
+    /// tell an operator to add a secret a dispatch would already deliver.
+    /// Another user's secret at the path is `false`, exactly as a path
+    /// nobody holds.
+    ///
+    /// Until 2026-10-13 this was `secret_exists_by_path`, scoped to
+    /// `created_by` alone, which called an ownerless secret missing.
+    pub async fn dispatch_readable_secret_exists(
+        &self,
+        key_path: &str,
+        user_id: Uuid,
+    ) -> Result<bool> {
         let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM secrets WHERE key_path = $1 AND created_by = $2)",
+            "SELECT EXISTS(SELECT 1 FROM secrets WHERE key_path = $1 \
+               AND (owner_user_id IS NULL OR owner_user_id = $2 OR created_by = $2))",
         )
         .bind(key_path)
         .bind(user_id)
@@ -4449,9 +4461,9 @@ impl SecretsManager {
         Ok(exists)
     }
 
-    /// Batch sibling to [`secret_exists_by_path`]. Single
-    /// `WHERE key_path = ANY($1)` query returns the subset of paths that
-    /// exist for `user_id`. Replaces the per-path loop in
+    /// Single `WHERE key_path = ANY($1)` query returns the subset of paths
+    /// that exist for `user_id` (the secrets that user CREATED; for "can a
+    /// dispatch read it" ask [`Self::dispatch_readable_secret_exists`]). Replaces the per-path loop in
     /// `import_platform_state` (1,000 round-trips at the manifest cap → 1).
     /// Empty input short-circuits without touching the DB.
     ///
@@ -4460,7 +4472,7 @@ impl SecretsManager {
     /// A path that doesn't exist (or that belongs to another user) is
     /// simply absent from the set.
     ///
-    /// Security: same `AND created_by = $2` scoping as the per-path method.
+    /// Security: scoped by `AND created_by = $2`.
     /// (Pre-r306 reviews used `AND user_id = $2`, which silently reported
     /// every modern secret as missing because `create_secret` and
     /// `upsert_secret` populate `created_by`/`owner_user_id` but never

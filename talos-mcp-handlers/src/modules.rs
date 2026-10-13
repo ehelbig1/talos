@@ -1685,7 +1685,10 @@ async fn handle_test_secret_access(
     });
 
     // Gate 4: vault presence — the path may pass all gates but not exist.
-    // Cheap existence check; never returns the value.
+    // Cheap existence check; never returns the value. Asked under the
+    // ownership rule a dispatch reads with, so "not stored" here means a
+    // dispatch would find nothing, and another user's secret at the path
+    // reads exactly as a path nobody holds.
     //
     // #730: the DIRECTION of this default is correct and deliberately unchanged
     // — a failed read still yields `passed: false`, which costs the caller a
@@ -1711,7 +1714,7 @@ async fn handle_test_secret_access(
                 "gates.vault_presence",
                 state
                     .secrets_manager
-                    .secret_exists_by_path(&secret_path, user_id)
+                    .dispatch_readable_secret_exists(&secret_path, user_id)
                     .await,
             );
             let presence_checked = presence_read.is_some();
@@ -1726,10 +1729,13 @@ async fn handle_test_secret_access(
                         secret_path
                     )
                 } else if exists {
-                    format!("Secret exists at path '{}' for this user.", secret_path)
+                    format!(
+                        "A secret this user's dispatch can read is stored at path '{}'.",
+                        secret_path
+                    )
                 } else {
                     format!(
-                        "No secret stored at path '{}' for this user. Add it in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.",
+                        "No secret this user's dispatch can read is stored at path '{}'. Add it in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.",
                         secret_path
                     )
                 },
