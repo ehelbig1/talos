@@ -23,8 +23,9 @@
 mod common;
 
 use talos_google_cloud::impersonation::{
-    active_full_tier_connections, choose_consent, ConsentChoice,
+    active_full_tier_connections, choose_consent, mint_readiness_for, ConsentChoice,
 };
+use talos_workflow_engine_core::MintReadiness;
 use uuid::Uuid;
 
 async fn seed_user(pool: &sqlx::PgPool) -> Uuid {
@@ -152,5 +153,57 @@ async fn touching_a_connection_does_not_change_which_one_is_chosen() {
     assert_eq!(
         choose_consent(&left, Some(personal)),
         ConsentChoice::NamedIsNotTheirs
+    );
+}
+
+/// What `test_secret_access` is told about a mint path, against real rows:
+/// the answer is the mint's own, it is read under the asking user's id, and a
+/// connection key that is another user's reads exactly as a key nobody holds.
+#[tokio::test]
+async fn readiness_is_read_under_the_asking_user_and_a_foreign_key_is_no_such_connection() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let (alice, bob, carol) = (
+        seed_user(&pool).await,
+        seed_user(&pool).await,
+        seed_user(&pool).await,
+    );
+    let (alices, bobs_a, bobs_b, nobodys) = (
+        Uuid::from_u128(0x21),
+        Uuid::from_u128(0x22),
+        Uuid::from_u128(0x23),
+        Uuid::from_u128(0x24),
+    );
+    connect(&pool, alice, alices, "full", true).await;
+    connect(&pool, bob, bobs_a, "full", true).await;
+    connect(&pool, bob, bobs_b, "full", true).await;
+    // Carol has only a disconnected one and a lower tier.
+    connect(&pool, carol, Uuid::from_u128(0x25), "full", false).await;
+    connect(&pool, carol, Uuid::from_u128(0x26), "read", true).await;
+
+    let ready = |user, named| {
+        let pool = pool.clone();
+        async move { mint_readiness_for(&pool, user, named).await.expect("read") }
+    };
+
+    // Usable: the only one, unnamed or named.
+    assert_eq!(ready(alice, None).await, MintReadiness::Ready);
+    assert_eq!(ready(alice, Some(alices)).await, MintReadiness::Ready);
+    // No consent.
+    assert_eq!(ready(carol, None).await, MintReadiness::NoConnection);
+    // Two consents and none named; either one named is usable.
+    assert_eq!(ready(bob, None).await, MintReadiness::SeveralAndNoneNamed);
+    assert_eq!(ready(bob, Some(bobs_b)).await, MintReadiness::Ready);
+
+    // Another user's key. For every asker it is the answer a key nobody
+    // holds gets: Alice's connection exists, and nobody else may learn that.
+    for asker in [bob, carol] {
+        let foreign = ready(asker, Some(alices)).await;
+        assert_eq!(foreign, MintReadiness::NamedConnectionNotUsable);
+        assert_eq!(foreign, ready(asker, Some(nobodys)).await);
+    }
+    // And Alice cannot use Bob's.
+    assert_eq!(
+        ready(alice, Some(bobs_a)).await,
+        MintReadiness::NamedConnectionNotUsable
     );
 }

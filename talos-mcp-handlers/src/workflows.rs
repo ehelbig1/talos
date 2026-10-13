@@ -10934,20 +10934,11 @@ async fn handle_get_workflow_quickstart(
             provisioned_read.unwrap_or_default().into_iter().collect();
 
         for key_path in &paths {
-            let provisioned = provisioned_set.contains(key_path);
-            if !provisioned && secrets_measured {
-                blockers.push(serde_json::json!({
-                    "type": "missing_secret",
-                    "key_path": key_path,
-                    // MCP-1201: secret writes are GraphQL-only.
-                    "tool": null,
-                    "note": "Provision the credential in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.",
-                }));
-            }
-            secrets_status.push(serde_json::json!({
-                "key_path": key_path,
-                "provisioned": if secrets_measured { serde_json::json!(provisioned) } else { serde_json::Value::Null },
-            }));
+            let provisioned = secrets_measured.then(|| provisioned_set.contains(key_path));
+            let (status, blocker) =
+                talos_workflow_creation_helpers::quickstart_secret_entry(key_path, provisioned);
+            blockers.extend(blocker);
+            secrets_status.push(status);
         }
         // Sort for stable output
         secrets_status.sort_by(|a, b| {

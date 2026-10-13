@@ -126,6 +126,31 @@ impl talos_workflow_engine_core::GithubInstallationTokenProvider for GithubToken
             Err(e) => Err(format!("{e:#}").into()),
         }
     }
+
+    /// The first two questions of [`GithubTokenResolver::token_for_owner`]
+    /// and nothing after them: is the App configured, and does `user_id` own
+    /// an active installation for `owner`. No token is minted.
+    async fn mint_readiness(
+        &self,
+        owner: &str,
+        user_id: Uuid,
+    ) -> Result<talos_workflow_engine_core::MintReadiness, talos_workflow_engine_core::BoxError>
+    {
+        use talos_workflow_engine_core::MintReadiness;
+        if self.cache.is_none() {
+            return Ok(MintReadiness::NotConfigured);
+        }
+        let installation = self
+            .repo
+            .get_active_by_account_for_user(owner, user_id)
+            .await
+            .map_err(|e| -> talos_workflow_engine_core::BoxError { format!("{e:#}").into() })?;
+        Ok(if installation.is_some() {
+            MintReadiness::Ready
+        } else {
+            MintReadiness::NoConnection
+        })
+    }
 }
 
 #[cfg(test)]

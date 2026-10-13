@@ -226,6 +226,29 @@ pub trait SecretsResolver: Send + Sync {
     }
 }
 
+/// Whether a token COULD be minted for a user, decided without minting one.
+///
+/// A diagnostic asks this instead of "is a secret stored at this path":
+/// nothing is ever stored at a mint path. It reads the same rows the mint
+/// reads, under the same user id, and makes no outbound call. `Ready` means
+/// there is ONE connection to mint from; it does not mean the provider will
+/// issue the token (that is only known by asking it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintReadiness {
+    /// There is one connection of the user's to mint from.
+    Ready,
+    /// The user has nothing of this kind connected.
+    NoConnection,
+    /// The path names a connection that is not a usable one of this user's.
+    /// Another user's, a disconnected one and one that never existed are
+    /// ONE answer: a caller must not learn which.
+    NamedConnectionNotUsable,
+    /// The user has several and the path names none, so nothing is minted.
+    SeveralAndNoneNamed,
+    /// This kind of mint is not configured in this deployment.
+    NotConfigured,
+}
+
 /// Resolves a GitHub App installation token for a repo owner (RFC 0008 B4).
 ///
 /// Injected into a [`SecretsResolver`] so a module secret path of the form
@@ -252,6 +275,14 @@ pub trait GithubInstallationTokenProvider: Send + Sync {
         owner: &str,
         user_id: Uuid,
     ) -> Result<Option<String>, BoxError>;
+
+    /// Whether [`Self::installation_token`] has an installation to mint from
+    /// for `owner` and `user_id`, WITHOUT minting. Same tenancy as the mint:
+    /// only an installation `user_id` owns counts.
+    ///
+    /// `Err` when the installation could not be looked up: "could not look"
+    /// is never "there is none".
+    async fn mint_readiness(&self, owner: &str, user_id: Uuid) -> Result<MintReadiness, BoxError>;
 }
 
 /// Mints a short-lived impersonated GCP service-account access token
@@ -297,6 +328,19 @@ pub trait GcpImpersonationTokenProvider: Send + Sync {
         connection: Option<Uuid>,
         user_id: Uuid,
     ) -> Result<Option<String>, BoxError>;
+
+    /// Whether [`Self::impersonated_token`] has ONE consent to mint from for
+    /// `connection` and `user_id`, WITHOUT minting and without any outbound
+    /// call. An implementation decides it with the same function the mint
+    /// uses, from the same list read under `user_id`.
+    ///
+    /// `Err` when the consents could not be read: "could not look" is never
+    /// "there is none".
+    async fn mint_readiness(
+        &self,
+        connection: Option<Uuid>,
+        user_id: Uuid,
+    ) -> Result<MintReadiness, BoxError>;
 }
 
 #[cfg(test)]

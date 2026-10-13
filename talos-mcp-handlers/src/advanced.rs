@@ -3148,12 +3148,26 @@ async fn handle_get_config_suggestions(
                                 )),
                             );
                         } else {
+                            // A canonical path that is minted at dispatch
+                            // has nothing to add to the vault.
                             entry.insert(
                                 "suggestion".to_string(),
-                                serde_json::json!(format!(
-                                    "Use canonical path '{}' — add it in the dashboard (Settings → Secrets) with key_path='{}'.",
-                                    canonical_all[0], canonical_all[0]
-                                )),
+                                serde_json::json!(
+                                    if talos_workflow_job_protocol::grant_reaches_minted_paths(
+                                        canonical_all[0]
+                                    )
+                                    .is_some()
+                                    {
+                                        talos_workflow_creation_helpers::unstored_secret_advice(
+                                            canonical_all[0],
+                                        )
+                                    } else {
+                                        format!(
+                                            "Use canonical path '{}' — add it in the dashboard (Settings → Secrets) with key_path='{}'.",
+                                            canonical_all[0], canonical_all[0]
+                                        )
+                                    }
+                                ),
                             );
                         }
                     } else {
@@ -3177,10 +3191,9 @@ async fn handle_get_config_suggestions(
                         } else if !path.is_empty() {
                             entry.insert(
                                 "warning".to_string(),
-                                serde_json::json!(format!(
-                                    "Secret path '{}' not yet in vault. Add it in the dashboard (Settings → Secrets) with key_path='{}'.",
-                                    path, path
-                                )),
+                                serde_json::json!(
+                                    talos_workflow_creation_helpers::unstored_secret_advice(&path)
+                                ),
                             );
                         }
                     }
