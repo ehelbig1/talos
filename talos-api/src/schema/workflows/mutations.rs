@@ -1662,6 +1662,22 @@ impl WorkflowsMutations {
                     let redacted = talos_dlp_provider::redact_str(&e.to_string());
                     let error_msg = format!("Test run failed: {}", redacted);
                     mark_test_execution_failed(&db_pool, &sender, execution_id, &error_msg).await;
+                    // The failure is recorded; now keep what the nodes that
+                    // completed had produced. Sealed as this path seals a
+                    // completed run's output, above.
+                    let wf_repo =
+                        talos_workflow_repository::WorkflowRepository::new(db_pool.clone())
+                            .with_encryption(sm_for_persist.clone());
+                    talos_execution_result_collector::keep_failed_run_outputs(
+                        &engine,
+                        execution_id,
+                        |outputs| async move {
+                            wf_repo
+                                .attach_failed_run_outputs(execution_id, &outputs)
+                                .await
+                        },
+                    )
+                    .await;
                 }
             }
         });

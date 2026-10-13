@@ -122,7 +122,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_node_output",
-            "description": "Get the output of a specific node from an execution (instead of the entire workflow output). Pass the node's graph id or its display label. A run that FAILED keeps the outputs of the nodes that completed before the failure when it was started by trigger_workflow, call_workflow, test_workflow, a replay or a bulk trigger, so those can be read back here; the node that failed, and anything after it, has none. A scheduled or webhook-started run that failed, and a retry, store none.",
+            "description": "Get the output of a specific node from an execution (instead of the entire workflow output). Pass the node's graph id or its display label. A run that FAILED keeps the outputs of the nodes that completed before the failure, however it was started (a trigger, a schedule, a webhook, a retry, a resume), so those can be read back here; the node that failed, and anything after it, has none. Two failed runs store none: one in which no node completed, and one cut off from outside the engine (a scheduled run that hit the scheduler's own timeout).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1905,10 +1905,10 @@ fn no_node_output_message(status: &str, execution_id: Uuid) -> String {
     match status {
         "failed" => format!(
             "This execution FAILED and stored no node outputs. A failed run keeps the outputs \
-             of the nodes that completed before the failure, so either none did, or the run \
-             ended on a path that does not keep them (a scheduled or webhook-started run, a \
-             retry, or a run from before they were kept). {see} shows the error and which \
-             node failed."
+             of the nodes that completed before the failure, so most likely none did. (A run \
+             cut off from outside the engine, such as a scheduled run that hit the scheduler's \
+             own timeout, and a run from before they were kept, store none either.) {see} \
+             shows the error and which node failed."
         ),
         "cancelled" => format!(
             "This execution was cancelled and stored no node outputs. {see} shows how far it got."
@@ -3788,7 +3788,14 @@ async fn handle_enqueue_workflow(
                         // failure-marking UPDATE also fails the row sits in
                         // 'running' state masking the real failure. Same
                         // WARN+target shape as above.
-                        if let Err(ue) = repo.mark_execution_failed(exec_id, &redacted, None).await
+                        //
+                        // With the failure, what the nodes that completed had
+                        // produced (`None` when none did).
+                        let partial =
+                            talos_execution_result_collector::collect_failed_run_outputs(&engine);
+                        if let Err(ue) = repo
+                            .mark_execution_failed(exec_id, &redacted, partial.as_ref())
+                            .await
                         {
                             tracing::warn!(
                                 target: "talos_audit",

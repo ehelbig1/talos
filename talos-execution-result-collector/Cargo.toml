@@ -17,5 +17,10 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "v5", "serde"] }
 
+[dev-dependencies]
+# `keep_failed_run_outputs` is driven against a real engine run that fails.
+talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils" }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [lints]
 workspace = true

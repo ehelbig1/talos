@@ -1054,6 +1054,50 @@ impl WorkflowRepository {
         Ok(())
     }
 
+    /// Store the outputs of the nodes that completed on a run that has just
+    /// been finalized as FAILED by a path whose own failure statement records
+    /// only the error (`fail_workflow_execution_unless_terminal` and its
+    /// siblings). `output` is
+    /// `talos_execution_result_collector::collect_failed_run_outputs`.
+    ///
+    /// Sealed exactly as [`Self::mark_execution_completed`] seals a completed
+    /// run's output: payload-bounded, encrypted under the workflow's org DEK
+    /// when a `SecretsManager` is wired, DLP-redacted plaintext otherwise.
+    /// Written only to a row that is `failed` and holds no output (see
+    /// `talos_execution_finalizer::attach_failed_run_outputs_encrypted`), so
+    /// it can never change a run's outcome or replace an output. Returns
+    /// whether the row took it.
+    pub async fn attach_failed_run_outputs(
+        &self,
+        execution_id: Uuid,
+        output: &serde_json::Value,
+    ) -> Result<bool> {
+        let bounded = bound_execution_payload(output);
+        let output = &*bounded;
+        let written = if let Some((key_id, enc_bytes, format_version)) = self
+            .maybe_encrypt_execution_output(execution_id, output)
+            .await?
+        {
+            talos_execution_finalizer::attach_failed_run_outputs_encrypted(
+                &self.db_pool,
+                execution_id,
+                &enc_bytes,
+                key_id,
+                format_version,
+            )
+            .await?
+        } else {
+            let redacted = talos_dlp_provider::redact_json(output);
+            talos_execution_finalizer::attach_failed_run_outputs_plain(
+                &self.db_pool,
+                execution_id,
+                &redacted,
+            )
+            .await?
+        };
+        Ok(written > 0)
+    }
+
     /// Mark an execution as waiting — the engine returned `ctx.waiting = true`
     /// because a Wait node is paused for an external resume signal. Mirrors
     /// the raw-SQL path in `scheduler.rs` around the engine-finished branch.

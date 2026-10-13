@@ -611,7 +611,23 @@ pub async fn trigger_continuation_workflow(
                 // these cleanup calls will likely also fail; without WARN
                 // the execution + child module rows stay 'running' with no
                 // operational signal.
-                if let Err(mark_err) = repo.fail_execution(execution_id, &error_msg).await {
+                let failed = repo.fail_execution(execution_id, &error_msg).await;
+                // The failure is recorded; now keep what the nodes that
+                // completed had produced. Sealed as this path seals a
+                // completed run's output, above.
+                let wf_repo = WorkflowRepository::new(db_pool_for_persist.clone())
+                    .with_encryption(sm_for_persist.clone());
+                talos_execution_result_collector::keep_failed_run_outputs(
+                    &engine,
+                    execution_id,
+                    |outputs| async move {
+                        wf_repo
+                            .attach_failed_run_outputs(execution_id, &outputs)
+                            .await
+                    },
+                )
+                .await;
+                if let Err(mark_err) = failed {
                     tracing::warn!(
                         target: "talos_audit",
                         execution_id = %execution_id,

@@ -52,6 +52,7 @@ talos-tenancy = { path = "../talos-tenancy" }
 talos-memory = { path = "../talos-memory" }
 talos-ml = { path = "../talos-ml" }
 talos-execution-repository = { path = "../talos-execution-repository" }
+talos-execution-result-collector = { path = "../talos-execution-result-collector" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tower-cookies.workspace = true

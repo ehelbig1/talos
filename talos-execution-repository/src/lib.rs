@@ -2297,6 +2297,41 @@ impl ExecutionRepository {
         Ok(())
     }
 
+    /// Store the outputs of the nodes that completed on a run that has just
+    /// been finalized as FAILED by a path whose own failure statement records
+    /// only the error. The twin of
+    /// `WorkflowRepository::attach_failed_run_outputs`, for the paths that
+    /// hold THIS repository: sealed exactly as
+    /// [`Self::mark_execution_completed`] seals a completed run's output, and
+    /// written only to a row that is `failed` and holds no output. Returns
+    /// whether the row took it.
+    pub async fn attach_failed_run_outputs(
+        &self,
+        exec_id: Uuid,
+        output: &serde_json::Value,
+    ) -> Result<bool> {
+        let written = if self.output_encryption_enabled() {
+            let (key_id, enc_bytes, format_version) = self.encrypt_output(exec_id, output).await?;
+            talos_execution_finalizer::attach_failed_run_outputs_encrypted(
+                &self.db_pool,
+                exec_id,
+                &enc_bytes,
+                key_id,
+                format_version,
+            )
+            .await?
+        } else {
+            let redacted = talos_dlp_provider::redact_json(output);
+            talos_execution_finalizer::attach_failed_run_outputs_plain(
+                &self.db_pool,
+                exec_id,
+                &redacted,
+            )
+            .await?
+        };
+        Ok(written > 0)
+    }
+
     pub async fn mark_execution_completed(
         &self,
         exec_id: Uuid,

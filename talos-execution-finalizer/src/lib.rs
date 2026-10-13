@@ -354,6 +354,62 @@ pub async fn complete_workflow_execution_plain(
     record("success", row)
 }
 
+/// Store, on a run that has ALREADY been finalized as failed, the outputs of
+/// the nodes that had completed, encrypted at rest by the caller.
+///
+/// For the failure paths whose own finalizer records the error and nothing
+/// else (the scheduler, the webhook router, the continuation and GraphQL
+/// paths: [`fail_workflow_execution_unless_terminal`] and its siblings). The
+/// row is failed FIRST, by that path's own statement with its own guard, and
+/// this runs after it. So this is not a terminal write: it changes no status
+/// and no timestamp, and records no outcome.
+///
+/// Guard: the row is `failed` and holds NO output yet. A row some other
+/// writer finalized (completed, cancelled, or failed with an output of its
+/// own) is left exactly as it is. Returns the rows written (0 or 1).
+pub async fn attach_failed_run_outputs_encrypted(
+    pool: &PgPool,
+    execution_id: Uuid,
+    enc_bytes: &[u8],
+    key_id: Uuid,
+    format_version: i16,
+) -> Result<u64> {
+    let done = sqlx::query(
+        "UPDATE workflow_executions \
+         SET output_data = NULL, output_data_enc = $1, output_enc_key_id = $2, \
+             output_data_format = $3 \
+         WHERE id = $4 AND status = 'failed' \
+           AND output_data IS NULL AND output_data_enc IS NULL",
+    )
+    .bind(enc_bytes)
+    .bind(key_id)
+    .bind(format_version)
+    .bind(execution_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// [`attach_failed_run_outputs_encrypted`] for the no-encryption
+/// configuration: the output is already DLP-redacted and payload-bounded by
+/// the caller.
+pub async fn attach_failed_run_outputs_plain(
+    pool: &PgPool,
+    execution_id: Uuid,
+    redacted_output: &serde_json::Value,
+) -> Result<u64> {
+    let done = sqlx::query(
+        "UPDATE workflow_executions SET output_data = $1 \
+         WHERE id = $2 AND status = 'failed' \
+           AND output_data IS NULL AND output_data_enc IS NULL",
+    )
+    .bind(redacted_output)
+    .bind(execution_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
 fn record(status: &str, row: Option<sqlx::postgres::PgRow>) -> Result<u64> {
     match row {
         Some(row) => {

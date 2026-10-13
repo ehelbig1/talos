@@ -1244,6 +1244,21 @@ async fn run_single_workflow_chain(
             .await {
     tracing::error!("Database operation failed in engine: {}", db_err);
 }
+            // The failure is recorded; now keep what the nodes that completed
+            // had produced. Sealed as this path seals a completed run's
+            // output, above.
+            let wf_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone())
+                .with_encryption(secrets_manager_for_persist);
+            talos_execution_result_collector::keep_failed_run_outputs(
+                &engine,
+                execution_id,
+                |outputs| async move {
+                    wf_repo
+                        .attach_failed_run_outputs(execution_id, &outputs)
+                        .await
+                },
+            )
+            .await;
             // The DB trigger trg_cancel_siblings_on_workflow_fail (migration
             // 20260327000001_cancel_siblings_on_workflow_fail.sql) atomically cancels
             // all still-running module_executions when workflow_executions.status changes

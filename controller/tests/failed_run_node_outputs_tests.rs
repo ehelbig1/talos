@@ -202,3 +202,188 @@ async fn the_outputs_of_the_nodes_that_completed_can_be_read_back_from_a_failed_
         json!({ "ticket": "ABC-12" })
     );
 }
+
+/// The paths whose failure statement records only the error (the scheduler,
+/// the webhook router, crash recovery, …) fail the row first and attach the
+/// completed outputs after. Through whichever repository the path holds,
+/// that second write:
+///
+/// * lands on a row that is `failed` and holds no output, sealed at rest,
+///   and changes nothing else about the row;
+/// * lands NOWHERE else: not on a row that completed, is still running or
+///   was cancelled, and not over an output a failed row already holds.
+#[tokio::test]
+async fn completed_outputs_attach_only_to_a_failed_row_that_holds_none() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let owner = seed_user(&pool).await;
+    let state = mcp_state(pool.clone()).await;
+    let outputs =
+        json!({ "fetch": { "items": [1, 2, 3] }, "compose": { "subject": "Three items" } });
+    let other = json!({ "fetch": { "items": ["something else"] } });
+
+    // Built the way the production paths build them: a repository that holds
+    // the secrets manager seals, one that does not writes redacted plaintext.
+    let sm = state.secrets_manager.clone();
+    sm.initialize().await.expect("an active encryption key");
+    let sealing_workflows = talos_workflow_repository::WorkflowRepository::new(pool.clone())
+        .with_encryption(sm.clone());
+    let sealing_executions =
+        talos_execution_repository::ExecutionRepository::with_encryption(pool.clone(), sm.clone());
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Via {
+        WorkflowRepositorySealing,
+        ExecutionRepositorySealing,
+        WorkflowRepositoryPlain,
+        ExecutionRepositoryPlain,
+    }
+    impl Via {
+        fn seals(self) -> bool {
+            matches!(
+                self,
+                Via::WorkflowRepositorySealing | Via::ExecutionRepositorySealing
+            )
+        }
+    }
+    let attach = |via: Via, exec_id: Uuid, value: Value| {
+        let (state, sealing_workflows, sealing_executions) =
+            (&state, &sealing_workflows, &sealing_executions);
+        async move {
+            match via {
+                Via::WorkflowRepositorySealing => {
+                    sealing_workflows
+                        .attach_failed_run_outputs(exec_id, &value)
+                        .await
+                }
+                Via::ExecutionRepositorySealing => {
+                    sealing_executions
+                        .attach_failed_run_outputs(exec_id, &value)
+                        .await
+                }
+                Via::WorkflowRepositoryPlain => {
+                    state
+                        .workflow_repo
+                        .attach_failed_run_outputs(exec_id, &value)
+                        .await
+                }
+                Via::ExecutionRepositoryPlain => {
+                    state
+                        .execution_repo
+                        .attach_failed_run_outputs(exec_id, &value)
+                        .await
+                }
+            }
+            .expect("attach")
+        }
+    };
+    // (status, error, plaintext column empty, ciphertext present)
+    let row = |exec_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, Option<String>, bool, bool)>(
+                "SELECT status, error_message, output_data IS NULL, output_data_enc IS NOT NULL \
+                 FROM workflow_executions WHERE id = $1",
+            )
+            .bind(exec_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read row")
+        }
+    };
+    // What a reader gets back, sealed or not.
+    let stored = |exec_id: Uuid| {
+        let sealing_executions = &sealing_executions;
+        async move {
+            let found = sealing_executions
+                .lookup_execution(exec_id, owner)
+                .await
+                .expect("lookup");
+            let talos_execution_repository::ExecutionLookup::Live(row) = found else {
+                panic!("the execution is live");
+            };
+            row.output_data
+        }
+    };
+
+    for via in [
+        Via::WorkflowRepositorySealing,
+        Via::ExecutionRepositorySealing,
+        Via::WorkflowRepositoryPlain,
+        Via::ExecutionRepositoryPlain,
+    ] {
+        // Failed the way a scheduled run is failed: the error, and no output.
+        let failed = seed_running_execution(&pool, owner).await;
+        talos_workflow_repository::fail_workflow_execution_unless_terminal(
+            &pool,
+            failed,
+            "Scheduled workflow failed: node 'send' failed: refused",
+        )
+        .await
+        .expect("fail the run");
+        assert!(attach(via, failed, outputs.clone()).await, "{via:?}");
+        let (status, error, plaintext_empty, sealed) = row(failed).await;
+        assert_eq!(status, "failed", "{via:?}: attaching changed the outcome");
+        assert_eq!(
+            error.as_deref(),
+            Some("Scheduled workflow failed: node 'send' failed: refused"),
+            "{via:?}: attaching changed the recorded error"
+        );
+        if via.seals() {
+            assert!(
+                plaintext_empty && sealed,
+                "{via:?}: the outputs were not sealed at rest"
+            );
+        } else {
+            assert!(!plaintext_empty && !sealed, "{via:?}");
+        }
+        assert_eq!(stored(failed).await, Some(outputs.clone()), "{via:?}");
+
+        // A row that already holds an output keeps it.
+        assert!(!attach(via, failed, other.clone()).await, "{via:?}");
+        assert_eq!(
+            stored(failed).await,
+            Some(outputs.clone()),
+            "{via:?}: an output was replaced"
+        );
+
+        // Through the tool, for its owner (the harness's own repositories
+        // do not hold the secrets manager, so the plaintext rows).
+        if !via.seals() {
+            let reply = controller::mcp::executions::dispatch(
+                "get_node_output",
+                Some(json!(1)),
+                &json!({ "execution_id": failed.to_string(), "node_id": "compose" }),
+                &state,
+                agent(owner),
+            )
+            .await
+            .expect("get_node_output is dispatched");
+            assert!(
+                text_json(&reply).to_string().contains("Three items"),
+                "{via:?}"
+            );
+        }
+
+        // Rows in any other state are not touched.
+        for status in ["running", "completed", "cancelled", "waiting"] {
+            let exec = seed_running_execution(&pool, owner).await;
+            sqlx::query("UPDATE workflow_executions SET status = $2 WHERE id = $1")
+                .bind(exec)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .expect("set status");
+            assert!(
+                !attach(via, exec, outputs.clone()).await,
+                "{via:?}: outputs were attached to a {status} row"
+            );
+            let (now, _, plaintext_empty, sealed) = row(exec).await;
+            assert_eq!(now, status);
+            assert!(
+                plaintext_empty && !sealed,
+                "{via:?}: a {status} row was written to"
+            );
+            assert_eq!(stored(exec).await, None, "{via:?}: {status}");
+        }
+    }
+}

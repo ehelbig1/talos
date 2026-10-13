@@ -198,6 +198,50 @@ pub fn collect_failed_run_outputs(engine: &ParallelWorkflowEngine) -> Option<Val
         .then_some(output)
 }
 
+/// Keep the completed nodes' outputs of a run that a path has JUST finalized
+/// as failed with a statement that records only the error (the scheduler,
+/// the webhook router, the continuation, enqueue and GraphQL paths, crash
+/// recovery).
+///
+/// `attach` is that path's own repository write
+/// (`attach_failed_run_outputs` on the workflow or the execution
+/// repository, whichever the path completes its runs with, so a failed
+/// run's outputs are sealed the way that path seals a completed run's). It
+/// is called only when a node completed.
+///
+/// Best effort, and it says so: the run is already recorded as failed with
+/// its error, and that is what must not be lost. A write that fails is
+/// logged and dropped; a row that did not take the outputs (another writer
+/// finalized it first) is logged at debug.
+///
+/// TAKES the engine's partial results, so call it once per failed run, and
+/// AFTER the failure itself has been written.
+pub async fn keep_failed_run_outputs<F, Fut, E>(
+    engine: &ParallelWorkflowEngine,
+    execution_id: uuid::Uuid,
+    attach: F,
+) where
+    F: FnOnce(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, E>>,
+    E: std::fmt::Display,
+{
+    let Some(outputs) = collect_failed_run_outputs(engine) else {
+        return;
+    };
+    match attach(outputs).await {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            %execution_id,
+            "a failed run's completed outputs were not stored: the row is not failed, or already holds an output"
+        ),
+        Err(e) => tracing::warn!(
+            %execution_id,
+            error = %e,
+            "a failed run's completed outputs could not be stored; the failure itself is recorded"
+        ),
+    }
+}
+
 /// Reserved key under which the original trigger input is round-tripped
 /// inside an execution's stored output. Both `collect_success_output`
 /// and `collect_failure_output` write to this key; `extract_trigger_input`
