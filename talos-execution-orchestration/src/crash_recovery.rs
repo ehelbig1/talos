@@ -286,6 +286,23 @@ pub(crate) async fn resume_one(
         )
         .await,
     );
+    // A row from before the `dry_run` column says "real" whatever the run
+    // was. If the outputs its module nodes had committed carry the worker's
+    // dry-run report, the run was a rehearsal, and it is resumed as one.
+    // This only ever sets the flag, never clears it.
+    if !row.dry_run
+        && crate::run_mode::seed_shows_a_dry_run(&initial_results, |node_id| {
+            matches!(engine.node_meta().get(node_id), Some((Some(_), _, None)))
+        })
+    {
+        tracing::warn!(
+            execution_id = %exec_id,
+            "{origin_label}: the row is not recorded as a dry run, but its completed module \
+             outputs carry the worker's dry-run report (a run started before the row could \
+             record its mode) — resuming as a dry run"
+        );
+        engine.set_dry_run(true);
+    }
     if initial_results.is_empty() {
         tracing::warn!(
             execution_id = %exec_id,
