@@ -2076,6 +2076,11 @@ async fn handle_get_node_output(
             serde_json::to_string_pretty(node_output).unwrap_or_default(),
         );
     }
+    // Parsed once more for the question below (is the node in the graph at
+    // all); taken before the label map consumes the text.
+    let graph_value = graph_str
+        .as_deref()
+        .and_then(|g| serde_json::from_str::<serde_json::Value>(g).ok());
     let label_map = build_node_label_map(graph_str);
     let labeled_keys: Vec<String> = data
         .as_object()
@@ -2094,6 +2099,30 @@ async fn handle_get_node_output(
     let outputs_omitted = data
         .get(talos_execution_result_collector::OUTPUTS_OMITTED_KEY)
         .is_some();
+    // Is the node in the graph at all, and if so what does this execution
+    // say about it? One bounded read of its events, only when it is.
+    let mut absence = classify_absent_node(graph_value.as_ref(), node_id, &data);
+    if let NodeAbsence::InGraph { rf_id, events, .. } = &mut absence {
+        match state
+            .execution_repo
+            .list_execution_events_for_node(
+                exec_id,
+                talos_workflow_engine_core::engine_node_uuid(rf_id),
+            )
+            .await
+        {
+            Ok(rows) => {
+                *events = Some(NodeEvents::from_types(
+                    rows.iter().map(|e| e.event_type.as_str()),
+                ))
+            }
+            Err(e) => {
+                // Say less, not something untrue: the message then states
+                // only what the stored outputs and the graph show.
+                tracing::warn!(error = %e, "get_node_output: could not read the node's events");
+            }
+        }
+    }
     mcp_not_found(
         req_id,
         -32000,
@@ -2103,8 +2132,245 @@ async fn handle_get_node_output(
             &exec.status,
             exec_id,
             outputs_omitted,
+            &absence,
         ),
     )
+}
+
+/// What this execution's events say happened to one node.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NodeEvents {
+    started: bool,
+    completed: bool,
+    failed: bool,
+    skipped: bool,
+}
+
+impl NodeEvents {
+    pub(crate) fn from_types<'a>(types: impl Iterator<Item = &'a str>) -> Self {
+        let mut events = Self::default();
+        for event_type in types {
+            match event_type {
+                "node_started" => events.started = true,
+                "node_completed" => events.completed = true,
+                "node_failed" => events.failed = true,
+                "node_skipped" => events.skipped = true,
+                _ => {}
+            }
+        }
+        events
+    }
+}
+
+/// One edge into a node with no stored output, and what the execution's
+/// stored outputs say about the node it comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IncomingEdge {
+    source: String,
+    condition: Option<String>,
+    /// The source node has a stored output in this execution: it ran.
+    source_ran: bool,
+    /// The engine recorded that this edge's condition could not be
+    /// evaluated (`__edge_condition_errors__` on the source's output).
+    condition_error: Option<String>,
+}
+
+/// Why a node the caller asked for has no stored output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeAbsence {
+    /// The workflow's graph could not be read; nothing is claimed.
+    GraphUnknown,
+    /// No node in the workflow's graph has that id or label.
+    NotInGraph,
+    /// The node is in the graph. It did not leave an output in this
+    /// execution.
+    InGraph {
+        rf_id: String,
+        /// `None` until read, or when the read failed.
+        events: Option<NodeEvents>,
+        incoming: Vec<IncomingEdge>,
+        /// Incoming edges past [`ABSENT_NODE_EDGES_SHOWN`].
+        incoming_omitted: usize,
+    },
+}
+
+/// Most incoming edges a not-found reply describes.
+const ABSENT_NODE_EDGES_SHOWN: usize = 6;
+
+/// Find `asked` (a node id or a `data.label`) in the workflow's graph and
+/// describe the edges into it against the execution's stored outputs.
+///
+/// The graph is the workflow's graph as stored NOW, which is what this tool
+/// has always resolved names against; the message says so.
+pub(crate) fn classify_absent_node(
+    graph: Option<&serde_json::Value>,
+    asked: &str,
+    data: &serde_json::Value,
+) -> NodeAbsence {
+    let Some(nodes) = graph
+        .and_then(|g| g.get("nodes"))
+        .and_then(|n| n.as_array())
+    else {
+        return NodeAbsence::GraphUnknown;
+    };
+    fn id_of(n: &serde_json::Value) -> Option<&str> {
+        n.get("id").and_then(|v| v.as_str())
+    }
+    fn label_of(n: &serde_json::Value) -> Option<&str> {
+        n.pointer("/data/label").and_then(|v| v.as_str())
+    }
+    let Some(rf_id) = nodes
+        .iter()
+        .find(|n| id_of(n) == Some(asked))
+        .or_else(|| nodes.iter().find(|n| label_of(n) == Some(asked)))
+        .and_then(id_of)
+    else {
+        return NodeAbsence::NotInGraph;
+    };
+
+    // A node's output is stored under its id, its engine UUID or its label.
+    let stored_output = |node_id: &str| -> Option<&serde_json::Value> {
+        let uuid = talos_workflow_engine_core::engine_node_uuid(node_id).to_string();
+        let label = nodes
+            .iter()
+            .find(|n| id_of(n) == Some(node_id))
+            .and_then(label_of);
+        data.get(node_id)
+            .or_else(|| data.get(&uuid))
+            .or_else(|| label.and_then(|l| data.get(l)))
+    };
+    let target_label = nodes
+        .iter()
+        .find(|n| id_of(n) == Some(rf_id))
+        .and_then(label_of);
+
+    let edges: Vec<&serde_json::Value> = graph
+        .and_then(|g| g.get("edges"))
+        .and_then(|e| e.as_array())
+        .map(|edges| {
+            edges
+                .iter()
+                .filter(|e| e.get("target").and_then(|v| v.as_str()) == Some(rf_id))
+                .collect()
+        })
+        .unwrap_or_default();
+    let incoming: Vec<IncomingEdge> = edges
+        .iter()
+        .take(ABSENT_NODE_EDGES_SHOWN)
+        .filter_map(|edge| {
+            let source = edge.get("source").and_then(|v| v.as_str())?;
+            let output = stored_output(source);
+            let condition_error = output
+                .and_then(|o| {
+                    o.get(talos_workflow_engine_core::reserved_keys::EDGE_CONDITION_ERRORS)
+                })
+                .and_then(|v| v.as_array())
+                .and_then(|entries| {
+                    entries.iter().find(|entry| {
+                        let target = entry.get("target").and_then(|v| v.as_str());
+                        target == Some(rf_id) || (target.is_some() && target == target_label)
+                    })
+                })
+                .and_then(|entry| entry.get("error").and_then(|v| v.as_str()))
+                .map(str::to_string);
+            Some(IncomingEdge {
+                source: source.to_string(),
+                condition: edge
+                    .get("condition")
+                    .and_then(|v| v.as_str())
+                    .filter(|c| !c.trim().is_empty())
+                    .map(|c| talos_text_util::bounded_preview(c, 160).to_string()),
+                source_ran: output.is_some(),
+                condition_error,
+            })
+        })
+        .collect();
+    NodeAbsence::InGraph {
+        rf_id: rf_id.to_string(),
+        events: None,
+        incoming_omitted: edges.len().saturating_sub(incoming.len()),
+        incoming,
+    }
+}
+
+/// The opening of a not-found reply: whether the node is in the graph, and
+/// what this execution shows about why it left no output.
+fn absent_node_opening(node_id: &str, absence: &NodeAbsence) -> String {
+    match absence {
+        NodeAbsence::GraphUnknown => format!("Node '{node_id}' not found in execution output."),
+        NodeAbsence::NotInGraph => format!(
+            "Node '{node_id}' not found in execution output, and it is NOT IN THE WORKFLOW'S \
+             GRAPH: no node there has that id or label (the graph as it is stored now; this \
+             execution may have run an earlier version)."
+        ),
+        NodeAbsence::InGraph {
+            events,
+            incoming,
+            incoming_omitted,
+            ..
+        } => {
+            let events = events.unwrap_or_default();
+            let mut msg = format!(
+                "Node '{node_id}' is in the workflow's graph and has no stored output in this \
+                 execution: "
+            );
+            if events.skipped {
+                msg.push_str("its skip condition was true, so it was SKIPPED.");
+                return msg;
+            }
+            if events.failed {
+                msg.push_str("it ran and FAILED, and a failed node stores no output.");
+                return msg;
+            }
+            if events.completed {
+                msg.push_str(
+                    "it ran and completed, but its output is not stored with the execution.",
+                );
+                return msg;
+            }
+            if events.started {
+                msg.push_str("it started and did not finish.");
+                return msg;
+            }
+            msg.push_str("it DID NOT RUN.");
+            if incoming.is_empty() {
+                msg.push_str(" It has no incoming edge.");
+            }
+            for edge in incoming {
+                let condition = edge
+                    .condition
+                    .as_deref()
+                    .map(|c| format!(" (condition `{c}`)"))
+                    .unwrap_or_default();
+                let finding = match (&edge.condition_error, edge.source_ran, &edge.condition) {
+                    (Some(error), _, _) => format!(
+                        "the condition could not be evaluated, so the edge was not taken: {}",
+                        talos_text_util::bounded_preview(error, 200)
+                    ),
+                    (None, true, Some(_)) => format!(
+                        "'{}' ran, so the condition was false on its output",
+                        edge.source
+                    ),
+                    (None, true, None) => format!(
+                        "'{}' ran and the edge has no condition, so the run ended before \
+                         reaching this node",
+                        edge.source
+                    ),
+                    (None, false, _) => format!("'{}' has no stored output either", edge.source),
+                };
+                msg.push_str(&format!(
+                    " Edge from '{}'{condition}: {finding}.",
+                    edge.source
+                ));
+            }
+            if *incoming_omitted > 0 {
+                msg.push_str(&format!(
+                    " ({incoming_omitted} more incoming edge(s) not shown.)"
+                ));
+            }
+            msg
+        }
+    }
 }
 
 /// The display label (`data.label`) of the graph node whose id is `rf_id`,
@@ -2136,6 +2402,7 @@ fn node_not_in_output_message(
     status: &str,
     execution_id: Uuid,
     outputs_omitted: bool,
+    absence: &NodeAbsence,
 ) -> String {
     let nodes: Vec<&str> = stored_keys
         .iter()
@@ -2143,9 +2410,10 @@ fn node_not_in_output_message(
         .filter(|k| !k.starts_with("__"))
         .collect();
     let mut msg = format!(
-        "Node '{node_id}' not found in execution output. Nodes with a stored output: [{}]. \
+        "{} Nodes with a stored output: [{}]. \
          Note: this surface accepts the rf_id (the 'id' column from get_workflow_graph) \
          OR the data.label set in the editor — both resolve to the same output entry.",
+        absent_node_opening(node_id, absence),
         nodes.join(", "),
     );
     if status == "failed" {
@@ -2169,7 +2437,10 @@ fn node_not_in_output_message(
 
 #[cfg(test)]
 mod node_not_in_output_message_tests {
-    use super::node_not_in_output_message;
+    use super::{
+        classify_absent_node, node_not_in_output_message, IncomingEdge, NodeAbsence, NodeEvents,
+    };
+    use serde_json::json;
     use uuid::Uuid;
 
     fn keys(v: &[&str]) -> Vec<String> {
@@ -2188,6 +2459,7 @@ mod node_not_in_output_message_tests {
             "failed",
             id,
             false,
+            &NodeAbsence::GraphUnknown,
         );
         assert!(
             msg.contains("Nodes with a stored output: [fetch, compose]"),
@@ -2209,6 +2481,7 @@ mod node_not_in_output_message_tests {
             "failed",
             Uuid::nil(),
             true,
+            &NodeAbsence::GraphUnknown,
         );
         assert!(msg.contains("Nodes with a stored output: []"), "{msg}");
         assert!(msg.contains("too large to store"), "{msg}");
@@ -2236,10 +2509,179 @@ mod node_not_in_output_message_tests {
 
     #[test]
     fn a_completed_run_gets_no_sentence_about_failure() {
-        let msg =
-            node_not_in_output_message("nope", &keys(&["a"]), "completed", Uuid::nil(), false);
+        let msg = node_not_in_output_message(
+            "nope",
+            &keys(&["a"]),
+            "completed",
+            Uuid::nil(),
+            false,
+            &NodeAbsence::GraphUnknown,
+        );
         assert!(!msg.contains("FAILED"), "{msg}");
         assert!(msg.contains("[a]"), "{msg}");
+    }
+
+    /// A chain `compose → links → part1 → send1 → part2 → send2`, as the
+    /// multi-part messages are wired: `partN → sendN` is conditional.
+    fn chain() -> serde_json::Value {
+        json!({
+            "nodes": [
+                { "id": "compose" }, { "id": "part1" }, { "id": "send1" },
+                { "id": "part2", "data": { "label": "Second part" } }, { "id": "send2" },
+            ],
+            "edges": [
+                { "source": "compose", "target": "part1" },
+                { "source": "part1", "target": "send1", "condition": "notify == true" },
+                { "source": "send1", "target": "part2" },
+                { "source": "part2", "target": "send2", "edge_type": "conditional", "condition": "notify == true" },
+            ],
+        })
+    }
+
+    fn message(asked: &str, absence: &NodeAbsence) -> String {
+        node_not_in_output_message(
+            asked,
+            &keys(&["compose"]),
+            "completed",
+            Uuid::nil(),
+            false,
+            absence,
+        )
+    }
+
+    /// The observed reply for a node skipped by a false edge condition was
+    /// the reply for a node that does not exist.
+    #[test]
+    fn a_node_that_did_not_run_is_not_reported_as_a_node_that_does_not_exist() {
+        let graph = chain();
+        // `part2` ran (its output is stored under its label) and the edge to
+        // `send2` has a condition: the condition was false.
+        let data =
+            json!({ "compose": {}, "part1": {}, "send1": {}, "Second part": { "notify": false } });
+        let absence = classify_absent_node(Some(&graph), "send2", &data);
+        assert_eq!(
+            absence,
+            NodeAbsence::InGraph {
+                rf_id: "send2".into(),
+                events: None,
+                incoming: vec![IncomingEdge {
+                    source: "part2".into(),
+                    condition: Some("notify == true".into()),
+                    source_ran: true,
+                    condition_error: None,
+                }],
+                incoming_omitted: 0,
+            }
+        );
+        let msg = message("send2", &absence);
+        assert!(msg.contains("is in the workflow's graph"), "{msg}");
+        assert!(msg.contains("DID NOT RUN"), "{msg}");
+        assert!(
+            msg.contains("Edge from 'part2' (condition `notify == true`): 'part2' ran, so the condition was false on its output."),
+            "{msg}"
+        );
+        assert!(!msg.contains("NOT IN THE WORKFLOW'S GRAPH"), "{msg}");
+
+        // An id that is nowhere in the graph is said to be exactly that.
+        let absence = classify_absent_node(Some(&graph), "send9", &data);
+        assert_eq!(absence, NodeAbsence::NotInGraph);
+        let msg = message("send9", &absence);
+        assert!(msg.contains("NOT IN THE WORKFLOW'S GRAPH"), "{msg}");
+        assert!(
+            msg.contains("Nodes with a stored output: [compose]"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn what_stopped_the_node_is_read_from_the_execution_not_guessed() {
+        let graph = chain();
+        // Upstream did not run either.
+        let absence = classify_absent_node(Some(&graph), "send2", &json!({ "compose": {} }));
+        let msg = message("send2", &absence);
+        assert!(msg.contains("Edge from 'part2' (condition `notify == true`): 'part2' has no stored output either."), "{msg}");
+
+        // A plain edge whose source ran: the run ended first.
+        let absence = classify_absent_node(Some(&graph), "part1", &json!({ "compose": {} }));
+        assert!(
+            message("part1", &absence).contains("'compose' ran and the edge has no condition, so the run ended before reaching this node"),
+        );
+
+        // The engine recorded that the condition could not be evaluated.
+        let data = json!({ "part1": { "__edge_condition_errors__": [
+            { "target": "send1", "condition": "notify == true", "error": "Variable not found: notify" }
+        ]}});
+        let msg = message("send1", &classify_absent_node(Some(&graph), "send1", &data));
+        assert!(msg.contains("the condition could not be evaluated, so the edge was not taken: Variable not found: notify"), "{msg}");
+
+        // A label finds the node, and the node's own events decide first.
+        let mut absence = classify_absent_node(Some(&graph), "Second part", &json!({}));
+        let NodeAbsence::InGraph { rf_id, events, .. } = &mut absence else {
+            panic!("a label resolves to its node")
+        };
+        assert_eq!(rf_id, "part2");
+        *events = Some(NodeEvents::from_types(
+            ["node_started", "node_skipped"].into_iter(),
+        ));
+        let msg = message("Second part", &absence);
+        assert!(
+            msg.contains("its skip condition was true, so it was SKIPPED"),
+            "{msg}"
+        );
+        assert!(!msg.contains("Edge from"), "{msg}");
+
+        *match &mut absence {
+            NodeAbsence::InGraph { events, .. } => events,
+            _ => unreachable!(),
+        } = Some(NodeEvents::from_types(
+            ["node_started", "node_failed"].into_iter(),
+        ));
+        assert!(message("Second part", &absence).contains("it ran and FAILED"));
+    }
+
+    #[test]
+    fn nothing_is_claimed_about_a_graph_that_could_not_be_read_and_edges_are_bounded() {
+        assert_eq!(
+            classify_absent_node(None, "send2", &json!({})),
+            NodeAbsence::GraphUnknown
+        );
+        assert_eq!(
+            classify_absent_node(Some(&json!({ "edges": [] })), "send2", &json!({})),
+            NodeAbsence::GraphUnknown
+        );
+        let msg = message("send2", &NodeAbsence::GraphUnknown);
+        assert!(
+            msg.starts_with(
+                "Node 'send2' not found in execution output. Nodes with a stored output"
+            ),
+            "{msg}"
+        );
+
+        let mut nodes = vec![json!({ "id": "join" })];
+        let mut edges = Vec::new();
+        for n in 0..9 {
+            nodes.push(json!({ "id": format!("b{n}") }));
+            edges.push(json!({ "source": format!("b{n}"), "target": "join" }));
+        }
+        let graph = json!({ "nodes": nodes, "edges": edges });
+        let absence = classify_absent_node(Some(&graph), "join", &json!({}));
+        let NodeAbsence::InGraph {
+            incoming,
+            incoming_omitted,
+            ..
+        } = &absence
+        else {
+            panic!("in graph")
+        };
+        assert_eq!((incoming.len(), *incoming_omitted), (6, 3));
+        assert!(message("join", &absence).contains("(3 more incoming edge(s) not shown.)"));
+        // A node with no edge into it says so.
+        let lone = json!({ "nodes": [{ "id": "lone" }], "edges": [] });
+        assert!(message(
+            "lone",
+            &classify_absent_node(Some(&lone), "lone", &json!({}))
+        )
+        .contains("It has no incoming edge."));
     }
 }
 
