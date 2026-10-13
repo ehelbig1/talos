@@ -228,7 +228,7 @@ async fn measure(
             allowed_hosts,
             string_list(manifest, "allowed_methods"),
             128,
-            talos_worker_runtime::rehearsal::node_payload(&config, &input, None),
+            talos_worker_runtime::rehearsal::node_payload(&config, &input, None, None),
             None,
             None,
             std::collections::HashMap::new(),
