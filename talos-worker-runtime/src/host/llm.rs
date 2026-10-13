@@ -614,25 +614,11 @@ impl wit_llm::Host for TalosContext {
         options: Option<String>,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
         self.host_call("llm::complete-with-options");
-        let extra = match options {
-            None => None,
-            Some(s) if s.trim().is_empty() => None,
-            Some(s) => {
-                if s.len() > MAX_PROVIDER_OPTIONS_BYTES {
-                    return Err(wit_llm::Error::InvalidRequest(format!(
-                        "provider options exceed {MAX_PROVIDER_OPTIONS_BYTES} bytes"
-                    )));
-                }
-                match serde_json::from_str::<serde_json::Value>(&s) {
-                    Ok(v) if v.is_object() => Some(v),
-                    _ => {
-                        return Err(wit_llm::Error::InvalidRequest(
-                            "provider options must be a JSON object".to_string(),
-                        ))
-                    }
-                }
-            }
-        };
+        // One rule for what `options` may be, shared with the operator's
+        // `local_llm_complete` tool (`crate::provider_options`).
+        let extra = crate::provider_options::parse_provider_options(options.as_deref())
+            .map_err(wit_llm::Error::InvalidRequest)?
+            .map(serde_json::Value::Object);
         self.complete_impl(req, JsonMode::Off, extra).await
     }
 }
@@ -1001,12 +987,21 @@ impl TalosContext {
 
         // R2 token ledger: fold provider-reported usage into the per-job
         // accumulator (drained into the signed JobResult at completion).
-        crate::context::fold_llm_usage(
+        // The call is also kept, in order, with the provider's own reason for
+        // stopping: a module that asked for JSON and got nothing back needs
+        // to see that the SECOND of its two calls stopped for `length`.
+        crate::context::record_llm_call(
             &self.llm_usage,
-            adapter.name(),
-            &model,
-            parsed.input_tokens.unwrap_or(0),
-            parsed.output_tokens.unwrap_or(0),
+            crate::context::LlmCallRecord {
+                provider: adapter.name().to_string(),
+                model: model.clone(),
+                prompt_tokens: parsed.input_tokens,
+                completion_tokens: parsed.output_tokens,
+                stop_reason: parsed.stop_reason.clone(),
+                duration_ms: Some(
+                    u64::try_from(llm_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
+            },
         );
 
         // A local prompt Ollama silently truncated to fit the loaded context:

@@ -15,7 +15,93 @@ use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 /// dispatch paths in `main.rs` create one per job, thread it into the
 /// context, and drain it into the signed result via
 /// [`drain_llm_usage_entries`].
-pub type LlmUsageAcc = Arc<std::sync::Mutex<HashMap<(String, String), (u64, u64, u32)>>>;
+pub type LlmUsageAcc = Arc<std::sync::Mutex<LlmUsage>>;
+
+/// What one job's LLM calls came to.
+///
+/// `totals` is the ledger: per `(provider, model)`, the prompt tokens, the
+/// completion tokens and the number of calls, which is what the signed
+/// result carries. `calls` is the first [`MAX_LLM_CALL_RECORDS`] calls in
+/// the order they were made, each with the reason the provider gave for
+/// stopping; it never leaves the process (an operator's `test_module` run
+/// reads it) and the calls past the bound are counted, not kept.
+#[derive(Debug, Default)]
+pub struct LlmUsage {
+    totals: HashMap<(String, String), (u64, u64, u32)>,
+    calls: Vec<LlmCallRecord>,
+    calls_not_listed: u32,
+}
+
+/// Most calls one job's [`LlmUsage`] lists individually.
+pub const MAX_LLM_CALL_RECORDS: usize = 20;
+
+/// Longest stop reason kept, in characters. It is the provider's text.
+const MAX_STOP_REASON_CHARS: usize = 40;
+
+/// One LLM call, as the provider reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmCallRecord {
+    pub provider: String,
+    pub model: String,
+    /// `None` when the provider reported no usage.
+    pub prompt_tokens: Option<u64>,
+    /// `None` when the provider reported no usage. For a model that reasons
+    /// before it answers this INCLUDES the reasoning: no provider path here
+    /// reports reasoning tokens on their own.
+    pub completion_tokens: Option<u64>,
+    /// The provider's own word for why generation stopped (`stop`,
+    /// `length`, `end_turn`, `max_tokens`, …), passed through unchanged.
+    pub stop_reason: Option<String>,
+    /// Wall-clock time of the call, when the call site measured it.
+    pub duration_ms: Option<u64>,
+}
+
+impl LlmUsage {
+    /// The per-`(provider, model)` totals.
+    #[must_use]
+    pub fn totals(&self) -> &HashMap<(String, String), (u64, u64, u32)> {
+        &self.totals
+    }
+
+    /// The first [`MAX_LLM_CALL_RECORDS`] calls, in order.
+    #[must_use]
+    pub fn calls(&self) -> &[LlmCallRecord] {
+        &self.calls
+    }
+
+    /// Calls made after the list was full.
+    #[must_use]
+    pub fn calls_not_listed(&self) -> u32 {
+        self.calls_not_listed
+    }
+}
+
+/// Record one LLM call: fold its usage into the totals (the rule
+/// [`fold_llm_usage`] has always applied) and keep it in the call list while
+/// there is room.
+pub fn record_llm_call(acc: &LlmUsageAcc, mut call: LlmCallRecord) {
+    if let Some(reason) = call.stop_reason.as_mut() {
+        *reason = reason
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_STOP_REASON_CHARS)
+            .collect();
+    }
+    fold_llm_usage(
+        acc,
+        &call.provider,
+        &call.model,
+        call.prompt_tokens.unwrap_or(0),
+        call.completion_tokens.unwrap_or(0),
+    );
+    if let Ok(mut usage) = acc.lock() {
+        if usage.calls.len() < MAX_LLM_CALL_RECORDS {
+            usage.calls.push(call);
+        } else {
+            usage.calls_not_listed = usage.calls_not_listed.saturating_add(1);
+        }
+    }
+}
 
 /// Per-job fuel accumulator: the fuel every in-worker attempt of a job
 /// consumed, drained into the signed `JobResult::fuel`.
@@ -88,8 +174,9 @@ pub fn fold_llm_usage(
     if prompt_tokens == 0 && completion_tokens == 0 {
         return;
     }
-    if let Ok(mut map) = acc.lock() {
-        let slot = map
+    if let Ok(mut usage) = acc.lock() {
+        let slot = usage
+            .totals
             .entry((provider.to_string(), model.to_string()))
             .or_insert((0, 0, 0));
         slot.0 = slot.0.saturating_add(prompt_tokens);
@@ -106,7 +193,7 @@ pub fn drain_llm_usage_entries(
     acc: &LlmUsageAcc,
 ) -> Vec<talos_workflow_job_protocol::LlmUsageEntry> {
     let mut items: Vec<((String, String), (u64, u64, u32))> = match acc.lock() {
-        Ok(mut map) => map.drain().collect(),
+        Ok(mut usage) => usage.totals.drain().collect(),
         Err(_) => return Vec::new(),
     };
     items.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1808,7 +1895,7 @@ impl TalosContext {
             // Fresh per-context accumulator; dispatch paths that need to
             // read usage after execution overwrite this with their own Arc
             // (same pattern as `state_store` sharing across pipeline steps).
-            llm_usage: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            llm_usage: LlmUsageAcc::default(),
             // Off unless a caller explicitly asks to collect diagnostics
             // in-process (`run_sandbox` / `test_module`). Every NATS-backed
             // dispatch path leaves this None and is unchanged.
@@ -3670,7 +3757,69 @@ mod llm_usage_acc_tests {
     use super::*;
 
     fn acc() -> LlmUsageAcc {
-        Arc::new(std::sync::Mutex::new(HashMap::new()))
+        LlmUsageAcc::default()
+    }
+
+    fn call(model: &str, completion: Option<u64>, stop: Option<&str>) -> LlmCallRecord {
+        LlmCallRecord {
+            provider: "ollama".into(),
+            model: model.into(),
+            prompt_tokens: completion.map(|_| 30),
+            completion_tokens: completion,
+            stop_reason: stop.map(str::to_string),
+            duration_ms: Some(12),
+        }
+    }
+
+    /// The observed run made two calls and showed one total. The second had
+    /// spent its whole budget reasoning and was cut off; nothing said so.
+    #[test]
+    fn each_call_is_kept_in_order_with_why_it_stopped_beside_the_totals() {
+        let a = acc();
+        record_llm_call(&a, call("m", Some(66), Some("stop")));
+        record_llm_call(&a, call("m", Some(1500), Some("length")));
+        let usage = a.lock().unwrap();
+        assert_eq!(
+            usage.totals()[&("ollama".to_string(), "m".to_string())],
+            (60, 1566, 2)
+        );
+        let stops: Vec<_> = usage
+            .calls()
+            .iter()
+            .map(|c| c.stop_reason.as_deref())
+            .collect();
+        assert_eq!(stops, [Some("stop"), Some("length")]);
+        assert_eq!(usage.calls()[1].completion_tokens, Some(1500));
+        assert_eq!(usage.calls_not_listed(), 0);
+    }
+
+    #[test]
+    fn the_call_list_is_bounded_and_the_rest_are_counted() {
+        let a = acc();
+        for _ in 0..MAX_LLM_CALL_RECORDS + 7 {
+            record_llm_call(&a, call("m", Some(1), Some("stop")));
+        }
+        let usage = a.lock().unwrap();
+        assert_eq!(usage.calls().len(), MAX_LLM_CALL_RECORDS);
+        assert_eq!(usage.calls_not_listed(), 7);
+        // The totals still count every call.
+        assert_eq!(
+            usage.totals()[&("ollama".to_string(), "m".to_string())].2 as usize,
+            MAX_LLM_CALL_RECORDS + 7
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_usage_is_listed_and_a_providers_stop_text_is_bounded() {
+        let a = acc();
+        let hostile = format!("len\u{7}gth{}", "x".repeat(200));
+        record_llm_call(&a, call("m", None, Some(&hostile)));
+        let usage = a.lock().unwrap();
+        // No usage: nothing in the totals (the ledger's rule), still a call.
+        assert!(usage.totals().is_empty());
+        let reason = usage.calls()[0].stop_reason.clone().unwrap();
+        assert_eq!(reason.chars().count(), 40);
+        assert!(reason.starts_with("length") && !reason.chars().any(char::is_control));
     }
 
     #[test]

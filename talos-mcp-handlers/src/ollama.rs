@@ -50,14 +50,15 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "local_llm_complete",
-            "description": "Run a chat completion against a local Ollama model (Tier 1 — data stays on-prem, no API costs, no DLP needed). Ideal for: classification, entity extraction, simple summarization, JSON structuring, and processing sensitive data. For complex reasoning or large context, use the anthropic-structured-llm module (Tier 2) instead.",
+            "description": "Run a chat completion against a local Ollama model (Tier 1 — data stays on-prem, no API costs, no DLP needed). Ideal for: classification, entity extraction, simple summarization, JSON structuring, and processing sensitive data. For complex reasoning or large context, use the anthropic-structured-llm module (Tier 2) instead. The reply is the answer text, then a second block with {model, stop_reason, usage: {prompt_tokens, completion_tokens}, duration_ms}: `stop_reason` is the model's own word, and `length` means the answer was cut off at max_tokens (with an empty answer, the whole budget went on reasoning). Only a model that runs on this machine is called: a cloud-hosted Ollama model is refused.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "model": { "type": "string", "description": "Ollama model name (default: 'mistral')" },
                     "system_prompt": { "type": "string", "description": "System instructions for the model" },
                     "user_prompt": { "type": "string", "description": "User message / input to process" },
-                    "max_tokens": { "type": "integer", "description": "Maximum tokens to generate (default: 1024)" }
+                    "max_tokens": { "type": "integer", "description": "Maximum tokens to generate (default: 1024). For a model that reasons first, reasoning counts against it." },
+                    "options": { "type": "object", "description": "Provider options, the same object a module passes to `llm::complete_with_options`, checked and applied by the same code (at most 8 KiB): `think` (true/false), `response_format` ({\"type\": \"json_object\"} or a json_schema), `temperature`, `top_p`, `top_k`, `seed`, `stop`, `num_ctx`, `keep_alive`, … Use it to try a prompt exactly as a module will send it. Options tune the request: `model`, `messages`, `system` and `stream` in it are dropped, so it cannot change which model is called. `think` is off unless options sets it (a module that sets no `think` gets the model's own default, which for a reasoning model is on: pass \"think\": true to reproduce that)." }
                 },
                 "required": ["user_prompt"]
             }
@@ -319,6 +320,61 @@ async fn handle_show_model(
     }
 }
 
+/// Read the `options` argument of `local_llm_complete`: an object, checked
+/// by the rule the worker applies to a module's `complete-with-options`
+/// (`talos_worker_runtime::provider_options`), not by one written here.
+///
+/// # Errors
+/// The worker's own words, or that the argument is not an object.
+pub(crate) fn local_complete_options(
+    args: &Value,
+) -> Result<Option<serde_json::Map<String, Value>>, String> {
+    match args.get("options") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(map)) if map.is_empty() => Ok(None),
+        Some(object @ Value::Object(_)) => {
+            talos_worker_runtime::provider_options::parse_provider_options(Some(
+                &object.to_string(),
+            ))
+        }
+        Some(other) => Err(format!(
+            "options must be an object (for example {{\"think\": true}}), got {}",
+            crate::utils::json_type_name(other)
+        )),
+    }
+}
+
+/// What `local_llm_complete` says about a completion, beside its text.
+pub(crate) fn local_complete_report(
+    model: &str,
+    reply: &talos_llm::ChatReply,
+    elapsed: std::time::Duration,
+) -> Value {
+    let cut_off = reply
+        .stop_reason
+        .as_deref()
+        .is_some_and(|reason| reason.eq_ignore_ascii_case("length"));
+    let mut report = serde_json::json!({
+        "model": model,
+        "stop_reason": reply.stop_reason,
+        "usage": {
+            "prompt_tokens": reply.prompt_tokens,
+            "completion_tokens": reply.completion_tokens,
+        },
+        "duration_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    });
+    if cut_off {
+        report["note"] = Value::String(if reply.text.is_empty() {
+            "Stopped for length with no answer: the whole max_tokens budget went on reasoning. \
+             Raise max_tokens, or pass options {\"think\": false}."
+                .to_string()
+        } else {
+            "Stopped for length: the answer above is cut off at max_tokens.".to_string()
+        });
+    }
+    report
+}
+
 async fn handle_local_complete(
     req_id: Option<Value>,
     args: &Value,
@@ -375,23 +431,45 @@ async fn handle_local_complete(
         return mcp_error(req_id, -32602, "system_prompt exceeds 50KB limit");
     }
 
+    // `options`: what a module passes to `llm::complete-with-options`,
+    // checked by the worker's own rule and applied by its own translation,
+    // so a prompt tried here is sent as the module would send it.
+    let options = match local_complete_options(args) {
+        Ok(options) => options,
+        Err(message) => return mcp_error(req_id, -32602, &message),
+    };
+    let apply_options = |body: &mut Value| {
+        if let Some(options) = options.clone() {
+            talos_worker_runtime::provider_options::apply_to_local_body(body, options);
+        }
+    };
+
     // R2 token ledger: attribute usage to the requesting user (nil uuid
     // from a non-user agent context records unscoped — the task-local
     // still carries it, but the ledger insert treats it as a real user id
     // only when non-nil).
+    let started = std::time::Instant::now();
+    let call = client.complete_with_options(
+        &model,
+        system_prompt,
+        user_prompt,
+        max_tokens,
+        apply_options,
+    );
     let completion = if user_id.is_nil() {
-        client
-            .complete(&model, system_prompt, user_prompt, max_tokens)
-            .await
+        call.await
     } else {
-        talos_llm::usage::scoped_user(
-            user_id,
-            client.complete(&model, system_prompt, user_prompt, max_tokens),
-        )
-        .await
+        talos_llm::usage::scoped_user(user_id, call).await
     };
     match completion {
-        Ok(text) => mcp_text(req_id, &text),
+        Ok(reply) => {
+            let report = local_complete_report(&model, &reply, started.elapsed());
+            // The answer first and on its own, as it has always been; what
+            // the model said about it in a second block.
+            let mut resp = mcp_text(req_id, &reply.text);
+            crate::utils::append_warning_block(&mut resp, &report.to_string());
+            resp
+        }
         Err(e) => {
             // MCP-316 (2026-05-11): mirror the MCP-217 redaction applied
             // to list/pull/delete/show. The four sibling handlers all
@@ -406,5 +484,107 @@ async fn handle_local_complete(
             tracing::error!(model = %model, "ollama local_complete failed: {:#}", e);
             mcp_error(req_id, -32000, "Local LLM completion failed")
         }
+    }
+}
+
+#[cfg(test)]
+mod local_complete_tests {
+    use super::{local_complete_options, local_complete_report};
+    use serde_json::json;
+
+    /// The request the tool sends for `args`, as the client builds it.
+    fn request(args: &serde_json::Value) -> serde_json::Value {
+        let options = local_complete_options(args).expect("options accepted");
+        talos_llm::local_request_with_options("local-model", "sys", "ask", 1500, |body| {
+            if let Some(options) = options.clone() {
+                talos_worker_runtime::provider_options::apply_to_local_body(body, options);
+            }
+        })
+    }
+
+    /// The observed module passed `{"think": true, "response_format":
+    /// {"type": "json_object"}}`; the tool took no options, so the same
+    /// prompt answered in 0.6 s and differently. With the same options the
+    /// tool now sends what the module sends.
+    #[test]
+    fn a_modules_options_are_sent_as_the_module_would_send_them() {
+        let body = request(&json!({
+            "options": { "think": true, "response_format": { "type": "json_object" }, "seed": 7 }
+        }));
+        assert_eq!(body["think"], true);
+        assert_eq!(body["format"], "json");
+        assert_eq!(body["options"]["seed"], 7);
+        assert_eq!(body["options"]["num_predict"], 1500);
+
+        // No options: the call the tool has always made (thinking off).
+        for args in [
+            json!({}),
+            json!({ "options": null }),
+            json!({ "options": {} }),
+        ] {
+            let body = request(&args);
+            assert_eq!(body["think"], false, "{args}");
+            assert!(body.get("format").is_none(), "{args}");
+        }
+    }
+
+    /// Options are the worker's to check. What it refuses, the tool refuses,
+    /// in the worker's words.
+    #[test]
+    fn options_the_validator_refuses_are_refused_and_the_model_cannot_be_moved() {
+        for (bad, why) in [
+            (json!("think"), "options must be an object"),
+            (json!(["think"]), "options must be an object"),
+            (json!(true), "options must be an object"),
+            (
+                json!({ "pad": "x".repeat(9 * 1024) }),
+                "provider options exceed 8192 bytes",
+            ),
+        ] {
+            let refusal = local_complete_options(&json!({ "options": bad })).unwrap_err();
+            assert!(refusal.contains(why), "{refusal}");
+        }
+
+        // Not a refusal, and not obeyed: an option naming another model or
+        // other messages is dropped, so the model that is called is the one
+        // the locality check was asked about.
+        let body = request(&json!({ "options": {
+            "model": "someone-elses:cloud",
+            "messages": [{ "role": "user", "content": "other" }],
+            "stream": true,
+        }}));
+        assert_eq!(body["model"], "local-model");
+        assert_eq!(body["messages"][1]["content"], "ask");
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn the_report_says_when_the_answer_was_cut_off_and_whether_any_arrived() {
+        let reply = |text: &str, stop: &str, completion: u64| talos_llm::ChatReply {
+            text: text.to_string(),
+            stop_reason: Some(stop.to_string()),
+            prompt_tokens: Some(412),
+            completion_tokens: Some(completion),
+        };
+        let elapsed = std::time::Duration::from_millis(41_000);
+        let cut = local_complete_report("local-model", &reply("", "length", 1500), elapsed);
+        assert_eq!(cut["stop_reason"], "length");
+        assert_eq!(
+            cut["usage"],
+            json!({ "prompt_tokens": 412, "completion_tokens": 1500 })
+        );
+        assert_eq!(cut["duration_ms"], 41_000);
+        assert!(cut["note"].as_str().unwrap().contains("went on reasoning"));
+
+        let partial =
+            local_complete_report("local-model", &reply("{\"a\":", "length", 1500), elapsed);
+        assert!(partial["note"]
+            .as_str()
+            .unwrap()
+            .contains("cut off at max_tokens"));
+
+        let whole = local_complete_report("local-model", &reply("{}", "stop", 12), elapsed);
+        assert_eq!(whole["stop_reason"], "stop");
+        assert!(whole.get("note").is_none());
     }
 }
