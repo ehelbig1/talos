@@ -58,6 +58,39 @@ assert_eq!(host::http::requests().len(), 1);
 
 State is per test thread: tests do not see each other's setup.
 
+## When one module reads another's output
+
+The fixture is the other module's real `run`, not a literal you wrote.
+
+Two modules can each pass every unit test and fail the first time they meet.
+It has happened: one wrote a count under a field name, and the other expected
+a list under the same name. Each module's tests fed it a hand-written,
+simplified copy of the other's output, so each passed against a shape the
+other module never produced. The first live run was the first time either
+saw the real one.
+
+So when module B consumes module A's output, B's test calls A:
+
+```rust
+// B's tests. `a` is module A, built into the same test crate.
+let upstream: serde_json::Value =
+    serde_json::from_str(&a::run(a_input()).unwrap()).unwrap();
+let out = run(json!({ "input": upstream }).to_string()).unwrap();
+```
+
+* Give A a representative input and stub its host calls, as in any test of A.
+  What B then reads is what A writes.
+* If A and B live in different crates, put the pair in a crate that includes
+  both (see "Modules outside the catalog"), or record A's output with a test
+  of A that fails when it changes, and have B read that file. A file nobody
+  regenerates is the hand-written literal again.
+* A literal is still right for input no module produces: a trigger payload,
+  a provider's response.
+* If the shape is exchanged across a service boundary by more than one pair
+  of modules, it is a contract: a doc, one block of source copied byte for
+  byte into every adapter, and a `<name>_contract.rs` test. See
+  `docs/building-blocks.md`.
+
 ## Modules outside the catalog
 
 Any crate can do what `talos-catalog-tests` does. In `build.rs`:

@@ -2186,6 +2186,91 @@ pub(crate) fn unknown_argument_warning(tool: &str, args: &serde_json::Value) -> 
     ))
 }
 
+/// The key a tool's JSON result carries the ignored argument names under.
+pub(crate) const IGNORED_ARGUMENTS_KEY: &str = "ignored_arguments";
+
+/// The most names [`unknown_argument_names`] returns, and the longest one it
+/// returns whole: a caller chooses its own argument names.
+const IGNORED_ARGUMENTS_MAX: usize = 32;
+const IGNORED_ARGUMENT_NAME_MAX_CHARS: usize = 64;
+
+/// The largest JSON text block [`carry_ignored_arguments`] will parse.
+const IGNORED_ARGUMENTS_MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+/// The argument NAMES `tool`'s advertised schema does not declare: what
+/// [`unknown_argument_warning`] warns about, as data. Sorted, at most
+/// [`IGNORED_ARGUMENTS_MAX`], each cut to
+/// [`IGNORED_ARGUMENT_NAME_MAX_CHARS`]. Empty when everything is declared,
+/// or the tool is not in the index.
+///
+/// SECURITY: names only, never values, as for the warning.
+pub(crate) fn unknown_argument_names(tool: &str, args: &serde_json::Value) -> Vec<String> {
+    let (Some(declared), Some(provided)) = (tool_arg_index().get(tool), args.as_object()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = provided
+        .keys()
+        .filter(|k| !k.starts_with('_') && !declared.contains(*k))
+        .map(|k| k.chars().take(IGNORED_ARGUMENT_NAME_MAX_CHARS).collect())
+        .collect();
+    names.sort();
+    names.dedup();
+    names.truncate(IGNORED_ARGUMENTS_MAX);
+    names
+}
+
+/// Put the ignored argument names INSIDE a tool's structured result.
+///
+/// The warning for an unknown argument is appended as a further text block
+/// ([`append_warning_block`]). A script that parses the first block, which
+/// is the JSON, never sees it: a misspelt `max_fuel` on `test_module` cost a
+/// fuel-exhausted run with nothing in the parsed result to say the limit had
+/// been ignored. So every text block that IS a JSON object also gets
+/// `ignored_arguments: [names]`.
+///
+/// Only objects are touched: an array or a prose block has nowhere to carry
+/// a key. A result that already has the key keeps its own. The block is
+/// written back pretty if it was pretty and compact if it was compact. With
+/// no ignored argument this does nothing, so every such reply is unchanged.
+pub(crate) fn carry_ignored_arguments(resp: &mut talos_mcp::JsonRpcResponse, names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    let Some(blocks) = resp
+        .result
+        .as_mut()
+        .and_then(|r| r.get_mut("content"))
+        .and_then(|c| c.as_array_mut())
+    else {
+        return;
+    };
+    for block in blocks {
+        let Some(text) = block.get("text").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        if text.len() > IGNORED_ARGUMENTS_MAX_RESULT_BYTES || !text.trim_start().starts_with('{') {
+            continue;
+        }
+        let Ok(serde_json::Value::Object(mut body)) = serde_json::from_str(text) else {
+            continue;
+        };
+        if body.contains_key(IGNORED_ARGUMENTS_KEY) {
+            continue;
+        }
+        let pretty = text.contains('\n');
+        body.insert(IGNORED_ARGUMENTS_KEY.to_string(), serde_json::json!(names));
+        let body = serde_json::Value::Object(body);
+        let rewritten = if pretty {
+            serde_json::to_string_pretty(&body)
+        } else {
+            serde_json::to_string(&body)
+        };
+        if let Ok(rewritten) = rewritten {
+            block["text"] = serde_json::Value::String(rewritten);
+        }
+    }
+}
+
 /// Human prose + machine-parsable JSON as two content blocks.
 ///
 /// Sweep DX finding (2026-07-07): id-bearing responses (`trigger_workflow`,
@@ -2440,6 +2525,114 @@ mod unknown_arg_tests {
         .expect("a misspelling must still warn");
         assert!(w.contains("cron_expression"), "warning: {w}");
         assert!(!w.contains("* * * * *"), "arg value leaked: {w}");
+    }
+
+    fn text_result(blocks: &[&str]) -> talos_mcp::JsonRpcResponse {
+        talos_mcp::JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            result: Some(serde_json::json!({
+                "content": blocks
+                    .iter()
+                    .map(|t| serde_json::json!({ "type": "text", "text": t }))
+                    .collect::<Vec<_>>()
+            })),
+            error: None,
+            error_kind: None,
+        }
+    }
+
+    fn block_text(resp: &talos_mcp::JsonRpcResponse, i: usize) -> String {
+        resp.result.as_ref().unwrap()["content"][i]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The observed miss: `test_module(max_feul: …)`. The warning went out
+    /// as a second block; a script reading the JSON saw a fuel-exhausted run
+    /// and nothing else.
+    #[test]
+    fn a_misspelt_argument_is_named_inside_the_json_result_as_well() {
+        let args = serde_json::json!({
+            "module_id": "m", "max_feul": 5_000_000, "zzz": 1, "_meta": {},
+        });
+        let names = unknown_argument_names("test_module", &args);
+        assert_eq!(names, ["max_feul", "zzz"], "sorted, names only, no `_meta`");
+
+        // The handler's reply: one JSON block. The decorator appends the
+        // warning block and carries the names into the JSON.
+        let mut resp =
+            text_result(&["{\n  \"status\": \"failed\",\n  \"error\": \"out of fuel\"\n}"]);
+        carry_ignored_arguments(&mut resp, &names);
+        append_warning_block(
+            &mut resp,
+            &unknown_argument_warning("test_module", &args).expect("warns"),
+        );
+
+        let first: serde_json::Value = serde_json::from_str(&block_text(&resp, 0)).unwrap();
+        assert_eq!(
+            first["ignored_arguments"],
+            serde_json::json!(["max_feul", "zzz"])
+        );
+        assert_eq!(first["status"], "failed");
+        assert!(
+            block_text(&resp, 0).contains('\n'),
+            "a pretty block stays pretty"
+        );
+        // The existing block is kept, and no VALUE is anywhere.
+        assert!(block_text(&resp, 1).starts_with("⚠ unknown argument"));
+        assert!(!serde_json::to_string(&resp.result)
+            .unwrap()
+            .contains("5000000"));
+    }
+
+    #[test]
+    fn only_json_object_blocks_carry_the_names_and_nothing_changes_without_any() {
+        let names = vec!["typo".to_string()];
+        let mut resp = text_result(&[
+            "Started. execution_id: abc",
+            r#"{"execution_id":"abc"}"#,
+            "[1,2,3]",
+            "{ not json",
+            r#"{"ignored_arguments":["its own"],"x":1}"#,
+        ]);
+        carry_ignored_arguments(&mut resp, &names);
+        assert_eq!(block_text(&resp, 0), "Started. execution_id: abc");
+        assert_eq!(
+            block_text(&resp, 1),
+            r#"{"execution_id":"abc","ignored_arguments":["typo"]}"#,
+            "a compact block stays compact"
+        );
+        assert_eq!(block_text(&resp, 2), "[1,2,3]");
+        assert_eq!(block_text(&resp, 3), "{ not json");
+        assert_eq!(
+            block_text(&resp, 4),
+            r#"{"ignored_arguments":["its own"],"x":1}"#
+        );
+
+        // No ignored argument: the reply is untouched, byte for byte.
+        let before = text_result(&[r#"{"b":1,"a":2}"#]);
+        let mut after = text_result(&[r#"{"b":1,"a":2}"#]);
+        carry_ignored_arguments(&mut after, &[]);
+        assert_eq!(block_text(&after, 0), block_text(&before, 0));
+        assert!(
+            unknown_argument_names("test_module", &serde_json::json!({"module_id": "m"}))
+                .is_empty()
+        );
+    }
+
+    /// A caller chooses its argument names, so the list is bounded.
+    #[test]
+    fn the_names_are_bounded_in_number_and_length() {
+        let mut args = serde_json::Map::new();
+        for i in 0..100 {
+            args.insert(format!("unknown_{i:03}"), serde_json::json!(1));
+        }
+        args.insert("x".repeat(500), serde_json::json!(1));
+        let names = unknown_argument_names("test_module", &serde_json::Value::Object(args));
+        assert_eq!(names.len(), 32);
+        assert!(names.iter().all(|n| n.chars().count() <= 64));
     }
 
     #[test]

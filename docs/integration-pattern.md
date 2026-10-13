@@ -687,6 +687,29 @@ answer pattern if you find yourself in the "yes" case.
   - At-most-once (rare — basically only Slack's "interactive"
     responses): don't 500 unless you can recover by reprocessing.
 
+### A started workflow that causes its own notification
+
+- **Does the workflow a notification starts do anything the notification
+  source reports?** If it does, every run starts the next one.
+  - The plain case is a write: a workflow started by "an issue changed" that
+    edits the issue. Most authors see that one coming.
+  - The case that is missed is a READ. Some sources report reads. An
+    audit-log alert whose filter matches List or Get calls is fired by a
+    workflow that lists the same resources to look at them, so each run
+    produces the notification that starts the next run. Nothing fails: the
+    workflow simply never stops being started.
+  - Rule: a workflow started by a change notification must not generate that
+    notification by reading. Before binding a workflow to a channel, write
+    down the calls the workflow makes against the source and check each one
+    against the filter that feeds the channel.
+  - Fix it at the filter, not in the workflow: narrow the filter to the
+    change you care about (the mutating methods, a specific resource), or
+    exclude the identity the workflow acts as. A guard inside the workflow
+    ("skip if I ran a minute ago") still spends an execution per loop turn
+    and hides the loop instead of ending it.
+  - Deduplication on the event id does not end it: each run's reads are new
+    events.
+
 ## Common pitfalls — "don't re-learn these"
 
 Drawn from real commits we paid for.
