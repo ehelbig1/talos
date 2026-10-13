@@ -1288,6 +1288,9 @@ async fn handle_tools_call_inner(
     // catches caller typos AND schema under-declaration without turning
     // either into a hard failure. Names only in the log — never values.
     let arg_warning = crate::utils::unknown_argument_warning(name, &args);
+    // The same names as data, for the structured result (a script that
+    // parses the JSON block never reads the warning block).
+    let ignored_arguments = crate::utils::unknown_argument_names(name, &args);
     if let Some(w) = arg_warning.as_deref() {
         tracing::warn!(
             target: "talos_mcp",
@@ -1313,6 +1316,7 @@ async fn handle_tools_call_inner(
     let decorate = |mut r: JsonRpcResponse| -> JsonRpcResponse {
         // Says what a `[REDACTED:…]` marker in the result does and does not mean.
         crate::utils::append_redaction_notice(&mut r);
+        crate::utils::carry_ignored_arguments(&mut r, &ignored_arguments);
         if let Some(w) = arg_warning.as_deref() {
             crate::utils::append_warning_block(&mut r, w);
         }
