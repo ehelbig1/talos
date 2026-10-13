@@ -398,6 +398,7 @@ into both deployments.
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
 | `TALOS_PUBLIC_BASE_URL` | none (optional; wins over discovery) | controller | Explicit public origin for external URLs (validated) | 🔒 (open-redirect) |
+| `TALOS_ACTION_LINKS_BASE_URL` | none (optional; action links use the public address) | controller | The address action links are minted on, when it should not be the public one (for example a private-network address). `https://host` or `https://host:port` only. A value that is not mints NO link (`link_address_misconfigured` in the node's report, an error in the log); it is never replaced by the public address. See `docs/action-links.md`. | |
 | `TALOS_NGROK_API_URL` | none (optional) | controller | ngrok local API to auto-discover the tunnel URL | |
 | `TALOS_PUBLIC_URL_REFRESH_SECS` | `60` (min 10) | controller | ngrok URL refresh interval | |
 | `NGROK_AUTHTOKEN` | none | compose (shell) | Starts the ngrok sidecar (compose profile `public`) | 🔒 |

@@ -1096,6 +1096,128 @@ pub fn get_base_url() -> String {
     "http://localhost:8000".to_string()
 }
 
+/// The variable an operator sets to put action links on an address of their
+/// own choosing ([`action_links_base_url`]).
+pub const ACTION_LINKS_BASE_URL_ENV: &str = "TALOS_ACTION_LINKS_BASE_URL";
+
+/// Why a value of [`ACTION_LINKS_BASE_URL_ENV`] was refused. Carries no part
+/// of the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionLinksBaseError {
+    /// Not `https://`. A link carries a capability token in its path, so it
+    /// is never minted for a plaintext address.
+    NotHttps,
+    /// Something other than a scheme and a host (and a port): a path, a
+    /// query, a fragment, userinfo, whitespace, or no host at all.
+    NotAnOrigin,
+}
+
+impl ActionLinksBaseError {
+    /// What an operator is told.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotHttps => "it must begin with https://",
+            Self::NotAnOrigin => {
+                "it must be https://host or https://host:port, with no path, query, fragment \
+                 or user information"
+            }
+        }
+    }
+}
+
+/// Read a value of [`ACTION_LINKS_BASE_URL_ENV`].
+///
+/// * unset or blank → `Ok(None)`: action links go out on the deployment's
+///   public address, exactly as before this setting existed;
+/// * `https://host[:port]` → `Ok(Some(origin))`;
+/// * anything else → `Err`. A caller must then mint NOTHING. This setting
+///   exists to keep a link (its token, and the label its page shows) off the
+///   public address, so a mistyped value must not send links out on the very
+///   address it was set to avoid.
+///
+/// Pure, so the rule is testable without the environment.
+pub fn parse_action_links_base(raw: Option<&str>) -> Result<Option<String>, ActionLinksBaseError> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if !value.starts_with("https://") {
+        return Err(ActionLinksBaseError::NotHttps);
+    }
+    if !is_valid_frontend_url(value) {
+        return Err(ActionLinksBaseError::NotAnOrigin);
+    }
+    Ok(Some(value.to_string()))
+}
+
+/// The address action links are minted on, when the operator has set one
+/// ([`ACTION_LINKS_BASE_URL_ENV`]). See [`parse_action_links_base`] for the
+/// three answers; `Err` means "mint nothing", never "use the public one".
+pub fn action_links_base_url() -> Result<Option<String>, ActionLinksBaseError> {
+    parse_action_links_base(std::env::var(ACTION_LINKS_BASE_URL_ENV).ok().as_deref())
+}
+
+#[cfg(test)]
+mod action_links_base_tests {
+    use super::{parse_action_links_base, ActionLinksBaseError as E};
+
+    #[test]
+    fn unset_or_blank_is_no_override() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(parse_action_links_base(raw), Ok(None), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn an_https_origin_is_used_as_given() {
+        for raw in [
+            "https://links.example",
+            "https://links.example:8443",
+            "  https://talos.tailnet.example  ",
+        ] {
+            assert_eq!(
+                parse_action_links_base(Some(raw)),
+                Ok(Some(raw.trim().to_string())),
+                "{raw}"
+            );
+        }
+    }
+
+    /// A link's path is a capability token. A value that is not an https
+    /// origin is refused; it is never repaired and never ignored.
+    #[test]
+    fn anything_else_is_refused() {
+        for raw in [
+            "http://links.example",
+            "links.example",
+            "ftp://links.example",
+            "//links.example",
+        ] {
+            assert_eq!(
+                parse_action_links_base(Some(raw)),
+                Err(E::NotHttps),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "https://",
+            "https://links.example/",
+            "https://links.example/base",
+            "https://links.example?x=1",
+            "https://links.example#frag",
+            "https://user@links.example",
+            "https://links.example@other.example",
+            "https://links .example",
+        ] {
+            assert_eq!(
+                parse_action_links_base(Some(raw)),
+                Err(E::NotAnOrigin),
+                "{raw}"
+            );
+        }
+    }
+}
+
 /// Returns true if `raw` is `http(s)://host(:port)` with no path,
 /// query, or fragment. Mirrors the inline validation in
 /// `talos-atlassian::callback_handler` and

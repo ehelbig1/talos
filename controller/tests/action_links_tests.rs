@@ -339,6 +339,119 @@ async fn a_dry_run_writes_no_token_row_and_returns_no_link() {
     assert!(output.to_string().contains("/action-links/"), "{output}");
 }
 
+/// A deployment may mint its links on an address of its own
+/// (`TALOS_ACTION_LINKS_BASE_URL`). The address is only where the link
+/// points: a token is found by its hash, so a link minted under either
+/// address opens the same page, and single use is unchanged.
+#[tokio::test]
+async fn a_link_minted_under_either_address_resolves_and_is_still_single_use() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let owner = create_test_user(&ctx.auth_service, "action_links_base@example.com").await;
+    let list = create_test_workflow(&pool, owner, "al-base-list").await;
+    let repo = ExecutionRepository::new(pool.clone());
+    let request = || ActionLinkRequest {
+        workflow_id: list,
+        label: "Done".into(),
+        payload: json!({ "op": "done" }),
+    };
+    let minted = repo
+        .mint_action_tokens(owner, None, None, None, &[request(), request()])
+        .await
+        .expect("mint");
+    let urls = [
+        talos_execution_repository::action_links::action_url(
+            "https://public-tunnel.example",
+            minted[0].as_ref().expect("minted"),
+        ),
+        talos_execution_repository::action_links::action_url(
+            "https://links.private.example:8443",
+            minted[1].as_ref().expect("minted"),
+        ),
+    ];
+    assert!(urls[0].starts_with("https://public-tunnel.example/action-links/"));
+    assert!(urls[1].starts_with("https://links.private.example:8443/action-links/"));
+
+    for url in &urls {
+        let token = token_of(url).to_string();
+        let (status, body) = body_of(
+            talos_webhooks::action_link_preview(Path(token.clone()), Extension(pool.clone()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, 200, "{url}");
+        assert!(body.contains("al-base-list"), "{body}");
+        // Looking did not use it; the first claim does, and the second finds
+        // nothing to claim.
+        assert!(matches!(
+            repo.claim_action_token(&token).await.expect("claim"),
+            ActionClaim::Claimed(_)
+        ));
+        assert!(!matches!(
+            repo.claim_action_token(&token).await.expect("claim"),
+            ActionClaim::Claimed(_)
+        ));
+    }
+}
+
+/// The minter itself, on real rows: with the operator's own address the link
+/// is on that address; with a setting that cannot be used NOTHING is minted
+/// (no link, and no token row either) and nothing goes out on the public
+/// address the setting was there to avoid.
+#[tokio::test]
+async fn an_unusable_address_setting_mints_nothing_and_a_usable_one_is_where_the_link_points() {
+    use talos_workflow_engine_core::action_links::ActionLinkSpec;
+
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let owner = create_test_user(&ctx.auth_service, "action_links_setting@example.com").await;
+    let list = create_test_workflow(&pool, owner, "al-setting-list").await;
+    let minter = talos_engine::action_link_minter::PostgresActionLinkMinter::new(pool.clone());
+    let specs = [ActionLinkSpec {
+        workflow_id: list,
+        label: "Done".into(),
+        payload: json!({ "op": "done" }),
+    }];
+    let token_rows = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workflow_action_tokens")
+            .fetch_one(&pool)
+            .await
+            .expect("count tokens")
+    };
+
+    for refused in [
+        talos_config::parse_action_links_base(Some("http://links.private.example")),
+        talos_config::parse_action_links_base(Some("https://links.private.example/base")),
+    ] {
+        assert!(refused.is_err());
+        let minted = minter
+            .mint_with_setting(refused, owner, Uuid::new_v4(), "links", Some(24), &specs)
+            .await
+            .expect("a refusal is an answer, not an error");
+        assert_eq!(
+            minted,
+            vec![Err(
+                talos_engine::action_link_minter::LINK_ADDRESS_MISCONFIGURED.to_string()
+            )]
+        );
+        assert_eq!(token_rows().await, 0, "a refused mint wrote a token row");
+    }
+
+    let own = talos_config::parse_action_links_base(Some("https://links.private.example"));
+    let minted = minter
+        .mint_with_setting(own, owner, Uuid::new_v4(), "links", Some(24), &specs)
+        .await
+        .expect("mint");
+    let url = minted[0].as_ref().expect("minted");
+    assert!(
+        url.starts_with("https://links.private.example/action-links/"),
+        "the link is not on the operator's address"
+    );
+    assert_eq!(token_of(url).len(), 64);
+    assert_eq!(token_rows().await, 1);
+}
+
 /// The store's own guarantees: a workflow that is not the minting user's is
 /// refused, and a link is claimed exactly once however it is submitted.
 #[tokio::test]
