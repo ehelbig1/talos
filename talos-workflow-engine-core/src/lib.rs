@@ -212,7 +212,7 @@ pub use secret_envelope::{
 };
 pub use secrets::{
     BoxError, ForcedRefresh, GcpImpersonationTokenProvider, GithubInstallationTokenProvider,
-    SecretsResolver,
+    MintReadiness, SecretsResolver,
 };
 pub use shared_key::{WorkerKeyRing, WorkerSharedKey};
 pub use sub_actor_context::{SubworkflowActorContextResolver, SubworkflowBinding};

@@ -147,7 +147,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_secret_access",
-            "description": format!("Debug whether a given module would be allowed to read a given secret path WITHOUT actually executing the module. Reports FIVE gates as PASS/FAIL with a human-readable reason:\n\n  1. capability_world — can the module reach a secret AT ALL, by EITHER route: the GUEST route (`secrets::get_secret()`, which needs the secrets interface) or the HOST route (a `vault://` marker in an outbound header or JSON body, resolved by the host at the socket — available to every world above minimal, and the route every OAuth integration uses). The per-route answers are in `gates[0].routes`.\n  2. allowed_secrets allowlist — is the path covered by the module's grant (exact / prefix match / wildcard)?\n  3. reserved_host_path — LLM provider keys (anthropic/api_key, openai/api_key, gemini/api_key) are deny-listed for ALL guests, even with allowed_secrets: [\\\"*\\\"]; the host uses them via the llm::* interface only.\n  4. vault_presence — is the secret actually stored in the vault for this user?\n  5. dispatch_prefetch — will a dispatch actually DELIVER this path on the strength of the grant alone? Gates 1-4 can all pass while the module receives nothing. {}\n\nUse this when get_secret() is failing at runtime with `unauthorized` to identify which gate is responsible without redeploying. NOTE: gate 5 is deliberately NOT folded into `would_succeed`, because the config-reference delivery route is not visible from here.", talos_workflow_job_protocol::SECRET_GRANT_DELIVERY_NOTE),
+            "description": format!("Debug whether a given module would be allowed to read a given secret path WITHOUT actually executing the module. Reports FIVE gates as PASS/FAIL with a human-readable reason:\n\n  1. capability_world — can the module reach a secret AT ALL, by EITHER route: the GUEST route (`secrets::get_secret()`, which needs the secrets interface) or the HOST route (a `vault://` marker in an outbound header or JSON body, resolved by the host at the socket — available to every world above minimal, and the route every OAuth integration uses). The per-route answers are in `gates[0].routes`.\n  2. allowed_secrets allowlist — is the path covered by the module's grant (exact / prefix match / wildcard)?\n  3. reserved_host_path — LLM provider keys (anthropic/api_key, openai/api_key, gemini/api_key) are deny-listed for ALL guests, even with allowed_secrets: [\\\"*\\\"]; the host uses them via the llm::* interface only.\n  4. vault_presence — is the secret actually stored in the vault for this user? For a path that is MINTED at dispatch (gcp/impersonated/<service account>/access_token, .../as/<connection key>/access_token, github_app:<owner>) nothing is ever stored, so this gate is `mint_readiness` instead: does this user have a connection to mint from (one Google Cloud (full) connection, or the one the path names; an active GitHub App installation for the owner)? No token is minted by this check, and it never advises storing a secret at such a path.\n  5. dispatch_prefetch — will a dispatch actually DELIVER this path on the strength of the grant alone? Gates 1-4 can all pass while the module receives nothing. {}\n\nUse this when get_secret() is failing at runtime with `unauthorized` to identify which gate is responsible without redeploying. NOTE: gate 5 is deliberately NOT folded into `would_succeed`, because the config-reference delivery route is not visible from here.", talos_workflow_job_protocol::SECRET_GRANT_DELIVERY_NOTE),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1695,33 +1695,48 @@ async fn handle_test_secret_access(
     // secret that may already be there, over a vault we never reached. So the
     // read is recorded, the reason states which of the two happened, and
     // `checked` says whether the answer is evidence.
-    let presence_read = readings.record(
-        "gates.vault_presence",
-        state
-            .secrets_manager
-            .secret_exists_by_path(&secret_path, user_id)
-            .await,
-    );
-    let presence_checked = presence_read.is_some();
-    let exists = presence_read.unwrap_or(false);
-    let gate_presence = serde_json::json!({
-        "name": "vault_presence",
-        "passed": exists,
-        "checked": presence_checked,
-        "reason": if !presence_checked {
-            format!(
-                "Could NOT check whether a secret is stored at path '{}' — the vault lookup failed (see server logs). This gate is reported as not passed so the overall verdict stays conservative; it is NOT evidence that the secret is absent, so do not add one on the strength of it.",
-                secret_path
-            )
-        } else if exists {
-            format!("Secret exists at path '{}' for this user.", secret_path)
-        } else {
-            format!(
-                "No secret stored at path '{}' for this user. Add it in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.",
-                secret_path
-            )
-        },
-    });
+    //
+    // A path MINTED at dispatch (`gcp/impersonated/…/access_token`,
+    // `github_app:<owner>`) has nothing stored at it, ever, so the vault is
+    // the wrong thing to ask and "add it in the dashboard" the wrong advice:
+    // a secret stored there is never read. For such a path this gate asks
+    // what a mint needs instead — a connection of this user's to mint from —
+    // through the provider the dispatch itself uses, without minting.
+    let (gate_presence, exists) = match talos_oauth::resolver::check_mint(&secret_path, user_id)
+        .await
+    {
+        Some(check) => (mint_readiness_gate(&secret_path, check), check.is_ready()),
+        None => {
+            let presence_read = readings.record(
+                "gates.vault_presence",
+                state
+                    .secrets_manager
+                    .secret_exists_by_path(&secret_path, user_id)
+                    .await,
+            );
+            let presence_checked = presence_read.is_some();
+            let exists = presence_read.unwrap_or(false);
+            let gate = serde_json::json!({
+                "name": "vault_presence",
+                "passed": exists,
+                "checked": presence_checked,
+                "reason": if !presence_checked {
+                    format!(
+                        "Could NOT check whether a secret is stored at path '{}' — the vault lookup failed (see server logs). This gate is reported as not passed so the overall verdict stays conservative; it is NOT evidence that the secret is absent, so do not add one on the strength of it.",
+                        secret_path
+                    )
+                } else if exists {
+                    format!("Secret exists at path '{}' for this user.", secret_path)
+                } else {
+                    format!(
+                        "No secret stored at path '{}' for this user. Add it in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.",
+                        secret_path
+                    )
+                },
+            });
+            (gate, exists)
+        }
+    };
 
     let all_pass = world_allowed && !is_reserved && allow_pass && exists;
     let mut body = serde_json::json!({
@@ -6173,6 +6188,184 @@ async fn handle_find_module_alternatives(
         }))
         .unwrap_or_default(),
     )
+}
+
+/// Gate 4 of `test_secret_access` for a path that is MINTED at dispatch.
+///
+/// Nothing is stored at such a path, so the gate reports what a mint needs
+/// (a connection of the caller's to mint from) and never advises storing a
+/// secret there. `passed` is `check.is_ready()`; an unreadable check is not
+/// passed and says it is not evidence.
+///
+/// A connection key that is not the caller's gets one sentence whether it is
+/// another user's, disconnected, or nothing at all: the check cannot tell
+/// them apart and this text must not pretend to.
+fn mint_readiness_gate(
+    secret_path: &str,
+    check: talos_oauth::resolver::MintCheck,
+) -> serde_json::Value {
+    use talos_oauth::resolver::MintCheck;
+    use talos_workflow_engine_core::MintReadiness;
+    use talos_workflow_job_protocol::MintScheme;
+
+    const NEVER_STORE: &str = "Do NOT add a secret at this path: nothing stored there is ever \
+                               read.";
+    let scheme = check.scheme();
+    let from = scheme.made_from();
+    let minted = format!(
+        "Nothing is stored at '{secret_path}': its value is minted when a job is dispatched, \
+         from {from}."
+    );
+    let reason = match check {
+        MintCheck::Answered(_, MintReadiness::Ready) => format!(
+            "{minted} This user has one to mint from. NOT checked here, because no token was \
+             minted: whether the provider will issue it{}.",
+            match scheme {
+                MintScheme::GcpImpersonated =>
+                    " (the connected Google account must be allowed to impersonate the service \
+                     account)",
+                MintScheme::GithubApp => " (the installation must still be granted on GitHub)",
+            }
+        ),
+        MintCheck::Answered(_, MintReadiness::NoConnection) => format!(
+            "{minted} This user has none, so nothing would be minted and the module would fail \
+             on the missing secret. Connect one (list_connections shows what is connected). \
+             {NEVER_STORE}"
+        ),
+        MintCheck::Answered(_, MintReadiness::NamedConnectionNotUsable) => format!(
+            "{minted} The connection this path names is not an active one of this user's, so \
+             nothing would be minted. Use a connection key that list_connections shows for this \
+             user. {NEVER_STORE}"
+        ),
+        MintCheck::Answered(_, MintReadiness::SeveralAndNoneNamed) => format!(
+            "{minted} This user has several and the path names none, so nothing would be \
+             minted: the platform never chooses between accounts. Name one in the path \
+             ({}); list_connections shows each connection's key. {NEVER_STORE}",
+            scheme.forms()
+        ),
+        MintCheck::Answered(_, MintReadiness::NotConfigured) => format!(
+            "{minted} This deployment is not configured to mint it, so nothing would be minted. \
+             That is a deployment setting, not something to fix at this path. {NEVER_STORE}"
+        ),
+        MintCheck::Malformed(_) => format!(
+            "'{secret_path}' is taken as a mint path, but it is not a form the minter reads \
+             ({}). Nothing is minted for it, and nothing stored at it is read. Correct the path. \
+             {NEVER_STORE}",
+            scheme.forms()
+        ),
+        MintCheck::Unreadable(_) => format!(
+            "{minted} Could NOT check whether this user has one to mint from: the lookup failed \
+             (see server logs). This gate is reported as not passed so the overall verdict stays \
+             conservative; it is NOT evidence that a connection is missing. {NEVER_STORE}"
+        ),
+    };
+    serde_json::json!({
+        "name": "mint_readiness",
+        "passed": check.is_ready(),
+        "checked": !matches!(check, MintCheck::Unreadable(_)),
+        "minted_at_dispatch": true,
+        "reason": reason,
+    })
+}
+
+#[cfg(test)]
+mod mint_readiness_gate_tests {
+    use super::mint_readiness_gate;
+    use talos_oauth::resolver::MintCheck;
+    use talos_workflow_engine_core::MintReadiness as R;
+    use talos_workflow_job_protocol::MintScheme::{GcpImpersonated, GithubApp};
+
+    const PATH: &str = "gcp/impersonated/runner@example-project.iam.gserviceaccount.com/as/\
+                        0b7b0f0e-4c1d-4a57-9d2e-3f6a1c2b9e10/access_token";
+
+    fn gate(check: MintCheck) -> (bool, bool, String) {
+        let g = mint_readiness_gate(PATH, check);
+        assert_eq!(g["name"], "mint_readiness");
+        assert_eq!(g["minted_at_dispatch"], true);
+        (
+            g["passed"].as_bool().unwrap(),
+            g["checked"].as_bool().unwrap(),
+            g["reason"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// The defect: every one of these read "No secret stored … Add it in the
+    /// dashboard". Following that stores a secret nothing will ever read.
+    #[test]
+    fn no_outcome_advises_storing_a_secret_at_a_minted_path() {
+        for check in [
+            MintCheck::Answered(GcpImpersonated, R::Ready),
+            MintCheck::Answered(GcpImpersonated, R::NoConnection),
+            MintCheck::Answered(GcpImpersonated, R::NamedConnectionNotUsable),
+            MintCheck::Answered(GcpImpersonated, R::SeveralAndNoneNamed),
+            MintCheck::Answered(GcpImpersonated, R::NotConfigured),
+            MintCheck::Answered(GithubApp, R::NoConnection),
+            MintCheck::Malformed(GcpImpersonated),
+            MintCheck::Unreadable(GcpImpersonated),
+        ] {
+            let (_, _, reason) = gate(check);
+            assert!(!reason.contains("Add it in the dashboard"), "{reason}");
+            assert!(!reason.contains("Settings → Secrets"), "{reason}");
+            if !check.is_ready() {
+                assert!(reason.contains("Do NOT add a secret"), "{reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_usable_connection_passes_and_says_what_was_not_checked() {
+        let (passed, checked, reason) = gate(MintCheck::Answered(GcpImpersonated, R::Ready));
+        assert!(passed && checked);
+        assert!(
+            reason.contains("minted when a job is dispatched"),
+            "{reason}"
+        );
+        assert!(reason.contains("NOT checked here"), "{reason}");
+    }
+
+    #[test]
+    fn no_consent_and_two_with_none_named_each_say_what_to_do() {
+        let (passed, checked, reason) = gate(MintCheck::Answered(GcpImpersonated, R::NoConnection));
+        assert!(!passed && checked);
+        assert!(reason.contains("This user has none"), "{reason}");
+
+        let (passed, checked, reason) =
+            gate(MintCheck::Answered(GcpImpersonated, R::SeveralAndNoneNamed));
+        assert!(!passed && checked);
+        assert!(
+            reason.contains("several and the path names none"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("/as/<connection key>/access_token"),
+            "{reason}"
+        );
+    }
+
+    /// One answer for a key that is another user's and a key that is
+    /// nobody's: the text may not say, or hint, which.
+    #[test]
+    fn a_key_that_is_not_the_callers_does_not_say_whose_it_is() {
+        let (passed, checked, reason) = gate(MintCheck::Answered(
+            GcpImpersonated,
+            R::NamedConnectionNotUsable,
+        ));
+        assert!(!passed && checked);
+        assert!(
+            reason.contains("is not an active one of this user's"),
+            "{reason}"
+        );
+        for leak in ["another user", "belongs to", "exists", "someone else"] {
+            assert!(!reason.contains(leak), "'{leak}' in: {reason}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_check_is_not_passed_and_not_evidence() {
+        let (passed, checked, reason) = gate(MintCheck::Unreadable(GcpImpersonated));
+        assert!(!passed && !checked);
+        assert!(reason.contains("NOT evidence"), "{reason}");
+    }
 }
 
 #[cfg(test)]

@@ -952,10 +952,16 @@ pub fn validate_workflow_description(input: Option<&str>) -> Result<ValidatedDes
 /// (`oauth/gmail/*`); it is satisfied when at least one of the caller's stored
 /// key paths is permitted by it, judged by the one grant matcher
 /// (`vault_path_permitted`). `*` (everything) is never "missing".
+///
+/// Neither is a grant whose value is MINTED at dispatch
+/// ([`minted_secret_grants`]): nothing is ever stored for it, so the absence
+/// of a stored secret is its normal state, and telling an operator to
+/// provision one sends them to store a secret that is never read.
 pub fn missing_secret_grants(required: &HashSet<String>, stored_paths: &[String]) -> Vec<String> {
     let mut missing: Vec<String> = required
         .iter()
         .filter(|grant| grant.as_str() != "*")
+        .filter(|grant| talos_workflow_job_protocol::grant_reaches_minted_paths(grant).is_none())
         .filter(|grant| {
             let one = [(*grant).clone()];
             !stored_paths
@@ -966,6 +972,84 @@ pub fn missing_secret_grants(required: &HashSet<String>, stored_paths: &[String]
         .collect();
     missing.sort();
     missing
+}
+
+/// The declared secret grants whose value is MINTED when a job is dispatched
+/// (`talos_workflow_job_protocol::grant_reaches_minted_paths`), sorted. There
+/// is nothing to store for these, so they are never "missing"; what they need
+/// is a connection, which `test_secret_access` checks for an exact path.
+pub fn minted_secret_grants(required: &HashSet<String>) -> Vec<String> {
+    let mut minted: Vec<String> = required
+        .iter()
+        .filter(|grant| talos_workflow_job_protocol::grant_reaches_minted_paths(grant).is_some())
+        .cloned()
+        .collect();
+    minted.sort();
+    minted
+}
+
+/// What to tell an operator about a secret path that is not stored for them.
+///
+/// For an ordinary path: add it in the dashboard. For a path (or a grant
+/// entry) that is MINTED at dispatch: there is nothing to add, and a secret
+/// stored there is never read; it needs a connection. Every tool that says
+/// "this secret is missing" gets its sentence here, so none of them can send
+/// an operator to store a secret under a mint path.
+pub fn unstored_secret_advice(path: &str) -> String {
+    match talos_workflow_job_protocol::grant_reaches_minted_paths(path) {
+        Some(scheme) => format!(
+            "'{path}' is minted when the workflow runs, from {}: there is nothing to store, \
+             and a secret stored at that path is never read. list_connections shows what is \
+             connected; test_secret_access checks one exact path.",
+            scheme.made_from()
+        ),
+        None => format!(
+            "Secret path '{path}' not yet in vault. Add it in the dashboard (Settings → \
+             Secrets) with key_path='{path}'."
+        ),
+    }
+}
+
+/// One declared secret grant in `get_workflow_quickstart`: its
+/// `secrets_status` entry and, when it blocks a run, its blocker.
+///
+/// `provisioned` is `None` when the vault could not be read (no verdict, no
+/// blocker). A grant that is minted at dispatch is never a `missing_secret`
+/// blocker and has no `provisioned` verdict: nothing is stored for it.
+pub fn quickstart_secret_entry(
+    key_path: &str,
+    provisioned: Option<bool>,
+) -> (serde_json::Value, Option<serde_json::Value>) {
+    if talos_workflow_job_protocol::grant_reaches_minted_paths(key_path).is_some() {
+        return (
+            serde_json::json!({
+                "key_path": key_path,
+                "provisioned": serde_json::Value::Null,
+                "minted_at_dispatch": true,
+                "note": unstored_secret_advice(key_path),
+            }),
+            None,
+        );
+    }
+    let blocker = (provisioned == Some(false)).then(|| {
+        serde_json::json!({
+            "type": "missing_secret",
+            "key_path": key_path,
+            // MCP-1201: secret writes are GraphQL-only.
+            "tool": null,
+            "note": "Provision the credential in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.",
+        })
+    });
+    (
+        serde_json::json!({
+            "key_path": key_path,
+            "provisioned": match provisioned {
+                Some(p) => serde_json::json!(p),
+                None => serde_json::Value::Null,
+            },
+        }),
+        blocker,
+    )
 }
 
 /// Inputs to [`build_create_workflow_response`]. Bundled in a single
@@ -1041,13 +1125,28 @@ pub fn build_create_workflow_response(inputs: CreateResponseInputs) -> Value {
     // were all stored was still told to "provision" them.
     let secrets_to_provision: Vec<&String> = match &inputs.missing_secrets {
         Some(missing) => missing.iter().collect(),
-        // Could not check: fall back to every declared grant, and say so.
+        // Could not check: fall back to every declared grant that COULD be
+        // a stored secret, and say so. A minted grant is not one.
         None => {
-            let mut all: Vec<&String> = inputs.required_secrets.iter().collect();
+            let mut all: Vec<&String> = inputs
+                .required_secrets
+                .iter()
+                .filter(|grant| {
+                    talos_workflow_job_protocol::grant_reaches_minted_paths(grant).is_none()
+                })
+                .collect();
             all.sort();
             all
         }
     };
+    // Grants minted at dispatch: nothing to provision, but something to know.
+    let minted_at_dispatch = minted_secret_grants(&inputs.required_secrets);
+    if !minted_at_dispatch.is_empty() {
+        next_steps.push(
+            "Some declared grants are minted when the workflow runs (a Google Cloud impersonated token, a GitHub App token): there is nothing to store for them, and a secret stored at such a path is never read. They need a connection instead — list_connections shows what is connected, and test_secret_access checks one exact path."
+                .to_string(),
+        );
+    }
     if !secrets_to_provision.is_empty() {
         // MCP-1201 (2026-05-17): secret writes moved exclusively to the
         // GraphQL surface (require_2fa + SecretsWrite). Provisioning
@@ -1135,6 +1234,13 @@ pub fn build_create_workflow_response(inputs: CreateResponseInputs) -> Value {
         "next_steps": next_steps,
         "next_steps_checklist": next_steps_checklist,
     });
+    // Present only when there is one, so every other response is unchanged.
+    if let (Some(obj), false) = (resp.as_object_mut(), minted_at_dispatch.is_empty()) {
+        obj.insert(
+            "minted_at_dispatch".to_string(),
+            serde_json::json!(minted_at_dispatch),
+        );
+    }
     if let (Some(obj), Some(warn)) = (resp.as_object_mut(), inputs.description_warning) {
         obj.insert(
             "semantic_search_warning".to_string(),
@@ -3017,6 +3123,122 @@ mod tests {
         );
         // Nothing stored: every non-wildcard grant is missing.
         assert_eq!(missing_secret_grants(&required, &[]).len(), 4);
+    }
+
+    /// The defect: a workflow whose module is granted a path that is MINTED
+    /// at dispatch was told that grant was a missing secret to "provision in
+    /// the dashboard". Nothing is ever stored at such a path, and a secret
+    /// stored there is never read.
+    #[test]
+    fn a_grant_that_is_minted_at_dispatch_is_never_a_missing_secret() {
+        let required: HashSet<String> = [
+            "gcp/impersonated/runner@example-project.iam.gserviceaccount.com/as/\
+             0b7b0f0e-4c1d-4a57-9d2e-3f6a1c2b9e10/access_token",
+            "gcp/impersonated/*",
+            "github_app:example-org",
+            "plaid/secret", // stored nowhere: the one real gap
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        assert_eq!(
+            missing_secret_grants(&required, &[]),
+            vec!["plaid/secret".to_string()]
+        );
+        assert_eq!(
+            minted_secret_grants(&required),
+            vec![
+                "gcp/impersonated/*".to_string(),
+                "gcp/impersonated/runner@example-project.iam.gserviceaccount.com/as/\
+                 0b7b0f0e-4c1d-4a57-9d2e-3f6a1c2b9e10/access_token"
+                    .to_string(),
+                "github_app:example-org".to_string(),
+            ]
+        );
+
+        // The response: the provision step names the real gap only, and the
+        // minted grants get their own entry that sends nobody to the vault.
+        let mut inputs = baseline_inputs();
+        inputs.required_secrets = required.clone();
+        inputs.missing_secrets = Some(missing_secret_grants(&required, &[]));
+        let resp = build_create_workflow_response(inputs);
+        assert_eq!(resp["missing_secrets"], serde_json::json!(["plaid/secret"]));
+        assert_eq!(resp["minted_at_dispatch"].as_array().unwrap().len(), 3);
+        let provision = resp["next_steps_checklist"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["action"] == "Provision secrets")
+            .expect("a provision step");
+        assert_eq!(
+            provision["required_secrets"],
+            serde_json::json!(["plaid/secret"])
+        );
+        let text = resp.to_string();
+        assert!(text.contains("minted when the workflow runs"), "{text}");
+
+        // Could not check what is stored: the fallback lists every declared
+        // grant EXCEPT the minted ones.
+        let mut inputs = baseline_inputs();
+        inputs.required_secrets = required;
+        inputs.missing_secrets = None;
+        let resp = build_create_workflow_response(inputs);
+        let step = resp["next_steps_checklist"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["action"] == "Check and provision secrets")
+            .expect("a check step");
+        assert_eq!(
+            step["required_secrets"],
+            serde_json::json!(["plaid/secret"])
+        );
+
+        // A workflow with no minted grant carries no such field.
+        let resp = build_create_workflow_response(baseline_inputs());
+        assert!(resp.get("minted_at_dispatch").is_none(), "{resp}");
+    }
+
+    /// `get_workflow_quickstart` raised a `missing_secret` blocker, with
+    /// "provision the credential in the dashboard", for a mint grant.
+    #[test]
+    fn a_quickstart_entry_for_a_minted_grant_is_not_a_blocker() {
+        // Stored-secret behaviour is unchanged, byte for byte.
+        let (status, blocker) = quickstart_secret_entry("plaid/secret", Some(false));
+        assert_eq!(
+            status,
+            serde_json::json!({ "key_path": "plaid/secret", "provisioned": false })
+        );
+        assert_eq!(
+            blocker,
+            Some(serde_json::json!({
+                "type": "missing_secret",
+                "key_path": "plaid/secret",
+                "tool": null,
+                "note": "Provision the credential in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.",
+            }))
+        );
+        let (status, blocker) = quickstart_secret_entry("plaid/secret", Some(true));
+        assert_eq!(status["provisioned"], true);
+        assert!(blocker.is_none());
+        // Could not read the vault: no verdict and no blocker.
+        let (status, blocker) = quickstart_secret_entry("plaid/secret", None);
+        assert!(status["provisioned"].is_null() && blocker.is_none());
+
+        // A minted grant: never a blocker, whatever the vault said.
+        for grant in ["gcp/impersonated/*", "github_app:example-org"] {
+            for provisioned in [Some(false), Some(true), None] {
+                let (status, blocker) = quickstart_secret_entry(grant, provisioned);
+                assert!(blocker.is_none(), "{grant}");
+                assert_eq!(status["minted_at_dispatch"], true);
+                assert!(status["provisioned"].is_null());
+                let note = status["note"].as_str().unwrap();
+                assert!(note.contains("nothing to store"), "{note}");
+                assert!(!note.contains("Settings"), "{note}");
+            }
+        }
+        assert!(unstored_secret_advice("jira/token").contains("Add it in the dashboard"));
     }
 
     #[test]

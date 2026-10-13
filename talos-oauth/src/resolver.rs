@@ -26,13 +26,8 @@ use crate::OAuthCredentialService;
 use talos_secrets_manager::SecretsManager;
 // The `gcp/impersonated/...` mint path (Phase D) has ONE home for its two
 // forms; this file only asks it what a path means.
-use talos_workflow_job_protocol::{
-    parse_gcp_impersonated_path, GCP_IMPERSONATED_PREFIX, GCP_IMPERSONATED_SUFFIX,
-};
-
-/// Secret-path scheme that resolves to a GitHub App installation token
-/// (RFC 0008 B4): `github_app:<owner>`.
-const GITHUB_APP_SCHEME: &str = "github_app:";
+use talos_workflow_engine_core::MintReadiness;
+use talos_workflow_job_protocol::{dispatch_mint, DispatchMint, MintScheme};
 
 /// Process-wide GitHub App installation-token provider, injected once at
 /// controller startup via [`set_github_installation_token_provider`]. The App is
@@ -61,6 +56,70 @@ pub fn set_github_installation_token_provider(provider: Arc<dyn GithubInstallati
 /// first call wins; later calls are ignored.
 pub fn set_gcp_impersonation_token_provider(provider: Arc<dyn GcpImpersonationTokenProvider>) {
     let _ = GCP_IMPERSONATION_PROVIDER.set(provider);
+}
+
+/// What can be said about a mint path without minting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintCheck {
+    /// The path is taken as a mint path but is not a form the minter reads.
+    /// Nothing is minted for it and nothing stored at it is read.
+    Malformed(MintScheme),
+    /// The provider's answer.
+    Answered(MintScheme, MintReadiness),
+    /// The provider could not be asked (its read failed). Not evidence of
+    /// anything; the failure is logged here.
+    Unreadable(MintScheme),
+}
+
+impl MintCheck {
+    /// Would a dispatch have a connection to mint this path from? `false`
+    /// for an unreadable check: an unknown is not a pass.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Answered(_, MintReadiness::Ready))
+    }
+
+    /// Which mint the path belongs to.
+    #[must_use]
+    pub fn scheme(&self) -> MintScheme {
+        match self {
+            Self::Malformed(s) | Self::Answered(s, _) | Self::Unreadable(s) => *s,
+        }
+    }
+}
+
+/// For a diagnostic: could `path` be minted for `user_id` at dispatch?
+///
+/// `None` when `path` is not a mint path at all (an ordinary stored secret:
+/// ask the vault). Otherwise the answer of the provider that would mint it,
+/// asked through the same process-wide provider the dispatch uses.
+///
+/// This never mints, refreshes or reads a token, and makes no outbound call.
+/// Tenancy is the provider's: it is asked about `user_id` only, and a
+/// connection key that is not that user's reads exactly as one that does not
+/// exist ([`MintReadiness::NamedConnectionNotUsable`]).
+pub async fn check_mint(path: &str, user_id: Uuid) -> Option<MintCheck> {
+    let mint = dispatch_mint(path)?;
+    let scheme = mint.scheme();
+    let answered = match mint {
+        DispatchMint::Malformed(_) => return Some(MintCheck::Malformed(scheme)),
+        DispatchMint::GithubApp { owner } => match GITHUB_PROVIDER.get() {
+            Some(provider) => provider.mint_readiness(owner, user_id).await,
+            None => Ok(MintReadiness::NotConfigured),
+        },
+        DispatchMint::GcpImpersonated(target) => match GCP_IMPERSONATION_PROVIDER.get() {
+            Some(provider) => provider.mint_readiness(target.connection, user_id).await,
+            None => Ok(MintReadiness::NotConfigured),
+        },
+    };
+    Some(match answered {
+        Ok(readiness) => MintCheck::Answered(scheme, readiness),
+        Err(e) => {
+            // The path is not logged: it names a service account or an owner.
+            tracing::warn!(error = %e, ?scheme, "mint readiness could not be read");
+            MintCheck::Unreadable(scheme)
+        }
+    })
 }
 
 /// Adapter exposing [`SecretsManager`] through the
@@ -140,14 +199,14 @@ impl SecretsResolver for ControllerSecretsResolver {
         let mut github_paths: Vec<String> = Vec::new();
         let mut gcp_impersonated_paths: Vec<String> = Vec::new();
         let mut vault_paths: Vec<String> = Vec::new();
+        // Which paths are mints is asked of the ONE recogniser
+        // (`dispatch_mint`), the same one the diagnostic tools ask, so a tool
+        // can never call a path "stored" that this function will not look up.
         for p in paths {
-            if p.starts_with(GITHUB_APP_SCHEME) {
-                github_paths.push(p.clone());
-            } else if p.starts_with(GCP_IMPERSONATED_PREFIX) && p.ends_with(GCP_IMPERSONATED_SUFFIX)
-            {
-                gcp_impersonated_paths.push(p.clone());
-            } else {
-                vault_paths.push(p.clone());
+            match dispatch_mint(p).map(|m| m.scheme()) {
+                Some(MintScheme::GithubApp) => github_paths.push(p.clone()),
+                Some(MintScheme::GcpImpersonated) => gcp_impersonated_paths.push(p.clone()),
+                None => vault_paths.push(p.clone()),
             }
         }
 
@@ -168,7 +227,13 @@ impl SecretsResolver for ControllerSecretsResolver {
             match (GITHUB_PROVIDER.get(), user_id) {
                 (Some(provider), Some(uid)) => {
                     for path in github_paths {
-                        let owner = &path[GITHUB_APP_SCHEME.len()..];
+                        let Some(DispatchMint::GithubApp { owner }) = dispatch_mint(&path) else {
+                            // `github_app:` with no owner.
+                            tracing::warn!(
+                                "malformed github_app path; not injected (fail closed)"
+                            );
+                            continue;
+                        };
                         match provider.installation_token(owner, uid).await {
                             // Key by the full `github_app:<owner>` path: that's
                             // what the module reads via get_secret(...).
@@ -207,7 +272,8 @@ impl SecretsResolver for ControllerSecretsResolver {
             match (GCP_IMPERSONATION_PROVIDER.get(), user_id) {
                 (Some(provider), Some(uid)) => {
                     for path in gcp_impersonated_paths {
-                        let Some(target) = parse_gcp_impersonated_path(&path) else {
+                        let Some(DispatchMint::GcpImpersonated(target)) = dispatch_mint(&path)
+                        else {
                             tracing::warn!(
                                 "malformed gcp/impersonated path; not injected (fail closed)"
                             );
@@ -291,5 +357,50 @@ impl SecretsResolver for ControllerSecretsResolver {
         self.oauth_service()
             .force_refresh_oauth_tokens_in_batch(paths)
             .await
+    }
+}
+
+#[cfg(test)]
+mod check_mint_tests {
+    use super::{check_mint, MintCheck};
+    use talos_workflow_engine_core::MintReadiness;
+    use talos_workflow_job_protocol::MintScheme;
+    use uuid::Uuid;
+
+    /// No provider is injected in this test binary, which is the state of a
+    /// deployment with neither integration configured.
+    #[tokio::test]
+    async fn a_stored_path_is_not_checked_and_a_mint_path_never_reads_as_stored() {
+        let user = Uuid::from_u128(1);
+
+        // An ordinary path: not a mint, so the caller asks the vault.
+        for path in ["jira/api_token", "gcp/impersonated/someone/refresh_token"] {
+            assert_eq!(check_mint(path, user).await, None, "{path}");
+        }
+
+        // A mint path the minter cannot read.
+        let malformed = check_mint("gcp/impersonated//access_token", user)
+            .await
+            .expect("a mint path");
+        assert_eq!(malformed, MintCheck::Malformed(MintScheme::GcpImpersonated));
+        assert!(!malformed.is_ready());
+
+        // A well-formed one with nothing configured to mint it.
+        for (path, scheme) in [
+            (
+                "gcp/impersonated/runner@example-project.iam.gserviceaccount.com/access_token",
+                MintScheme::GcpImpersonated,
+            ),
+            ("github_app:example-org", MintScheme::GithubApp),
+        ] {
+            let check = check_mint(path, user).await.expect("a mint path");
+            assert_eq!(
+                check,
+                MintCheck::Answered(scheme, MintReadiness::NotConfigured),
+                "{path}"
+            );
+            assert!(!check.is_ready());
+            assert_eq!(check.scheme(), scheme);
+        }
     }
 }

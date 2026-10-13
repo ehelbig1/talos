@@ -4172,6 +4172,44 @@ mod blocked_vault_report_tests {
     /// comment at all. The reference is EMBEDDED in a larger string, which is
     /// why detection routes through `extract_vault_refs` rather than a
     /// `strip_prefix`.
+    /// The warning is about the GRANT, never about what is stored, so it is
+    /// right for a path minted at dispatch too: a mint path the module's
+    /// grant covers is silent, and one it does not cover is refused by the
+    /// worker exactly as the warning says. The case that was reported live
+    /// (a `…/as/<connection key>/access_token` reference under a grant that
+    /// named the older `…/access_token` form) is the second one. The advice
+    /// is to grant the path; it never says to store a secret.
+    #[test]
+    fn a_minted_path_is_judged_by_its_grant_and_never_told_to_be_stored() {
+        const SA: &str = "runner@example-project.iam.gserviceaccount.com";
+        let named =
+            format!("gcp/impersonated/{SA}/as/0b7b0f0e-4c1d-4a57-9d2e-3f6a1c2b9e10/access_token");
+        let cfg = json!({ "AUTH_HEADER": format!("Bearer vault://{named}") });
+
+        // Covered: by the exact path, or by the namespace.
+        for grant in [named.as_str(), "gcp/impersonated/*"] {
+            assert!(
+                describe_blocked_vault_refs("check", "GCP check", &cfg, &s(&[grant])).is_none(),
+                "{grant}"
+            );
+        }
+
+        // Not covered: the grant names the form with no connection key.
+        let older = format!("gcp/impersonated/{SA}/access_token");
+        let r = describe_blocked_vault_refs("check", "GCP check", &cfg, &s(&[&older]))
+            .expect("the grant does not cover the named form");
+        assert_eq!(r.entries[0]["vault_path"], named);
+        assert!(
+            r.next_step.contains("update_module_secrets"),
+            "{}",
+            r.next_step
+        );
+        for text in [&r.summary, &r.next_step] {
+            assert!(!text.contains("dashboard"), "{text}");
+            assert!(!text.contains("Settings"), "{text}");
+        }
+    }
+
     #[test]
     fn the_reported_empty_grant_http_node_is_reported() {
         let cfg = json!({

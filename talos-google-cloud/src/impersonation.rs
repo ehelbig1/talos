@@ -159,6 +159,45 @@ pub fn choose_consent(active: &[Uuid], named: Option<Uuid>) -> ConsentChoice {
     }
 }
 
+/// What a [`ConsentChoice`] means for "could a mint be made", for a tool that
+/// must answer without minting. Total over the choice, so a new variant has
+/// to be given an answer here.
+///
+/// `NamedIsNotTheirs` is one answer whether the named key is another user's,
+/// a disconnected connection or nothing at all: [`choose_consent`] cannot
+/// tell them apart (its list is the requesting user's own), and neither may
+/// its caller.
+#[must_use]
+pub fn readiness_of(choice: ConsentChoice) -> talos_workflow_engine_core::MintReadiness {
+    use talos_workflow_engine_core::MintReadiness as R;
+    match choice {
+        ConsentChoice::Use(_) => R::Ready,
+        ConsentChoice::NoConsent => R::NoConnection,
+        ConsentChoice::SeveralAndNoneNamed => R::SeveralAndNoneNamed,
+        ConsentChoice::NamedIsNotTheirs => R::NamedConnectionNotUsable,
+    }
+}
+
+/// Could a token be minted for `user_id` from the connection a path names
+/// (`connection`), decided WITHOUT minting: the list
+/// [`active_full_tier_connections`] reads under `user_id`, put to
+/// [`choose_consent`]. This is the whole of what a diagnostic may learn.
+///
+/// Tenancy: `connection` is only ever compared with `user_id`'s own keys, so
+/// a key that belongs to another user is answered exactly as a key that
+/// belongs to nobody.
+///
+/// # Errors
+/// When the consents cannot be read.
+pub async fn mint_readiness_for(
+    pool: &Pool<Postgres>,
+    user_id: Uuid,
+    connection: Option<Uuid>,
+) -> Result<talos_workflow_engine_core::MintReadiness> {
+    let active = active_full_tier_connections(pool, user_id).await?;
+    Ok(readiness_of(choose_consent(&active, connection)))
+}
+
 /// The keys of `user_id`'s active full-tier connections, in a fixed order.
 ///
 /// Tenancy: filtered on `user_id`. This is the list [`choose_consent`]
@@ -355,6 +394,21 @@ impl GcpImpersonationTokenProvider for GcpImpersonationService {
         self.cache.insert(cache_key, minted);
         Ok(Some(token))
     }
+
+    /// The consent question of [`Self::impersonated_token`] and nothing
+    /// after it: the same list, read under the same user id, put to the same
+    /// [`choose_consent`]. No token is read, refreshed or minted, and the
+    /// cache is not consulted (a cached token says a mint WAS possible, not
+    /// that the connection is still there).
+    async fn mint_readiness(
+        &self,
+        connection: Option<Uuid>,
+        user_id: Uuid,
+    ) -> Result<talos_workflow_engine_core::MintReadiness, BoxError> {
+        mint_readiness_for(&self.db_pool, user_id, connection)
+            .await
+            .map_err(|e| -> BoxError { e.to_string().into() })
+    }
 }
 
 /// Hand-written `Debug` — never let a stray `{:?}` expose the inner service
@@ -444,6 +498,39 @@ mod choose_consent_tests {
             assert_ne!(named, other);
         }
         assert_eq!(named, mint_cache_key(user, Some(key(1)), sa));
+    }
+
+    /// What a diagnostic is told for each state of the user's consents: the
+    /// stored-secret cases never reach here, so these are the four a mint
+    /// path can be in.
+    #[test]
+    fn readiness_is_the_mints_own_choice_and_a_foreign_key_reads_as_no_such_connection() {
+        use super::readiness_of;
+        use talos_workflow_engine_core::MintReadiness as R;
+        let ready = |active: &[Uuid], named| readiness_of(choose_consent(active, named));
+
+        // Usable: the only one unnamed, or one of several named.
+        assert_eq!(ready(&[key(1)], None), R::Ready);
+        assert_eq!(ready(&[key(1), key(2)], Some(key(2))), R::Ready);
+        // No consent at all.
+        assert_eq!(ready(&[], None), R::NoConnection);
+        // Two consents and none named.
+        assert_eq!(ready(&[key(1), key(2)], None), R::SeveralAndNoneNamed);
+        // A key that is not the caller's. The list is the caller's own, so a
+        // key held by another user and a key nobody holds are the same input
+        // and must be the same answer, with or without consents of their own.
+        let someone_elses = key(9);
+        let nobodys = key(10);
+        for active in [vec![], vec![key(1)], vec![key(1), key(2)]] {
+            assert_eq!(
+                ready(&active, Some(someone_elses)),
+                R::NamedConnectionNotUsable
+            );
+            assert_eq!(
+                ready(&active, Some(someone_elses)),
+                ready(&active, Some(nobodys))
+            );
+        }
     }
 
     #[test]
