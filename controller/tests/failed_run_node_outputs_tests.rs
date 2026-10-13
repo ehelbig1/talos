@@ -189,17 +189,16 @@ async fn the_outputs_of_the_nodes_that_completed_can_be_read_back_from_a_failed_
     );
 
     // A retry still finds the trigger where it always was.
-    let read_back: Option<Value> = state
+    let found = state
         .execution_repo
         .lookup_execution(exec_id, owner)
         .await
-        .ok()
-        .and_then(|found| match found {
-            talos_execution_repository::ExecutionLookup::Live(row) => row.output_data,
-            _ => None,
-        });
+        .expect("read the execution");
+    let talos_execution_repository::ExecutionLookup::Live(row) = found else {
+        panic!("the execution was just finalized and is in the live table");
+    };
     assert_eq!(
-        talos_execution_result_collector::extract_trigger_input(read_back.as_ref()),
+        talos_execution_result_collector::extract_trigger_input(row.output_data.as_ref()),
         json!({ "ticket": "ABC-12" })
     );
 }
