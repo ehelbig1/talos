@@ -194,6 +194,62 @@ async fn a_run_cut_off_by_its_timeout_keeps_them_too() {
     );
 }
 
+/// Answers the first node at once, never answers the second, and says when
+/// the second has been asked: by then the first's output is committed.
+struct StallsAfterFirstAndSaysSo {
+    first: Uuid,
+    second_asked: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl NodeDispatcher for StallsAfterFirstAndSaysSo {
+    async fn dispatch(&self, job: DispatchJob) -> Result<DispatchResult, BoxError> {
+        if job.module_id == self.first {
+            return Ok(DispatchResult {
+                output: json!({ "fetched": 3 }),
+            });
+        }
+        self.second_asked.notify_one();
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+}
+
+/// A caller that holds the run to a deadline of its OWN (the scheduler does)
+/// drops the run from outside: the engine returns nothing, not even an error.
+/// The engine is still there, and so are the outputs.
+#[tokio::test]
+async fn a_run_dropped_by_its_caller_keeps_them_for_the_engine_that_outlives_it() {
+    let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    // No timeout of the engine's own: only the caller stops this run.
+    let mut engine = chain(ids, None).await;
+    let second_asked = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(StallsAfterFirstAndSaysSo {
+        first: ids[0],
+        second_asked: Arc::clone(&second_asked),
+    });
+
+    tokio::select! {
+        biased;
+        () = second_asked.notified() => {}
+        ended = engine.run_with_trigger_input_transport(dispatcher, None, json!({}), Uuid::new_v4()) => {
+            panic!("the second node never answers, so the run cannot end: {:?}", ended.map(|_| ()))
+        }
+    }
+
+    let outputs = by_label(
+        &engine,
+        engine
+            .take_partial_results()
+            .expect("kept when the caller drops the run"),
+    );
+    assert_eq!(
+        outputs.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["first"]
+    );
+    assert_eq!(outputs["first"]["fetched"], 3);
+}
+
 /// Stands in for the controller's sanitizer: the per-run pass knows one
 /// secret VALUE, the stateless pass knows one PATTERN.
 struct TwoPassSanitizer;
