@@ -1947,6 +1947,7 @@ impl SchedulerService {
         let db_pool = self.db_pool.clone();
         let db_pool_for_timeout = self.db_pool.clone();
         let sender = self.event_sender.clone();
+        let sender_for_timeout = sender.clone();
         let registry = self.registry.clone();
         let secrets_manager = self.secrets_manager.clone();
         let worker_manager = self.worker_manager.clone();
@@ -2066,17 +2067,16 @@ impl SchedulerService {
             )
             .await
             {
-                record_scheduled_timeout(
-                    &db_pool_for_timeout,
-                    TimedOutRun {
-                        execution_id,
-                        workflow_id,
-                        schedule_id,
-                        timeout_secs,
-                        phase,
-                    },
-                )
-                .await;
+                let timed_out = TimedOutRun {
+                    execution_id,
+                    workflow_id,
+                    schedule_id,
+                    timeout_secs,
+                    phase,
+                };
+                if record_scheduled_timeout(&db_pool_for_timeout, timed_out).await {
+                    announce_scheduled_timeout(&sender_for_timeout, timed_out);
+                }
             }
         });
     }
@@ -2362,6 +2362,8 @@ pub struct TimedOutRun {
 ///
 /// In that order: the outputs attach only to a row that is already failed.
 /// The engine's partial results are TAKEN, so this is called once per run.
+/// Live subscribers are then told, when this call is what failed the row
+/// ([`announce_scheduled_timeout`]).
 ///
 /// Public so a database test can drive it over a real engine; the scheduler
 /// is its only production caller.
@@ -2369,9 +2371,10 @@ pub async fn finish_timed_out_run(
     engine: &talos_workflow_engine::ParallelWorkflowEngine,
     db_pool: &PgPool,
     secrets_manager: &Arc<SecretsManager>,
+    sender: &tokio::sync::broadcast::Sender<ExecutionEvent>,
     run: TimedOutRun,
 ) {
-    record_scheduled_timeout(db_pool, run).await;
+    let failed_here = record_scheduled_timeout(db_pool, run).await;
     let execution_id = run.execution_id;
     let exec_repo = talos_execution_repository::ExecutionRepository::with_encryption(
         db_pool.clone(),
@@ -2387,6 +2390,43 @@ pub async fn finish_timed_out_run(
         },
     )
     .await;
+    // Announced last, as the run-failure arm does: a subscriber that reads
+    // the run on this event finds its outputs already there.
+    if failed_here {
+        announce_scheduled_timeout(sender, run);
+    }
+}
+
+/// The reason a timed-out scheduled run is stored and announced with.
+fn timed_out_message(timeout_secs: u64) -> String {
+    format!("Execution timed out after {timeout_secs} seconds")
+}
+
+/// Tell live subscribers that a scheduled run ended by running out of time.
+///
+/// The run-failure arm has always sent a `Failed` event; neither timeout
+/// did, so a subscriber watching a scheduled run that timed out saw its
+/// last node event and then nothing. Called only when
+/// [`record_scheduled_timeout`] says this call failed the row, so a
+/// subscriber is never told "failed" about a row that says otherwise, and
+/// is told once when both timeouts fire. A send error means nobody is
+/// listening.
+fn announce_scheduled_timeout(
+    sender: &tokio::sync::broadcast::Sender<ExecutionEvent>,
+    run: TimedOutRun,
+) {
+    let _ = sender.send(ExecutionEvent {
+        execution_id: run.execution_id,
+        node_id: None,
+        status: ExecutionStatus::Failed,
+        trace_id: None,
+        span_id: None,
+        log_message: Some(timed_out_message(run.timeout_secs)),
+        iteration_index: None,
+        iteration_total: None,
+        duration_ms: None,
+        output: None,
+    });
 }
 
 /// Record a scheduled run that ran out of time: counted, logged, the row
@@ -2395,7 +2435,12 @@ pub async fn finish_timed_out_run(
 /// One body, two callers: [`finish_timed_out_run`], for a run stopped at its
 /// deadline with its engine still there, and the outer backstop timeout,
 /// which has no engine left and so keeps no outputs.
-async fn record_scheduled_timeout(db_pool: &PgPool, run: TimedOutRun) {
+///
+/// Returns whether THIS call failed the row. `false` when the row was
+/// already terminal (an operator cancelled it, or the other timeout got
+/// there first) or the write did not land: in neither case did the run end
+/// as "timed out" by this call, so the caller announces nothing.
+async fn record_scheduled_timeout(db_pool: &PgPool, run: TimedOutRun) -> bool {
     let TimedOutRun {
         execution_id,
         workflow_id,
@@ -2422,21 +2467,25 @@ async fn record_scheduled_timeout(db_pool: &PgPool, run: TimedOutRun) {
     // that the timeout was DETECTED but not persisted.
     // Same class as MCP-743 (talos-webhooks). WARN with
     // `target: "talos_audit"` for dashboard alerting.
-    if let Err(ue) = talos_workflow_repository::fail_workflow_execution_unless_terminal(
+    let failed_here = match talos_workflow_repository::fail_workflow_execution_unless_terminal(
         db_pool,
         execution_id,
-        &format!("Execution timed out after {} seconds", timeout_secs),
+        &timed_out_message(timeout_secs),
     )
     .await
     {
-        tracing::warn!(
-            target: "talos_audit",
-            execution_id = %execution_id,
-            workflow_id = %workflow_id,
-            error = %ue,
-            "Scheduler: failed to mark timed-out execution as 'failed' — row will stay 'running' indefinitely until the underlying DB issue resolves"
-        );
-    }
+        Ok(rows) => rows > 0,
+        Err(ue) => {
+            tracing::warn!(
+                target: "talos_audit",
+                execution_id = %execution_id,
+                workflow_id = %workflow_id,
+                error = %ue,
+                "Scheduler: failed to mark timed-out execution as 'failed' — row will stay 'running' indefinitely until the underlying DB issue resolves"
+            );
+            false
+        }
+    };
     // MCP-438: tokio::time::timeout drops the future on elapse, but
     // any in-flight NATS-dispatched module_executions are orphaned
     // — the drop doesn't propagate cancellation to remote workers,
@@ -2463,6 +2512,7 @@ async fn record_scheduled_timeout(db_pool: &PgPool, run: TimedOutRun) {
             "timeout-path sibling cancellation UPDATE failed"
         ),
     }
+    failed_here
 }
 
 /// Drive one scheduled engine run until it returns or its deadline passes.
@@ -3165,6 +3215,7 @@ async fn run_scheduled_execution(
                 &engine,
                 &db_pool,
                 &secrets_manager,
+                &sender,
                 TimedOutRun {
                     execution_id,
                     workflow_id,
@@ -4843,5 +4894,84 @@ mod run_deadline_tests {
             body.contains("ExecutionRepository::with_encryption("),
             "the outputs are sealed as this path seals a completed run's: {body}"
         );
+    }
+
+    /// A subscriber watching a scheduled run that timed out saw its last
+    /// node event and then nothing: the run-failure arm announced, neither
+    /// timeout did.
+    #[tokio::test]
+    async fn a_timed_out_run_is_announced_as_failed_with_its_reason() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(4);
+        let run = super::TimedOutRun {
+            execution_id: uuid::Uuid::from_u128(0x71),
+            workflow_id: uuid::Uuid::from_u128(0x72),
+            schedule_id: uuid::Uuid::from_u128(0x73),
+            timeout_secs: 3600,
+            phase: talos_metrics::SCHEDULER_PHASE_STEADY,
+        };
+        super::announce_scheduled_timeout(&sender, run);
+
+        let event: super::ExecutionEvent = receiver.try_recv().expect("one event");
+        assert_eq!(event.execution_id, run.execution_id);
+        assert!(matches!(event.status, super::ExecutionStatus::Failed));
+        assert!(event.node_id.is_none(), "a run-level event, not a node's");
+        // The same words the row is failed with.
+        assert_eq!(
+            event.log_message.as_deref(),
+            Some("Execution timed out after 3600 seconds")
+        );
+        assert_eq!(
+            super::timed_out_message(3600),
+            "Execution timed out after 3600 seconds"
+        );
+        assert!(receiver.try_recv().is_err(), "exactly one");
+
+        // Nobody listening is not an error.
+        drop(receiver);
+        super::announce_scheduled_timeout(&sender, run);
+    }
+
+    /// Both timeouts announce, and only when their own write is what failed
+    /// the row: a subscriber is not told "failed" about a run an operator
+    /// cancelled, and is told once when both timeouts fire. In the path
+    /// that keeps the outputs, the announcement comes after them. Textual
+    /// for the wiring; `finish_timed_out_run` is driven for real against
+    /// rows by the controller's database test.
+    #[test]
+    fn each_timeout_announces_only_the_failure_it_recorded() {
+        let src = include_str!("lib.rs");
+
+        let inner = between(src, "pub async fn finish_timed_out_run(", "\n}\n");
+        let recorded = inner
+            .find("let failed_here = record_scheduled_timeout(db_pool, run).await;")
+            .expect("the inner path keeps the recorder's answer");
+        let kept = inner
+            .find("keep_failed_run_outputs(")
+            .expect("the outputs are kept");
+        let announced = inner
+            .find("if failed_here {\n        announce_scheduled_timeout(sender, run);")
+            .expect("announced only when this call failed the row");
+        assert!(recorded < kept && kept < announced, "{inner}");
+        assert_eq!(inner.matches("announce_scheduled_timeout(").count(), 1);
+
+        let spawn = between(src, "    fn spawn_workflow_execution(", "\n    }\n");
+        assert!(
+            spawn.contains(
+                "if record_scheduled_timeout(&db_pool_for_timeout, timed_out).await {\n                    \
+                 announce_scheduled_timeout(&sender_for_timeout, timed_out);"
+            ),
+            "the outer timeout announces only the failure it recorded"
+        );
+
+        let recorder = between(
+            src,
+            "async fn record_scheduled_timeout(db_pool: &PgPool, run: TimedOutRun) -> bool {",
+            "\n}\n",
+        );
+        assert!(
+            recorder.contains("Ok(rows) => rows > 0,"),
+            "the recorder's answer is whether its own write failed the row: {recorder}"
+        );
+        assert!(recorder.trim_end().ends_with("failed_here"), "{recorder}");
     }
 }
