@@ -338,7 +338,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "test_module",
             "description": ([
-                "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call), so you can see how close a run came to its fuel and token limits. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. ",
+                "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n  - `trigger_input`: the run's trigger payload (goes to `data[\"__trigger_input__\"]`, where the engine writes it for every node of a workflow run)\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call), so you can see how close a run came to its fuel and token limits. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. ",
                 TEST_MODULE_NETWORK_NOTE,
                 "\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
             ]
@@ -351,6 +351,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "input": { "type": "object", "description": "Simulated upstream node output — delivered to the module under `data[\"input\"]`, matching workflow-dispatch shape. When passed WITHOUT an explicit `config`, it is treated as config for backwards compatibility." },
                     "actor_id": { "type": "string", "description": "Optional UUID of an actor whose memories the module should see. Modules calling agent_memory::search / get / list-keys etc. will scope to this actor (mirrors workflow dispatch when the workflow is bound to an actor). The actor must be owned by you; cross-tenant actor_ids are rejected. Without this, memory calls run anonymously and return 0 hits." },
                     "accumulated": { "type": "object", "description": "Optional. Outputs of EARLIER workflow nodes, keyed by node id, delivered to the module as `data[\"__accumulated__\"]` exactly as the engine does in a workflow. Use it to rehearse a module that reads a non-parent node's output (e.g. {\"prepare\": {\"refs\": {...}}}). Max 1 MB." },
+                    "trigger_input": { "type": "object", "description": "Optional. The trigger payload of the workflow run being rehearsed, delivered to the module as `data[\"__trigger_input__\"]` exactly as the engine does for every node. Use it to rehearse a module that reads the run's trigger (e.g. {\"ticket\": {\"key\": \"ABC-12\"}}). Max 1 MB. This argument is the ONLY way to supply it: `__trigger_input__` at the top level of `input` or `config` is refused, because the engine writes that key itself and removes a copy that arrives inside upstream data. The same holds for `__accumulated__` (a copy inside `input` or `config` is dropped; use `accumulated`). The engine's other input keys (`__staleness__`, `__degraded_inputs__`, `__actor_context__`) are NOT removed from `input` here, so a module's handling of them can be rehearsed by passing them in `input`; in a workflow run only the engine can set them." },
                     "timeout_secs": { "type": "number", "description": "Execution timeout in seconds (default 30, max 120)" },
                     "http_fixtures": {
                         "type": "array",
@@ -2817,8 +2818,68 @@ pub(crate) fn test_module_payload(
     config_val: &serde_json::Value,
     input_val: &serde_json::Value,
     accumulated: Option<&serde_json::Value>,
+    trigger_input: Option<&serde_json::Value>,
 ) -> serde_json::Value {
-    talos_worker_runtime::rehearsal::node_payload(config_val, input_val, accumulated)
+    talos_worker_runtime::rehearsal::node_payload(config_val, input_val, accumulated, trigger_input)
+}
+
+/// The most one of `test_module`'s engine-key arguments (`accumulated`,
+/// `trigger_input`) may hold.
+const ENGINE_KEY_ARGUMENT_MAX_BYTES: usize = 1_048_576;
+
+/// Read one of `test_module`'s engine-key arguments: the value the tool
+/// places where the ENGINE places it (`__accumulated__`, `__trigger_input__`).
+/// Absent or null is none; anything but an object is refused by name; so is
+/// more than [`ENGINE_KEY_ARGUMENT_MAX_BYTES`].
+pub(crate) fn engine_key_argument(
+    args: &serde_json::Value,
+    name: &str,
+    what: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    match args.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) if !v.is_object() => Err(format!(
+            "{name} must be an object ({what}), got {}",
+            crate::utils::json_type_name(v)
+        )),
+        Some(v) => {
+            if serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
+                > ENGINE_KEY_ARGUMENT_MAX_BYTES
+            {
+                return Err(format!("{name} exceeds 1 MB limit"));
+            }
+            Ok(Some(v.clone()))
+        }
+    }
+}
+
+/// Why a `test_module` call is refused when the trigger was put inside
+/// `input` or `config` instead of the `trigger_input` argument.
+///
+/// The engine writes `__trigger_input__` at the payload root itself and
+/// removes any copy that arrived inside upstream data, and this tool does
+/// the same. Removing it without a word would run the module with no trigger
+/// and leave the caller to work out why, so the call is refused instead,
+/// before anything runs. Only the top level of each object is checked: that
+/// is the only place a key is spread to the root from.
+pub(crate) fn trigger_key_misplaced(
+    config: &serde_json::Value,
+    input: &serde_json::Value,
+) -> Option<String> {
+    const KEY: &str = "__trigger_input__";
+    let place = if input.get(KEY).is_some() {
+        "input"
+    } else if config.get(KEY).is_some() {
+        "config"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "`{place}` carries `{KEY}`. That key is written by the engine, not by an upstream node, \
+         so this tool does not take it from `{place}`: pass the trigger payload as the \
+         `trigger_input` argument and it is placed at `data[\"{KEY}\"]`, where a workflow run \
+         puts it."
+    ))
 }
 
 /// `test_module`'s `http_fixtures`: `None` when absent (the run makes real
@@ -3801,30 +3862,23 @@ async fn handle_test_module(
         .then(|| std::sync::Arc::new(talos_worker_runtime::http_replay::HttpCapture::new()));
     let fuel_profile = want_fuel_profile
         .then(|| std::sync::Arc::new(talos_worker_runtime::fuel_profile::FuelProfile::new()));
-    let accumulated = match args.get("accumulated") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(v) if !v.is_object() => {
-            return Some(mcp_error(
-                req_id.clone(),
-                -32602,
-                &format!(
-                    "accumulated must be an object mapping node id to that node's output, got {}",
-                    crate::utils::json_type_name(v)
-                ),
-            ))
-        }
-        Some(v) => {
-            if serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) > 1_048_576 {
-                return Some(mcp_error(
-                    req_id.clone(),
-                    -32602,
-                    "accumulated exceeds 1 MB limit",
-                ));
-            }
-            Some(v.clone())
-        }
-    };
+    let accumulated =
+        match engine_key_argument(args, "accumulated", "mapping node id to that node's output") {
+            Ok(v) => v,
+            Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
+        };
+    let trigger_input =
+        match engine_key_argument(args, "trigger_input", "the run's trigger payload") {
+            Ok(v) => v,
+            Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
+        };
     let input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
+    if let Some(msg) = trigger_key_misplaced(
+        args.get("config").unwrap_or(&serde_json::Value::Null),
+        &input,
+    ) {
+        return Some(mcp_error(req_id.clone(), -32602, &msg));
+    }
     // New `config` param mirrors the node-config position in workflow dispatch.
     // When present, the module receives payload `{config: {...}, input: {...}, ...keys_at_root}`
     // — identical to what engine_dispatch_single.rs builds for in-workflow execution.
@@ -4047,7 +4101,12 @@ async fn handle_test_module(
         Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
     };
 
-    let payload = test_module_payload(&config_val, &input_val, accumulated.as_ref());
+    let payload = test_module_payload(
+        &config_val,
+        &input_val,
+        accumulated.as_ref(),
+        trigger_input.as_ref(),
+    );
 
     // Auto-detect vault:// refs on the FULL payload (config + input) and
     // merge into allowed_secrets. Single source of truth in
@@ -6078,6 +6137,7 @@ mod rehearsal_tool_tests {
             &json!({"MODE": "merge"}),
             &json!({"messages": []}),
             Some(&json!({"prepare": {"refs": {"m1": {"id": "A"}}}})),
+            None,
         );
         assert_eq!(p["MODE"], "merge");
         assert_eq!(p["config"]["MODE"], "merge");
@@ -6093,6 +6153,7 @@ mod rehearsal_tool_tests {
             &json!({"__accumulated__": {"from": "config"}}),
             &json!({"__accumulated__": {"from": "input"}, "x": 1}),
             None,
+            None,
         );
         assert!(p.get("__accumulated__").is_none(), "{p}");
         assert_eq!(p["x"], 1);
@@ -6101,17 +6162,114 @@ mod rehearsal_tool_tests {
             &json!({}),
             &json!({"__accumulated__": {"from": "input"}}),
             Some(&json!({"from": "arg"})),
+            None,
         );
         assert_eq!(p["__accumulated__"]["from"], "arg");
+    }
+
+    /// A module that reads the run's trigger is rehearsed by passing it as
+    /// `trigger_input`: it lands at the root `__trigger_input__`, where the
+    /// engine writes it for every node, and nowhere else.
+    #[test]
+    fn the_trigger_is_placed_where_the_engine_places_it() {
+        let trigger = json!({"ticket": {"key": "ABC-12"}});
+        let p = test_module_payload(
+            &json!({"MODE": "move"}),
+            &json!({"items": [1]}),
+            None,
+            Some(&trigger),
+        );
+        assert_eq!(p["__trigger_input__"], trigger);
+        assert_eq!(p["MODE"], "move");
+        assert_eq!(p["items"], json!([1]));
+        assert!(p["config"].get("__trigger_input__").is_none());
+        assert!(p["input"].get("__trigger_input__").is_none());
+
+        // No argument: no key, as on a run with no trigger seed.
+        let p = test_module_payload(&json!({"MODE": "move"}), &json!({}), None, None);
+        assert!(p.get("__trigger_input__").is_none(), "{p}");
+    }
+
+    /// Only the dedicated argument sets the root key, as for
+    /// `__accumulated__`: the engine writes it set-or-REMOVE, so a copy that
+    /// arrived inside upstream data never stands in for the trigger.
+    #[test]
+    fn a_trigger_key_inside_input_or_config_does_not_become_the_engine_key() {
+        let p = test_module_payload(
+            &json!({"__trigger_input__": {"from": "config"}}),
+            &json!({"__trigger_input__": {"from": "input"}, "x": 1}),
+            None,
+            None,
+        );
+        assert!(p.get("__trigger_input__").is_none(), "{p}");
+        assert_eq!(p["x"], 1);
+        let p = test_module_payload(
+            &json!({}),
+            &json!({"__trigger_input__": {"from": "input"}}),
+            None,
+            Some(&json!({"from": "arg"})),
+        );
+        assert_eq!(p["__trigger_input__"]["from"], "arg");
+    }
+
+    /// The handler does not let that removal be silent. A caller who put the
+    /// trigger inside `input` (the undocumented way that used to work) is
+    /// told, before anything runs, which argument carries it.
+    #[test]
+    fn a_trigger_passed_inside_input_or_config_is_refused_with_the_argument_to_use() {
+        use super::trigger_key_misplaced;
+        for (config, input, place) in [
+            (json!({}), json!({"__trigger_input__": {"a": 1}}), "input"),
+            (json!({"__trigger_input__": {"a": 1}}), json!({}), "config"),
+        ] {
+            let msg = trigger_key_misplaced(&config, &input).expect("refused");
+            assert!(msg.contains(&format!("`{place}`")), "{msg}");
+            assert!(msg.contains("trigger_input"), "{msg}");
+        }
+        // Nested deeper it is ordinary data, and so is everything else.
+        assert!(trigger_key_misplaced(
+            &json!({"MODE": "x"}),
+            &json!({"payload": {"__trigger_input__": 1}, "__staleness__": {"any_stale": true}}),
+        )
+        .is_none());
+    }
+
+    /// `accumulated` and `trigger_input` are read by one rule: absent or
+    /// null is none, anything but an object is refused by name, and so is
+    /// more than 1 MB.
+    #[test]
+    fn an_engine_key_argument_is_an_object_of_at_most_a_megabyte() {
+        use super::engine_key_argument;
+        let args = json!({
+            "trigger_input": {"ticket": {"key": "ABC-12"}},
+            "accumulated": null,
+            "wrong": [1, 2],
+            "big": {"blob": "x".repeat(1_048_577)},
+        });
+        assert_eq!(
+            engine_key_argument(&args, "trigger_input", "the run's trigger payload"),
+            Ok(Some(json!({"ticket": {"key": "ABC-12"}})))
+        );
+        assert_eq!(engine_key_argument(&args, "accumulated", "x"), Ok(None));
+        assert_eq!(engine_key_argument(&args, "absent", "x"), Ok(None));
+        let wrong = engine_key_argument(&args, "wrong", "the run's trigger payload").unwrap_err();
+        assert!(
+            wrong.contains("wrong must be an object") && wrong.contains("array"),
+            "{wrong}"
+        );
+        assert_eq!(
+            engine_key_argument(&args, "big", "x").unwrap_err(),
+            "big exceeds 1 MB limit"
+        );
     }
 
     /// The legacy shapes are unchanged: an empty config or input adds no
     /// sub-object.
     #[test]
     fn empty_config_and_input_add_no_sub_objects() {
-        let p = test_module_payload(&json!({}), &json!({}), None);
+        let p = test_module_payload(&json!({}), &json!({}), None, None);
         assert_eq!(p, json!({}));
-        let p = test_module_payload(&json!({"K": 1}), &json!({}), None);
+        let p = test_module_payload(&json!({"K": 1}), &json!({}), None, None);
         assert_eq!(p, json!({"K": 1, "config": {"K": 1}}));
     }
 

@@ -12,15 +12,18 @@ use crate::http_replay::HttpFixture;
 
 /// The payload a rehearsed module receives, shaped as the engine shapes a
 /// node's input: config and input keys merged at the root, the two objects
-/// also under `config` / `input`, and — when the caller supplies it — earlier
-/// nodes' outputs under `__accumulated__`.
+/// also under `config` / `input`, and — when the caller supplies them —
+/// earlier nodes' outputs under `__accumulated__` and the run's trigger
+/// payload under `__trigger_input__`.
 ///
-/// `__accumulated__` is set LAST and only from the dedicated argument, so a
-/// same-named key inside `config` or `input` cannot stand in for it.
+/// Both engine keys are set LAST and only from their dedicated argument,
+/// set-or-REMOVE as the engine writes them, so a same-named key inside
+/// `config` or `input` cannot stand in for either.
 pub fn node_payload(
     config: &serde_json::Value,
     input: &serde_json::Value,
     accumulated: Option<&serde_json::Value>,
+    trigger_input: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let mut merged = serde_json::Map::new();
     if let Some(obj) = config.as_object() {
@@ -45,6 +48,14 @@ pub fn node_payload(
         }
         None => {
             merged.remove("__accumulated__");
+        }
+    }
+    match trigger_input {
+        Some(trigger) => {
+            merged.insert("__trigger_input__".to_string(), trigger.clone());
+        }
+        None => {
+            merged.remove("__trigger_input__");
         }
     }
     serde_json::Value::Object(merged)
