@@ -421,5 +421,11 @@ mod tests {
             action_url("https://x.example", &token),
             format!("https://x.example/action-links/{token}")
         );
+        // An address of the operator's own, with a port: the link is that
+        // origin and the same path. Nothing of another address is in it.
+        assert_eq!(
+            action_url("https://links.private.example:8443", &token),
+            format!("https://links.private.example:8443/action-links/{token}")
+        );
     }
 }

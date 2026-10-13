@@ -78,7 +78,7 @@ The node returns the same output with every placeholder replaced,
 
 Reasons: `unknown_target`, `workflow_not_owned`, `payload_not_an_object`,
 `payload_too_large`, `label_empty`, `too_many_links` (64 per run),
-`unavailable`.
+`unavailable`, `link_address_misconfigured` (see "The address a link is on").
 
 The node never fails the run. If links cannot be minted at all, every
 placeholder becomes its fallback (or `#`) and the message still sends.
@@ -93,6 +93,46 @@ one of those refuses, the page says so and the link can be used again.
 Treat the payload as you would any trigger input: validate it. The label and
 the payload come from the same module, so a module you would not trust to
 start the target workflow should not be upstream of this node.
+
+## What the page shows, and where it travels
+
+The confirmation page shows the link's `label` and the NAME of the workflow
+it starts. The page after a confirmation shows the label again. Both are
+there so that the person confirming knows what will start.
+
+So a label is not private to the message it was written for. Whoever opens
+the link sees it, and it travels over whatever address the link is on, along
+with the token in the link's path. On a deployment whose public address is a
+third-party tunnel, that tunnel carries all three. Write a label that says
+what the action does ("Mark done", "Start the review") and keep names, ticket
+titles and anything else you would not put on a public page out of it. The
+same goes for the name of a workflow that a link starts.
+
+## The address a link is on
+
+By default a link is minted on the deployment's public address (the same one
+webhooks and approval links use; see `docs/local-public-url.md`).
+
+An operator can put action links on an address of their own, for example one
+that is reachable only on a private network:
+
+```
+TALOS_ACTION_LINKS_BASE_URL=https://talos.private.example
+```
+
+* It must be `https://` and a scheme and host only (a port is allowed): no
+  path, query, fragment or user information.
+* Unset, nothing changes.
+* A value that does not meet the rule mints NOTHING. Every request falls back
+  with the reason `link_address_misconfigured`, no token is stored, and the
+  controller logs an error naming the variable. It is never replaced by the
+  public address: the setting exists to keep links off that address.
+* The setting only decides where a link points. The address has to reach this
+  deployment's `/action-links/` route for the link to work, and making it do
+  so (DNS, a private proxy) is the operator's. A token is found by its hash,
+  so links minted before and after a change of address all still resolve.
+* It applies to action links only. Approval and correction links, webhooks
+  and OAuth callbacks stay on the public address.
 
 ## Security properties
 

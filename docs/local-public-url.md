@@ -69,6 +69,11 @@ path — the open-redirect-misconfig defense):
 A tunnel-URL **change** logs a WARN naming what went stale; the first
 discovery logs the URL at INFO.
 
+One family of links can be taken off this address: action links
+(`/action-links/{token}`), with `TALOS_ACTION_LINKS_BASE_URL`. A link's page
+shows its label, so on a third-party tunnel the tunnel carries the label and
+the token. See "The address a link is on" in `docs/action-links.md`.
+
 ## Security notes
 
 * The tunnel exposes ONLY the controller (`controller:8000`). All its
