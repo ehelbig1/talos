@@ -2098,7 +2098,7 @@ async fn handle_get_node_output(
         req_id,
         -32000,
         &node_not_in_output_message(
-            &node_id,
+            node_id,
             &labeled_keys,
             &exec.status,
             exec_id,
