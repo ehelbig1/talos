@@ -39,6 +39,32 @@ add_action_links_node(
   connect_from: "compose", connect_to: "send")
 ```
 
+If the workflow already has an edge `compose → send`, the call REPLACES it:
+`compose → links` is plain, and `links → send` keeps the type and condition
+of the edge it replaced, so a send that was conditional on `notify == true`
+is still conditional. The reply lists what was replaced (`replaced_edges`).
+With no such edge, the two edges are added. If several edges would be
+replaced and they do not carry the same condition, the call is refused: wire
+that one by hand with `add_edge` / `remove_edge`.
+
+Calling the tool again for a `node_id` that already exists changes what the
+node may start, and nothing else: `targets` is replaced by the list given,
+`ttl_hours` is changed when given, and no edge and no other setting of the
+node (`continue_on_error`, for one) is touched. `connect_from` /
+`connect_to` are not applied to an existing node, and the reply says so.
+
+The node can also be written when the workflow is created:
+
+```
+create_workflow(name, nodes: [
+  { id: "compose", module_id: "…" },
+  { id: "links", node_type: "action_links",
+    targets: { "list": "<workflow id>" }, ttl_hours: 72 },
+  { id: "send", module_id: "…" } ],
+  edges: [ { source: "compose", target: "links" },
+           { source: "links", target: "send", condition: "notify == true" } ])
+```
+
 `targets` is the list of workflows a link from this node may start. You
 write it; a module cannot add to it.
 

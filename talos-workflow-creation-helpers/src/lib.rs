@@ -11,7 +11,13 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-const STRUCTURAL_NODE_TYPES: &[&str] = &["collect", "loop", "sub_workflow", "capability_dispatch"];
+const STRUCTURAL_NODE_TYPES: &[&str] = &[
+    "collect",
+    "loop",
+    "sub_workflow",
+    "capability_dispatch",
+    "action_links",
+];
 
 /// Is `node_type` one of the built-in structural kinds a creation tool
 /// builds (`collect` / `loop` / `sub_workflow` / `capability_dispatch`)?
@@ -90,6 +96,28 @@ pub fn structural_node_error(
                 if !flag.is_boolean() {
                     return Err(format!(
                         "Structural node '{node_id}' (collect): label_items must be true or false, got {flag}"
+                    ));
+                }
+            }
+            Ok(None)
+        }
+        // The shape of `targets` has one rule, the one every graph write is
+        // held to. Whether each workflow is the caller's is asked where the
+        // graph is written, with the same answer for every tool.
+        "action_links" => {
+            talos_workflow_engine_core::action_links::check_action_targets(field("targets"))
+                .map_err(|fault| {
+                    format!(
+                        "Structural node '{node_id}' (action_links): {fault}. Pass it at the top \
+                         level or in config: {{\"targets\": {{\"<name>\": \"<workflow uuid>\"}}, \
+                         \"ttl_hours\": 72}}."
+                    )
+                })?;
+            if let Some(ttl) = field("ttl_hours").filter(|v| !v.is_null()) {
+                if ttl.as_u64().is_none() {
+                    return Err(format!(
+                        "Structural node '{node_id}' (action_links): ttl_hours must be a whole \
+                         number of hours (1 to 336), got {ttl}"
                     ));
                 }
             }
@@ -223,7 +251,7 @@ pub fn validate_regular_module_ids(regular_nodes: &[&Value]) -> Result<(), Strin
         if mid.is_empty() || uuid::Uuid::parse_str(mid).is_err() {
             let nid = node.get("id").and_then(|v| v.as_str()).unwrap_or("?");
             return Err(format!(
-                "Invalid module_id '{}' on node '{}'. Must be a valid UUID from list_templates, or set node_type for structural nodes (collect, loop, sub_workflow, capability_dispatch).",
+                "Invalid module_id '{}' on node '{}'. Must be a valid UUID from list_templates, or set node_type for structural nodes (collect, loop, sub_workflow, capability_dispatch, action_links).",
                 talos_text_util::bounded_preview(mid, 64),
                 talos_text_util::bounded_preview(nid, 64)
             ));
@@ -566,6 +594,22 @@ fn structural_kind_data(kind: &str, node: &Value) -> Value {
                 "required_capabilities": caps,
                 "timeout_secs": get_u("timeout_secs").unwrap_or(60),
             })
+        }
+        // What `add_action_links_node` writes: the targets as given (checked
+        // by `structural_node_error`) and the lifetime, clamped as that tool
+        // and the graph parser clamp it, only when the author stated one.
+        "action_links" => {
+            let mut data = serde_json::json!({
+                "targets": node
+                    .get("targets")
+                    .or_else(|| ncfg.and_then(|c| c.get("targets")))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            });
+            if let Some(hours) = get_u("ttl_hours") {
+                data["ttl_hours"] = serde_json::json!(hours.clamp(1, 336));
+            }
+            data
         }
         // `label_items: true` asks the engine to name each item's branch
         // (`sources`). Written only when true, so an unlabelled collect keeps
@@ -2402,6 +2446,65 @@ mod tests {
         let data = build_structural_node_data("capability_dispatch", &n);
         assert_eq!(data["required_capabilities"][0], "http-fetch");
         assert_eq!(data["timeout_secs"], 60);
+    }
+
+    #[test]
+    fn an_inline_action_links_node_is_held_to_the_targets_rule() {
+        let id = Uuid::from_u128(4).to_string();
+        let none: HashSet<&str> = HashSet::new();
+        assert!(is_structural_node_type("action_links"));
+        for node in [
+            json!({ "id": "links", "node_type": "action_links", "targets": { "list": id } }),
+            json!({ "id": "links", "node_type": "action_links", "config": { "targets": { "list": id }, "ttl_hours": 24 } }),
+        ] {
+            assert_eq!(structural_node_error(&node, &none), Ok(None), "{node}");
+        }
+        for (node, why) in [
+            (
+                json!({ "id": "links", "node_type": "action_links" }),
+                "Missing or invalid 'targets'",
+            ),
+            (
+                json!({ "id": "links", "node_type": "action_links", "targets": {} }),
+                "must name 1 to 16",
+            ),
+            (
+                json!({ "id": "links", "node_type": "action_links", "targets": { "a b": id } }),
+                "is not usable",
+            ),
+            (
+                json!({ "id": "links", "node_type": "action_links", "targets": { "list": "nope" } }),
+                "must be a workflow UUID",
+            ),
+            (
+                json!({ "id": "links", "node_type": "action_links", "targets": { "list": id }, "ttl_hours": "soon" }),
+                "ttl_hours must be a whole number",
+            ),
+        ] {
+            let refusal = structural_node_error(&node, &none).unwrap_err();
+            assert!(
+                refusal.contains(why) && refusal.contains("'links'"),
+                "{node}: {refusal}"
+            );
+        }
+
+        // What is stored is what `add_action_links_node` stores.
+        assert_eq!(
+            build_structural_node_data(
+                "action_links",
+                &json!({ "id": "links", "node_type": "action_links", "targets": { "list": id } })
+            ),
+            json!({ "targets": { "list": id } })
+        );
+        assert_eq!(
+            build_structural_node_data(
+                "action_links",
+                &json!({ "id": "links", "node_type": "action_links",
+                         "config": { "targets": { "list": id }, "ttl_hours": 9000 },
+                         "continue_on_error": true })
+            ),
+            json!({ "targets": { "list": id }, "ttl_hours": 336, "continue_on_error": true })
+        );
     }
 
     #[test]
