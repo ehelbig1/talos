@@ -144,7 +144,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-deny
 
@@ -276,7 +276,7 @@ jobs:
           save-if: ${{ env.CACHE_SAVE == 'true' }}
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest
 
@@ -377,7 +377,7 @@ jobs:
           save-if: false
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest
 
@@ -505,7 +505,7 @@ jobs:
           save-if: ${{ env.CACHE_SAVE == 'true' }}
 
       - name: Install cargo-component
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-component@0.21.1
 
@@ -612,7 +612,7 @@ jobs:
         # schema baseline + tail by default (phase 2), with `sqlx migrate run`
         # applying the post-cutpoint migrations. The `schema-baseline` job below
         # is the drift gate that keeps that fast path trustworthy.
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: sqlx-cli@0.9.0
 
@@ -810,7 +810,7 @@ jobs:
           persist-credentials: false
 
       - name: Install sqlx-cli
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: sqlx-cli@0.9.0
 
@@ -943,7 +943,7 @@ jobs:
           save-if: ${{ env.CACHE_SAVE == 'true' }}
 
       - name: Install sqlx-cli
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: sqlx-cli@0.9.0
 
