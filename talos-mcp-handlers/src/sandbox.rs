@@ -242,7 +242,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_secrets": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Secret key_paths this sandbox can access via secrets::get_secret(). Supports separator-aware prefix matching: 'stripe' grants 'stripe' and 'stripe/key' but NOT 'stripe-live/key' — the separator must be '/'. Default: [] (deny all). Use ['*'] for all."
+                        "description": "Secret key_paths this sandbox can access via secrets::get_secret(). Supports separator-aware prefix matching: 'stripe' grants 'stripe' and 'stripe/key' but NOT 'stripe-live/key' — the separator must be '/'. Default: [] (deny all). Use ['*'] for all. A path whose value is MINTED rather than stored (gcp/impersonated/<service account>/access_token, .../as/<connection key>/access_token, github_app:<owner>) is minted for this run, from your own connection, only when this list covers it: a vault:// reference in the input alone does not mint."
                     },
                     "actor_id": {
                         "type": "string",
@@ -379,7 +379,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_secrets": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Secret paths to make available during execution (e.g. ['github_token']). vault:// references in config/input are automatically allowlisted, so this is only needed for `secrets::get_secret()` direct calls."
+                        "description": "Secret paths to make available during execution (e.g. ['github_token']). vault:// references in config/input are automatically allowlisted, so this is only needed for `secrets::get_secret()` direct calls. A path whose value is MINTED rather than stored (gcp/impersonated/<service account>/access_token, .../as/<connection key>/access_token, github_app:<owner>) is minted for a real run, from your own connection, when the MODULE's own allowed_secrets covers it (this argument and a reference in config do not grant a mint); test_secret_access says whether it would be. A rehearsal with http_fixtures mints nothing."
                     }
                 },
                 "required": ["module_id"]
@@ -2042,6 +2042,9 @@ async fn handle_run_sandbox(
     // Single source of truth in talos_secrets_manager::vault_resolver so all three
     // execution paths (run_sandbox, test_module, engine) extract identically.
     let vault_refs = talos_workflow_engine::vault_resolver::extract_vault_refs(&input);
+    // What the caller DECLARED, before references found in the input are
+    // merged in: the grant a mint is judged against, below.
+    let declared_secrets = allowed_secrets.clone();
     let allowed_secrets = talos_workflow_engine::vault_resolver::merge_vault_refs_into_allowlist(
         allowed_secrets,
         &vault_refs,
@@ -2063,12 +2066,20 @@ async fn handle_run_sandbox(
 
     // Fetch secrets if allowed_secrets is specified.
     // Pass the calling agent's user_id so cross-tenant secrets are never returned.
+    //
+    // Resolved the way a dispatch resolves them (see handle_test_module). A
+    // path that is MINTED is minted only when the caller's declared
+    // `allowed_secrets` covers it: a `vault://` reference in the input is
+    // not a grant. With no user identity nothing is minted at all.
     let mut secrets: std::collections::HashMap<String, String> = if !allowed_secrets.is_empty() {
-        state
-            .secrets_manager
-            .get_secrets_by_paths(&allowed_secrets, agent.user_id)
-            .await
-            .unwrap_or_default()
+        talos_oauth::resolver::resolve_for_standalone_run(
+            state.secrets_manager.clone(),
+            &declared_secrets,
+            &allowed_secrets,
+            agent.user_id,
+        )
+        .await
+        .unwrap_or_default()
     } else {
         std::collections::HashMap::new()
     };
@@ -2821,6 +2832,22 @@ pub(crate) fn test_module_payload(
     trigger_input: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     talos_worker_runtime::rehearsal::node_payload(config_val, input_val, accumulated, trigger_input)
+}
+
+/// The grant `test_module` lets a MINT be made under.
+///
+/// A real run: the module's own `allowed_secrets`, which is also the list
+/// its security context enforces, so a token is minted only for a path the
+/// module could use in a workflow. A rehearsal (`http_fixtures`): nothing.
+/// A rehearsal sends no request, so a token minted for it would be a real
+/// credential created for no call, and the description promises that a
+/// rehearsal resolves no secret at the socket.
+pub(crate) fn test_module_mint_grant(rehearsal: bool, module_grant: &[String]) -> &[String] {
+    if rehearsal {
+        &[]
+    } else {
+        module_grant
+    }
 }
 
 /// The most one of `test_module`'s engine-key arguments (`accumulated`,
@@ -4120,12 +4147,25 @@ async fn handle_test_module(
 
     // Fetch secrets if allowed_secrets is specified.
     // Pass the calling user's id so cross-tenant secrets are never returned.
+    //
+    // Resolved the way a dispatch resolves them, so a path that is MINTED
+    // (an impersonated Google Cloud token, a GitHub App token) is minted
+    // here too and a module that authenticates with one can be run on its
+    // own. A mint needs what a dispatch of this module would need: the
+    // MODULE's own grant must cover the path (the list the run's security
+    // context enforces, not the caller's `allowed_secrets` argument and not
+    // a reference typed into `config`). In a rehearsal (`http_fixtures`)
+    // nothing is sent, so nothing is minted either: the grant is empty.
+    let mint_grant = test_module_mint_grant(http_replay.is_some(), &module.allowed_secrets);
     let mut secrets: std::collections::HashMap<String, String> = if !allowed_secrets.is_empty() {
-        state
-            .secrets_manager
-            .get_secrets_by_paths(&allowed_secrets, Some(user_id))
-            .await
-            .unwrap_or_default()
+        talos_oauth::resolver::resolve_for_standalone_run(
+            state.secrets_manager.clone(),
+            mint_grant,
+            &allowed_secrets,
+            Some(user_id),
+        )
+        .await
+        .unwrap_or_default()
     } else {
         std::collections::HashMap::new()
     };
@@ -6260,6 +6300,79 @@ mod rehearsal_tool_tests {
         assert_eq!(
             engine_key_argument(&args, "big", "x").unwrap_err(),
             "big exceeds 1 MB limit"
+        );
+    }
+
+    /// A rehearsal mints nothing, whatever the module is granted; a real
+    /// run may mint what the module's own grant covers and nothing else.
+    #[test]
+    fn a_rehearsal_mints_nothing_and_a_real_run_only_under_the_modules_grant() {
+        use super::test_module_mint_grant;
+        const MINT: &str =
+            "gcp/impersonated/runner@example-project.iam.gserviceaccount.com/access_token";
+        let module_grant = vec!["gcp/impersonated/*".to_string()];
+        let wanted = vec![MINT.to_string(), "jira/api_token".to_string()];
+        let resolved = |rehearsal: bool, grant: &[String]| {
+            talos_oauth::resolver::standalone_run_paths(
+                test_module_mint_grant(rehearsal, grant),
+                &wanted,
+            )
+        };
+
+        // A real run of a module granted the path: both.
+        assert_eq!(resolved(false, &module_grant), wanted);
+        // A rehearsal of the same module: the stored path only.
+        assert_eq!(resolved(true, &module_grant), ["jira/api_token"]);
+        // A real run of a module NOT granted it (the caller only referenced
+        // it in config, which put it in `wanted`): the stored path only.
+        assert_eq!(resolved(false, &[]), ["jira/api_token"]);
+    }
+
+    /// Which list each tool lets a mint be judged against. The handlers are
+    /// not driven here (they need a module and a runtime), so the two
+    /// expressions are held as written: `test_module` judges against the
+    /// MODULE's grant, never its own `allowed_secrets` argument, and
+    /// `run_sandbox` against what the caller declared BEFORE references
+    /// found in the input were merged in. Either list swapped for the merged
+    /// one would mint for a path nobody granted.
+    #[test]
+    fn each_tool_judges_a_mint_against_a_grant_and_not_against_what_was_asked_for() {
+        let source = include_str!("sandbox.rs");
+        // Built at run time so this test's own text is not what it finds.
+        let test_module = [
+            "test_module_mint_grant(http_replay.is_some(), ",
+            "&module.allowed_secrets)",
+        ]
+        .concat();
+        assert_eq!(source.matches(&test_module).count(), 1, "{test_module}");
+        let run_sandbox = [
+            "            &declared_",
+            "secrets,\n            &allowed_secrets,\n            agent.user_id,",
+        ]
+        .concat();
+        assert_eq!(
+            source.matches(&run_sandbox).count(),
+            1,
+            "run_sandbox's resolve call"
+        );
+        // The declared list is taken before the merge.
+        let declared =
+            source.find(&["let declared_", "secrets = allowed_secrets.clone();"].concat());
+        let merged = source.find(
+            "merge_vault_refs_into_allowlist(\n        allowed_secrets,\n        &vault_refs,",
+        );
+        assert!(declared.is_some() && merged.is_some());
+        assert!(
+            declared < merged,
+            "run_sandbox took its grant after the merge"
+        );
+        // Neither tool asks the vault directly any more.
+        assert_eq!(
+            source
+                .matches(&[".get_secrets_", "by_paths("].concat())
+                .count(),
+            0,
+            "a standalone run resolves through resolve_for_standalone_run"
         );
     }
 
