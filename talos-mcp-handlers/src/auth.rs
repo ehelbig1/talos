@@ -1432,6 +1432,9 @@ mod mcp_auth_refusal_tests {
         let mut expected: std::collections::HashSet<_> =
             McpAuthOutcome::ALL.iter().copied().collect();
         expected.remove(&McpAuthOutcome::Ok);
+        // Not this middleware's: the tokenless local route refuses a caller
+        // that is not on this machine (`local_caller::local_callers_only`).
+        expected.remove(&McpAuthOutcome::LocalRouteRefused);
         assert_eq!(covered, expected, "every non-Ok outcome has a refusal");
     }
 }

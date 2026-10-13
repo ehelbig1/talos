@@ -5478,10 +5478,10 @@ mod tests {
                 o.as_str()
             )));
         }
-        // Seven distinct label values, seven distinct series — the recorder
+        // Eight distinct label values, eight distinct series — the recorder
         // does not aggregate outcomes away.
-        assert_eq!(McpAuthOutcome::ALL.len(), 7);
-        assert_eq!(warm.matches("talos_mcp_auth_total{outcome=").count(), 7);
+        assert_eq!(McpAuthOutcome::ALL.len(), 8);
+        assert_eq!(warm.matches("talos_mcp_auth_total{outcome=").count(), 8);
         // Package DY's two gates: every value moved exactly once, and the
         // series count equals the enum arity — a recorder that collapsed two
         // refusal reasons into one label would pass the per-value loop above

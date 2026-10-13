@@ -45,7 +45,11 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 The production overlay:
 - Removes dev port mappings for internal services
 - Requires explicit credentials (no defaults)
-- Sets `RUST_ENV=production` on controller and worker
+- Sets `RUST_ENV=staging` on controller and worker (not `production`: the
+  file's backends terminate no TLS, see its header). A staging build mounts
+  the development MCP route `/mcp/local`; it answers only a caller on the
+  controller's own machine, so a request through the overlay's nginx gets
+  `404`. Use `/mcp` with an agent token
 - Enables HSTS and strict rate limiting
 - Drops all Linux capabilities and sets read-only root filesystem
 

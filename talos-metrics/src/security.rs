@@ -244,6 +244,12 @@ impl PlatformAdminOutcome {
 /// bcrypt worker panicked, stored hash malformed) and is a verdict here,
 /// unlike `ApiKeyValidation`, because an auth surface that fails 100 % of
 /// requests for an infrastructure reason must not read as quiet.
+///
+/// `LocalRouteRefused` is the one value the middleware does not produce: it
+/// is a request to the TOKENLESS local route (`/mcp/local`, mounted outside
+/// production only) that did not come from the controller's own machine,
+/// answered `404` by `talos_mcp_handlers::local_caller`. On a build that
+/// serves the route it is the signal that something is exposing the port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum McpAuthOutcome {
     Ok,
@@ -253,6 +259,7 @@ pub enum McpAuthOutcome {
     UnscopedAgent,
     RateLimited,
     Error,
+    LocalRouteRefused,
 }
 
 impl McpAuthOutcome {
@@ -264,6 +271,7 @@ impl McpAuthOutcome {
         Self::UnscopedAgent,
         Self::RateLimited,
         Self::Error,
+        Self::LocalRouteRefused,
     ];
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -275,6 +283,7 @@ impl McpAuthOutcome {
             Self::UnscopedAgent => "unscoped_agent",
             Self::RateLimited => "rate_limited",
             Self::Error => "error",
+            Self::LocalRouteRefused => "local_route_refused",
         }
     }
 }

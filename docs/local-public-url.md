@@ -76,10 +76,19 @@ the token. See "The address a link is on" in `docs/action-links.md`.
 
 ## Security notes
 
-* The tunnel exposes ONLY the controller (`controller:8000`). All its
-  public-path handlers carry their own auth (push-token + OIDC JWT for
-  Pub/Sub, verification tokens/HMAC for webhooks, hashed tokens for
-  approval links) — same posture as a production deploy behind nginx.
+* The tunnel exposes ONLY the controller (`controller:8000`), and it
+  forwards EVERY path on it, not a chosen few. The public-path handlers
+  carry their own auth (push-token + OIDC JWT for Pub/Sub, verification
+  tokens/HMAC for webhooks, hashed tokens for approval links).
+* The one route with no auth of its own is the development MCP route,
+  `/mcp/local`, which a non-production build serves. It answers only a
+  caller on the controller's own machine: a request that arrived through
+  the tunnel carries the tunnel's name as `Host` and a forwarding header,
+  and is answered `404` (`talos-mcp-handlers/src/local_caller.rs`). Until
+  2026-10-13 it had no such check and was served on the tunnel's address
+  to anyone. A refusal is counted on
+  `talos_mcp_auth_total{outcome="local_route_refused"}`; a non-zero value
+  means something is offering the route to the outside.
 * The ngrok inspector UI binds host-only (`127.0.0.1:4040`).
 * Plaintext secret-handling rules are unchanged — the tunnel carries
   TLS end-to-end (https terminates at ngrok's edge, agent → local hop
