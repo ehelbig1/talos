@@ -2038,9 +2038,14 @@ impl SchedulerService {
             let timeout_secs: u64 =
                 talos_config::positive_env_or_default("SCHEDULER_EXECUTION_TIMEOUT_SECS", 3600u64);
             let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+            // The budget is held on the engine run itself, inside
+            // `run_scheduled_execution`, from this instant. This outer
+            // timeout is the backstop and waits a little longer: see
+            // `TIMED_OUT_RUN_WRITE_GRACE`.
+            let run_deadline = tokio::time::Instant::now() + timeout_duration;
 
             if let Err(_elapsed) = tokio::time::timeout(
-                timeout_duration,
+                timeout_duration + TIMED_OUT_RUN_WRITE_GRACE,
                 run_scheduled_execution(
                     execution_id,
                     workflow_id,
@@ -2055,70 +2060,23 @@ impl SchedulerService {
                     worker_shared_key,
                     nats_client,
                     phase,
+                    run_deadline,
+                    timeout_secs,
                 ),
             )
             .await
             {
-                // The timeout drops `run_scheduled_execution` mid-flight, so
-                // its own terminal arms never run — count the failure here or
-                // a timed-out scheduled run is invisible to the detector.
-                record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_FAILED);
-                tracing::error!(
-                    execution_id = %execution_id,
-                    workflow_id = %workflow_id,
-                    schedule_id = %schedule_id,
-                    timeout_secs = timeout_secs,
-                    "Scheduled workflow execution timed out"
-                );
-                // MCP-776 (2026-05-13): log failure-marking UPDATE
-                // failures. Pre-fix `let _ = ...await` swallowed errors;
-                // a DB hiccup at this moment left the workflow_executions
-                // row stuck in 'running' forever, indistinguishable from
-                // a genuinely-running execution. Operators have NO signal
-                // that the timeout was DETECTED but not persisted.
-                // Same class as MCP-743 (talos-webhooks). WARN with
-                // `target: "talos_audit"` for dashboard alerting.
-                if let Err(ue) = talos_workflow_repository::fail_workflow_execution_unless_terminal(
+                record_scheduled_timeout(
                     &db_pool_for_timeout,
-                    execution_id,
-                    &format!("Execution timed out after {} seconds", timeout_secs),
+                    TimedOutRun {
+                        execution_id,
+                        workflow_id,
+                        schedule_id,
+                        timeout_secs,
+                        phase,
+                    },
                 )
-                .await
-                {
-                    tracing::warn!(
-                        target: "talos_audit",
-                        execution_id = %execution_id,
-                        workflow_id = %workflow_id,
-                        error = %ue,
-                        "Scheduler: failed to mark timed-out execution as 'failed' — row will stay 'running' indefinitely until the underlying DB issue resolves"
-                    );
-                }
-                // MCP-438: tokio::time::timeout drops the future on elapse, but
-                // any in-flight NATS-dispatched module_executions are orphaned
-                // — the drop doesn't propagate cancellation to remote workers,
-                // so their rows sit in 'running' forever and skew per-actor /
-                // per-workflow counts in get_actor_summary, get_workflow_health,
-                // etc. The error-path inside run_scheduled_execution already
-                // does this cancellation; mirror it here so timeout-path
-                // parity holds.
-                match talos_workflow_repository::cancel_running_module_executions(
-                    &db_pool_for_timeout,
-                    execution_id,
-                    talos_workflow_repository::SiblingCancelReason::WorkflowTimedOut,
-                )
-                .await
-                {
-                    Ok(cancelled) => tracing::info!(
-                        execution_id = %execution_id,
-                        cancelled,
-                        "timeout-path sibling cancellation UPDATE complete"
-                    ),
-                    Err(e) => tracing::warn!(
-                        execution_id = %execution_id,
-                        error = %e,
-                        "timeout-path sibling cancellation UPDATE failed"
-                    ),
-                }
+                .await;
             }
         });
     }
@@ -2375,6 +2333,148 @@ fn record_dispatch(phase: &'static str, outcome: &'static str) {
     }
 }
 
+/// How much longer than the run's budget the OUTER timeout waits.
+///
+/// The budget itself is enforced on the engine run, inside
+/// `run_scheduled_execution`, where the engine is still there to say what its
+/// completed nodes produced. The outer timeout is the backstop for everything
+/// else in that function (the row, the engine build, a write that hangs), and
+/// it must not fire while the inner one is still recording a run that ran out
+/// of time.
+const TIMED_OUT_RUN_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A scheduled run that ran out of time, as its two recorders need it named.
+#[derive(Clone, Copy, Debug)]
+pub struct TimedOutRun {
+    pub execution_id: Uuid,
+    pub workflow_id: Uuid,
+    pub schedule_id: Uuid,
+    /// The budget it ran out of, for the stored reason.
+    pub timeout_secs: u64,
+    /// The dispatch phase its outcome is counted under.
+    pub phase: &'static str,
+}
+
+/// What the scheduler does with a run that reached its deadline while its
+/// engine is still there: the timeout is recorded
+/// ([`record_scheduled_timeout`]), and then what the nodes that completed had
+/// produced is kept, sealed as this path seals a completed run's output.
+///
+/// In that order: the outputs attach only to a row that is already failed.
+/// The engine's partial results are TAKEN, so this is called once per run.
+///
+/// Public so a database test can drive it over a real engine; the scheduler
+/// is its only production caller.
+pub async fn finish_timed_out_run(
+    engine: &talos_workflow_engine::ParallelWorkflowEngine,
+    db_pool: &PgPool,
+    secrets_manager: &Arc<SecretsManager>,
+    run: TimedOutRun,
+) {
+    record_scheduled_timeout(db_pool, run).await;
+    let execution_id = run.execution_id;
+    let exec_repo = talos_execution_repository::ExecutionRepository::with_encryption(
+        db_pool.clone(),
+        secrets_manager.clone(),
+    );
+    talos_execution_result_collector::keep_failed_run_outputs(
+        engine,
+        execution_id,
+        |outputs| async move {
+            exec_repo
+                .attach_failed_run_outputs(execution_id, &outputs)
+                .await
+        },
+    )
+    .await;
+}
+
+/// Record a scheduled run that ran out of time: counted, logged, the row
+/// failed with the reason, and its still-running module rows cancelled.
+///
+/// One body, two callers: [`finish_timed_out_run`], for a run stopped at its
+/// deadline with its engine still there, and the outer backstop timeout,
+/// which has no engine left and so keeps no outputs.
+async fn record_scheduled_timeout(db_pool: &PgPool, run: TimedOutRun) {
+    let TimedOutRun {
+        execution_id,
+        workflow_id,
+        schedule_id,
+        timeout_secs,
+        phase,
+    } = run;
+    // Counted here, by whichever timeout fired: the run's own terminal arms
+    // do not run for a timed-out run, and uncounted it is invisible to the
+    // detector.
+    record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_FAILED);
+    tracing::error!(
+        execution_id = %execution_id,
+        workflow_id = %workflow_id,
+        schedule_id = %schedule_id,
+        timeout_secs = timeout_secs,
+        "Scheduled workflow execution timed out"
+    );
+    // MCP-776 (2026-05-13): log failure-marking UPDATE
+    // failures. Pre-fix `let _ = ...await` swallowed errors;
+    // a DB hiccup at this moment left the workflow_executions
+    // row stuck in 'running' forever, indistinguishable from
+    // a genuinely-running execution. Operators have NO signal
+    // that the timeout was DETECTED but not persisted.
+    // Same class as MCP-743 (talos-webhooks). WARN with
+    // `target: "talos_audit"` for dashboard alerting.
+    if let Err(ue) = talos_workflow_repository::fail_workflow_execution_unless_terminal(
+        db_pool,
+        execution_id,
+        &format!("Execution timed out after {} seconds", timeout_secs),
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "talos_audit",
+            execution_id = %execution_id,
+            workflow_id = %workflow_id,
+            error = %ue,
+            "Scheduler: failed to mark timed-out execution as 'failed' — row will stay 'running' indefinitely until the underlying DB issue resolves"
+        );
+    }
+    // MCP-438: tokio::time::timeout drops the future on elapse, but
+    // any in-flight NATS-dispatched module_executions are orphaned
+    // — the drop doesn't propagate cancellation to remote workers,
+    // so their rows sit in 'running' forever and skew per-actor /
+    // per-workflow counts in get_actor_summary, get_workflow_health,
+    // etc. The error-path inside run_scheduled_execution already
+    // does this cancellation; mirror it here so timeout-path
+    // parity holds.
+    match talos_workflow_repository::cancel_running_module_executions(
+        db_pool,
+        execution_id,
+        talos_workflow_repository::SiblingCancelReason::WorkflowTimedOut,
+    )
+    .await
+    {
+        Ok(cancelled) => tracing::info!(
+            execution_id = %execution_id,
+            cancelled,
+            "timeout-path sibling cancellation UPDATE complete"
+        ),
+        Err(e) => tracing::warn!(
+            execution_id = %execution_id,
+            error = %e,
+            "timeout-path sibling cancellation UPDATE failed"
+        ),
+    }
+}
+
+/// Drive one scheduled engine run until it returns or its deadline passes.
+/// `None` means the deadline passed: the run future has been dropped, and the
+/// engine it borrowed is the caller's again.
+async fn run_until_deadline<F, T>(deadline: tokio::time::Instant, run: F) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout_at(deadline, run).await.ok()
+}
+
 /// Runs a single scheduled workflow execution to completion.
 #[allow(clippy::too_many_arguments)]
 async fn run_scheduled_execution(
@@ -2395,6 +2495,10 @@ async fn run_scheduled_execution(
     // so the terminal outcome lands on the right series; it changes no
     // behaviour inside this function.
     phase: &'static str,
+    // When the run's wall-clock budget (`SCHEDULER_EXECUTION_TIMEOUT_SECS`,
+    // `timeout_secs`) runs out, measured from when this function was called.
+    run_deadline: tokio::time::Instant,
+    timeout_secs: u64,
 ) {
     // 1. Fetch the workflow's actor binding + description BEFORE inserting the
     //    execution row so the row carries the workflow's bound actor_id from the
@@ -2997,58 +3101,81 @@ async fn run_scheduled_execution(
     }
 
     // See `SchedulerDispatch` for the rationale that pins this decision.
-    let run_result = match SchedulerDispatch::for_run(initial_results) {
-        SchedulerDispatch::Fresh { trigger_input } => match fence_epoch {
-            Some(epoch) => {
-                talos_engine::fence::run_with_trigger_input_fenced(
-                    &mut engine,
-                    nats_client,
-                    worker_shared_key,
-                    trigger_input,
-                    execution_id,
-                    db_pool.clone(),
-                    epoch,
-                )
-                .await
-            }
-            None => {
-                talos_engine::nats_run::run_with_trigger_input_via_nats(
-                    &mut engine,
-                    nats_client,
-                    worker_shared_key,
-                    trigger_input,
-                    execution_id,
-                )
-                .await
-            }
-        },
-        SchedulerDispatch::Resume { initial_results } => match fence_epoch {
-            Some(epoch) => {
-                talos_engine::fence::run_with_seed_fenced(
-                    &mut engine,
-                    nats_client,
-                    worker_shared_key,
-                    initial_results,
-                    execution_id,
-                    db_pool.clone(),
-                    epoch,
-                )
-                .await
-            }
-            None => {
-                talos_engine::nats_run::run_with_seed_via_nats(
-                    &engine,
-                    nats_client,
-                    worker_shared_key,
-                    initial_results,
-                    execution_id,
-                )
-                .await
-            }
-        },
+    //
+    // The run is held to its deadline HERE, not only by the timeout around
+    // this whole function. When that outer timeout fired it dropped the
+    // engine along with everything else, so a scheduled run that ran out of
+    // time stored its error and nothing its nodes had produced. Stopped here,
+    // the engine outlives the run.
+    let run = async {
+        match SchedulerDispatch::for_run(initial_results) {
+            SchedulerDispatch::Fresh { trigger_input } => match fence_epoch {
+                Some(epoch) => {
+                    talos_engine::fence::run_with_trigger_input_fenced(
+                        &mut engine,
+                        nats_client,
+                        worker_shared_key,
+                        trigger_input,
+                        execution_id,
+                        db_pool.clone(),
+                        epoch,
+                    )
+                    .await
+                }
+                None => {
+                    talos_engine::nats_run::run_with_trigger_input_via_nats(
+                        &mut engine,
+                        nats_client,
+                        worker_shared_key,
+                        trigger_input,
+                        execution_id,
+                    )
+                    .await
+                }
+            },
+            SchedulerDispatch::Resume { initial_results } => match fence_epoch {
+                Some(epoch) => {
+                    talos_engine::fence::run_with_seed_fenced(
+                        &mut engine,
+                        nats_client,
+                        worker_shared_key,
+                        initial_results,
+                        execution_id,
+                        db_pool.clone(),
+                        epoch,
+                    )
+                    .await
+                }
+                None => {
+                    talos_engine::nats_run::run_with_seed_via_nats(
+                        &engine,
+                        nats_client,
+                        worker_shared_key,
+                        initial_results,
+                        execution_id,
+                    )
+                    .await
+                }
+            },
+        }
     };
-    match run_result {
-        Ok(ctx) => {
+    match run_until_deadline(run_deadline, run).await {
+        None => {
+            finish_timed_out_run(
+                &engine,
+                &db_pool,
+                &secrets_manager,
+                TimedOutRun {
+                    execution_id,
+                    workflow_id,
+                    schedule_id,
+                    timeout_secs,
+                    phase,
+                },
+            )
+            .await;
+        }
+        Some(Ok(ctx)) => {
             // Aggregate output data. Pre-fix the scheduler ONLY inserted
             // `ctx.results` keyed by node_id and skipped `ctx.node_timings`
             // entirely — so scheduled executions never had
@@ -3150,7 +3277,7 @@ async fn run_scheduled_execution(
         }
         // An operator cancelled the run (here, or seen by the fence): the row
         // is already `cancelled`, so nothing to mark and nothing to alert.
-        Err(e) if talos_engine::fence::was_cancelled_by_operator(&e) => {
+        Some(Err(e)) if talos_engine::fence::was_cancelled_by_operator(&e) => {
             record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_CANCELLED);
             tracing::info!(
                 execution_id = %execution_id,
@@ -3158,7 +3285,7 @@ async fn run_scheduled_execution(
                 "Scheduler: run stopped — the execution was cancelled by an operator"
             );
         }
-        Err(e) if talos_engine::fence::was_fenced(&e) => {
+        Some(Err(e)) if talos_engine::fence::was_fenced(&e) => {
             // FU-1 fence: a fence abort means crash-recovery reclaimed this
             // scheduled run (the row's epoch advanced) — it now belongs to the
             // resumer (or a reclaim already failed it). Do NOT mark it failed:
@@ -3180,7 +3307,7 @@ async fn run_scheduled_execution(
                  leaving the row to its new owner"
             );
         }
-        Err(e) => {
+        Some(Err(e)) => {
             // MCP-448: DLP-redact the engine error before persistence
             // and broadcast. Upstream API errors often carry tokens
             // ("HTTP 401: invalid token sk-proj-xxx", Bearer header
@@ -4559,5 +4686,162 @@ mod backlog_attribution_tests {
         assert!(body.contains("log_backlog("), "{body}");
         assert!(!body.contains("tracing::warn!"), "{body}");
         assert!(!body.contains("scheduler_catchup_backlog"), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod run_deadline_tests {
+    use std::time::Duration;
+
+    /// A run that returns in time gives its result back untouched.
+    #[tokio::test]
+    async fn a_run_that_finishes_before_its_deadline_returns_what_it_returned() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            super::run_until_deadline(deadline, async { 7 }).await,
+            Some(7)
+        );
+    }
+
+    /// A run that does not is DROPPED, at the deadline and not at some other
+    /// time, and what it had borrowed is the caller's again: that is what
+    /// lets the scheduler read a timed-out run's completed outputs from the
+    /// engine the run was using.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_past_its_deadline_is_dropped_then_and_releases_what_it_borrowed() {
+        struct NotesItsDrop<'a>(&'a mut Vec<&'static str>);
+        impl Drop for NotesItsDrop<'_> {
+            fn drop(&mut self) {
+                self.0.push("the run was dropped");
+            }
+        }
+
+        let mut engine_stand_in = vec!["a node completed"];
+        let started = tokio::time::Instant::now();
+        let budget = Duration::from_secs(3600);
+        let run = async {
+            let _held = NotesItsDrop(&mut engine_stand_in);
+            std::future::pending::<()>().await;
+        };
+        assert_eq!(super::run_until_deadline(started + budget, run).await, None);
+        assert_eq!(
+            started.elapsed(),
+            budget,
+            "the run was stopped at a time that is not its deadline"
+        );
+        assert_eq!(engine_stand_in, ["a node completed", "the run was dropped"]);
+    }
+
+    /// A deadline already behind us still gives the run its first poll, and
+    /// then stops it: a run whose set-up used the whole budget is recorded
+    /// as timed out, not left running.
+    #[tokio::test]
+    async fn a_deadline_already_passed_stops_a_run_that_is_not_ready() {
+        let deadline = tokio::time::Instant::now();
+        assert_eq!(
+            super::run_until_deadline(deadline, std::future::pending::<()>()).await,
+            None
+        );
+        assert_eq!(
+            super::run_until_deadline(deadline, async { "ready at once" }).await,
+            Some("ready at once")
+        );
+    }
+
+    /// The function between two markers of this file, tests excluded.
+    fn between<'a>(src: &'a str, from: &str, to: &str) -> &'a str {
+        let production = src
+            .split("mod startup_herd_tests")
+            .next()
+            .expect("the production half");
+        production
+            .split(from)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{from}` must exist"))
+            .split(to)
+            .next()
+            .unwrap_or_else(|| panic!("`{to}` must follow `{from}`"))
+    }
+
+    /// The wiring `finish_timed_out_run`'s own test cannot see: that the
+    /// scheduler's run is the thing held to the deadline, that a run past it
+    /// goes to `finish_timed_out_run` with the engine, and that the timeout
+    /// around the whole function waits long enough for that to be written.
+    ///
+    /// Textual, and it says so: it cannot tell whether the arm is reached.
+    /// What it catches is the shape the defect had, a timeout that only the
+    /// outer wrapper holds.
+    #[test]
+    fn the_engine_run_is_held_to_the_deadline_inside_the_function_that_owns_the_engine() {
+        let src = include_str!("lib.rs");
+
+        let run_fn = between(src, "async fn run_scheduled_execution(", "\n}\n");
+        let held = run_fn
+            .split("match run_until_deadline(run_deadline, run).await {")
+            .nth(1)
+            .expect("the engine run is held to `run_deadline`");
+        let timed_out_arm = held
+            .split("Some(Ok(ctx)) => {")
+            .next()
+            .expect("the arms follow");
+        assert!(timed_out_arm.contains("None => {"), "{timed_out_arm}");
+        assert!(
+            timed_out_arm.contains("finish_timed_out_run(") && timed_out_arm.contains("&engine,"),
+            "a run past its deadline must be finished with the engine it ran on: {timed_out_arm}"
+        );
+        // Both dispatches are inside the held future, so neither escapes it.
+        let before_hold = run_fn
+            .split("match run_until_deadline(run_deadline, run).await {")
+            .next()
+            .expect("the text before the hold");
+        let held_future = before_hold
+            .split("let run = async {")
+            .nth(1)
+            .expect("the held future");
+        for dispatch in [
+            "run_with_trigger_input_fenced(",
+            "run_with_trigger_input_via_nats(",
+            "run_with_seed_fenced(",
+            "run_with_seed_via_nats(",
+        ] {
+            assert_eq!(
+                run_fn.matches(dispatch).count(),
+                1,
+                "{dispatch} is dispatched from one place"
+            );
+            assert!(
+                held_future.contains(dispatch),
+                "{dispatch} runs outside the deadline"
+            );
+        }
+
+        let spawn = between(src, "    fn spawn_workflow_execution(", "\n    }\n");
+        assert!(
+            spawn.contains("let run_deadline = tokio::time::Instant::now() + timeout_duration;"),
+            "the deadline is the budget, counted from before the run function is called"
+        );
+        assert!(
+            spawn.contains("timeout_duration + TIMED_OUT_RUN_WRITE_GRACE,"),
+            "the outer timeout must outlast the deadline, or it drops the engine first"
+        );
+    }
+
+    /// The outputs attach only to a row that is already failed, so the
+    /// timeout is recorded before they are kept.
+    #[test]
+    fn a_timed_out_run_is_recorded_before_its_outputs_are_kept() {
+        let src = include_str!("lib.rs");
+        let body = between(src, "pub async fn finish_timed_out_run(", "\n}\n");
+        let recorded = body
+            .find("record_scheduled_timeout(db_pool, run).await;")
+            .expect("the timeout is recorded");
+        let kept = body
+            .find("keep_failed_run_outputs(")
+            .expect("the outputs are kept");
+        assert!(recorded < kept, "{body}");
+        assert!(
+            body.contains("ExecutionRepository::with_encryption("),
+            "the outputs are sealed as this path seals a completed run's: {body}"
+        );
     }
 }

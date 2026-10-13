@@ -9734,6 +9734,7 @@ dependencies = [
  "talos-task-supervision",
  "talos-worker-fleet",
  "talos-workflow-authorization",
+ "talos-workflow-engine",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
  "talos-workflow-liveness",

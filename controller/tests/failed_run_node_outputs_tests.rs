@@ -387,3 +387,152 @@ async fn completed_outputs_attach_only_to_a_failed_row_that_holds_none() {
         }
     }
 }
+
+/// Answers `fetch` at once, never answers `compose`, and says when `compose`
+/// has been asked: by then `fetch`'s output is committed.
+struct StallsAtCompose {
+    fetch: Uuid,
+    compose_asked: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl talos_workflow_engine_core::NodeDispatcher for StallsAtCompose {
+    async fn dispatch(
+        &self,
+        job: talos_workflow_engine_core::DispatchJob,
+    ) -> Result<talos_workflow_engine_core::DispatchResult, talos_workflow_engine_core::BoxError>
+    {
+        if job.module_id == self.fetch {
+            return Ok(talos_workflow_engine_core::DispatchResult {
+                output: json!({ "items": [1, 2, 3], "echoed": "Bearer ghp_abcdefghijklmnopqrstuvwx12" }),
+            });
+        }
+        self.compose_asked.notify_one();
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+}
+
+/// A scheduled run that ran out of the scheduler's own budget stored its
+/// error and nothing else: the timeout sat around the whole run function and
+/// dropped the engine with it, so there was nothing left to read the
+/// completed nodes from. The run is now stopped at its deadline with the
+/// engine still there, and `finish_timed_out_run` is what the scheduler then
+/// calls. Driven here over a real engine whose run was dropped that way.
+#[tokio::test]
+async fn a_scheduled_run_stopped_at_its_deadline_keeps_what_its_completed_nodes_produced() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let owner = seed_user(&pool).await;
+    let exec_id = seed_running_execution(&pool, owner).await;
+    let state = mcp_state(pool.clone()).await;
+    let sm = state.secrets_manager.clone();
+    sm.initialize().await.expect("an active encryption key");
+
+    let (fetch, compose) = (Uuid::new_v4(), Uuid::new_v4());
+    let graph = talos_workflow_engine::WorkflowGraphBuilder::new()
+        .add_module("fetch", fetch, None)
+        .add_module("compose", compose, None)
+        .edge("fetch", "compose")
+        .build()
+        .expect("graph builds");
+    let artifact = |id: Uuid| talos_workflow_engine_core::WasmModuleArtifact {
+        module_id: id,
+        content_hash: "stub".into(),
+        wasm_bytes: vec![],
+        oci_url: None,
+        max_fuel: 1_000_000,
+        capability_world: "stub".into(),
+        allowed_hosts: vec![],
+        allowed_methods: vec![],
+        allowed_secrets: vec![],
+        requires_approval_for: vec![],
+        integration_name: None,
+        config: None,
+    };
+    let mut engine = talos_workflow_engine_test_utils::minimal_engine();
+    engine.set_user_id(owner);
+    engine.set_module_fetcher(std::sync::Arc::new(
+        talos_workflow_engine_test_utils::memory::InMemoryModuleFetcher::new()
+            .with_module(fetch, artifact(fetch))
+            .with_module(compose, artifact(compose)),
+    ));
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph).unwrap())
+        .await
+        .expect("load graph");
+
+    // The scheduler's shape: the RUN is dropped at the deadline, the engine
+    // is not. `fetch` has completed; `compose` is in flight and never answers.
+    let compose_asked = std::sync::Arc::new(tokio::sync::Notify::new());
+    let dispatcher = std::sync::Arc::new(StallsAtCompose {
+        fetch,
+        compose_asked: std::sync::Arc::clone(&compose_asked),
+    });
+    tokio::select! {
+        biased;
+        () = compose_asked.notified() => {}
+        ended = engine.run_with_trigger_input_transport(dispatcher, None, json!({}), exec_id) => {
+            panic!("`compose` never answers, so the run cannot end: {:?}", ended.map(|_| ()))
+        }
+    }
+
+    talos_scheduler::finish_timed_out_run(
+        &engine,
+        &pool,
+        &sm,
+        talos_scheduler::TimedOutRun {
+            execution_id: exec_id,
+            workflow_id: Uuid::new_v4(),
+            schedule_id: Uuid::new_v4(),
+            timeout_secs: 3600,
+            phase: talos_metrics::SCHEDULER_PHASE_STEADY,
+        },
+    )
+    .await;
+
+    let (status, error, plaintext_empty, sealed) =
+        sqlx::query_as::<_, (String, Option<String>, bool, bool)>(
+            "SELECT status, error_message, output_data IS NULL, output_data_enc IS NOT NULL \
+             FROM workflow_executions WHERE id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read row");
+    assert_eq!(status, "failed");
+    assert_eq!(
+        error.as_deref(),
+        Some("Execution timed out after 3600 seconds"),
+        "the recorded reason is the timeout, unchanged by keeping the outputs"
+    );
+    assert!(
+        plaintext_empty && sealed,
+        "the completed outputs were not stored, or not sealed at rest"
+    );
+
+    let found =
+        talos_execution_repository::ExecutionRepository::with_encryption(pool.clone(), sm.clone())
+            .lookup_execution(exec_id, owner)
+            .await
+            .expect("lookup");
+    let talos_execution_repository::ExecutionLookup::Live(row) = found else {
+        panic!("the execution is live");
+    };
+    let stored = row
+        .output_data
+        .expect("a timed-out run's completed outputs");
+    assert_eq!(stored["fetch"]["items"], json!([1, 2, 3]), "{stored}");
+    assert!(
+        stored.get("compose").is_none(),
+        "the node that was still running has no output: {stored}"
+    );
+    assert!(
+        !stored
+            .to_string()
+            .contains("ghp_abcdefghijklmnopqrstuvwx12"),
+        "a completed node's output was stored unredacted"
+    );
+
+    // Taken once: the engine does not go on holding the run's outputs.
+    assert!(engine.take_partial_results().is_none());
+}

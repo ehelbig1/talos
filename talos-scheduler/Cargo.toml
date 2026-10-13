@@ -31,6 +31,8 @@ talos-registry = { path = "../talos-registry" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-task-supervision = { path = "../talos-task-supervision" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
+# Named only as the type of the engine a timed-out run is read back from.
+talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
@@ -41,6 +43,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Paused time: a deadline an hour away is tested without waiting an hour.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true, features = ["default", "fmt"] }
 
 [lints]
