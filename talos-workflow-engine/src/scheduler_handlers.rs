@@ -86,6 +86,24 @@ pub(crate) enum WaitOutcome {
     Pause { waiting_output: JsonValue },
 }
 
+/// The output of a node that passes its parent's output on (transformed or
+/// not), with the one fact the router needs about where a failure in it came
+/// from.
+///
+/// A parent that failed under `continue_on_error` commits an `__error`
+/// envelope, and a node that forwards its input forwards that envelope. The
+/// envelope is then the PARENT's verdict on itself. Read as the forwarding
+/// node's own, it failed a node that did its job, and with it a run whose
+/// author had said the branch may fail.
+pub(crate) struct ForwardedOutput {
+    /// What the node returns.
+    pub(crate) output: JsonValue,
+    /// The gathered input already reported a failure
+    /// ([`output_reports_error`]), so a failure reported by `output` is
+    /// inherited.
+    pub(crate) parent_reported_failure: bool,
+}
+
 impl ParallelWorkflowEngine {
     /// [`SystemNodeKind::Collect`] — aggregate every parent branch's
     /// output into a single `{count, items: [...]}` envelope.
@@ -705,7 +723,7 @@ impl ParallelWorkflowEngine {
         node_id: Uuid,
         execution_id: Uuid,
         results: &HashMap<Uuid, JsonValue>,
-    ) -> Option<JsonValue> {
+    ) -> Option<ForwardedOutput> {
         use talos_workflow_engine_core::action_links::{
             apply_action_links, plan_action_links, ActionLinkSpec, ResolvedLink,
         };
@@ -716,6 +734,9 @@ impl ParallelWorkflowEngine {
         };
         let ttl_hours = *ttl_hours;
         let input = self.gather_inputs(node_idx, results);
+        // Read BEFORE the input is consumed: whether a failure in the output
+        // this node returns is the parent's, not this node's.
+        let parent_reported_failure = output_reports_error(&input);
         let (planned, unidentified) = plan_action_links(&input, targets);
         let node_label = self
             .node_labels
@@ -836,12 +857,10 @@ impl ParallelWorkflowEngine {
                 resolved.len() + unidentified
             ),
         );
-        Some(apply_action_links(
-            input,
-            &resolved,
-            unidentified,
-            unavailable,
-        ))
+        Some(ForwardedOutput {
+            output: apply_action_links(input, &resolved, unidentified, unavailable),
+            parent_reported_failure,
+        })
     }
 
     /// [`SystemNodeKind::AssistantReport`] — controller-side weekly

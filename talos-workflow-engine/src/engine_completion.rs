@@ -198,6 +198,55 @@ impl ParallelWorkflowEngine {
         }
     }
 
+    /// Route the output of a node that FORWARDS its parent's output
+    /// ([`crate::scheduler_handlers::ForwardedOutput`]).
+    ///
+    /// When the parent's output already reported a failure, the envelope in
+    /// the forwarded output is the parent's, and the parent's own
+    /// `continue_on_error` or error edge has already decided what that
+    /// failure means for the run. This node did not fail: its output is
+    /// committed and its successors are released as for any committed
+    /// output, so a conditional edge is evaluated against the forwarded
+    /// envelope (`is_error == false` stops a send) and an error edge off THIS
+    /// node stays inactive. `__degraded_inputs__` still names the node that
+    /// failed to everything downstream.
+    ///
+    /// In every other case this is [`Self::route_system_node_output`]: a
+    /// failure the node reports that its input did not carry is its own.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn route_forwarded_output(
+        &self,
+        node_idx: NodeIndex,
+        forwarded: crate::scheduler_handlers::ForwardedOutput,
+        execution_id: Uuid,
+        wall_time_ms: u64,
+        chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
+        exec_ctx: &Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>>,
+        results: &mut HashMap<Uuid, JsonValue>,
+        joins: &mut Joins,
+        ready: &mut VecDeque<NodeIndex>,
+    ) -> Result<(), String> {
+        if !forwarded.parent_reported_failure {
+            return self
+                .route_system_node_output(
+                    node_idx,
+                    forwarded.output,
+                    execution_id,
+                    wall_time_ms,
+                    chains_ctx,
+                    exec_ctx,
+                    results,
+                    joins,
+                    ready,
+                )
+                .await;
+        }
+        self.progress.mark_finished(self.graph[node_idx]);
+        results.insert(self.graph[node_idx], forwarded.output);
+        self.release_successors(node_idx, Release::Succeeded, results, joins, ready);
+        Ok(())
+    }
+
     /// Post-completion processing for a node whose dispatch future
     /// just returned from `executing.next().await`.
     ///
@@ -649,7 +698,47 @@ impl ParallelWorkflowEngine {
         // modules (potentially MBs each) are not retained in the
         // engine's `Arc` for the lifetime of the caller.
         self.module_prefetch_cache.clear();
-        Err(format!("node '{node_label}' failed: {error_msg}"))
+        Err(format!(
+            "node '{node_label}' failed: {error_msg}{}",
+            self.failed_upstream_note(finished_idx, results)
+        ))
+    }
+
+    /// What a run's failure message adds when the node that failed it sits
+    /// downstream of a node that had ALREADY failed (and was continued past,
+    /// or routed to an error edge).
+    ///
+    /// A node handed a failed parent's envelope can fail on it with the
+    /// parent's own error text (a gate that passes its input on does), and
+    /// "node 'gate' failed: <the fetch's error>" sends a reader to the wrong
+    /// node. The names come from [`Self::degraded_inputs_report`], the same
+    /// derivation `__degraded_inputs__` uses: labels only (sorted, at most
+    /// 16), never the reasons, which the message would repeat.
+    ///
+    /// Empty when no ancestor failed, so every other failure message is
+    /// byte-identical.
+    fn failed_upstream_note(
+        &self,
+        failed_idx: NodeIndex,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> String {
+        let Some(report) = self.degraded_inputs_report(failed_idx, results) else {
+            return String::new();
+        };
+        let names: Vec<&str> = report
+            .get("entries")
+            .and_then(JsonValue::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| e.get("node").and_then(JsonValue::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if names.is_empty() {
+            return String::new();
+        }
+        format!(" (already failed upstream: {})", names.join(", "))
     }
 
     /// Resolve every outgoing edge of `finished_idx` according to `how`, then

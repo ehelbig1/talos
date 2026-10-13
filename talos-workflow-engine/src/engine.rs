@@ -2445,8 +2445,10 @@ impl ParallelWorkflowEngine {
                 // ── Action links (controller-side capability mint) ───────────
                 // Reads its parent's output, mints the links it asks for and
                 // passes the output on. Same async + route-downstream +
-                // degrade-not-fail contract as the readers above.
-                if let Some(output) = await_polling_in_flight!(self.try_dispatch_action_links(
+                // degrade-not-fail contract as the readers above. It FORWARDS
+                // its input, so a failure envelope it inherited from a parent
+                // that was continued past is not this node's failure.
+                if let Some(forwarded) = await_polling_in_flight!(self.try_dispatch_action_links(
                     node_idx,
                     node_id,
                     execution_id,
@@ -2457,9 +2459,9 @@ impl ParallelWorkflowEngine {
                     } else {
                         None
                     };
-                    self.route_system_node_output(
+                    self.route_forwarded_output(
                         node_idx,
-                        output,
+                        forwarded,
                         execution_id,
                         0, // no timer on this in-process path — UNKNOWN, not instant
                         chains_ctx,
