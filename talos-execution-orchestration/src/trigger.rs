@@ -33,7 +33,7 @@ use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use talos_engine::builder::{for_workflow, BuildError, EngineOpts};
+use talos_engine::builder::{for_workflow, BuildError};
 use talos_engine::nats_run::run_with_trigger_input_via_nats;
 use talos_engine::user_errors::render_graph_load_error;
 use talos_execution_result_collector as result_collector;
@@ -444,6 +444,9 @@ impl ExecutionOrchestrationService {
                 parent_execution_id,
                 root_execution_id,
                 talos_workflow_repository::InitialExecutionStatus::Running,
+                // The row records the mode the engine below is built with,
+                // so a resume or a recovery of this run is built the same.
+                talos_workflow_repository::RunMode::from_dry_run(dry_run),
             )
             .await
             .map_err(OrchestrationError::Internal)?;
@@ -554,13 +557,18 @@ impl ExecutionOrchestrationService {
             })?
             .clone();
 
-        let opts = EngineOpts::for_run(workflow_id, graph_json)
-            // Phase D2: the gate-resolved actor (already incorporates the
-            // explicit→workflow→default fallback) so the engine tier matches
-            // the stamped execution row.
-            .with_effective_actor(effective_actor, None)
-            .with_actor_context(lifted_actor_context)
-            .with_dry_run(dry_run);
+        // Phase D2: the gate-resolved actor (already incorporates the
+        // explicit→workflow→default fallback) so the engine tier matches
+        // the stamped execution row. The mode is the one the row was
+        // created with, above.
+        let opts = crate::run_mode::engine_opts_for_row(
+            workflow_id,
+            graph_json,
+            effective_actor,
+            None,
+            talos_workflow_repository::RunMode::from_dry_run(dry_run),
+        )
+        .with_actor_context(lifted_actor_context);
         let workflow_repo_for_task = self.workflow_repo.clone();
         let mut engine = match for_workflow(
             self.registry.clone(),

@@ -2312,6 +2312,7 @@ impl WebhookRouter {
                 None, // parent_execution_id
                 None, // root_execution_id
                 talos_workflow_repository::InitialExecutionStatus::Queued,
+                talos_workflow_repository::RunMode::Real,
             )
             .await
         {

@@ -181,7 +181,15 @@ fn replay(pool: &Pool<Postgres>, f: &Fixture) -> BoxedWrite {
         .expect("seed original");
         let exec = Uuid::new_v4();
         let got = talos_execution_repository::ExecutionRepository::new(pool)
-            .create_replay_execution(exec, wf, user, original, Some(actor), None)
+            .create_replay_execution(
+                exec,
+                wf,
+                user,
+                original,
+                Some(actor),
+                None,
+                talos_workflow_repository::RunMode::Real,
+            )
             .await
             .expect("replay insert");
         (exec, got)
@@ -216,7 +224,15 @@ fn mcp_test(pool: &Pool<Postgres>, f: &Fixture) -> BoxedWrite {
     Box::pin(async move {
         let exec = Uuid::new_v4();
         let got = talos_workflow_repository::WorkflowRepository::new(pool)
-            .create_test_execution(exec, wf, user, None, ExecutionPriority::Normal, Some(actor))
+            .create_test_execution(
+                exec,
+                wf,
+                user,
+                None,
+                ExecutionPriority::Normal,
+                Some(actor),
+                talos_workflow_repository::RunMode::Real,
+            )
             .await
             .expect("mcp test insert");
         (exec, got)

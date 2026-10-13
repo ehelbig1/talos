@@ -2673,6 +2673,7 @@ async fn run_scheduled_execution(
             None, // parent_execution_id — top-level run
             None, // root_execution_id — top-level run
             talos_workflow_repository::InitialExecutionStatus::Running,
+            talos_workflow_repository::RunMode::Real,
         )
         .await
     {

@@ -59,6 +59,10 @@ pub struct ExecutionRow {
     pub provenance: Option<serde_json::Value>,
     pub acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
     pub acknowledgement_reason: Option<String>,
+    /// The run was started as a dry run (`workflow_executions.dry_run`).
+    /// Whatever re-runs this row (a retry) or starts a new run from it (a
+    /// replay) must carry it: a rehearsal never comes back as a real run.
+    pub dry_run: bool,
 }
 
 /// The three ways an execution id can resolve for a given user: it is in the
@@ -207,7 +211,7 @@ macro_rules! execution_row_columns {
          output_data_enc, output_enc_key_id, output_data_format, \
          error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
          workflow_version_id, priority, is_test_execution, provenance, \
-         acknowledged_at, acknowledgement_reason"
+         acknowledged_at, acknowledgement_reason, dry_run"
     };
 }
 
@@ -261,6 +265,9 @@ fn execution_row_from(
         provenance: r.try_get::<Option<_>, _>("provenance")?,
         acknowledged_at: r.try_get::<Option<_>, _>("acknowledged_at")?,
         acknowledgement_reason: r.try_get::<Option<_>, _>("acknowledgement_reason")?,
+        // NOT NULL in the schema, and read as such: a row whose mode cannot
+        // be read is an error, never an ordinary run.
+        dry_run: r.try_get::<bool, _>("dry_run")?,
     })
 }
 
@@ -1335,7 +1342,7 @@ impl ExecutionRepository {
                     output_data_enc, output_enc_key_id, output_data_format, \
                     error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
                     workflow_version_id, priority, is_test_execution, provenance, \
-                    acknowledged_at, acknowledgement_reason \
+                    acknowledged_at, acknowledgement_reason, dry_run \
              FROM workflow_executions WHERE id = ANY($1) AND user_id = $2",
         )
         .bind(exec_ids)
@@ -1366,6 +1373,7 @@ impl ExecutionRepository {
                 provenance: r.try_get::<Option<_>, _>("provenance")?,
                 acknowledged_at: r.try_get::<Option<_>, _>("acknowledged_at")?,
                 acknowledgement_reason: r.try_get::<Option<_>, _>("acknowledgement_reason")?,
+                dry_run: r.try_get::<bool, _>("dry_run")?,
             });
         }
         Ok(out)
@@ -1644,7 +1652,7 @@ impl ExecutionRepository {
                  SELECT id, workflow_id, status, started_at, completed_at, output_data, \
                         error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
                         workflow_version_id, priority, is_test_execution, provenance, \
-                        0 AS depth \
+                        dry_run, 0 AS depth \
                  FROM workflow_executions \
                  WHERE id = $1 AND user_id = $2 \
                UNION ALL \
@@ -1652,14 +1660,15 @@ impl ExecutionRepository {
                         we.output_data, we.error_message, we.is_pinned, we.pin_note, \
                         we.replayed_from_id, we.actor_id, we.workflow_version_id, \
                         we.priority, we.is_test_execution, we.provenance, \
-                        c.depth + 1 \
+                        we.dry_run, c.depth + 1 \
                  FROM workflow_executions we \
                  JOIN chain c ON we.id = c.replayed_from_id \
                  WHERE we.user_id = $2 AND c.depth < $3 \
              ) \
              SELECT id, workflow_id, status, started_at, completed_at, output_data, \
                     error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
-                    workflow_version_id, priority, is_test_execution, provenance \
+                    workflow_version_id, priority, is_test_execution, provenance, \
+                    dry_run \
              FROM chain ORDER BY depth ASC",
         )
         .bind(exec_id)
@@ -1691,6 +1700,7 @@ impl ExecutionRepository {
                     provenance: r.try_get::<Option<_>, _>("provenance")?,
                     acknowledged_at: None,
                     acknowledgement_reason: None,
+                    dry_run: r.try_get::<bool, _>("dry_run")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2102,6 +2112,7 @@ impl ExecutionRepository {
         replayed_from_id: Uuid,
         actor_id: Option<Uuid>,
         provenance: Option<&serde_json::Value>,
+        run_mode: talos_execution_finalizer::RunMode,
     ) -> Result<BudgetAdmission> {
         // Package CK: a replay is a new start, so it runs the SAME five-cap
         // check as every other start, inside this INSERT's transaction and
@@ -2117,8 +2128,8 @@ impl ExecutionRepository {
         }
         sqlx::query(
             "INSERT INTO workflow_executions \
-             (id, workflow_id, user_id, status, started_at, replayed_from_id, actor_id, provenance) \
-             VALUES ($1, $2, $3, 'running', NOW(), $4, $5, $6)",
+             (id, workflow_id, user_id, status, started_at, replayed_from_id, actor_id, provenance, dry_run) \
+             VALUES ($1, $2, $3, 'running', NOW(), $4, $5, $6, $7)",
         )
         .bind(exec_id)
         .bind(wf_id)
@@ -2126,6 +2137,9 @@ impl ExecutionRepository {
         .bind(replayed_from_id)
         .bind(actor_id)
         .bind(provenance)
+        // The ORIGINAL's mode, passed by the caller that read it: a replay of
+        // a rehearsal is a rehearsal.
+        .bind(run_mode.is_dry_run())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -2554,49 +2568,6 @@ impl ExecutionRepository {
 
     // ── Cleanup & alerts ───────────────────────────────────────────────────
 
-    /// List stuck 'running' executions for the resume-after-restart path.
-    ///
-    /// Returns everything the resume needs in ONE query (LEFT JOIN against
-    /// `workflows`):
-    /// * `id`, `workflow_id`, `user_id`, `checkpoint_data` — basic dispatch
-    ///   identity.
-    /// * `actor_id` — the actor that originally triggered this execution
-    ///   (NULL = anonymous trigger).
-    /// * `workflow_default_actor_id` — the workflow's bound default actor
-    ///   from `workflows.actor_id`, used as a fallback when `actor_id` is
-    ///   NULL (mirrors the `arg.or(wf_record.actor_id)` semantics in
-    ///   `handle_trigger_workflow`).
-    /// * `graph_json` — the workflow definition the engine needs to load.
-    ///
-    /// **Why both actor columns matter**: re-stamping the original actor on
-    /// resume keeps `max_llm_tier` enforcement intact across pod restarts.
-    /// A tier-1 actor's resumed run must NOT silently lose its
-    /// data-egress ceiling because the pod that originally booted the
-    /// engine got rescheduled.
-    pub async fn list_stuck_executions_for_resume(
-        &self,
-        stale_after_minutes: i64,
-    ) -> Result<Vec<StuckExecutionForResume>> {
-        let rows = sqlx::query_as::<_, StuckExecutionForResume>(
-            "SELECT \
-                e.id, \
-                e.workflow_id, \
-                e.user_id, \
-                e.checkpoint_data, \
-                e.actor_id, \
-                w.actor_id AS workflow_default_actor_id, \
-                w.graph_json \
-             FROM workflow_executions e \
-             LEFT JOIN workflows w ON w.id = e.workflow_id \
-             WHERE e.status = 'running' \
-               AND e.updated_at < NOW() - make_interval(mins => $1::int)",
-        )
-        .bind(stale_after_minutes)
-        .fetch_all(&self.db_pool)
-        .await?;
-        Ok(rows)
-    }
-
     /// Mark stuck 'running' executions as 'failed' after timeout_minutes,
     /// scoped to a single user. Returns the number of executions cleaned up.
     ///
@@ -2789,6 +2760,7 @@ impl ExecutionRepository {
              FROM claimed c \
              WHERE e.id = c.id AND e.status = 'running' \
              RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, e.epoch, \
+                       e.dry_run, \
                        (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
                            AS workflow_default_actor_id, \
                        {RESUME_GRAPH_SQL} AS graph_json",
@@ -2843,6 +2815,7 @@ impl ExecutionRepository {
                     WHERE w.id = e.workflow_id AND w.org_id = ANY($3))) \
                AND e.status = 'waiting' \
              RETURNING e.id, e.workflow_id, e.user_id, e.checkpoint_data, e.actor_id, e.epoch, \
+                       e.dry_run, \
                        (SELECT w.actor_id FROM workflows w WHERE w.id = e.workflow_id) \
                            AS workflow_default_actor_id, \
                        {RESUME_GRAPH_SQL} AS graph_json",
@@ -3061,7 +3034,8 @@ impl ExecutionRepository {
             "SELECT id, workflow_id, status, started_at, completed_at, output_data, \
                     output_data_enc, output_enc_key_id, output_data_format, \
                     error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
-                    workflow_version_id, priority, is_test_execution, provenance \
+                    workflow_version_id, priority, is_test_execution, provenance, \
+                    dry_run \
              FROM workflow_executions \
              WHERE workflow_id = $1 AND user_id = $2 AND status IN ('completed', 'failed') \
              ORDER BY started_at DESC \
@@ -3096,6 +3070,7 @@ impl ExecutionRepository {
                 provenance: r.try_get::<Option<_>, _>("provenance")?,
                 acknowledged_at: None,
                 acknowledgement_reason: None,
+                dry_run: r.try_get::<bool, _>("dry_run")?,
             });
         }
         Ok(result)
@@ -4388,7 +4363,9 @@ const RESUME_GRAPH_SQL: &str = "CASE WHEN e.workflow_version_id IS NULL \
      ELSE (SELECT v.graph_json::text FROM workflow_versions v \
            WHERE v.id = e.workflow_version_id AND v.workflow_id = e.workflow_id) END";
 
-/// Row returned by `list_stuck_executions_for_resume`.
+/// A run handed to the resume kernel: what `claim_stuck_execution_for_resume`
+/// (crash recovery) and `claim_waiting_execution_for_resume` (a paused run)
+/// return.
 ///
 /// Carries everything the resume-after-restart path needs to
 /// reconstruct an engine identical (in identity + tier ceiling) to
@@ -4413,6 +4390,10 @@ pub struct StuckExecutionForResume {
     /// the workflow, or its pinned version, was deleted between trigger and
     /// resume — caller treats NULL as a hard skip.
     pub graph_json: Option<String>,
+    /// The run was started as a dry run. The resumed half runs as one too:
+    /// until 2026-10-13 it did not, and a rehearsal that paused came back as
+    /// a real run.
+    pub dry_run: bool,
 }
 
 /// How many execution ids a stale-cleanup record lists; the count beside the

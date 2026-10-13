@@ -24,6 +24,47 @@ use anyhow::Result;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Whether a run is the real thing or a rehearsal: the value of
+/// `workflow_executions.dry_run`.
+///
+/// It lives in this leaf for the reason the terminal writes do: the two
+/// repositories that create execution rows cannot see each other, and both
+/// must say the same thing.
+///
+/// An enum and not a `bool` so that every statement that creates a row SAYS
+/// which it is creating (`RunMode::Real`), and a path that learns to start
+/// dry runs has one obvious thing to pass. The row is written once with it
+/// and it never changes: whatever rebuilds an engine for the row later (a
+/// resume after a pause, crash recovery, a retry) or starts a new run from
+/// it (a replay) reads it back, so a rehearsal cannot come back as a real
+/// run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    /// An ordinary run.
+    Real,
+    /// A rehearsal: outbound calls are answered by stubs and no action link
+    /// is minted.
+    DryRun,
+}
+
+impl RunMode {
+    /// The mode for a caller's `dry_run` flag.
+    #[must_use]
+    pub fn from_dry_run(dry_run: bool) -> Self {
+        if dry_run {
+            Self::DryRun
+        } else {
+            Self::Real
+        }
+    }
+
+    /// The column value, and what an engine's dry-run flag is set to.
+    #[must_use]
+    pub fn is_dry_run(self) -> bool {
+        matches!(self, Self::DryRun)
+    }
+}
+
 /// A DISPATCHER lost or refused a run: the scheduler, the webhook router, the
 /// continuation / handoff paths. Guard: never clobber a terminal row, and never
 /// touch a `resuming` row — that one is OWNED by crash recovery

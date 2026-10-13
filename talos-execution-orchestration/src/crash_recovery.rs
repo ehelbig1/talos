@@ -38,7 +38,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use talos_actor_repository::ActorRepository;
-use talos_engine::builder::{for_workflow, EngineOpts};
+use talos_engine::builder::for_workflow;
 use talos_engine::checkpoint_store::load_checkpoint_for_resume;
 use talos_execution_repository::{ExecutionRepository, StuckExecutionForResume};
 use talos_registry::ModuleRegistry;
@@ -221,8 +221,18 @@ pub(crate) async fn resume_one(
     // Re-stamp the original actor (or the workflow's bound default) so the
     // per-actor `max_llm_tier` ceiling is re-applied on resume. `for_workflow`
     // fail-closes to tier-1 if the actor row can't be read.
-    let opts = EngineOpts::for_run(row.workflow_id, graph_json)
-        .with_effective_actor(row.actor_id, row.workflow_default_actor_id);
+    //
+    // And the mode it was started in. A dry run that paused on an approval or
+    // a wait node, or that a restart caught mid-flight, is resumed as a dry
+    // run: until 2026-10-13 it was resumed as an ordinary one, with every
+    // stub lifted.
+    let opts = crate::run_mode::engine_opts_for_row(
+        row.workflow_id,
+        graph_json,
+        row.actor_id,
+        row.workflow_default_actor_id,
+        talos_workflow_repository::RunMode::from_dry_run(row.dry_run),
+    );
 
     let mut engine = match for_workflow(
         deps.registry.clone(),

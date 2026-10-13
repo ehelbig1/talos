@@ -15,7 +15,7 @@
 use serde_json::Value;
 use uuid::Uuid;
 
-use talos_engine::builder::{for_workflow, EngineOpts};
+use talos_engine::builder::for_workflow;
 use talos_engine::nats_run::run_with_trigger_input_via_nats;
 use talos_execution_repository::ExecutionLookup;
 use talos_execution_result_collector as result_collector;
@@ -125,6 +125,10 @@ impl ExecutionOrchestrationService {
         let workflow_id = orig.workflow_id;
         let inherited_actor_id = orig.actor_id;
         let output_data = orig.output_data;
+        // A replay of a dry run is a dry run: the new row is created with
+        // the original's mode and the engine is built with it. A rehearsal
+        // is never turned into a real run by replaying it.
+        let run_mode = talos_workflow_repository::RunMode::from_dry_run(orig.dry_run);
 
         // 3. Workflow enabled check. is_workflow_enabled returns
         // Option<bool>: None means the workflow row is gone, false
@@ -258,6 +262,7 @@ impl ExecutionOrchestrationService {
                 original_execution_id,
                 inherited_actor_id,
                 provenance.as_ref(),
+                run_mode,
             )
             .await
             .map_err(OrchestrationError::Internal)?
@@ -287,8 +292,13 @@ impl ExecutionOrchestrationService {
             self.secrets_manager.clone(),
             self.actor_repo.clone(),
             user_id,
-            EngineOpts::for_run(workflow_id, graph_json.clone())
-                .with_effective_actor(effective_actor, None),
+            crate::run_mode::engine_opts_for_row(
+                workflow_id,
+                graph_json.clone(),
+                effective_actor,
+                None,
+                run_mode,
+            ),
         )
         .await
         {

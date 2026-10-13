@@ -586,6 +586,7 @@ impl WorkflowRepository {
         parent_execution_id: Option<Uuid>,
         root_execution_id: Option<Uuid>,
         initial_status: InitialExecutionStatus,
+        run_mode: RunMode,
     ) -> Result<ConcurrencyAdmission> {
         let mut tx = self.db_pool.begin().await?;
 
@@ -716,8 +717,8 @@ impl WorkflowRepository {
 
         sqlx::query(
             "INSERT INTO workflow_executions \
-             (id, workflow_id, user_id, workflow_version_id, status, started_at, priority, actor_id, provenance, parent_execution_id, root_execution_id) \
-             VALUES ($1, $2, $3, $4, $10::text, NOW(), $5, $6, $7, $8, $9)",
+             (id, workflow_id, user_id, workflow_version_id, status, started_at, priority, actor_id, provenance, parent_execution_id, root_execution_id, dry_run) \
+             VALUES ($1, $2, $3, $4, $10::text, NOW(), $5, $6, $7, $8, $9, $11)",
         )
         .bind(id)
         .bind(workflow_id)
@@ -729,6 +730,9 @@ impl WorkflowRepository {
         .bind(parent_execution_id)
         .bind(root_execution_id)
         .bind(initial_status.as_db_str())
+        // Written here, in the statement that creates the row, and never
+        // after: see `RunMode`.
+        .bind(run_mode.is_dry_run())
         .execute(&mut *tx)
         .await?;
 
@@ -936,6 +940,7 @@ impl WorkflowRepository {
         version_id: Option<Uuid>,
         priority: ExecutionPriority,
         actor_id: Option<Uuid>,
+        run_mode: RunMode,
     ) -> Result<talos_actor_budget_refusal::BudgetAdmission> {
         use talos_actor_budget_refusal::{admit_actor_budget, BudgetAdmission};
         let mut tx = self.db_pool.begin().await?;
@@ -948,8 +953,8 @@ impl WorkflowRepository {
         }
         sqlx::query(
             "INSERT INTO workflow_executions \
-             (id, workflow_id, user_id, workflow_version_id, status, started_at, priority, is_test_execution, actor_id) \
-             VALUES ($1, $2, $3, $4, 'running', NOW(), $5, true, $6)",
+             (id, workflow_id, user_id, workflow_version_id, status, started_at, priority, is_test_execution, actor_id, dry_run) \
+             VALUES ($1, $2, $3, $4, 'running', NOW(), $5, true, $6, $7)",
         )
         .bind(id)
         .bind(workflow_id)
@@ -957,6 +962,7 @@ impl WorkflowRepository {
         .bind(version_id)
         .bind(priority.as_str())
         .bind(actor_id)
+        .bind(run_mode.is_dry_run())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

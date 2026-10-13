@@ -105,3 +105,6 @@ pub use talos_execution_finalizer::fail_runs_interrupted_by_shutdown;
 /// re-exported so the scheduler and webhook router call it through the crate they
 /// already depend on.
 pub use talos_execution_finalizer::fail_workflow_execution_unless_terminal;
+/// Whether a row is created for a real run or a dry run. Re-exported so a
+/// caller of the row-creating methods needs no second dependency.
+pub use talos_execution_finalizer::RunMode;

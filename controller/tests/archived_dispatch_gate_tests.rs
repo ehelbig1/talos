@@ -217,6 +217,7 @@ async fn the_admission_gate_writes_no_row_for_an_archived_workflow() {
                 None,
                 None,
                 InitialExecutionStatus::Running,
+                talos_workflow_repository::RunMode::Real,
             )
             .await
             .expect("admission query")

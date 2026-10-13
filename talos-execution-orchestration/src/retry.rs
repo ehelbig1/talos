@@ -19,7 +19,7 @@
 //!      responsible for updating the execution row's terminal status
 //!      after the run completes.
 
-use talos_engine::builder::{for_workflow, EngineOpts};
+use talos_engine::builder::for_workflow;
 use talos_engine::nats_run::run_with_trigger_input_via_nats;
 use talos_execution_repository::ExecutionLookup;
 use talos_execution_result_collector as result_collector;
@@ -242,8 +242,15 @@ impl ExecutionOrchestrationService {
             self.secrets_manager.clone(),
             self.actor_repo.clone(),
             user_id,
-            EngineOpts::for_run(workflow_id, graph_json.clone())
-                .with_effective_actor(effective_actor, None),
+            // A retry re-runs the SAME row, so it runs in the row's mode:
+            // a retried dry run is still a dry run.
+            crate::run_mode::engine_opts_for_row(
+                workflow_id,
+                graph_json.clone(),
+                effective_actor,
+                None,
+                talos_workflow_repository::RunMode::from_dry_run(exec.dry_run),
+            ),
         )
         .await
         {

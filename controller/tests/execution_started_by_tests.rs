@@ -121,6 +121,7 @@ impl World {
                 None,
                 None,
                 InitialExecutionStatus::Running,
+                talos_workflow_repository::RunMode::Real,
             )
             .await
             .expect("insert");
@@ -153,6 +154,7 @@ async fn each_start_path_is_read_back_as_itself() {
                 None,
                 ExecutionPriority::Normal,
                 Some(w.actor),
+                talos_workflow_repository::RunMode::Real,
             )
             .await
             .expect("test insert"),
@@ -287,7 +289,15 @@ async fn the_paths_that_mark_their_rows_another_way_are_read_from_those_marks() 
     let replay = Uuid::new_v4();
     admitted(
         w.executions
-            .create_replay_execution(replay, w.workflow, w.user, scheduled, Some(w.actor), None)
+            .create_replay_execution(
+                replay,
+                w.workflow,
+                w.user,
+                scheduled,
+                Some(w.actor),
+                None,
+                talos_workflow_repository::RunMode::Real,
+            )
             .await
             .expect("replay insert"),
     );
