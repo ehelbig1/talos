@@ -593,15 +593,22 @@ impl ReplayService {
         if module.allowed_secrets.is_empty() {
             return HashMap::new();
         }
-        match self
-            .secrets_manager
-            .get_secrets_by_paths(&module.allowed_secrets, Some(user_id))
-            .await
+        // Resolved the way a dispatch resolves them, so a module that
+        // authenticates with a MINTED token (an impersonated Google Cloud
+        // service account, a GitHub App installation) is replayed with one.
+        // The grant and the request are the same list: the module's own.
+        match talos_oauth::resolver::resolve_for_standalone_run(
+            self.secrets_manager.clone(),
+            &module.allowed_secrets,
+            &module.allowed_secrets,
+            Some(user_id),
+        )
+        .await
         {
             Ok(map) => map,
             Err(e) => {
                 tracing::warn!(
-                    "replay: secret prefetch failed (continuing with empty map): {:#}",
+                    "replay: secret prefetch failed (continuing with empty map): {}",
                     e
                 );
                 HashMap::new()

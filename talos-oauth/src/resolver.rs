@@ -404,3 +404,140 @@ mod check_mint_tests {
         }
     }
 }
+
+/// The paths a module run OUTSIDE a workflow may have resolved for it:
+/// `test_module`, `run_sandbox`, a module replay.
+///
+/// `wanted` is everything the run would like (its grant list plus any
+/// `vault://` reference found in its payload). `granted` is the grant the run
+/// is ENTITLED to: the module's own `allowed_secrets`, or for inline code the
+/// list its caller declared. Two rules:
+///
+/// * a STORED path is returned as it was asked for. These surfaces have
+///   always fetched a referenced stored secret for the caller's own user,
+///   and what the guest may then do with it is decided where it runs, by
+///   the grant list in its security context;
+/// * a MINT path ([`dispatch_mint`]) is kept only when `granted` covers it.
+///   A mint is an outbound call that creates a credential, so it needs the
+///   grant a real dispatch of the module would need. A `vault://` reference
+///   typed into a test's config is not a grant.
+///
+/// Order is kept and duplicates are dropped. Pure, so the rule is tested
+/// without a database.
+#[must_use]
+pub fn standalone_run_paths(granted: &[String], wanted: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    wanted
+        .iter()
+        .filter(|path| {
+            dispatch_mint(path).is_none()
+                || talos_workflow_job_protocol::vault_path_permitted(granted, path)
+        })
+        .filter(|path| seen.insert(path.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Resolve the secrets of a module run outside a workflow, the way a
+/// dispatch resolves them: stored paths from the vault, mint paths minted.
+///
+/// Until 2026-10-13 these surfaces asked the vault directly, so a module
+/// that authenticates with a minted token (an impersonated Google Cloud
+/// service account, a GitHub App installation) could not be rehearsed or
+/// replayed on its own: nothing is stored at a mint path, the vault returned
+/// nothing, and the run failed on a missing secret.
+///
+/// This is [`ControllerSecretsResolver::resolve_by_paths`] over
+/// [`standalone_run_paths`]. So the tenancy is the dispatch's own: a mint is
+/// made only for `user_id`, from that user's own connection, and with no
+/// `user_id` nothing is minted at all.
+///
+/// # Errors
+/// When the vault cannot be read. A mint that is refused or fails is not an
+/// error: the path is simply absent from the map, as on a dispatch.
+pub async fn resolve_for_standalone_run(
+    sm: Arc<SecretsManager>,
+    granted: &[String],
+    wanted: &[String],
+    user_id: Option<Uuid>,
+) -> Result<HashMap<String, String>, BoxError> {
+    let paths = standalone_run_paths(granted, wanted);
+    if paths.is_empty() {
+        return Ok(HashMap::new());
+    }
+    ControllerSecretsResolver::new(sm)
+        .resolve_by_paths(&paths, user_id)
+        .await
+}
+
+#[cfg(test)]
+mod standalone_run_paths_tests {
+    use super::standalone_run_paths;
+
+    const SA: &str = "runner@example-project.iam.gserviceaccount.com";
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    /// A stored path is fetched as before, granted or not: these tools have
+    /// always resolved a referenced stored secret for the caller's own user.
+    #[test]
+    fn stored_paths_are_unchanged() {
+        let wanted = s(&[
+            "jira/api_token",
+            "oauth/gmail/abc/access_token",
+            "jira/api_token",
+        ]);
+        assert_eq!(
+            standalone_run_paths(&[], &wanted),
+            s(&["jira/api_token", "oauth/gmail/abc/access_token"]),
+            "order kept, duplicates dropped, nothing withheld"
+        );
+    }
+
+    /// A mint needs the grant a dispatch would need. A `vault://` reference
+    /// in a test's config puts the path in `wanted`; it does not grant it.
+    #[test]
+    fn a_mint_path_is_resolved_only_when_the_grant_covers_it() {
+        let plain = format!("gcp/impersonated/{SA}/access_token");
+        let named =
+            format!("gcp/impersonated/{SA}/as/0b7b0f0e-4c1d-4a57-9d2e-3f6a1c2b9e10/access_token");
+        let other =
+            "gcp/impersonated/someone-else@example-project.iam.gserviceaccount.com/access_token"
+                .to_string();
+        let github = "github_app:example-org".to_string();
+        let wanted = vec![
+            "jira/api_token".to_string(),
+            plain.clone(),
+            named.clone(),
+            other.clone(),
+            github.clone(),
+        ];
+
+        // No grant: only the stored path.
+        assert_eq!(standalone_run_paths(&[], &wanted), s(&["jira/api_token"]));
+
+        // The exact path: that one mint, and no other.
+        assert_eq!(
+            standalone_run_paths(&s(&[&plain]), &wanted),
+            vec!["jira/api_token".to_string(), plain.clone()]
+        );
+
+        // A grant on one service account does not reach another's token, and
+        // a Google grant does not reach a GitHub one.
+        let one_account = s(&[&format!("gcp/impersonated/{SA}")]);
+        assert_eq!(
+            standalone_run_paths(&one_account, &wanted),
+            vec!["jira/api_token".to_string(), plain.clone(), named.clone()]
+        );
+
+        // The namespace, and the GitHub scheme by its exact entry.
+        let both = s(&["gcp/impersonated/*", "github_app:example-org"]);
+        assert_eq!(standalone_run_paths(&both, &wanted), wanted);
+        assert_eq!(
+            standalone_run_paths(&s(&["github_app:another-org"]), &wanted),
+            s(&["jira/api_token"])
+        );
+    }
+}

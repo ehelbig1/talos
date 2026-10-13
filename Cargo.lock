@@ -9625,6 +9625,7 @@ dependencies = [
  "talos-capability-world",
  "talos-dlp-provider",
  "talos-module-repository",
+ "talos-oauth",
  "talos-registry",
  "talos-replay-diff",
  "talos-secrets-manager",

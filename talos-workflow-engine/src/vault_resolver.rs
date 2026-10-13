@@ -73,12 +73,11 @@ pub enum VaultResolverError {
         /// The reserved vault path (prefix stripped).
         vault_path: String,
     },
-    /// A `vault://<path>` reference names a path whose value is MINTED when a
-    /// workflow run dispatches the module
-    /// ([`talos_workflow_job_protocol::dispatch_mint`]). The surfaces that
-    /// call this check read stored secrets and do not mint, so the path is
-    /// absent here for a reason that has nothing to do with the vault:
-    /// nothing is ever stored at it.
+    /// A `vault://<path>` reference names a path whose value is MINTED when
+    /// the module runs ([`talos_workflow_job_protocol::dispatch_mint`]), and
+    /// no token was minted for it: the module's grant does not cover the
+    /// path, the caller has no connection to mint from, or the mint failed.
+    /// Never a missing stored secret: nothing is ever stored at such a path.
     MintedAtDispatch {
         /// The config key whose value referenced the mint path.
         config_key: String,
@@ -115,10 +114,11 @@ impl fmt::Display for VaultResolverError {
             } => write!(
                 f,
                 "Config key '{config_key}' references vault://{vault_path}, whose value is \
-                 minted when a workflow run dispatches the module. This tool does not mint, \
-                 and nothing is ever stored at that path, so do NOT add a secret there. \
-                 Rehearse the module inside a workflow (test_workflow); test_secret_access \
-                 says whether a mint has a connection to use."
+                 minted when the module runs, and no token was minted for it. A mint needs \
+                 two things: the module's allowed_secrets must cover the path (a reference \
+                 in config is not a grant), and you need a connection to mint from. \
+                 test_secret_access checks both. Nothing is ever stored at that path, so do \
+                 NOT add a secret there."
             ),
         }
     }
@@ -177,7 +177,7 @@ pub fn check_vault_refs_resolvable(
             });
         }
         if !resolved.contains_key(vault_path.as_str()) {
-            // A mint path is absent because this surface does not mint, not
+            // A mint path is absent because no token was minted for it, not
             // because a secret is missing: say that, and never "ensure the
             // secret exists".
             if talos_workflow_job_protocol::dispatch_mint(vault_path).is_some() {
@@ -239,9 +239,9 @@ mod tests {
         r
     }
 
-    /// `test_module` and `run_sandbox` read stored secrets and do not mint.
-    /// For a mint path they answered "ensure the secret exists (dashboard
-    /// Settings → Secrets …)": advice to store a secret that is never read.
+    /// For a mint path that was not resolved, `test_module` and `run_sandbox`
+    /// answered "ensure the secret exists (dashboard Settings → Secrets …)":
+    /// advice to store a secret that is never read.
     #[test]
     fn an_absent_mint_path_is_not_called_a_missing_secret() {
         for path in [
@@ -253,7 +253,7 @@ mod tests {
             let payload = serde_json::json!({ "AUTH_HEADER": format!("Bearer vault://{path}") });
             let refs = refs_of(&payload);
             let err = check_vault_refs_resolvable(&resolved(&[]), &refs)
-                .expect_err("this surface does not mint");
+                .expect_err("no token was minted for it");
             assert!(
                 matches!(err, VaultResolverError::MintedAtDispatch { .. }),
                 "{err:?}"
@@ -263,7 +263,11 @@ mod tests {
                 text.contains("AUTH_HEADER") && text.contains(path),
                 "{text}"
             );
-            assert!(text.contains("minted when a workflow run"), "{text}");
+            assert!(text.contains("minted when the module runs"), "{text}");
+            assert!(
+                text.contains("allowed_secrets must cover the path"),
+                "{text}"
+            );
             assert!(text.contains("do NOT add a secret"), "{text}");
             assert!(!text.contains("Ensure the secret exists"), "{text}");
             assert!(!text.contains("Settings → Secrets"), "{text}");

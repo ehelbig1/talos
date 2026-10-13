@@ -21,6 +21,7 @@ talos-workflow-repository = { path = "../talos-workflow-repository" }
 
 # Talos crates — services
 talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-oauth = { path = "../talos-oauth" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-registry = { path = "../talos-registry" }
 talos-capability-world = { path = "../talos-capability-world" }
