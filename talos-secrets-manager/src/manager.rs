@@ -4355,6 +4355,33 @@ impl SecretsManager {
         Ok(paths)
     }
 
+    /// The key paths of every secret a dispatch for `user_id` can read: names
+    /// only, never a value.
+    ///
+    /// This is the population a tool must judge a module's secret grant
+    /// against when it says "this grant has nothing stored behind it". The
+    /// ownership rule is the one [`Self::get_secrets_by_paths`] reads with
+    /// (the user's own secrets and the ownerless ones), so the tool and the
+    /// dispatch cannot disagree about whose secrets count. Another user's
+    /// secret is never in it.
+    ///
+    /// Bounded, and it says when the bound was reached: a listing cut short
+    /// would call a stored secret missing, so more than
+    /// [`DISPATCH_READABLE_KEY_PATHS_CAP`] paths is an error ("could not
+    /// check"), not a truncated answer.
+    pub async fn list_dispatch_readable_key_paths(&self, user_id: Uuid) -> Result<Vec<String>> {
+        let paths = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT key_path FROM secrets \
+             WHERE owner_user_id IS NULL OR owner_user_id = $1 OR created_by = $1 \
+             ORDER BY key_path LIMIT $2",
+        )
+        .bind(user_id)
+        .bind(DISPATCH_READABLE_KEY_PATHS_CAP as i64 + 1)
+        .fetch_all(&self.db_pool)
+        .await?;
+        whole_listing_or_refuse(paths, DISPATCH_READABLE_KEY_PATHS_CAP)
+    }
+
     /// All canonical secret paths declared across all installed templates,
     /// returned as `(template_name, [allowed_secrets])`. Global scope (no
     /// user filter) — canonical paths are a workspace-wide concept.
@@ -5684,6 +5711,53 @@ impl SecretRequestor {
             SecretRequestor::Module(id) => Some(*id),
             _ => None,
         }
+    }
+}
+
+/// The most key paths [`SecretsManager::list_dispatch_readable_key_paths`]
+/// returns. Past it the listing is refused instead of cut short.
+pub const DISPATCH_READABLE_KEY_PATHS_CAP: usize = 10_000;
+
+/// `paths` when it is the whole listing, an error when the query returned
+/// more than `cap` rows (it asks for `cap + 1`, so "more" is detectable).
+///
+/// A caller reads the listing to say which grants have NOTHING stored behind
+/// them. Cut short, it would name a stored secret as missing with the same
+/// confidence as a real gap; an error makes the caller say it could not check.
+fn whole_listing_or_refuse(paths: Vec<String>, cap: usize) -> Result<Vec<String>> {
+    if paths.len() > cap {
+        return Err(anyhow!(
+            "more than {cap} secret key paths are readable here; the listing is refused rather than cut short"
+        ));
+    }
+    Ok(paths)
+}
+
+#[cfg(test)]
+mod whole_listing_tests {
+    use super::whole_listing_or_refuse;
+
+    fn paths(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("svc/key-{i}")).collect()
+    }
+
+    #[test]
+    fn a_listing_within_the_cap_is_returned_whole() {
+        assert_eq!(whole_listing_or_refuse(paths(0), 3).unwrap(), paths(0));
+        assert_eq!(whole_listing_or_refuse(paths(3), 3).unwrap(), paths(3));
+    }
+
+    /// The query asks for one row more than the cap. That extra row is the
+    /// only evidence the listing is incomplete, and it must become a refusal:
+    /// dropping it would return a full-looking listing with a path missing.
+    #[test]
+    fn a_listing_past_the_cap_is_refused_not_cut_short() {
+        let error = whole_listing_or_refuse(paths(4), 3)
+            .expect_err("four rows against a cap of three")
+            .to_string();
+        assert!(error.contains("refused rather than cut short"), "{error}");
+        // Names no path: the message can reach a log line.
+        assert!(!error.contains("svc/key"), "{error}");
     }
 }
 
