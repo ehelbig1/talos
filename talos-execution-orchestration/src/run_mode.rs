@@ -38,9 +38,97 @@ pub(crate) fn engine_opts_for_row(
         .with_dry_run(run_mode.is_dry_run())
 }
 
+/// Whether the outputs a resumed run is seeded with show that the run was
+/// started as a DRY RUN.
+///
+/// The row's own flag ([`RunMode`]) is the record, and it decides for every
+/// run created since the column existed. This is for the rows it cannot
+/// speak for: a dry run that was started BEFORE the column and is still
+/// paused has `dry_run = false`, and on that flag alone its resume would be
+/// a real run, with every stub lifted. Its completed nodes say otherwise.
+///
+/// The evidence is the worker's dry-run report on a node output
+/// ([`talos_workflow_job_protocol::read_dry_run_report`]). Only the output of
+/// a PLAIN MODULE node counts, because only there is it unforgeable: the
+/// worker writes the report on every module output of a dry run and REMOVES
+/// a module's own copy on an ordinary run. The trigger seed is caller data,
+/// and a system node can forward caller data, so a report-shaped value there
+/// proves nothing and is ignored. (Nothing a caller plants could do worse
+/// than stub their own run, but a rule that can be steered is not a rule.)
+///
+/// It only ever moves a run TOWARD a dry run. One module output with a
+/// report is enough: an ordinary run has none.
+#[must_use]
+pub(crate) fn seed_shows_a_dry_run(
+    seed: &std::collections::HashMap<Uuid, serde_json::Value>,
+    is_plain_module_node: impl Fn(&Uuid) -> bool,
+) -> bool {
+    seed.iter().any(|(node_id, output)| {
+        is_plain_module_node(node_id)
+            && talos_workflow_job_protocol::read_dry_run_report(output).is_some()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dry run paused before the row could record its mode: the row says
+    /// "real", and the outputs its nodes had already committed say it was a
+    /// rehearsal.
+    #[test]
+    fn a_completed_module_output_with_the_workers_report_is_evidence_of_a_dry_run() {
+        use serde_json::json;
+        let (trigger, module, system) =
+            (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let is_module = |id: &Uuid| *id == module;
+        let report = json!({ "stubbed_calls": 1, "by_surface": { "http": 1 } });
+        let seed = |entries: &[(Uuid, serde_json::Value)]| {
+            entries
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+
+        // The worker's report on a module output: a dry run.
+        assert!(seed_shows_a_dry_run(
+            &seed(&[(module, json!({ "sent": true, "__dry_run__": report }))]),
+            is_module
+        ));
+        // Zero stubbed calls is still a report: the worker writes it on
+        // every module output of a dry run.
+        assert!(seed_shows_a_dry_run(
+            &seed(&[(
+                module,
+                json!({ "__dry_run__": { "stubbed_calls": 0, "by_surface": {} } })
+            )]),
+            is_module
+        ));
+
+        // An ordinary run's outputs: none.
+        assert!(!seed_shows_a_dry_run(
+            &seed(&[(module, json!({ "sent": true }))]),
+            is_module
+        ));
+        assert!(!seed_shows_a_dry_run(&seed(&[]), is_module));
+        // The stub RESPONSE a module is handed carries `true` under the key;
+        // a module that echoes it has not produced a report.
+        assert!(!seed_shows_a_dry_run(
+            &seed(&[(module, json!({ "__dry_run__": true }))]),
+            is_module
+        ));
+
+        // Caller data proves nothing: a report-shaped value in the trigger
+        // seed, or forwarded by a system node, is not the worker's.
+        assert!(!seed_shows_a_dry_run(
+            &seed(&[
+                (trigger, json!({ "__dry_run__": report })),
+                (system, json!({ "__dry_run__": report })),
+                (module, json!({ "sent": true })),
+            ]),
+            is_module
+        ));
+    }
 
     #[test]
     fn a_dry_run_row_gets_a_dry_run_engine_and_a_real_row_a_real_one() {
@@ -114,6 +202,17 @@ mod tests {
                 );
             }
         }
+        // The resume kernel also asks the run's own completed outputs, for
+        // the rows the flag cannot speak for.
+        let resume = sources
+            .iter()
+            .find(|(f, _)| *f == "crash_recovery.rs")
+            .unwrap()
+            .1;
+        assert!(
+            resume.contains("seed_shows_a_dry_run("),
+            "the resume kernel no longer reads the seed for evidence of a dry run"
+        );
         // A fresh trigger uses the caller's flag twice: for the row it
         // creates and for the engine it builds. One without the other is a
         // row that disagrees with its run.
