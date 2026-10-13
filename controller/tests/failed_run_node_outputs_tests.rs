@@ -476,19 +476,16 @@ async fn a_scheduled_run_stopped_at_its_deadline_keeps_what_its_completed_nodes_
         }
     }
 
-    talos_scheduler::finish_timed_out_run(
-        &engine,
-        &pool,
-        &sm,
-        talos_scheduler::TimedOutRun {
-            execution_id: exec_id,
-            workflow_id: Uuid::new_v4(),
-            schedule_id: Uuid::new_v4(),
-            timeout_secs: 3600,
-            phase: talos_metrics::SCHEDULER_PHASE_STEADY,
-        },
-    )
-    .await;
+    // A live subscriber, as the dashboard's execution updates are.
+    let (sender, mut events) = tokio::sync::broadcast::channel(8);
+    let timed_out = talos_scheduler::TimedOutRun {
+        execution_id: exec_id,
+        workflow_id: Uuid::new_v4(),
+        schedule_id: Uuid::new_v4(),
+        timeout_secs: 3600,
+        phase: talos_metrics::SCHEDULER_PHASE_STEADY,
+    };
+    talos_scheduler::finish_timed_out_run(&engine, &pool, &sm, &sender, timed_out).await;
 
     let (status, error, plaintext_empty, sealed) =
         sqlx::query_as::<_, (String, Option<String>, bool, bool)>(
@@ -535,4 +532,60 @@ async fn a_scheduled_run_stopped_at_its_deadline_keeps_what_its_completed_nodes_
 
     // Taken once: the engine does not go on holding the run's outputs.
     assert!(engine.take_partial_results().is_none());
+
+    // The subscriber was told, once, that the run failed and why. Neither
+    // scheduler timeout used to say anything: a watcher of a scheduled run
+    // that timed out saw its last node event and then nothing.
+    let run_level: Vec<talos_engine::events::ExecutionEvent> =
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| event.node_id.is_none())
+            .collect();
+    assert_eq!(run_level.len(), 1, "{run_level:?}");
+    assert_eq!(run_level[0].execution_id, exec_id);
+    assert!(matches!(
+        run_level[0].status,
+        talos_engine::events::ExecutionStatus::Failed
+    ));
+    assert_eq!(
+        run_level[0].log_message.as_deref(),
+        Some("Execution timed out after 3600 seconds")
+    );
+
+    // The other timeout firing afterwards (the backstop, when the first
+    // one's writes ran long) fails nothing and so announces nothing.
+    talos_scheduler::finish_timed_out_run(&engine, &pool, &sm, &sender, timed_out).await;
+    assert!(
+        events.try_recv().is_err(),
+        "a row that was already failed was announced a second time"
+    );
+
+    // A run an operator cancelled before the timeout fired stays cancelled,
+    // and the subscriber is not told it failed.
+    let cancelled = seed_running_execution(&pool, owner).await;
+    sqlx::query("UPDATE workflow_executions SET status = 'cancelled' WHERE id = $1")
+        .bind(cancelled)
+        .execute(&pool)
+        .await
+        .expect("cancel");
+    talos_scheduler::finish_timed_out_run(
+        &engine,
+        &pool,
+        &sm,
+        &sender,
+        talos_scheduler::TimedOutRun {
+            execution_id: cancelled,
+            ..timed_out
+        },
+    )
+    .await;
+    let status: String = sqlx::query_scalar("SELECT status FROM workflow_executions WHERE id = $1")
+        .bind(cancelled)
+        .fetch_one(&pool)
+        .await
+        .expect("read");
+    assert_eq!(status, "cancelled");
+    assert!(
+        events.try_recv().is_err(),
+        "a cancelled run was announced as failed"
+    );
 }
