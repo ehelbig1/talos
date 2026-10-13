@@ -2513,6 +2513,72 @@ impl WebhookRouter {
                 .await;
         });
 
+        // The row was created `queued`. Claim it as `running` before the
+        // engine runs: the success finalizers take only a `running` row, so a
+        // run on an unclaimed row could finish and never be recorded as
+        // completed (which is what happened until 2026-10-13, in both modes).
+        // A row that is no longer `queued` was cancelled or finalized by
+        // someone else before dispatch; it is theirs, and it is not run.
+        let run_repo = talos_workflow_repository::WorkflowRepository::new(self.db_pool.clone())
+            .with_encryption(self.secrets_manager.clone());
+        match run_repo
+            .mark_execution_running_from_queued(execution_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    workflow_id = %workflow_id,
+                    "Webhook run not started: its execution row is no longer queued \
+                     (cancelled or finalized before dispatch)"
+                );
+                // The dedup claim is KEPT: the delivery arrived and its run
+                // was stopped on purpose, so a redelivery must not start it.
+                let body = serde_json::json!({
+                    "execution_id": execution_id,
+                    "status": "not_started",
+                })
+                .to_string();
+                return Ok((
+                    StatusCode::CONFLICT,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response());
+            }
+            Err(e) => {
+                tracing::error!(
+                    execution_id = %execution_id,
+                    error = %e,
+                    "Failed to claim the queued webhook execution"
+                );
+                if let Err(db_err) =
+                    talos_workflow_repository::fail_workflow_execution_unless_terminal(
+                        &self.db_pool,
+                        execution_id,
+                        "Could not claim the queued execution",
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "talos_rpc",
+                        execution_id = %execution_id,
+                        error = %db_err,
+                        "Failed to mark webhook execution failed after a claim error — execution row left in queued state",
+                    );
+                }
+                // Transient pre-dispatch failure — the engine never ran.
+                self.release_dedup_claim(trigger_id, dedup_claim).await;
+                self.capture_post_auth_drop(
+                    trigger_id,
+                    dlq_capture,
+                    dispatch_failure::drop_reason::WORKFLOW_EXECUTION_ROW_FAILED,
+                );
+                return Err(anyhow::anyhow!("Internal server error"));
+            }
+        }
+
         if auto_respond {
             // Synchronous mode: wait inline up to sync_timeout_secs for the
             // engine to complete and return per-node output as the HTTP body.
@@ -2539,29 +2605,7 @@ impl WebhookRouter {
 
             match tokio::time::timeout(timeout, run_fut).await {
                 Ok(Ok(ctx)) => {
-                    let node_labels = engine.node_labels();
-                    let mut output = serde_json::Map::new();
-                    for (nid, result) in &ctx.results {
-                        let key = node_labels
-                            .get(nid)
-                            .cloned()
-                            .unwrap_or_else(|| nid.to_string());
-                        if key == "__trigger__" {
-                            continue;
-                        }
-                        if result
-                            .get("__skipped")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        let clean =
-                            talos_workflow_engine::ParallelWorkflowEngine::unwrap_output(result)
-                                .clone();
-                        output.insert(key, clean);
-                    }
-                    let output_value = serde_json::Value::Object(output);
+                    let output_value = crate::workflow_run::run_output(&engine, &ctx);
                     // Persist the SCRUBBED output to workflow_executions, return
                     // the UNSCRUBBED output to the caller — they triggered the
                     // request and own the data; the audit log is what gets DLP.
@@ -2754,39 +2798,40 @@ impl WebhookRouter {
                 }
             }
         } else {
-            // Async mode: spawn engine, return 202 immediately.
+            // Async mode: spawn the engine, return 202 immediately.
             //
-            // NOT epoch-fenced (self-review correction): an earlier change wired
-            // the FU-1 fence here, but it was inert AND unnecessary. The webhook
-            // async path creates the execution row as `Queued` and nothing
-            // transitions it to `running` before the engine writes its terminal
-            // status (only the MCP enqueue path calls
-            // mark_execution_running_from_queued). Crash recovery
-            // (`claim_stuck_execution_for_resume`) only reclaims `running` rows,
-            // so a `queued` webhook run is NEVER reclaimed → there is never a
-            // resumer → there is no split-brain for a fence to close. The fence
-            // therefore protected against nothing (and cost a per-run heartbeat
-            // task). Wiring it in would only have meaning if we ALSO marked the
-            // row `running` — i.e. made webhook runs crash-recoverable — which is
-            // a separate deliberate change, not something to bolt on to justify a
-            // fence. Left unfenced; the run's terminal write is status-guarded.
+            // The spawned task RECORDS the run when it returns
+            // (`workflow_run::record_async_run`): completed or waiting with
+            // its output, or failed with its error and the outputs of the
+            // nodes that completed. Until 2026-10-13 it logged a failure and
+            // wrote nothing, on a row that was still `queued`.
+            //
+            // Fenced. The row is `running` for the whole run now, so it is a
+            // long-lived `running` row like a scheduled run's: crash recovery
+            // can reclaim it, and the controller that started it must stop
+            // dispatching when that happens. (The comment that stood here
+            // said a fence was inert because the row stayed `queued` and was
+            // never reclaimed. That was the defect, not a property to keep.)
+            let db_pool = self.db_pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = talos_engine::nats_run::run_with_trigger_input_via_nats(
+                let run = talos_engine::fence::run_with_trigger_input_fenced_at_row_epoch(
                     &mut engine,
                     nats,
                     worker_shared_key,
                     input_payload,
                     execution_id,
+                    db_pool.clone(),
                 )
-                .await
-                {
-                    tracing::error!(
-                        execution_id = %execution_id,
-                        workflow_id = %workflow_id,
-                        error = ?e,
-                        "Workflow execution failed (async)"
-                    );
-                }
+                .await;
+                crate::workflow_run::record_async_run(
+                    &engine,
+                    &run_repo,
+                    &db_pool,
+                    execution_id,
+                    workflow_id,
+                    run,
+                )
+                .await;
             });
 
             let body = serde_json::json!({

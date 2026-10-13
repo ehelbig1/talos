@@ -33,6 +33,7 @@ mod router;
 mod signature;
 mod suspension;
 mod types;
+mod workflow_run;
 
 pub use rate_limiter::CircuitBreaker;
 pub use rate_limiter::CircuitBreakerFailureType;
@@ -55,3 +56,4 @@ pub use signature::{
 };
 pub use suspension::{suspension_callback_handler, SUSPENSION_CALLBACK_MAX_BODY_BYTES};
 pub use types::{validate_event_filter, WebhookTrigger};
+pub use workflow_run::{record_async_run, AsyncRunRecord};

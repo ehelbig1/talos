@@ -51,15 +51,22 @@
 //!   the scheduler is still dispatching — so they're the highest-value
 //!   non-resume site.
 //!
+//! - the inbound-webhook ASYNC path (`talos-webhooks` →
+//!   [`run_with_trigger_input_fenced_at_row_epoch`], since 2026-10-13). Until
+//!   then this section said that path needed no fence because its row stayed
+//!   `queued` for the whole run and crash recovery reclaims only `running`
+//!   rows. That was true, and it was the defect: nothing ever moved the row
+//!   out of `queued`, the success finalizers take only a `running` row, and
+//!   so a webhook run that succeeded was never recorded as completed. The
+//!   router now claims the row as `running` before the run, which makes an
+//!   async webhook run a long-lived `running` row like a scheduled one:
+//!   reclaimable, and therefore fenced.
+//!
 //! ## Remaining unfenced fresh-run sites
 //!
-//! The inbound-webhook paths are NOT fenced. The SYNC path (`auto_respond=true`)
-//! is bounded by `sync_timeout` (≤120s, under the stale window), and a reclaim
-//! there would abort the inline run the caller is waiting on. The ASYNC path
-//! creates its row as `Queued` and never marks it `running`, and crash recovery
-//! only reclaims `running` rows — so a webhook async run is never reclaimed,
-//! there is never a resumer, and there is no split-brain for a fence to close
-//! (a fence there would be inert and unnecessary).
+//! The inbound-webhook SYNC path (`auto_respond=true`) is NOT fenced. It is
+//! bounded by `sync_timeout` (≤120s, under the stale window), and a reclaim
+//! there would abort the inline run the caller is waiting on.
 //!
 //! Other `run_with_trigger_input_via_nats` call sites also dispatch WITHOUT a
 //! fence: `retry.rs`, `replay.rs`, continuation/approval resume
@@ -208,6 +215,62 @@ pub async fn run_with_trigger_input_fenced(
 
     // `_heartbeat`'s drop aborts the task here (and on a panic unwind).
     attribute_stop(result, &operator_cancelled)
+}
+
+/// [`run_with_trigger_input_fenced`] at the epoch the row holds NOW, read
+/// here, for a caller that has just claimed or created the row and has no
+/// epoch in hand.
+///
+/// Falls back to the unfenced run, with a warning, when the epoch cannot be
+/// read or the row is not there: a fence started at a guessed epoch aborts a
+/// healthy run on its first heartbeat, which is worse than running unfenced
+/// (see [`run_with_trigger_input_fenced`]).
+pub async fn run_with_trigger_input_fenced_at_row_epoch(
+    engine: &mut ParallelWorkflowEngine,
+    nats_client: Arc<async_nats::Client>,
+    worker_shared_key: Option<WorkerSharedKey>,
+    trigger_input: JsonValue,
+    execution_id: Uuid,
+    pool: Pool<Postgres>,
+) -> Result<WorkflowContext, WorkflowEngineError> {
+    let epoch = talos_execution_repository::ExecutionRepository::new(pool.clone())
+        .current_execution_epoch(execution_id)
+        .await;
+    match epoch {
+        Ok(Some(my_epoch)) => {
+            run_with_trigger_input_fenced(
+                engine,
+                nats_client,
+                worker_shared_key,
+                trigger_input,
+                execution_id,
+                pool,
+                my_epoch,
+            )
+            .await
+        }
+        other => {
+            match other {
+                Err(e) => tracing::warn!(
+                    %execution_id,
+                    error = %e,
+                    "could not read the execution's epoch for the fresh-run fence; running unfenced"
+                ),
+                _ => tracing::warn!(
+                    %execution_id,
+                    "execution row missing when reading its epoch for the fence; running unfenced"
+                ),
+            }
+            run_with_trigger_input_via_nats(
+                engine,
+                nats_client,
+                worker_shared_key,
+                trigger_input,
+                execution_id,
+            )
+            .await
+        }
+    }
 }
 
 /// A fence stop caused by an OPERATOR cancel (the heartbeat saw the row turn
