@@ -434,6 +434,11 @@ pub(crate) fn graph_write_response(
             ))
         }
         Err(e) => {
+            // What an `action_links` node may start: a refusal the caller
+            // can act on, not a failed write.
+            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, req_id) {
+                return Err(resp);
+            }
             tracing::error!(workflow_id = %wf_id, site, "graph write failed: {}", e);
             Err(mcp_error(
                 req_id.clone(),
@@ -4335,39 +4340,15 @@ async fn for_each_preview(
 
 // ── add_action_links_node ────────────────────────────────────────────────────
 
-/// Read and check the `targets` argument: 1 to 16 entries, each a usable
-/// name mapped to a workflow UUID. Pure, so the refusals are testable
-/// without a database; ownership is checked by the handler.
+/// Read and check the `targets` argument with the rule every graph write is
+/// held to (`check_action_targets`): 1 to 16 entries, each a usable name
+/// mapped to a workflow UUID. Whether each workflow is the caller's is asked
+/// where the graph is written (`talos_workflow_repository::action_link_targets`).
 pub(crate) fn parse_action_link_targets(
     args: &serde_json::Value,
 ) -> Result<std::collections::BTreeMap<String, uuid::Uuid>, String> {
-    use talos_workflow_engine_core::action_links::{action_name_valid, MAX_ACTION_TARGETS};
-    let Some(raw) = args.get("targets").and_then(serde_json::Value::as_object) else {
-        return Err(
-            "Missing or invalid 'targets': an object of target name → workflow UUID".to_string(),
-        );
-    };
-    if raw.is_empty() || raw.len() > MAX_ACTION_TARGETS {
-        return Err(format!(
-            "'targets' must name 1 to {MAX_ACTION_TARGETS} workflows; got {}",
-            raw.len()
-        ));
-    }
-    let mut targets = std::collections::BTreeMap::new();
-    for (name, value) in raw {
-        if !action_name_valid(name) {
-            // The name is caller-supplied: echo a bounded, printable prefix.
-            let shown: String = name.chars().filter(|c| !c.is_control()).take(60).collect();
-            return Err(format!(
-                "Target name '{shown}' is not usable: 1-40 characters of letters, digits, '_' and '-'"
-            ));
-        }
-        let Some(id) = value.as_str().and_then(|s| uuid::Uuid::parse_str(s).ok()) else {
-            return Err(format!("Target '{name}' must be a workflow UUID"));
-        };
-        targets.insert(name.clone(), id);
-    }
-    Ok(targets)
+    talos_workflow_engine_core::action_links::check_action_targets(args.get("targets"))
+        .map_err(|fault| fault.to_string())
 }
 
 async fn handle_add_action_links_node(
@@ -4380,19 +4361,10 @@ async fn handle_add_action_links_node(
         Ok(t) => t,
         Err(message) => return mcp_error(req_id, -32602, &message),
     };
-    // Each target must be a workflow the caller owns. One answer for
-    // "does not exist" and "is not yours". The mint re-checks ownership
-    // every time a link is made; this is the early, readable refusal.
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
-    for (name, id) in &targets {
-        if !state.workflow_repo.workflow_exists(*id, user_id).await {
-            return mcp_error(
-                req_id,
-                -32602,
-                &format!("Target '{name}': workflow {id} not found or not accessible"),
-            );
-        }
-    }
+    // Each target must be a workflow the caller owns. That is asked in front
+    // of the write, for this tool and every other one, with one answer for
+    // "does not exist" and "is not yours". The mint asks again every time a
+    // link is made.
     // Clamp mirrors the graph parser (a hand-edited graph re-clamps there).
     let ttl_hours = args
         .get("ttl_hours")
@@ -5018,6 +4990,11 @@ async fn handle_duplicate_workflow(
                 match state.workflow_repo.copy_input_schema(wf_id, new_id).await {
                     Ok(_) => true,
                     Err(e) => {
+                        if let Some(resp) =
+                            crate::utils::action_targets_refusal_response(&e, &req_id)
+                        {
+                            return resp;
+                        }
                         tracing::warn!(
                             target: "talos_audit",
                             wf_id = %wf_id,

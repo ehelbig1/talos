@@ -1977,6 +1977,9 @@ async fn handle_create_workflow(
             )
         }
         Err(e) => {
+            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+                return resp;
+            }
             tracing::error!(err = ?e, "create_workflow failed");
             mcp_error(req_id, -32000, "Failed to create workflow")
         }
@@ -6487,6 +6490,9 @@ async fn handle_clone_workflow(
             ))
         }
         Err(e) => {
+            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+                return Some(resp);
+            }
             tracing::error!("clone_workflow insert failed: {}", e);
             Some(mcp_error(
                 req_id.clone(),
@@ -6915,6 +6921,9 @@ async fn handle_import_workflow(
             ))
         }
         Err(e) => {
+            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+                return Some(resp);
+            }
             tracing::error!("import_workflow insert failed: {}", e);
             Some(mcp_error(
                 req_id.clone(),
@@ -10620,6 +10629,9 @@ async fn handle_instantiate_workflow_pattern(
             ))
         }
         Err(e) => {
+            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+                return Some(resp);
+            }
             tracing::error!(
                 "instantiate_workflow_pattern: insert failed for pattern '{}': {}",
                 pattern_name,
@@ -13046,6 +13058,9 @@ async fn handle_plan_and_execute_workflow(
             )
             .await
         {
+            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+                return resp;
+            }
             tracing::error!(
                 "plan_and_execute: failed to create subtask workflow '{}': {:#}",
                 task_name,
@@ -13120,6 +13135,9 @@ async fn handle_plan_and_execute_workflow(
         )
         .await
     {
+        if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+            return resp;
+        }
         tracing::error!(
             "plan_and_execute: failed to create orchestrator workflow: {:#}",
             e
@@ -13598,6 +13616,9 @@ async fn handle_create_tree_of_thoughts_workflow(
             .unwrap_or_default(),
         ),
         Err(e) => {
+            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+                return resp;
+            }
             tracing::error!("create_tree_of_thoughts_workflow failed: {}", e);
             mcp_error(req_id, -32000, "Failed to create Tree-of-Thoughts workflow")
         }
@@ -13757,6 +13778,9 @@ async fn handle_import_yaml_workflow(
             "note": "Workflow created from YAML. Node module references need to be resolved — use add_node_to_workflow with rust_code for inline nodes.",
         })).unwrap_or_default()),
         Err(e) => {
+            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+                return resp;
+            }
             tracing::error!("import_yaml_workflow failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to import YAML workflow")
         }

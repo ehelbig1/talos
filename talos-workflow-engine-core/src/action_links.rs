@@ -352,6 +352,185 @@ pub fn parse_action_targets(raw: Option<&JsonValue>) -> BTreeMap<String, Uuid> {
     targets
 }
 
+/// What is wrong with one `action_links` node's `targets` as WRITTEN.
+///
+/// The engine reads `targets` leniently ([`parse_action_targets`] drops what
+/// it cannot use, so a stored graph never configures more than the bounds).
+/// A WRITE is held to the strict form of the same rule, so a tool cannot
+/// answer "updated" for a list the engine will then silently read as
+/// something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetsFault {
+    /// `targets` is absent or is not an object.
+    NotAMap,
+    /// Fewer than one or more than [`MAX_ACTION_TARGETS`] entries.
+    Count(usize),
+    /// An entry's name is not [`action_name_valid`]. Carries a bounded,
+    /// printable prefix of the name.
+    Name(String),
+    /// The named entry's value is not a workflow UUID.
+    NotAWorkflowId(String),
+    /// The named entry's workflow does not exist or is not the owner's.
+    /// ONE answer for both: a refusal never says whether another user's
+    /// workflow exists.
+    NotAccessible {
+        /// The entry's name.
+        name: String,
+        /// The id as the caller wrote it.
+        workflow_id: Uuid,
+    },
+}
+
+impl std::fmt::Display for TargetsFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAMap => write!(
+                f,
+                "Missing or invalid 'targets': an object of target name → workflow UUID"
+            ),
+            Self::Count(got) => write!(
+                f,
+                "'targets' must name 1 to {MAX_ACTION_TARGETS} workflows; got {got}"
+            ),
+            Self::Name(shown) => write!(
+                f,
+                "Target name '{shown}' is not usable: 1-{MAX_ACTION_NAME_CHARS} characters of \
+                 letters, digits, '_' and '-'"
+            ),
+            Self::NotAWorkflowId(name) => write!(f, "Target '{name}' must be a workflow UUID"),
+            Self::NotAccessible { name, workflow_id } => write!(
+                f,
+                "Target '{name}': workflow {workflow_id} not found or not accessible"
+            ),
+        }
+    }
+}
+
+/// Caller-supplied text as a refusal may echo it: no control characters, at
+/// most 60 characters.
+fn shown(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(60).collect()
+}
+
+/// The strict reading of a `targets` value, for a WRITE: an object of 1 to
+/// [`MAX_ACTION_TARGETS`] entries, each a usable name mapped to a workflow
+/// UUID. Whether each workflow is the owner's is a database question the
+/// caller asks next.
+///
+/// # Errors
+/// The first fault, by name order.
+pub fn check_action_targets(
+    raw: Option<&JsonValue>,
+) -> Result<BTreeMap<String, Uuid>, TargetsFault> {
+    let Some(map) = raw.and_then(JsonValue::as_object) else {
+        return Err(TargetsFault::NotAMap);
+    };
+    if map.is_empty() || map.len() > MAX_ACTION_TARGETS {
+        return Err(TargetsFault::Count(map.len()));
+    }
+    let mut names: Vec<&String> = map.keys().collect();
+    names.sort();
+    let mut targets = BTreeMap::new();
+    for name in names {
+        if !action_name_valid(name) {
+            return Err(TargetsFault::Name(shown(name)));
+        }
+        let Some(id) = map[name].as_str().and_then(|s| Uuid::parse_str(s).ok()) else {
+            return Err(TargetsFault::NotAWorkflowId(name.clone()));
+        };
+        targets.insert(name.clone(), id);
+    }
+    Ok(targets)
+}
+
+/// A write that would store an `action_links` node the rule refuses: which
+/// node, and what is wrong with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionTargetsRefusal {
+    /// The node's id (bounded and printable).
+    pub node: String,
+    /// What is wrong.
+    pub fault: TargetsFault,
+}
+
+impl std::fmt::Display for ActionTargetsRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Action-links node '{}': {}", self.node, self.fault)
+    }
+}
+
+impl std::error::Error for ActionTargetsRefusal {}
+
+/// One `action_links` node's checked targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeActionTargets {
+    /// The node's id (bounded and printable).
+    pub node: String,
+    /// Its targets, name → workflow.
+    pub targets: BTreeMap<String, Uuid>,
+}
+
+/// Whether the engine may read this graph node as an `action_links` node.
+///
+/// The graph loader takes the kind from `kind`, or from a `system:` `type`
+/// when there is no `kind`. This answers yes when EITHER says
+/// `action_links`: a node a writer is unsure about is held to the rule.
+#[must_use]
+pub fn is_action_links_node(node: &JsonValue) -> bool {
+    node.get("kind").and_then(JsonValue::as_str) == Some("action_links")
+        || node.get("type").and_then(JsonValue::as_str) == Some("system:action_links")
+}
+
+fn graph_nodes(graph: &JsonValue) -> impl Iterator<Item = &JsonValue> {
+    graph
+        .get("nodes")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn node_id_shown(node: &JsonValue) -> String {
+    shown(node.get("id").and_then(JsonValue::as_str).unwrap_or("?"))
+}
+
+/// Every `action_links` node in a graph, with its targets read strictly.
+///
+/// # Errors
+/// The first node (in graph order) whose `targets` breaks the rule.
+pub fn action_targets_in_graph(
+    graph: &JsonValue,
+) -> Result<Vec<NodeActionTargets>, ActionTargetsRefusal> {
+    graph_nodes(graph)
+        .filter(|node| is_action_links_node(node))
+        .map(|node| {
+            let node_id = node_id_shown(node);
+            match check_action_targets(node.get("data").and_then(|d| d.get("targets"))) {
+                Ok(targets) => Ok(NodeActionTargets {
+                    node: node_id,
+                    targets,
+                }),
+                Err(fault) => Err(ActionTargetsRefusal {
+                    node: node_id,
+                    fault,
+                }),
+            }
+        })
+        .collect()
+}
+
+/// The workflows a STORED graph's `action_links` nodes name, read as the
+/// engine reads them (leniently). Used to tell what a write introduces from
+/// what the workflow already held.
+#[must_use]
+pub fn stored_action_target_ids(graph: &JsonValue) -> HashSet<Uuid> {
+    graph_nodes(graph)
+        .filter(|node| is_action_links_node(node))
+        .flat_map(|node| {
+            parse_action_targets(node.get("data").and_then(|d| d.get("targets"))).into_values()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +722,135 @@ mod tests {
         }
         let long = format!("https://x.example/{}", "a".repeat(MAX_FALLBACK_CHARS));
         assert_eq!(acceptable_fallback(&long), None);
+    }
+
+    #[test]
+    fn a_written_target_list_is_held_to_the_strict_form_of_the_rule() {
+        let id = Uuid::from_u128(7);
+        assert_eq!(
+            check_action_targets(Some(
+                &json!({ "list": id.to_string(), "bills-due_2": id.to_string() })
+            )),
+            Ok(BTreeMap::from([
+                ("bills-due_2".to_string(), id),
+                ("list".to_string(), id)
+            ]))
+        );
+        for (raw, fault) in [
+            (None, TargetsFault::NotAMap),
+            (Some(json!(["list"])), TargetsFault::NotAMap),
+            (Some(json!("list")), TargetsFault::NotAMap),
+            (Some(json!({})), TargetsFault::Count(0)),
+            (
+                Some(json!({ "bad name": id.to_string() })),
+                TargetsFault::Name("bad name".into()),
+            ),
+            (
+                Some(json!({ "list": "pa-list-capture" })),
+                TargetsFault::NotAWorkflowId("list".into()),
+            ),
+            (
+                Some(json!({ "list": 5 })),
+                TargetsFault::NotAWorkflowId("list".into()),
+            ),
+        ] {
+            assert_eq!(check_action_targets(raw.as_ref()), Err(fault));
+        }
+        let many: Map<String, JsonValue> = (0..=MAX_ACTION_TARGETS)
+            .map(|n| (format!("t{n:02}"), json!(id.to_string())))
+            .collect();
+        assert_eq!(
+            check_action_targets(Some(&JsonValue::Object(many))),
+            Err(TargetsFault::Count(MAX_ACTION_TARGETS + 1))
+        );
+        // A name is echoed bounded and without control characters.
+        let hostile = format!("a\u{7}b{}", "x".repeat(200));
+        let Err(TargetsFault::Name(shown)) =
+            check_action_targets(Some(&json!({ hostile: id.to_string() })))
+        else {
+            panic!("a hostile name is refused")
+        };
+        assert_eq!(shown.chars().count(), 60);
+        assert!(!shown.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn a_graph_names_the_node_whose_targets_break_the_rule() {
+        let id = Uuid::from_u128(7);
+        let node = |node_id: &str, kind: JsonValue, targets: JsonValue| {
+            let mut node = json!({ "id": node_id, "data": { "targets": targets } });
+            for (key, value) in kind.as_object().unwrap() {
+                node[key] = value.clone();
+            }
+            node
+        };
+        let by_kind = json!({ "kind": "action_links", "type": "system:action_links" });
+        // Either spelling the loader accepts makes it an action-links node.
+        let by_type_only = json!({ "type": "system:action_links" });
+        let by_kind_only = json!({ "kind": "action_links" });
+        let other = json!({ "kind": "collect", "type": "system:collect" });
+
+        let good = json!({ "nodes": [
+            node("a", by_kind.clone(), json!({ "list": id.to_string() })),
+            node("b", by_type_only.clone(), json!({ "bills": id.to_string() })),
+            // Not an action-links node: its `targets` is its own business.
+            node("c", other, json!("anything")),
+        ]});
+        let found = action_targets_in_graph(&good).unwrap();
+        assert_eq!(
+            found.iter().map(|n| n.node.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+
+        for kind in [by_kind, by_type_only, by_kind_only] {
+            let bad = json!({ "nodes": [
+                node("a", kind.clone(), json!({ "list": id.to_string() })),
+                node("links", kind, json!({ "list": "nope" })),
+            ]});
+            assert_eq!(
+                action_targets_in_graph(&bad),
+                Err(ActionTargetsRefusal {
+                    node: "links".into(),
+                    fault: TargetsFault::NotAWorkflowId("list".into()),
+                })
+            );
+        }
+        // A node with no `data` at all has no targets.
+        assert_eq!(
+            action_targets_in_graph(&json!({ "nodes": [{ "id": "n", "kind": "action_links" }] })),
+            Err(ActionTargetsRefusal {
+                node: "n".into(),
+                fault: TargetsFault::NotAMap
+            })
+        );
+        // No nodes, or not a graph: nothing to refuse.
+        assert_eq!(action_targets_in_graph(&json!({})), Ok(vec![]));
+        assert_eq!(action_targets_in_graph(&json!("x")), Ok(vec![]));
+
+        assert_eq!(
+            ActionTargetsRefusal {
+                node: "links".into(),
+                fault: TargetsFault::NotAccessible {
+                    name: "list".into(),
+                    workflow_id: id
+                },
+            }
+            .to_string(),
+            format!("Action-links node 'links': Target 'list': workflow {id} not found or not accessible")
+        );
+    }
+
+    #[test]
+    fn what_a_stored_graph_already_names_is_read_as_the_engine_reads_it() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let stored = json!({ "nodes": [
+            { "id": "x", "kind": "action_links",
+              "data": { "targets": { "list": a.to_string(), "bad name": b.to_string(), "n": "nope" } } },
+            { "id": "y", "type": "system:action_links", "data": { "targets": { "bills": b.to_string() } } },
+            { "id": "z", "kind": "collect", "data": { "targets": { "t": Uuid::from_u128(3).to_string() } } },
+        ]});
+        assert_eq!(stored_action_target_ids(&stored), HashSet::from([a, b]));
+        assert!(stored_action_target_ids(&json!(null)).is_empty());
     }
 
     #[test]

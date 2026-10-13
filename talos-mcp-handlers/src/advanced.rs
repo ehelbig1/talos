@@ -4424,6 +4424,9 @@ async fn handle_promote_workflow(
         )
         .await
     {
+        if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+            return resp;
+        }
         tracing::error!(source_workflow_id = %src_id, "promote_workflow insert failed: {}", e);
         return mcp_error(req_id, -32000, "Failed to create promoted workflow");
     }

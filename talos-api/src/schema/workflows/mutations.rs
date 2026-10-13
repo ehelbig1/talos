@@ -366,6 +366,10 @@ impl WorkflowsMutations {
             )
             .await
             .map_err(|e| {
+                // See the update below: the one refusal with words of its own.
+                if let Some(refusal) = talos_workflow_repository::action_targets_refusal(&e) {
+                    return async_graphql::Error::new(refusal.to_string()).extend_safe();
+                }
                 tracing::error!(error = %e, "graphql: workflow insert failed");
                 async_graphql::Error::new("Request could not be completed").extend_safe()
             })?;
@@ -537,6 +541,12 @@ impl WorkflowsMutations {
             )
             .await
             .map_err(|e| {
+                // What an `action_links` node may start: a refusal the
+                // caller can act on (it names the node and the entry, and
+                // gives one answer for "does not exist" and "is not yours").
+                if let Some(refusal) = talos_workflow_repository::action_targets_refusal(&e) {
+                    return async_graphql::Error::new(refusal.to_string()).extend_safe();
+                }
                 tracing::error!(error = %e, "graphql: workflow update failed");
                 async_graphql::Error::new("Request could not be completed").extend_safe()
             })?;

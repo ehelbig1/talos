@@ -348,6 +348,24 @@ pub fn render_freshness_contract(
     }))
 }
 
+/// The refusal to give when a graph write failed because of what an
+/// `action_links` node in it may start, or `None` when it failed for any
+/// other reason.
+///
+/// The rule lives in front of the statements that write a graph
+/// (`talos_workflow_repository::action_link_targets`), so every tool is held
+/// to it whether or not it calls this; this only turns the typed refusal
+/// into words a caller can act on. The words name the node and the entry,
+/// and give one answer for a workflow that does not exist and one that is
+/// not the caller's.
+pub fn action_targets_refusal_response(
+    error: &anyhow::Error,
+    req_id: &Option<serde_json::Value>,
+) -> Option<super::types::JsonRpcResponse> {
+    talos_workflow_repository::action_targets_refusal(error)
+        .map(|refusal| super::mcp_error(req_id.clone(), -32602, &refusal.to_string()))
+}
+
 pub fn ensure_graph_within_caps(
     graph_json: &str,
     req_id: &Option<serde_json::Value>,

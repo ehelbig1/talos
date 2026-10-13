@@ -42,6 +42,15 @@ add_action_links_node(
 `targets` is the list of workflows a link from this node may start. You
 write it; a module cannot add to it.
 
+The same rule applies whichever tool writes it (`add_action_links_node`,
+`update_node_config`, an import, a copy, the web editor): 1 to 16 entries,
+each a name of 1 to 40 letters, digits, `_` and `-` mapped to the id of a
+workflow of yours. A write that breaks it is refused and names the node and
+the entry; for a workflow, "does not exist" and "is not yours" are one
+answer. A target the workflow already names is not asked about again when
+something else in the graph is edited, so a workflow whose target you have
+since deleted stays editable; the link for it is simply not minted (below).
+
 ## What the compose module returns
 
 ```json
@@ -76,10 +85,15 @@ The node returns the same output with every placeholder replaced,
 }
 ```
 
-Reasons: `unknown_target`, `workflow_not_owned`, `payload_not_an_object`,
-`payload_too_large`, `label_empty`, `too_many_links` (64 per run),
-`unavailable`, `dry_run`, `link_address_misconfigured` (see "The address a link
-is on").
+Reasons: `unknown_target`, `workflow_not_owned`, `workflow_archived`,
+`payload_not_an_object`, `payload_too_large`, `label_empty`, `too_many_links`
+(64 per run), `unavailable`, `dry_run`, `link_address_misconfigured` (see "The
+address a link is on").
+
+A target is checked every time a link is made, not only when the node was
+written. One that was deleted since, or is no longer yours, is
+`workflow_not_owned`; one you have archived is `workflow_archived`. Either
+way no link exists for it and its placeholder becomes the fallback.
 
 The node never fails the run. If links cannot be minted at all, every
 placeholder becomes its fallback (or `#`) and the message still sends.

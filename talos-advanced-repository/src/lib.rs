@@ -2659,6 +2659,10 @@ impl AdvancedRepository {
             }
             None => talos_db::begin_user_scoped(&self.db_pool, user_id).await?,
         };
+        talos_workflow_repository::action_link_targets::refuse_unowned_targets_on_conn(
+            &mut tx, user_id, None, graph_json,
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO workflows \
              (id, user_id, name, module_uri, graph_json, capabilities, intent, status, \

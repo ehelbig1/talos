@@ -78,6 +78,10 @@ pub enum MintRefusal {
     LabelEmpty,
     /// The workflow does not exist or is not the minting user's.
     WorkflowNotOwned,
+    /// The workflow is the minting user's and has been archived. A link to
+    /// it could only ever be refused when used, so none is made and the
+    /// message carries the request's fallback instead.
+    WorkflowArchived,
     /// More than [`MAX_LINKS_PER_MINT`] links were requested; this one is
     /// past the cap.
     TooManyLinks,
@@ -92,6 +96,7 @@ impl MintRefusal {
             Self::PayloadTooLarge => "payload_too_large",
             Self::LabelEmpty => "label_empty",
             Self::WorkflowNotOwned => "workflow_not_owned",
+            Self::WorkflowArchived => "workflow_archived",
             Self::TooManyLinks => "too_many_links",
         }
     }
@@ -173,8 +178,14 @@ impl ExecutionRepository {
     ///
     /// One statement: the expired-token sweep (an indexed range scan) is a
     /// CTE of the batched insert, and the ownership JOIN drops any request
-    /// naming a workflow that is not `user_id`'s — RETURNING reports which
-    /// rows landed, so a link is rendered only for a token that exists.
+    /// naming a workflow that is not `user_id`'s — the statement reports
+    /// which rows landed, so a link is rendered only for a token that exists.
+    ///
+    /// The node's configuration is not trusted to be current: a target that
+    /// was the user's when it was written and has since been deleted or
+    /// changed hands is [`MintRefusal::WorkflowNotOwned`], and one the user
+    /// has since archived is [`MintRefusal::WorkflowArchived`]. No row is
+    /// written for either.
     pub async fn mint_action_tokens(
         &self,
         user_id: Uuid,
@@ -210,41 +221,57 @@ impl ExecutionRepository {
             return Ok(out);
         }
 
-        let stored: std::collections::HashSet<String> = sqlx::query_scalar(
-            "WITH gc AS ( \
-                 DELETE FROM workflow_action_tokens WHERE expires_at < NOW() \
-             ) \
-             INSERT INTO workflow_action_tokens \
-                 (user_id, workflow_id, token_hash, label, payload, \
-                  source_execution_id, source_node, expires_at) \
-             SELECT $1, w.id, x.token_hash, x.label, x.payload::jsonb, $6, $7, \
-                    NOW() + make_interval(hours => $8::int) \
-             FROM UNNEST($2::uuid[], $3::text[], $4::text[], $5::text[]) \
-                  AS x(workflow_id, token_hash, label, payload) \
-             JOIN workflows w ON w.id = x.workflow_id AND w.user_id = $1 \
-             RETURNING token_hash",
-        )
-        .bind(user_id)
-        .bind(&workflow_ids)
-        .bind(&hashes)
-        .bind(&labels)
-        .bind(&payloads)
-        .bind(source_execution_id)
-        .bind(source_node)
-        .bind(i32::try_from(stored_ttl_hours(ttl_hours)).unwrap_or(i32::MAX))
-        .fetch_all(&self.db_pool)
-        .await?
-        .into_iter()
-        .collect();
+        // Each request that named a workflow of the user's comes back once:
+        // stored, or not stored because the workflow is archived. One that
+        // does not come back named a workflow the user does not own.
+        let retired = talos_workflow_liveness::retired_sql(Some("w"));
+        // sql-safe: the one fragment is a talos_workflow_liveness predicate (fixed text, literal alias); every value is bound
+        let answered: std::collections::HashMap<String, bool> =
+            sqlx::query_as::<_, (String, bool)>(sqlx::AssertSqlSafe(format!(
+                "WITH gc AS ( \
+                     DELETE FROM workflow_action_tokens WHERE expires_at < NOW() \
+                 ), \
+                 asked AS ( \
+                     SELECT w.id AS workflow_id, x.token_hash, x.label, x.payload, \
+                            ({retired}) AS retired \
+                     FROM UNNEST($2::uuid[], $3::text[], $4::text[], $5::text[]) \
+                          AS x(workflow_id, token_hash, label, payload) \
+                     JOIN workflows w ON w.id = x.workflow_id AND w.user_id = $1 \
+                 ), \
+                 stored AS ( \
+                     INSERT INTO workflow_action_tokens \
+                         (user_id, workflow_id, token_hash, label, payload, \
+                          source_execution_id, source_node, expires_at) \
+                     SELECT $1, workflow_id, token_hash, label, payload::jsonb, $6, $7, \
+                            NOW() + make_interval(hours => $8::int) \
+                     FROM asked WHERE NOT retired \
+                     RETURNING token_hash \
+                 ) \
+                 SELECT token_hash, false AS retired FROM stored \
+                 UNION ALL \
+                 SELECT token_hash, true AS retired FROM asked WHERE retired",
+            )))
+            .bind(user_id)
+            .bind(&workflow_ids)
+            .bind(&hashes)
+            .bind(&labels)
+            .bind(&payloads)
+            .bind(source_execution_id)
+            .bind(source_node)
+            .bind(i32::try_from(stored_ttl_hours(ttl_hours)).unwrap_or(i32::MAX))
+            .fetch_all(&self.db_pool)
+            .await?
+            .into_iter()
+            .collect();
 
-        // A validated request whose row did not land named a workflow the
-        // user does not own (or one deleted since the node resolved it).
         let mut hash_iter = hashes.iter();
         for slot in &mut out {
             if slot.is_ok() {
                 let hash = hash_iter.next().expect("one hash per validated request");
-                if !stored.contains(hash) {
-                    *slot = Err(MintRefusal::WorkflowNotOwned);
+                match answered.get(hash) {
+                    Some(false) => {}
+                    Some(true) => *slot = Err(MintRefusal::WorkflowArchived),
+                    None => *slot = Err(MintRefusal::WorkflowNotOwned),
                 }
             }
         }
