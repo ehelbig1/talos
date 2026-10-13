@@ -45,6 +45,15 @@ pub struct TestDb {
     db_name: String,
 }
 
+/// How long `TestDb::drop` waits for its `DROP DATABASE` before it stops
+/// waiting and lets the drop finish on its own.
+///
+/// An unobstructed drop takes about 50 ms end to end (measured 2026-10-13: the
+/// statement 16 ms, the login before it about 30). The wait must be a bounded
+/// one, not a join — see `Drop for TestDb`.
+#[allow(dead_code)]
+pub const TEST_DB_DROP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl Drop for TestDb {
     fn drop(&mut self) {
         // Drop is synchronous but sqlx is async, and we are typically dropping
@@ -52,10 +61,15 @@ impl Drop for TestDb {
         // runtime panics. Run the drop on a dedicated OS thread with its own
         // current-thread runtime. `DROP DATABASE … WITH (FORCE)` terminates any
         // backends the test's pool still holds. Best-effort: a failure here
-        // only leaks one small (data-free) database, swept on the next run.
+        // only leaks one small (data-free) database, which
+        // `scripts/dev-test-db.sh status` counts and `rebuild` removes.
         let template_url = self.template_url.clone();
         let db_name = self.db_name.clone();
-        let _ = std::thread::spawn(move || {
+        let (finished, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            // Dropped when this thread ends, however it ends: the waiter is
+            // released by a failed drop as promptly as by a finished one.
+            let _finished = finished;
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -77,8 +91,23 @@ impl Drop for TestDb {
                     let _ = conn.close().await;
                 }
             });
-        })
-        .join();
+        });
+        // A BOUNDED wait, not a join (2026-10-13). This thread is the test's
+        // current-thread runtime, and nothing on that runtime moves while it
+        // waits here. A connection one of its tasks was still opening — a
+        // handler's `tokio::spawn` reaching for the pool — stops in the middle
+        // of its login. `DROP DATABASE` needs every backend on the server to
+        // answer it, and a backend waiting on its client's login answers only
+        // when `authentication_timeout` ends it: 60 s on a stock server, 5 s
+        // on the ones this repository starts. A join waited that out, in every
+        // test that left such a task, and in every other test dropping its
+        // database on the same server at that moment.
+        //
+        // Returning is what ends it: the test function returns, its runtime is
+        // dropped, the task and its socket go, and the drop finishes on its
+        // own thread. If the test process ends first, the statement is already
+        // with the server, which completes it.
+        let _ = wait.recv_timeout(TEST_DB_DROP_WAIT);
     }
 }
 

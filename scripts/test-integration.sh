@@ -155,6 +155,11 @@ export TALOS_TEST_RUN_ID
 # end with "canceling authentication due to timeout") and takes most of the
 # cost away if it is right.
 #
+# Observed directly on 2026-10-13 (the backend is a connection a task of the
+# blocked runtime was opening, and it ends with exactly that line). The
+# harness now waits a bounded second for its drop instead of joining it, so
+# the setting above is the bound on a drop nothing waits for any more.
+#
 # Printed once, before the container is removed; never fails the run:
 # statements of 3 s or more, refusals to clone the template, sessions of 3 s
 # or more on the template (talos_ctl), each backend a barrier waited on — and
