@@ -1130,6 +1130,22 @@ async fn handle_get_workflow_identity(
                 .and_then(|g| g.get("nodes").and_then(|n| n.as_array()).map(|a| a.len()))
                 .unwrap_or(0);
 
+            // Who the workflow runs as. A read of its own (the identity row
+            // does not carry the binding), owner-scoped like that one; a
+            // failed read is said, not shown as "no actor".
+            let actor = match state
+                .workflow_repo
+                .get_workflow_actor_id(wf_id, user_id)
+                .await
+            {
+                Ok(actor_id) => {
+                    crate::utils::workflow_actor_block(&state.actor_repo, actor_id, user_id).await
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "get_workflow_identity: could not read the actor binding");
+                    serde_json::json!({ "unreadable": true })
+                }
+            };
             let result = serde_json::json!({
                 "id": wf_id,
                 "name": r.name,
@@ -1140,6 +1156,7 @@ async fn handle_get_workflow_identity(
                 "readiness_score": r.readiness_score,
                 "readiness_computed_at": r.readiness_computed_at.map(|t| t.to_rfc3339()),
                 "node_count": node_count,
+                "actor": actor,
                 "_see_also": {
                     "inferred_input_schema": "Call get_workflow_input_schema(workflow_id) to derive an input shape from recent executions.",
                     "readiness_breakdown": "Call get_readiness_breakdown(workflow_id) for the per-component decomposition behind readiness_score.",

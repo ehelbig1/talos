@@ -537,6 +537,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "ttl_hours": {
                         "type": "number",
                         "description": "Custom TTL in hours (overrides memory_type default). Null = use type default."
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional labels stored beside the value, exactly as a workflow's `__memory_write__` envelope stores its `metadata` (same column, same 16 KiB limit). Use `{\"kind\": \"<label>\"}` to mark a synthetic row so readers that pass exclude_kinds leave it out of recall. Must be an object; anything else is refused. Omitted (or null), the row has no metadata — and writing an existing key without it clears the metadata that key had."
                     }
                 },
                 "required": ["actor_id", "key", "value"]
@@ -4062,15 +4066,37 @@ async fn handle_actor_remember(
         },
     };
 
-    match talos_actor_memory_service::persist_memory(
+    // `metadata`: the labels a workflow's `__memory_write__` envelope may
+    // carry. The envelope ignores one that is not an object; an operator
+    // who typed one is told. The size limit is the write's own
+    // (`talos_memory::MAX_METADATA_BYTES`), enforced where every writer
+    // passes.
+    let metadata = match args.get("metadata") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(m) if m.is_object() => Some(m),
+        Some(other) => {
+            return mcp_error(
+                req_id,
+                -32602,
+                &format!(
+                "metadata must be an object (for example {{\"kind\": \"daily_brief\"}}), got {}",
+                crate::utils::json_type_name(other)
+            ),
+            )
+        }
+    };
+
+    match talos_actor_memory_service::persist_memory_with_metadata_typed(
         &state.db_pool,
         actor_id,
         key,
         &value,
+        metadata,
         memory_type,
         ttl_hours,
     )
     .await
+    .map_err(anyhow::Error::from)
     {
         Ok(outcome) => {
             let expires_at = talos_actor_memory_service::default_expires_at(memory_type, ttl_hours);
@@ -4101,6 +4127,7 @@ async fn handle_actor_remember(
                     "memory_type": memory_type,
                     "expires_at": expires_iso,
                     "embedded": outcome.embedded,
+                    "metadata_stored": metadata.is_some(),
                     "message": message,
                 }))
                 .unwrap_or_default(),
@@ -4119,6 +4146,14 @@ async fn handle_actor_remember(
                     -32602,
                     &format!("{quota}. Use actor_forget to delete unused memories."),
                 );
+            }
+            // What the caller sent was refused by the write's own rules
+            // (the metadata size limit is one). The words are about the
+            // caller's input and carry nothing internal.
+            if let Some(talos_memory::MemoryWriteError::Validation(why)) =
+                e.downcast_ref::<talos_memory::MemoryWriteError>()
+            {
+                return mcp_error(req_id, -32602, &why.to_string());
             }
             tracing::error!("actor_remember: {}", e);
             mcp_error(req_id, -32000, "Failed to store memory")

@@ -356,6 +356,46 @@ pub fn ensure_graph_within_caps(
         .map_err(|msg| super::mcp_error(req_id.clone(), -32602, &msg))
 }
 
+/// A workflow's actor binding, as `get_workflow` and `get_workflow_identity`
+/// show it.
+///
+/// `{"bound": false}` when the workflow has none: said outright, so a
+/// missing field cannot be read as "not asked". When it has one,
+/// `{"bound": true, "actor_id", "name"}`; the name is read owner-scoped, so
+/// an actor that is not the caller's (or was deleted) is `name: null` with
+/// `actor_found: false`, and a read that failed is `name: null` with
+/// `name_unreadable: true` rather than a name that reads as absent.
+pub async fn workflow_actor_block(
+    actor_repo: &talos_actor_repository::ActorRepository,
+    actor_id: Option<uuid::Uuid>,
+    user_id: uuid::Uuid,
+) -> serde_json::Value {
+    let Some(actor_id) = actor_id else {
+        return serde_json::json!({ "bound": false });
+    };
+    match actor_repo
+        .get_actor_names_by_ids(&[actor_id], user_id)
+        .await
+    {
+        Ok(names) => match names.get(&actor_id) {
+            Some(name) => serde_json::json!({
+                "bound": true, "actor_id": actor_id.to_string(), "name": name,
+            }),
+            None => serde_json::json!({
+                "bound": true, "actor_id": actor_id.to_string(), "name": null,
+                "actor_found": false,
+            }),
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "workflow_actor_block: could not read the actor's name");
+            serde_json::json!({
+                "bound": true, "actor_id": actor_id.to_string(), "name": null,
+                "name_unreadable": true,
+            })
+        }
+    }
+}
+
 pub fn orchestration_error_to_response(
     err: talos_execution_orchestration::OrchestrationError,
     req_id: Option<serde_json::Value>,
