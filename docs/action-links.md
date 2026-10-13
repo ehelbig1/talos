@@ -83,6 +83,10 @@ Reasons: `unknown_target`, `workflow_not_owned`, `payload_not_an_object`,
 The node never fails the run. If links cannot be minted at all, every
 placeholder becomes its fallback (or `#`) and the message still sends.
 
+If the node above it failed and was continued past (`continue_on_error`), the
+node passes that failure on unchanged, with a report that says nothing was
+minted. It is not itself a failed node. Put a condition on the edge to the
+send node (`is_error == false`) if a failed compose should send nothing.
 ### Under a dry run
 
 A dry run (`test_workflow`, `call_workflow` or `trigger_workflow` with
