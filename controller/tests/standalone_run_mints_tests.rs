@@ -14,7 +14,9 @@
 //! * a mint is made only under a grant: a path that is merely wanted (a
 //!   `vault://` reference in a test's config) reaches no provider;
 //! * with no user identity nothing is minted;
-//! * a refused mint is an absent path, not an error.
+//! * a refused mint is an absent path, not an error;
+//! * a replay mints the path its node config references under a glob grant,
+//!   and nothing for a reference outside the grant.
 //!
 //! The providers are process-wide and set once, so this file is one test
 //! function: its own process, its own providers.
@@ -193,6 +195,53 @@ async fn a_standalone_run_mints_for_its_caller_only_and_only_under_a_grant() {
         take_asked().iter().all(|(_, _, user)| *user == stranger),
         "a provider was asked about a user other than the caller"
     );
+
+    // A REPLAY of a module granted a GLOB. The exact path is named only by
+    // the node config the rows are replayed with, as it is on a dispatch. A
+    // replay used to ask for its grant list alone: a glob names no path, so
+    // nothing was minted and every row failed on a missing secret.
+    let replay_grant = s(&["gcp/impersonated/*"]);
+    let alone = talos_replay_service::replay_wanted_paths(&replay_grant, std::iter::empty());
+    let resolved = resolve_for_standalone_run(sm.clone(), &replay_grant, &alone, Some(connected))
+        .await
+        .expect("resolve");
+    assert!(resolved.is_empty(), "{:?}", resolved.keys());
+    assert!(
+        take_asked().is_empty(),
+        "the grant list alone names no path to mint"
+    );
+
+    // With the node config: the path it references under the grant is
+    // minted, for the caller. The reference OUTSIDE the grant (the GitHub
+    // one) reaches no provider.
+    let node_config = serde_json::json!({
+        "GCP_AUTH": format!("Bearer vault://{named}"),
+        "GH_AUTH": format!("Bearer vault://{github}"),
+        "PROJECT": "example-project",
+    });
+    let with_config = talos_replay_service::replay_wanted_paths(&replay_grant, [&node_config]);
+    let resolved =
+        resolve_for_standalone_run(sm.clone(), &replay_grant, &with_config, Some(connected))
+            .await
+            .expect("resolve");
+    assert_eq!(
+        resolved.get(&named).map(String::as_str),
+        Some("minted:runner@example-project.iam.gserviceaccount.com")
+    );
+    assert!(!resolved.contains_key(&github));
+    assert_eq!(
+        take_asked(),
+        vec![(SA.to_string(), Some(key), connected)],
+        "one mint, for the caller, and none for the reference outside the grant"
+    );
+
+    // The same replay by another user: asked about THAT user, and refused.
+    let resolved =
+        resolve_for_standalone_run(sm.clone(), &replay_grant, &with_config, Some(stranger))
+            .await
+            .expect("resolve");
+    assert!(resolved.is_empty(), "{:?}", resolved.keys());
+    assert!(take_asked().iter().all(|(_, _, user)| *user == stranger));
 
     // No user identity: nothing is minted, and no provider is asked.
     let resolved = resolve_for_standalone_run(sm, &grant, &wanted, None)
