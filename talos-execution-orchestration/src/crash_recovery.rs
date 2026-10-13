@@ -384,6 +384,17 @@ pub(crate) async fn resume_one(
                 &format!("{origin_label}: resume dispatch failed: {redacted}"),
             )
             .await;
+            // The failure is recorded; now keep what the nodes that completed
+            // had produced (the checkpoint's seed included), so the run can
+            // be read back node by node.
+            let wf_repo = talos_workflow_repository::WorkflowRepository::new(deps.db_pool.clone())
+                .with_encryption(deps.secrets_manager.clone());
+            talos_execution_result_collector::keep_failed_run_outputs(
+                &engine,
+                exec_id,
+                |outputs| async move { wf_repo.attach_failed_run_outputs(exec_id, &outputs).await },
+            )
+            .await;
             tracing::error!(execution_id = %exec_id, error = %redacted, "{origin_label}: resume dispatch failed");
         }
     }

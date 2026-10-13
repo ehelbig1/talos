@@ -321,11 +321,20 @@ impl ExecutionOrchestrationService {
                         raw_err_full.as_str()
                     };
                     let redacted_err = talos_dlp_provider::redact_str(raw_err);
+                    // What a failed run stores: the trigger input and the
+                    // outputs of the nodes that completed. A retry resets the
+                    // row's output when it starts, so writing nothing here
+                    // (as this did) left a twice-failed run with no trigger
+                    // input at all, and a second retry ran on `{}`.
+                    let fail_output = result_collector::collect_failure_output(
+                        &engine,
+                        &trigger_input_for_storage,
+                    );
                     if let Err(db_err) = repo_for_task
                         .mark_execution_failed(
                             execution_id,
                             &format!("Retry failed: {}", redacted_err),
-                            None,
+                            Some(&fail_output),
                         )
                         .await
                     {
@@ -350,5 +359,28 @@ impl ExecutionOrchestrationService {
             },
             trace: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod failed_retry_output_pin {
+    /// A retry resets the row's stored output when it starts. If the retry
+    /// then fails and stores nothing, the row has lost its trigger input for
+    /// good and a second retry runs on `{}`. That is what this path did: it
+    /// passed `None`. It is not driven here (a retry needs NATS), so the
+    /// failure arm is held as written: it builds the failure output from the
+    /// engine and the trigger input, and stores it.
+    #[test]
+    fn a_failed_retry_stores_its_trigger_input_and_completed_outputs() {
+        let source = include_str!("retry.rs");
+        let builds = ["result_collector::collect_failure_", "output("].concat();
+        let stores = ["Some(&fail_", "output),"].concat();
+        assert_eq!(source.matches(&builds).count(), 1, "{builds}");
+        assert_eq!(source.matches(&stores).count(), 1, "{stores}");
+        let fail_arm = &source[source.find(&builds).expect("built")..];
+        assert!(
+            fail_arm.find(&stores).is_some(),
+            "the failure output is built but not stored"
+        );
     }
 }

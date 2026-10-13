@@ -2652,6 +2652,22 @@ impl WebhookRouter {
                             "Failed to mark webhook execution failed after sync run error — execution row left in queued state",
                         );
                     }
+                    // The failure is recorded; now keep what the nodes that
+                    // completed had produced. Sealed as this path seals a
+                    // completed run's output, above.
+                    let wf_repo =
+                        talos_workflow_repository::WorkflowRepository::new(db_pool.clone())
+                            .with_encryption(self.secrets_manager.clone());
+                    talos_execution_result_collector::keep_failed_run_outputs(
+                        &engine,
+                        execution_id,
+                        |outputs| async move {
+                            wf_repo
+                                .attach_failed_run_outputs(execution_id, &outputs)
+                                .await
+                        },
+                    )
+                    .await;
                     let body = serde_json::json!({
                         "execution_id": execution_id,
                         "status": "failed",
@@ -2706,6 +2722,22 @@ impl WebhookRouter {
                             "Failed to mark webhook execution failed after sync timeout — execution row left in queued state",
                         );
                     }
+                    // The failure is recorded; now keep what the nodes that
+                    // completed had produced. Sealed as this path seals a
+                    // completed run's output, above.
+                    let wf_repo =
+                        talos_workflow_repository::WorkflowRepository::new(db_pool.clone())
+                            .with_encryption(self.secrets_manager.clone());
+                    talos_execution_result_collector::keep_failed_run_outputs(
+                        &engine,
+                        execution_id,
+                        |outputs| async move {
+                            wf_repo
+                                .attach_failed_run_outputs(execution_id, &outputs)
+                                .await
+                        },
+                    )
+                    .await;
                     let body = serde_json::json!({
                         "execution_id": execution_id,
                         "status": "timeout",

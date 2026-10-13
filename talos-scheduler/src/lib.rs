@@ -3207,6 +3207,24 @@ async fn run_scheduled_execution(
                     "Scheduler: execution failed AND failure-marking UPDATE failed — execution row stuck 'running'"
                 );
             }
+            // The failure is recorded; now keep what the nodes that completed
+            // had produced, so a scheduled run that failed can be read back
+            // node by node. Sealed as this path seals a completed run's
+            // output, above.
+            let exec_repo = talos_execution_repository::ExecutionRepository::with_encryption(
+                db_pool.clone(),
+                secrets_manager.clone(),
+            );
+            talos_execution_result_collector::keep_failed_run_outputs(
+                &engine,
+                execution_id,
+                |outputs| async move {
+                    exec_repo
+                        .attach_failed_run_outputs(execution_id, &outputs)
+                        .await
+                },
+            )
+            .await;
             // Cancel any still-running sibling module_executions.
             match talos_workflow_repository::cancel_running_module_executions(
                 &db_pool,
