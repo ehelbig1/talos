@@ -372,7 +372,13 @@ impl ReplayService {
             });
         }
 
-        let secrets = self.prefetch_secrets(&module, input.user_id).await;
+        let secrets = self
+            .prefetch_secrets(
+                &module,
+                input.user_id,
+                samples.iter().map(|sample| &sample.node_config),
+            )
+            .await;
         // MCP-691: module-replay path has no workflow context — pass
         // None so resolve_replay_tier defaults to Tier-1.
         let llm_tier = self.resolve_replay_tier(None, input.user_id).await;
@@ -437,7 +443,10 @@ impl ReplayService {
             .await?;
         reject_unreplayable_world(&module.capability_world, /* workflow_mode */ true)?;
 
-        let secrets = self.prefetch_secrets(&module, input.user_id).await;
+        // Every row of a workflow-mode replay runs with this one config.
+        let secrets = self
+            .prefetch_secrets(&module, input.user_id, std::iter::once(&plan.node_config))
+            .await;
 
         // 4. Pull recent completed workflow_executions with output_data.
         let wf_exec_rows = self
@@ -585,22 +594,30 @@ impl ReplayService {
     /// hit). DB error → empty map (matches the reference handler) so
     /// a transient secrets outage does not abort replay; modules that
     /// genuinely require a secret will surface a clean per-row error.
-    async fn prefetch_secrets(
+    ///
+    /// `node_configs` are the configs the rows will be replayed with. A
+    /// dispatch resolves the `vault://` references in a node's config as
+    /// well as the module's grant list, and so does this: see
+    /// [`replay_wanted_paths`].
+    async fn prefetch_secrets<'a>(
         &self,
         module: &WasmModule,
         user_id: Uuid,
+        node_configs: impl IntoIterator<Item = &'a JsonValue>,
     ) -> HashMap<String, String> {
         if module.allowed_secrets.is_empty() {
             return HashMap::new();
         }
+        let wanted = replay_wanted_paths(&module.allowed_secrets, node_configs);
         // Resolved the way a dispatch resolves them, so a module that
         // authenticates with a MINTED token (an impersonated Google Cloud
         // service account, a GitHub App installation) is replayed with one.
-        // The grant and the request are the same list: the module's own.
+        // The grant is the module's own list; what is wanted is that list
+        // plus the references it permits.
         match talos_oauth::resolver::resolve_for_standalone_run(
             self.secrets_manager.clone(),
             &module.allowed_secrets,
-            &module.allowed_secrets,
+            &wanted,
             Some(user_id),
         )
         .await
@@ -732,6 +749,70 @@ fn plan_workflow_replay(
         node_config,
         predecessor_label,
     })
+}
+
+/// The most distinct `vault://` references a replay takes from the node
+/// configs it replays with. A node config names a handful; past this the
+/// rest are not asked for, and the count is logged.
+pub const REPLAY_REFERENCED_PATHS_MAX: usize = 64;
+
+/// The secret paths a replay asks to have resolved: the module's own grant
+/// list, then every `vault://` reference in the node configs it will replay
+/// with THAT THE GRANT PERMITS.
+///
+/// A dispatch resolves both. A replay passed the grant list alone, and a
+/// grant entry is looked up as a literal path, so a module granted a prefix
+/// (`oauth/gmail`) or a glob (`gcp/impersonated/*`) was replayed with no
+/// credential: the exact path is named only by the node's config, as
+/// `Bearer vault://…`. Every row then failed on a missing secret.
+///
+/// A reference the grant does not permit is not asked for. A real dispatch
+/// could not use it either (the worker refuses a path outside the grant),
+/// and a replay must not fetch, or mint, more than the module is entitled
+/// to. What is returned is still only what is WANTED: whether a mint is made
+/// is decided again, against the same grant, by
+/// `talos_oauth::resolver::standalone_run_paths`.
+///
+/// References are read where the engine reads them: the top level of the
+/// config (`extract_vault_refs`). Order is kept and duplicates are dropped.
+/// Pure, so the rule is tested without a database.
+#[must_use]
+pub fn replay_wanted_paths<'a>(
+    grants: &[String],
+    node_configs: impl IntoIterator<Item = &'a JsonValue>,
+) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut wanted: Vec<String> = Vec::with_capacity(grants.len());
+    for grant in grants {
+        if seen.insert(grant.clone()) {
+            wanted.push(grant.clone());
+        }
+    }
+    let (mut taken, mut dropped) = (0usize, 0usize);
+    for config in node_configs {
+        for (_key, path) in talos_workflow_job_protocol::extract_vault_refs(config) {
+            if !talos_workflow_job_protocol::vault_path_permitted(grants, &path)
+                || seen.contains(&path)
+            {
+                continue;
+            }
+            if taken == REPLAY_REFERENCED_PATHS_MAX {
+                dropped += 1;
+                continue;
+            }
+            seen.insert(path.clone());
+            wanted.push(path);
+            taken += 1;
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            max = REPLAY_REFERENCED_PATHS_MAX,
+            "replay: more distinct vault references in the node configs than a replay resolves; the rest were not asked for"
+        );
+    }
+    wanted
 }
 
 /// Reject capability worlds that the standalone runtime cannot
@@ -1126,5 +1207,141 @@ mod tests {
         assert_eq!(c.matched, 0);
         assert_eq!(c.drifted, 0);
         assert_eq!(c.errored, 0);
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    const SA: &str = "runner@example-project.iam.gserviceaccount.com";
+
+    /// The defect: a replay asked for the grant list alone. A glob or prefix
+    /// grant names no path, so the exact path the node's config references
+    /// was never resolved and every row failed on a missing secret.
+    #[test]
+    fn a_replay_asks_for_the_references_its_node_config_names_under_the_grant() {
+        let minted = format!("gcp/impersonated/{SA}/access_token");
+        let stored = "oauth/gmail/u/a@example.com/access_token";
+        let config = serde_json::json!({
+            "GCP_AUTH": format!("Bearer vault://{minted}"),
+            "AUTH_HEADER": format!("Bearer vault://{stored}"),
+            "QUERY": "is:unread",
+        });
+
+        let grants = strs(&["gcp/impersonated/*", "oauth/gmail"]);
+        let wanted = replay_wanted_paths(&grants, [&config]);
+        assert_eq!(&wanted[..2], &grants[..], "the grant list comes first");
+        let mut referenced = wanted[2..].to_vec();
+        referenced.sort();
+        assert_eq!(referenced, strs(&[&minted, stored]));
+
+        // And the mint is then made: the path rule keeps it under this grant.
+        assert!(
+            talos_oauth::resolver::standalone_run_paths(&grants, &wanted).contains(&minted),
+            "a glob mint grant plus the config's reference must reach the mint"
+        );
+    }
+
+    /// A reference the grant does not permit is not asked for: not a stored
+    /// path, and not a mint. A replay resolves no more than a dispatch of the
+    /// module could use.
+    #[test]
+    fn a_reference_outside_the_grant_is_not_asked_for() {
+        let config = serde_json::json!({
+            "A": "Bearer vault://oauth/slack/u/token",
+            "B": format!("Bearer vault://gcp/impersonated/{SA}/access_token"),
+            "C": "vault://github_app:example-org",
+            // Under the grant, by a different separator: a different path.
+            "D": "vault://oauth/gmail-archive/token",
+        });
+        let grants = strs(&["oauth/gmail"]);
+        assert_eq!(replay_wanted_paths(&grants, [&config]), grants);
+
+        // No grant at all: nothing a config names is asked for.
+        assert!(replay_wanted_paths(&[], [&config]).is_empty());
+    }
+
+    #[test]
+    fn references_are_taken_once_across_rows_and_only_from_the_top_level() {
+        let row = serde_json::json!({
+            "AUTH_HEADER": "Bearer vault://oauth/gmail/u/a@example.com/access_token",
+            // Where the engine does not look, a replay does not either.
+            "nested": { "AUTH_HEADER": "Bearer vault://oauth/gmail/u/b@example.com/access_token" },
+        });
+        let other = serde_json::json!({
+            "AUTH_HEADER": "Bearer vault://oauth/gmail/u/c@example.com/access_token",
+        });
+        let grants = strs(&["oauth/gmail", "oauth/gmail"]);
+        assert_eq!(
+            replay_wanted_paths(&grants, [&row, &row, &other, &row]),
+            strs(&[
+                "oauth/gmail",
+                "oauth/gmail/u/a@example.com/access_token",
+                "oauth/gmail/u/c@example.com/access_token",
+            ])
+        );
+        // A config that is not an object carries no reference.
+        assert_eq!(
+            replay_wanted_paths(
+                &strs(&["*"]),
+                [&JsonValue::Null, &serde_json::json!("vault://x")]
+            ),
+            strs(&["*"])
+        );
+    }
+
+    #[test]
+    fn the_references_a_replay_takes_are_bounded() {
+        let configs: Vec<JsonValue> = (0..REPLAY_REFERENCED_PATHS_MAX + 10)
+            .map(|i| serde_json::json!({ "K": format!("vault://svc/key-{i}") }))
+            .collect();
+        let wanted = replay_wanted_paths(&strs(&["svc"]), &configs);
+        assert_eq!(wanted.len(), 1 + REPLAY_REFERENCED_PATHS_MAX);
+        assert_eq!(wanted[1], "svc/key-0");
+    }
+
+    /// The wiring the helper's own tests cannot see: both replay modes hand
+    /// the configs they replay with to the prefetch, and the prefetch asks
+    /// for what the helper returns while the GRANT stays the module's list.
+    /// Textual, and it says so.
+    #[test]
+    fn both_replay_modes_resolve_the_references_of_the_configs_they_replay_with() {
+        let src = include_str!("lib.rs");
+        let production = src.split("\nmod tests {").next().expect("production half");
+        assert!(
+            production.contains("samples.iter().map(|sample| &sample.node_config),"),
+            "module mode must pass each row's node config"
+        );
+        assert!(
+            production.contains("std::iter::once(&plan.node_config)"),
+            "workflow mode must pass the target node's config"
+        );
+        let prefetch = production
+            .split("async fn prefetch_secrets<'a>(")
+            .nth(1)
+            .expect("prefetch_secrets")
+            .split("\n    }\n")
+            .next()
+            .expect("its body");
+        assert!(
+            prefetch.contains(
+                "let wanted = replay_wanted_paths(&module.allowed_secrets, node_configs);"
+            ),
+            "{prefetch}"
+        );
+        let call = prefetch
+            .split("resolve_for_standalone_run(")
+            .nth(1)
+            .expect("the resolver call");
+        let args: Vec<&str> = call.split(',').map(str::trim).take(3).collect();
+        assert_eq!(
+            args,
+            [
+                "self.secrets_manager.clone()",
+                "&module.allowed_secrets",
+                "&wanted"
+            ],
+            "the grant a mint is judged against is the module's own list, never the wanted one"
+        );
     }
 }
