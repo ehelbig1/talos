@@ -20,6 +20,10 @@
 //! `fallback`, or `#`, when the link could not be minted), the request key
 //! removed, and an engine-authored [`ACTION_LINKS_REPORT`] in its place.
 //!
+//! A dry run mints nothing: a link starts a real workflow, so a rehearsal
+//! must not hold one. Every request falls back and is reported with the
+//! reason [`DRY_RUN_REASON`].
+//!
 //! # Who decides what a link may start
 //!
 //! The GRAPH AUTHOR, in the node's configuration: `targets` maps a short
@@ -55,6 +59,9 @@ pub const ACTION_PLACEHOLDER_PREFIX: &str = "talos-action:";
 /// What replaces a placeholder whose link was not minted and which named no
 /// fallback: a link that goes nowhere.
 pub const DEAD_LINK: &str = "#";
+/// The reason a request carries in the report when its link was not minted
+/// because the run is a dry run.
+pub const DRY_RUN_REASON: &str = "dry_run";
 /// Most requests one node run acts on.
 pub const MAX_ACTION_LINKS: usize = 64;
 /// Most targets one node may be configured with.

@@ -711,6 +711,9 @@ impl ParallelWorkflowEngine {
     /// falls back and the report says why — the message still goes out,
     /// with the links it would have had before this node existed.
     ///
+    /// Under a dry run (`self.dry_run`) nothing is minted: every request
+    /// that would have been falls back with the reason `dry_run`.
+    ///
     /// The minted URLs are capability secrets. They travel in the output
     /// (that is the node's purpose) and are never logged here: only counts.
     ///
@@ -725,7 +728,7 @@ impl ParallelWorkflowEngine {
         results: &HashMap<Uuid, JsonValue>,
     ) -> Option<ForwardedOutput> {
         use talos_workflow_engine_core::action_links::{
-            apply_action_links, plan_action_links, ActionLinkSpec, ResolvedLink,
+            apply_action_links, plan_action_links, ActionLinkSpec, ResolvedLink, DRY_RUN_REASON,
         };
         let (_, _, Some(SystemNodeKind::ActionLinks { targets, ttl_hours })) =
             self.node_meta.get(&node_id)?
@@ -764,6 +767,12 @@ impl ParallelWorkflowEngine {
         let (resolved, unavailable): (Vec<ResolvedLink>, Option<&str>) = if specs.is_empty() {
             // Nothing to mint: no requests, or every one refused at planning.
             (all_fall_back("not_minted"), None)
+        } else if self.dry_run {
+            // A link is a capability: confirmed, it starts a real workflow
+            // with the payload this rehearsal composed. A dry run mints
+            // none. This branch sits BEFORE the minter is consulted, so a
+            // dry run writes no token row either.
+            (all_fall_back(DRY_RUN_REASON), None)
         } else if let (Some(minter), Some(user_id)) =
             (self.action_link_minter.clone(), self.user_id)
         {

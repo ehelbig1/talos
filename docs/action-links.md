@@ -78,7 +78,7 @@ The node returns the same output with every placeholder replaced,
 
 Reasons: `unknown_target`, `workflow_not_owned`, `payload_not_an_object`,
 `payload_too_large`, `label_empty`, `too_many_links` (64 per run),
-`unavailable`.
+`unavailable`, `dry_run`.
 
 The node never fails the run. If links cannot be minted at all, every
 placeholder becomes its fallback (or `#`) and the message still sends.
@@ -87,6 +87,21 @@ If the node above it failed and was continued past (`continue_on_error`), the
 node passes that failure on unchanged, with a report that says nothing was
 minted. It is not itself a failed node. Put a condition on the edge to the
 send node (`is_error == false`) if a failed compose should send nothing.
+### Under a dry run
+
+A dry run (`test_workflow`, `call_workflow` or `trigger_workflow` with
+`dry_run: true`) mints no link. A link starts a real workflow, and a
+rehearsal's payload is rehearsal data, so the node asks the link store for
+nothing: every request falls back and is reported with the reason `dry_run`,
+and no token is stored. The reply's `dry_run` block names the node and how
+many links it left unminted (`action_links_not_minted`).
+
+To see a message with working links, run the workflow for real.
+
+One limit: the dry-run flag is not stored with the execution. A dry run that
+pauses and is resumed later (an approval, a wait node, a controller restart)
+continues as an ordinary run, and an `action_links` node reached after the
+resume mints.
 
 ## What the target workflow sees
 
