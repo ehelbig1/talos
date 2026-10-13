@@ -652,3 +652,75 @@ second one.
 
 Verify with `opens_total{transition="opened"}` before and after on a worker
 with a known-flaky upstream, and state the expected increase up front.
+
+---
+
+## More than one GitHub App per deployment — a private App in each organisation
+
+**Added:** 2026-10-13. **Priority: MEDIUM** (it decides whether Talos can be
+connected to an organisation that will not install a public App owned by an
+individual). Asked for while connecting a second organisation.
+
+**What.** Talos has ONE GitHub App: `GithubAppConfig::from_env` reads one
+`GITHUB_APP_*` set at start-up, the installation-token provider is a process
+singleton (`OnceLock`, RFC 0008 B4-wiring), and the connect flow builds its
+install link from that one App's slug and verifies a claim with that one App's
+client credentials. A private App owned by a personal account installs on that
+account only, so reaching a second organisation today means making the App
+public: any GitHub user can then install it, every organisation is asked for
+the App's single permission set, and one private key mints tokens for every
+installation.
+
+RFC 0008 left this open (open question 1): "each org bringing its own App
+ID/key — more config, stronger isolation". This entry is that alternative.
+
+**Why it matters.**
+1. **Blast radius.** One key for every connected organisation means one leak
+   reaches all of them. A key per App bounds it to one.
+2. **Least privilege.** Permissions belong to the App, not to the installation.
+   With one App, an organisation that needs "Actions: read" is asked to approve
+   whatever the widest user of the App needs, and widening it later makes every
+   organisation approve again.
+3. **Ownership.** An organisation's owners can create, audit and delete an App
+   their organisation owns. A public App owned by somebody's personal account
+   is the thing many organisations refuse by policy.
+
+**Why it is not done yet.** One operator, one App was the assumption the
+integration was built on, and it was true until a second organisation was
+wanted. It is a change to where a signing key lives and to who may use it, so
+it wants a design before code.
+
+**Suggested shape** (design first; an RFC amendment, then phases).
+- **A registry of Apps**, replacing the single env-provided config. Each App's
+  private key, client secret and webhook secret are stored through
+  `SecretsManager` (encrypted at rest; the RFC's D2 already says the platform
+  secret namespace), not in the environment. The env-provided App can remain
+  as "the deployment's default App" so nothing existing changes.
+- **Registering an App is a secret write**: behind the two-factor GraphQL path,
+  never an MCP tool (MCP is read-only for secrets).
+- **Tenancy.** An App belongs to the Talos user or organisation that registered
+  it. Nobody else can connect through it or mint with it, and its existence is
+  not disclosed to them (same answer as "no such App").
+- **`github_app_installations` records which App an installation belongs to.**
+  The mint uses that App's key; the token cache is keyed so two Apps cannot
+  collide.
+- **The connect flow names its App** in the bound `state`, builds the install
+  link from that App's slug, and verifies the claim with that App's client
+  credentials (`GET /user/installations` with a user token for THAT App). The
+  rule that a claim never moves an installation another user holds stays.
+- **Modules do not change.** `github_app:<owner>` resolves to the caller's
+  installation for that owner and, through it, to the App. If the caller holds
+  two installations for one owner through two Apps, nothing is minted until the
+  path names one, the same rule the GCP impersonation mint follows
+  (`choose_consent`): never choose between two.
+- **Diagnostics** (`test_secret_access`, `list_connections`) say which App an
+  installation belongs to, by name, never by key material.
+
+**Not in scope.** A GitHub App webhook receiver per App (B5-wiring is not built
+for one App yet), and Marketplace listing.
+
+**Verify** with two Apps registered by one user and one by another: a mint for
+each owner uses the right key (the App id in the JWT's `iss`); a path for an
+owner held through two Apps mints nothing until it names one; the second
+user's App cannot be connected through, minted with, or seen by the first; an
+all-default deployment (only the env App) behaves byte for byte as before.
