@@ -4793,6 +4793,66 @@ pub const DRY_RUN_NOT_MOCKED: &str = "A dry run answers these with a stub: non-G
      calls: those run for real. A node listed with stubbed_calls 0 had nothing stubbed, so \
      whatever it did, it did.";
 
+/// What the controller's own nodes do under a dry run. The worker's stubs
+/// (above) cover a module's outbound calls; this covers everything a dry run
+/// reaches that is not a module. One text, used by the reply block and by
+/// every tool description that documents `dry_run`.
+pub const DRY_RUN_SYSTEM_NODES: &str =
+    "Controller-side nodes under a dry run: an action_links node \
+     mints NO link (each placeholder becomes its fallback or `#`, and `__action_links_report__` \
+     lists every request under not_minted with reason `dry_run`). Everything else a system node \
+     or an output protocol does is REAL: a pending_approvals, ops_alerts_digest or \
+     assistant_report node still mints approve/reject and correction links for the real items it \
+     lists; a module with requires_approval_for, and a confidence gate set to pause, still \
+     creates a real approval request, notifies, and pauses the run; `__memory_write__`, \
+     `__ops_alert__` and `__ml_distill__` in a node's output are acted on; judge verdicts are \
+     recorded. A dry run that pauses and is resumed later (an approval, a wait node, a controller \
+     restart) continues as an ORDINARY run: the flag is not stored with the execution.";
+
+/// One `action_links` node's requests that a dry run did not mint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DryRunUnmintedLinks {
+    /// The node's label.
+    pub node: String,
+    /// How many of its requests were not minted because the run was a dry run.
+    pub links: u64,
+}
+
+/// The nodes whose `__action_links_report__` lists requests not minted
+/// because the run was a dry run, read from a run's output keyed by node.
+/// Sorted by node, at most 200 entries.
+///
+/// Stated limit: a node that passes an `action_links` node's output on
+/// unchanged carries that report and is listed too.
+pub fn dry_run_unminted_links(output: &serde_json::Value) -> Vec<DryRunUnmintedLinks> {
+    use talos_workflow_engine_core::action_links::{ACTION_LINKS_REPORT, DRY_RUN_REASON};
+    const MAX_NODES: usize = 200;
+    let Some(nodes) = output.as_object() else {
+        return Vec::new();
+    };
+    let mut found: Vec<DryRunUnmintedLinks> = nodes
+        .iter()
+        .filter(|(label, _)| !label.starts_with("__"))
+        .filter_map(|(label, node_output)| {
+            let not_minted = node_output
+                .get(ACTION_LINKS_REPORT)?
+                .get("not_minted")?
+                .as_array()?;
+            let links = not_minted
+                .iter()
+                .filter(|l| l.get("reason").and_then(|r| r.as_str()) == Some(DRY_RUN_REASON))
+                .count();
+            (links > 0).then(|| DryRunUnmintedLinks {
+                node: label.clone(),
+                links: links as u64,
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| a.node.cmp(&b.node));
+    found.truncate(MAX_NODES);
+    found
+}
+
 /// The dry-run reports of a run's module nodes, read from the record the
 /// worker stamps on each output
 /// ([`talos_workflow_job_protocol::DRY_RUN_REPORT_KEY`]).
@@ -4837,11 +4897,17 @@ pub fn dry_run_block(output: &serde_json::Value) -> serde_json::Value {
         .filter(|n| n.stubbed_calls > 0)
         .map(|n| n.node.as_str())
         .collect();
+    let unminted: Vec<serde_json::Value> = dry_run_unminted_links(output)
+        .iter()
+        .map(|n| serde_json::json!({ "node": n.node, "links": n.links }))
+        .collect();
     serde_json::json!({
         "requested": true,
         "nodes_with_stubbed_calls": stubbed,
         "nodes": nodes.iter().map(DryRunNode::to_json).collect::<Vec<_>>(),
+        "action_links_not_minted": unminted,
         "not_mocked": DRY_RUN_NOT_MOCKED,
+        "system_nodes": DRY_RUN_SYSTEM_NODES,
     })
 }
 
@@ -4876,6 +4942,54 @@ mod dry_run_report_tests {
         assert_eq!(block["nodes_with_stubbed_calls"], json!(["send"]));
         assert_eq!(block["nodes"][1]["by_surface"], json!({ "http": 1 }));
         assert!(block["not_mocked"].as_str().unwrap().contains("email"));
+    }
+
+    /// A dry run through an `action_links` node mints nothing; the block
+    /// names the node and how many links it left unminted. A request refused
+    /// for its own reason is not counted, and an ordinary run lists nothing.
+    #[test]
+    fn links_a_dry_run_did_not_mint_are_named_by_node() {
+        let output = json!({
+            "links": {
+                "html": "<a href=\"#\">done</a>",
+                "__action_links_report__": {
+                    "available": true, "requested": 3, "minted": 0,
+                    "not_minted": [
+                        { "id": "a", "reason": "dry_run", "fell_back": false },
+                        { "id": "b", "reason": "dry_run", "fell_back": true },
+                        { "id": "c", "reason": "unknown_target", "fell_back": false },
+                    ],
+                },
+            },
+            "ordinary": {
+                "__action_links_report__": {
+                    "available": true, "requested": 1, "minted": 1, "not_minted": [],
+                },
+            },
+            "__node_timings__": {
+                "__action_links_report__": { "not_minted": [{ "id": "x", "reason": "dry_run" }] },
+            },
+        });
+        assert_eq!(
+            dry_run_unminted_links(&output),
+            [DryRunUnmintedLinks {
+                node: "links".into(),
+                links: 2
+            }]
+        );
+        let block = dry_run_block(&output);
+        assert_eq!(
+            block["action_links_not_minted"],
+            json!([{ "node": "links", "links": 2 }])
+        );
+        assert!(block["system_nodes"]
+            .as_str()
+            .unwrap()
+            .contains("mints NO link"));
+        assert_eq!(
+            dry_run_block(&json!({ "send": { "sent": true } }))["action_links_not_minted"],
+            json!([])
+        );
     }
 
     #[test]
