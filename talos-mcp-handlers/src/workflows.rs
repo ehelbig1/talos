@@ -5836,6 +5836,15 @@ async fn handle_call_workflow(
         Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
     };
     let terminal_nodes = crate::utils::terminal_node_ids(&parsed_graph);
+    // MCP-268 (2026-05-10): direction-class wrong-type rejection. Read
+    // BEFORE the row is created (2026-10-13): the row records whether the
+    // run is a dry run, in the statement that creates it, so that a resume
+    // or a recovery of the run is a dry run too. (Read after it, as it was,
+    // a wrong-typed value also returned past a row already marked running.)
+    let dry_run = match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return Some(resp),
+    };
     let exec_id = uuid::Uuid::new_v4();
     // M T5-1: enforce max_concurrent_executions on call_workflow.
     // Pre-fix this used `create_execution` (the bypass path), so an
@@ -5857,6 +5866,7 @@ async fn handle_call_workflow(
             None,
             None,
             talos_workflow_repository::InitialExecutionStatus::Running,
+            talos_workflow_repository::RunMode::from_dry_run(dry_run),
         )
         .await
     {
@@ -5956,12 +5966,6 @@ async fn handle_call_workflow(
     // it drives to a terminal status and finalizes the row regardless. Mirrors
     // handle_test_workflow / handle_test_workflow_draft and the GraphQL
     // test-workflow mutation.
-    //
-    // MCP-268 (2026-05-10): direction-class wrong-type rejection.
-    let dry_run = match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {
-        Ok(v) => v,
-        Err(resp) => return Some(resp),
-    };
     let opts = talos_engine::builder::EngineOpts::for_run(wf_id, graph_json.clone())
         // Gate-resolved above and already stamped on the execution row. The
         // second argument stays as the workflow's own actor so a hypothetical
@@ -7238,6 +7242,7 @@ async fn handle_bulk_trigger_workflow(
                 None,
                 None,
                 talos_workflow_repository::InitialExecutionStatus::Running,
+                talos_workflow_repository::RunMode::Real,
             )
             .await
         {
@@ -7712,6 +7717,7 @@ async fn handle_trigger_workflow_as_actors(
                 None,
                 None,
                 talos_workflow_repository::InitialExecutionStatus::Running,
+                talos_workflow_repository::RunMode::Real,
             )
             .await
         {
@@ -8510,6 +8516,14 @@ async fn handle_test_workflow(
     };
     let terminal_nodes = crate::utils::terminal_node_ids(&parsed_graph);
 
+    // MCP-269 (2026-05-10): direction-class wrong-type rejection. Read
+    // BEFORE the row is created (2026-10-13), for the reason given in
+    // handle_call_workflow: the row records the mode when it is created.
+    let dry_run = match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return Some(resp),
+    };
+
     // Create execution record with test flag
     let exec_id = uuid::Uuid::new_v4();
     let priority =
@@ -8527,6 +8541,7 @@ async fn handle_test_workflow(
             version_id,
             priority,
             test_actor_arg.or(test_wf_record.actor_id),
+            talos_workflow_repository::RunMode::from_dry_run(dry_run),
         )
         .await
     {
@@ -8615,11 +8630,6 @@ async fn handle_test_workflow(
             &mut input_payload,
         );
 
-    // MCP-269 (2026-05-10): direction-class wrong-type rejection.
-    let dry_run = match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {
-        Ok(v) => v,
-        Err(resp) => return Some(resp),
-    };
     let effective_test_actor = test_actor_arg.or(test_wf_record.actor_id);
 
     // Build the engine via the canonical builder.

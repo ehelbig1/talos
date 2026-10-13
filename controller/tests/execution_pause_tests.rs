@@ -79,6 +79,7 @@ async fn admit(
         None,
         None,
         InitialExecutionStatus::Running,
+        talos_workflow_repository::RunMode::Real,
     )
     .await
     .expect("admission query")

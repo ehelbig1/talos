@@ -921,7 +921,7 @@ async fn handle_get_execution_status(
                 serde_json::Value::Array(errored_edges),
             );
         }
-        if let Some(dry_run) = dry_run_block_of(exec.output_data.as_ref()) {
+        if let Some(dry_run) = dry_run_block_of(exec.dry_run, exec.output_data.as_ref()) {
             map.insert("dry_run".to_string(), dry_run);
         }
         if has_output {
@@ -5961,17 +5961,28 @@ pub(crate) fn continued_failures_block(
         .collect()
 }
 
-/// The `dry_run` block of `get_execution_status`, or `None` for a run whose
-/// stored node outputs carry no dry-run report (which is every run that was
-/// not a dry run). Its presence is how a stored run is told from a rehearsal.
+/// The `dry_run` block of `get_execution_status`, or `None` for a run that
+/// was not a dry run. Its presence is how a stored run is told from a
+/// rehearsal.
+///
+/// `recorded_as_dry_run` is the execution ROW's own flag
+/// (`workflow_executions.dry_run`), and it decides: a dry run has the block
+/// even when it stored no output (it failed, or is still running) or none of
+/// its nodes made a stubbed call. A row created before the flag existed
+/// reads `false`, so for those the older evidence still counts: a node
+/// output that carries the worker's dry-run report.
 pub(crate) fn dry_run_block_of(
+    recorded_as_dry_run: bool,
     output_data: Option<&serde_json::Value>,
 ) -> Option<serde_json::Value> {
-    let output = output_data?;
-    if talos_workflow_validation::dry_run_nodes(output).is_empty() {
+    let stamped = output_data
+        .is_some_and(|output| !talos_workflow_validation::dry_run_nodes(output).is_empty());
+    if !recorded_as_dry_run && !stamped {
         return None;
     }
-    Some(talos_workflow_validation::dry_run_block(output))
+    Some(talos_workflow_validation::dry_run_block(
+        output_data.unwrap_or(&serde_json::Value::Null),
+    ))
 }
 
 /// The edges of a stored run whose conditions errored, for the
@@ -6068,10 +6079,20 @@ mod continued_failures_block_tests {
         let dry = json!({
             "send": { "sent": true, "__dry_run__": { "stubbed_calls": 1, "by_surface": { "http": 1 } } },
         });
-        let block = dry_run_block_of(Some(&dry)).expect("a dry run");
+        let block = dry_run_block_of(false, Some(&dry)).expect("a dry run");
         assert_eq!(block["nodes_with_stubbed_calls"], json!(["send"]));
-        assert!(dry_run_block_of(Some(&json!({ "send": { "sent": true } }))).is_none());
-        assert!(dry_run_block_of(None).is_none());
+        assert!(dry_run_block_of(false, Some(&json!({ "send": { "sent": true } }))).is_none());
+        assert!(dry_run_block_of(false, None).is_none());
+
+        // The row's own flag decides. A dry run that stored nothing (it
+        // failed, or is still running) and one whose nodes stubbed nothing
+        // are still dry runs, and say so.
+        let failed = dry_run_block_of(true, None).expect("recorded as a dry run");
+        assert_eq!(failed["requested"], true);
+        assert_eq!(failed["nodes"], json!([]));
+        let nothing_stubbed = dry_run_block_of(true, Some(&json!({ "send": { "sent": true } })))
+            .expect("recorded as a dry run");
+        assert_eq!(nothing_stubbed["nodes_with_stubbed_calls"], json!([]));
     }
 
     #[test]
@@ -6115,6 +6136,7 @@ pub async fn build_execution_trace_json(
     let completed_at = exec.completed_at;
     let error_message = exec.error_message.clone();
     let output_data = exec.output_data.clone();
+    let recorded_as_dry_run = exec.dry_run;
     let workflow_id = exec.workflow_id;
     let actor_id = exec.actor_id;
     let provenance = exec.provenance.clone();
@@ -6531,7 +6553,7 @@ pub async fn build_execution_trace_json(
     }
     // A dry run's node outputs carry what was answered by a stub. Present
     // only for a run that was one.
-    if let Some(dry_run) = dry_run_block_of(output_data.as_ref()) {
+    if let Some(dry_run) = dry_run_block_of(recorded_as_dry_run, output_data.as_ref()) {
         result["dry_run"] = dry_run;
     }
     readings.attach(&mut result);

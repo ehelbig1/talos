@@ -99,10 +99,10 @@ many links it left unminted (`action_links_not_minted`).
 
 To see a message with working links, run the workflow for real.
 
-One limit: the dry-run flag is not stored with the execution. A dry run that
-pauses and is resumed later (an approval, a wait node, a controller restart)
-continues as an ordinary run, and an `action_links` node reached after the
-resume mints.
+The execution row records that the run is a dry run. So a dry run that pauses
+and is resumed (an approval, a wait node), is recovered after a controller
+restart, or is retried is still a dry run when it reaches an `action_links`
+node, and a replay of a dry run is a dry run.
 
 ## What the target workflow sees
 

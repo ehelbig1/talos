@@ -62,6 +62,7 @@ async fn queued_execution_requires_running_promotion_before_completion() {
             None,                                                 // parent_execution_id
             None,                                                 // root_execution_id
             InitialExecutionStatus::Queued,
+            talos_workflow_repository::RunMode::Real,
         )
         .await
         .expect("create queued execution");
@@ -151,6 +152,7 @@ async fn get_execution_decodes_text_priority_column() {
         None,           // parent_execution_id
         None,           // root_execution_id
         InitialExecutionStatus::Queued,
+        talos_workflow_repository::RunMode::Real,
     )
     .await
     .expect("create execution with a text priority");

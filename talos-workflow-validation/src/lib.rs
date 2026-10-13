@@ -4806,8 +4806,9 @@ pub const DRY_RUN_SYSTEM_NODES: &str =
      lists; a module with requires_approval_for, and a confidence gate set to pause, still \
      creates a real approval request, notifies, and pauses the run; `__memory_write__`, \
      `__ops_alert__` and `__ml_distill__` in a node's output are acted on; judge verdicts are \
-     recorded. A dry run that pauses and is resumed later (an approval, a wait node, a controller \
-     restart) continues as an ORDINARY run: the flag is not stored with the execution.";
+     recorded. The execution row records that it is a dry run, so a dry run that pauses and is \
+     resumed (an approval, a wait node), is recovered after a controller restart, or is retried \
+     continues as a dry run, and a replay of one is a dry run too.";
 
 /// One `action_links` node's requests that a dry run did not mint.
 #[derive(Debug, Clone, PartialEq, Eq)]
