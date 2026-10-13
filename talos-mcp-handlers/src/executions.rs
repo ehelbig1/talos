@@ -122,7 +122,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_node_output",
-            "description": "Get the output of a specific node from an execution (instead of the entire workflow output).",
+            "description": "Get the output of a specific node from an execution (instead of the entire workflow output). Pass the node's graph id or its display label. A run that FAILED keeps the outputs of the nodes that completed before the failure when it was started by trigger_workflow, call_workflow, test_workflow, a replay or a bulk trigger, so those can be read back here; the node that failed, and anything after it, has none. A scheduled or webhook-started run that failed, and a retry, store none.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1896,15 +1896,19 @@ async fn handle_tail_worker_logs(
 ///
 /// Until 2026-10-12 it said "Execution has no output data yet" whatever the
 /// status. For a run that FAILED that is wrong twice: there is nothing still
-/// to come, and the thing the caller needs is the error. A failed run stores
-/// its error, not its nodes' outputs, so the reply says so and names where
-/// the error is. No error text is repeated here.
+/// to come, and the thing the caller needs is the error. A failed run that
+/// stored NO output either had no node complete, or ended on a path that
+/// does not keep completed outputs; the reply says so and names where the
+/// error is. No error text is repeated here.
 fn no_node_output_message(status: &str, execution_id: Uuid) -> String {
     let see = format!("get_execution_status(execution_id: \"{execution_id}\", detail: true)");
     match status {
         "failed" => format!(
-            "This execution FAILED, so it stored no node outputs: a failed run records its \
-             error instead. {see} shows the error and which node failed."
+            "This execution FAILED and stored no node outputs. A failed run keeps the outputs \
+             of the nodes that completed before the failure, so either none did, or the run \
+             ended on a path that does not keep them (a scheduled or webhook-started run, a \
+             retry, or a run from before they were kept). {see} shows the error and which \
+             node failed."
         ),
         "cancelled" => format!(
             "This execution was cancelled and stored no node outputs. {see} shows how far it got."
@@ -2053,14 +2057,26 @@ async fn handle_get_node_output(
     //    sees friendly names instead of synthetic UUIDs. Pre-fix this
     //    listed `03823045-...` and `6fb0ab0f-...` (sha256-derived)
     //    which forced the operator to cross-reference get_workflow_graph.
-    let label_map = build_node_label_map(
-        state
-            .execution_repo
-            .get_workflow_graph_for_user(exec.workflow_id, user_id)
-            .await
-            .ok()
-            .flatten(),
-    );
+    let graph_str = state
+        .execution_repo
+        .get_workflow_graph_for_user(exec.workflow_id, user_id)
+        .await
+        .ok()
+        .flatten();
+    // 3b. The other direction: the caller gave a graph node id, and the
+    //     stored output is keyed by that node's display LABEL (the shape the
+    //     result collector writes, for a completed run and a failed one).
+    //     One graph read serves this and the list below.
+    if let Some(node_output) =
+        graph_node_label(graph_str.as_deref(), node_id).and_then(|label| data.get(&label))
+    {
+        return respond_maybe_archived(
+            req_id,
+            archived_at,
+            serde_json::to_string_pretty(node_output).unwrap_or_default(),
+        );
+    }
+    let label_map = build_node_label_map(graph_str);
     let labeled_keys: Vec<String> = data
         .as_object()
         .map(|o| {
@@ -2075,17 +2091,156 @@ async fn handle_get_node_output(
                 .collect()
         })
         .unwrap_or_default();
+    let outputs_omitted = data
+        .get(talos_execution_result_collector::OUTPUTS_OMITTED_KEY)
+        .is_some();
     mcp_not_found(
         req_id,
         -32000,
-        &format!(
-            "Node '{}' not found in execution output. Resolved node labels available: [{}]. \
-             Note: this surface accepts the rf_id (the 'id' column from get_workflow_graph) \
-             OR the data.label set in the editor — both resolve to the same output entry.",
-            node_id,
-            labeled_keys.join(", "),
+        &node_not_in_output_message(
+            &node_id,
+            &labeled_keys,
+            &exec.status,
+            exec_id,
+            outputs_omitted,
         ),
     )
+}
+
+/// The display label (`data.label`) of the graph node whose id is `rf_id`,
+/// when it has one that differs from the id.
+fn graph_node_label(graph_str: Option<&str>, rf_id: &str) -> Option<String> {
+    let graph: serde_json::Value = serde_json::from_str(graph_str?).ok()?;
+    graph
+        .get("nodes")?
+        .as_array()?
+        .iter()
+        .find(|node| node.get("id").and_then(|v| v.as_str()) == Some(rf_id))?
+        .pointer("/data/label")?
+        .as_str()
+        .filter(|label| *label != rf_id)
+        .map(str::to_string)
+}
+
+/// What `get_node_output` says when the execution has stored output but none
+/// under the node asked for.
+///
+/// `stored_keys` are the stored output's keys, labels resolved. The engine's
+/// own entries (`__trigger_input__`, …) are not nodes and are not listed as
+/// nodes. For a run that FAILED the reply says what a failed run keeps, so
+/// "not found" is not read as "wrong name": the node may simply not have
+/// completed.
+fn node_not_in_output_message(
+    node_id: &str,
+    stored_keys: &[String],
+    status: &str,
+    execution_id: Uuid,
+    outputs_omitted: bool,
+) -> String {
+    let nodes: Vec<&str> = stored_keys
+        .iter()
+        .map(String::as_str)
+        .filter(|k| !k.starts_with("__"))
+        .collect();
+    let mut msg = format!(
+        "Node '{node_id}' not found in execution output. Nodes with a stored output: [{}]. \
+         Note: this surface accepts the rf_id (the 'id' column from get_workflow_graph) \
+         OR the data.label set in the editor — both resolve to the same output entry.",
+        nodes.join(", "),
+    );
+    if status == "failed" {
+        let see = format!("get_execution_status(execution_id: \"{execution_id}\", detail: true)");
+        msg.push_str(&if outputs_omitted {
+            format!(
+                " This execution FAILED, and the outputs of the nodes that had completed were \
+                 too large to store with it, so none can be read back. {see} shows which node \
+                 failed."
+            )
+        } else {
+            format!(
+                " This execution FAILED: only the nodes that completed before the failure have \
+                 a stored output. The node that failed has none, and neither does anything \
+                 after it. {see} shows which node failed."
+            )
+        });
+    }
+    msg
+}
+
+#[cfg(test)]
+mod node_not_in_output_message_tests {
+    use super::node_not_in_output_message;
+    use uuid::Uuid;
+
+    fn keys(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The observed reply listed `[__trigger_input__]` as the available
+    /// "labels" of a run that had completed five nodes, and said nothing
+    /// about the run having failed.
+    #[test]
+    fn a_failed_run_says_what_it_keeps_and_lists_only_nodes() {
+        let id = Uuid::from_u128(7);
+        let msg = node_not_in_output_message(
+            "send",
+            &keys(&["fetch", "compose", "__trigger_input__"]),
+            "failed",
+            id,
+            false,
+        );
+        assert!(
+            msg.contains("Nodes with a stored output: [fetch, compose]"),
+            "{msg}"
+        );
+        assert!(!msg.contains("__trigger_input__"), "{msg}");
+        assert!(
+            msg.contains("only the nodes that completed before the failure"),
+            "{msg}"
+        );
+        assert!(msg.contains(&id.to_string()), "{msg}");
+    }
+
+    #[test]
+    fn outputs_too_large_to_store_are_said_to_be_so() {
+        let msg = node_not_in_output_message(
+            "fetch",
+            &keys(&["__completed_outputs_omitted__", "__trigger_input__"]),
+            "failed",
+            Uuid::nil(),
+            true,
+        );
+        assert!(msg.contains("Nodes with a stored output: []"), "{msg}");
+        assert!(msg.contains("too large to store"), "{msg}");
+    }
+
+    #[test]
+    fn a_graph_node_id_finds_the_label_its_output_is_stored_under() {
+        use super::graph_node_label;
+        let graph = r#"{"nodes":[
+            {"id":"n1","data":{"label":"fetch"}},
+            {"id":"same","data":{"label":"same"}},
+            {"id":"bare"}
+        ]}"#;
+        assert_eq!(
+            graph_node_label(Some(graph), "n1").as_deref(),
+            Some("fetch")
+        );
+        // Nothing new to try when the label is the id, absent, or unknown.
+        assert_eq!(graph_node_label(Some(graph), "same"), None);
+        assert_eq!(graph_node_label(Some(graph), "bare"), None);
+        assert_eq!(graph_node_label(Some(graph), "nope"), None);
+        assert_eq!(graph_node_label(None, "n1"), None);
+        assert_eq!(graph_node_label(Some("not json"), "n1"), None);
+    }
+
+    #[test]
+    fn a_completed_run_gets_no_sentence_about_failure() {
+        let msg =
+            node_not_in_output_message("nope", &keys(&["a"]), "completed", Uuid::nil(), false);
+        assert!(!msg.contains("FAILED"), "{msg}");
+        assert!(msg.contains("[a]"), "{msg}");
+    }
 }
 
 /// Default per-value cap used by compare_executions and get_execution_diff

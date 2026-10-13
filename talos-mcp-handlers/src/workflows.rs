@@ -3734,8 +3734,9 @@ async fn handle_test_workflow_draft(
                 }
             }
             Err(e) => {
-                let fail_output = talos_dlp_provider::redact_json(
-                    &serde_json::json!({"__trigger_input__": input_payload_for_storage}),
+                let fail_output = talos_execution_result_collector::collect_failure_output(
+                    &engine,
+                    &input_payload_for_storage,
                 );
                 if let Err(e) = repo_for_draft
                     .mark_execution_failed(exec_id, &e.to_string(), Some(&fail_output))
@@ -6066,8 +6067,11 @@ async fn handle_call_workflow(
             }
             Err(e) => {
                 let err_str = e.to_string();
+                // What the nodes that completed had produced, so a failed
+                // run can be read back node by node. `None` when none did.
+                let partial = talos_execution_result_collector::collect_failed_run_outputs(&engine);
                 if let Err(e) = repo_for_spawn
-                    .mark_execution_failed(exec_id, &err_str, None)
+                    .mark_execution_failed(exec_id, &err_str, partial.as_ref())
                     .await
                 {
                     tracing::warn!(
@@ -7414,8 +7418,9 @@ async fn handle_bulk_trigger_workflow(
                     }
                 }
                 Err(e) => {
-                    let fail_output = talos_dlp_provider::redact_json(
-                        &serde_json::json!({"__trigger_input__": input_payload_for_storage}),
+                    let fail_output = talos_execution_result_collector::collect_failure_output(
+                        &engine,
+                        &input_payload_for_storage,
                     );
                     if let Err(e) = repo_for_bulk
                         .mark_execution_failed(exec_id, &e.to_string(), Some(&fail_output))
@@ -7927,8 +7932,9 @@ async fn handle_trigger_workflow_as_actors(
                     }
                 }
                 Err(e) => {
-                    let fail_output = talos_dlp_provider::redact_json(
-                        &serde_json::json!({"__trigger_input__": per_actor_input_for_storage}),
+                    let fail_output = talos_execution_result_collector::collect_failure_output(
+                        &engine,
+                        &per_actor_input_for_storage,
                     );
                     if let Err(e) = repo_clone
                         .mark_execution_failed(exec_id, &e.to_string(), Some(&fail_output))
@@ -8737,8 +8743,11 @@ async fn handle_test_workflow(
                 }
             }
             Err(e) => {
+                // What the nodes that completed had produced, so a failed
+                // run can be read back node by node. `None` when none did.
+                let partial = talos_execution_result_collector::collect_failed_run_outputs(&engine);
                 if let Err(e) = repo_for_spawn
-                    .mark_execution_failed(exec_id, &e.to_string(), None)
+                    .mark_execution_failed(exec_id, &e.to_string(), partial.as_ref())
                     .await
                 {
                     tracing::warn!(

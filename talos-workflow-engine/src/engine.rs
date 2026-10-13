@@ -23,6 +23,48 @@ const RUN_STOPPED: &str = "workflow run stopped: its execution is no longer runn
 struct VersionedResults {
     map: HashMap<uuid::Uuid, JsonValue>,
     version: u64,
+    /// Where the map goes if the run ends WITHOUT handing it to a
+    /// [`WorkflowContext`] — see [`PartialResultsSlot`]. `None` for a map
+    /// nobody will ask about (tests of the versioning alone).
+    on_abandon: Option<PartialResultsSlot>,
+}
+
+/// Where a run that does not complete leaves the outputs its nodes had
+/// committed.
+///
+/// The reactor's results live in a map local to the scheduler loop. Every way
+/// a run can end without completing drops that map: a node failure returns
+/// `Err` through one of many `?`, and a timeout or a cancellation drops the
+/// loop's whole future from outside, so no line after the loop runs. A caller
+/// then had the error text and nothing else, and the outputs of the nodes
+/// that DID complete — exactly what debugging the failure needs — were gone.
+///
+/// So the keeping is done by the map's own `Drop`
+/// ([`VersionedResults`]): whichever way the loop is left, the map lands
+/// here, and [`ParallelWorkflowEngine::take_partial_results`] hands it out
+/// once. A run that completes or pauses takes the map out first
+/// ([`VersionedResults::into_map`]) and leaves nothing.
+pub(crate) type PartialResultsSlot = Arc<std::sync::Mutex<Option<HashMap<uuid::Uuid, JsonValue>>>>;
+
+impl VersionedResults {
+    /// The map, for a run that completed or paused: it travels in the
+    /// returned [`WorkflowContext`], so nothing is left in the slot.
+    fn into_map(mut self) -> HashMap<uuid::Uuid, JsonValue> {
+        self.on_abandon = None;
+        std::mem::take(&mut self.map)
+    }
+}
+
+impl Drop for VersionedResults {
+    fn drop(&mut self) {
+        if let Some(slot) = self.on_abandon.take() {
+            // A poisoned lock means some other holder panicked; the run is
+            // over either way and the outputs are simply not kept.
+            if let Ok(mut held) = slot.lock() {
+                *held = Some(std::mem::take(&mut self.map));
+            }
+        }
+    }
 }
 
 impl std::ops::Deref for VersionedResults {
@@ -816,6 +858,11 @@ pub struct ParallelWorkflowEngine {
     /// (out-of-tree consumers, tests without a store) makes the node pass
     /// its input on with every placeholder fallen back, never fail.
     pub(crate) action_link_minter: Option<Arc<dyn talos_workflow_engine_core::ActionLinkMinter>>,
+    /// The committed node outputs of the last run on this engine that did
+    /// not complete. See [`PartialResultsSlot`]. Each engine has its own: a
+    /// sub-workflow's engine is built fresh, so a child's partial results
+    /// are never the parent's.
+    pub(crate) partial_results: PartialResultsSlot,
     /// Read-side port for the user's connected services — powers the
     /// `connections` system node. Same None-degrades contract as
     /// `ops_alerts_reader`.
@@ -1226,6 +1273,7 @@ impl ParallelWorkflowEngine {
             ops_alerts_reader: None,
             pending_approvals_reader: None,
             action_link_minter: None,
+            partial_results: PartialResultsSlot::default(),
             connections_reader: None,
             assistant_report_reader: None,
             operator_digest_reader: None,
@@ -1417,6 +1465,37 @@ impl ParallelWorkflowEngine {
         let sanitizer = self.output_sanitizer.as_ref()?;
         let configs: Vec<JsonValue> = self.node_configs.values().cloned().collect();
         Some(sanitizer.new_execution(&configs))
+    }
+
+    /// The outputs committed by the nodes of the LAST run on this engine
+    /// that did not complete: it failed, timed out or was cancelled. Keyed
+    /// by node id, like [`WorkflowContext::results`], and including the
+    /// synthetic trigger seed. `None` after a run that completed or paused
+    /// (its results are in the context it returned) and before any run.
+    ///
+    /// TAKES them: a second call is `None`, so an engine that outlives its
+    /// run does not go on holding the run's outputs.
+    ///
+    /// What is returned has passed the same two scrubs a completed run's
+    /// results pass before they leave the engine (the per-run pass built
+    /// from this engine's node configs, then the stateless patterns). A
+    /// caller that stores it is storing what it would have stored had the
+    /// run completed after these nodes.
+    ///
+    /// A node that FAILED has no entry, unless its failure was continued
+    /// past or routed to an error edge, in which case its entry is the
+    /// error envelope it committed.
+    pub fn take_partial_results(&self) -> Option<HashMap<Uuid, JsonValue>> {
+        let held = self.partial_results.lock().ok()?.take()?;
+        let exec_ctx = self.new_execution_sanitizer();
+        Some(
+            held.into_iter()
+                .map(|(k, v)| {
+                    let v = exec_ctx.as_ref().map(|c| c.redact_output(&v)).unwrap_or(v);
+                    (k, self.redact_json(&v))
+                })
+                .collect(),
+        )
     }
 
     /// RFC 0010 P3 (D3b): `&self` wrapper over
@@ -2071,9 +2150,15 @@ impl ParallelWorkflowEngine {
         // Seed results and pre-resolve the outgoing edges of already-
         // completed (seeded) nodes. The fresh-run case sees only the
         // synthetic trigger here.
+        // A run starts with nothing to take: an earlier run's leftovers on
+        // this engine are not this run's.
+        if let Ok(mut held) = self.partial_results.lock() {
+            *held = None;
+        }
         let mut results = VersionedResults {
             map: initial_results,
             version: 0,
+            on_abandon: Some(Arc::clone(&self.partial_results)),
         };
         let seeded: HashSet<Uuid> = results.keys().copied().collect();
         for &node_id in &seeded {
@@ -2589,7 +2674,7 @@ impl ParallelWorkflowEngine {
                     commit_paused_result!(node_id, waiting_output);
                     drain_in_flight_before_pause!();
                     return Ok(WorkflowContext {
-                        results: results.map,
+                        results: results.into_map(),
                         waiting: true,
                         ..Default::default()
                     });
@@ -2702,7 +2787,7 @@ impl ParallelWorkflowEngine {
                             commit_paused_result!(node_id, waiting_output);
                             drain_in_flight_before_pause!();
                             return Ok(WorkflowContext {
-                                results: results.map,
+                                results: results.into_map(),
                                 waiting: true,
                                 ..Default::default()
                             });
@@ -3259,7 +3344,7 @@ impl ParallelWorkflowEngine {
 
         // Two-pass scrub: value-based then regex DLP patterns.
         let results: HashMap<Uuid, JsonValue> = results
-            .map
+            .into_map()
             .into_iter()
             .map(|(k, v)| {
                 let v = exec_ctx.as_ref().map(|c| c.redact_output(&v)).unwrap_or(v);

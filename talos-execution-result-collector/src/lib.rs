@@ -91,24 +91,111 @@ pub fn collect_success_output(
     talos_dlp_provider::redact_json(&Value::Object(output))
 }
 
-/// Build the failure-path output JSON.
+/// The most the completed nodes' outputs of a FAILED run may weigh, as JSON,
+/// to be stored with it: half of the execution-payload ceiling
+/// ([`talos_dlp_provider::MAX_EXECUTION_PAYLOAD_BYTES`]).
 ///
-/// Pre-extraction every caller wrote the same shape inline:
+/// The ceiling replaces a whole over-size payload with a truncation marker,
+/// and a failed run's payload carries `__trigger_input__`, which a retry
+/// reads. So the outputs are bounded HERE, on their own, and when they do
+/// not fit they are left out and the trigger stays.
+pub const FAILED_RUN_OUTPUTS_MAX_BYTES: usize = talos_dlp_provider::MAX_EXECUTION_PAYLOAD_BYTES / 2;
+
+/// The key that says a failed run's completed outputs were NOT stored, and
+/// why. Present only then.
+pub const OUTPUTS_OMITTED_KEY: &str = "__completed_outputs_omitted__";
+
+/// What a run that did not complete stores: the outputs of the nodes that
+/// DID complete, keyed by label exactly as [`collect_success_output`] keys
+/// them, and the trigger input when the caller round-trips one.
 ///
-/// ```ignore
-/// let fail_output = talos_dlp_provider::redact_json(
-///     &serde_json::json!({"__trigger_input__": trigger_input_for_storage}),
-/// );
-/// ```
+/// Until 2026-10-13 a failed run stored its trigger input and nothing else,
+/// so the outputs that explain a failure could not be read back by any tool.
 ///
-/// Pulling this into a helper keeps the failure-path output shape
-/// in lockstep with the success-path keys (both project
-/// `__trigger_input__` at the top level so downstream consumers
-/// don't need to branch on success/failure to find the input).
-pub fn collect_failure_output(trigger_input_for_storage: &Value) -> Value {
-    talos_dlp_provider::redact_json(&serde_json::json!({
-        "__trigger_input__": trigger_input_for_storage
-    }))
+/// * `partial` is [`ParallelWorkflowEngine::take_partial_results`]: already
+///   scrubbed by the engine's two passes, and `None` when the run left
+///   nothing (it failed before any node completed).
+/// * The synthetic trigger seed and skipped nodes are dropped, as on the
+///   success path. A node whose failure was continued past keeps the error
+///   envelope it committed.
+/// * Outputs over [`FAILED_RUN_OUTPUTS_MAX_BYTES`] are left out as a whole
+///   and [`OUTPUTS_OMITTED_KEY`] says so. Never a subset: a reader could not
+///   tell a node that did not run from one that did not fit.
+/// * `__trigger_input__` stays at the top level whatever happens to the
+///   outputs: retry and replay read it from there.
+/// * The whole value is DLP-redacted, like every stored execution output.
+///
+/// Pure: no engine, so the projection is tested as it runs.
+pub fn failure_output(
+    node_labels: &std::collections::HashMap<uuid::Uuid, String>,
+    partial: Option<std::collections::HashMap<uuid::Uuid, Value>>,
+    trigger_input_for_storage: Option<&Value>,
+) -> Value {
+    let mut output = Map::new();
+    for (nid, result) in partial.unwrap_or_default() {
+        let key = node_labels
+            .get(&nid)
+            .cloned()
+            .unwrap_or_else(|| nid.to_string());
+        if key == "__trigger__" {
+            continue;
+        }
+        if result
+            .get("__skipped")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let clean = ParallelWorkflowEngine::unwrap_output(&result).clone();
+        output.insert(key, clean);
+    }
+    let bytes = serde_json::to_vec(&output).map_or(usize::MAX, |b| b.len());
+    if bytes > FAILED_RUN_OUTPUTS_MAX_BYTES {
+        let nodes = output.len();
+        output.clear();
+        output.insert(
+            OUTPUTS_OMITTED_KEY.to_string(),
+            serde_json::json!({
+                "reason": "too_large",
+                "nodes": nodes,
+                "bytes": bytes,
+                "limit_bytes": FAILED_RUN_OUTPUTS_MAX_BYTES,
+            }),
+        );
+    }
+    if let Some(trigger) = trigger_input_for_storage {
+        output.insert(TRIGGER_INPUT_KEY.to_string(), trigger.clone());
+    }
+    talos_dlp_provider::redact_json(&Value::Object(output))
+}
+
+/// The failure-path output of a run that round-trips its trigger input:
+/// [`failure_output`] over what the engine kept of the run.
+///
+/// TAKES the engine's partial results, so call it once per failed run.
+pub fn collect_failure_output(
+    engine: &ParallelWorkflowEngine,
+    trigger_input_for_storage: &Value,
+) -> Value {
+    failure_output(
+        engine.node_labels(),
+        engine.take_partial_results(),
+        Some(trigger_input_for_storage),
+    )
+}
+
+/// The same for a path that stores no trigger input with its runs
+/// (`call_workflow`, `test_workflow`): the completed nodes' outputs, or
+/// `None` when no node completed, so such a run still stores nothing.
+///
+/// TAKES the engine's partial results, so call it once per failed run.
+pub fn collect_failed_run_outputs(engine: &ParallelWorkflowEngine) -> Option<Value> {
+    let output = failure_output(engine.node_labels(), engine.take_partial_results(), None);
+    output
+        .as_object()
+        .is_some_and(|o| !o.is_empty())
+        .then_some(output)
 }
 
 /// Reserved key under which the original trigger input is round-tripped
@@ -376,24 +463,153 @@ mod tests {
         );
     }
 
+    fn labels(pairs: &[(Uuid, &str)]) -> HashMap<Uuid, String> {
+        pairs
+            .iter()
+            .map(|(id, l)| (*id, (*l).to_string()))
+            .collect()
+    }
+
     #[test]
     fn collect_failure_output_carries_trigger_input() {
-        let out = collect_failure_output(&serde_json::json!({"k": "v"}));
-        assert_eq!(out["__trigger_input__"], serde_json::json!({"k": "v"}));
+        let out = failure_output(&HashMap::new(), None, Some(&serde_json::json!({"k": "v"})));
+        // Nothing completed: the shape a failed run has always stored.
+        assert_eq!(out, serde_json::json!({ "__trigger_input__": {"k": "v"} }));
     }
 
     #[test]
     fn collect_failure_output_redacts_secrets_from_trigger_input() {
         // Trigger input may itself carry secrets (e.g. webhook
         // payload). Failure-path persistence must redact too.
-        let out =
-            collect_failure_output(&serde_json::json!({"token": "ghp_abcdefghijklmnopqrstuvwx12"}));
+        let out = failure_output(
+            &HashMap::new(),
+            None,
+            Some(&serde_json::json!({"token": "ghp_abcdefghijklmnopqrstuvwx12"})),
+        );
         let serialized = serde_json::to_string(&out).unwrap();
         assert!(
             !serialized.contains("ghp_abcdefghijklmnopqrstuvwx12"),
             "DLP did not redact the ghp_* token from failure output: {}",
             serialized
         );
+    }
+
+    /// The defect: a run that failed at its sixth node stored its trigger
+    /// and nothing else, so `get_node_output` for the five that completed
+    /// answered "not found … available: [__trigger_input__]".
+    #[test]
+    fn a_failed_run_stores_what_its_completed_nodes_produced_keyed_by_label() {
+        let (trigger, fetch, compose, skipped, continued, unlabelled) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let partial: HashMap<Uuid, Value> = [
+            (trigger, serde_json::json!({ "seed": true })),
+            (fetch, serde_json::json!({ "items": [1, 2] })),
+            (compose, serde_json::json!({ "subject": "s" })),
+            (skipped, serde_json::json!({ "__skipped": true, "reason": "no_active_input" })),
+            (
+                continued,
+                serde_json::json!({ "__error": true, "error_message": "boom", "__continued": true }),
+            ),
+            (unlabelled, serde_json::json!({ "x": 1 })),
+        ]
+        .into_iter()
+        .collect();
+        let out = failure_output(
+            &labels(&[
+                (trigger, "__trigger__"),
+                (fetch, "fetch"),
+                (compose, "compose"),
+                (skipped, "skipped"),
+                (continued, "optional"),
+            ]),
+            Some(partial),
+            Some(&serde_json::json!({ "ticket": "ABC-12" })),
+        );
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "fetch": { "items": [1, 2] },
+                "compose": { "subject": "s" },
+                "optional": { "__error": true, "error_message": "boom", "__continued": true },
+                unlabelled.to_string(): { "x": 1 },
+                "__trigger_input__": { "ticket": "ABC-12" },
+            })
+        );
+        // What retry and replay read is where it always was.
+        assert_eq!(
+            extract_trigger_input(Some(&out)),
+            serde_json::json!({ "ticket": "ABC-12" })
+        );
+    }
+
+    #[test]
+    fn a_completed_nodes_output_is_redacted_before_it_is_stored() {
+        let node = Uuid::new_v4();
+        let partial: HashMap<Uuid, Value> = [(
+            node,
+            serde_json::json!({ "echoed": "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwx12" }),
+        )]
+        .into_iter()
+        .collect();
+        let out = failure_output(&labels(&[(node, "fetch")]), Some(partial), None);
+        assert!(out.get("fetch").is_some(), "{out}");
+        assert!(
+            !out.to_string().contains("ghp_abcdefghijklmnopqrstuvwx12"),
+            "a completed node's output reached storage unredacted: {out}"
+        );
+    }
+
+    /// Too much to store: the outputs are left out as a whole and the
+    /// payload says so. The trigger a retry needs is still there, which the
+    /// payload ceiling alone would not have kept.
+    #[test]
+    fn outputs_too_large_to_store_are_left_out_whole_and_the_trigger_is_kept() {
+        let (small, big) = (Uuid::new_v4(), Uuid::new_v4());
+        let partial: HashMap<Uuid, Value> = [
+            (small, serde_json::json!({ "ok": true })),
+            (
+                big,
+                serde_json::json!({ "blob": "x".repeat(FAILED_RUN_OUTPUTS_MAX_BYTES) }),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let out = failure_output(
+            &labels(&[(small, "small"), (big, "big")]),
+            Some(partial),
+            Some(&serde_json::json!({ "ticket": "ABC-12" })),
+        );
+        assert!(
+            out.get("small").is_none() && out.get("big").is_none(),
+            "a subset was kept"
+        );
+        let omitted = &out[OUTPUTS_OMITTED_KEY];
+        assert_eq!(omitted["reason"], "too_large");
+        assert_eq!(omitted["nodes"], 2);
+        assert_eq!(omitted["limit_bytes"], FAILED_RUN_OUTPUTS_MAX_BYTES);
+        assert_eq!(
+            out["__trigger_input__"],
+            serde_json::json!({ "ticket": "ABC-12" })
+        );
+        assert!(
+            serde_json::to_vec(&out).unwrap().len()
+                < talos_dlp_provider::MAX_EXECUTION_PAYLOAD_BYTES,
+            "the stored payload would be truncated, taking the trigger with it"
+        );
+
+        // Just under the bound, everything is kept.
+        let partial: HashMap<Uuid, Value> =
+            [(small, serde_json::json!({ "blob": "x".repeat(1024) }))]
+                .into_iter()
+                .collect();
+        let out = failure_output(&labels(&[(small, "small")]), Some(partial), None);
+        assert!(out.get(OUTPUTS_OMITTED_KEY).is_none() && out.get("small").is_some());
     }
 
     #[test]
@@ -435,7 +651,7 @@ mod tests {
     #[test]
     fn extract_trigger_input_round_trips_through_collect() {
         let original = serde_json::json!({"foo": "bar"});
-        let failure_out = collect_failure_output(&original);
+        let failure_out = failure_output(&HashMap::new(), None, Some(&original));
         // Failure output is DLP-redacted; the trigger key still carries
         // the input value verbatim (no secrets here).
         let recovered = extract_trigger_input(Some(&failure_out));

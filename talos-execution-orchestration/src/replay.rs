@@ -374,8 +374,10 @@ impl ExecutionOrchestrationService {
                         raw_err_full.as_str()
                     };
                     let redacted_err = talos_dlp_provider::redact_str(raw_err);
-                    let fail_output =
-                        result_collector::collect_failure_output(&trigger_input_for_storage);
+                    let fail_output = result_collector::collect_failure_output(
+                        &engine,
+                        &trigger_input_for_storage,
+                    );
                     if let Err(db_err) = repo_for_task
                         .mark_execution_failed(new_execution_id, &redacted_err, Some(&fail_output))
                         .await

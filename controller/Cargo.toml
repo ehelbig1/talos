@@ -183,6 +183,9 @@ prometheus.workspace = true # opentelemetry-prometheus 0.32 supports prometheus 
 [dev-dependencies]
 # fuel_ledger_tests drives the real hourly-budget admission (2026-09-29).
 talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
+# failed_run_node_outputs_tests builds a failed run's stored output with the
+# production projection (2026-10-13).
+talos-execution-result-collector = { path = "../talos-execution-result-collector" }
 # create_workflow_from_spec_gate_tests: `CompiledInline::prebuilt_for_tests`
 # drives `persist_compiled` without a WASM toolchain (2026-09-25).
 talos-inline-compile-service = { path = "../talos-inline-compile-service", features = ["test-support"] }

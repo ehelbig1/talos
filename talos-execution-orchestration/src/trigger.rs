@@ -776,8 +776,12 @@ impl ExecutionOrchestrationService {
                     );
                 }
                 Err(e) => {
-                    let fail_output =
-                        result_collector::collect_failure_output(&trigger_input_for_storage);
+                    // Takes what the engine kept of the run: the outputs of
+                    // the nodes that completed before it failed.
+                    let fail_output = result_collector::collect_failure_output(
+                        &engine,
+                        &trigger_input_for_storage,
+                    );
                     // MCP-447: redact the engine error string ONCE at the
                     // source so all three downstream sinks (DB row,
                     // alert pipeline, user-configured webhook) see the
