@@ -105,3 +105,14 @@ and MAC hex), plus `a_results_dispatch_binding_cannot_be_stripped_or_moved`.
 - The worker's idempotency cache re-serves a cached result under a fresh
   signature (stacked PR); its fuel is the cached run's, counted when that
   re-serve is the answer accepted.
+
+## The worker PR (stacked)
+
+- Every result the worker signs for a request goes through
+  `sign_job_result_for` (`worker/src/main.rs`), which stamps the request's
+  attempt and execution (`bind_to_request`) and signs. The oversized-result
+  replacement copies the original's binding; the idempotency cache re-binds a
+  cached result to the request it now answers and re-signs it (fresh nonce).
+- Mutation: the stamp removed from `sign_job_result_for` →
+  `a_signed_result_answers_the_request_it_was_signed_for` FAIL / PASS restored.
+- Deploy only after a controller carrying the first PR is running.

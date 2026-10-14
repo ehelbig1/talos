@@ -873,6 +873,28 @@ mod signature_failure_payload_tests {
         );
     }
 
+    /// Security review 2026-10-14, B-9: a result the worker signs for a
+    /// request names that request's attempt and execution, and the binding is
+    /// under the signature — the dispatcher takes only an answer to the
+    /// attempt it is waiting on.
+    #[test]
+    fn a_signed_result_answers_the_request_it_was_signed_for() {
+        let mut req = unauthenticated_req();
+        req.dispatch_attempt = 2;
+        let ring = talos_workflow_engine_core::WorkerKeyRing::single(
+            talos_workflow_engine_core::WorkerSharedKey::new(vec![0x24; 32]),
+        );
+        let mut result = failed_result(req.job_id, &std::time::Instant::now(), "x");
+        sign_job_result_for(&mut result, &req, &ring).expect("sign");
+        assert_eq!(
+            result.answers(&req.dispatch_identity()),
+            talos_workflow_job_protocol::ResultAnswer::ThisDispatch
+        );
+        result
+            .verify_no_replay_dispatch(&ring, &[], 300, true)
+            .expect("the bound result verifies");
+    }
+
     fn unauthenticated_req() -> JobRequest {
         JobRequest {
             crypto_scheme: 0,
@@ -1221,6 +1243,19 @@ fn sign_job_result(
         Some(sk) => result.sign_ed25519_with_worker_id(sk, worker_identity()),
         None => result.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity()),
     }
+}
+
+/// Sign `result` as the answer to `req`: stamp the attempt and execution it
+/// answers (security review 2026-10-14, B-9), then [`sign_job_result`]. Every
+/// result the worker publishes for a request goes through here; the dispatcher
+/// takes only an answer to the attempt it is waiting on.
+fn sign_job_result_for(
+    result: &mut JobResult,
+    req: &talos_workflow_job_protocol::JobRequest,
+    shared_key: &talos_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    result.bind_to_request(req);
+    sign_job_result(result, shared_key)
 }
 
 /// Ed25519 verifying keys that may vouch for a CACHED result signed by
@@ -3251,12 +3286,21 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         !stale_failure
                                     });
-                                    if let Some(cached) = cached {
+                                    if let Some(mut cached) = cached {
                                         ::tracing::info!(
                                             job_id = %req.job_id,
                                             "idempotency: re-publishing cached result for re-seen \
                                              job_id (transport retry); skipping re-execution"
                                         );
+                                        // B-9 (2026-10-14): the cached result names the
+                                        // attempt that produced it; the dispatcher takes
+                                        // only an answer to the attempt it is waiting on.
+                                        // Re-bind to THIS request and re-sign (a fresh
+                                        // nonce). The output and its fuel are the cached
+                                        // run's: that run is what this answers with.
+                                        if let Err(e) = sign_job_result_for(&mut cached, &req, &key_clone) {
+                                            ::tracing::error!(job_id = %req.job_id, error = %e, "CRITICAL: Failed to re-sign cached job result");
+                                        }
                                         if let Err(e) = publish_result_with_retry(
                                             &nc_clone, &cached, 3, reply_to, &key_clone,
                                         )
@@ -3271,9 +3315,10 @@ async fn main() -> anyhow::Result<()> {
 
                                 let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone(), &nc_clone).await;
 
+                                // B-9 (2026-10-14): name the dispatch this answers.
                                 // L-11: bind worker identity for audit attribution.
                                 // RFC 0010 P2: Ed25519 when configured, else HMAC.
-                                if let Err(e) = sign_job_result(&mut result, &key_clone) {
+                                if let Err(e) = sign_job_result_for(&mut result, &req, &key_clone) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign job result");
                                 }
 
