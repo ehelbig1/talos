@@ -46,7 +46,19 @@ async fn run(
     sql: &str,
     role: GuestRoleSetting<'_>,
 ) -> Result<DatabaseResult, DatabaseRpcError> {
-    execute_guest_query_within(pool, sql, &[], true, role, BUDGET).await
+    let actor = crate::test_actor(pool).await;
+    run_as(pool, actor, sql, role).await
+}
+
+/// [`run`] for an actor seeded elsewhere: a pool whose user cannot write
+/// `users` (the outsider below) cannot seed its own.
+async fn run_as(
+    pool: &PgPool,
+    actor: uuid::Uuid,
+    sql: &str,
+    role: GuestRoleSetting<'_>,
+) -> Result<DatabaseResult, DatabaseRpcError> {
+    execute_guest_query_within(pool, sql, &[], true, role, actor, BUDGET).await
 }
 
 fn refused(result: Result<DatabaseResult, DatabaseRpcError>) -> String {
@@ -79,8 +91,10 @@ async fn guest_sql_runs_as_talos_guest_and_ungranted_tables_are_refused() {
     )
     .await
     {
+        // The path keeps only the SQLSTATE (2026-10-14): 42501 is
+        // insufficient_privilege.
         Err(DatabaseRpcError::QueryError(msg)) => {
-            assert!(msg.contains("permission denied"), "{msg}")
+            assert_eq!(msg, "sqlstate=42501", "{msg}")
         }
         other => panic!("an ungranted table must be refused, got {other:?}"),
     }
@@ -158,9 +172,20 @@ async fn a_pool_user_outside_the_guest_role_is_refused() {
         .connect_with(options)
         .await
         .expect("connect as the login");
+    // The actor is seeded by the admin, and the login may read `actors` (the
+    // owner lookup runs before the role switch), so the refusal below is the
+    // role's, not the lookup's.
+    let actor = crate::test_actor(&admin).await;
+    admin
+        .execute(sqlx::AssertSqlSafe(format!(
+            "GRANT SELECT ON actors TO {login}"
+        )))
+        .await
+        .expect("grant actors read");
     let why = refused(
-        run(
+        run_as(
             &outsider,
+            actor,
             "SELECT 1 AS n",
             GuestRoleSetting::Role("talos_guest"),
         )
@@ -169,7 +194,9 @@ async fn a_pool_user_outside_the_guest_role_is_refused() {
     assert!(why.contains("permission denied"), "{why}");
     outsider.close().await;
     let _ = admin
-        .execute(sqlx::AssertSqlSafe(format!("DROP ROLE {login}")))
+        .execute(sqlx::AssertSqlSafe(format!(
+            "REVOKE SELECT ON actors FROM {login}; DROP ROLE {login}"
+        )))
         .await;
 }
 

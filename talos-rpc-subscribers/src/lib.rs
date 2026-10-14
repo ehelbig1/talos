@@ -27,6 +27,8 @@
 mod admission;
 mod build_skew;
 #[cfg(test)]
+mod data_plane_tenancy_db_tests;
+#[cfg(test)]
 mod guest_role_db_tests;
 mod guest_session;
 mod kernel;
@@ -623,9 +625,12 @@ pub(crate) fn db_sandbox_posture_decision(
     if role_valid {
         return Ok(true);
     }
-    if ack_unscoped {
-        return Ok(false);
-    }
+    // Since 2026-10-14 (security review B-4/D-2) the acknowledgement no longer
+    // admits an unfenced production boot: guest SQL with no fence is refused
+    // per query in production (`guest_fence`), so booting would only defer
+    // the refusal. `ack_unscoped` is kept in the signature so the refusal can
+    // say the old escape is gone.
+    let _ = ack_unscoped;
     let why = match guest_role {
         None => "TALOS_RPC_GUEST_ROLE is unset",
         Some(_) => "TALOS_RPC_GUEST_ROLE is set to an invalid Postgres identifier",
@@ -636,9 +641,10 @@ pub(crate) fn db_sandbox_posture_decision(
          read/write across tenants on the primary pool. Fix by one of: (a) set \
          TALOS_RPC_GUEST_ROLE to a minimally-privileged role (apply migration \
          20260522120000_talos_guest_role.sql and grant it only the tables the \
-         sandbox may touch); (b) to run the sandbox unconfined anyway (e.g. a \
-         single-tenant homelab), set TALOS_ALLOW_UNSCOPED_DB_SANDBOX=1 to \
-         acknowledge that guest SQL then runs with full app-user privileges."
+         sandbox may touch); (b) for a single-tenant homelab that wants the \
+         sandbox unconfined, run it outside production (RUST_ENV unset). \
+         TALOS_ALLOW_UNSCOPED_DB_SANDBOX no longer admits an unfenced \
+         production boot (2026-10-14)."
     ))
 }
 
@@ -702,6 +708,7 @@ async fn execute_guest_query(
     params: &[String],
     is_fetch: bool,
     guest_role: GuestRoleSetting<'_>,
+    actor_id: uuid::Uuid,
 ) -> Result<talos_memory::database_rpc::DatabaseResult, talos_memory::database_rpc::DatabaseRpcError>
 {
     execute_guest_query_within(
@@ -710,6 +717,7 @@ async fn execute_guest_query(
         params,
         is_fetch,
         guest_role,
+        actor_id,
         std::time::Duration::from_secs(talos_memory::database_rpc::QUERY_TIMEOUT_SECS),
     )
     .await
@@ -726,6 +734,7 @@ async fn execute_guest_query_within(
     params: &[String],
     is_fetch: bool,
     guest_role: GuestRoleSetting<'_>,
+    actor_id: uuid::Uuid,
     budget: std::time::Duration,
 ) -> Result<talos_memory::database_rpc::DatabaseResult, talos_memory::database_rpc::DatabaseRpcError>
 {
@@ -733,17 +742,7 @@ async fn execute_guest_query_within(
 
     // A fence that is configured but unusable refuses before a connection is
     // taken; it is never read as "no fence".
-    let guest_role = match guest_role {
-        GuestRoleSetting::Unset => None,
-        GuestRoleSetting::Role(role) => Some(role),
-        GuestRoleSetting::Invalid => {
-            return Err(DatabaseRpcError::ConnectionFailed(
-                "TALOS_RPC_GUEST_ROLE is not a valid role name; guest SQL is refused until it \
-                 is fixed or unset"
-                    .to_string(),
-            ))
-        }
-    };
+    let guest_role = guest_fence(guest_role, talos_config::is_production())?;
     let deadline = tokio::time::Instant::now() + budget;
     let conn = match tokio::time::timeout_at(deadline, pool.acquire()).await {
         Ok(Ok(conn)) => conn,
@@ -761,7 +760,7 @@ async fn execute_guest_query_within(
     };
     let result = match tokio::time::timeout_at(
         deadline,
-        run_guest_transaction(tx_conn, sql, params, is_fetch, guest_role),
+        run_guest_transaction(tx_conn, sql, params, is_fetch, guest_role, actor_id),
     )
     .await
     {
@@ -807,6 +806,7 @@ async fn run_guest_transaction(
     params: &[String],
     is_fetch: bool,
     guest_role: Option<&str>,
+    actor_id: uuid::Uuid,
 ) -> Result<talos_memory::database_rpc::DatabaseResult, talos_memory::database_rpc::DatabaseRpcError>
 {
     use sqlx::{Connection, Row};
@@ -824,14 +824,41 @@ async fn run_guest_transaction(
             .await
             .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
 
-        // SET LOCAL ROLE — reverted automatically at COMMIT/ROLLBACK — and
-        // read back what the role is, in the same round trip. `guest_role`
-        // is validated by `is_valid_pg_role_identifier` where it is read
-        // (`GuestRoleSetting::parse`), so this format!-into-SQL is safe.
+        // The tenant the guest SQL runs for: the owner of the SIGNED actor,
+        // read before the role switch (the guest role has no grant on
+        // `actors`). No such actor refuses. Until 2026-10-14 guest SQL
+        // carried no tenant at all, so every RLS policy's
+        // permit-when-unset arm admitted every tenant's rows to any table
+        // granted to the guest role (security review B-4/D-2).
+        let owner: Option<Option<uuid::Uuid>> =
+            sqlx::query_scalar("SELECT user_id FROM actors WHERE id = $1")
+                .bind(actor_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
+        let Some(owner) = owner.flatten() else {
+            return Err(DatabaseRpcError::Unauthorized);
+        };
+        // The one statement that sets the tenant GUCs (`TenantReadScope`),
+        // with no org list: the owner's personal rows.
+        let tenant_sql = talos_tenancy::TenantReadScope::new(owner, Vec::new()).set_local_sql();
+
+        // SET LOCAL ROLE — reverted automatically at COMMIT/ROLLBACK — the
+        // tenant GUCs, and a read-back of what the role is, in one round
+        // trip. `guest_role` is validated by `is_valid_pg_role_identifier`
+        // where it is read (`GuestRoleSetting::parse`), so this
+        // format!-into-SQL is safe.
+        if guest_role.is_none() {
+            // sql-safe: SET LOCALs whose only values are a Uuid (TenantReadScope::set_local_sql); SET LOCAL takes no bind parameters
+            sqlx::raw_sql(sqlx::AssertSqlSafe(tenant_sql.clone()))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
+        }
         if let Some(role) = guest_role {
-            // sql-safe: the role is operator configuration, checked by is_valid_pg_role_identifier where it is read (GuestRoleSetting::parse) and quoted; SET LOCAL ROLE takes no bind parameters
+            // sql-safe: the role is operator configuration, checked by is_valid_pg_role_identifier where it is read (GuestRoleSetting::parse) and quoted; the tenant SET LOCALs carry only a Uuid (TenantReadScope::set_local_sql); SET LOCAL takes no bind parameters
             let entered = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                "SET LOCAL ROLE \"{role}\"; \
+                "SET LOCAL ROLE \"{role}\"; {tenant_sql}; \
                  SELECT rolsuper, rolbypassrls FROM pg_catalog.pg_roles \
                  WHERE rolname = current_user"
             )))
@@ -880,10 +907,10 @@ async fn run_guest_transaction(
             let row = q
                 .fetch_one(&mut *tx)
                 .await
-                .map_err(|e| DatabaseRpcError::QueryError(e.to_string()))?;
+                .map_err(|e| DatabaseRpcError::QueryError(guest_failure_class(&e)))?;
             let json_val: serde_json::Value = row
                 .try_get("json_res")
-                .map_err(|e| DatabaseRpcError::QueryError(format!("json_res decode: {e}")))?;
+                .map_err(|_| DatabaseRpcError::QueryError("decode".to_string()))?;
             if let Some(arr) = json_val.as_array() {
                 if arr.len() > MAX_RESULT_ROWS {
                     return Err(DatabaseRpcError::ResultTooLarge(format!(
@@ -922,7 +949,7 @@ async fn run_guest_transaction(
             let r = q
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| DatabaseRpcError::QueryError(e.to_string()))?;
+                .map_err(|e| DatabaseRpcError::QueryError(guest_failure_class(&e)))?;
             tx.commit()
                 .await
                 .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
@@ -2684,8 +2711,10 @@ pub fn spawn_database_rpc_subscriber(
                 &req.params,
                 req.is_fetch,
                 guest_role_setting(),
+                req.actor_id,
             )
             .await;
+            let result = guest_reply(result, req.actor_id);
 
             let outcome = match &result {
                 Ok(_) => RpcOutcome::Ok,
@@ -2711,6 +2740,218 @@ pub fn spawn_database_rpc_subscriber(
             );
         }
     });
+}
+
+/// The fence guest SQL runs under, or the refusal. Outside production an
+/// unset role runs as the app user (a dev stack's choice), unchanged. In
+/// PRODUCTION no fence is never acceptable, with or without
+/// `TALOS_ALLOW_UNSCOPED_DB_SANDBOX` (security review 2026-10-14, B-4/D-2):
+/// this per-query refusal backs the boot gate. A set-but-invalid role always
+/// refuses — it is never read as "no fence".
+pub(crate) fn guest_fence(
+    setting: GuestRoleSetting<'_>,
+    is_production: bool,
+) -> Result<Option<&str>, talos_memory::database_rpc::DatabaseRpcError> {
+    use talos_memory::database_rpc::DatabaseRpcError;
+    match setting {
+        GuestRoleSetting::Unset if is_production => Err(DatabaseRpcError::ConnectionFailed(
+            "TALOS_RPC_GUEST_ROLE is unset in production; guest SQL is refused".to_string(),
+        )),
+        GuestRoleSetting::Unset => Ok(None),
+        GuestRoleSetting::Role(role) => Ok(Some(role)),
+        GuestRoleSetting::Invalid => Err(DatabaseRpcError::ConnectionFailed(
+            "TALOS_RPC_GUEST_ROLE is not a valid role name; guest SQL is refused until it \
+             is fixed or unset"
+                .to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod guest_fence_tests {
+    use super::*;
+
+    #[test]
+    fn production_refuses_guest_sql_with_no_fence() {
+        assert!(guest_fence(GuestRoleSetting::Unset, true).is_err());
+        assert_eq!(guest_fence(GuestRoleSetting::Unset, false).unwrap(), None);
+        assert_eq!(
+            guest_fence(GuestRoleSetting::Role("talos_guest"), true).unwrap(),
+            Some("talos_guest")
+        );
+        assert!(guest_fence(GuestRoleSetting::Invalid, false).is_err());
+    }
+}
+
+/// A user and an actor of theirs, for tests of the guest-SQL path: the path
+/// resolves the signed actor's owner and refuses an actor that does not
+/// exist.
+#[cfg(test)]
+pub(crate) async fn test_actor(pool: &sqlx::PgPool) -> uuid::Uuid {
+    let user = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, is_active) VALUES ($1, $2, 'x', true)",
+    )
+    .bind(user)
+    .bind(format!("{user}@guest-sql.test"))
+    .execute(pool)
+    .await
+    .expect("seed user");
+    let actor = uuid::Uuid::new_v4();
+    // allow-unscoped-org-write: a test fixture seeding a personal actor on the migrated test database
+    sqlx::query("INSERT INTO actors (id, user_id, name, status) VALUES ($1, $2, $3, 'active')")
+        .bind(actor)
+        .bind(user)
+        .bind(format!("guest-sql-{actor}"))
+        .execute(pool)
+        .await
+        .expect("seed actor");
+    actor
+}
+
+/// What the guest is told about its query. A database failure becomes
+/// [`GUEST_QUERY_FAILED`], never Postgres' own text, which names relations,
+/// columns, constraints and roles and can quote a constraint's offending
+/// value; the SQLSTATE class is logged here (never the text — guest SQL can
+/// carry PII in literals). Security review 2026-10-14, B-4.
+pub(crate) fn guest_reply(
+    result: Result<
+        talos_memory::database_rpc::DatabaseResult,
+        talos_memory::database_rpc::DatabaseRpcError,
+    >,
+    actor_id: uuid::Uuid,
+) -> Result<talos_memory::database_rpc::DatabaseResult, talos_memory::database_rpc::DatabaseRpcError>
+{
+    use talos_memory::database_rpc::DatabaseRpcError;
+    result.map_err(|e| match e {
+        DatabaseRpcError::QueryError(class) => {
+            tracing::info!(
+                target: "talos_rpc",
+                event_kind = "database_rpc_guest_query_failed",
+                %actor_id,
+                %class,
+                "database RPC: guest query failed at the database"
+            );
+            DatabaseRpcError::QueryError(GUEST_QUERY_FAILED.to_string())
+        }
+        other => other,
+    })
+}
+
+/// The one sentence a guest is given when its SQL fails at the database
+/// (security review 2026-10-14, B-4). Postgres' own text is a schema oracle
+/// and can quote values.
+pub const GUEST_QUERY_FAILED: &str = "query failed";
+
+/// What is recorded of a guest query's failure: the SQLSTATE, or a fixed
+/// kind — never the message, which can carry the guest's literals.
+fn guest_failure_class(e: &sqlx::Error) -> String {
+    match e {
+        sqlx::Error::Database(db) => {
+            format!("sqlstate={}", db.code().as_deref().unwrap_or("unknown"))
+        }
+        sqlx::Error::RowNotFound => "row_not_found".to_string(),
+        sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_) => "decode".to_string(),
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => "pool".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+/// What one durable state write did (security review 2026-10-14, B-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateWriteVerdict {
+    /// Written (or deleted).
+    Written,
+    /// The execution does not exist or is not live
+    /// ([`talos_memory::state_rpc::STATE_WRITABLE_STATUSES`]): nothing written.
+    NotLive,
+    /// The execution holds its quota of keys or bytes: nothing written.
+    OverQuota,
+}
+
+/// THE durable state write: ONE statement that writes only for a live
+/// execution and within that execution's key and byte quota
+/// (`MAX_STATE_KEYS_PER_EXECUTION`, `MAX_STATE_BYTES_PER_EXECUTION`). Until
+/// 2026-10-14 any signed write landed for any `execution_id`, existing or
+/// not, with no bound on how many keys one execution held. Overwriting a key
+/// the execution already holds counts that key's NEW size against the bytes
+/// quota and does not count it as a new key. Two concurrent writes may both
+/// pass the quota read; the overshoot is bounded by the subscriber's
+/// in-flight cap. Outside the write ceiling by decision (2026-09-06).
+pub async fn execution_state_write(
+    pool: &sqlx::PgPool,
+    execution_id: uuid::Uuid,
+    key: &str,
+    value: &str,
+) -> sqlx::Result<StateWriteVerdict> {
+    use talos_memory::state_rpc::{
+        MAX_STATE_BYTES_PER_EXECUTION, MAX_STATE_KEYS_PER_EXECUTION, STATE_WRITABLE_STATUSES,
+    };
+    let (live, within, written): (bool, bool, bool) = sqlx::query_as(
+        "WITH live AS ( \
+             SELECT EXISTS (SELECT 1 FROM workflow_executions \
+                            WHERE id = $1 AND status = ANY($6)) AS ok), \
+         held AS ( \
+             SELECT count(*) FILTER (WHERE key <> $2) AS other_keys, \
+                    COALESCE(SUM(octet_length(value)) FILTER (WHERE key <> $2), 0) AS other_bytes \
+             FROM execution_state WHERE execution_id = $1), \
+         admitted AS ( \
+             SELECT live.ok AS live, \
+                    (held.other_keys < $4 \
+                     AND held.other_bytes + octet_length($3) <= $5) AS within \
+             FROM live, held), \
+         ins AS ( \
+             INSERT INTO execution_state (execution_id, key, value, version, updated_at) \
+             SELECT $1, $2, $3, 1, NOW() FROM admitted WHERE live AND within \
+             ON CONFLICT (execution_id, key) DO UPDATE SET \
+               value = EXCLUDED.value, \
+               version = execution_state.version + 1, \
+               updated_at = NOW() \
+             RETURNING 1) \
+         SELECT admitted.live, admitted.within, EXISTS (SELECT 1 FROM ins) FROM admitted",
+    )
+    .bind(execution_id)
+    .bind(key)
+    .bind(value)
+    .bind(MAX_STATE_KEYS_PER_EXECUTION)
+    .bind(MAX_STATE_BYTES_PER_EXECUTION)
+    .bind(STATE_WRITABLE_STATUSES)
+    .fetch_one(pool)
+    .await?;
+    Ok(match (live, within, written) {
+        (false, _, _) => StateWriteVerdict::NotLive,
+        (true, false, _) => StateWriteVerdict::OverQuota,
+        (true, true, _) => StateWriteVerdict::Written,
+    })
+}
+
+/// The durable state DELETE, for a live execution only (the same rule as the
+/// write: a signed delete names an execution, and one that is not live has
+/// nothing a guest may change).
+pub async fn execution_state_delete(
+    pool: &sqlx::PgPool,
+    execution_id: uuid::Uuid,
+    key: &str,
+) -> sqlx::Result<StateWriteVerdict> {
+    let live: bool = sqlx::query_scalar(
+        "WITH live AS ( \
+             SELECT EXISTS (SELECT 1 FROM workflow_executions \
+                            WHERE id = $1 AND status = ANY($3)) AS ok), \
+         del AS ( \
+             DELETE FROM execution_state \
+             WHERE execution_id = $1 AND key = $2 AND (SELECT ok FROM live)) \
+         SELECT ok FROM live",
+    )
+    .bind(execution_id)
+    .bind(key)
+    .bind(talos_memory::state_rpc::STATE_WRITABLE_STATUSES)
+    .fetch_one(pool)
+    .await?;
+    Ok(if live {
+        StateWriteVerdict::Written
+    } else {
+        StateWriteVerdict::NotLive
+    })
 }
 
 pub fn spawn_state_write_subscriber(
@@ -2906,53 +3147,40 @@ pub fn spawn_state_write_subscriber(
             // "timeout" so operators can alert on it, same as the
             // MCP-733 query_error visibility rule.
             let db_work = async {
-                if req.is_delete {
-                    match sqlx::query(
-                        "DELETE FROM execution_state WHERE execution_id = $1 AND key = $2",
-                    )
-                    .bind(req.execution_id)
-                    .bind(&req.key)
-                    .execute(&pool)
-                    .await
-                    {
-                        Ok(_) => RpcOutcome::Ok,
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "talos_rpc",
-                                actor_id = %req.actor_id,
-                                execution_id = %req.execution_id,
-                                error = %e,
-                                "state-write DELETE failed — guest sees no error (fire-and-forget)"
-                            );
-                            RpcOutcome::QueryError
-                        }
-                    }
+                let written = if req.is_delete {
+                    execution_state_delete(&pool, req.execution_id, &req.key).await
                 } else {
-                    match sqlx::query(
-                        "INSERT INTO execution_state (execution_id, key, value, version, updated_at) \
-                         VALUES ($1, $2, $3, 1, NOW()) \
-                         ON CONFLICT (execution_id, key) DO UPDATE SET \
-                           value = EXCLUDED.value, \
-                           version = execution_state.version + 1, \
-                           updated_at = NOW()",
-                    )
-                    .bind(req.execution_id)
-                    .bind(&req.key)
-                    .bind(&req.value)
-                    .execute(&pool)
-                    .await
-                    {
-                        Ok(_) => RpcOutcome::Ok,
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "talos_rpc",
-                                actor_id = %req.actor_id,
-                                execution_id = %req.execution_id,
-                                error = %e,
-                                "state-write UPSERT failed — guest sees no error (fire-and-forget)"
-                            );
-                            RpcOutcome::QueryError
-                        }
+                    execution_state_write(&pool, req.execution_id, &req.key, &req.value).await
+                };
+                match written {
+                    Ok(StateWriteVerdict::Written) => RpcOutcome::Ok,
+                    Ok(StateWriteVerdict::NotLive) => {
+                        tracing::warn!(
+                            target: "talos_rpc",
+                            actor_id = %req.actor_id,
+                            execution_id = %req.execution_id,
+                            "state-write refused: the execution does not exist or has ended"
+                        );
+                        RpcOutcome::NotFound
+                    }
+                    Ok(StateWriteVerdict::OverQuota) => {
+                        tracing::warn!(
+                            target: "talos_rpc",
+                            actor_id = %req.actor_id,
+                            execution_id = %req.execution_id,
+                            "state-write refused: the execution holds its quota of durable state"
+                        );
+                        RpcOutcome::StorageFull
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "talos_rpc",
+                            actor_id = %req.actor_id,
+                            execution_id = %req.execution_id,
+                            error = %e,
+                            "state-write failed — guest sees no error (fire-and-forget)"
+                        );
+                        RpcOutcome::QueryError
                     }
                 }
             };
@@ -3783,8 +4011,9 @@ mod controller_function_deny_tests {
         // Invalid role, no ack → refuse boot (a typo must not silently disable
         // the fence in production).
         assert!(db_sandbox_posture_decision(true, Some("talos guest"), false).is_err());
-        // Unset role but explicit ack → permitted-but-unscoped (caller logs).
-        assert_eq!(db_sandbox_posture_decision(true, None, true), Ok(false));
+        // Unset role with the old ack → still refused (2026-10-14): guest SQL
+        // with no fence is refused per query in production.
+        assert!(db_sandbox_posture_decision(true, None, true).is_err());
         // A valid role wins even if the ack is also set (stay fenced).
         assert_eq!(
             db_sandbox_posture_decision(true, Some("talos_guest"), true),

@@ -257,6 +257,12 @@ const CHECK_WEIGHTS: &[(&str, u32, CheckKind)] = &[
     // (`talos_audit_chain_unverifiable_total`) and its alert are where a
     // machine acts on it; this check is where a human does.
     ("audit_chain_verification", 0, CheckKind::Control),
+    // Zero weight for reason 2 of `audit_chain_verification`'s argument above
+    // (the grade bands are absolute against a 100-point total, and a new
+    // weighted check would re-grade every deployment). The finding is carried
+    // by `Status::Fail` in production, which lands in `status_counts.fail` and
+    // `recommendation_for` by name. Security review 2026-10-14, B-2.
+    ("fleet_identity", 0, CheckKind::Control),
 ];
 
 /// One rendered check.
@@ -350,6 +356,72 @@ pub fn check_production_mode(is_prod: bool) -> Check {
         },
         verification: Verification::Parsed,
         points: if is_prod { 10 } else { 0 },
+        parts: None,
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// fleet_identity — does this controller still accept the fleet-shared key?
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Render the `fleet_identity` check: whether the two surfaces THIS process
+/// verifies (job results, signed RPC) still accept the fleet-shared
+/// `WORKER_SHARED_KEY` (security review 2026-10-14, B-2). `result_required`
+/// and `rpc_required` are the parsed `TALOS_RESULT_REQUIRE_ED25519` /
+/// `TALOS_RPC_REQUIRE_ED25519`; `acknowledged` is the parsed
+/// `TALOS_ALLOW_LEGACY_FLEET_HMAC` (an `Err` is an unreadable value). The
+/// third surface, dispatch, is the WORKER's switch and is not readable here;
+/// the detail says so rather than guessing.
+#[must_use]
+pub fn check_fleet_identity(
+    is_prod: bool,
+    result_required: bool,
+    rpc_required: bool,
+    acknowledged: &Result<Vec<talos_config::fleet_identity::LegacyFleetSurface>, String>,
+) -> Check {
+    use talos_config::fleet_identity::LegacyFleetSurface as S;
+    let surface = |name: &str, required: bool| {
+        if required {
+            format!("{name}: Ed25519 required")
+        } else {
+            format!("{name}: accepts WORKER_SHARED_KEY")
+        }
+    };
+    let mut detail = format!(
+        "{}; {}; dispatch: the worker's TALOS_DISPATCH_REQUIRE_ED25519 (not readable from the \
+         controller)",
+        surface("result", result_required),
+        surface("rpc", rpc_required)
+    );
+    let legacy: Vec<S> = [(S::Result, result_required), (S::Rpc, rpc_required)]
+        .iter()
+        .filter(|(_, required)| !required)
+        .map(|(s, _)| *s)
+        .collect();
+    let status = match acknowledged {
+        Err(e) => {
+            detail.push_str(&format!("; {e}"));
+            Status::Fail
+        }
+        Ok(_) if legacy.is_empty() => Status::Pass,
+        Ok(_) if !is_prod => Status::Info,
+        Ok(ack) if legacy.iter().all(|s| ack.contains(s)) => {
+            detail.push_str(
+                "; the legacy posture is acknowledged via TALOS_ALLOW_LEGACY_FLEET_HMAC — one \
+                 leaked key signs for any tenant on these surfaces",
+            );
+            Status::Warn
+        }
+        // Unreachable on a booted production controller (the boot gate
+        // refuses it); reported for a process that skipped the gate.
+        Ok(_) => Status::Fail,
+    };
+    Check {
+        name: "fleet_identity",
+        status,
+        detail,
+        verification: Verification::Parsed,
+        points: 0,
         parts: None,
     }
 }
@@ -2132,6 +2204,16 @@ pub async fn run_security_audit(
 
     let checks = vec![
         check_production_mode(is_prod),
+        check_fleet_identity(
+            is_prod,
+            talos_config::bool_env_or_default("TALOS_RESULT_REQUIRE_ED25519", false),
+            talos_config::bool_env_or_default("TALOS_RPC_REQUIRE_ED25519", false),
+            &talos_config::fleet_identity::parse_acknowledged(
+                std::env::var("TALOS_ALLOW_LEGACY_FLEET_HMAC")
+                    .ok()
+                    .as_deref(),
+            ),
+        ),
         check_jwt_algorithm(
             talos_auth::jwt_selftest(),
             &talos_config::get_env("TALOS_DEPLOYMENT_TOPOLOGY", "single_pod"),

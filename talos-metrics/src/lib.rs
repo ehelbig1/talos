@@ -4839,7 +4839,7 @@ mod tests {
             );
             declared.insert(line);
         }
-        assert_eq!(declared.len(), 64, "the table changed; re-derive it");
+        assert_eq!(declared.len(), 66, "the table changed; re-derive it");
 
         // (b) nothing outside the table. A seeded combination nothing can
         // increment reads as a wired signal that does not exist (check 58).
@@ -4849,8 +4849,8 @@ mod tests {
             .collect();
         assert_eq!(
             exported.len(),
-            64,
-            "expected exactly the 64 reachable pairs, got {}:\n{}",
+            66,
+            "expected exactly the 66 reachable pairs, got {}:\n{}",
             exported.len(),
             exported.join("\n")
         );
@@ -4957,8 +4957,8 @@ mod tests {
             "bucket layout changed; the no-seed cost argument is stale"
         );
         // The counter is seeded, so its line count does not move.
-        assert_eq!(lines(&cold, "talos_rpc_calls_total"), 64);
-        assert_eq!(lines(&warm, "talos_rpc_calls_total"), 64);
+        assert_eq!(lines(&cold, "talos_rpc_calls_total"), 66);
+        assert_eq!(lines(&warm, "talos_rpc_calls_total"), 66);
     }
 
     /// The DEFERRED-push counter (package ES) is seeded over its whole closed

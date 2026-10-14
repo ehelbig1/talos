@@ -50,6 +50,21 @@ pub const MAX_IN_FLIGHT: usize = 32;
 pub const MAX_STATE_KEY_LEN: usize = 1024;
 pub const MAX_STATE_VALUE_BYTES: usize = 1024 * 1024;
 
+/// Most keys one execution may hold in `execution_state`, and the most value
+/// bytes across them (security review 2026-10-14, B-3). The per-message caps
+/// above bound one write; these bound the population, which a fleet-key
+/// holder could otherwise grow without limit under fresh keys. Enforced by
+/// the controller's one write statement, beside the requirement that the
+/// execution exists and is live.
+pub const MAX_STATE_KEYS_PER_EXECUTION: i64 = 1_000;
+pub const MAX_STATE_BYTES_PER_EXECUTION: i64 = 16 * 1024 * 1024;
+
+/// The execution statuses a durable state write is accepted for. A write for
+/// an execution that does not exist, or has ended, is refused: nothing reads
+/// `execution_state` back at runtime (the worker reads its own in-memory
+/// store), so such a row is only ever growth.
+pub const STATE_WRITABLE_STATUSES: &[&str] = &["running", "resuming", "waiting"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateWriteRequest {
     pub execution_id: Uuid,

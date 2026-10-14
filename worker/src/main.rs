@@ -2250,6 +2250,23 @@ async fn main() -> anyhow::Result<()> {
     // continue to see the silent default.
     enforce_production_sigstore_policy_explicit()?;
 
+    // Security review 2026-10-14 (B-2): a production worker does not accept
+    // a dispatch signed with the fleet-shared WORKER_SHARED_KEY unless
+    // TALOS_ALLOW_LEGACY_FLEET_HMAC names `dispatch`. The controller gates
+    // results and RPC at its own boot.
+    talos_config::fleet_identity::enforce_production_fleet_identity(
+        talos_config::is_production(),
+        &[talos_config::fleet_identity::SurfaceSwitch {
+            surface: talos_config::fleet_identity::LegacyFleetSurface::Dispatch,
+            switch: "TALOS_DISPATCH_REQUIRE_ED25519",
+            required: talos_config::bool_env_or_default("TALOS_DISPATCH_REQUIRE_ED25519", false),
+        }],
+        std::env::var("TALOS_ALLOW_LEGACY_FLEET_HMAC")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
     // L-4: Sigstore startup sanity — verify `cosign` is actually
     // executable when policy is non-Disabled. Pre-fix the missing
     // binary surfaced as a per-pull "cosign_unavailable" error;

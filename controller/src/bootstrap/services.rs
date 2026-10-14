@@ -46,6 +46,30 @@ pub(crate) async fn init_database() -> anyhow::Result<sqlx::Pool<sqlx::Postgres>
     // outside production.
     talos_rpc_subscribers::enforce_production_db_sandbox_posture(config::is_production())?;
 
+    // Security review 2026-10-14 (B-2): production does not accept the
+    // fleet-shared WORKER_SHARED_KEY on the two surfaces this process verifies
+    // (job results, signed RPC) unless TALOS_ALLOW_LEGACY_FLEET_HMAC names
+    // them. The worker gates the third (dispatch) at its own boot.
+    talos_config::fleet_identity::enforce_production_fleet_identity(
+        config::is_production(),
+        &[
+            talos_config::fleet_identity::SurfaceSwitch {
+                surface: talos_config::fleet_identity::LegacyFleetSurface::Result,
+                switch: "TALOS_RESULT_REQUIRE_ED25519",
+                required: talos_config::bool_env_or_default("TALOS_RESULT_REQUIRE_ED25519", false),
+            },
+            talos_config::fleet_identity::SurfaceSwitch {
+                surface: talos_config::fleet_identity::LegacyFleetSurface::Rpc,
+                switch: "TALOS_RPC_REQUIRE_ED25519",
+                required: talos_config::bool_env_or_default("TALOS_RPC_REQUIRE_ED25519", false),
+            },
+        ],
+        std::env::var("TALOS_ALLOW_LEGACY_FLEET_HMAC")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
     // RFC 0010 P1/P3 production fail-closed posture (2026-09-12). If
     // TALOS_DISPATCH_SCHEME=ed25519 (or claim-based TALOS_ENVELOPE_SEALING) is
     // requested but TALOS_CONTROLLER_SIGNING_KEY is unset/unparsable, every sign

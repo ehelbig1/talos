@@ -219,7 +219,7 @@ rpc_subject_table! {
     /// `execution_state` durability, fire-and-forget.
     /// `state_rpc::StateWriteRequest`.
     StateWrite = "talos.state.write" => [
-        Ok, Invalid, Unauthorized, Replay, TooLarge, QueryError, Timeout,
+        Ok, Invalid, Unauthorized, Replay, NotFound, TooLarge, StorageFull, QueryError, Timeout,
     ];
     /// Per-user integration watch state. `integration_state_rpc::IntegrationOp`.
     IntegrationStateOp = "talos.integration_state.op" => [
@@ -254,7 +254,9 @@ mod tests {
         assert_eq!(RpcOutcome::ALL.len(), 18, "outcome vocabulary changed");
         assert_eq!(
             seeded_pairs().count(),
-            64,
+            // 64 until 2026-10-14; +2 when `talos.state.write` gained
+            // `not_found` and `storage_full` (security review B-3).
+            66,
             "the reachable (subject, outcome) set changed; re-derive it from \
              talos-rpc-subscribers/src/lib.rs (the_declared_table_matches_the_source \
              does this mechanically) before changing this number"

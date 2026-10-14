@@ -1088,15 +1088,15 @@ fn grade_a_is_reachable_in_development_only_at_perfection() {
 fn weights_sum_to_max_score() {
     let sum: u32 = CHECK_WEIGHTS.iter().map(|(_, p, _)| *p).sum();
     assert_eq!(sum, MAX_SCORE, "CHECK_WEIGHTS no longer sums to MAX_SCORE");
-    // Nine SCORED checks plus TWO deliberately weighted 0 —
-    // `write_ceiling_enforcement` and `audit_chain_verification` (each entry
-    // argues its own zero; the second does not borrow the first's reasons, and
-    // only one of the three applies to it). Eleven entries, nine weights.
-    assert_eq!(CHECK_WEIGHTS.len(), 11);
+    // Nine SCORED checks plus THREE deliberately weighted 0 —
+    // `write_ceiling_enforcement`, `audit_chain_verification` and
+    // `fleet_identity` (each entry argues its own zero). Twelve entries, nine
+    // weights.
+    assert_eq!(CHECK_WEIGHTS.len(), 12);
     assert_eq!(
         CHECK_WEIGHTS.iter().filter(|(_, p, _)| *p > 0).count(),
         9,
-        "exactly two checks are deliberately unweighted"
+        "exactly three checks are deliberately unweighted"
     );
 }
 
@@ -2403,5 +2403,50 @@ async fn an_unreadable_candidate_is_distinguished_from_an_empty_one() {
             assert_ne!(a, b);
         }
         other => panic!("unexpected probe outcomes: {other:?}"),
+    }
+}
+
+// ── fleet_identity (security review 2026-10-14, B-2) ───────────────────────
+
+#[test]
+fn fleet_identity_passes_only_when_both_controller_surfaces_require_ed25519() {
+    use talos_config::fleet_identity::LegacyFleetSurface as S;
+    assert_eq!(
+        check_fleet_identity(true, true, true, &Ok(vec![])).status,
+        Status::Pass
+    );
+    let ack = check_fleet_identity(true, true, false, &Ok(vec![S::Rpc]));
+    assert_eq!(ack.status, Status::Warn);
+    assert!(
+        ack.detail.contains("rpc: accepts WORKER_SHARED_KEY"),
+        "{}",
+        ack.detail
+    );
+    assert_eq!(
+        check_fleet_identity(true, false, true, &Ok(vec![S::Rpc])).status,
+        Status::Fail,
+        "an acknowledgement for one surface does not cover another"
+    );
+    assert_eq!(
+        check_fleet_identity(true, true, true, &Err("bad".into())).status,
+        Status::Fail
+    );
+    assert_eq!(
+        check_fleet_identity(false, false, false, &Ok(vec![])).status,
+        Status::Info
+    );
+    assert_eq!(
+        check_fleet_identity(true, false, false, &Ok(vec![])).verification,
+        Verification::Parsed
+    );
+    // Unweighted: no arm awards a point.
+    for c in [
+        check_fleet_identity(true, true, true, &Ok(vec![])),
+        check_fleet_identity(true, true, false, &Ok(vec![S::Rpc])),
+        check_fleet_identity(true, false, false, &Ok(vec![])),
+        check_fleet_identity(false, false, false, &Ok(vec![])),
+        check_fleet_identity(true, true, true, &Err("bad".into())),
+    ] {
+        assert_eq!((c.points, c.forfeited()), (0, 0), "{c:?}");
     }
 }
