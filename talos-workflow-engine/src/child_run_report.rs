@@ -57,6 +57,11 @@ pub(crate) struct ChildRunReporter {
     /// The child ran one level deeper than this engine.
     depth: i16,
     origin: ChildRunOrigin,
+    /// Where the child sits under the top-level execution. `None` on an
+    /// `Untracked` origin.
+    lineage: Option<crate::child_run_outputs::SubflowLineage>,
+    /// The dispatching engine's record of its children's node outputs.
+    outputs: crate::child_run_outputs::ChildRunOutputsSlot,
 }
 
 /// How a settled child ended, and what to say about it.
@@ -107,7 +112,26 @@ impl ParallelWorkflowEngine {
                 .unwrap_or_else(|| node_id.to_string()),
             ChildRunOrigin::Untracked => String::new(),
         };
+        // The top-level execution and the path down to this child. A
+        // top-level engine's own execution id IS the root; a child engine
+        // runs under a synthetic id, so it hands down the root it was given.
+        let lineage = match origin {
+            ChildRunOrigin::Node { execution_id, .. } => {
+                let (root_execution_id, mut node_path) = match &self.subflow_lineage {
+                    Some(l) => (l.root_execution_id, l.node_path.clone()),
+                    None => (execution_id, Vec::new()),
+                };
+                node_path.push(parent_node_label.clone());
+                Some(crate::child_run_outputs::SubflowLineage {
+                    root_execution_id,
+                    node_path,
+                })
+            }
+            ChildRunOrigin::Untracked => None,
+        };
         ChildRunReporter {
+            lineage,
+            outputs: Arc::clone(&self.child_run_outputs),
             recorder: self.child_run_recorder.clone(),
             sanitizer: self.output_sanitizer.clone(),
             parent_workflow_id: self.workflow_id,
@@ -119,6 +143,47 @@ impl ParallelWorkflowEngine {
 }
 
 impl ChildRunReporter {
+    /// The lineage to stamp on the child engine before it runs, so the
+    /// children IT dispatches name the top-level execution and their full
+    /// path. Every site that hydrates a child engine calls this.
+    pub(crate) fn child_lineage(&self) -> Option<crate::child_run_outputs::SubflowLineage> {
+        self.lineage.clone()
+    }
+
+    /// Keep a settled child's node outputs for the parent run's stored
+    /// output (see [`crate::child_run_outputs`]). Nothing on an `Untracked`
+    /// origin, like the ledger write.
+    ///
+    /// `results` must already have passed the child engine's scrubs: a
+    /// completed run's context, or `take_partial_results`.
+    pub(crate) fn keep_outputs(
+        &self,
+        child_workflow_id: Uuid,
+        completed: bool,
+        child: &ParallelWorkflowEngine,
+        results: Option<&std::collections::HashMap<Uuid, JsonValue>>,
+    ) {
+        let ChildRunOrigin::Node { kind, .. } = self.origin else {
+            return;
+        };
+        let Some(label) = self.lineage.as_ref().and_then(|l| l.node_path.last()) else {
+            return;
+        };
+        let nodes = results.map_or_else(serde_json::Map::new, |r| {
+            crate::child_run_outputs::project_node_outputs(r, &child.node_labels)
+        });
+        let run = crate::child_run_outputs::KeptChildRun {
+            workflow_id: child_workflow_id,
+            kind: kind.as_str(),
+            completed,
+            nodes,
+            child_runs: child.child_run_outputs(),
+        };
+        if let Ok(mut kept) = self.outputs.lock() {
+            kept.keep(label, run);
+        }
+    }
+
     /// Persist one child run. **THE** write site for the whole ledger.
     ///
     /// Silent no-op with no recorder, on an `Untracked` origin (the
@@ -159,6 +224,15 @@ impl ChildRunReporter {
         recorder
             .record(ChildRunRecord {
                 parent_execution_id: execution_id,
+                root_execution_id: self
+                    .lineage
+                    .as_ref()
+                    .map_or(execution_id, |l| l.root_execution_id),
+                node_path: self
+                    .lineage
+                    .as_ref()
+                    .map(|l| l.node_path.clone())
+                    .unwrap_or_default(),
                 parent_workflow_id,
                 parent_node_id: self.parent_node_label.clone(),
                 dispatch_kind: kind,

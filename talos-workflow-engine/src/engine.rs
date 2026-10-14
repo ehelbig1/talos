@@ -863,6 +863,13 @@ pub struct ParallelWorkflowEngine {
     /// sub-workflow's engine is built fresh, so a child's partial results
     /// are never the parent's.
     pub(crate) partial_results: PartialResultsSlot,
+    /// The node outputs of the child runs this engine's nodes dispatched,
+    /// kept for the run's stored output. Each engine has its own, like
+    /// `partial_results`; a child's record nests inside its parent's.
+    pub(crate) child_run_outputs: crate::child_run_outputs::ChildRunOutputsSlot,
+    /// Where this engine sits under a top-level execution. `None` on a
+    /// top-level engine; set by whatever hydrates a child engine.
+    pub(crate) subflow_lineage: Option<crate::child_run_outputs::SubflowLineage>,
     /// Read-side port for the user's connected services — powers the
     /// `connections` system node. Same None-degrades contract as
     /// `ops_alerts_reader`.
@@ -1274,6 +1281,8 @@ impl ParallelWorkflowEngine {
             pending_approvals_reader: None,
             action_link_minter: None,
             partial_results: PartialResultsSlot::default(),
+            child_run_outputs: crate::child_run_outputs::ChildRunOutputsSlot::default(),
+            subflow_lineage: None,
             connections_reader: None,
             assistant_report_reader: None,
             operator_digest_reader: None,
@@ -1465,6 +1474,21 @@ impl ParallelWorkflowEngine {
         let sanitizer = self.output_sanitizer.as_ref()?;
         let configs: Vec<JsonValue> = self.node_configs.values().cloned().collect();
         Some(sanitizer.new_execution(&configs))
+    }
+
+    /// The node outputs of the child runs the last run on this engine
+    /// dispatched (see [`crate::child_run_outputs`]), for the run's stored
+    /// output under [`crate::child_run_outputs::CHILD_RUNS_KEY`]. `None` when
+    /// no node ran a child. Kept whether the run completed or not: a child
+    /// that ran before the parent failed is part of what explains the
+    /// failure.
+    pub fn child_run_outputs(&self) -> Option<JsonValue> {
+        self.child_run_outputs.lock().ok()?.to_json()
+    }
+
+    /// Where this engine sits under a top-level execution, if it is a child.
+    pub fn subflow_lineage(&self) -> Option<&crate::child_run_outputs::SubflowLineage> {
+        self.subflow_lineage.as_ref()
     }
 
     /// The outputs committed by the nodes of the LAST run on this engine
@@ -2154,6 +2178,9 @@ impl ParallelWorkflowEngine {
         // this engine are not this run's.
         if let Ok(mut held) = self.partial_results.lock() {
             *held = None;
+        }
+        if let Ok(mut kept) = self.child_run_outputs.lock() {
+            kept.clear();
         }
         let mut results = VersionedResults {
             map: initial_results,

@@ -24,13 +24,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_executions",
-            "description": "List recent executions for ONE workflow (workflow_id required) with status, time, and error info. For a cross-workflow listing use list_recent_executions instead. Each row carries `started_by`: {kind, id?, integration?}, where kind is one of schedule (id = the schedule), webhook (id = the trigger), manual (trigger_workflow), api (the web UI or a GraphQL caller), test (test_workflow), test_draft, call_workflow, bulk_trigger, trigger_as_actors, enqueue, continuation, action_link (id = the link), push_channel (id = the channel, with its integration), actor_dispatch, handoff, replay (id = the execution replayed), chain, evaluation, or not_recorded for a row that says nothing about how it started (never assumed to be manual); and `is_test`, true for a run test_workflow made. A dry run is not marked on the row: get_execution_status shows a `dry_run` block for one.",
+            "description": "List recent executions for ONE workflow (workflow_id required) with status, time, and error info. For a cross-workflow listing use list_recent_executions instead. Each row carries `started_by`: {kind, id?, integration?}, where kind is one of schedule (id = the schedule), webhook (id = the trigger), manual (trigger_workflow), api (the web UI or a GraphQL caller), test (test_workflow), test_draft, call_workflow, bulk_trigger, trigger_as_actors, enqueue, continuation, action_link (id = the link), push_channel (id = the channel, with its integration), actor_dispatch, handoff, replay (id = the execution replayed), chain, evaluation, or not_recorded for a row that says nothing about how it started (never assumed to be manual); and `is_test`, true for a run test_workflow made. A dry run is not marked on the row: get_execution_status shows a `dry_run` block for one. A run of this workflow as another workflow's sub-workflow (or judge, ensemble, loop body, ...) has no execution row of its own: pass include_child_runs: true to get them as a separate `child_runs` list, each marked kind: \"child\" with the top-level `execution_id` it ran under and the node `path` to pass to get_sub_workflow_output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workflow_id": { "type": "string" },
                     "limit": { "type": "number", "description": "Max results (default 60)" },
-                    "offset": { "type": "number", "description": "Skip this many results (default 0)" }
+                    "offset": { "type": "number", "description": "Skip this many results (default 0)" },
+                    "include_child_runs": { "type": "boolean", "description": "Also list this workflow's runs as a child of another run, in `child_runs` (same limit and offset, paged separately). Default false." }
                 },
                 "required": ["workflow_id"]
             }
@@ -265,14 +266,15 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_sub_workflow_output",
-            "description": "Get the output of a sub-workflow node from a parent execution. Returns the child workflow's per-node results.",
+            "description": "Get the output of a sub-workflow node from a parent execution. With `node_id`: the output the parent node received (with one terminal node in the child, that node's output only). With `path` (node ids, outermost first, e.g. [\"assess\", \"brief\"]): every node output of the child run that the last node in the path dispatched, however deep, as JSON — {runs: [{workflow_id, kind, status, nodes: {<node id>: output}, child_runs: [<node ids that ran a child of their own>]}], runs_not_kept}. A step in the middle of a path follows that node's newest run. Kept for runs that started on or after 2026-10-14, up to 1 MB of child outputs per run and 8 runs per node; a run whose outputs did not fit says `outputs_omitted`. list_executions(include_child_runs: true) gives each child run's execution_id and path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "execution_id": { "type": "string", "description": "UUID of the parent execution" },
-                    "node_id": { "type": "string", "description": "Node ID of the sub-workflow node in the parent workflow" }
+                    "execution_id": { "type": "string", "description": "UUID of the top-level execution" },
+                    "node_id": { "type": "string", "description": "Node ID of the sub-workflow node in the parent workflow" },
+                    "path": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 16, "description": "Node ids from the top-level workflow down to the node whose child run to show. Use instead of node_id." }
                 },
-                "required": ["execution_id", "node_id"]
+                "required": ["execution_id"]
             }
         }),
         serde_json::json!({
@@ -977,6 +979,14 @@ async fn handle_list_executions(
         Err(resp) => return resp,
     };
 
+    let include_child_runs = match args.get("include_child_runs") {
+        None | Some(Value::Null) => LIST_CHILD_RUNS_BY_DEFAULT,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return mcp_error(req_id, -32602, "'include_child_runs' must be a boolean");
+        }
+    };
+
     let rows = match state
         .execution_repo
         .list_executions(wf_id, user_id, limit, offset)
@@ -1079,6 +1089,35 @@ async fn handle_list_executions(
         "offset": offset,
         "has_more": has_more,
     });
+    if include_child_runs {
+        let ledger = talos_child_run_ledger::ChildRunLedger::new(state.db_pool.clone());
+        match ledger
+            .list_for_child_workflow(wf_id, user_id, limit, offset)
+            .await
+        {
+            Ok((runs, child_total)) => {
+                let items: Vec<Value> = runs.iter().map(child_run_listing_item).collect();
+                if let Some(obj) = envelope.as_object_mut() {
+                    obj.insert("child_runs".to_string(), Value::Array(items));
+                    obj.insert(
+                        "child_runs_total".to_string(),
+                        serde_json::json!(child_total),
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(workflow_id = %wf_id, error = %e, "list_executions: child-run read failed");
+                if let Some(obj) = envelope.as_object_mut() {
+                    obj.insert("child_runs".to_string(), Value::Null);
+                    obj.insert("child_runs_total".to_string(), Value::Null);
+                    obj.insert(
+                        "child_runs_note".to_string(),
+                        serde_json::json!("The child-run ledger could not be read; child_runs is unknown, not empty."),
+                    );
+                }
+            }
+        }
+    }
     if total.is_none() {
         if let Some(obj) = envelope.as_object_mut() {
             obj.insert(
@@ -1098,6 +1137,45 @@ async fn handle_list_executions(
         req_id,
         &serde_json::to_string_pretty(&envelope).unwrap_or_default(),
     )
+}
+
+/// Whether `list_executions` lists a workflow's child runs when the caller
+/// does not say. `false` until the operator decides otherwise
+/// (`docs/engineering-log/packages/2026-10-14-child-run-outputs.md`):
+/// flipping it adds a `child_runs` list to every listing and changes no
+/// count.
+const LIST_CHILD_RUNS_BY_DEFAULT: bool = false;
+
+/// One child run in `list_executions`' `child_runs` list. `execution_id` is
+/// the TOP-LEVEL execution and `path` the node ids down to the dispatching
+/// node: together, `get_sub_workflow_output`'s arguments. A row recorded
+/// before 2026-10-14 has no path; for a direct child its parent execution
+/// is the top-level one.
+fn child_run_listing_item(r: &talos_child_run_ledger::ChildRunOfWorkflow) -> Value {
+    let (execution_id, path) = match r.root_execution_id {
+        Some(root) => (Some(root), Some(r.node_path.clone())),
+        None if r.depth == 1 => (
+            Some(r.parent_execution_id),
+            Some(vec![r.parent_node_id.clone()]),
+        ),
+        None => (None, None),
+    };
+    serde_json::json!({
+        "kind": "child",
+        "child_run_id": r.id,
+        "execution_id": execution_id,
+        "path": path,
+        "parent_workflow_id": r.parent_workflow_id,
+        "parent_node_id": r.parent_node_id,
+        "dispatch_kind": r.dispatch_kind,
+        "depth": r.depth,
+        "status": r.status,
+        "started_at": r.started_at.to_rfc3339(),
+        "completed_at": r.completed_at.to_rfc3339(),
+        "duration_ms": r.duration_ms,
+        "error_message": r.error_class,
+        "actor_id": r.actor_id,
+    })
 }
 
 async fn handle_list_recent_executions(
@@ -4174,8 +4252,12 @@ async fn handle_enqueue_workflow(
                 .await
                 {
                     Ok(ctx) => {
-                        let output_data = talos_dlp_provider::redact_json(
-                            &serde_json::to_value(&ctx.results).unwrap_or(serde_json::json!({})),
+                        let output_data = talos_execution_result_collector::with_child_runs(
+                            talos_dlp_provider::redact_json(
+                                &serde_json::to_value(&ctx.results)
+                                    .unwrap_or(serde_json::json!({})),
+                            ),
+                            &engine,
                         );
                         // PR #423 sibling: a wait/confidence-gate pause returns
                         // `Ok(ctx)` with `ctx.waiting = true` — the execution is
@@ -4289,10 +4371,26 @@ async fn handle_get_sub_workflow_output(
         Ok(id) => id,
         Err(resp) => return resp,
     };
+    if let Some(raw_path) = args.get("path").filter(|v| !v.is_null()) {
+        if args.get("node_id").is_some_and(|v| !v.is_null()) {
+            return mcp_error(req_id, -32602, "Pass 'path' or 'node_id', not both");
+        }
+        let path = match parse_child_run_path(raw_path) {
+            Ok(p) => p,
+            Err(msg) => return mcp_error(req_id, -32602, &msg),
+        };
+        return handle_get_child_run_by_path(req_id, exec_id, &path, state, user_id).await;
+    }
     // MCP-226 (2026-05-08): trim node_id at the boundary.
     let node_id = match args.get("node_id").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => n.trim(),
-        _ => return mcp_error(req_id, -32602, "Missing or empty 'node_id' parameter"),
+        _ => {
+            return mcp_error(
+                req_id,
+                -32602,
+                "Missing or empty 'node_id' parameter (or pass 'path')",
+            )
+        }
     };
 
     // Load the parent execution's output_data
@@ -4338,6 +4436,17 @@ async fn handle_get_sub_workflow_output(
                             formatted.push_str(&format!("    {}\n", line));
                         }
                     }
+                    // The child's every node output is kept apart from what
+                    // the parent node received; say where.
+                    if output_data
+                        .get(talos_execution_result_collector::CHILD_RUNS_KEY)
+                        .and_then(|r| r.get(node_id))
+                        .is_some()
+                    {
+                        formatted.push_str(&format!(
+                            "\n  Every node output of this child run: get_sub_workflow_output(execution_id, path: [\"{node_id}\"])\n"
+                        ));
+                    }
                     // Show timing info if present
                     if let Some(timings) = obj.get("__node_timings__") {
                         formatted.push_str("\n  --- Child Node Timings ---\n");
@@ -4377,6 +4486,129 @@ async fn handle_get_sub_workflow_output(
             req_id,
             -32000,
             "Execution has no output data (may still be running)",
+        ),
+    }
+}
+
+/// The `path` argument of `get_sub_workflow_output`: a non-empty array of
+/// non-empty node ids, no longer than the engine's nesting limit.
+fn parse_child_run_path(raw: &Value) -> Result<Vec<String>, String> {
+    let max = talos_execution_result_collector::MAX_CHILD_RUN_PATH_LEN;
+    let Some(items) = raw.as_array() else {
+        return Err("'path' must be an array of node ids".to_string());
+    };
+    if items.is_empty() || items.len() > max {
+        return Err(format!("'path' must hold 1 to {max} node ids"));
+    }
+    items
+        .iter()
+        .map(|v| match v.as_str().map(str::trim) {
+            Some(s) if !s.is_empty() => Ok(s.to_string()),
+            _ => Err("every element of 'path' must be a non-empty node id".to_string()),
+        })
+        .collect()
+}
+
+/// `get_sub_workflow_output(path)`: the per-node outputs of a child run at
+/// any depth, read from the top-level execution's stored output. The
+/// ownership check is the same lookup the `node_id` form makes, so an
+/// execution the caller does not own reads exactly as one that does not
+/// exist.
+async fn handle_get_child_run_by_path(
+    req_id: Option<serde_json::Value>,
+    exec_id: Uuid,
+    path: &[String],
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    use talos_execution_result_collector::{resolve_child_run_path, ChildRunPathError};
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
+        }
+        Err(e) => {
+            tracing::error!("get_sub_workflow_output: load failed: {}", e);
+            return mcp_error(req_id, -32000, "Failed to load execution");
+        }
+    };
+    let Some(output_data) = exec.output_data else {
+        return mcp_error(
+            req_id,
+            -32000,
+            "Execution has no output data (may still be running)",
+        );
+    };
+    match resolve_child_run_path(&output_data, path) {
+        Ok(mut entry) => {
+            // Name the nested child runs rather than inline them: each is
+            // one more path element away, and inlining every level would
+            // return the whole tree for a question about one run.
+            if let Some(runs) = entry.get_mut("runs").and_then(Value::as_array_mut) {
+                for run in runs {
+                    if let Some(obj) = run.as_object_mut() {
+                        if let Some(children) = obj.remove("child_runs") {
+                            let labels: Vec<String> = children
+                                .as_object()
+                                .map(|o| {
+                                    o.keys().filter(|k| !k.starts_with("__")).cloned().collect()
+                                })
+                                .unwrap_or_default();
+                            obj.insert("child_runs".to_string(), serde_json::json!(labels));
+                        }
+                    }
+                }
+            }
+            let body = serde_json::json!({
+                "execution_id": exec_id,
+                "path": path,
+                "node": entry,
+            });
+            respond_maybe_archived(
+                req_id,
+                archived_at,
+                serde_json::to_string_pretty(&body).unwrap_or_default(),
+            )
+        }
+        Err(ChildRunPathError::BadPath) => mcp_error(req_id, -32602, "Invalid 'path'"),
+        Err(ChildRunPathError::NoRecord {
+            omitted: Some(detail),
+        }) => mcp_not_found(
+            req_id,
+            -32000,
+            &format!(
+                "This execution's child-run outputs were not stored: they did not fit the \
+                 execution payload limit ({detail})"
+            ),
+        ),
+        Err(ChildRunPathError::NoRecord { omitted: None }) => mcp_not_found(
+            req_id,
+            -32000,
+            "This execution stored no child-run outputs: no node of it ran a child, or it \
+             started before they were kept (2026-10-14)",
+        ),
+        Err(ChildRunPathError::NotFound { step, available }) => mcp_not_found(
+            req_id,
+            -32000,
+            &format!(
+                "No child run at path step {} ('{}'). Nodes that ran a child at that level: {:?}",
+                step,
+                path.get(step).map_or("", String::as_str),
+                available
+            ),
+        ),
+        Err(ChildRunPathError::OutputsOmitted { step, detail }) => mcp_not_found(
+            req_id,
+            -32000,
+            &format!(
+                "The run at path step {step} ('{}') kept no outputs: they did not fit ({detail})",
+                path.get(step).map_or("", String::as_str),
+            ),
         ),
     }
 }

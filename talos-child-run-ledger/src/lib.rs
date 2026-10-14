@@ -144,6 +144,45 @@ pub struct ChildRunRow {
     pub duration_ms: i64,
 }
 
+/// One recorded run of a given workflow AS somebody's child, for a listing
+/// of that workflow's runs ([`ChildRunLedger::list_for_child_workflow`]).
+#[derive(Debug, Clone)]
+pub struct ChildRunOfWorkflow {
+    /// The ledger row's own id. Not an execution id: a child run has none.
+    pub id: Uuid,
+    /// The top-level execution the run belonged to — the id to pass to
+    /// `get_sub_workflow_output` with [`Self::node_path`]. `None` on a row
+    /// written before 2026-10-14; then [`Self::parent_execution_id`] is the
+    /// top-level execution only when `depth` is 1.
+    pub root_execution_id: Option<Uuid>,
+    /// The execution the dispatching engine ran under; synthetic (it names no
+    /// row) when `depth` is greater than 1.
+    pub parent_execution_id: Uuid,
+    /// The workflow whose node dispatched the run.
+    pub parent_workflow_id: Uuid,
+    /// The dispatching node.
+    pub parent_node_id: String,
+    /// The node labels from the top-level execution down to the dispatching
+    /// node. Empty on a row written before 2026-10-14.
+    pub node_path: Vec<String>,
+    /// Which node kind dispatched it.
+    pub dispatch_kind: String,
+    /// The effective actor the run ran as.
+    pub actor_id: Option<Uuid>,
+    /// Nesting depth; 1 = a direct child of a top-level execution.
+    pub depth: i16,
+    /// When the run started.
+    pub started_at: DateTime<Utc>,
+    /// When it settled.
+    pub completed_at: DateTime<Utc>,
+    /// `completed` or `failed`.
+    pub status: String,
+    /// A redacted, capped error summary. Never a payload.
+    pub error_class: Option<String>,
+    /// Wall time of the run.
+    pub duration_ms: i64,
+}
+
 /// What the ledger knows about one child inside a window — the two
 /// execution-derived readiness components, from the one table that can see a
 /// sub-workflow run.
@@ -217,8 +256,8 @@ impl ChildRunLedger {
             "INSERT INTO sub_workflow_runs \
                  (parent_execution_id, parent_workflow_id, parent_node_id, dispatch_kind, \
                   child_workflow_id, user_id, actor_id, depth, started_at, completed_at, \
-                  status, error_class, duration_ms) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                  status, error_class, duration_ms, root_execution_id, node_path) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(record.parent_execution_id)
         .bind(record.parent_workflow_id)
@@ -233,6 +272,8 @@ impl ChildRunLedger {
         .bind(record.status.as_str())
         .bind(record.error_class.as_deref())
         .bind(record.duration_ms)
+        .bind(record.root_execution_id)
+        .bind(&record.node_path)
         .execute(&self.pool)
         .await
         .context("record_child_run")?;
@@ -348,6 +389,75 @@ impl ChildRunLedger {
             });
         }
         Ok(out)
+    }
+
+    /// The recorded runs of `child_workflow_id` as somebody's child, newest
+    /// first, and how many there are in all — one page, two statements, no
+    /// per-row lookups. Owner-scoped at the app layer and under RLS.
+    ///
+    /// `limit` is clamped to [`MAX_LIST_LIMIT`].
+    ///
+    /// # Errors
+    /// Any database failure.
+    pub async fn list_for_child_workflow(
+        &self,
+        child_workflow_id: Uuid,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ChildRunOfWorkflow>, i64)> {
+        let limit = limit.clamp(1, MAX_LIST_LIMIT);
+        let offset = offset.max(0);
+        let mut tx = talos_db::begin_user_scoped(&self.pool, user_id).await?;
+        let rows = sqlx::query(
+            "SELECT id, root_execution_id, parent_execution_id, parent_workflow_id, \
+                    parent_node_id, node_path, dispatch_kind, actor_id, depth, started_at, \
+                    completed_at, status, error_class, duration_ms \
+             FROM sub_workflow_runs \
+             WHERE child_workflow_id = $1 AND user_id = $2 \
+             ORDER BY started_at DESC, id \
+             LIMIT $3 OFFSET $4",
+        )
+        .bind(child_workflow_id)
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&mut *tx)
+        .await
+        .context("list_child_runs_for_child_workflow")?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM sub_workflow_runs \
+             WHERE child_workflow_id = $1 AND user_id = $2",
+        )
+        .bind(child_workflow_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("count_child_runs_for_child_workflow")?;
+        tx.commit().await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(ChildRunOfWorkflow {
+                id: r.try_get("id")?,
+                root_execution_id: r.try_get("root_execution_id")?,
+                parent_execution_id: r.try_get("parent_execution_id")?,
+                parent_workflow_id: r.try_get("parent_workflow_id")?,
+                parent_node_id: r.try_get("parent_node_id")?,
+                node_path: r
+                    .try_get::<Option<Vec<String>>, _>("node_path")?
+                    .unwrap_or_default(),
+                dispatch_kind: r.try_get("dispatch_kind")?,
+                actor_id: r.try_get("actor_id")?,
+                depth: r.try_get("depth")?,
+                started_at: r.try_get("started_at")?,
+                completed_at: r.try_get("completed_at")?,
+                status: r.try_get("status")?,
+                error_class: r.try_get("error_class")?,
+                duration_ms: r.try_get("duration_ms")?,
+            });
+        }
+        Ok((out, total))
     }
 
     /// How many recorded runs each of `child_workflow_ids` has had since
@@ -490,11 +600,13 @@ impl ChildRunLedger {
                  WHERE s.started_at < NOW() - make_interval(days => $1::int) \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM workflow_executions e \
-                       WHERE e.id = s.parent_execution_id AND e.is_pinned \
+                       WHERE e.id = COALESCE(s.root_execution_id, s.parent_execution_id) \
+                         AND e.is_pinned \
                    ) \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM workflow_executions_archive a \
-                       WHERE a.id = s.parent_execution_id AND a.is_pinned \
+                       WHERE a.id = COALESCE(s.root_execution_id, s.parent_execution_id) \
+                         AND a.is_pinned \
                    ) \
                  ORDER BY s.started_at, s.id \
                  LIMIT {LEDGER_PURGE_BATCH} \

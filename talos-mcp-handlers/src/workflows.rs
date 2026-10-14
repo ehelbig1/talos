@@ -3707,6 +3707,10 @@ async fn handle_test_workflow_draft(
                         serde_json::to_value(&ctx.node_timings).unwrap_or_default(),
                     );
                 }
+                talos_execution_result_collector::attach_child_runs(
+                    &mut output,
+                    engine.child_run_outputs(),
+                );
                 let output_json =
                     talos_dlp_provider::redact_json(&serde_json::Value::Object(output));
                 // PR #423 sibling: a wait/confidence-gate pause is NOT
@@ -6043,6 +6047,11 @@ async fn handle_call_workflow(
                     &ctx.results,
                     &node_labels_snapshot,
                 );
+                let mut output = output;
+                talos_execution_result_collector::attach_child_runs(
+                    &mut output,
+                    engine.child_run_outputs(),
+                );
                 let output_json =
                     talos_dlp_provider::redact_json(&serde_json::Value::Object(output));
                 // PR #423 sibling: a wait/confidence-gate pause is NOT
@@ -7405,6 +7414,10 @@ async fn handle_bulk_trigger_workflow(
                             serde_json::to_value(&ctx.node_timings).unwrap_or_default(),
                         );
                     }
+                    talos_execution_result_collector::attach_child_runs(
+                        &mut output,
+                        engine.child_run_outputs(),
+                    );
                     let output_json =
                         talos_dlp_provider::redact_json(&serde_json::Value::Object(output));
                     // PR #423 sibling: a wait/confidence-gate pause is NOT
@@ -7920,6 +7933,10 @@ async fn handle_trigger_workflow_as_actors(
                             serde_json::to_value(&ctx.node_timings).unwrap_or_default(),
                         );
                     }
+                    talos_execution_result_collector::attach_child_runs(
+                        &mut output,
+                        engine.child_run_outputs(),
+                    );
                     let output_json =
                         talos_dlp_provider::redact_json(&serde_json::Value::Object(output));
                     // PR #423 sibling: a wait/confidence-gate pause is NOT
@@ -8732,6 +8749,11 @@ async fn handle_test_workflow(
                 let output = crate::utils::project_engine_results_to_output(
                     &ctx.results,
                     &node_labels_snapshot,
+                );
+                let mut output = output;
+                talos_execution_result_collector::attach_child_runs(
+                    &mut output,
+                    engine.child_run_outputs(),
                 );
                 let output_json =
                     talos_dlp_provider::redact_json(&serde_json::Value::Object(output));

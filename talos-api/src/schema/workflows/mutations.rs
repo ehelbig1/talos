@@ -1570,8 +1570,11 @@ impl WorkflowsMutations {
                     for (node_id, output) in &ctx.results {
                         aggregated_output.insert(node_id.to_string(), output.clone());
                     }
-                    let aggregated_json = talos_dlp_provider::redact_json(
-                        &serde_json::Value::Object(aggregated_output),
+                    let aggregated_json = talos_execution_result_collector::with_child_runs(
+                        talos_dlp_provider::redact_json(&serde_json::Value::Object(
+                            aggregated_output,
+                        )),
+                        &engine,
                     );
 
                     const MAX_AGGREGATED_OUTPUT_BYTES: usize = 50 * 1024 * 1024; // 50 MB

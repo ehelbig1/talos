@@ -943,6 +943,8 @@ async fn a_failed_ledger_write_is_swallowed_but_counted() {
     PostgresChildRunRecorder::new(pool)
         .record(ChildRunRecord {
             parent_execution_id: Uuid::new_v4(),
+            root_execution_id: Uuid::new_v4(),
+            node_path: vec!["n1".into()],
             parent_workflow_id: Uuid::new_v4(),
             parent_node_id: "n1".into(),
             dispatch_kind: ChildDispatchKind::SubWorkflow,
