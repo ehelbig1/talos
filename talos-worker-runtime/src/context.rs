@@ -284,6 +284,12 @@ pub struct TalosContext {
     /// Set only from a hand-built `SecurityPolicy` in the controller process.
     pub http_capture: Option<std::sync::Arc<crate::http_replay::HttpCapture>>,
 
+    /// A rehearsal against an actor's memory: records the keys the run reads
+    /// and writes, and leaves writes unapplied when asked. Set only from a
+    /// hand-built `SecurityPolicy` in the controller process
+    /// (see [`crate::memory_rehearsal`]).
+    pub memory_rehearsal: Option<std::sync::Arc<crate::memory_rehearsal::MemoryRehearsal>>,
+
     /// The host call in progress, named by the call itself
     /// ([`Self::host_call`]); read by the fuel profile's call hook when the
     /// call returns. One store per host call, whether or not a profile is on.
@@ -1789,6 +1795,7 @@ impl TalosContext {
             idempotency_key: None,
             http_replay: None,
             http_capture: None,
+            memory_rehearsal: None,
             host_call_label: crate::fuel_profile::UNNAMED,
             provider,
             expose_call_count: std::sync::atomic::AtomicU64::new(0),

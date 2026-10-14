@@ -1640,6 +1640,9 @@ async fn execute_job(
         http_replay: None,
         http_capture: None,
         fuel_profile: None,
+        // A dispatched job's memory calls are the run's own: never a
+        // rehearsal (`memory_rehearsal` is set only by `test_module`).
+        memory_rehearsal: None,
     };
 
     // Parse the capability world hint from the controller.  When present and non-Unknown,
@@ -2091,6 +2094,7 @@ async fn execute_pipeline_job(
                 http_replay: None,
                 http_capture: None,
                 fuel_profile: None,
+                memory_rehearsal: None,
             },
             user_id: Some(req.user_id),
             // Per-step in-worker retry policy (2026-07-24). HMAC-bound via

@@ -338,7 +338,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "test_module",
             "description": ([
-                "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n  - `trigger_input`: the run's trigger payload (goes to `data[\"__trigger_input__\"]`, where the engine writes it for every node of a workflow run)\n  - `__started_by__` is always {\"kind\": \"test\"}: in a workflow run the engine writes how the run was started there (action_link, manual, schedule, …), and a rehearsal is a test\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call) and `llm_calls` ({calls: [{call, provider, model, prompt_tokens, completion_tokens, stop_reason, duration_ms}], not_listed}: each call in the order made, the first 20 listed and the rest counted), so you can see how close a run came to its fuel and token limits and WHICH call hit one. `stop_reason` is the provider's own word: `length` (or `max_tokens`) means the call was cut off at its token budget, and for a model that reasons first the budget may have gone entirely on reasoning, leaving an empty answer; completion_tokens includes reasoning, which no provider here reports separately. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. ",
+                "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n  - `trigger_input`: the run's trigger payload (goes to `data[\"__trigger_input__\"]`, where the engine writes it for every node of a workflow run)\n  - `__started_by__` is always {\"kind\": \"test\"}: in a workflow run the engine writes how the run was started there (action_link, manual, schedule, …), and a rehearsal is a test\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. Its memory WRITES are applied too, unless `memory_writes: \"discard\"`, which rehearses against the actor's memory without changing it; either way the reply's `memory` lists the keys read and the writes asked for. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call) and `llm_calls` ({calls: [{call, provider, model, prompt_tokens, completion_tokens, stop_reason, duration_ms}], not_listed}: each call in the order made, the first 20 listed and the rest counted), so you can see how close a run came to its fuel and token limits and WHICH call hit one. `stop_reason` is the provider's own word: `length` (or `max_tokens`) means the call was cut off at its token budget, and for a model that reasons first the budget may have gone entirely on reasoning, leaving an empty answer; completion_tokens includes reasoning, which no provider here reports separately. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. ",
                 TEST_MODULE_NETWORK_NOTE,
                 "\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
             ]
@@ -350,6 +350,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "config": { "type": "object", "description": "Node config values — delivered to the module under `data[\"config\"]`, matching add_node_to_workflow's `config` semantics. Preferred param for config-taking modules. `max_fuel` here sets this run's fuel limit, as it does on a node." },
                     "input": { "type": "object", "description": "Simulated upstream node output — delivered to the module under `data[\"input\"]`, matching workflow-dispatch shape. When passed WITHOUT an explicit `config`, it is treated as config for backwards compatibility." },
                     "actor_id": { "type": "string", "description": "Optional UUID of an actor whose memories the module should see. Modules calling agent_memory::search / get / list-keys etc. will scope to this actor (mirrors workflow dispatch when the workflow is bound to an actor). The actor must be owned by you; cross-tenant actor_ids are rejected. Without this, memory calls run anonymously and return 0 hits." },
+                    "memory_writes": { "type": "string", "enum": ["apply", "discard"], "description": "Optional, with actor_id. \"apply\" (the default) persists the module's memory writes to the actor, as a workflow run would: agent_memory set / delete / store_with_embedding and a returned __memory_write__. \"discard\" rehearses against the actor's memory WITHOUT changing it: reads reach the actor, writes are answered as if they succeeded and are not sent, after the capability world, the actor's write ceiling and key validation have run (so a write the ceiling refuses is still refused), and a __memory_write__ in the output is reported, not persisted. Either way, with an actor_id the reply's `memory` lists the keys read, the prefixes listed, the number of searches and the writes asked for: keys only, never a value or a search query." },
                     "accumulated": { "type": "object", "description": "Optional. Outputs of EARLIER workflow nodes, keyed by node id, delivered to the module as `data[\"__accumulated__\"]` exactly as the engine does in a workflow. Use it to rehearse a module that reads a non-parent node's output (e.g. {\"prepare\": {\"refs\": {...}}}). Max 1 MB." },
                     "trigger_input": { "type": "object", "description": "Optional. The trigger payload of the workflow run being rehearsed, delivered to the module as `data[\"__trigger_input__\"]` exactly as the engine does for every node. Use it to rehearse a module that reads the run's trigger (e.g. {\"ticket\": {\"key\": \"ABC-12\"}}). Max 1 MB. This argument is the ONLY way to supply it: `__trigger_input__` at the top level of `input` or `config` is refused, because the engine writes that key itself and removes a copy that arrives inside upstream data. The same holds for `__accumulated__` (a copy inside `input` or `config` is dropped; use `accumulated`). The engine's other input keys (`__staleness__`, `__degraded_inputs__`, `__actor_context__`) are NOT removed from `input` here, so a module's handling of them can be rehearsed by passing them in `input`; in a workflow run only the engine can set them." },
                     "timeout_secs": { "type": "number", "description": "Execution timeout in seconds (default 30, max 120)" },
@@ -2909,6 +2910,18 @@ pub(crate) fn trigger_key_misplaced(
     ))
 }
 
+/// `test_module`'s `memory_writes`: `true` for `"discard"`, `false` for
+/// `"apply"` or absent (what an actor-scoped rehearsal has always done).
+/// Anything else is refused rather than read as one of the two.
+pub(crate) fn parse_memory_writes(raw: Option<&serde_json::Value>) -> Result<bool, String> {
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::String(s)) if s == "apply" => Ok(false),
+        Some(serde_json::Value::String(s)) if s == "discard" => Ok(true),
+        Some(_) => Err("'memory_writes' must be \"apply\" or \"discard\"".to_string()),
+    }
+}
+
 /// `test_module`'s `http_fixtures`: `None` when absent (the run makes real
 /// requests), else the recorded answers, validated. The JSON form has one
 /// parser, [`talos_worker_runtime::rehearsal::parse_http_fixtures`].
@@ -4045,6 +4058,19 @@ async fn handle_test_module(
         }
     }
 
+    let discard_memory_writes = match parse_memory_writes(args.get("memory_writes")) {
+        Ok(d) => d,
+        Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
+    };
+    // Records the run's memory calls for the reply, and leaves writes
+    // unapplied when asked. Present whenever an actor's memory is reached
+    // (or writes are to be discarded); never on a dispatched job.
+    let memory_rehearsal = (actor_id_opt.is_some() || discard_memory_writes).then(|| {
+        std::sync::Arc::new(
+            talos_worker_runtime::memory_rehearsal::MemoryRehearsal::new(discard_memory_writes),
+        )
+    });
+
     // Load module — check wasm_modules first, then node_templates (sandbox).
     // The node_templates fallback restricts to: catalog templates (user_id IS NULL)
     // and templates owned by the caller. This prevents IDOR: a user cannot execute
@@ -4339,6 +4365,7 @@ async fn handle_test_module(
         http_replay: http_replay.clone(),
         http_capture: http_capture.clone(),
         fuel_profile: fuel_profile.clone(),
+        memory_rehearsal: memory_rehearsal.clone(),
         ..Default::default()
     };
     // A rehearsal runs ONCE: the recordings are handed out in order, so an
@@ -4446,7 +4473,12 @@ async fn handle_test_module(
             //   * no actor_id → keep the no-write behavior but SAY SO
             //     instead of silently dropping.
             let memory_write_note = if output.get("__memory_write__").is_some() {
-                if actor_id_opt.is_some() {
+                if discard_memory_writes {
+                    Some(
+                        "output contains __memory_write__ — NOT persisted: memory_writes is \
+                         \"discard\", so this rehearsal changes nothing in the actor's memory",
+                    )
+                } else if actor_id_opt.is_some() {
                     // Same hook, same ceiling the engine would apply (#750).
                     // The hook itself refuses and records when the ceiling
                     // says so, so this call site cannot report "persisted"
@@ -4499,6 +4531,7 @@ async fn handle_test_module(
                     "llm_usage": rendered_llm_usage(&llm_usage),
                     "llm_calls": rendered_llm_calls(&llm_usage),
                     "memory_write": memory_write_note,
+                    "memory": memory_rehearsal.as_ref().map(|r| r.report()),
                     // Denied/failed host calls this run. Present on the
                     // SUCCESS arm too: a module can swallow a failed fetch in
                     // its own error handling and still return ok.
@@ -4519,6 +4552,7 @@ async fn handle_test_module(
                 "fuel": rendered_test_fuel(&fuel, fuel_limit),
                 "llm_usage": rendered_llm_usage(&llm_usage),
                     "llm_calls": rendered_llm_calls(&llm_usage),
+                "memory": memory_rehearsal.as_ref().map(|r| r.report()),
                 // The whole point: an opaque `networkerror` here is now
                 // accompanied by the host's reason for it.
                 "host_diagnostics": collected_host_diagnostics(&host_diags),
@@ -6439,6 +6473,21 @@ mod rehearsal_tool_tests {
             0,
             "a standalone run resolves through resolve_for_standalone_run"
         );
+    }
+
+    /// `memory_writes`: absent and "apply" keep what an actor-scoped
+    /// rehearsal has always done; "discard" leaves writes unapplied;
+    /// anything else is refused rather than read as one of the two.
+    #[test]
+    fn memory_writes_is_apply_discard_or_refused() {
+        use crate::sandbox::parse_memory_writes;
+        assert_eq!(parse_memory_writes(None), Ok(false));
+        assert_eq!(parse_memory_writes(Some(&json!(null))), Ok(false));
+        assert_eq!(parse_memory_writes(Some(&json!("apply"))), Ok(false));
+        assert_eq!(parse_memory_writes(Some(&json!("discard"))), Ok(true));
+        for bad in [json!("Discard"), json!(true), json!(1), json!({})] {
+            assert!(parse_memory_writes(Some(&bad)).is_err(), "{bad}");
+        }
     }
 
     /// The legacy shapes are unchanged: an empty config or input adds no

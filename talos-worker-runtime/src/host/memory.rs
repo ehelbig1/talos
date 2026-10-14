@@ -79,6 +79,9 @@ impl wit_agent_memory::Host for TalosContext {
             Some(p) => p,
             None => return Err(wit_agent_memory::Error::NotAvailable),
         };
+        if let Some(r) = &self.memory_rehearsal {
+            r.record_read(&key);
+        }
         let result = match call_memory_op(
             actor_id,
             nats,
@@ -136,6 +139,9 @@ impl wit_agent_memory::Host for TalosContext {
             Some(p) => p,
             None => return Err(wit_agent_memory::Error::NotAvailable),
         };
+        if let Some(r) = &self.memory_rehearsal {
+            r.record_read(&key);
+        }
         let result = match call_memory_op(
             actor_id,
             nats,
@@ -222,6 +228,14 @@ impl wit_agent_memory::Host for TalosContext {
             Some(p) => p,
             None => return Err(wit_agent_memory::Error::NotAvailable),
         };
+        // A rehearsal that leaves writes unapplied answers here, after every
+        // gate that decides whether the write MAY be made has run.
+        if let Some(r) = &self.memory_rehearsal {
+            r.record_write("set", &key);
+            if r.discards_writes() {
+                return Ok(());
+            }
+        }
         let json_val: serde_json::Value =
             serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
         let result = match call_memory_op(
@@ -286,6 +300,12 @@ impl wit_agent_memory::Host for TalosContext {
             Some(p) => p,
             None => return Err(wit_agent_memory::Error::NotAvailable),
         };
+        if let Some(r) = &self.memory_rehearsal {
+            r.record_write("delete", &key);
+            if r.discards_writes() {
+                return Ok(());
+            }
+        }
         match call_memory_op(
             actor_id,
             nats,
@@ -319,6 +339,9 @@ impl wit_agent_memory::Host for TalosContext {
             Some(p) => p,
             None => return Err(wit_agent_memory::Error::NotAvailable),
         };
+        if let Some(r) = &self.memory_rehearsal {
+            r.record_list(prefix.as_deref());
+        }
         match call_memory_op(
             actor_id,
             nats,
@@ -365,6 +388,12 @@ impl wit_agent_memory::Host for TalosContext {
             Some(p) => p,
             None => return Err(wit_agent_memory::Error::NotAvailable),
         };
+        if let Some(r) = &self.memory_rehearsal {
+            r.record_write("store_with_embedding", &entry.key);
+            if r.discards_writes() {
+                return Ok(());
+            }
+        }
         // The guest provides `value` as a plain string. Preserve it literally —
         // `get` MUST return the same bytes back. Parse into a JSON value if it
         // looks like JSON (so the DB gets a typed payload and `jsonb_path_ops`
@@ -438,6 +467,9 @@ impl wit_agent_memory::Host for TalosContext {
             Some(p) => p,
             None => return Ok(vec![]),
         };
+        if let Some(r) = &self.memory_rehearsal {
+            r.record_search();
+        }
         // Dedupe + strip empties so the signed canonical bytes are stable
         // regardless of caller-supplied input shape. A guest passing
         // `["meeting_prep", "meeting_prep", ""]` signs the same bytes as

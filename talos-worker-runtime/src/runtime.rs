@@ -371,6 +371,10 @@ pub struct SecurityPolicy {
     /// Keeps the responses a real `test_module` run receives, for later
     /// replay. `None` everywhere else, and not on the wire.
     pub http_capture: Option<std::sync::Arc<crate::http_replay::HttpCapture>>,
+    /// Records an in-process rehearsal's memory calls and, when asked, leaves
+    /// its memory writes unapplied ([`crate::memory_rehearsal`]). `None`
+    /// everywhere else, and not on the wire.
+    pub memory_rehearsal: Option<std::sync::Arc<crate::memory_rehearsal::MemoryRehearsal>>,
     /// Charges the run's fuel to the host calls it was spent between
     /// ([`crate::fuel_profile`]). `None` everywhere else, and not on the wire:
     /// only a run that asks pays for the call hook.
@@ -4573,6 +4577,7 @@ impl TalosRuntime {
         // A rehearsal's recorded HTTP answers (None on every dispatched job).
         context.http_replay = security_policy.http_replay.clone();
         context.http_capture = security_policy.http_capture.clone();
+        context.memory_rehearsal = security_policy.memory_rehearsal.clone();
 
         // Enable dry-run mode if requested (mocks non-GET HTTP, webhook, messaging calls).
         if dry_run {
