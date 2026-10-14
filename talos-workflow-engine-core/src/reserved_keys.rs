@@ -1021,6 +1021,39 @@ pub const LOOP_ITERATION: &str = "__loop_iteration";
 /// can read the trigger payload even after intermediate transforms.
 pub const TRIGGER_INPUT: &str = "__trigger_input__";
 
+/// How the run a node belongs to was started: `{"kind": "<kind>"}`, where the
+/// kind is the word `list_executions` shows in `started_by.kind`
+/// (`action_link`, `manual`, `schedule`, `webhook`, `test`, …). Kind only:
+/// never the link id, the token, the user id or the channel id. A child run
+/// carries its parent's. Set-or-REMOVE on every module dispatch, so a module
+/// can tell a tap on an action link from a run started by hand or a
+/// rehearsal without a field of the workflow author's own (2026-10-14).
+pub const STARTED_BY: &str = "__started_by__";
+
+/// The longest start kind the engine will carry. The kinds are the
+/// platform's own words, so the bound only matters for a row something else
+/// wrote.
+pub const STARTED_BY_KIND_MAX_CHARS: usize = 64;
+
+/// Write [`STARTED_BY`] onto an assembled node input, set-or-REMOVE: with a
+/// kind, `{"kind": kind}` (capped to [`STARTED_BY_KIND_MAX_CHARS`]); without
+/// one, the key is removed, so a copy riding in on caller data never stands
+/// in for the engine's.
+pub fn apply_started_by(
+    merged: &mut serde_json::Map<String, serde_json::Value>,
+    kind: Option<&str>,
+) {
+    match kind.filter(|k| !k.is_empty()) {
+        Some(k) => {
+            let k: String = k.chars().take(STARTED_BY_KIND_MAX_CHARS).collect();
+            merged.insert(STARTED_BY.to_string(), serde_json::json!({ "kind": k }));
+        }
+        None => {
+            merged.remove(STARTED_BY);
+        }
+    }
+}
+
 // ── Engine-authored INPUT keys: the strip list ───────────────────────
 
 /// Every `__`-prefixed key the ENGINE writes onto a node's INPUT and a
@@ -1037,6 +1070,8 @@ pub const TRIGGER_INPUT: &str = "__trigger_input__";
 /// * [`TRIGGER_INPUT`] — the root trigger payload every hop preserves.
 /// * [`STALENESS`] — the freshness verdict ("inputs verified fresh").
 /// * [`DEGRADED_INPUTS`] — the completeness verdict, spoofable both ways.
+/// * [`STARTED_BY`] — how the run was started; a supplied copy would let a
+///   rehearsal or a manual run pass for a tap on an action link.
 ///
 /// Three places apply it, and the reason there are three is the reason
 /// the list has one home:
@@ -1073,6 +1108,7 @@ pub const ENGINE_AUTHORED_INPUT_KEYS: &[&str] = &[
     TRIGGER_INPUT,
     STALENESS,
     DEGRADED_INPUTS,
+    STARTED_BY,
 ];
 
 /// Remove every [`ENGINE_AUTHORED_INPUT_KEYS`] key from `input`.

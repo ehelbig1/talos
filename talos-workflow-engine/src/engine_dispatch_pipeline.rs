@@ -589,6 +589,12 @@ impl ParallelWorkflowEngine {
                     obj,
                     degraded_inputs.clone(),
                 );
+                // How the run was started, on the chain head as every other
+                // engine-authored key here.
+                talos_workflow_engine_core::reserved_keys::apply_started_by(
+                    obj,
+                    self.started_by_kind().as_deref(),
+                );
             }
             first.input_payload = wrapped;
         }

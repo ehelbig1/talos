@@ -3065,6 +3065,10 @@ impl ParallelWorkflowEngine {
             if let Some(ref ti) = trigger_input_val {
                 merged_input.insert("__trigger_input__".to_string(), ti.clone());
             }
+            talos_workflow_engine_core::reserved_keys::apply_started_by(
+                &mut merged_input,
+                self.started_by_kind().as_deref(),
+            );
             merged_input
                 .entry("iteration_count".to_string())
                 .or_insert(serde_json::json!(iteration));

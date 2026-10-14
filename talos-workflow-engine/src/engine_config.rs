@@ -521,6 +521,35 @@ impl ParallelWorkflowEngine {
         self.child_run_recorder = Some(recorder);
     }
 
+    /// Read each top-level run's start kind from its execution row when the
+    /// run starts (`__started_by__`). Wired by the controller engine builder;
+    /// absent out-of-tree, where the key is simply not written.
+    pub fn set_started_by_resolver(
+        &mut self,
+        resolver: Arc<dyn talos_workflow_engine_core::StartedByResolver>,
+    ) {
+        self.started_by_resolver = Some(resolver);
+    }
+
+    /// Set the start kind every module dispatch of this engine receives as
+    /// `__started_by__`. `None` removes it. A run with a resolver overwrites
+    /// this when it starts.
+    pub fn set_started_by_kind(&self, kind: Option<String>) {
+        if let Ok(mut held) = self.started_by.write() {
+            *held = kind.map(|k| {
+                k.chars()
+                    .take(talos_workflow_engine_core::reserved_keys::STARTED_BY_KIND_MAX_CHARS)
+                    .collect()
+            });
+        }
+    }
+
+    /// The start kind this engine hands its module dispatches, if known.
+    #[must_use]
+    pub fn started_by_kind(&self) -> Option<String> {
+        self.started_by.read().ok().and_then(|k| k.clone())
+    }
+
     /// Replace the default module-execution store. Consumers that
     /// don't have a Postgres-backed module store plug in their own
     /// impl (capture, append log, no-op) here.

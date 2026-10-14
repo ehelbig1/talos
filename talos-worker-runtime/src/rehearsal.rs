@@ -19,6 +19,14 @@ use crate::http_replay::HttpFixture;
 /// Both engine keys are set LAST and only from their dedicated argument,
 /// set-or-REMOVE as the engine writes them, so a same-named key inside
 /// `config` or `input` cannot stand in for either.
+/// The key a module reads to learn how its run was started; the engine's
+/// `talos_workflow_engine_core::reserved_keys::STARTED_BY`, spelled here
+/// because the worker runtime does not depend on the engine core.
+pub const REHEARSAL_STARTED_BY_KEY: &str = "__started_by__";
+
+/// What every rehearsal says started it.
+pub const REHEARSAL_STARTED_BY_KIND: &str = "test";
+
 pub fn node_payload(
     config: &serde_json::Value,
     input: &serde_json::Value,
@@ -58,6 +66,13 @@ pub fn node_payload(
             merged.remove("__trigger_input__");
         }
     }
+    // A rehearsal is a test run, and says so the way the engine says how a
+    // workflow run was started. Set last, so a `__started_by__` inside
+    // `config` or `input` never stands in for it.
+    merged.insert(
+        REHEARSAL_STARTED_BY_KEY.to_string(),
+        serde_json::json!({ "kind": REHEARSAL_STARTED_BY_KIND }),
+    );
     serde_json::Value::Object(merged)
 }
 

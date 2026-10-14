@@ -50,6 +50,10 @@ decide, act — are reader, decider, sender; keeper and composer sit between.
 * A source weaker than authenticated mail (a reply box, a webhook) may only
   ADD, never close, drop or move (`docs/capture-contract.md`).
 * An unreadable store is an error, never an empty store that overwrites it.
+* A keeper that records what a person did (a tap, a step) tells their act from
+  a rehearsal or a run started by hand with `__started_by__.kind`
+  (`action_link`, `manual`, `schedule`, `test`, …), which the engine writes on
+  every module's input. Not with a trigger field of its own.
 
 **Composer.**
 * Renders; does not decide. Escapes every model-written string. Says when an

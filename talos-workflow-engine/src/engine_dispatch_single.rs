@@ -478,6 +478,12 @@ impl ParallelWorkflowEngine {
                     merged.remove(talos_workflow_engine_core::reserved_keys::TRIGGER_INPUT);
                 }
             }
+            // How the run was started (kind only), set-or-REMOVE like the
+            // keys above: a copy in caller data never stands in for it.
+            talos_workflow_engine_core::reserved_keys::apply_started_by(
+                &mut merged,
+                self.started_by_kind().as_deref(),
+            );
             serde_json::Value::Object(merged)
         };
 
