@@ -88,7 +88,156 @@ pub fn collect_success_output(
             serde_json::to_value(&ctx.node_timings).unwrap_or_default(),
         );
     }
+    attach_child_runs(&mut output, engine.child_run_outputs());
     talos_dlp_provider::redact_json(&Value::Object(output))
+}
+
+/// The reserved key a run's child-run record is stored under
+/// (see [`talos_workflow_engine::child_run_outputs`]).
+pub use talos_workflow_engine::child_run_outputs::CHILD_RUNS_KEY;
+
+/// Put a run's child-run record (`engine.child_run_outputs()`) into its
+/// stored output under [`CHILD_RUNS_KEY`] — but only when the whole output
+/// still fits [`talos_dlp_provider::MAX_EXECUTION_PAYLOAD_BYTES`]. The
+/// ceiling replaces an over-size payload with a truncation marker as a
+/// whole, so a record that pushed a payload over it would cost the run the
+/// outputs it stored before the record existed. When it does not fit, the
+/// key says so and nothing else is lost.
+///
+/// The record is DLP-redacted here, so a caller that has already redacted
+/// the rest of the output can attach it afterwards.
+pub fn attach_child_runs(output: &mut Map<String, Value>, child_runs: Option<Value>) {
+    let Some(child_runs) = child_runs else {
+        return;
+    };
+    let size = |v: &Value| serde_json::to_vec(v).map_or(usize::MAX, |b| b.len());
+    let record_bytes = size(&child_runs);
+    let rest_bytes = serde_json::to_vec(&*output).map_or(usize::MAX, |b| b.len());
+    // The key, its quotes, a colon and a comma.
+    let overhead = CHILD_RUNS_KEY.len() + 4;
+    let fits = rest_bytes
+        .saturating_add(record_bytes)
+        .saturating_add(overhead)
+        <= talos_dlp_provider::MAX_EXECUTION_PAYLOAD_BYTES;
+    let value = if fits {
+        talos_dlp_provider::redact_json(&child_runs)
+    } else {
+        serde_json::json!({
+            "__omitted__": {
+                "reason": "too_large",
+                "bytes": record_bytes,
+                "limit_bytes": talos_dlp_provider::MAX_EXECUTION_PAYLOAD_BYTES
+                    .saturating_sub(rest_bytes),
+            }
+        })
+    };
+    output.insert(CHILD_RUNS_KEY.to_string(), value);
+}
+
+/// The longest node path [`resolve_child_run_path`] follows: the engine's
+/// own nesting limit, so a path no run could have produced is refused.
+pub const MAX_CHILD_RUN_PATH_LEN: usize = talos_workflow_engine::DEFAULT_MAX_SUBFLOW_DEPTH;
+
+/// Why a node path could not be followed through a stored child-run record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildRunPathError {
+    /// The path was empty or longer than [`MAX_CHILD_RUN_PATH_LEN`].
+    BadPath,
+    /// The run stored no child-run record: no node of it ran a child, it
+    /// ran before records were kept (2026-10-14), or the record did not fit
+    /// the payload ceiling (`omitted` says which).
+    NoRecord {
+        /// `Some` when the record was left out for size.
+        omitted: Option<Value>,
+    },
+    /// Step `step` (0-based) names a node that ran no child at that level.
+    NotFound {
+        /// Index of the path element that was not found.
+        step: usize,
+        /// The node labels that did run a child at that level.
+        available: Vec<String>,
+    },
+    /// Step `step` reached a run whose outputs were left out for size, so
+    /// the path cannot go further.
+    OutputsOmitted {
+        /// Index of the path element whose run was left out.
+        step: usize,
+        /// What the record says about the omission.
+        detail: Value,
+    },
+}
+
+/// Follow `path` (node labels, outermost first) through the child-run
+/// record stored in an execution's `output_data` and return the last
+/// node's entry: `{runs: [...], runs_not_kept}`, each run with its
+/// `nodes` outputs and the labels of any `child_runs` beneath it.
+///
+/// At an intermediate step the path follows that node's NEWEST run, which
+/// is the run whose output the parent received (a `sub_workflow` node runs
+/// exactly one). Pure: the caller has already checked that the execution
+/// is the caller's, and what is read here was DLP-redacted when stored.
+///
+/// # Errors
+/// [`ChildRunPathError`], one variant per reason, so a caller can say
+/// which.
+pub fn resolve_child_run_path(
+    output_data: &Value,
+    path: &[String],
+) -> Result<Value, ChildRunPathError> {
+    if path.is_empty() || path.len() > MAX_CHILD_RUN_PATH_LEN {
+        return Err(ChildRunPathError::BadPath);
+    }
+    let mut level = match output_data.get(CHILD_RUNS_KEY) {
+        Some(v) if v.get("__omitted__").is_some() => {
+            return Err(ChildRunPathError::NoRecord {
+                omitted: v.get("__omitted__").cloned(),
+            })
+        }
+        Some(v) if v.is_object() => v,
+        _ => return Err(ChildRunPathError::NoRecord { omitted: None }),
+    };
+    for (step, label) in path.iter().enumerate() {
+        let Some(entry) = level.get(label.as_str()) else {
+            let available = level
+                .as_object()
+                .map(|o| o.keys().filter(|k| !k.starts_with("__")).cloned().collect())
+                .unwrap_or_default();
+            return Err(ChildRunPathError::NotFound { step, available });
+        };
+        if step + 1 == path.len() {
+            return Ok(entry.clone());
+        }
+        let newest = entry
+            .get("runs")
+            .and_then(Value::as_array)
+            .and_then(|r| r.last());
+        if let Some(detail) = newest.and_then(|r| r.get("outputs_omitted")) {
+            return Err(ChildRunPathError::OutputsOmitted {
+                step,
+                detail: detail.clone(),
+            });
+        }
+        level = match newest.and_then(|r| r.get("child_runs")) {
+            Some(next) => next,
+            None => {
+                return Err(ChildRunPathError::NotFound {
+                    step: step + 1,
+                    available: Vec::new(),
+                })
+            }
+        };
+    }
+    Err(ChildRunPathError::BadPath)
+}
+
+/// [`attach_child_runs`] for a caller that holds the stored output as a
+/// `Value` (already redacted or not: the record is redacted on its own).
+/// A non-object output is returned unchanged.
+pub fn with_child_runs(mut stored: Value, engine: &ParallelWorkflowEngine) -> Value {
+    if let Some(obj) = stored.as_object_mut() {
+        attach_child_runs(obj, engine.child_run_outputs());
+    }
+    stored
 }
 
 /// The most the completed nodes' outputs of a FAILED run may weigh, as JSON,
@@ -178,10 +327,13 @@ pub fn collect_failure_output(
     engine: &ParallelWorkflowEngine,
     trigger_input_for_storage: &Value,
 ) -> Value {
-    failure_output(
-        engine.node_labels(),
-        engine.take_partial_results(),
-        Some(trigger_input_for_storage),
+    with_child_runs(
+        failure_output(
+            engine.node_labels(),
+            engine.take_partial_results(),
+            Some(trigger_input_for_storage),
+        ),
+        engine,
     )
 }
 
@@ -191,7 +343,10 @@ pub fn collect_failure_output(
 ///
 /// TAKES the engine's partial results, so call it once per failed run.
 pub fn collect_failed_run_outputs(engine: &ParallelWorkflowEngine) -> Option<Value> {
-    let output = failure_output(engine.node_labels(), engine.take_partial_results(), None);
+    let output = with_child_runs(
+        failure_output(engine.node_labels(), engine.take_partial_results(), None),
+        engine,
+    );
     output
         .as_object()
         .is_some_and(|o| !o.is_empty())
@@ -355,6 +510,112 @@ mod tests {
     //! indirectly via `collect_success_output_inner` — same logic,
     //! but `node_labels` is passed in directly. The public function
     //! is a thin shim that delegates.
+
+    // ── child-run record (2026-10-14) ─────────────────────────────────────
+
+    fn stored_with_chain() -> Value {
+        serde_json::json!({
+            "assess": {"ok": true},
+            CHILD_RUNS_KEY: {
+                "assess": {"runs_not_kept": 0, "runs": [{
+                    "status": "completed",
+                    "nodes": {"read": {"ticket": "t"}},
+                    "child_runs": {"brief": {"runs_not_kept": 0, "runs": [{
+                        "status": "completed",
+                        "nodes": {"draft": {"d": 1}, "notify": {"n": 2}}
+                    }]}}
+                }]}
+            }
+        })
+    }
+
+    fn path(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_path_reaches_a_grandchilds_every_node() {
+        let entry =
+            resolve_child_run_path(&stored_with_chain(), &path(&["assess", "brief"])).unwrap();
+        assert_eq!(entry["runs"][0]["nodes"]["draft"]["d"], 1);
+        assert_eq!(entry["runs"][0]["nodes"]["notify"]["n"], 2);
+    }
+
+    #[test]
+    fn a_wrong_step_names_what_ran_a_child_there() {
+        let err = resolve_child_run_path(&stored_with_chain(), &path(&["read"])).unwrap_err();
+        assert_eq!(
+            err,
+            ChildRunPathError::NotFound {
+                step: 0,
+                available: vec!["assess".to_string()]
+            }
+        );
+        let err = resolve_child_run_path(&stored_with_chain(), &path(&["assess", "brief", "x"]))
+            .unwrap_err();
+        assert!(
+            matches!(err, ChildRunPathError::NotFound { step: 2, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_without_a_record_or_a_bad_path_says_so() {
+        assert_eq!(
+            resolve_child_run_path(&serde_json::json!({"a": 1}), &path(&["a"])),
+            Err(ChildRunPathError::NoRecord { omitted: None })
+        );
+        assert_eq!(
+            resolve_child_run_path(&stored_with_chain(), &[]),
+            Err(ChildRunPathError::BadPath)
+        );
+        let too_long = vec!["a".to_string(); MAX_CHILD_RUN_PATH_LEN + 1];
+        assert_eq!(
+            resolve_child_run_path(&stored_with_chain(), &too_long),
+            Err(ChildRunPathError::BadPath)
+        );
+    }
+
+    #[test]
+    fn a_record_that_would_overflow_the_payload_ceiling_is_left_out_and_says_so() {
+        let mut out = Map::new();
+        out.insert(
+            "big".to_string(),
+            Value::String("x".repeat(talos_dlp_provider::MAX_EXECUTION_PAYLOAD_BYTES - 100)),
+        );
+        attach_child_runs(
+            &mut out,
+            Some(serde_json::json!({"n": {"runs": ["y".repeat(200)]}})),
+        );
+        assert_eq!(out[CHILD_RUNS_KEY]["__omitted__"]["reason"], "too_large");
+        assert!(
+            serde_json::to_vec(&out).unwrap().len()
+                <= talos_dlp_provider::MAX_EXECUTION_PAYLOAD_BYTES,
+            "the record must never push a payload that fitted over the ceiling"
+        );
+        let err = resolve_child_run_path(&Value::Object(out), &path(&["n"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ChildRunPathError::NoRecord { omitted: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn a_record_that_fits_is_stored_redacted() {
+        let mut out = Map::new();
+        attach_child_runs(
+            &mut out,
+            Some(
+                serde_json::json!({"n": {"runs": [{"nodes": {"k": "Bearer ghp_abcdefghijklmnopqrstuvwx12"}}]}}),
+            ),
+        );
+        assert!(!serde_json::to_string(&out)
+            .unwrap()
+            .contains("ghp_abcdefghijklmnopqrstuvwx12"));
+        let mut none = Map::new();
+        attach_child_runs(&mut none, None);
+        assert!(none.is_empty(), "no record, no key");
+    }
 
     use super::*;
     use std::collections::HashMap;

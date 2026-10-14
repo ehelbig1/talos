@@ -1526,6 +1526,11 @@ impl ParallelWorkflowEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
         let child_actor_id = sub_engine.actor_id;
+        // Built before the run so the child engine knows where it sits: the
+        // children IT dispatches then name the top-level execution and their
+        // full node path (`sub_workflow_runs.root_execution_id`/`node_path`).
+        let reporter = self.child_run_reporter(origin);
+        sub_engine.subflow_lineage = reporter.child_lineage();
 
         let run = sub_engine
             .run_with_seed_with_transport(
@@ -1536,9 +1541,25 @@ impl ParallelWorkflowEngine {
             )
             .await;
 
+        // The child's node outputs are kept for the parent run's stored
+        // output whichever way it ended (`crate::child_run_outputs`). A
+        // failed child keeps what its completed nodes committed.
         let outcome = match run {
-            Ok(ctx) => Ok(Self::collapse_subworkflow_output(&ctx.results, &sub_engine)),
-            Err(e) => Err(SubflowError::ExecutionFailed(e.to_string())),
+            Ok(ctx) => {
+                let collapsed = Self::collapse_subworkflow_output(&ctx.results, &sub_engine);
+                reporter.keep_outputs(
+                    sub_wf_id,
+                    !talos_workflow_engine_core::reserved_keys::output_reports_error(&collapsed),
+                    &sub_engine,
+                    Some(&ctx.results),
+                );
+                Ok(collapsed)
+            }
+            Err(e) => {
+                let partial = sub_engine.take_partial_results();
+                reporter.keep_outputs(sub_wf_id, false, &sub_engine, partial.as_ref());
+                Err(SubflowError::ExecutionFailed(e.to_string()))
+            }
         };
 
         // ONE write site for the whole child-run ledger (RFC 0012). AWAITED,
@@ -1562,7 +1583,7 @@ impl ParallelWorkflowEngine {
                 error: Some(e.clone().message(Self::origin_kind_label(origin))),
             },
         };
-        self.child_run_reporter(origin)
+        reporter
             .record(
                 sub_wf_id,
                 user_id,

@@ -104,7 +104,10 @@ pub async fn record_async_run(
     let record = classify_async_run(&run);
     match (record, run) {
         (AsyncRunRecord::Completed | AsyncRunRecord::Waiting, Ok(ctx)) => {
-            let stored = talos_dlp_provider::redact_json(&run_output(engine, &ctx));
+            let stored = talos_execution_result_collector::with_child_runs(
+                talos_dlp_provider::redact_json(&run_output(engine, &ctx)),
+                engine,
+            );
             let written = if record == AsyncRunRecord::Waiting {
                 wf_repo.mark_execution_waiting(execution_id, &stored).await
             } else {

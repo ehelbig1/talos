@@ -3252,6 +3252,12 @@ async fn run_scheduled_execution(
                     serde_json::to_value(&ctx.node_timings).unwrap_or_default(),
                 );
             }
+            // The node outputs of the child runs this run's nodes dispatched
+            // (`get_sub_workflow_output`'s `path`), when they fit.
+            talos_execution_result_collector::attach_child_runs(
+                &mut aggregated_output,
+                engine.child_run_outputs(),
+            );
             let aggregated_json =
                 talos_dlp_provider::redact_json(&serde_json::Value::Object(aggregated_output));
 

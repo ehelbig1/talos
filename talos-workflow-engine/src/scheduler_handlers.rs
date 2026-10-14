@@ -2187,6 +2187,7 @@ impl ParallelWorkflowEngine {
         // engine begins running, exactly as at the P1 chokepoint. A missing
         // graph or a build failure above is not a child RUN and gets no row.
         let reporter = self.child_run_reporter(run_site.with_kind(origin.child_dispatch_kind()));
+        sub_engine.subflow_lineage = reporter.child_lineage();
         let started = std::time::Instant::now();
         let started_at_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2222,9 +2223,20 @@ impl ParallelWorkflowEngine {
                     }
                     sub_outputs.insert(key, ParallelWorkflowEngine::unwrap_output(output).clone());
                 }
-                serde_json::Value::Object(sub_outputs)
+                let out = serde_json::Value::Object(sub_outputs);
+                reporter.keep_outputs(
+                    sub_wf_id,
+                    !talos_workflow_engine_core::reserved_keys::output_reports_error(&out),
+                    &sub_engine,
+                    Some(&ctx.results),
+                );
+                out
             }
-            Err(e) => origin.run_error(sub_wf_id, e),
+            Err(e) => {
+                let partial = sub_engine.take_partial_results();
+                reporter.keep_outputs(sub_wf_id, false, &sub_engine, partial.as_ref());
+                origin.run_error(sub_wf_id, e)
+            }
         };
 
         // ONE write site for the whole ledger — the same
@@ -2453,6 +2465,7 @@ impl ParallelWorkflowEngine {
                             // and recording the parent's would be wrong in the
                             // one field an operator uses to attribute a run.
                             iter_actor_id = sub_engine.actor_id;
+                            sub_engine.subflow_lineage = reporter.child_lineage();
                             let sub_execution_id = Uuid::new_v4();
                             let trigger_node_id = Uuid::new_v4();
                             sub_engine.add_node(trigger_node_id, None, None, None);
@@ -2544,16 +2557,25 @@ impl ParallelWorkflowEngine {
                                     // finished-signal check at the top level misses
                                     // the flag — the loop runs to max_iterations
                                     // despite the body clearly signalling done.
-                                    if sub_outputs.len() == 1 {
+                                    let iter_out = if sub_outputs.len() == 1 {
                                         sub_outputs
                                             .into_values()
                                             .next()
                                             .unwrap_or(serde_json::Value::Null)
                                     } else {
                                         serde_json::Value::Object(sub_outputs)
-                                    }
+                                    };
+                                    reporter.keep_outputs(
+                                        body_wf_id,
+                                        !talos_workflow_engine_core::reserved_keys::output_reports_error(&iter_out),
+                                        &sub_engine,
+                                        Some(&ctx.results),
+                                    );
+                                    iter_out
                                 }
                                 Err(e) => {
+                                    let partial = sub_engine.take_partial_results();
+                                    reporter.keep_outputs(body_wf_id, false, &sub_engine, partial.as_ref());
                                     tracing::warn!(
                                         iteration,
                                         error = %e,

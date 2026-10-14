@@ -2609,7 +2609,10 @@ impl WebhookRouter {
                     // Persist the SCRUBBED output to workflow_executions, return
                     // the UNSCRUBBED output to the caller — they triggered the
                     // request and own the data; the audit log is what gets DLP.
-                    let scrubbed_for_storage = talos_dlp_provider::redact_json(&output_value);
+                    let scrubbed_for_storage = talos_execution_result_collector::with_child_runs(
+                        talos_dlp_provider::redact_json(&output_value),
+                        &engine,
+                    );
                     // MCP-682 (2026-05-13): route through encryption-aware
                     // repository so sync-response webhook completions land
                     // in `output_data_enc` on Phase A deployments. Pre-fix
