@@ -181,9 +181,13 @@ fn boxed(err: impl std::fmt::Display) -> BoxError {
 impl SecretsResolver for ControllerSecretsResolver {
     async fn resolve_module_secrets(
         &self,
-        node_id: Uuid,
+        module_id: Uuid,
+        user_id: Option<Uuid>,
     ) -> Result<HashMap<String, String>, BoxError> {
-        self.sm.get_module_secrets(node_id).await.map_err(boxed)
+        self.sm
+            .get_module_secrets_for(module_id, user_id)
+            .await
+            .map_err(boxed)
     }
 
     async fn resolve_by_paths(

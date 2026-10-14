@@ -37,7 +37,14 @@ async fn test_store_and_retrieve_credentials() -> Result<()> {
     let access_token = "test-access-token";
     let scope = "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email";
 
+    // `allowed_modules` may name only a module the user can run.
     let module_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO modules (id, user_id, name, kind) VALUES ($1, $2, $3, 'sandbox')")
+        .bind(module_id)
+        .bind(user_id)
+        .bind(format!("oauth-scoped-{module_id}"))
+        .execute(&pool)
+        .await?;
 
     oauth_service
         .store_credentials(

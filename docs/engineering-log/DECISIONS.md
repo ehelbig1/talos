@@ -1694,6 +1694,7 @@ enforced by `clippy.toml`.
   95. every execution-row insert runs the actor budget check
   96. the CLAUDE.md engineering-log split lost nothing
   97. a documented env var with NO default must be TRANSPORTED
+  98. a module-grant secret read names the user it reads for
 
 ### The actor write ceiling → [`2026-10-05-actor-write-ceiling.md`](docs/engineering-log/2026-10-05-actor-write-ceiling.md)
 

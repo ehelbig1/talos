@@ -9529,6 +9529,51 @@ fi
 
 echo
 
+bold "▶ check 98: a module-grant secret read names the user it reads for"
+
+# `secrets.allowed_modules` grants a secret to a MODULE id, and a module id is
+# not a tenant: a catalog module, or one shared with an organization, is
+# dispatched by many users. Until 2026-10-14 the engine's `SecretsResolver`
+# read `WHERE $1 = ANY(allowed_modules)` with no owner predicate
+# (`SecretsManager::get_module_secrets(module_id)`), so a secret one user
+# granted to a shared module was decrypted and sealed into every other user's
+# job of that module (security review 2026-10-14, C-1). The unscoped method
+# was deleted; the read is `get_module_secrets_for(module_id, user_id)` /
+# `get_module_secrets_for_user`, and the trait method takes the user.
+#
+# This check refuses the unscoped name coming back, as a definition or a call,
+# anywhere in the tree. Comment lines are skipped (the doc comments that tell
+# the story name it). Opt-out: `// allow-unscoped-module-secrets: <reason>` on
+# the line or one of the 3 above it — there is no known legitimate use.
+# Measured: 2 hits on main @ 8192b6e0 (the definition in talos-secrets-manager
+# and the engine resolver's call in talos-oauth — both the defect), 0 after,
+# 0 false positives. Limit: a textual match — an alias or a function pointer
+# to a re-added unscoped method would not be seen; the trait signature, which
+# requires the user, is the stronger guard.
+CK98_HITS=0
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"; rest="${hit#*:}"; lineno="${rest%%:*}"; text="${rest#*:}"
+    case "$(printf '%s' "$text" | sed -E 's/^[[:space:]]+//')" in //*) continue ;; esac
+    start=$((lineno > 3 ? lineno - 3 : 1))
+    if sed -n "${start},${lineno}p" "$file" | grep -q 'allow-unscoped-module-secrets:'; then
+        continue
+    fi
+    printf '  %s\n' "$hit"
+    CK98_HITS=$((CK98_HITS + 1))
+done < <(cd "$ROOT" && grep -rEn --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" \
+            '(^|[^A-Za-z0-9_])get_module_secrets[[:space:]]*\(' . 2>/dev/null || true)
+if [ "$CK98_HITS" -gt 0 ]; then
+    red "✗ $CK98_HITS unscoped module-grant secret read(s)"
+    yellow "  → call get_module_secrets_for(module_id, user_id) — a module id is shared by every user who runs it"
+    yellow "  → or mark it // allow-unscoped-module-secrets: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ no unscoped module-grant secret read"
+fi
+
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

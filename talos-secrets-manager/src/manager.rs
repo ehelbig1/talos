@@ -1378,6 +1378,9 @@ impl SecretsManager {
         allowed_modules: Vec<Uuid>,
         org_id: Option<Uuid>,
     ) -> Result<Uuid> {
+        self.refuse_unreachable_allowed_modules(&allowed_modules, creator_user_id)
+            .await?;
+
         // 1. Pre-generate secret_id so it's available as AAD.
         let secret_id = Uuid::new_v4();
 
@@ -1514,6 +1517,46 @@ impl SecretsManager {
         );
 
         Ok(secret_id)
+    }
+
+    /// Refuse an `allowed_modules` list that names a module the writer
+    /// cannot run: one that does not exist, or that is neither theirs, a
+    /// catalog module (no owner, no org) nor a module of an organization
+    /// they belong to. Every writer of `allowed_modules` calls this —
+    /// `create_secret` and `upsert_secret` — so no surface can grant a
+    /// secret to another tenant's module id (security review 2026-10-14,
+    /// C-1, the "poison" direction). One generic reason for every miss:
+    /// the caller is not told which id exists.
+    async fn refuse_unreachable_allowed_modules(
+        &self,
+        allowed_modules: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<()> {
+        if allowed_modules.is_empty() {
+            return Ok(());
+        }
+        let mut wanted: Vec<Uuid> = allowed_modules.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let reachable: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM modules m \
+             WHERE m.id = ANY($1) \
+               AND (m.user_id = $2 \
+                    OR (m.user_id IS NULL AND m.org_id IS NULL) \
+                    OR m.org_id IN (SELECT om.org_id FROM organization_members om \
+                                    WHERE om.user_id = $2))",
+        )
+        .bind(&wanted)
+        .bind(user_id)
+        .fetch_one(&self.db_pool)
+        .await
+        .context("Failed to check allowed_modules ownership")?;
+        if reachable != wanted.len() as i64 {
+            return Err(anyhow!(
+                "Validation: allowed_modules names a module that does not exist or that you cannot use"
+            ));
+        }
+        Ok(())
     }
 
     /// Retrieve and decrypt a secret
@@ -2580,24 +2623,27 @@ impl SecretsManager {
         aead_open_utf8(&dek.key, encrypted, aad)
     }
 
-    /// Fetch all secrets authorized for a specific module
-    pub async fn get_module_secrets(
+    /// The secrets whose `allowed_modules` names `module_id`, as seen by
+    /// `user_id`: `Some` → the user's own and global/system secrets
+    /// ([`get_module_secrets_for_user`](Self::get_module_secrets_for_user));
+    /// `None` → global/system secrets only (`owner_user_id IS NULL`, the
+    /// same rule `get_secrets_by_paths` applies to a user-less read).
+    ///
+    /// There is no unscoped read. A module id is not a tenant — a catalog
+    /// or org-shared module is dispatched by many users — and until
+    /// 2026-10-14 the engine's `SecretsResolver` read every secret granting
+    /// the module, so one user's grant was delivered into another user's
+    /// job (security review C-1). `scripts/lint-structural.sh` refuses a
+    /// reintroduced unscoped `get_module_secrets(`.
+    pub async fn get_module_secrets_for(
         &self,
         module_id: Uuid,
+        user_id: Option<Uuid>,
     ) -> Result<std::collections::HashMap<String, String>> {
-        // MCP-589 (2026-05-12): un-scoped wrapper. Cross-tenant
-        // safe ONLY when the caller guarantees `module_id` is private
-        // to a single user. For org-shared modules (created via
-        // `share_module_with_org`), use `get_module_secrets_for_user`
-        // and pass the workflow owner's user_id explicitly. The
-        // trait-side `SecretsResolver::resolve_module_secrets`
-        // (defined in the sibling talos-workflow-engine repo) still
-        // routes through here pending a sibling-repo signature
-        // change.
-        self.get_module_secrets_inner(module_id, None).await
+        self.get_module_secrets_inner(module_id, user_id).await
     }
 
-    /// User-scoped variant of `get_module_secrets`. Returns secrets
+    /// Returns secrets
     /// where `module_id` is in `allowed_modules` AND the secret is
     /// either owned by `user_id` or is a global/system secret
     /// (`owner_user_id IS NULL`). Use this in every dispatch path
@@ -2666,6 +2712,7 @@ impl SecretsManager {
                        encryption_format_version, expires_at, org_id
                 FROM secrets
                 WHERE $1 = ANY(allowed_modules)
+                  AND owner_user_id IS NULL
                 "#,
             )
             .bind(module_id)
@@ -3679,6 +3726,8 @@ impl SecretsManager {
         allowed_modules: Vec<Uuid>,
         org_id: Option<Uuid>,
     ) -> Result<(Uuid, bool)> {
+        self.refuse_unreachable_allowed_modules(&allowed_modules, creator_user_id)
+            .await?;
         // N T2-N1: id-bound AAD on upsert requires knowing the row's
         // `id` BEFORE the encrypt step. The previous single-round
         // `INSERT … ON CONFLICT … DO UPDATE` pattern can't supply that
