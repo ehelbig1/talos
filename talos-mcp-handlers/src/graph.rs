@@ -1072,14 +1072,23 @@ pub(crate) async fn upsert_system_node(
         .get("connect_to")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    if let Some(edges) = graph.get_mut("edges").and_then(|e| e.as_array_mut()) {
-        for from in &connect_from_sources {
-            edges.push(serde_json::json!({ "source": from, "target": &node_id }));
-        }
-        if let Some(ref to) = connect_to {
-            edges.push(serde_json::json!({ "source": &node_id, "target": to }));
-        }
-    }
+    // Put the node ON the path it was asked to sit on. An edge
+    // `connect_from → connect_to` that already exists is replaced (left in
+    // place it would carry the unprocessed output round the new node), its
+    // condition stays on the edge INTO the node, and no edge is added twice.
+    let replaced_edges = graph
+        .get_mut("edges")
+        .and_then(|e| e.as_array_mut())
+        .map(|edges| {
+            splice_node_before_condition(
+                edges,
+                &node_id,
+                &connect_from_sources,
+                connect_to.as_deref(),
+            )
+            .replaced
+        })
+        .unwrap_or_default();
 
     // `connect_from` / `connect_to` are edge writes like any other, and this
     // one helper backs every `add_*_node` tool — so the cycle gate belongs
@@ -1111,6 +1120,13 @@ pub(crate) async fn upsert_system_node(
     .await
     .message_suffix()
     .to_string();
+    // What the node replaced travels with the note every handler already
+    // shows (in `wiring_out`, or on its own in a bespoke reply), so no tool
+    // replaces an edge without saying so.
+    let auto_publish_note = format!(
+        "{}{auto_publish_note}",
+        replaced_edges_note(&replaced_edges, &node_id)
+    );
 
     let wiring_in = if !connect_from_sources.is_empty() {
         format!("\nWired: {} → {}", connect_from_sources.join(", "), node_id)
@@ -1268,7 +1284,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "connect_to": {
                         "type": "string",
-                        "description": "Optional: ID of an existing node to connect this loop node TO (adds a default edge). Avoids a separate add_edge call."
+                        "description": "Optional: ID of an existing node to connect this loop node TO (adds a default edge). Avoids a separate add_edge call. If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node."
                     }
                 },
                 "required": ["workflow_id", "node_id", "body_node_id", "condition"]
@@ -1287,7 +1303,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "description": "Node ID(s) to wire INTO this node (usually the trigger).",
                         "oneOf": [ { "type": "string" }, { "type": "array", "items": { "type": "string" } } ]
                     },
-                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this node TO (e.g. the compose node)." }
+                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this node TO (e.g. the compose node). If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id"]
             }
@@ -1305,7 +1321,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "description": "Node ID(s) to wire INTO this node (usually the trigger).",
                         "oneOf": [ { "type": "string" }, { "type": "array", "items": { "type": "string" } } ]
                     },
-                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this node TO (e.g. the compose node)." }
+                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this node TO (e.g. the compose node). If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id"]
             }
@@ -1342,7 +1358,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "connect_to": {
                         "type": "string",
-                        "description": "Optional: ID of an existing node to connect this node TO (e.g. the compose node)."
+                        "description": "Optional: ID of an existing node to connect this node TO (e.g. the compose node). If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node."
                     }
                 },
                 "required": ["workflow_id", "node_id"]
@@ -1375,7 +1391,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "connect_to": {
                         "type": "string",
-                        "description": "Optional: ID of an existing node to connect this node TO (e.g. the compose node)."
+                        "description": "Optional: ID of an existing node to connect this node TO (e.g. the compose node). If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node."
                     }
                 },
                 "required": ["workflow_id", "node_id"]
@@ -1427,7 +1443,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "connect_to": {
                         "type": "string",
-                        "description": "Optional: ID of an existing node to connect this node TO (e.g. a collect or compose node)."
+                        "description": "Optional: ID of an existing node to connect this node TO (e.g. a collect or compose node). If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node."
                     }
                 },
                 "required": ["workflow_id", "node_id"]
@@ -1498,7 +1514,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "connect_to": {
                         "type": "string",
-                        "description": "Optional: ID of an existing node to connect this collect node TO (adds a default edge)."
+                        "description": "Optional: ID of an existing node to connect this collect node TO (adds a default edge). If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node."
                     }
                 },
                 "required": ["workflow_id", "node_id"]
@@ -1533,7 +1549,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "connect_to": {
                         "type": "string",
-                        "description": "Optional: ID of an existing node to connect this sub-workflow node TO (adds a default edge). Avoids a separate add_edge call."
+                        "description": "Optional: ID of an existing node to connect this sub-workflow node TO (adds a default edge). Avoids a separate add_edge call. If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node."
                     }
                 },
                 "required": ["workflow_id", "node_id", "sub_workflow_id"]
@@ -1651,7 +1667,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "connect_to": {
                         "type": "string",
-                        "description": "Optional: ID of an existing node to connect this dispatch node TO (adds a default edge). Avoids a separate add_edge call."
+                        "description": "Optional: ID of an existing node to connect this dispatch node TO (adds a default edge). Avoids a separate add_edge call. If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node."
                     }
                 },
                 "required": ["workflow_id", "node_id", "required_capabilities"]
@@ -1752,7 +1768,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "description": "Behaviour when condition is false: 'error' (default, stops workflow with error) or 'passthrough' (forwards output with __verification_failed__: true)"
                     },
                     "connect_from": { "type": "string", "description": "Optional: ID of an existing node to connect FROM into this verify node." },
-                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this verify node TO." }
+                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this verify node TO. If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id", "condition"]
             }
@@ -1780,7 +1796,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             { "type": "array", "items": { "type": "string" } }
                         ]
                     },
-                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this synthesize node TO." }
+                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this synthesize node TO. If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id"]
             }
@@ -1805,7 +1821,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "inject_history": { "type": "boolean", "description": "Inject __agent_history__ array into each iteration input (default: true)" },
                     "timeout_secs": { "type": "number", "description": "Per-iteration execution timeout in seconds (default: 60). Always enforced — loop bodies have no enforce_timeout opt-in." },
                     "connect_from": { "type": "string", "description": "Optional: ID of an existing node to connect FROM into this agent loop node." },
-                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this agent loop node TO." }
+                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this agent loop node TO. If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id", "body_workflow_id"]
             }
@@ -1823,7 +1839,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "inject_history": { "type": "boolean", "description": "Inject prior iteration outputs as history into each iteration input (default: true)" },
                     "timeout_secs": { "type": "number", "description": "Per-iteration execution timeout in seconds (default: 60). Always enforced — loop bodies have no enforce_timeout opt-in." },
                     "connect_from": { "type": "string", "description": "Optional: ID of an existing node to connect FROM into this ReActLoop node." },
-                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this ReActLoop node TO." }
+                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this ReActLoop node TO. If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id", "body_workflow_id"]
             }
@@ -1838,7 +1854,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "node_id": { "type": "string", "description": "Unique string ID for the new Wait node" },
                     "message": { "type": "string", "description": "Optional human-readable message surfaced to whoever is resuming this wait (max 500 chars)" },
                     "connect_from": { "type": "string", "description": "Optional: ID of an existing node to connect FROM into this Wait node." },
-                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this Wait node TO (wires the resume path)." }
+                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this Wait node TO (wires the resume path). If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id"]
             }
@@ -1906,7 +1922,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             { "type": "array", "items": { "type": "string" } }
                         ]
                     },
-                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to" }
+                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id", "judge_workflow_id", "rubric"]
             }
@@ -1933,7 +1949,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             { "type": "array", "items": { "type": "string" } }
                         ]
                     },
-                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to" }
+                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id", "verdict_expr"]
             }
@@ -1984,7 +2000,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             { "type": "array", "items": { "type": "string" } }
                         ]
                     },
-                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to" }
+                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id", "child_workflow_id"]
             }
@@ -2007,7 +2023,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             { "type": "array", "items": { "type": "string" } }
                         ]
                     },
-                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to" }
+                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id"]
             }
@@ -2032,7 +2048,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             { "type": "array", "items": { "type": "string" } }
                         ]
                     },
-                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to" }
+                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id", "child_workflow_id", "reflection_workflow_id"]
             }
@@ -2057,7 +2073,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                             { "type": "array", "items": { "type": "string" } }
                         ]
                     },
-                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to" }
+                    "connect_to": { "type": "string", "description": "Optional node_id to wire an edge to If an edge connect_from → connect_to already exists it is REPLACED: the path runs through this node, and that edge's type and condition move to the edge into this node." }
                 },
                 "required": ["workflow_id", "node_id", "classifier_workflow_id", "routes"]
             }
@@ -4426,6 +4442,101 @@ pub(crate) fn splice_node_into_edges(
         }
     }
     Ok(wiring)
+}
+
+/// Put a node of ANY kind between `froms` and `to`: the splice every
+/// `add_*_node` tool makes through [`upsert_system_node`].
+///
+/// An edge `from → to` that exists is REPLACED by `from → node → to`. Left
+/// in place it is a way round the new node: a judge added "between compose
+/// and send" would be bypassed by the edge it was meant to sit on.
+///
+/// The replaced edge's type and condition go on the edge INTO the node. A
+/// condition is written against the output of the node it leaves, and most
+/// of these nodes change that output (a collect returns `{items, count}`, a
+/// dispatch returns its route), so on the far side the same expression would
+/// read a different shape. On the way in it reads what it always read; when
+/// it is false the new node does not run and neither does `to`, which is
+/// what the edge said before. Each source keeps its own condition, so
+/// several sources need not agree.
+///
+/// ([`splice_node_into_edges`], for `add_action_links_node`, keeps the
+/// condition on the way OUT: that node passes its input through unchanged,
+/// and that shape is the one its operator asked for.)
+///
+/// No edge is added twice, so calling a tool again for the same node does
+/// not duplicate its wiring.
+pub(crate) fn splice_node_before_condition(
+    edges: &mut Vec<serde_json::Value>,
+    node_id: &str,
+    froms: &[String],
+    to: Option<&str>,
+) -> LinkWiring {
+    let mut wiring = LinkWiring::default();
+    for from in froms {
+        // The edge this source had straight to `to`, if any (all copies of
+        // it are removed; the first one's terms are kept).
+        let mut terms = serde_json::Map::new();
+        if let Some(to) = to {
+            let mut kept = Vec::with_capacity(edges.len());
+            let mut found = false;
+            for edge in edges.drain(..) {
+                if edge_joins(&edge, from, to) {
+                    if !found {
+                        terms = edge_terms(&edge);
+                        found = true;
+                    }
+                    wiring.replaced.push(edge);
+                } else {
+                    kept.push(edge);
+                }
+            }
+            *edges = kept;
+        }
+        if !edges.iter().any(|edge| edge_joins(edge, from, node_id)) {
+            terms.insert("source".to_string(), serde_json::json!(from));
+            terms.insert("target".to_string(), serde_json::json!(node_id));
+            edges.push(serde_json::Value::Object(terms));
+            wiring.added.push((from.clone(), node_id.to_string()));
+        }
+    }
+    if let Some(to) = to {
+        if !edges.iter().any(|edge| edge_joins(edge, node_id, to)) {
+            edges.push(serde_json::json!({ "source": node_id, "target": to }));
+            wiring.added.push((node_id.to_string(), to.to_string()));
+        }
+    }
+    wiring
+}
+
+/// What a tool says when its node replaced existing edges: which, and where
+/// their condition went. Empty when nothing was replaced.
+fn replaced_edges_note(replaced: &[serde_json::Value], node_id: &str) -> String {
+    if replaced.is_empty() {
+        return String::new();
+    }
+    let which: Vec<String> = replaced
+        .iter()
+        .map(|edge| {
+            let end = |key: &str| {
+                edge.get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string()
+            };
+            let condition = edge
+                .get("condition")
+                .and_then(|v| v.as_str())
+                .map(|c| format!(" (condition `{}`)", talos_text_util::bounded_preview(c, 80)))
+                .unwrap_or_default();
+            format!("{} → {}{condition}", end("source"), end("target"))
+        })
+        .collect();
+    format!(
+        "\nReplaced existing edge(s): {}. Each now runs through '{node_id}', and its type and \
+         condition are on the edge INTO '{node_id}'.",
+        which.join("; ")
+    )
 }
 
 /// A second `add_action_links_node` call for a node id that exists: an
@@ -8517,6 +8628,89 @@ mod fan_in_posture_tests {
         let mut edges = vec![edge("a", "send"), edge("a", "send")];
         splice_node_into_edges(&mut edges, "links", &["a".to_string()], Some("send")).expect("ok");
         assert_eq!(edges, vec![edge("a", "links"), edge("links", "send")]);
+    }
+
+    /// The general splice, behind every `add_*_node` tool: the replaced
+    /// edge's condition stays on the way IN, where it reads the output it
+    /// was written against.
+    #[test]
+    fn any_node_put_on_an_existing_edge_replaces_it_and_keeps_the_condition_on_the_way_in() {
+        use super::{replaced_edges_note, splice_node_before_condition};
+        let conditional = json!({ "id": "e7", "source": "fetch", "target": "send",
+            "edge_type": "conditional", "condition": "count > 0" });
+        let mut edges = vec![edge("start", "fetch"), conditional.clone()];
+        let wiring =
+            splice_node_before_condition(&mut edges, "join", &["fetch".to_string()], Some("send"));
+        assert_eq!(
+            edges,
+            vec![
+                edge("start", "fetch"),
+                // Evaluated on `fetch`'s output, as before.
+                json!({ "source": "fetch", "target": "join",
+                        "edge_type": "conditional", "condition": "count > 0" }),
+                // The node's own output need not have `count` at all.
+                edge("join", "send"),
+            ]
+        );
+        assert_eq!(wiring.replaced, vec![conditional]);
+        let note = replaced_edges_note(&wiring.replaced, "join");
+        assert!(
+            note.contains("fetch → send (condition `count > 0`)"),
+            "{note}"
+        );
+        assert!(note.contains("on the edge INTO 'join'"), "{note}");
+        assert_eq!(replaced_edges_note(&[], "join"), "");
+
+        // Nothing to replace: the two edges are added, plain, as before.
+        let mut edges = vec![edge("start", "fetch")];
+        let wiring =
+            splice_node_before_condition(&mut edges, "join", &["fetch".to_string()], Some("send"));
+        assert!(wiring.replaced.is_empty());
+        assert_eq!(
+            edges,
+            vec![
+                edge("start", "fetch"),
+                edge("fetch", "join"),
+                edge("join", "send")
+            ]
+        );
+    }
+
+    #[test]
+    fn each_source_keeps_its_own_condition_and_a_repeat_call_adds_nothing() {
+        use super::splice_node_before_condition;
+        let froms = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut edges = vec![
+            json!({ "source": "a", "target": "send", "condition": "ok == true" }),
+            edge("b", "send"),
+            // `c` had no edge to `send`.
+            edge("c", "elsewhere"),
+        ];
+        let wiring = splice_node_before_condition(&mut edges, "collect", &froms, Some("send"));
+        assert_eq!(wiring.replaced.len(), 2);
+        assert_eq!(
+            edges,
+            vec![
+                edge("c", "elsewhere"),
+                json!({ "source": "a", "target": "collect", "condition": "ok == true" }),
+                edge("b", "collect"),
+                edge("c", "collect"),
+                edge("collect", "send"),
+            ]
+        );
+        // The same call again: nothing replaced, nothing added, nothing doubled.
+        let before = edges.clone();
+        let again = splice_node_before_condition(&mut edges, "collect", &froms, Some("send"));
+        assert!(again.replaced.is_empty() && again.added.is_empty());
+        assert_eq!(edges, before);
+
+        // Only one end named: no edge is replaced.
+        let mut edges = vec![edge("a", "send")];
+        splice_node_before_condition(&mut edges, "n", &["a".to_string()], None);
+        assert_eq!(edges, vec![edge("a", "send"), edge("a", "n")]);
+        let mut edges = vec![edge("a", "send")];
+        splice_node_before_condition(&mut edges, "n", &[], Some("send"));
+        assert_eq!(edges, vec![edge("a", "send"), edge("n", "send")]);
     }
 
     #[test]
