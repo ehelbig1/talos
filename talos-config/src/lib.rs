@@ -1,3 +1,5 @@
+pub mod fleet_identity;
+
 use std::env;
 use std::sync::LazyLock;
 

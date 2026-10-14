@@ -124,29 +124,47 @@ wt_describe() {
 # nothing for a side that gains no keys at this phase, so the caller can omit
 # the `env:` map entirely (Helm deep-merges these maps with values.yaml).
 
+# A production controller/worker refuses to boot while a surface it verifies
+# still accepts the fleet-shared WORKER_SHARED_KEY, unless
+# TALOS_ALLOW_LEGACY_FLEET_HMAC names that surface (security review
+# 2026-10-14, B-2; docs/worker-identity.md). Each phase acknowledges exactly
+# the surfaces it does not yet require, and nothing more:
+#   off..C  controller: result,rpc   worker: dispatch
+#   D       controller: rpc          worker: (none)
+# `rpc` stays acknowledged at D: the controller's own in-process rehearsal
+# runtime (run_sandbox, test_module) signs its RPCs with the fleet key, so
+# TALOS_RPC_REQUIRE_ED25519 would refuse them — an operator decision (D-8).
+
 # wt_render_controller_env <phase> <worker_pub_hex>
 wt_render_controller_env() {
     local phase="$1" wpub="$2"
-    wt_phase_at_least "$phase" A || return 0
-    printf '    TALOS_WORKER_PUBLIC_KEYS: "fleet=%s"\n' "$wpub"
+    if wt_phase_at_least "$phase" A; then
+        printf '    TALOS_WORKER_PUBLIC_KEYS: "fleet=%s"\n' "$wpub"
+    fi
     if wt_phase_at_least "$phase" C; then
         printf '    TALOS_DISPATCH_SCHEME: "ed25519"\n'
         printf '    TALOS_ENVELOPE_SEALING: "required"\n'
     fi
     if wt_phase_at_least "$phase" D; then
         printf '    TALOS_RESULT_REQUIRE_ED25519: "1"\n'
+        printf '    TALOS_ALLOW_LEGACY_FLEET_HMAC: "rpc"\n'
+    else
+        printf '    TALOS_ALLOW_LEGACY_FLEET_HMAC: "result,rpc"\n'
     fi
 }
 
 # wt_render_worker_env <phase> <controller_pub_hex>
 wt_render_worker_env() {
     local phase="$1" cpub="$2"
-    wt_phase_at_least "$phase" B || return 0
-    printf '    TALOS_WORKER_ID: "fleet"\n'
-    printf '    TALOS_CONTROLLER_PUBLIC_KEY: "%s"\n' "$cpub"
+    if wt_phase_at_least "$phase" B; then
+        printf '    TALOS_WORKER_ID: "fleet"\n'
+        printf '    TALOS_CONTROLLER_PUBLIC_KEY: "%s"\n' "$cpub"
+    fi
     if wt_phase_at_least "$phase" D; then
         printf '    TALOS_ENVELOPE_SEALING: "required"\n'
         printf '    TALOS_DISPATCH_REQUIRE_ED25519: "1"\n'
+    else
+        printf '    TALOS_ALLOW_LEGACY_FLEET_HMAC: "dispatch"\n'
     fi
 }
 

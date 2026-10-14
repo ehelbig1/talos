@@ -206,6 +206,7 @@ mod db_tests {
             &[],
             true,
             crate::GuestRoleSetting::Unset,
+            crate::test_actor(pool).await,
             Duration::from_secs(10),
         )
         .await
@@ -233,6 +234,7 @@ mod db_tests {
                 &[],
                 is_fetch,
                 crate::GuestRoleSetting::Unset,
+                crate::test_actor(&pool).await,
                 Duration::from_secs(10),
             )
             .await;
@@ -276,6 +278,7 @@ mod db_tests {
                 &[],
                 is_fetch,
                 crate::GuestRoleSetting::Unset,
+                crate::test_actor(&pool).await,
                 Duration::from_secs(10),
             )
             .await;
@@ -317,6 +320,7 @@ mod db_tests {
             &[],
             false,
             crate::GuestRoleSetting::Unset,
+            crate::test_actor(&pool).await,
             Duration::from_secs(1),
         )
         .await;
@@ -422,12 +426,15 @@ mod db_tests {
             &[],
             false,
             crate::GuestRoleSetting::Role("talos_guest"),
+            crate::test_actor(&pool).await,
             Duration::from_secs(10),
         )
         .await;
         match res {
-            Err(DatabaseRpcError::QueryError(msg)) => assert!(
-                msg.contains("permission denied"),
+            // Only the SQLSTATE is kept (2026-10-14): 42501 is
+            // insufficient_privilege.
+            Err(DatabaseRpcError::QueryError(msg)) => assert_eq!(
+                msg, "sqlstate=42501",
                 "expected a privilege refusal, got {msg}"
             ),
             other => panic!("talos_guest must be refused pg_advisory_lock, got {other:?}"),
@@ -440,6 +447,7 @@ mod db_tests {
             &[],
             true,
             crate::GuestRoleSetting::Role("talos_guest"),
+            crate::test_actor(&pool).await,
             Duration::from_secs(10),
         )
         .await;
