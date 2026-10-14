@@ -448,7 +448,10 @@ impl NodeLifecycleHook for ControllerNodeHook {
         // dataset. The decision is pinned by this comment and by
         // `talos_security_audit::UNGATED_OUTPUT_PROTOCOLS`, which names BOTH
         // and is asserted on.
-        talos_ml::spawn_distill_from_output(ctx.actor_id, output);
+        // A label the module marks `human_confirmed` is accepted only from a
+        // run an action-link tap started (`ctx.started_by_kind`, the engine's
+        // word): see `talos_ml::distill`.
+        talos_ml::spawn_distill_from_output(ctx.actor_id, output, ctx.started_by_kind);
 
         // ── 4. `__ops_alert__` protocol: persist normalized ops-alerts ──
         // Outside the write ceiling by the same decision — see step 3.
@@ -460,12 +463,13 @@ impl NodeLifecycleHook for ControllerNodeHook {
         actor_id: Option<Uuid>,
         step_output: &JsonValue,
         max_write_ceiling: WriteCeiling,
+        started_by_kind: Option<&str>,
     ) {
         // Pipeline-step memory writes: same extraction, NO fuel
         // attribution — the dispatcher's fuel sink records each step's fuel
         // from the signed result.
         self.persist_memory_write_if_present(actor_id, step_output, max_write_ceiling);
-        talos_ml::spawn_distill_from_output(actor_id, step_output);
+        talos_ml::spawn_distill_from_output(actor_id, step_output, started_by_kind);
         self.persist_ops_alert_if_present(actor_id, step_output);
     }
 

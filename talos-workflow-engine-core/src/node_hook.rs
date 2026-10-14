@@ -62,6 +62,12 @@ pub struct NodeCompletionContext<'a> {
     /// inherits `max_write_ceiling`, which is byte-identical to the
     /// pre-2026-09-24 behaviour. See `crate::CeilingAxis`.
     pub http_verb_ceiling: Option<crate::WriteCeiling>,
+    /// How the run was started (`action_link`, `schedule`, `test`, …): the
+    /// engine's own word (`reserved_keys::STARTED_BY`), read from the run's
+    /// row and carried into child runs, never from module output. `None`
+    /// when unknown. The `__ml_distill__` hook accepts a human-confirmed
+    /// label only when this is `action_link`.
+    pub started_by_kind: Option<&'a str>,
     /// MONOTONIC execution time in milliseconds, measured from dispatch
     /// to completion with `std::time::Instant` — despite the field name,
     /// which is preserved because it is also the name of the column it
@@ -138,6 +144,7 @@ pub trait NodeLifecycleHook: Send + Sync {
         _actor_id: Option<Uuid>,
         _step_output: &JsonValue,
         _max_write_ceiling: crate::WriteCeiling,
+        _started_by_kind: Option<&str>,
     ) {
     }
 

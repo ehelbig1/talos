@@ -428,6 +428,7 @@ impl ParallelWorkflowEngine {
         // (see the note on `handle_completed_future`); `0` means the
         // caller started no timer, not that the node was instantaneous.
         if let Some(hook) = self.node_hook.as_ref() {
+            let started_by_kind = self.started_by_kind();
             let node_label = self.node_labels.get(&node_id).map(String::as_str);
             let module_id = self.node_meta.get(&node_id).and_then(|(m, _, _)| *m);
             hook.on_node_completed(
@@ -440,6 +441,7 @@ impl ParallelWorkflowEngine {
                     actor_id: self.actor_id,
                     max_write_ceiling: self.max_write_ceiling,
                     http_verb_ceiling: self.http_verb_ceiling,
+                    started_by_kind: started_by_kind.as_deref(),
                     wall_time_ms,
                 },
                 output,
@@ -671,6 +673,7 @@ impl ParallelWorkflowEngine {
         // responsibility; the hook spawns both SQL writes so they
         // don't delay the return).
         if let Some(hook) = self.node_hook.as_ref() {
+            let started_by_kind = self.started_by_kind();
             let node_label = self.node_labels.get(&finished_id).map(String::as_str);
             let module_id = self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
             hook.on_node_failed(
@@ -683,6 +686,7 @@ impl ParallelWorkflowEngine {
                     actor_id: self.actor_id,
                     max_write_ceiling: self.max_write_ceiling,
                     http_verb_ceiling: self.http_verb_ceiling,
+                    started_by_kind: started_by_kind.as_deref(),
                     wall_time_ms,
                 },
                 &error_msg,

@@ -162,6 +162,12 @@ What follows from that:
   `talos.state.write`, and writes the operator or the platform makes
   (`actor_remember`, `clone_memories`, consolidation, the execution trace). Do
   not gate these without new facts.
+- A person's label reaches a classifier as an `__ml_distill__` item with
+  `human_confirmed: true` (2026-10-14, operator decision: outside the ceiling
+  like the rest of the protocol). It becomes a gold `correction` row ONLY when
+  the run's start kind (`NodeCompletionContext::started_by_kind`, the engine's
+  word) is `action_link`; from any other run it is refused, never downgraded.
+  Do not widen that set or read the kind from module output.
 - A classifier that decides whether SQL is a read walks the whole statement: a
   data-modifying CTE (`WITH ins AS (INSERT …) SELECT …`) parses as a query.
 - What a SQL statement CARRIES is asked of

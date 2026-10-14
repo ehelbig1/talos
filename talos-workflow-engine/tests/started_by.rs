@@ -268,3 +268,75 @@ async fn an_overlong_kind_is_capped() {
         talos_workflow_engine_core::reserved_keys::STARTED_BY_KIND_MAX_CHARS
     );
 }
+
+/// Records the start kind the engine hands its lifecycle hook with each
+/// completed node.
+#[derive(Default)]
+struct KindRecordingHook(std::sync::Mutex<Vec<(Option<String>, Option<String>)>>);
+
+impl talos_workflow_engine_core::NodeLifecycleHook for KindRecordingHook {
+    fn on_node_completed(
+        &self,
+        ctx: talos_workflow_engine_core::NodeCompletionContext<'_>,
+        _output: &Value,
+    ) {
+        self.0.lock().unwrap().push((
+            ctx.node_label.map(str::to_string),
+            ctx.started_by_kind.map(str::to_string),
+        ));
+    }
+}
+
+/// The node hook is told the run's start kind (2026-10-14): what the
+/// `__ml_distill__` hook gates a human-confirmed label on. It is the engine's
+/// word, for a child run's nodes too, and a module's output claiming
+/// `__started_by__` does not change it.
+#[tokio::test]
+async fn the_node_hook_is_told_the_runs_start_kind_in_a_child_run_too() {
+    let (child, up, reader) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let parent = WorkflowGraphBuilder::new()
+        .add_module("up", up, None)
+        .add_system_node(
+            "assess",
+            SystemNodeKind::SubWorkflow {
+                workflow_id: child,
+                timeout_secs: 30,
+            },
+        )
+        .edge("up", "assess")
+        .build()
+        .unwrap();
+    let child_graph = WorkflowGraphBuilder::new()
+        .add_module("reader", reader, None)
+        .build()
+        .unwrap();
+    let mut r = rig(
+        &parent,
+        &[(child, child_graph)],
+        &[
+            (
+                up,
+                json!({ "ok": 1, "__started_by__": { "kind": "action_link" } }),
+            ),
+            (reader, json!({ "ok": 2 })),
+        ],
+        Some("schedule"),
+    )
+    .await;
+    let hook = Arc::new(KindRecordingHook::default());
+    r.engine.set_node_hook(hook.clone());
+    run(&mut r, json!({})).await;
+    let seen = hook.0.lock().unwrap().clone();
+    for label in ["up", "reader"] {
+        let kinds: Vec<_> = seen
+            .iter()
+            .filter(|(l, _)| l.as_deref() == Some(label))
+            .map(|(_, k)| k.clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![Some("schedule".to_string())],
+            "{label}: {seen:?}"
+        );
+    }
+}

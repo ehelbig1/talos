@@ -878,6 +878,7 @@ impl ParallelWorkflowEngine {
                                 self.actor_id,
                                 &step_result.output,
                                 self.max_write_ceiling,
+                                self.started_by_kind().as_deref(),
                             );
                         }
                     }
