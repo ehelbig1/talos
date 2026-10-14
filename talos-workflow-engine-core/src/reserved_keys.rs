@@ -1057,12 +1057,10 @@ pub const TRIGGER_INPUT: &str = "__trigger_input__";
 ///    Set-or-REMOVE closes that at the merge; the strips above close it
 ///    at the two boundaries data crosses to reach the merge.
 ///
-/// A child-workflow trigger seed is the ONE deliberate exception, and it
-/// is narrow: the parent dispatcher wraps the child's trigger as
-/// `{..upstream, "__trigger_input__": <root trigger>}` so the root
-/// payload survives sub-workflow composition. That wrapper is
-/// ENGINE-authored, so [`strip_engine_authored_keys_for_child_seed`]
-/// keeps [`TRIGGER_INPUT`] and strips the other four.
+/// A child workflow's trigger seed has NO exception (2026-10-14). The outer
+/// run's trigger reaches a `sub_workflow` child as an engine parameter, not
+/// as a [`TRIGGER_INPUT`] key in its seed, so the child's seed is stripped
+/// like every other inbound payload and no module upstream can author it.
 ///
 /// This is a FIXED list, not a blanket `__`-prefix sweep: `__error`,
 /// `__continued`, `__memory_write__`, `__ops_alert__`, `__ml_distill__`,
@@ -1134,26 +1132,6 @@ impl serde::Serialize for WithoutEngineAuthoredKeys<'_> {
             }
             serde_json::Value::Array(a) => s.collect_seq(a.iter().map(WithoutEngineAuthoredKeys)),
             other => other.serialize(s),
-        }
-    }
-}
-
-/// The child-seed variant: strips every engine-authored input key EXCEPT
-/// [`TRIGGER_INPUT`], which the parent dispatcher legitimately wraps into a
-/// sub-workflow's trigger envelope (see [`ENGINE_AUTHORED_INPUT_KEYS`]).
-///
-/// The child engine re-derives the other four from its OWN actor binding,
-/// results map and graph, so a copy riding in from the parent's upstream
-/// output would be inherited by the child's root nodes exactly when the
-/// child declines to inject (a send-world root, the kill-switch, no bound
-/// actor).
-pub fn strip_engine_authored_keys_for_child_seed(input: &mut serde_json::Value) {
-    let Some(obj) = input.as_object_mut() else {
-        return;
-    };
-    for reserved in ENGINE_AUTHORED_INPUT_KEYS {
-        if *reserved != TRIGGER_INPUT {
-            obj.remove(*reserved);
         }
     }
 }
@@ -1958,25 +1936,5 @@ mod tests {
         let mut input = json!("a bare string trigger");
         strip_engine_authored_keys(&mut input);
         assert_eq!(input, json!("a bare string trigger"));
-    }
-
-    #[test]
-    fn the_child_seed_variant_keeps_only_the_trigger_input_wrapper() {
-        let mut seed = json!({
-            "__trigger_input__": { "question": "root" },
-            "__actor_context__": { "spoofed": true },
-            "__accumulated__": { "spoofed": true },
-            "__staleness__": { "any_stale": false },
-            "__degraded_inputs__": { "any_degraded": true },
-            "upstream": "value"
-        });
-        strip_engine_authored_keys_for_child_seed(&mut seed);
-        assert_eq!(
-            seed,
-            json!({ "__trigger_input__": { "question": "root" }, "upstream": "value" })
-        );
-        let mut bare = json!(7);
-        strip_engine_authored_keys_for_child_seed(&mut bare);
-        assert_eq!(bare, json!(7));
     }
 }

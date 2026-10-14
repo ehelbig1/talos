@@ -863,6 +863,15 @@ pub struct ParallelWorkflowEngine {
     /// sub-workflow's engine is built fresh, so a child's partial results
     /// are never the parent's.
     pub(crate) partial_results: PartialResultsSlot,
+    /// The OUTER run's trigger input, for a child engine a `sub_workflow`
+    /// node started: what every node of the child receives as
+    /// `__trigger_input__`. An engine PARAMETER, set by the dispatcher on the
+    /// child engine before it runs, never a key in the child's seed — so the
+    /// child's own reserved-key strip cannot remove it and no module upstream
+    /// of the `sub_workflow` node can author it. `None` on a top-level engine
+    /// and on the children of other node kinds, whose `__trigger_input__` is
+    /// their own seed. See [`Self::extract_trigger_input`].
+    pub(crate) outer_trigger_input: Option<JsonValue>,
     /// Read-side port for the user's connected services — powers the
     /// `connections` system node. Same None-degrades contract as
     /// `ops_alerts_reader`.
@@ -1274,6 +1283,7 @@ impl ParallelWorkflowEngine {
             pending_approvals_reader: None,
             action_link_minter: None,
             partial_results: PartialResultsSlot::default(),
+            outer_trigger_input: None,
             connections_reader: None,
             assistant_report_reader: None,
             operator_digest_reader: None,

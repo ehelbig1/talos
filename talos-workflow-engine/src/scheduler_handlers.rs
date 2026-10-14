@@ -1563,39 +1563,17 @@ impl ParallelWorkflowEngine {
         let timeout_secs = *timeout_secs;
         let sub_wf_id = *sub_wf_id;
         let inputs = self.gather_inputs(node_idx, results);
-        // Propagate the parent's `__trigger_input__` into the child's
-        // trigger envelope so the scaffold's "always preserved" contract
-        // survives sub-workflow composition. Without this, a chained
-        // pipeline like `orchestrator → pr-triage → ask-my-memory` loses
-        // the user's original question at the first hop — the child
-        // sees only its direct upstream's output and has no way to
-        // reach the outer trigger.
-        //
-        // The child's `extract_trigger_input` helper unwraps the
-        // `__trigger_input__` key, so downstream nodes see the *root*
-        // user trigger no matter how deep the composition. When the
-        // upstream output is itself a map, we merge rather than
-        // replace — upstream fields still reach the child, plus the
-        // preserved outer trigger as a reserved key.
-        let parent_trigger = self.extract_trigger_input(results);
-        let child_trigger = match (parent_trigger, &inputs) {
-            (Some(pti), JsonValue::Object(existing)) => {
-                let mut merged = existing.clone();
-                merged.insert("__trigger_input__".to_string(), pti);
-                JsonValue::Object(merged)
-            }
-            (Some(pti), _) => {
-                // Non-object upstream (scalar or null): build an envelope
-                // so the __trigger_input__ key has somewhere to live.
-                let mut m = serde_json::Map::new();
-                if !inputs.is_null() {
-                    m.insert("input".to_string(), inputs.clone());
-                }
-                m.insert("__trigger_input__".to_string(), pti);
-                JsonValue::Object(m)
-            }
-            (None, _) => inputs,
-        };
+        // The parent's trigger reaches the child as `__trigger_input__`, so
+        // the scaffold's "always preserved" contract survives composition:
+        // a chained pipeline like `orchestrator → pr-triage → ask-my-memory`
+        // keeps the user's original question at every hop. It is handed to
+        // the child engine as a PARAMETER (`outer_trigger_input`), not as a
+        // key in the child's seed: the seed is this node's upstream output,
+        // stripped of every `__` key, so a module upstream cannot author the
+        // child's trigger, and the child's own strip cannot drop the real one.
+        // Until 2026-10-14 it rode in the seed and that strip removed it, so
+        // only a ROOT `sub_workflow` node's child saw the outer trigger.
+        let outer_trigger = self.extract_trigger_input(results);
         tracing::info!(
             %node_id,
             sub_workflow_id = %sub_wf_id,
@@ -1620,7 +1598,7 @@ impl ParallelWorkflowEngine {
         );
         let dispatch_started = std::time::Instant::now();
         let child = self.dispatch_subworkflow(
-            child_trigger,
+            inputs,
             sub_wf_id,
             dispatcher.clone(),
             worker_shared_key.clone(),
@@ -1628,6 +1606,7 @@ impl ParallelWorkflowEngine {
                 execution_id,
                 node_id,
             },
+            outer_trigger,
         );
         let output = self
             .bounded_child(node_id, "sub_workflow", timeout_secs, child)
@@ -2830,20 +2809,12 @@ impl ParallelWorkflowEngine {
         let mut termination_reason: &'static str = "condition_false";
         let mut terminating_error: Option<String> = None;
 
-        // Extract `__trigger_input__` to inject into every loop iteration.
-        // Source: (1) gathered inputs, (2) the `__trigger__` node's
-        // output in `results`.
-        let trigger_input_val = inputs
-            .as_object()
-            .and_then(|o| o.get("__trigger_input__"))
-            .cloned()
-            .or_else(|| {
-                self.node_labels
-                    .iter()
-                    .find(|(_, label)| label.as_str() == "__trigger__")
-                    .and_then(|(uuid, _)| results.get(uuid))
-                    .cloned()
-            });
+        // The run's trigger input, injected into every loop iteration. From
+        // the engine (`extract_trigger_input`), never from the gathered
+        // inputs: until 2026-10-14 a `__trigger_input__` key in the
+        // upstream module's OUTPUT was read first, so a module could author
+        // what every iteration took for the run's trigger.
+        let trigger_input_val = self.extract_trigger_input(results);
 
         // MCP-H6: hoist the per-iteration DB-read costs out of the
         // loop body. Pre-fix every iteration re-ran:
