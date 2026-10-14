@@ -27,6 +27,18 @@
 //!   band, and divergences / abstentions land in `ml_disagreements`
 //!   for the digest.
 //!
+//! Human-confirmed labels (2026-10-14): an item may carry
+//! `"human_confirmed": true` (or the single-item form, at the envelope's top
+//! level). Such an item is appended as `source = 'correction'`, the gold rows
+//! eval, knn weighting and the teacher audit treat as truth, and is kept out
+//! of the shadow agreement stats (those measure the fast path against the
+//! TEACHER). It is accepted ONLY when the run's start kind, the engine's
+//! word read from the run's own row (`NodeCompletionContext::started_by_kind`),
+//! is `action_link`: a person tapped a link. From any other run the item is
+//! refused, counted and logged, never appended, so a model cannot label its
+//! own output as human. Outside the write ceiling like the rest of this
+//! protocol (operator decision 2026-10-14, the same as 2026-09-06's).
+//!
 //! Identity: the envelope carries NO tenancy. The owning user resolves
 //! from the HOST-SUPPLIED actor binding (engine-stamped `actor_id` →
 //! `actors.user_id`), the same trust chain `__memory_write__` uses; a
@@ -140,6 +152,9 @@ struct DistillEnvelope {
     label: Option<String>,
     #[serde(default)]
     example_key: Option<String>,
+    /// Single-item form's `human_confirmed`.
+    #[serde(default)]
+    human_confirmed: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -148,6 +163,31 @@ struct DistillItem {
     label: String,
     #[serde(default)]
     example_key: Option<String>,
+    /// The label is a person's, not a model's. Admitted only from a run an
+    /// action link started ([`admit_human_labels`]).
+    #[serde(default)]
+    human_confirmed: bool,
+}
+
+/// The one start kind a human-confirmed label is accepted from.
+pub const HUMAN_CONFIRMED_START_KIND: &str = "action_link";
+
+/// Drop the human-confirmed items a run may not record, and say how many.
+///
+/// Pure: `started_by_kind` is the engine's word for how the run started,
+/// never anything the module wrote. An item that does not claim to be human
+/// passes through unchanged.
+fn admit_human_labels(
+    items: Vec<DistillItem>,
+    started_by_kind: Option<&str>,
+) -> (Vec<DistillItem>, usize) {
+    if started_by_kind == Some(HUMAN_CONFIRMED_START_KIND) {
+        return (items, 0);
+    }
+    let before = items.len();
+    let kept: Vec<DistillItem> = items.into_iter().filter(|i| !i.human_confirmed).collect();
+    let refused = before - kept.len();
+    (kept, refused)
 }
 
 /// Normalize + validate the envelope into an item list. Items with
@@ -176,6 +216,7 @@ fn normalize(envelope: DistillEnvelope) -> Option<(String, Vec<DistillItem>)> {
             features_text: f,
             label: l,
             example_key: envelope.example_key,
+            human_confirmed: envelope.human_confirmed,
         });
     }
     // Normalize + validate each item. The label is TRIMMED before storage
@@ -320,7 +361,11 @@ fn finalize_items(model: &str, items: Vec<DistillItem>, mac_key: &[u8]) -> Vec<D
 /// Entry point for the controller node hook (node-completion AND
 /// per-pipeline-step, mirroring `__memory_write__`). Sync + cheap:
 /// extract, validate, `tokio::spawn`, return.
-pub fn spawn_distill_from_output(actor_id: Option<Uuid>, output: &serde_json::Value) {
+pub fn spawn_distill_from_output(
+    actor_id: Option<Uuid>,
+    output: &serde_json::Value,
+    started_by_kind: Option<&str>,
+) {
     let Some(raw) = output.get("__ml_distill__") else {
         return;
     };
@@ -343,6 +388,20 @@ pub fn spawn_distill_from_output(actor_id: Option<Uuid>, output: &serde_json::Va
         tracing::warn!("__ml_distill__ envelope empty/invalid after validation; dropped");
         return;
     };
+    let (items, refused) = admit_human_labels(items, started_by_kind);
+    if refused > 0 {
+        tracing::warn!(
+            target: "talos_ml",
+            model,
+            refused,
+            started_by = started_by_kind.unwrap_or("unknown"),
+            "__ml_distill__ human_confirmed item(s) refused: only a run an action link \
+             started may record a human label"
+        );
+    }
+    if items.is_empty() {
+        return;
+    }
     let Some(ctx) = DISTILL_CONTEXT.get() else {
         tracing::warn!(
             model,
@@ -457,14 +516,21 @@ async fn process_distill(
     // The append is the teacher signal; shadow is best-effort observation.
     // (Pre-fix, a mid-loop `?` on a shadow-stat write aborted the whole
     // flow and silently dropped the append.)
-    let shadow_recorded = if state != LifecycleState::LlmOnly {
+    // Human-confirmed items are gold, not the teacher's answers: the shadow
+    // stats measure the fast path against the TEACHER, so they are left out.
+    let teacher_items: Vec<DistillItem> = items
+        .iter()
+        .filter(|i| !i.human_confirmed)
+        .cloned()
+        .collect();
+    let shadow_recorded = if state != LifecycleState::LlmOnly && !teacher_items.is_empty() {
         match run_shadow(
             ctx,
             resolved.model_id,
             user_id,
             tenancy.org_id,
             model_name,
-            &items,
+            &teacher_items,
         )
         .await
         {
@@ -491,10 +557,15 @@ async fn process_distill(
         .map(|i| AppendExample {
             features_text: i.features_text.clone(),
             label: i.label.clone(),
-            source: ExampleSource::LlmProduction,
+            source: if i.human_confirmed {
+                ExampleSource::Correction
+            } else {
+                ExampleSource::LlmProduction
+            },
             example_key: i.example_key.clone(),
         })
         .collect();
+    let human_confirmed = items.iter().filter(|i| i.human_confirmed).count();
     // Items offered to the append, logged beside `appended` (rows INSERTED or
     // CHANGED). A re-distill of examples the dataset already holds unchanged is
     // `submitted > 0, appended = 0` — the no-op the upsert now recognises —
@@ -523,6 +594,7 @@ async fn process_distill(
         model = model_name,
         state = state.as_str(),
         submitted,
+        human_confirmed,
         appended = stored,
         shadow_recorded,
         "distill hook processed"
@@ -635,6 +707,65 @@ async fn run_shadow(
 
 #[cfg(test)]
 mod tests {
+    // ── human-confirmed labels (2026-10-14) ──────────────────────────────
+
+    fn item(key: &str, human: bool) -> DistillItem {
+        DistillItem {
+            features_text: format!("text {key}"),
+            label: "keep".into(),
+            example_key: Some(key.into()),
+            human_confirmed: human,
+        }
+    }
+
+    #[test]
+    fn a_human_label_is_admitted_only_from_an_action_link_run() {
+        let items = || vec![item("h", true), item("t", false)];
+        let (kept, refused) = admit_human_labels(items(), Some("action_link"));
+        assert_eq!((kept.len(), refused), (2, 0));
+        for kind in [
+            Some("schedule"),
+            Some("manual"),
+            Some("test"),
+            Some("webhook"),
+            None,
+        ] {
+            let (kept, refused) = admit_human_labels(items(), kind);
+            assert_eq!(refused, 1, "{kind:?}");
+            assert_eq!(kept.len(), 1, "{kind:?}");
+            assert!(!kept[0].human_confirmed, "{kind:?}: the teacher item stays");
+        }
+    }
+
+    #[test]
+    fn human_confirmed_parses_in_both_forms_and_defaults_off() {
+        let batch: DistillEnvelope = serde_json::from_value(serde_json::json!({
+            "model": "m", "items": [
+                { "features_text": "a", "label": "x", "human_confirmed": true },
+                { "features_text": "b", "label": "y" }
+            ]
+        }))
+        .unwrap();
+        let (_, items) = normalize(batch).unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.human_confirmed).collect::<Vec<_>>(),
+            vec![true, false]
+        );
+        let single: DistillEnvelope = serde_json::from_value(serde_json::json!({
+            "model": "m", "features_text": "a", "label": "x", "human_confirmed": true
+        }))
+        .unwrap();
+        assert!(normalize(single).unwrap().1[0].human_confirmed);
+        // Not a boolean: the envelope is malformed and dropped whole, never
+        // read as a claim either way.
+        assert!(
+            serde_json::from_value::<DistillEnvelope>(serde_json::json!({
+                "model": "m", "features_text": "a", "label": "x", "human_confirmed": "yes"
+            }))
+            .is_err()
+        );
+    }
+
     use super::*;
 
     /// FIXED test key — never the real KEK-derived value.

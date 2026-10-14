@@ -270,6 +270,7 @@ impl NodeLifecycleHook for CaptureNodeLifecycleHook {
         actor_id: Option<Uuid>,
         step_output: &JsonValue,
         max_write_ceiling: WriteCeiling,
+        _started_by_kind: Option<&str>,
     ) {
         self.calls
             .lock()
