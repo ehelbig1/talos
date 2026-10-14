@@ -2137,6 +2137,10 @@ impl ParallelWorkflowEngine {
         // caller's looser tier/write ceiling or read the caller's memory.
         self.bind_subengine_actor_and_ceilings(&mut sub_engine, sub_wf_id, user_id)
             .await;
+        // As whom the child runs is now known: may it spend (G-8)?
+        if let Err(reason) = sub_engine.admit_as_child().await {
+            return origin.build_error(crate::WorkflowEngineError::ChildRunRefused { reason });
+        }
 
         let clean_input = if let Some(obj) = inputs.as_object() {
             let mut cleaned = obj.clone();
@@ -2447,7 +2451,7 @@ impl ParallelWorkflowEngine {
                         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
                     let mut iter_actor_id = None;
                     let iter_result = match hydrated {
-                        Ok(mut sub_engine) => {
+                        Ok(mut sub_engine) => 'iteration: {
                             // Fail-closed binding (H2 + identity): the
                             // per-iteration sub-engine inherits the PARENT
                             // identity + ceilings from `adapter_set_al`;
@@ -2465,6 +2469,14 @@ impl ParallelWorkflowEngine {
                             // and recording the parent's would be wrong in the
                             // one field an operator uses to attribute a run.
                             iter_actor_id = sub_engine.actor_id;
+                            // As whom this iteration runs is now known: may it
+                            // spend (G-8)? A refusal is this iteration's error.
+                            if let Err(reason) = sub_engine.admit_as_child().await {
+                                break 'iteration serde_json::json!({
+                                    "__error": true,
+                                    "error_message": format!("Agent body not started: {reason}"),
+                                });
+                            }
                             sub_engine.subflow_lineage = reporter.child_lineage();
                             let sub_execution_id = Uuid::new_v4();
                             let trigger_node_id = Uuid::new_v4();
@@ -3175,6 +3187,8 @@ impl ParallelWorkflowEngine {
                 job_id: Some(iter_exec_id),
                 user_id: self.user_id(),
                 actor_id: self.actor_id(),
+                // Also charged to the ROOT run's actor (G-8); `None` on the root's own dispatch.
+                root_actor_id: self.root_actor_id,
                 // User-scoped redis URI (L-27): `wasm:{user_id}:{module_id}`,
                 // the key the registry pre-warmed under this same `loop_user_id`
                 // in the fetch above. The worker strips `redis:` and GETs it.

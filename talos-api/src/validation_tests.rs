@@ -522,13 +522,12 @@ fn test_validate_workflow_execution_timeout_accepts_typical_value() {
     assert!(validate_workflow_execution_timeout(g).is_ok());
 }
 
+/// `0` turns off the engine's wall-clock cap, so GraphQL create/update
+/// refuse it like every other graph writer (security review 2026-10-14, G-6).
 #[test]
-fn test_validate_workflow_execution_timeout_accepts_zero() {
-    // 0 = "disabled" sentinel; engine falls back to default. Allowed
-    // because the engine itself treats 0 specially — the API
-    // boundary should match.
+fn test_validate_workflow_execution_timeout_refuses_zero() {
     let g = r#"{"execution_timeout_secs": 0}"#;
-    assert!(validate_workflow_execution_timeout(g).is_ok());
+    assert!(validate_workflow_execution_timeout(g).is_err());
 }
 
 #[test]

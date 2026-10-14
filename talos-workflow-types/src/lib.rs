@@ -204,9 +204,12 @@ pub const MAX_RHAI_EXPRESSION_BYTES: usize = 8 * 1024;
 /// strings cause the engine to silently fall back to its default
 /// (300 s workflow-level; 30 or 60 s per-node), so this validator
 /// likewise accepts those without complaint — rejecting them here
-/// would be a behavioural change beyond the timeout-cap scope. Only
-/// `Some(secs) > cap` is rejected. `0` is allowed at the workflow
-/// level because the engine treats it as "disabled" / "use default".
+/// would be a behavioural change beyond the timeout-cap scope.
+/// `Some(secs) > cap` is rejected, and so is `0` at the workflow level
+/// (since 2026-10-14, security review G-6): the engine reads `0` as "no
+/// wall-clock cap at all", so a stored `0` turned off every bound on the
+/// run — combined with a self-referencing ensemble, a run that never ended.
+/// No stored workflow on the reference stack used it (0 of 80).
 ///
 /// Malformed JSON returns `Ok(())` — defer to the canonical engine
 /// parser for the parse error message (avoid double-failing here).
@@ -221,6 +224,14 @@ pub fn validate_graph_timeouts(graph_json: &str) -> Result<(), String> {
         .get("execution_timeout_secs")
         .and_then(|v| v.as_u64())
     {
+        if secs == 0 {
+            return Err(format!(
+                "Invalid execution_timeout_secs 0 in graph_json: a workflow must have a \
+                 wall-clock cap (1 to {} seconds). Leave the field out for the engine's \
+                 default.",
+                MAX_WORKFLOW_EXECUTION_TIMEOUT_SECS,
+            ));
+        }
         if secs > MAX_WORKFLOW_EXECUTION_TIMEOUT_SECS {
             return Err(format!(
                 "Invalid execution_timeout_secs {} in graph_json: exceeds the {} second cap. \
@@ -676,11 +687,13 @@ version: null
         assert!(validate_graph_timeouts(g).is_ok());
     }
 
+    /// The engine reads `0` as "no wall-clock cap", so it is refused at
+    /// every write (security review 2026-10-14, G-6).
     #[test]
-    fn timeout_validator_accepts_zero() {
-        // 0 = "disabled" sentinel; engine falls back to default.
+    fn timeout_validator_refuses_zero() {
         let g = r#"{"execution_timeout_secs": 0}"#;
-        assert!(validate_graph_timeouts(g).is_ok());
+        let err = validate_graph_timeouts(g).unwrap_err();
+        assert!(err.contains("execution_timeout_secs 0"), "{err}");
     }
 
     #[test]
@@ -897,11 +910,11 @@ version: null
 
     #[test]
     fn per_node_validator_catches_the_actual_bypass() {
-        // The MCP-1218 reproducer: workflow-level disabled (0 passes
-        // the MCP-1216 cap) + per-node 24h timeout (would have run
-        // for 24h pre-fix).
+        // The MCP-1218 reproducer: a per-node 24h timeout (would have
+        // run for 24h pre-fix). Its workflow-level `0` is refused on its
+        // own since 2026-10-14, so the fixture states a legal one.
         let g = r#"{
-            "execution_timeout_secs": 0,
+            "execution_timeout_secs": 120,
             "nodes": [{"id": "sub", "kind": "sub_workflow", "data": {"timeout_secs": 86400}}]
         }"#;
         let err = validate_graph_timeouts(g).unwrap_err();
@@ -1012,7 +1025,7 @@ version: null
     fn retry_validator_catches_combined_bypass() {
         // The full retry-escalation reproducer.
         let g = r#"{
-            "execution_timeout_secs": 0,
+            "execution_timeout_secs": 120,
             "nodes": [{
                 "id": "n",
                 "retry_count": 1000000,

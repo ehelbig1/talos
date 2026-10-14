@@ -1661,6 +1661,10 @@ pub struct FuelReport {
     pub module_id: Uuid,
     /// The actor the fuel is charged to.
     pub actor_id: Option<Uuid>,
+    /// The ROOT run's actor, also charged when this attempt ran inside a
+    /// sub-workflow (`DispatchJob::root_actor_id`, security review
+    /// 2026-10-14 G-8). `None` on the root run's own dispatch.
+    pub root_actor_id: Option<Uuid>,
     /// The fuel the verified result reports as spent.
     pub fuel: talos_workflow_job_protocol::SpentFuel,
     /// Whether the attempt succeeded.
@@ -2020,6 +2024,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
                 job.workflow_id,
             );
             let node_label = job.node_label.clone();
+            let root_actor_id = job.root_actor_id;
             Some(Box::new(
                 move |result: &talos_workflow_job_protocol::JobResult| {
                     if let Some(sink) = usage_sink.as_ref() {
@@ -2041,6 +2046,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
                             node_label: node_label.clone(),
                             module_id,
                             actor_id,
+                            root_actor_id,
                             fuel,
                             outcome: if result.is_terminal_success() {
                                 FuelOutcome::Completed
@@ -2402,6 +2408,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
                         node_label: step_job.node_label.clone(),
                         module_id: step_job.module_id,
                         actor_id: step_job.actor_id,
+                        root_actor_id: step_job.root_actor_id,
                         fuel,
                         outcome: if matches!(
                             sr.status,

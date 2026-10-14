@@ -251,7 +251,10 @@ pub async fn executions_last_minute<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
-/// Fuel recorded for `actor_id` over the rolling last hour. `::bigint` is
+/// Fuel recorded for `actor_id` over the rolling last hour: rows run AS the
+/// actor, and rows of sub-workflows run inside a run ROOTED at the actor
+/// (`root_actor_id`, security review 2026-10-14 G-8) — each row once, so a
+/// child that inherited the root's actor is not counted twice. `::bigint` is
 /// required: SUM(bigint) returns NUMERIC, which sqlx cannot decode as i64.
 pub async fn fuel_last_hour<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
@@ -259,11 +262,47 @@ pub async fn fuel_last_hour<'e, E: sqlx::PgExecutor<'e>>(
 ) -> sqlx::Result<i64> {
     sqlx::query_scalar(
         "SELECT COALESCE(SUM(fuel_consumed), 0)::bigint FROM execution_cost_rollup \
-         WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '1 hour'",
+         WHERE (actor_id = $1 OR root_actor_id = $1) \
+           AND recorded_at > now() - INTERVAL '1 hour'",
     )
     .bind(actor_id)
     .fetch_one(executor)
     .await
+}
+
+/// Whether a CHILD run may start as `actor_id` (security review 2026-10-14,
+/// G-8): `Ok(None)` to start it, `Ok(Some(refusal))` when the actor's hourly
+/// FUEL cap is spent. One statement: the actor's fuel cap and its fuel sum.
+///
+/// Only the fuel cap applies. A child run has no execution row and is NOT
+/// charged to the actor's execution-count caps — a recorded decision (the
+/// child-run ledger digest in `docs/engineering-log/DECISIONS.md`); fuel is
+/// what a child spends. No advisory lock: this is a mid-run check against
+/// spend already recorded, not an admission atomic with an INSERT.
+pub async fn child_run_fuel_refusal<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    actor_id: Uuid,
+) -> sqlx::Result<Option<BudgetRefusal>> {
+    let row: Option<(Option<i64>, String, i64)> = sqlx::query_as(
+        "SELECT p.max_fuel_per_hour, p.on_budget_exceeded, \
+                (SELECT COALESCE(SUM(r.fuel_consumed), 0)::bigint FROM execution_cost_rollup r \
+                  WHERE (r.actor_id = $1 OR r.root_actor_id = $1) \
+                    AND r.recorded_at > now() - INTERVAL '1 hour') \
+         FROM actor_budget_policies p WHERE p.actor_id = $1",
+    )
+    .bind(actor_id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(match row {
+        Some((Some(limit), mode, used)) if used >= limit => Some(BudgetRefusal {
+            actor_id,
+            cap: BudgetCap::FuelPerHour,
+            limit,
+            used,
+            mode,
+        }),
+        _ => None,
+    })
 }
 
 /// Executions attributed to `actor_id` that started in the rolling last hour.

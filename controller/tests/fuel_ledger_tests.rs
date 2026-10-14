@@ -80,6 +80,7 @@ fn attempt(f: &Fixture, row: Uuid, consumed: u64, outcome: AttemptOutcome) -> Di
         node_label: Some("summarise".into()),
         module_id: Some(f.module),
         actor_id: Some(f.actor),
+        root_actor_id: None,
         consumed,
         limit: Some(5_000),
         wall_time_ms: 12,
@@ -375,4 +376,111 @@ async fn the_result_observer_records_a_failed_attempts_fuel() {
             .await
             .expect("read row");
     assert_eq!(total, Some(800));
+}
+
+/// A second actor of the fixture's user, for a child bound to its own actor.
+async fn second_actor(pool: &Pool<Postgres>, f: &Fixture) -> Uuid {
+    let actor = Uuid::new_v4();
+    sqlx::query("INSERT INTO actors (id, user_id, name, status) VALUES ($1, $2, $3, 'active')")
+        .bind(actor)
+        .bind(f.user)
+        .bind(format!("fuel-child-actor-{actor}"))
+        .execute(pool)
+        .await
+        .expect("seed second actor");
+    actor
+}
+
+/// A child run's fuel is charged to the ROOT run's actor too (security
+/// review 2026-10-14, G-8): a root actor at its fuel cap only through a child
+/// bound to another actor is refused; a child that inherited the root's actor
+/// is counted once, not twice.
+#[tokio::test]
+async fn a_childs_fuel_is_charged_to_the_root_runs_actor_once() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let f = fixture(&pool).await;
+    let child_actor = second_actor(&pool, &f).await;
+    sqlx::query(
+        "INSERT INTO actor_budget_policies (actor_id, max_fuel_per_hour, on_budget_exceeded) \
+         VALUES ($1, 1000, 'block')",
+    )
+    .bind(f.actor)
+    .execute(&pool)
+    .await
+    .expect("seed policy");
+    let row = seed_module_execution(&pool, &f).await;
+
+    // A child bound to its own actor spent 600; another, inheriting the
+    // root's actor, spent 400.
+    let mut bound = attempt(&f, row, 600, AttemptOutcome::Completed);
+    bound.actor_id = Some(child_actor);
+    bound.root_actor_id = Some(f.actor);
+    talos_cost_attribution::record_dispatch_fuel(&pool, &bound)
+        .await
+        .expect("record");
+    let mut inherited = attempt(&f, row, 400, AttemptOutcome::Completed);
+    inherited.root_actor_id = Some(f.actor);
+    talos_cost_attribution::record_dispatch_fuel(&pool, &inherited)
+        .await
+        .expect("record");
+
+    assert_eq!(
+        talos_actor_budget_refusal::fuel_last_hour(&pool, f.actor)
+            .await
+            .unwrap(),
+        1_000,
+        "the root is charged both children, each once"
+    );
+    assert_eq!(
+        talos_actor_budget_refusal::fuel_last_hour(&pool, child_actor)
+            .await
+            .unwrap(),
+        600,
+        "the child's own actor is charged what it ran"
+    );
+    match admit(&pool, f.actor).await {
+        talos_actor_budget_refusal::BudgetAdmission::Refused(r) => {
+            assert_eq!(r.cap, talos_actor_budget_refusal::BudgetCap::FuelPerHour);
+        }
+        other => panic!("the root's next run must be refused: {other:?}"),
+    }
+}
+
+/// A child run is asked about its actor's hourly fuel cap before it starts
+/// (G-8): under the cap it starts, at the cap it is refused and the refusal
+/// is recorded; an actor with no policy is not limited.
+#[tokio::test]
+async fn a_child_run_is_refused_when_its_actor_has_spent_its_fuel() {
+    use talos_workflow_engine_core::ChildRunAdmission;
+    let (pool, _db) = common::isolated_db_pool().await;
+    let f = fixture(&pool).await;
+    let unlimited = second_actor(&pool, &f).await;
+    sqlx::query(
+        "INSERT INTO actor_budget_policies (actor_id, max_fuel_per_hour, on_budget_exceeded) \
+         VALUES ($1, 1000, 'block')",
+    )
+    .bind(f.actor)
+    .execute(&pool)
+    .await
+    .expect("seed policy");
+    let admission = talos_engine::child_run_admission::PostgresChildRunAdmission::new(pool.clone());
+
+    assert_eq!(
+        admission.admit_child_run(f.actor).await,
+        Ok(()),
+        "nothing spent"
+    );
+    let row = seed_module_execution(&pool, &f).await;
+    talos_cost_attribution::record_dispatch_fuel(
+        &pool,
+        &attempt(&f, row, 1_000, AttemptOutcome::Completed),
+    )
+    .await
+    .expect("record");
+    let refused = admission
+        .admit_child_run(f.actor)
+        .await
+        .expect_err("the cap is spent");
+    assert!(refused.contains("fuel"), "{refused}");
+    assert_eq!(admission.admit_child_run(unlimited).await, Ok(()));
 }

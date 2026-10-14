@@ -197,6 +197,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `HOSTNAME` | pod hostname | both | Fallback worker id / job host tag | |
 | `WASM_EXECUTION_TIMEOUT_SECS` | `120` | both | Per-node WASM execution timeout | |
 | `TALOS_MAX_CONCURRENT_NODES` | `8` (clamped ≥1) | controller | Max concurrent node dispatch within an execution | |
+| `TALOS_MAX_CHILD_RUNS_PER_RUN` | `256` (1–10000; anything else is the default) | controller | Sub-workflow runs one root run may start across every depth (ensemble, judge, dispatch, agent-loop iterations, sub_workflow). Depth (16) bounds a chain; this bounds the tree. A refused child fails its parent node with "not started". Child runs still have no execution row, are not counted toward `max_concurrent_executions` or the actor's execution caps, and are not stopped by the execution pause once their root is running; each is asked about its actor's hourly FUEL cap before it starts | |
 | `TALOS_MAX_CONCURRENT_EXECUTIONS` | built-in default | controller | Execution-level concurrency semaphore | |
 | `WASM_RESULT_CACHE_CAPACITY` | `256` | worker | Result-cache entry cap | |
 | `WASM_INSTANCE_CACHE_MAX_PER_TIER` | `256` | worker | Instance-cache cap per tier | |

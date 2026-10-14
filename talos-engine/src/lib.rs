@@ -5,6 +5,7 @@ pub mod approval_gate;
 pub mod assistant_report_reader;
 pub mod builder;
 pub mod checkpoint_store;
+pub mod child_run_admission;
 pub mod child_run_recorder;
 pub mod connections_reader;
 pub mod error;

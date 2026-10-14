@@ -72,6 +72,11 @@ pub struct DispatchFuel {
     pub module_id: Option<Uuid>,
     /// The actor the budget is charged to.
     pub actor_id: Option<Uuid>,
+    /// The ROOT run's actor when the attempt ran inside a sub-workflow: the
+    /// root is charged too, so a run cannot move its spend into children
+    /// (security review 2026-10-14, G-8). The hourly fuel cap counts a row
+    /// once for either actor.
+    pub root_actor_id: Option<Uuid>,
     /// Fuel consumed (`> 0`).
     pub consumed: u64,
     /// The limit the worker enforced, when reported.
@@ -89,8 +94,8 @@ fn db_i64(v: u64) -> i64 {
 /// The rollup INSERT for an engine attempt.
 pub const INSERT_DISPATCH_FUEL_SQL: &str = "INSERT INTO execution_cost_rollup \
      (actor_id, workflow_id, execution_id, node_id, module_id, fuel_consumed, \
-      wall_time_ms, max_fuel, outcome) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+      wall_time_ms, max_fuel, outcome, root_actor_id) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
 
 /// Adds an attempt's fuel to its `module_executions` row. Only the fuel
 /// column is written: a status or `completed_at` write belongs to the
@@ -116,6 +121,7 @@ pub async fn record_dispatch_fuel(pool: &PgPool, fuel: &DispatchFuel) -> Result<
         .bind(db_i64(fuel.wall_time_ms))
         .bind(fuel.limit.map(db_i64))
         .bind(fuel.outcome.as_str())
+        .bind(fuel.root_actor_id)
         .execute(&mut *tx)
         .await?;
     sqlx::query(ADD_MODULE_EXECUTION_FUEL_SQL)

@@ -116,6 +116,7 @@ mod approval_gate;
 mod assistant_report_reader;
 pub mod attempt_window;
 mod checkpoint;
+mod child_run_admission;
 mod child_run_recorder;
 pub mod child_workflow_refs;
 pub mod connections_reader;
@@ -165,6 +166,7 @@ pub use attempt_window::{
     TOKIO_WRAP_GRACE_SECS,
 };
 pub use checkpoint::CheckpointStore;
+pub use child_run_admission::ChildRunAdmission;
 pub use child_run_recorder::{
     ChildDispatchKind, ChildRunOrigin, ChildRunRecord, ChildRunRecorder, ChildRunSite,
     ChildRunStatus, MAX_ERROR_CLASS_CHARS, MAX_NODE_PATH_LEN, MAX_PARENT_NODE_ID_CHARS,

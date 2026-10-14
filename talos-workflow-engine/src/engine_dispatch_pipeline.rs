@@ -358,6 +358,8 @@ impl ParallelWorkflowEngine {
                 job_id: None,
                 user_id: Some(uid),
                 actor_id: self.actor_id,
+                // Also charged to the ROOT run's actor (G-8); `None` on the root's own dispatch.
+                root_actor_id: self.root_actor_id,
                 // User-scoped redis URI (L-27): keyed on `uid` + `step_module_id`
                 // to match `wasm:{user_id}:{module_id}`, the key the registry
                 // pre-warmed under this same `uid` in the fetch above. The

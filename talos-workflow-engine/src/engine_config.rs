@@ -391,6 +391,31 @@ impl ParallelWorkflowEngine {
         self.max_subflow_depth = depth;
     }
 
+    /// The child-run budget this engine's ROOT run shares with every
+    /// sub-engine (see [`crate::child_run_budget`]).
+    #[must_use]
+    pub fn child_run_budget(&self) -> &crate::child_run_budget::ChildRunBudget {
+        &self.child_run_budget
+    }
+
+    /// Give this run a fresh child-run budget of `limit` (the default is
+    /// `TALOS_MAX_CHILD_RUNS_PER_RUN`, else
+    /// [`DEFAULT_MAX_CHILD_RUNS_PER_RUN`](crate::child_run_budget::DEFAULT_MAX_CHILD_RUNS_PER_RUN)).
+    /// Every sub-engine hydrated afterwards spends from it.
+    pub fn set_max_child_runs(&mut self, limit: u32) {
+        self.child_run_budget = crate::child_run_budget::ChildRunBudget::new(limit);
+    }
+
+    /// Install the child-run admission port (see
+    /// [`talos_workflow_engine_core::ChildRunAdmission`]). Carried into
+    /// every sub-engine.
+    pub fn set_child_run_admission(
+        &mut self,
+        admission: Arc<dyn talos_workflow_engine_core::ChildRunAdmission>,
+    ) {
+        self.child_run_admission = Some(admission);
+    }
+
     /// The sub-workflow dispatch depth this engine is operating at.
     /// `0` for top-level engines; `N` for engines hydrated `N`
     /// sub-workflow levels below the root. Useful for tests
