@@ -134,12 +134,20 @@ impl ForcedRefresh {
 /// imply `resolve_by_paths` would also fail.
 #[async_trait]
 pub trait SecretsResolver: Send + Sync {
-    /// Return the secrets explicitly granted to the node identified by
-    /// `node_id` (for example, secrets listed in its `allowed_secrets`
-    /// grant). Returns an empty map when the node has no grants.
+    /// Return the secrets whose `allowed_modules` grant names the module
+    /// `module_id`, AS SEEN BY `user_id`: the user's own secrets and
+    /// system secrets (no owner), never another user's. `None` (a
+    /// dispatch with no user) returns system secrets only. Returns an
+    /// empty map when nothing is granted.
+    ///
+    /// The user is a required argument because a module id is not a
+    /// tenant: a catalog module or an org-shared module is dispatched by
+    /// many users, and a grant one of them wrote must not be delivered
+    /// into another's job (security review 2026-10-14, C-1).
     async fn resolve_module_secrets(
         &self,
-        node_id: Uuid,
+        module_id: Uuid,
+        user_id: Option<Uuid>,
     ) -> Result<HashMap<String, String>, BoxError>;
 
     /// Resolve a batch of vault paths for a given user. `user_id` is

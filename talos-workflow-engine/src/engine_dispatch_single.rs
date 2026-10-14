@@ -1419,6 +1419,7 @@ mod oauth_repair_tests {
         async fn resolve_module_secrets(
             &self,
             _node_id: Uuid,
+            _user_id: Option<Uuid>,
         ) -> Result<HashMap<String, String>, BoxError> {
             Ok(HashMap::new())
         }

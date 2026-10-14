@@ -81,10 +81,18 @@ async fn test_unauthorized_module_access() {
     );
 
     let pool = setup_test_db().await;
-    let manager = SecretsManager::new(pool).unwrap();
+    let manager = SecretsManager::new(pool.clone()).unwrap();
     manager.initialize().await.unwrap();
 
+    // `allowed_modules` may name only a module the writer can run, so the
+    // granted module is a real (catalog) row. Module B only asks.
     let module_a = Uuid::new_v4();
+    sqlx::query("INSERT INTO modules (id, user_id, name, kind) VALUES ($1, NULL, $2, 'sandbox')")
+        .bind(module_a)
+        .bind(format!("restricted-secret-{module_a}"))
+        .execute(&pool)
+        .await
+        .unwrap();
     let module_b = Uuid::new_v4();
 
     // Create secret allowed only for module A

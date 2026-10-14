@@ -258,9 +258,11 @@ pub(crate) async fn resolve_secrets_map_for(
     extra_paths: &[String],
     max_llm_tier: talos_workflow_engine_core::LlmTier,
 ) -> std::collections::HashMap<String, String> {
-    // 1. Module-grant secrets.
+    // 1. Module-grant secrets, as seen by the user this job runs for: a
+    // module id is shared by every user who dispatches it, so the grant
+    // read is scoped to the user's own and system secrets.
     let mut secrets_map = resolver
-        .resolve_module_secrets(node_id)
+        .resolve_module_secrets(node_id, user_id)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, %node_id, "resolve_module_secrets failed");

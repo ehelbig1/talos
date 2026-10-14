@@ -359,6 +359,7 @@ impl SecretsResolver for InMemorySecretsResolver {
     async fn resolve_module_secrets(
         &self,
         node_id: Uuid,
+        _user_id: Option<Uuid>,
     ) -> Result<HashMap<String, String>, BoxError> {
         Ok(self
             .module_secrets
@@ -593,7 +594,7 @@ mod tests {
             .with_vault_path("stripe/key", "secret-b")
             .with_llm_key(user, "anthropic", "secret-c");
 
-        let m = r.resolve_module_secrets(node).await.unwrap();
+        let m = r.resolve_module_secrets(node, Some(user)).await.unwrap();
         assert_eq!(m.get("API_KEY"), Some(&"secret-a".to_string()));
 
         let v = r

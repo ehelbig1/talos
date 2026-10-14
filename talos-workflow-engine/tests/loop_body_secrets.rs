@@ -29,6 +29,8 @@ use uuid::Uuid;
 struct RecordingResolver {
     paths: Mutex<Vec<String>>,
     module_ids: Mutex<Vec<Uuid>>,
+    /// The user each module-grant read was asked for.
+    module_users: Mutex<Vec<Option<Uuid>>>,
 }
 
 #[async_trait]
@@ -36,8 +38,10 @@ impl SecretsResolver for RecordingResolver {
     async fn resolve_module_secrets(
         &self,
         node_id: Uuid,
+        user_id: Option<Uuid>,
     ) -> Result<HashMap<String, String>, BoxError> {
         self.module_ids.lock().unwrap().push(node_id);
+        self.module_users.lock().unwrap().push(user_id);
         Ok(HashMap::new())
     }
 
@@ -83,7 +87,8 @@ async fn a_loop_body_is_given_the_secrets_its_config_and_grant_name() {
 
     let resolver = Arc::new(RecordingResolver::default());
     let mut engine = minimal_engine();
-    engine.set_user_id(Uuid::new_v4());
+    let user = Uuid::new_v4();
+    engine.set_user_id(user);
     engine.set_secrets_resolver(resolver.clone());
     engine.set_module_fetcher(Arc::new(InMemoryModuleFetcher::new().with_module(
         body_module,
@@ -138,4 +143,13 @@ async fn a_loop_body_is_given_the_secrets_its_config_and_grant_name() {
     // The module's own secrets are looked up by the MODULE's id.
     let module_ids = resolver.module_ids.lock().unwrap().clone();
     assert!(module_ids.contains(&body_module), "{module_ids:?}");
+    // ...and for the user the run is for: a module id is shared by every
+    // user who dispatches it, so a grant read without the user would hand
+    // one user's secret to another (security review 2026-10-14, C-1).
+    let module_users = resolver.module_users.lock().unwrap().clone();
+    assert!(!module_users.is_empty());
+    assert!(
+        module_users.iter().all(|u| *u == Some(user)),
+        "a module-grant read was not scoped to the run's user: {module_users:?}"
+    );
 }
