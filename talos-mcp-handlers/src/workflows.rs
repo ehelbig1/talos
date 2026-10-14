@@ -4402,6 +4402,9 @@ async fn handle_get_workflow_full(
         "edges": edges,
         "tags": tags,
         "is_enabled": wf_is_enabled,
+        // Who the workflow runs as. Always present: `{"bound": false}` for a
+        // workflow with no actor.
+        "actor": crate::utils::workflow_actor_block(&state.actor_repo, wf.actor_id, user_id).await,
     });
     if let Some(obj) = result.as_object_mut() {
         if let Some(ref desc) = wf_description {
@@ -9380,6 +9383,8 @@ async fn handle_get_workflow_summary(
             "total_versions": total_versions,
             "last_published": last_published.map(|t| t.to_rfc3339()),
         },
+        // Who the workflow runs as; `{"bound": false}` when it has no actor.
+        "actor": crate::utils::workflow_actor_block(&state.actor_repo, wf.actor_id, user_id).await,
         "dependencies": dependencies,
         "sub_workflows": sub_workflow_ids,
         "active_schedules": schedule_count,
