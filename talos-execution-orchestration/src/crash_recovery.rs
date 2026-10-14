@@ -351,7 +351,10 @@ pub(crate) async fn resume_one(
             for (node_id, output) in &ctx.results {
                 aggregated.insert(node_id.to_string(), output.clone());
             }
-            let output_json = serde_json::Value::Object(aggregated);
+            let output_json = talos_execution_result_collector::with_child_runs(
+                serde_json::Value::Object(aggregated),
+                &engine,
+            );
             let wf_repo = talos_workflow_repository::WorkflowRepository::new(deps.db_pool.clone())
                 .with_encryption(deps.secrets_manager.clone());
             let finalize = if ctx.waiting {

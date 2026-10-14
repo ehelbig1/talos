@@ -41,6 +41,7 @@ const _LLM_PRIMITIVES_FEATURE_COHERENCE_CHECK: () = assert!(
 
 mod capability_ceiling;
 mod chain_detect;
+pub mod child_run_outputs;
 mod child_run_report;
 mod condition_eval;
 mod dispatch_bytes;

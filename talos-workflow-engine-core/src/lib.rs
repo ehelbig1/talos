@@ -166,7 +166,7 @@ pub use attempt_window::{
 pub use checkpoint::CheckpointStore;
 pub use child_run_recorder::{
     ChildDispatchKind, ChildRunOrigin, ChildRunRecord, ChildRunRecorder, ChildRunSite,
-    ChildRunStatus, MAX_ERROR_CLASS_CHARS, MAX_PARENT_NODE_ID_CHARS,
+    ChildRunStatus, MAX_ERROR_CLASS_CHARS, MAX_NODE_PATH_LEN, MAX_PARENT_NODE_ID_CHARS,
 };
 pub use child_workflow_refs::{
     child_workflow_ids, child_workflow_ids_checked, collect_child_workflow_references,

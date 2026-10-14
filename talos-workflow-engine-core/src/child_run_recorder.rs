@@ -149,6 +149,10 @@ pub const MAX_ERROR_CLASS_CHARS: usize = 512;
 /// The longest `parent_node_id` a record may carry.
 pub const MAX_PARENT_NODE_ID_CHARS: usize = 120;
 
+/// The most elements a record's `node_path` may carry. Far above the engine's
+/// default nesting limit (16); the table's CHECK is the second belt.
+pub const MAX_NODE_PATH_LEN: usize = 64;
+
 /// One child run, as the engine observed it.
 ///
 /// Timestamps are carried as UNIX MILLISECONDS rather than a `chrono` type on
@@ -158,6 +162,20 @@ pub const MAX_PARENT_NODE_ID_CHARS: usize = 120;
 pub struct ChildRunRecord {
     /// The execution the PARENT ran under.
     pub parent_execution_id: Uuid,
+    /// The TOP-LEVEL execution this child ran under, however deep it is.
+    ///
+    /// For a direct child this is `parent_execution_id`. For a grandchild it
+    /// is not: a child engine runs under a synthetic execution id that names
+    /// no row anywhere, and until 2026-10-14 that synthetic id was the only
+    /// execution a grandchild's row named.
+    pub root_execution_id: Uuid,
+    /// The node labels from the top-level execution down to (and including)
+    /// `parent_node_id`: `["assess", "brief"]` for a run dispatched by node
+    /// `brief` of the child that node `assess` ran. The path
+    /// `get_sub_workflow_output` takes to reach this run's node outputs.
+    /// Each element is scrubbed and capped like `parent_node_id`, and the
+    /// list to [`MAX_NODE_PATH_LEN`].
+    pub node_path: Vec<String>,
     /// The parent's workflow DEFINITION id, denormalised so a purged parent
     /// execution still answers "who ran me".
     pub parent_workflow_id: Uuid,
@@ -207,12 +225,15 @@ impl ChildRunRecord {
     /// must not be mistaken for one.
     #[must_use]
     pub fn sanitized(mut self) -> Self {
-        self.parent_node_id = self
-            .parent_node_id
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(MAX_PARENT_NODE_ID_CHARS)
-            .collect();
+        let scrub_node_id = |id: &str| -> String {
+            id.chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_PARENT_NODE_ID_CHARS)
+                .collect()
+        };
+        self.parent_node_id = scrub_node_id(&self.parent_node_id);
+        self.node_path.truncate(MAX_NODE_PATH_LEN);
+        self.node_path = self.node_path.iter().map(|id| scrub_node_id(id)).collect();
         self.error_class = self.error_class.map(|e| {
             e.chars()
                 .filter(|c| !c.is_control() || *c == '\n')
