@@ -1034,6 +1034,11 @@ impl ParallelWorkflowEngine {
     /// passing as the sub-workflow trigger, then returns the collapsed
     /// terminal output (single-terminal workflows flatten to their leaf
     /// output; multi-terminal fall back to label-keyed map).
+    ///
+    /// `outer_trigger` is the parent run's trigger input
+    /// ([`Self::extract_trigger_input`]); the child receives it as
+    /// `__trigger_input__` through an engine parameter, not through its seed
+    /// (see `ParallelWorkflowEngine::outer_trigger_input`).
     pub async fn dispatch_subworkflow(
         &self,
         inputs: JsonValue,
@@ -1041,6 +1046,7 @@ impl ParallelWorkflowEngine {
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
         site: talos_workflow_engine_core::ChildRunSite,
+        outer_trigger: Option<JsonValue>,
     ) -> JsonValue {
         // Strip internal metadata keys so sub-workflow input doesn't carry
         // engine internals (`__trigger_input__`, `__fuel_consumed__`, …).
@@ -1052,12 +1058,13 @@ impl ParallelWorkflowEngine {
             inputs
         };
         match self
-            .execute_subworkflow_graph(
+            .run_subworkflow_graph(
                 sub_wf_id,
                 clean_input,
                 dispatcher,
                 worker_shared_key,
                 site.with_kind(talos_workflow_engine_core::ChildDispatchKind::SubWorkflow),
+                outer_trigger,
             )
             .await
         {
@@ -1395,6 +1402,31 @@ impl ParallelWorkflowEngine {
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
         origin: talos_workflow_engine_core::ChildRunOrigin,
     ) -> Result<JsonValue, SubflowError> {
+        self.run_subworkflow_graph(
+            sub_wf_id,
+            trigger_input,
+            dispatcher,
+            worker_shared_key,
+            origin,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::execute_subworkflow_graph`] with the outer run's trigger input
+    /// handed to the child engine as a parameter. Only a `sub_workflow` node
+    /// passes one: the other kinds' children read their own seed as
+    /// `__trigger_input__` (a judge's `{content, rubric}`, a classifier's
+    /// input), which their workflows are written against.
+    pub(crate) async fn run_subworkflow_graph(
+        &self,
+        sub_wf_id: Uuid,
+        trigger_input: JsonValue,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        origin: talos_workflow_engine_core::ChildRunOrigin,
+        outer_trigger: Option<JsonValue>,
+    ) -> Result<JsonValue, SubflowError> {
         self.module_fetcher
             .as_ref()
             .ok_or(SubflowError::NoRegistry)?;
@@ -1475,12 +1507,12 @@ impl ParallelWorkflowEngine {
         // `__accumulated__` / `__staleness__` / `__degraded_inputs__` would be
         // INHERITED by the child's root nodes whenever the child declines to
         // inject its own (a send-world root, the kill-switch, no bound actor).
-        // `__trigger_input__` is KEPT — the parent dispatcher wraps it here
-        // deliberately so the root payload survives composition.
+        // `__trigger_input__` goes too: the outer trigger reaches the child as
+        // an engine parameter (below), so no seed can carry one, from a
+        // module or from anywhere else.
         let mut trigger_input = trigger_input;
-        talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys_for_child_seed(
-            &mut trigger_input,
-        );
+        talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys(&mut trigger_input);
+        sub_engine.outer_trigger_input = outer_trigger;
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
 
@@ -1754,45 +1786,39 @@ impl ParallelWorkflowEngine {
         JsonValue::Object(map)
     }
 
-    /// Resolve the workflow's original trigger input from the completed-
-    /// results map. Returns `None` when the synthetic `__trigger__` node
-    /// hasn't emitted yet (should never happen on the main dispatch
-    /// path, but the reactor may call this before seed hydration under
-    /// some edge cases).
+    /// The run's trigger input — what every node receives as
+    /// `__trigger_input__`. Engine-authored end to end:
     ///
-    /// Behaviour for nested cases:
+    /// * On a child engine a `sub_workflow` node started, the OUTER run's
+    ///   trigger, handed down as an engine parameter
+    ///   (`ParallelWorkflowEngine::outer_trigger_input`). However deep the
+    ///   composition, every level passes on what it was given, so a
+    ///   grandchild sees the top-level run's trigger.
+    /// * Otherwise the synthetic `__trigger__` node's output: the run's own
+    ///   seed. `None` when there is none (a bare `run()`).
     ///
-    /// * When the parent workflow was itself invoked as a sub-workflow,
-    ///   its `results[__trigger__]` is a wrapper blob shaped like
-    ///   `{..upstream, "__trigger_input__": <root-user-trigger>}`. We
-    ///   unwrap one level so callers downstream see the **original
-    ///   user-facing trigger** — which is the whole point of the
-    ///   `__trigger_input__` key (survive sub-workflow boundaries).
-    /// * When no wrapper is present (top-level workflow), the trigger
-    ///   blob IS the trigger input — returned as-is.
+    /// Until 2026-10-14 the outer trigger rode in the child's SEED under a
+    /// `__trigger_input__` key that this function unwrapped, and the
+    /// `sub_workflow` dispatcher stripped every `__` key from that seed
+    /// before the child ran, so a `sub_workflow` node that was not a root
+    /// handed its child its upstream's output as the trigger. Nothing reads
+    /// a `__trigger_input__` key out of a seed any more.
     ///
-    /// This keeps the scaffold's "`__trigger_input__` is always preserved"
-    /// contract honest even for 2+ level deep composition. Single source
-    /// of truth — all three callers (loop body dispatcher, single-node
-    /// dispatcher, sub-workflow dispatcher) use this helper.
+    /// Single source of truth: the single-node dispatcher, the
+    /// `for_each_connection` node, the loop node and the `sub_workflow`
+    /// dispatcher all call this.
     pub(crate) fn extract_trigger_input(
         &self,
         results: &HashMap<Uuid, JsonValue>,
     ) -> Option<JsonValue> {
-        let trigger_blob = self
-            .node_labels
+        if let Some(outer) = &self.outer_trigger_input {
+            return Some(outer.clone());
+        }
+        self.node_labels
             .iter()
             .find(|(_, label)| label.as_str() == "__trigger__")
             .and_then(|(uuid, _)| results.get(uuid))
-            .cloned()?;
-        // Nested case: we're a sub-workflow whose trigger carries the
-        // outer user trigger under `__trigger_input__`. Unwrap one level.
-        if let Some(obj) = trigger_blob.as_object() {
-            if let Some(inner) = obj.get("__trigger_input__") {
-                return Some(inner.clone());
-            }
-        }
-        Some(trigger_blob)
+            .cloned()
     }
 
     /// Strip the engine's wrapping envelope from a node output if
