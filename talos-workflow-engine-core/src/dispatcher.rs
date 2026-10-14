@@ -133,6 +133,14 @@ pub struct DispatchJob {
     /// The node's graph label (`execution_cost_rollup.node_id`).
     /// Controller-side attribution only, never on the wire.
     pub node_label: Option<String>,
+    /// The actor of the ROOT run this dispatch belongs to, when it differs
+    /// from nothing: a sub-workflow's dispatch runs as the child's actor
+    /// (`actor_id`) and is ALSO charged to the root run's actor, so a run
+    /// cannot move its spend into children (security review 2026-10-14,
+    /// G-8). Written to `execution_cost_rollup.root_actor_id`.
+    /// Controller-side attribution only, never on the wire. `None` = the
+    /// dispatch is the root run's own (or no actor is known).
+    pub root_actor_id: Option<Uuid>,
 
     // ── Module artifact ──────────────────────────────────────────────
     /// URI the worker can resolve the wasm binary from if
@@ -399,6 +407,7 @@ impl Default for DispatchJob {
             actor_id: None,
             workflow_id: None,
             node_label: None,
+            root_actor_id: None,
             module_uri: String::new(),
             wasm_bytes: None,
             expected_wasm_hash: None,
@@ -804,6 +813,7 @@ impl fmt::Debug for DispatchJob {
             .field("job_id", &self.job_id)
             .field("user_id", &self.user_id)
             .field("actor_id", &self.actor_id)
+            .field("root_actor_id", &self.root_actor_id)
             .field("workflow_id", &self.workflow_id)
             .field("node_label", &self.node_label)
             .field("module_uri", &self.module_uri)

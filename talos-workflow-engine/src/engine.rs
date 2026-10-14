@@ -1005,6 +1005,17 @@ pub struct ParallelWorkflowEngine {
     /// [`AdapterSet::into_engine_with_graph`] when hydrating a
     /// sub-engine from the parent's adapter set.
     pub(crate) current_subflow_depth: usize,
+    /// The child runs the whole ROOT run may still start, shared with every
+    /// sub-engine at every depth (security review 2026-10-14, G-2). A root
+    /// engine makes a fresh one; `AdapterSet` carries the same counter down.
+    pub(crate) child_run_budget: crate::child_run_budget::ChildRunBudget,
+    /// The actor of the ROOT run, carried into every sub-engine so a child's
+    /// fuel is charged to the root's actor too (`DispatchJob::root_actor_id`,
+    /// G-8). `None` on a root engine (its own `actor_id` is the root's).
+    pub(crate) root_actor_id: Option<Uuid>,
+    /// Asked before each child run starts, for the actor the child runs as
+    /// (G-8). `None` admits every child (tests, tools without a database).
+    pub(crate) child_run_admission: Option<Arc<dyn talos_workflow_engine_core::ChildRunAdmission>>,
     /// Shared in-flight/completed snapshot for THIS engine's run.
     ///
     /// Interior mutability by design: the whole reactor runs under
@@ -1098,6 +1109,14 @@ pub struct AdapterSet {
     cancellation_token: Option<tokio_util::sync::CancellationToken>,
     max_subflow_depth: usize,
     current_subflow_depth: usize,
+    /// The ROOT run's child-run budget — the same counter, not a copy.
+    child_run_budget: crate::child_run_budget::ChildRunBudget,
+    /// The ROOT run's actor (see the engine field).
+    root_actor_id: Option<Uuid>,
+    child_run_admission: Option<Arc<dyn talos_workflow_engine_core::ChildRunAdmission>>,
+    /// The building engine's published wall-clock deadline. A child run may
+    /// not outlive it, whatever its own graph says (including `0`).
+    parent_deadline: Option<std::time::Instant>,
 }
 
 impl AdapterSet {
@@ -1147,11 +1166,31 @@ impl AdapterSet {
                 limit: self.max_subflow_depth,
             });
         }
+        // Breadth: one unit of the ROOT run's child-run budget per hydrated
+        // child, across every depth (security review 2026-10-14, G-2). The
+        // depth guard above bounds the chain; this bounds the tree.
+        if let Err(limit) = self.child_run_budget.take() {
+            return Err(crate::WorkflowEngineError::ChildRunBudgetExhausted { limit });
+        }
+        let parent_deadline = self.parent_deadline;
         let mut engine = self.into_engine();
         // Attribute this engine's nodes to the workflow DEFINITION it runs, not
         // to the synthetic per-run id the caller is about to seed.
         engine.set_workflow_id(workflow_id);
         engine.load_from_graph_json(graph_json)?;
+        // A child never outlives the run that started it: its wall-clock
+        // budget is what is left of the parent's, or its own if smaller — and
+        // a child whose graph says `0` (no cap) gets the parent's remainder.
+        if let Some(deadline) = parent_deadline {
+            let remaining = deadline
+                .saturating_duration_since(tokio::time::Instant::now().into_std())
+                .as_secs()
+                .max(1);
+            engine.execution_timeout_secs = match engine.execution_timeout_secs {
+                0 => remaining,
+                own => own.min(remaining),
+            };
+        }
         Ok(engine)
     }
 
@@ -1211,6 +1250,10 @@ impl AdapterSet {
         engine.rate_limit_store = self.rate_limit_store;
         engine.cancellation_token = self.cancellation_token;
         engine.max_subflow_depth = self.max_subflow_depth;
+        // The SAME counter: a child's children spend the root's budget.
+        engine.child_run_budget = self.child_run_budget;
+        engine.root_actor_id = self.root_actor_id;
+        engine.child_run_admission = self.child_run_admission;
         // The new engine is one level deeper than the parent. The
         // depth check happens in `into_engine_with_graph`; this
         // unguarded path is for tests / pre-load scenarios where
@@ -1221,6 +1264,22 @@ impl AdapterSet {
 }
 
 impl ParallelWorkflowEngine {
+    /// The ROOT run's actor, for `DispatchJob::root_actor_id`: the root
+    /// engine's own actor, or the one a sub-engine inherited.
+    pub(crate) fn charged_root_actor_id(&self) -> Option<Uuid> {
+        self.root_actor_id.or(self.actor_id)
+    }
+
+    /// Ask the child-run admission port whether THIS (child) engine may run,
+    /// as the actor it is now bound to (security review 2026-10-14, G-8).
+    /// Called at each site that starts a child run, after the binding.
+    pub(crate) async fn admit_as_child(&self) -> Result<(), String> {
+        match (self.child_run_admission.as_ref(), self.actor_id) {
+            (Some(port), Some(actor_id)) => port.admit_child_run(actor_id).await,
+            _ => Ok(()),
+        }
+    }
+
     /// The workflow id cost attribution records for a node of this run —
     /// `NodeCompletionContext::workflow_id` and `DispatchJob::workflow_id`
     /// both read it, so the fuel sink and the completion hook can never
@@ -1325,6 +1384,9 @@ impl ParallelWorkflowEngine {
             cancellation_token: None,
             max_subflow_depth: DEFAULT_MAX_SUBFLOW_DEPTH,
             current_subflow_depth: 0,
+            child_run_budget: crate::child_run_budget::ChildRunBudget::default(),
+            root_actor_id: None,
+            child_run_admission: None,
             progress: ExecutionProgress::default(),
             parent_run_waits: None,
         }
@@ -1386,6 +1448,10 @@ impl ParallelWorkflowEngine {
             // from this AdapterSet sits one level deeper, computed
             // by `into_engine` / `into_engine_with_graph`.
             current_subflow_depth: self.current_subflow_depth,
+            child_run_budget: self.child_run_budget.clone(),
+            parent_deadline: self.progress.deadline(),
+            root_actor_id: self.charged_root_actor_id(),
+            child_run_admission: self.child_run_admission.clone(),
         }
     }
 

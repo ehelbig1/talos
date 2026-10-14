@@ -67,9 +67,26 @@ pub enum SubflowError {
     BuildFailed(String),
     /// `run_with_seed` returned an error — execution actually ran and failed.
     ExecutionFailed(String),
+    /// The ROOT run has started its whole child-run budget (`limit`):
+    /// [`crate::WorkflowEngineError::ChildRunBudgetExhausted`] at the
+    /// sub-engine chokepoint (security review 2026-10-14, G-2).
+    ChildRunBudgetExhausted(u32),
+    /// The child-run admission port refused the child's actor (G-8).
+    ChildRunRefused(String),
 }
 
 impl SubflowError {
+    /// A sub-engine that could not be hydrated: the child-run budget keeps
+    /// its type; anything else is a build failure.
+    pub(crate) fn from_hydration(e: crate::WorkflowEngineError) -> Self {
+        match e {
+            crate::WorkflowEngineError::ChildRunBudgetExhausted { limit } => {
+                SubflowError::ChildRunBudgetExhausted(limit)
+            }
+            other => SubflowError::BuildFailed(other.to_string()),
+        }
+    }
+
     /// Canonical `{__error, error_message}` envelope with a caller-provided
     /// context label (e.g. "Judge", "Ensemble child", "Sub-workflow").
     pub fn into_error_envelope(self, context: &str) -> JsonValue {
@@ -105,6 +122,14 @@ impl SubflowError {
             }
             SubflowError::ExecutionFailed(e) => {
                 format!("{} workflow execution failed: {}", context, e)
+            }
+            SubflowError::ChildRunBudgetExhausted(limit) => format!(
+                "{} not started: {}",
+                context,
+                crate::WorkflowEngineError::ChildRunBudgetExhausted { limit }
+            ),
+            SubflowError::ChildRunRefused(reason) => {
+                format!("{} not started: {}", context, reason)
             }
         }
     }
@@ -1458,7 +1483,7 @@ impl ParallelWorkflowEngine {
         let mut sub_engine = self
             .adapter_set()
             .into_engine_with_graph(sub_wf_id, &graph_json)
-            .map_err(|e| SubflowError::BuildFailed(e.to_string()))?;
+            .map_err(SubflowError::from_hydration)?;
 
         // The sub-workflow runs under a synthetic execution id with no
         // `workflow_executions` row (see the `run_with_seed_with_transport`
@@ -1494,6 +1519,11 @@ impl ParallelWorkflowEngine {
         // looser ceiling. See `bind_subengine_actor_and_ceilings`.
         self.bind_subengine_actor_and_ceilings(&mut sub_engine, sub_wf_id, user_id)
             .await;
+        // As whom the child runs is now known: may it spend (G-8)?
+        sub_engine
+            .admit_as_child()
+            .await
+            .map_err(SubflowError::ChildRunRefused)?;
 
         // Synthetic trigger node: seeded with the caller's input,
         // wired to every root so root-level modules actually execute.

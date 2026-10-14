@@ -337,6 +337,16 @@ fn upsert_system_node_into_graph(graph: &mut serde_json::Value, node: serde_json
     let Some(new_id) = crate::utils::json_optional_string(&node, "id") else {
         return;
     };
+    // A stored graph with no `nodes` array (`{}`) gets one: until 2026-10-14
+    // the node was silently dropped here while the tool reported it added.
+    if let Some(obj) = graph.as_object_mut() {
+        if !obj.get("nodes").is_some_and(serde_json::Value::is_array) {
+            obj.insert("nodes".into(), serde_json::Value::Array(Vec::new()));
+        }
+        if !obj.get("edges").is_some_and(serde_json::Value::is_array) {
+            obj.insert("edges".into(), serde_json::Value::Array(Vec::new()));
+        }
+    }
     if let Some(nodes) = graph.get_mut("nodes").and_then(|n| n.as_array_mut()) {
         if let Some(existing_idx) = nodes
             .iter()
@@ -934,6 +944,48 @@ pub(crate) fn fan_in_posture_next_steps(node_id: &str, posture: FanInPosture) ->
 /// `create_workflow`; it catches self-loops (`a → a`) too. Validation keeps
 /// its own check — graphs mutated by import or a raw `graph_json` write never
 /// pass through here.
+/// Refuse a graph whose child references would close a cycle back to
+/// `workflow_id` — the one write gate every `add_*_node` tool that names a
+/// child workflow passes (security review 2026-10-14, G-2). A failed read of
+/// the child graphs refuses too: the gate cannot say the graph is safe.
+async fn reject_if_sub_workflow_cycle(
+    state: &McpState,
+    workflow_id: uuid::Uuid,
+    graph: &serde_json::Value,
+    user_id: uuid::Uuid,
+    req_id: &Option<serde_json::Value>,
+) -> Result<(), JsonRpcResponse> {
+    let graph_json = serde_json::to_string(graph).unwrap_or_default();
+    match talos_workflow_validation::sub_workflow_cycle_for_write(
+        &state.workflow_repo,
+        workflow_id,
+        &graph_json,
+        user_id,
+    )
+    .await
+    {
+        Ok(None) => Ok(()),
+        Ok(Some(cycle)) => {
+            let path: Vec<String> = cycle.iter().map(uuid::Uuid::to_string).collect();
+            Err(mcp_error(
+                req_id.clone(),
+                -32602,
+                &format!(
+                    "This node would make the workflow run itself: {}. A workflow that \
+                     reaches itself through its child references fans out until the \
+                     sub-workflow limits stop it. Point the node at another workflow. \
+                     Nothing was saved.",
+                    path.join(" → ")
+                ),
+            ))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %workflow_id, "sub-workflow cycle check could not read the child graphs");
+            Err(crate::utils::database_error(req_id.clone()))
+        }
+    }
+}
+
 fn reject_if_cyclic(
     graph: &serde_json::Value,
     req_id: &Option<serde_json::Value>,
@@ -1050,6 +1102,8 @@ pub(crate) async fn upsert_system_node(
         "data": data,
         "position": { "x": 300, "y": 300 }
     });
+    let references_a_child =
+        !talos_workflow_engine_core::collect_child_workflow_references(&new_node).is_empty();
     upsert_system_node_into_graph(&mut graph, new_node);
 
     let connect_from_sources: Vec<String> = match args.get("connect_from") {
@@ -1095,6 +1149,11 @@ pub(crate) async fn upsert_system_node(
     // here, not only on `add_edge`. Runs BEFORE the save so a cycle is never
     // persisted.
     reject_if_cyclic(&graph, req_id)?;
+    // …and across workflows: a node whose child reference reaches this
+    // workflow again (`A → A`, `A → B → A`) is refused before it is stored.
+    if references_a_child {
+        reject_if_sub_workflow_cycle(state, workflow_id, &graph, user_id, req_id).await?;
+    }
 
     // Read the in-degree off the FINAL graph (see `count_incoming_edges`).
     let incoming_edge_count = count_incoming_edges(&graph, &node_id);

@@ -2224,3 +2224,43 @@ async fn a_sub_workflow_run_forwards_its_waits_to_the_parent_run() {
         std::time::Duration::from_secs(45)
     );
 }
+
+/// A child run never outlives the run that started it (security review
+/// 2026-10-14, G-2/G-6): its wall-clock budget is the parent's remainder or
+/// its own, whichever is smaller — and a child whose graph says `0` (no cap)
+/// gets the parent's remainder rather than no bound at all.
+#[tokio::test]
+async fn a_child_engine_never_outlives_its_parents_deadline() {
+    let parent = ParallelWorkflowEngine::new();
+    parent.progress.set_deadline(Some((
+        tokio::time::Instant::now().into_std() + std::time::Duration::from_secs(10),
+        10,
+    )));
+    let graph_with = |secs: u64| {
+        let mut g = crate::WorkflowGraphBuilder::new()
+            .add_module("only", Uuid::new_v4(), None)
+            .build()
+            .unwrap();
+        g["execution_timeout_secs"] = serde_json::json!(secs);
+        g
+    };
+    let timeout_of = |secs: u64| {
+        parent
+            .adapter_set()
+            .into_engine_with_graph(Uuid::new_v4(), &graph_with(secs))
+            .expect("hydrate")
+            .execution_timeout_secs
+    };
+    let unbounded = timeout_of(0);
+    assert!((1..=10).contains(&unbounded), "a 0 child got {unbounded}");
+    let longer = timeout_of(3600);
+    assert!((1..=10).contains(&longer), "a longer child got {longer}");
+    assert_eq!(timeout_of(2), 2, "a shorter child keeps its own");
+
+    // A parent with no published deadline leaves the child's own setting.
+    let free = ParallelWorkflowEngine::new()
+        .adapter_set()
+        .into_engine_with_graph(Uuid::new_v4(), &graph_with(0))
+        .expect("hydrate");
+    assert_eq!(free.execution_timeout_secs, 0);
+}

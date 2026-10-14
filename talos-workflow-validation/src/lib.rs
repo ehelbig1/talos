@@ -2525,6 +2525,30 @@ pub fn find_sub_workflow_cycle(
     None
 }
 
+/// The WRITE gate: the reference cycle a graph about to be stored for
+/// `workflow_id` would close, or `None`. The child graphs are read as
+/// [`load_child_graphs`] reads them (tenancy-scoped, bounded); a database
+/// failure is `Err`, which a writer must treat as a refusal.
+///
+/// Until 2026-10-14 the cycle walk ran only in the advisory
+/// `validate_workflow`, and a self-reference was refused only by
+/// `add_sub_workflow_node`: an `ensemble` (or judge, dispatch, …) whose
+/// child was its own workflow was stored and fanned out exponentially at run
+/// time (security review G-2). One check covers `A → A` and `A → B → A`.
+pub async fn sub_workflow_cycle_for_write(
+    workflow_repo: &WorkflowRepository,
+    workflow_id: Uuid,
+    graph_json: &str,
+    user_id: Uuid,
+) -> Result<Option<Vec<Uuid>>> {
+    let child_graphs = load_child_graphs(workflow_repo, workflow_id, graph_json, user_id).await?;
+    Ok(find_sub_workflow_cycle(
+        workflow_id,
+        graph_json,
+        &child_graphs,
+    ))
+}
+
 /// The `sub-workflow-cycle` finding for `root_id`, or nothing.
 ///
 /// `node_id` is the ROOT-graph node whose reference starts the cycle when the

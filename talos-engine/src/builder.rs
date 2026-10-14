@@ -103,6 +103,11 @@ pub(super) fn build_controller_engine_registry_only(
     engine.set_child_run_recorder(Arc::new(
         crate::child_run_recorder::PostgresChildRunRecorder::new(pool.clone()),
     ));
+    // Each child run is asked about its actor's hourly fuel cap before it
+    // starts (security review 2026-10-14, G-8); a root run was admitted once.
+    engine.set_child_run_admission(Arc::new(
+        crate::child_run_admission::PostgresChildRunAdmission::new(pool.clone()),
+    ));
     // `__started_by__`: each top-level run reads its start kind from its row.
     engine.set_started_by_resolver(Arc::new(
         crate::started_by_resolver::PostgresStartedByResolver::new(pool.clone()),

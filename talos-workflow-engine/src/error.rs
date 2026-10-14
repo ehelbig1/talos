@@ -170,6 +170,32 @@ pub enum WorkflowEngineError {
         limit: usize,
     },
 
+    /// The ROOT run has started its whole child-run budget
+    /// ([`crate::child_run_budget`], default
+    /// [`DEFAULT_MAX_CHILD_RUNS_PER_RUN`](crate::child_run_budget::DEFAULT_MAX_CHILD_RUNS_PER_RUN),
+    /// `TALOS_MAX_CHILD_RUNS_PER_RUN`). Depth bounds a chain; this bounds
+    /// the tree — a self-referencing ensemble fanned out 10 per level would
+    /// otherwise attempt 10¹⁶ child runs before the depth guard fired
+    /// (security review 2026-10-14, G-2).
+    #[error(
+        "this run has started its limit of {limit} sub-workflow runs; a workflow \
+         likely fans out into itself (an ensemble, judge or dispatch node whose child \
+         reaches this workflow again)"
+    )]
+    ChildRunBudgetExhausted {
+        /// The budget the root run started with.
+        limit: u32,
+    },
+
+    /// The child-run admission port refused to start a child run as its
+    /// actor (the actor's hourly fuel cap is spent, or the cap could not be
+    /// read). See [`talos_workflow_engine_core::ChildRunAdmission`].
+    #[error("sub-workflow run refused: {reason}")]
+    ChildRunRefused {
+        /// The port's sentence.
+        reason: String,
+    },
+
     /// The caller requested cancellation via the
     /// [`CancellationToken`](tokio_util::sync::CancellationToken)
     /// passed to

@@ -139,6 +139,7 @@ mod tests {
             job_id: None,
             user_id: None,
             actor_id: None,
+            root_actor_id: None,
             module_uri: "test".into(),
             wasm_bytes: None,
             expected_wasm_hash: None,

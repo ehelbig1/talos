@@ -132,6 +132,7 @@ pub fn dispatch_fuel_row(
         node_label: report.node_label.clone(),
         module_id: Some(report.module_id),
         actor_id: report.actor_id,
+        root_actor_id: report.root_actor_id,
         consumed: report.fuel.consumed,
         limit: report.fuel.limit,
         wall_time_ms: report.execution_time_ms,
@@ -901,6 +902,7 @@ mod fuel_sink_wiring_tests {
             node_label: Some("summarise".into()),
             module_id: Uuid::new_v4(),
             actor_id: Some(Uuid::new_v4()),
+            root_actor_id: Some(Uuid::new_v4()),
             fuel: SpentFuel {
                 consumed: 1_234,
                 limit: Some(5_000),
