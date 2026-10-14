@@ -1414,13 +1414,16 @@ async fn handle_run_scratch_session(
     let job_id = uuid::Uuid::new_v4();
     let compilation_result = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        state.compiler.compile_to_wasm_with_config(
+        // Compiled FOR the stored world the gates checked (security review
+        // 2026-10-14, G-1): a body declaring another world is refused.
+        state.compiler.compile_rust_for_world(
             user_id,
             job_id,
             "scratch_session",
             &rust_code,
             &serde_json::json!({}),
             None,
+            &world,
         ),
     )
     .await;
@@ -1569,7 +1572,9 @@ async fn handle_run_scratch_session(
             talos_worker_runtime::runtime::RetryPolicy::in_process_transient(),
             None,
             talos_worker_runtime::runtime::SecurityPolicy::default(),
-            None,                                                // capability_world_hint
+            // The stored world `validate_scratch_world` checked above: the
+            // runtime links it and refuses a binary that needs more.
+            Some(crate::sandbox::checked_world_hint(&world)),
             None,                                                // max_fuel_override
             false,                                               // dry_run
             None,    // actor_id — scratch sessions bind no actor

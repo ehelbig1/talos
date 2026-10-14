@@ -402,6 +402,8 @@ impl Default for DispatchJob {
             module_uri: String::new(),
             wasm_bytes: None,
             expected_wasm_hash: None,
+            // no-world-hint: the trait-boundary default; every production
+            // dispatch path sets the module row's world (lint check 99).
             capability_world: None,
             integration_name: None,
             input_payload: JsonValue::Null,

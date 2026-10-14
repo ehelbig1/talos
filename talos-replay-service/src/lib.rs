@@ -906,7 +906,9 @@ async fn run_replays(
                 talos_worker_runtime::runtime::RetryPolicy::in_process_transient(),
                 None,
                 talos_worker_runtime::runtime::SecurityPolicy::default(),
-                None,
+                // The module row's world: the runtime links it and refuses a
+                // binary that needs more (security review 2026-10-14, G-1).
+                Some(module.capability_world.clone()),
                 None,
                 false,
                 None,        // actor_id

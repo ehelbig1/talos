@@ -6775,7 +6775,6 @@ async fn handle_import_workflow(
                         .as_ref()
                         .map(|m| m.mod_name)
                         .unwrap_or("imported-module");
-                    let cap_world = meta.as_ref().map(|m| m.cap_world).unwrap_or("minimal-node");
                     let cargo_name =
                         talos_workflow_repository::sanitize_module_cargo_name(mod_name);
 
@@ -6809,7 +6808,21 @@ async fn handle_import_workflow(
                             };
                             match state
                                 .workflow_repo
-                                .upsert_wasm_module(*mid, user_id, mod_name, &wasm, src, cap_world)
+                                // The row records the world the BINARY is
+                                // (`res.capability_world`, reconciled against
+                                // the source by the compile), never the
+                                // bundle's claim: a bundle labelled minimal
+                                // whose source builds a wider module is
+                                // recorded wide, so every ceiling reads the
+                                // truth (security review 2026-10-14, G-1).
+                                .upsert_wasm_module(
+                                    *mid,
+                                    user_id,
+                                    mod_name,
+                                    &wasm,
+                                    src,
+                                    res.capability_world.as_node_str(),
+                                )
                                 .await
                             {
                                 Ok(_) => auto_compiled.push(mod_name.to_string()),

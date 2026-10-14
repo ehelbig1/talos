@@ -669,7 +669,7 @@ async fn dispatch_single_message(
         http_verb_ceiling: actor_http_verb_ceiling,
         egress_scope: actor_egress,
         wasm_bytes: None,
-        capability_world: None,
+        capability_world: Some(exec_info.capability_world.as_str().to_string()),
         integration_name: exec_info.integration_name.clone(),
         expected_wasm_hash: Some(exec_info.content_hash.clone()),
         // MCP-1089 (2026-05-16): propagate per-module `max_fuel` from

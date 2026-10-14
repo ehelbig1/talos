@@ -330,13 +330,18 @@ impl HotUpdateService {
         let job_id = Uuid::new_v4();
         let result = self
             .compiler
-            .compile_to_wasm_with_config(
+            // FOR the world the ceiling gate above checked: a source that
+            // declares another world is refused (security review 2026-10-14,
+            // G-1) — an existing narrow-labelled module cannot be swapped for
+            // a wider binary.
+            .compile_rust_for_world(
                 user_id,
                 job_id,
                 &ctx.name,
                 &wrapped_source,
                 &config,
                 stored_dependencies.as_ref(),
+                &effective_world,
             )
             .await
             .map_err(|e| {
@@ -351,6 +356,10 @@ impl HotUpdateService {
             let messages = result.errors.iter().map(|e| e.message.clone()).collect();
             return Err(HotUpdateError::Compilation(messages));
         }
+
+        // The row records the binary's world, within the one checked.
+        let recorded_world = talos_compilation::world_to_record(&effective_world, &result)
+            .map_err(HotUpdateError::CapabilityCeilingViolation)?;
 
         let wasm_bytes = result
             .wasm_bytes
@@ -399,7 +408,7 @@ impl HotUpdateService {
                 module_id,
                 user_id,
                 &ctx.name,
-                &effective_world,
+                recorded_world,
                 &wasm_bytes,
                 &source_code,
                 fuel_budget,
@@ -414,7 +423,7 @@ impl HotUpdateService {
                 ctx.template_id,
                 user_id,
                 &ctx.name,
-                &effective_world,
+                recorded_world,
                 &wasm_bytes,
                 &result.content_hash,
                 &source_code,

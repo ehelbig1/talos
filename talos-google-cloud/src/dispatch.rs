@@ -633,7 +633,7 @@ async fn dispatch_monitoring_incident_inner(
         http_verb_ceiling: actor_http_verb_ceiling,
         egress_scope: actor_egress,
         wasm_bytes: None,
-        capability_world: None,
+        capability_world: Some(exec_info.capability_world.as_str().to_string()),
         integration_name: exec_info.integration_name.clone(),
         expected_wasm_hash: Some(exec_info.content_hash.clone()),
         max_fuel: exec_info.max_fuel,
