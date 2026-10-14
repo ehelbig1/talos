@@ -9,16 +9,28 @@
 //! read, before step 2 has passed:
 //!
 //! 1. `Authorization: Bearer` is present and of a sane length.
-//! 2. The token verifies under the app's client secret ([`crate::push_jwt`]).
-//! 3. The body (at most 1 MiB) is read and parsed for three things only:
-//!    `matchedWebhookIds`, `webhookEvent`, `issue.key`. Everything else in it
-//!    — the ticket — is skipped by the parser and never held, logged or
-//!    stored.
+//! 2. The token verifies under the app's client secret ([`crate::push_jwt`]),
+//!    and has not been used before ([`crate::push_replay`]): a token is
+//!    single-use, remembered by its hash until it can no longer verify. A
+//!    delivery answered with a 5xx releases its token, so Atlassian's retry
+//!    is not refused as a replay.
+//! 3. The body (at most 1 MiB) is read and parsed for four things only:
+//!    `matchedWebhookIds`, `webhookEvent`, `issue.key`, and the HOST (or, on
+//!    the API gateway, the cloud id) of `issue.self`. Everything else in it —
+//!    the ticket — is skipped by the parser and never held, logged or stored.
 //! 4. The matched webhook ids are mapped to the registrations that own them.
 //!    A lookup that did not answer is a 503 (Atlassian retries); no row is a
-//!    200 (nothing to retry toward). A webhook id registered on more than one
-//!    site is ambiguous — the delivery does not say which site it came from —
-//!    and starts nothing.
+//!    200 (nothing to retry toward). A registration acts on a delivery only
+//!    when the delivery's `issue.self` is on the registration's OWN site:
+//!    a Jira webhook id is unique only within one site, so an id match alone
+//!    could start one user's workflow for another site's event (security
+//!    review 2026-10-14, F-1). A delivery with no `issue.self`, or from
+//!    another site, starts nothing (202) and is recorded. Among registrations
+//!    on the delivery's site, a webhook id registered on more than one site is
+//!    still ambiguous and starts nothing.
+//! 4b. Each registration acts on at most [`DELIVERIES_PER_REGISTRATION_PER_MINUTE`]
+//!    deliveries a minute (per replica), and holds at most
+//!    [`DEDUP_ROWS_PER_REGISTRATION`] remembered deliveries (F-4).
 //! 5. The execution pause is consulted, BEFORE the delivery is recorded as
 //!    handled: a 503 after that record would be retried by Atlassian and then
 //!    skipped as a duplicate, which is a drop.
@@ -67,6 +79,34 @@ const MAX_DELIVERY_ID_LEN: usize = 128;
 /// registered on more than one site.
 pub const REFUSAL_AMBIGUOUS_WEBHOOK_ID: &str = "ambiguous_webhook_id";
 
+/// The reason recorded for a start withheld because the delivery's
+/// `issue.self` is not on the registration's site (or is absent).
+pub const REFUSAL_SITE_MISMATCH: &str = "site_mismatch";
+
+/// The reason recorded for a start withheld because the registration already
+/// holds [`DEDUP_ROWS_PER_REGISTRATION`] remembered deliveries.
+pub const REFUSAL_DEDUP_CAP: &str = "dedup_cap";
+
+/// Most deliveries one registration acts on per minute, per replica. A Jira
+/// user's assigned issues change far less often; this bounds what a flood of
+/// verified deliveries can start and insert.
+pub const DELIVERIES_PER_REGISTRATION_PER_MINUTE: u32 = 60;
+
+/// Most remembered (unswept) deliveries one registration holds. The hourly
+/// sweep deletes rows older than seven days; a registration at this count has
+/// received over a thousand deliveries a day for a week, which is a flood.
+/// Above it a delivery inserts nothing and starts nothing (`DLQ_MAX_PENDING`'s
+/// refuse-and-record shape).
+pub const DEDUP_ROWS_PER_REGISTRATION: i64 = 10_000;
+
+/// Most refusal records (site mismatch, dedup cap) written per registration
+/// per hour: a refusal is recorded so its owner can find it, but a flood of
+/// refusals must not become a flood of rows.
+const REFUSAL_RECORDS_PER_REGISTRATION_PER_HOUR: u32 = 10;
+
+/// Longest `issue.self` read.
+const MAX_SELF_URL_LEN: usize = 512;
+
 /// What the receiver made of a delivery, as a closed set. The handler turns
 /// it into a status; a test reads it to know WHY a status was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +117,18 @@ pub enum ReceiptNote {
     NotConfigured,
     /// The token did not verify.
     Refused(JwtRefusal),
+    /// The token verified but was already used (here or, with a shared
+    /// replay guard, on another replica). Nothing is read.
+    Replayed,
+    /// The replay memory could not answer (full, or the shared guard is
+    /// down and the deployment fails closed); Atlassian is asked to retry.
+    ReplayUnavailable,
+    /// Every registration the delivery matched is on another site than the
+    /// delivery's `issue.self` (or the delivery has none). Nothing started.
+    SiteMismatch {
+        /// Registrations the delivery's webhook ids matched.
+        matched: usize,
+    },
     /// The body was longer than [`JIRA_WEBHOOK_MAX_BODY_BYTES`] (or the
     /// connection ended before it was all read).
     BodyTooLarge,
@@ -97,8 +149,15 @@ pub enum ReceiptNote {
     Accepted {
         /// Registrations the delivery's webhook ids matched.
         matched: usize,
-        /// Of those, how many were withheld as ambiguous.
+        /// Of those, how many were withheld because the delivery is from
+        /// another site.
+        off_site: usize,
+        /// Of the rest, how many were withheld as ambiguous.
         ambiguous: usize,
+        /// Of the rest, how many were over their per-minute budget.
+        rate_limited: usize,
+        /// Of the rest, how many were at their remembered-delivery cap.
+        capped: usize,
         /// Of the rest, how many had already seen this delivery.
         duplicates: usize,
     },
@@ -113,10 +172,13 @@ impl ReceiptNote {
             Self::MissingBearer | Self::Refused(_) => StatusCode::UNAUTHORIZED,
             Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::BodyMalformed => StatusCode::BAD_REQUEST,
-            Self::NotConfigured | Self::LookupFailed | Self::Deferred | Self::DedupFailed => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-            Self::TooManyRegistrations | Self::Accepted { .. } => StatusCode::OK,
+            Self::NotConfigured
+            | Self::LookupFailed
+            | Self::Deferred
+            | Self::DedupFailed
+            | Self::ReplayUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::SiteMismatch { .. } => StatusCode::ACCEPTED,
+            Self::TooManyRegistrations | Self::Replayed | Self::Accepted { .. } => StatusCode::OK,
         }
     }
 }
@@ -199,14 +261,28 @@ impl<'de> Deserialize<'de> for MatchedIds {
 fn short_string_or_nothing<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
-    struct Short;
+    string_up_to_or_nothing(deserializer, 128)
+}
+
+/// `issue.self`, up to [`MAX_SELF_URL_LEN`]: only its site is ever used.
+fn self_url_or_nothing<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    string_up_to_or_nothing(deserializer, MAX_SELF_URL_LEN)
+}
+
+fn string_up_to_or_nothing<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    max: usize,
+) -> Result<Option<String>, D::Error> {
+    struct Short(usize);
     impl<'de> Visitor<'de> for Short {
         type Value = Option<String>;
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("any JSON value")
         }
         fn visit_str<E>(self, v: &str) -> Result<Option<String>, E> {
-            Ok((v.len() <= 128).then(|| v.to_string()))
+            Ok((v.len() <= self.0).then(|| v.to_string()))
         }
         fn visit_unit<E>(self) -> Result<Option<String>, E> {
             Ok(None)
@@ -232,13 +308,15 @@ fn short_string_or_nothing<'de, D: Deserializer<'de>>(
             Ok(None)
         }
     }
-    deserializer.deserialize_any(Short)
+    deserializer.deserialize_any(Short(max))
 }
 
-/// The issue, of which only the key is read.
+/// The issue, of which only the key and the site of `self` are read.
 #[derive(Debug, Default)]
 struct IssueRef {
     key: Option<String>,
+    /// `issue.self`, held only until its site is taken from it.
+    self_url: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for IssueRef {
@@ -275,10 +353,15 @@ impl<'de> Deserialize<'de> for IssueRef {
                 #[derive(Deserialize)]
                 #[serde(transparent)]
                 struct Key(#[serde(deserialize_with = "short_string_or_nothing")] Option<String>);
+                #[derive(Deserialize)]
+                #[serde(transparent)]
+                struct SelfUrl(#[serde(deserialize_with = "self_url_or_nothing")] Option<String>);
                 let mut out = IssueRef::default();
                 while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
                     if name == "key" {
                         out.key = map.next_value::<Key>()?.0;
+                    } else if name == "self" {
+                        out.self_url = map.next_value::<SelfUrl>()?.0;
                     } else {
                         map.next_value::<IgnoredAny>()?;
                     }
@@ -290,8 +373,8 @@ impl<'de> Deserialize<'de> for IssueRef {
     }
 }
 
-/// The three things read from a delivery. No other field of the body is
-/// named here, so no other field can be held.
+/// The things read from a delivery. No other field of the body is named
+/// here, so no other field can be held.
 #[derive(Debug, Deserialize)]
 struct DeliveryBody {
     #[serde(rename = "matchedWebhookIds", default)]
@@ -363,6 +446,133 @@ pub(crate) struct Owner {
     pub cloud_id: String,
     pub webhook_id: i64,
     pub workflow_id: Option<Uuid>,
+    /// The site URL of the registration's own Jira connection
+    /// (`atlassian_integrations.site_url` for its user and cloud id). `None`
+    /// when the connection is gone: such a registration acts on nothing.
+    pub site_url: Option<String>,
+}
+
+/// Which Jira site a delivery is about, taken from its `issue.self`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliverySite {
+    /// `https://<host>/…` — a site address (`example.atlassian.net`, or a
+    /// custom domain). Lowercased.
+    Host(String),
+    /// `https://api.atlassian.com/ex/jira/<cloud id>/…` — the API gateway,
+    /// which names the site by its cloud id.
+    Cloud(String),
+}
+
+/// The site an `issue.self` URL names, or `None` when it is not an `https`
+/// URL with a host. Pure; only the host (or the gateway's cloud id) is kept.
+#[must_use]
+pub fn delivery_site(self_url: &str) -> Option<DeliverySite> {
+    let url = reqwest::Url::parse(self_url).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host == "api.atlassian.com" {
+        let mut segments = url.path_segments()?;
+        return match (segments.next(), segments.next(), segments.next()) {
+            (Some("ex"), Some("jira"), Some(cloud)) if !cloud.is_empty() => {
+                Some(DeliverySite::Cloud(cloud.to_string()))
+            }
+            _ => None,
+        };
+    }
+    Some(DeliverySite::Host(host))
+}
+
+/// Whether a registration may act on a delivery from `site`: the delivery is
+/// about the registration's own site. Fail closed: no site on either side is
+/// "not on this site".
+#[must_use]
+pub(crate) fn owner_is_on_site(owner: &Owner, site: Option<&DeliverySite>) -> bool {
+    match site {
+        Some(DeliverySite::Cloud(cloud)) => *cloud == owner.cloud_id,
+        Some(DeliverySite::Host(host)) => owner
+            .site_url
+            .as_deref()
+            .and_then(|u| reqwest::Url::parse(u).ok())
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+            .is_some_and(|own| own == *host),
+        None => false,
+    }
+}
+
+/// Split matched registrations into those on the delivery's site and the
+/// rest. Pure.
+pub(crate) fn split_by_site(
+    owners: Vec<Owner>,
+    site: Option<&DeliverySite>,
+) -> (Vec<Owner>, Vec<Owner>) {
+    owners
+        .into_iter()
+        .partition(|owner| owner_is_on_site(owner, site))
+}
+
+/// A fixed-window counter per registration, bounded: when it holds more than
+/// [`Self::MAX_KEYS`] registrations it drops every window that has ended.
+pub(crate) struct RegistrationBudget {
+    max: u32,
+    window: std::time::Duration,
+    windows: dashmap::DashMap<Uuid, (u32, std::time::Instant)>,
+}
+
+impl RegistrationBudget {
+    const MAX_KEYS: usize = 4096;
+
+    pub(crate) fn new(max: u32, window: std::time::Duration) -> Self {
+        Self {
+            max,
+            window,
+            windows: dashmap::DashMap::new(),
+        }
+    }
+
+    /// Spend one unit of `registration`'s budget; `false` when it is spent.
+    pub(crate) fn allow(&self, registration: Uuid) -> bool {
+        let now = std::time::Instant::now();
+        if self.windows.len() > Self::MAX_KEYS {
+            let window = self.window;
+            self.windows
+                .retain(|_, (_, started)| now.duration_since(*started) < window);
+        }
+        let mut entry = self.windows.entry(registration).or_insert((0, now));
+        let (count, started) = entry.value_mut();
+        if now.duration_since(*started) >= self.window {
+            *count = 1;
+            *started = now;
+            true
+        } else if *count < self.max {
+            *count += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The per-registration budgets the receiver holds (per replica).
+pub struct DeliveryBudgets {
+    pub(crate) deliveries: RegistrationBudget,
+    pub(crate) refusal_records: RegistrationBudget,
+}
+
+impl Default for DeliveryBudgets {
+    fn default() -> Self {
+        Self {
+            deliveries: RegistrationBudget::new(
+                DELIVERIES_PER_REGISTRATION_PER_MINUTE,
+                std::time::Duration::from_secs(60),
+            ),
+            refusal_records: RegistrationBudget::new(
+                REFUSAL_RECORDS_PER_REGISTRATION_PER_HOUR,
+                std::time::Duration::from_secs(3600),
+            ),
+        }
+    }
 }
 
 /// Split matched registrations into those a delivery may act on and those it
@@ -448,7 +658,39 @@ impl AtlassianIntegrationService {
         };
         push_jwt::log_shape_once(&verified);
 
-        // 3. The body, bounded, and only three things out of it.
+        // 2b. Single use. Before the body and before any database read.
+        let token_hash = crate::push_replay::token_hash(token);
+        match self
+            .delivery_replay
+            .admit(token_hash, verified.expires_at)
+            .await
+        {
+            crate::push_replay::ReplayVerdict::Fresh => {}
+            crate::push_replay::ReplayVerdict::Replayed => {
+                tracing::warn!(
+                    target: "talos_audit",
+                    event_kind = "jira_webhook_replayed",
+                    "Jira webhook delivery refused: its token was already used"
+                );
+                return PushReceipt::just(ReceiptNote::Replayed);
+            }
+            crate::push_replay::ReplayVerdict::Unavailable => {
+                return PushReceipt::just(ReceiptNote::ReplayUnavailable);
+            }
+        }
+
+        let receipt = self.receive_verified_delivery(headers, body).await;
+        // A 5xx asks Atlassian to retry, perhaps with this same token; the
+        // retry must not be refused as a replay of a delivery that did nothing.
+        if receipt.status().is_server_error() {
+            self.delivery_replay.release_everywhere(&token_hash).await;
+        }
+        receipt
+    }
+
+    /// Steps 3 onward, for a delivery whose token verified and was fresh.
+    async fn receive_verified_delivery(&self, headers: &HeaderMap, body: Body) -> PushReceipt {
+        // 3. The body, bounded, and only four things out of it.
         let declared_too_large = headers
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
@@ -474,20 +716,29 @@ impl AtlassianIntegrationService {
                 "Jira webhook delivery named more webhook ids than are looked up"
             );
         }
+        // The site the delivery is about; the URL itself is not kept.
+        let site = delivery.issue.self_url.as_deref().and_then(delivery_site);
         if delivery.matched_webhook_ids.ids.is_empty() {
             return PushReceipt::just(ReceiptNote::Accepted {
                 matched: 0,
+                off_site: 0,
                 ambiguous: 0,
+                rate_limited: 0,
+                capped: 0,
                 duplicates: 0,
             });
         }
 
         // 4. Whose webhooks these are: asked of the registrations, by the id
-        //    Atlassian issued. Nothing else in the request is consulted.
+        //    Atlassian issued, with each registration's own site. Nothing
+        //    else in the request is consulted.
         let owners: Vec<Owner> = match sqlx::query_as(
-            "SELECT id, user_id, cloud_id, webhook_id, workflow_id \
-             FROM atlassian_webhook_registrations WHERE webhook_id = ANY($1) \
-             ORDER BY webhook_id, cloud_id LIMIT $2",
+            "SELECT r.id, r.user_id, r.cloud_id, r.webhook_id, r.workflow_id, i.site_url \
+             FROM atlassian_webhook_registrations r \
+             LEFT JOIN atlassian_integrations i \
+               ON i.user_id = r.user_id AND i.cloud_id = r.cloud_id \
+             WHERE r.webhook_id = ANY($1) \
+             ORDER BY r.webhook_id, r.cloud_id LIMIT $2",
         )
         .bind(&delivery.matched_webhook_ids.ids)
         .bind(MAX_MATCHED_REGISTRATIONS as i64 + 1)
@@ -513,7 +764,10 @@ impl AtlassianIntegrationService {
             }
         };
         let matched = owners.len();
-        let (deliverable, ambiguous) = split_ambiguous(owners);
+        // A webhook id is unique only within one Jira site: a registration
+        // acts only on a delivery about its own site.
+        let (on_site, off_site) = split_by_site(owners, site.as_ref());
+        let (deliverable, ambiguous) = split_ambiguous(on_site);
 
         // 5. The execution pause, before anything records this delivery.
         let pause = talos_execution_pause::push_admission(
@@ -527,33 +781,74 @@ impl AtlassianIntegrationService {
             return PushReceipt::just(ReceiptNote::Deferred);
         }
 
+        for owner in &off_site {
+            self.record_off_site(owner, site.is_some()).await;
+        }
         for owner in &ambiguous {
             self.record_ambiguous(owner).await;
         }
+        if deliverable.is_empty() && ambiguous.is_empty() && !off_site.is_empty() {
+            return PushReceipt::just(ReceiptNote::SiteMismatch { matched });
+        }
 
-        // 6. Each registration handles a delivery once.
+        // 5b. Each registration's per-minute budget (per replica).
+        let (deliverable, over_budget): (Vec<Owner>, Vec<Owner>) = deliverable
+            .into_iter()
+            .partition(|owner| self.delivery_budgets.deliveries.allow(owner.id));
+        for owner in &over_budget {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "jira_push_rate_limited",
+                registration = %owner.id,
+                limit_per_minute = DELIVERIES_PER_REGISTRATION_PER_MINUTE,
+                "Jira webhook delivery dropped: this registration is over its per-minute budget"
+            );
+        }
+
+        // 6. Each registration handles a delivery once, and remembers at most
+        //    DEDUP_ROWS_PER_REGISTRATION deliveries.
         let candidate_ids: Vec<Uuid> = deliverable.iter().map(|o| o.id).collect();
-        let fresh_ids: Vec<Uuid> = match delivery_id(headers) {
-            Some(delivery_id) if !candidate_ids.is_empty() => match sqlx::query_scalar(
-                "INSERT INTO atlassian_webhook_deliveries (registration_id, delivery_id) \
-                 SELECT unnest($1::uuid[]), $2 ON CONFLICT DO NOTHING RETURNING registration_id",
-            )
-            .bind(&candidate_ids)
-            .bind(delivery_id)
-            .fetch_all(&self.db_pool)
-            .await
-            {
-                Ok(fresh) => fresh,
-                Err(e) => {
-                    tracing::error!(error = %e, "Jira webhook delivery could not be recorded as handled; answering 503");
-                    return PushReceipt::just(ReceiptNote::DedupFailed);
+        let (fresh_ids, capped_ids): (Vec<Uuid>, Vec<Uuid>) = match delivery_id(headers) {
+            Some(delivery_id) if !candidate_ids.is_empty() => {
+                match sqlx::query_as::<_, (Uuid, bool, bool)>(
+                    "WITH cand AS ( \
+                         SELECT r AS registration_id, \
+                                (SELECT count(*) FROM atlassian_webhook_deliveries d \
+                                  WHERE d.registration_id = r) AS held \
+                         FROM unnest($1::uuid[]) AS r), \
+                     ins AS ( \
+                         INSERT INTO atlassian_webhook_deliveries (registration_id, delivery_id) \
+                         SELECT registration_id, $2 FROM cand WHERE held < $3 \
+                         ON CONFLICT DO NOTHING RETURNING registration_id) \
+                     SELECT c.registration_id, (c.held >= $3), (i.registration_id IS NOT NULL) \
+                     FROM cand c LEFT JOIN ins i USING (registration_id)",
+                )
+                .bind(&candidate_ids)
+                .bind(delivery_id)
+                .bind(DEDUP_ROWS_PER_REGISTRATION)
+                .fetch_all(&self.db_pool)
+                .await
+                {
+                    Ok(rows) => (
+                        rows.iter().filter(|r| r.2).map(|r| r.0).collect(),
+                        rows.iter().filter(|r| r.1).map(|r| r.0).collect(),
+                    ),
+                    Err(e) => {
+                        tracing::error!(error = %e, "Jira webhook delivery could not be recorded as handled; answering 503");
+                        return PushReceipt::just(ReceiptNote::DedupFailed);
+                    }
                 }
-            },
+            }
             // No identifier to recognise a retry by: handled as new. The
-            // workflow a delivery starts is one that is safe to run twice.
-            _ => candidate_ids.clone(),
+            // token is single-use (step 2b), so a resend of this delivery
+            // under the same token is refused there; the workflow a delivery
+            // starts is one that is safe to run twice.
+            _ => (candidate_ids.clone(), Vec::new()),
         };
-        let duplicates = candidate_ids.len() - fresh_ids.len();
+        for owner in deliverable.iter().filter(|o| capped_ids.contains(&o.id)) {
+            self.record_refusal(owner, REFUSAL_DEDUP_CAP).await;
+        }
+        let duplicates = candidate_ids.len() - fresh_ids.len() - capped_ids.len();
 
         if !fresh_ids.is_empty() {
             if let Err(e) = sqlx::query(
@@ -597,11 +892,53 @@ impl AtlassianIntegrationService {
         PushReceipt {
             note: ReceiptNote::Accepted {
                 matched,
+                off_site: off_site.len(),
                 ambiguous: ambiguous.len(),
+                rate_limited: over_budget.len(),
+                capped: capped_ids.len(),
                 duplicates,
             },
             starts,
         }
+    }
+
+    /// A delivery withheld from a registration because it is about another
+    /// site (or names none): said in the audit stream, and — when the
+    /// registration would have started a workflow, within the refusal-record
+    /// budget — as a row its owner can find.
+    async fn record_off_site(&self, owner: &Owner, delivery_named_a_site: bool) {
+        tracing::warn!(
+            target: "talos_audit",
+            event_kind = "jira_push_site_mismatch",
+            registration = %owner.id,
+            user_id = %owner.user_id,
+            webhook_id = owner.webhook_id,
+            delivery_named_a_site,
+            "Jira webhook delivery withheld: it is not about this registration's site, so its \
+             webhook id may be another site's"
+        );
+        self.record_refusal(owner, REFUSAL_SITE_MISMATCH).await;
+    }
+
+    /// [`record_not_started`] for a registration with a bound workflow, within
+    /// its refusal-record budget.
+    async fn record_refusal(&self, owner: &Owner, reason: &'static str) {
+        let Some(workflow_id) = owner.workflow_id else {
+            return;
+        };
+        if !self.delivery_budgets.refusal_records.allow(owner.id) {
+            return;
+        }
+        record_not_started(
+            &self.db_pool,
+            owner.user_id,
+            owner.id,
+            &owner.cloud_id,
+            owner.webhook_id,
+            workflow_id,
+            reason,
+        )
+        .await;
     }
 
     /// A delivery withheld because its webhook id is registered on more than
@@ -818,11 +1155,13 @@ mod tests {
         .expect("sign")
     }
 
+    /// A fresh token each call: a token is single-use (`push_replay`), and
+    /// Atlassian's carry a `jti`.
     fn valid_token() -> String {
         token(
             Algorithm::HS256,
             SECRET,
-            &serde_json::json!({"exp": now() + 120}),
+            &serde_json::json!({"exp": now() + 120, "jti": Uuid::new_v4().to_string()}),
         )
     }
 
@@ -969,14 +1308,13 @@ mod tests {
     #[tokio::test]
     async fn a_body_that_is_too_large_or_not_a_delivery_is_refused_without_a_database_read() {
         let svc = service();
-        let headers = bearer(&valid_token());
 
         let big = Body::from(vec![b' '; JIRA_WEBHOOK_MAX_BODY_BYTES + 1]);
         assert_eq!(
-            svc.receive_push(&headers, big).await.note,
+            svc.receive_push(&bearer(&valid_token()), big).await.note,
             ReceiptNote::BodyTooLarge
         );
-        let mut declared = headers.clone();
+        let mut declared = bearer(&valid_token());
         declared.insert(
             header::CONTENT_LENGTH,
             (JIRA_WEBHOOK_MAX_BODY_BYTES + 1)
@@ -990,7 +1328,9 @@ mod tests {
         );
 
         for junk in ["", "not json", "[1,2,3]", r#"{"matchedWebhookIds":["a"]}"#] {
-            let receipt = svc.receive_push(&headers, Body::from(junk)).await;
+            let receipt = svc
+                .receive_push(&bearer(&valid_token()), Body::from(junk))
+                .await;
             assert_eq!(receipt.note, ReceiptNote::BodyMalformed, "{junk}");
             assert_eq!(receipt.status(), StatusCode::BAD_REQUEST);
         }
@@ -1001,12 +1341,17 @@ mod tests {
             r#"{"matchedWebhookIds":[]}"#,
             r#"{"matchedWebhookIds":null}"#,
         ] {
-            let receipt = svc.receive_push(&headers, Body::from(body)).await;
+            let receipt = svc
+                .receive_push(&bearer(&valid_token()), Body::from(body))
+                .await;
             assert_eq!(
                 receipt.note,
                 ReceiptNote::Accepted {
                     matched: 0,
+                    off_site: 0,
                     ambiguous: 0,
+                    rate_limited: 0,
+                    capped: 0,
                     duplicates: 0
                 },
                 "{body}"
@@ -1145,7 +1490,109 @@ mod tests {
             cloud_id: cloud_id.to_string(),
             webhook_id,
             workflow_id: Some(Uuid::new_v4()),
+            site_url: Some(format!("https://{cloud_id}.example.test")),
         }
+    }
+
+    /// A token is single-use, refused the second time before the body or
+    /// the database is read (security review 2026-10-14, F-2 / F-10).
+    #[tokio::test]
+    async fn a_replayed_token_is_refused_before_any_database_read() {
+        let svc = service();
+        let headers = bearer(&valid_token());
+        // Matches nothing, so the first use reads no database either.
+        let first = svc
+            .receive_push(&headers, Body::from(r#"{"matchedWebhookIds":[]}"#))
+            .await;
+        assert!(matches!(first.note, ReceiptNote::Accepted { .. }));
+        // The replay names a webhook id: were the body or the database read,
+        // the unreachable pool would answer LookupFailed.
+        let replay = svc.receive_push(&headers, delivery()).await;
+        assert_eq!(replay.note, ReceiptNote::Replayed);
+        assert!(replay.starts.is_empty());
+        // Without the identifier header too: the token is the key, not a
+        // header the sender chooses.
+        assert_eq!(
+            svc.receive_push(&headers, delivery()).await.note,
+            ReceiptNote::Replayed
+        );
+    }
+
+    /// A delivery answered with a 5xx is retried by Atlassian, perhaps with
+    /// the same token; that retry must be read again, not refused.
+    #[tokio::test]
+    async fn a_token_whose_delivery_was_answered_with_a_5xx_can_be_retried() {
+        let svc = service();
+        let headers = bearer(&valid_token());
+        let first = svc.receive_push(&headers, delivery()).await;
+        assert_eq!(first.note, ReceiptNote::LookupFailed);
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry = svc.receive_push(&headers, delivery()).await;
+        assert_eq!(
+            retry.note,
+            ReceiptNote::LookupFailed,
+            "not refused as a replay"
+        );
+    }
+
+    #[test]
+    fn a_delivery_site_is_the_host_of_issue_self_or_the_gateways_cloud_id() {
+        assert_eq!(
+            delivery_site("https://Example.atlassian.net/rest/api/3/issue/10001"),
+            Some(DeliverySite::Host("example.atlassian.net".into()))
+        );
+        assert_eq!(
+            delivery_site(
+                "https://api.atlassian.com/ex/jira/11111111-2222-3333-4444-555555555555/rest/api/3/issue/1"
+            ),
+            Some(DeliverySite::Cloud(
+                "11111111-2222-3333-4444-555555555555".into()
+            ))
+        );
+        for not_a_site in [
+            "http://example.atlassian.net/rest/api/3/issue/1",
+            "https://api.atlassian.com/rest/api/3/issue/1",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(delivery_site(not_a_site), None, "{not_a_site}");
+        }
+    }
+
+    #[test]
+    fn a_registration_acts_only_on_a_delivery_about_its_own_site() {
+        let mine = owner(1000, "site-a");
+        let theirs = owner(1000, "site-b");
+        let host = DeliverySite::Host("site-a.example.test".into());
+        let (on, off) = split_by_site(vec![mine.clone(), theirs.clone()], Some(&host));
+        assert_eq!(on, vec![mine.clone()]);
+        assert_eq!(off, vec![theirs.clone()]);
+        // On the gateway the cloud id decides.
+        let cloud = DeliverySite::Cloud("site-b".into());
+        let (on, _) = split_by_site(vec![mine.clone(), theirs.clone()], Some(&cloud));
+        assert_eq!(on, vec![theirs]);
+        // No site named: nothing acts. A registration whose connection is
+        // gone acts on nothing either.
+        let (on, _) = split_by_site(vec![mine.clone()], None);
+        assert!(on.is_empty());
+        let orphan = Owner {
+            site_url: None,
+            ..mine
+        };
+        assert!(!owner_is_on_site(&orphan, Some(&host)));
+    }
+
+    #[test]
+    fn a_registration_budget_refuses_past_its_window_count() {
+        let budget = RegistrationBudget::new(2, std::time::Duration::from_secs(60));
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(budget.allow(a));
+        assert!(budget.allow(a));
+        assert!(!budget.allow(a));
+        assert!(
+            budget.allow(b),
+            "one registration's flood does not spend another's"
+        );
     }
 
     /// A webhook id on two sites is withheld on both; one on a single site is
@@ -1203,12 +1650,25 @@ mod tests {
         assert_eq!(
             N::Accepted {
                 matched: 1,
+                off_site: 0,
                 ambiguous: 0,
+                rate_limited: 0,
+                capped: 0,
                 duplicates: 1
             }
             .status(),
             StatusCode::OK
         );
         assert_eq!(N::TooManyRegistrations.status(), StatusCode::OK);
+        assert_eq!(N::Replayed.status(), StatusCode::OK);
+        assert_eq!(
+            N::ReplayUnavailable.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // A delivery about another site is refused, and not retried.
+        assert_eq!(
+            N::SiteMismatch { matched: 1 }.status(),
+            StatusCode::ACCEPTED
+        );
     }
 }

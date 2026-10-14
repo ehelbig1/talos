@@ -115,6 +115,11 @@ pub struct AtlassianIntegrationService {
     /// Serializes webhook registration per `(user, site)` across the fleet.
     pub(crate) push_locks:
         talos_integration_helpers::state_store::CreateLockMap<(uuid::Uuid, String)>,
+    /// The delivery tokens already used (`push_replay`): a token is
+    /// single-use.
+    pub(crate) delivery_replay: crate::push_replay::DeliveryReplayCache,
+    /// Per-registration delivery and refusal-record budgets (per replica).
+    pub(crate) delivery_budgets: crate::push_receiver::DeliveryBudgets,
 }
 
 impl AtlassianIntegrationService {
@@ -150,6 +155,8 @@ impl AtlassianIntegrationService {
             api_base_url: std::sync::OnceLock::new(),
             webhook_base_url: std::sync::OnceLock::new(),
             push_locks: talos_integration_helpers::state_store::CreateLockMap::new(),
+            delivery_replay: crate::push_replay::DeliveryReplayCache::new(),
+            delivery_budgets: crate::push_receiver::DeliveryBudgets::default(),
         }
     }
 

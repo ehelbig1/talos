@@ -103,34 +103,52 @@ believed until it is verified, in this order:
 1. `Authorization: Bearer <token>` must be present.
 2. The token must be a JWT signed with the app's **client secret**
    (`ATLASSIAN_CLIENT_SECRET`) using HS256, HS384 or HS512. `none` and every
-   asymmetric algorithm are refused. `exp` and `nbf` are honoured when
-   present. A request that fails here is answered 401 before the body is read
-   and before the database is touched.
-3. The delivery is mapped to its owner by the webhook id Talos registered. The
-   request cannot name a user. A webhook id that Talos holds on more than one
-   Jira site is ambiguous and starts nothing.
-4. Atlassian's `X-Atlassian-Webhook-Identifier` is remembered for seven days:
+   asymmetric algorithm are refused. `exp` is required and may be at most an
+   hour away; `nbf` is honoured when present. A request that fails here is
+   answered 401 before the body is read and before the database is touched.
+3. **A token is used once.** Its hash is remembered until it can no longer
+   verify (on every replica, when the controller runs a shared replay guard);
+   a second use is answered 200 and does nothing, before the body or the
+   database is read. A delivery answered 503 forgets its token, so
+   Atlassian's retry is read again.
+4. The delivery is mapped to its owner by the webhook id Talos registered,
+   and only on the delivery's own site: a Jira webhook id is unique only
+   within one site, so the receiver reads the site from the delivery's
+   `issue.self` (its host, or the cloud id on `api.atlassian.com/ex/jira/…`)
+   and a registration acts only when that is its own connection's site. A
+   delivery with no `issue.self`, or from another site, starts nothing,
+   is answered 202, and is recorded (`site_mismatch`). The request cannot name
+   a user. A webhook id that Talos holds on more than one site, with both on
+   the delivery's site, is ambiguous and starts nothing.
+5. Each channel acts on at most 60 deliveries a minute (per controller), and
+   remembers at most 10,000 deliveries; above that a delivery starts nothing
+   and is recorded (`dedup_cap`) until the seven-day sweep makes room.
+6. Atlassian's `X-Atlassian-Webhook-Identifier` is remembered for seven days:
    a retried delivery starts nothing a second time.
-5. The workflow is started as the channel's owner through the same service as
+7. The workflow is started as the channel's owner through the same service as
    `trigger_workflow`, so the execution pause, whether the workflow is live,
    its actor's budget and ceilings, its input schema and its concurrency limit
    all apply, and ownership is checked again.
 
 Atlassian does not document the token's algorithm or its claims. The first
 delivery a controller process authenticates writes one INFO line,
-`event_kind="jira_webhook_jwt_shape"`, with the algorithm and the *names* of
-the claims (never a value). After the first real delivery, look for that line:
-it is what would let the check be tightened (for example to require an
-audience).
+`event_kind="jira_webhook_jwt_shape"`, with the algorithm, the *names* of the
+claims (never a value) and the token's lifetime in seconds. A real delivery
+(2026-10-14) carried `HS256` and `context, exp, iat, iss, jti, sub` — which is
+why `exp` is now required. The values of `iss` and `sub` for an OAuth 2.0
+app are still undocumented, so they are not checked; the token carries no
+`qsh`, so it is not bound to the body, which is what the single-use rule
+covers.
 
 ## What it answers Atlassian
 
 | Status | When | Atlassian |
 |---|---|---|
-| 200 | Verified. Includes "matched no channel", "already handled" and "no workflow bound". | does not retry |
+| 200 | Verified. Includes "matched no channel", "already handled", "token already used" and "no workflow bound". | does not retry |
+| 202 | Verified, but about another Jira site than every channel it named (or names no site). Recorded. | does not retry |
 | 401 | No bearer token, or it does not verify. | does not retry |
 | 400 / 413 | The body is not a delivery, or is over 1 MiB. | does not retry |
-| 503 | The execution pause is set, the database did not answer, or the client secret is not configured. | retries (up to five times) |
+| 503 | The execution pause is set, the database did not answer, the replay memory could not answer, or the client secret is not configured. | retries (up to five times) |
 
 ## Behaviour worth knowing
 

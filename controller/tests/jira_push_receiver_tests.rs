@@ -262,15 +262,27 @@ async fn connect_site(
     scope: &str,
     account_id: Option<&str>,
 ) -> (String, Uuid) {
+    connect_site_at(w, user, scope, account_id, "https://example.atlassian.net").await
+}
+
+/// [`connect_site`] on a stated site address.
+async fn connect_site_at(
+    w: &World,
+    user: Uuid,
+    scope: &str,
+    account_id: Option<&str>,
+    site_url: &str,
+) -> (String, Uuid) {
     let cloud_id = Uuid::new_v4().to_string();
     let integration: Uuid = sqlx::query_scalar(
         "INSERT INTO atlassian_integrations (user_id, cloud_id, site_url, display_name, scope, account_id) \
-         VALUES ($1, $2, 'https://example.atlassian.net', 'Example Site', $3, $4) RETURNING id",
+         VALUES ($1, $2, $5, 'Example Site', $3, $4) RETURNING id",
     )
     .bind(user)
     .bind(&cloud_id)
     .bind(scope)
     .bind(account_id)
+    .bind(site_url)
     .fetch_one(&w.pool)
     .await
     .expect("connection");
@@ -388,6 +400,8 @@ fn delivery_token() -> String {
         &serde_json::json!({
             "iss": "example-app",
             "exp": (chrono::Utc::now() + chrono::Duration::minutes(3)).timestamp(),
+            // A delivery token is single-use; Atlassian's carry a `jti`.
+            "jti": Uuid::new_v4().to_string(),
         }),
         &jsonwebtoken::EncodingKey::from_secret(CLIENT_SECRET.as_bytes()),
     )
@@ -617,7 +631,10 @@ async fn a_delivery_starts_the_bound_workflow_once_as_the_registrations_owner() 
         receipt.note,
         ReceiptNote::Accepted {
             matched: 1,
+            off_site: 0,
             ambiguous: 0,
+            rate_limited: 0,
+            capped: 0,
             duplicates: 0
         }
     );
@@ -686,7 +703,10 @@ async fn a_delivery_starts_the_bound_workflow_once_as_the_registrations_owner() 
         again.note,
         ReceiptNote::Accepted {
             matched: 1,
+            off_site: 0,
             ambiguous: 0,
+            rate_limited: 0,
+            capped: 0,
             duplicates: 1
         }
     );
@@ -889,7 +909,10 @@ async fn an_unknown_or_ambiguous_webhook_id_starts_nothing() {
         unknown.note,
         ReceiptNote::Accepted {
             matched: 0,
+            off_site: 0,
             ambiguous: 0,
+            rate_limited: 0,
+            capped: 0,
             duplicates: 0
         }
     );
@@ -902,7 +925,10 @@ async fn an_unknown_or_ambiguous_webhook_id_starts_nothing() {
         ambiguous.note,
         ReceiptNote::Accepted {
             matched: 2,
+            off_site: 0,
             ambiguous: 2,
+            rate_limited: 0,
+            capped: 0,
             duplicates: 0
         }
     );
@@ -935,7 +961,10 @@ async fn an_unknown_or_ambiguous_webhook_id_starts_nothing() {
         mixed.note,
         ReceiptNote::Accepted {
             matched: 3,
+            off_site: 0,
             ambiguous: 2,
+            rate_limited: 0,
+            capped: 0,
             duplicates: 0
         }
     );
@@ -982,6 +1011,18 @@ async fn a_delivery_that_matches_more_registrations_than_are_read_starts_nothing
         .execute(&w.pool)
         .await
         .expect("a registration of the shared id");
+        // Its connection, on the site the deliveries below are about: the
+        // test is about ambiguity, not about the site binding.
+        sqlx::query(
+            "INSERT INTO atlassian_integrations (user_id, cloud_id, site_url, display_name, scope) \
+             VALUES ($1, $2, 'https://example.atlassian.net', 'Example Site', $3)",
+        )
+        .bind(owner)
+        .bind(site)
+        .bind(SCOPE_WITH_WEBHOOKS)
+        .execute(&w.pool)
+        .await
+        .expect("the owner's connection");
         bound.push(workflow);
     }
 
@@ -1009,7 +1050,10 @@ async fn a_delivery_that_matches_more_registrations_than_are_read_starts_nothing
         alone.note,
         ReceiptNote::Accepted {
             matched: 2,
+            off_site: 0,
             ambiguous: 2,
+            rate_limited: 0,
+            capped: 0,
             duplicates: 0
         }
     );
@@ -1553,7 +1597,10 @@ async fn deleting_a_channel_or_disconnecting_removes_the_webhook_at_atlassian_an
         after.note,
         ReceiptNote::Accepted {
             matched: 0,
+            off_site: 0,
             ambiguous: 0,
+            rate_limited: 0,
+            capped: 0,
             duplicates: 0
         }
     );
@@ -1721,4 +1768,263 @@ async fn a_paused_deployment_defers_a_delivery_that_would_start_a_workflow() {
         .expect("resume");
     let retried = deliver(&w, &[registration.webhook_id], Some("delivery-p1")).await;
     assert_eq!(retried.starts.len(), 1, "the retry is not a duplicate");
+}
+
+// ── Security review 2026-10-14: F-1 (site binding), F-2 / F-10 (single-use
+//    token), F-4 (bounded dedup) ───────────────────────────────────────────
+
+/// A delivery about `self_host`'s issue, naming `webhook_ids`.
+fn delivery_body_on_site(webhook_ids: &[i64], self_host: Option<&str>) -> String {
+    let mut issue = serde_json::json!({ "id": "10001", "key": "PROJ-7" });
+    if let Some(host) = self_host {
+        issue["self"] = serde_json::json!(format!("https://{host}/rest/api/3/issue/10001"));
+    }
+    serde_json::json!({
+        "webhookEvent": "jira:issue_updated",
+        "matchedWebhookIds": webhook_ids,
+        "issue": issue,
+    })
+    .to_string()
+}
+
+/// A Jira webhook id is unique only within a site. A delivery naming a
+/// registration's id but about ANOTHER site — an attacker's own webhook that
+/// happens to carry the same id — starts nothing, and is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_whose_site_is_not_the_registrations_starts_nothing() {
+    let w = world().await;
+    let (victim, _, _) = user_with_jira(&w).await; // example.atlassian.net
+    let registration = registered(&w, victim).await;
+    let workflow = common::create_test_workflow(&w.pool, victim, "on-jira-change").await;
+    bind_registration_workflow(&w.pool, victim, registration.id, Some(workflow))
+        .await
+        .expect("bind");
+
+    let receipt = w
+        .svc
+        .receive_push(
+            &delivery_headers(Some("from-another-site")),
+            Body::from(delivery_body_on_site(
+                &[registration.webhook_id],
+                Some("other-site.atlassian.net"),
+            )),
+        )
+        .await;
+    assert_eq!(receipt.note, ReceiptNote::SiteMismatch { matched: 1 });
+    assert_eq!(receipt.status(), StatusCode::ACCEPTED);
+    assert!(receipt.starts.is_empty());
+    assert_eq!(executions(&w, workflow).await, 0);
+    assert_eq!(
+        refusals(&w, victim).await,
+        vec!["site_mismatch".to_string()]
+    );
+    let remembered: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM atlassian_webhook_deliveries WHERE registration_id = $1",
+    )
+    .bind(registration.id)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        remembered, 0,
+        "an off-site delivery is not remembered as handled"
+    );
+
+    // The same webhook id, about her own site, starts her workflow.
+    let own = w
+        .svc
+        .receive_push(
+            &delivery_headers(Some("from-her-site")),
+            Body::from(delivery_body_on_site(
+                &[registration.webhook_id],
+                Some("example.atlassian.net"),
+            )),
+        )
+        .await;
+    assert_eq!(own.starts.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_without_a_site_starts_nothing() {
+    let w = world().await;
+    let (alice, _, _) = user_with_jira(&w).await;
+    let registration = registered(&w, alice).await;
+    let workflow = common::create_test_workflow(&w.pool, alice, "on-jira-change").await;
+    bind_registration_workflow(&w.pool, alice, registration.id, Some(workflow))
+        .await
+        .expect("bind");
+    let receipt = w
+        .svc
+        .receive_push(
+            &delivery_headers(Some("no-self")),
+            Body::from(delivery_body_on_site(&[registration.webhook_id], None)),
+        )
+        .await;
+    assert_eq!(receipt.note, ReceiptNote::SiteMismatch { matched: 1 });
+    assert!(receipt.starts.is_empty());
+}
+
+/// Two sites that hand out the same webhook id: a delivery from one site
+/// starts that site's registration only (before 2026-10-14 the id was
+/// ambiguous and both were withheld; with the site known it is not).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_webhook_id_on_two_sites_starts_only_the_delivering_sites_registration() {
+    let w = world().await;
+    let alice = user(&w).await;
+    let bob = user(&w).await;
+    connect_site_at(
+        &w,
+        alice,
+        SCOPE_WITH_WEBHOOKS,
+        Some("557058:a"),
+        "https://alice-site.atlassian.net",
+    )
+    .await;
+    connect_site_at(
+        &w,
+        bob,
+        SCOPE_WITH_WEBHOOKS,
+        Some("557058:b"),
+        "https://bob-site.atlassian.net",
+    )
+    .await;
+    w.atlassian.next_webhook_id.store(7, Ordering::SeqCst);
+    let alices = registered(&w, alice).await;
+    w.atlassian.next_webhook_id.store(7, Ordering::SeqCst);
+    let bobs = registered(&w, bob).await;
+    assert_eq!((alices.webhook_id, bobs.webhook_id), (7, 7));
+    let alice_workflow = common::create_test_workflow(&w.pool, alice, "alice-on-jira").await;
+    let bob_workflow = common::create_test_workflow(&w.pool, bob, "bob-on-jira").await;
+    bind_registration_workflow(&w.pool, alice, alices.id, Some(alice_workflow))
+        .await
+        .unwrap();
+    bind_registration_workflow(&w.pool, bob, bobs.id, Some(bob_workflow))
+        .await
+        .unwrap();
+
+    // From Alice's site, naming id 7: Alice's start only.
+    let receipt = w
+        .svc
+        .receive_push(
+            &delivery_headers(Some("seven-from-alice")),
+            Body::from(delivery_body_on_site(
+                &[7],
+                Some("alice-site.atlassian.net"),
+            )),
+        )
+        .await;
+    let started: Vec<(Uuid, Uuid)> = receipt
+        .starts
+        .iter()
+        .map(|s| (s.user_id, s.workflow_id))
+        .collect();
+    assert_eq!(started, vec![(alice, alice_workflow)]);
+    assert!(
+        refusals(&w, bob)
+            .await
+            .contains(&"site_mismatch".to_string()),
+        "Bob's registration is withheld as off-site, and he can find out why"
+    );
+}
+
+/// A token is single-use: the same token with a different identifier and a
+/// different issue starts nothing the second time, and is remembered nowhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_token_starts_nothing_and_records_nothing() {
+    let w = world().await;
+    let (alice, _, _) = user_with_jira(&w).await;
+    let registration = registered(&w, alice).await;
+    let workflow = common::create_test_workflow(&w.pool, alice, "on-jira-change").await;
+    bind_registration_workflow(&w.pool, alice, registration.id, Some(workflow))
+        .await
+        .expect("bind");
+    let token = delivery_token();
+    let headers_with = |identifier: &str| {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h.insert(
+            "X-Atlassian-Webhook-Identifier",
+            identifier.parse().unwrap(),
+        );
+        h
+    };
+    let first = w
+        .svc
+        .receive_push(
+            &headers_with("one"),
+            Body::from(delivery_body(&[registration.webhook_id])),
+        )
+        .await;
+    assert_eq!(first.starts.len(), 1);
+    let forged = w
+        .svc
+        .receive_push(
+            &headers_with("two"),
+            Body::from(delivery_body_for_issue(
+                &[registration.webhook_id],
+                "OTHER-1",
+            )),
+        )
+        .await;
+    assert_eq!(forged.note, ReceiptNote::Replayed);
+    assert!(forged.starts.is_empty());
+    let remembered: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM atlassian_webhook_deliveries WHERE registration_id = $1",
+    )
+    .bind(registration.id)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(remembered, 1, "the replay inserted nothing");
+}
+
+/// A registration holding its cap of remembered deliveries inserts and
+/// starts nothing more until the sweep makes room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_at_its_dedup_cap_starts_nothing_and_inserts_nothing() {
+    let w = world().await;
+    let (alice, _, _) = user_with_jira(&w).await;
+    let registration = registered(&w, alice).await;
+    let workflow = common::create_test_workflow(&w.pool, alice, "on-jira-change").await;
+    bind_registration_workflow(&w.pool, alice, registration.id, Some(workflow))
+        .await
+        .expect("bind");
+    sqlx::query(
+        "INSERT INTO atlassian_webhook_deliveries (registration_id, delivery_id) \
+         SELECT $1, 'prior-' || g FROM generate_series(1, $2) AS g",
+    )
+    .bind(registration.id)
+    .bind(talos_atlassian::push_receiver::DEDUP_ROWS_PER_REGISTRATION)
+    .execute(&w.pool)
+    .await
+    .expect("fill to the cap");
+
+    let receipt = deliver(&w, &[registration.webhook_id], Some("one-too-many")).await;
+    assert_eq!(
+        receipt.note,
+        ReceiptNote::Accepted {
+            matched: 1,
+            off_site: 0,
+            ambiguous: 0,
+            rate_limited: 0,
+            capped: 1,
+            duplicates: 0
+        }
+    );
+    assert!(receipt.starts.is_empty());
+    let remembered: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM atlassian_webhook_deliveries WHERE registration_id = $1",
+    )
+    .bind(registration.id)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        remembered,
+        talos_atlassian::push_receiver::DEDUP_ROWS_PER_REGISTRATION
+    );
+    assert_eq!(refusals(&w, alice).await, vec!["dedup_cap".to_string()]);
 }

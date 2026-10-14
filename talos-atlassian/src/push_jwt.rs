@@ -9,14 +9,22 @@
 //! * the signature must verify under the app's client secret, with an HMAC
 //!   algorithm (HS256 / HS384 / HS512) and no other. `none` and every
 //!   asymmetric algorithm are refused by name BEFORE any key is used;
-//! * `exp` and `nbf` are honoured when the token carries them (60 s leeway),
-//!   and NOT required, because requiring a claim nobody has documented would
-//!   refuse every real delivery if the guess were wrong;
-//! * `aud`, `iss` and `sub` are not checked, for the same reason.
+//! * `exp` is REQUIRED (since 2026-10-14) and must be at most
+//!   [`MAX_TOKEN_LIFETIME_SECS`] in the future; `nbf` is honoured when
+//!   present (60 s leeway). The shape log below showed the claims a real
+//!   delivery carries — `context, exp, iat, iss, jti, sub`, HS256 — so the
+//!   requirement refuses only what Atlassian does not send. A token is
+//!   single-use: the receiver keeps a replay cache keyed on the token's hash
+//!   for as long as an `exp` can be valid (security review 2026-10-14, F-2);
+//! * `aud`, `iss` and `sub` are not checked: their VALUES for an OAuth 2.0
+//!   app's delivery are undocumented, and a guessed value would refuse every
+//!   real delivery. The token carries no `qsh`, so it is not bound to the
+//!   request body; the replay cache is what stops one token carrying a second
+//!   body.
 //!
-//! The first delivery this process authenticates logs the header `alg` and the
-//! sorted NAMES of its claims (never a value) so the claim set can be learned
-//! from production and this validation tightened.
+//! The first delivery this process authenticates logs the header `alg`, the
+//! sorted NAMES of its claims and the token's lifetime in seconds (never a
+//! claim value) so this validation can be tightened further.
 //!
 //! The comparison of the MAC is the `jsonwebtoken` crate's (constant time);
 //! nothing here compares secret material.
@@ -39,6 +47,11 @@ pub const MIN_CLIENT_SECRET_BYTES: usize = 16;
 /// Clock skew tolerated on `exp` / `nbf`, in seconds.
 pub const LEEWAY_SECS: u64 = 60;
 
+/// Furthest in the future a token's `exp` may be. The receiver's replay
+/// cache remembers a token for at least this long plus [`LEEWAY_SECS`], so no
+/// token it accepts can outlive its memory of having seen it.
+pub const MAX_TOKEN_LIFETIME_SECS: u64 = 60 * 60;
+
 /// Why a delivery's token was refused. A closed set: the handler logs the
 /// word and never the token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +70,11 @@ pub enum JwtRefusal {
     NotYetValid,
     /// The token verified structurally but a claim is malformed.
     InvalidClaims,
+    /// The token carries no `exp`: it would never stop being usable.
+    MissingExpiry,
+    /// `exp` is further out than [`MAX_TOKEN_LIFETIME_SECS`]: a token that
+    /// outlives the replay cache's memory of it could be used twice.
+    ExpiryTooFar,
 }
 
 impl JwtRefusal {
@@ -70,6 +88,8 @@ impl JwtRefusal {
             Self::Expired => "expired",
             Self::NotYetValid => "not_yet_valid",
             Self::InvalidClaims => "invalid_claims",
+            Self::MissingExpiry => "missing_expiry",
+            Self::ExpiryTooFar => "expiry_too_far",
         }
     }
 }
@@ -81,6 +101,11 @@ pub struct VerifiedJwt {
     pub alg: &'static str,
     /// Sorted, bounded, and limited to plain names.
     pub claim_names: Vec<String>,
+    /// `exp`, in Unix seconds. Always present on a verified token; the
+    /// receiver remembers the token until then (plus the leeway).
+    pub expires_at: u64,
+    /// `exp - iat` when the token carries an `iat`, for the shape log.
+    pub lifetime_secs: Option<u64>,
 }
 
 /// THE algorithm restriction: the only names this receiver will verify.
@@ -141,8 +166,8 @@ pub fn verify_delivery_jwt(token: &str, client_secret: &[u8]) -> Result<Verified
     }
 
     let mut validation = Validation::new(algorithm);
-    // Honoured when present, never required: the claim set is undocumented.
-    validation.required_spec_claims.clear();
+    // `exp` required (a real delivery carries it); nothing else is.
+    validation.set_required_spec_claims(&["exp"]);
     validation.validate_exp = true;
     validation.validate_nbf = true;
     validation.validate_aud = false;
@@ -163,12 +188,24 @@ pub fn verify_delivery_jwt(token: &str, client_secret: &[u8]) -> Result<Verified
         ErrorKind::InvalidToken | ErrorKind::Base64(_) | ErrorKind::Utf8(_) => {
             JwtRefusal::Malformed
         }
+        ErrorKind::MissingRequiredClaim(_) => JwtRefusal::MissingExpiry,
         _ => JwtRefusal::InvalidClaims,
     })?;
+
+    let claim_u64 = |name: &str| data.claims.get(name).and_then(serde_json::Value::as_u64);
+    let expires_at = claim_u64("exp").ok_or(JwtRefusal::InvalidClaims)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if expires_at > now.saturating_add(MAX_TOKEN_LIFETIME_SECS + LEEWAY_SECS) {
+        return Err(JwtRefusal::ExpiryTooFar);
+    }
 
     Ok(VerifiedJwt {
         alg,
         claim_names: plain_claim_names(data.claims.keys().map(String::as_str)),
+        expires_at,
+        lifetime_secs: claim_u64("iat").map(|iat| expires_at.saturating_sub(iat)),
     })
 }
 
@@ -214,8 +251,10 @@ pub fn log_shape_once(verified: &VerifiedJwt) {
         event_kind = "jira_webhook_jwt_shape",
         alg = verified.alg,
         claim_names = %verified.claim_names.join(","),
-        "first authenticated Jira webhook delivery in this process: its JWT header alg and \
-         claim NAMES (never values), recorded so the receiver's validation can be tightened"
+        lifetime_secs = ?verified.lifetime_secs,
+        "first authenticated Jira webhook delivery in this process: its JWT header alg, \
+         claim NAMES (never values) and lifetime, recorded so the receiver's validation can \
+         be tightened"
     );
 }
 
@@ -270,23 +309,49 @@ mod tests {
         }
     }
 
-    /// The claim set is undocumented, so a token with no `exp`, no `aud` and
-    /// no `iss` is still a token Atlassian may send.
+    /// A real delivery carries `exp` (the shape log on a live stack:
+    /// `context, exp, iat, iss, jti, sub`). A token without one would never
+    /// stop being usable, so it is refused (security review 2026-10-14, F-2).
     #[test]
-    fn a_token_without_the_undocumented_claims_is_accepted() {
+    fn a_token_without_exp_is_refused() {
         let token = signed(
             Algorithm::HS256,
             &serde_json::json!({"anything": true}),
             SECRET,
         );
-        assert!(verify_delivery_jwt(&token, SECRET).is_ok());
-        // An `aud` nobody configured is not a reason to refuse either.
+        assert_eq!(
+            verify_delivery_jwt(&token, SECRET),
+            Err(JwtRefusal::MissingExpiry)
+        );
+        // An `aud` nobody configured is not a reason to refuse.
         let token = signed(
             Algorithm::HS256,
-            &serde_json::json!({"aud": "some-client-id"}),
+            &serde_json::json!({"aud": "some-client-id", "exp": now() + 120}),
             SECRET,
         );
         assert!(verify_delivery_jwt(&token, SECRET).is_ok());
+    }
+
+    /// An `exp` further out than the replay cache remembers a token could be
+    /// used again once forgotten.
+    #[test]
+    fn a_token_with_a_far_future_exp_is_refused() {
+        let far = signed(
+            Algorithm::HS256,
+            &serde_json::json!({"exp": now() + MAX_TOKEN_LIFETIME_SECS + LEEWAY_SECS + 120}),
+            SECRET,
+        );
+        assert_eq!(
+            verify_delivery_jwt(&far, SECRET),
+            Err(JwtRefusal::ExpiryTooFar)
+        );
+        let near = signed(
+            Algorithm::HS256,
+            &serde_json::json!({"exp": now() + MAX_TOKEN_LIFETIME_SECS, "iat": now()}),
+            SECRET,
+        );
+        let verified = verify_delivery_jwt(&near, SECRET).expect("an hour is accepted");
+        assert_eq!(verified.lifetime_secs, Some(MAX_TOKEN_LIFETIME_SECS));
     }
 
     #[test]
@@ -356,7 +421,7 @@ mod tests {
         );
         let early = signed(
             Algorithm::HS256,
-            &serde_json::json!({"nbf": now() + 600}),
+            &serde_json::json!({"nbf": now() + 600, "exp": now() + 1200}),
             SECRET,
         );
         assert_eq!(
@@ -426,6 +491,8 @@ mod tests {
             JwtRefusal::Expired,
             JwtRefusal::NotYetValid,
             JwtRefusal::InvalidClaims,
+            JwtRefusal::MissingExpiry,
+            JwtRefusal::ExpiryTooFar,
         ] {
             assert!(r
                 .as_str()
