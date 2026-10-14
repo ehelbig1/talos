@@ -62,6 +62,7 @@ export default defineConfig({
       '/approvals/': controllerProxy(),
       '/approval-actions/': controllerProxy(),
       '/action-links/': controllerProxy(),
+      '/memory-grants/': controllerProxy(),
       '/corrections/': controllerProxy(),
       '/ws': {
         target: proxyTarget,

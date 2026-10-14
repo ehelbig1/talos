@@ -11,6 +11,14 @@ anyhow.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "uuid", "chrono"] }
+# Memory read grants: the token is random bytes, stored as a hash and compared
+# in constant time; minting and revoking are recorded in admin_event_log.
+hex.workspace = true
+subtle.workspace = true
+talos-admin-event-log = { path = "../talos-admin-event-log" }
+talos-db = { path = "../talos-db" }
+talos-random = { path = "../talos-random" }
+talos-text-util = { path = "../talos-text-util" }
 talos-config = { path = "../talos-config" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-memory = { path = "../talos-memory" }

@@ -4,6 +4,7 @@
 mod action_links;
 mod approval;
 mod approval_actions;
+mod memory_grants;
 
 /// Minimal HTML escape for dynamic content embedded in the public
 /// token-authenticated pages (approval gates, correction links). ONE
@@ -48,6 +49,7 @@ pub use dispatch_failure::{drop_reason as dlq_drop_reason, ModuleDispatchFailure
 pub use dlq::{
     dlq_entry_was_authenticated, DlqMetrics, DlqService, ReplayRefused, DLQ_AUTHENTICATED_KEY,
 };
+pub use memory_grants::memory_grant_read;
 pub use router::{insert_webhook_module_execution, webhook_handler, WebhookRouter};
 pub use signature::HMAC_SENDER_NOTE;
 pub use signature::{

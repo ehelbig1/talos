@@ -637,6 +637,38 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "required": ["actor_id", "key", "ttl_hours"]
             }
         }),
+        // ── Memory read grants ─────────────────────────────────────────────
+        serde_json::json!({
+            "name": "create_memory_read_grant",
+            "description": "Make a bearer token that reads ONE key of ONE actor's memory and nothing else. Use it to hand a single document (an approved brief, say) to a session or program that must not have the rest of the platform: MCP access reads every key of every actor you own and can write and change as well, so it is the wrong thing to hand over. The scope (the actor and the exact key) is fixed here; the holder sends the token and no other input, so it cannot be widened. Read-only. Expires (ttl_hours, default 24, max 168), can be limited to a number of reads (max_reads), and can be ended early with revoke_memory_read_grant. The token is returned ONCE, in this reply; only its hash is stored. The holder reads the document with `GET <address>/memory-grants/document` and the header `Authorization: Bearer <token>` (the token is never put in a URL). Every refusal is the same 404: an unknown, expired, revoked or used-up token, and a key with nothing stored under it. The document is returned as actor_recall returns it, NOT redacted, to whoever holds the token from any network that reaches the address: making a grant is the decision that this document may leave, including for an actor whose data otherwise stays on this host. Making and revoking a grant are recorded in the admin event log with the key; each read is counted on the grant (list_memory_read_grants). For the grant to be the session's ONLY access, run the session where it cannot reach this controller's port: on the controller's own machine the tokenless /mcp/local route answers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "actor_id": { "type": "string", "description": "UUID of the actor whose memory holds the document. Must be yours." },
+                    "key": { "type": "string", "description": "The exact memory key. Not a prefix: one grant reads one key." },
+                    "label": { "type": "string", "description": "What the grant is for, in your words (1-160 characters). Shown in list_memory_read_grants and recorded with the grant." },
+                    "ttl_hours": { "type": "integer", "description": "Lifetime in hours, 1 to 168 (default 24)." },
+                    "max_reads": { "type": "integer", "description": "Optional: the grant stops working after this many reads (1 to 1000). Omitted, it can be read any number of times until it expires." }
+                },
+                "required": ["actor_id", "key", "label"]
+            }
+        }),
+        serde_json::json!({
+            "name": "list_memory_read_grants",
+            "description": "List the memory read grants you have made, newest first (at most 100): the actor and key each reads, its label, whether it is live, expired, revoked or used up, when it expires, and how many times and when it was last read. Never shows a token. A grant's row is kept for 30 days after it expires so you can see whether it was used.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        serde_json::json!({
+            "name": "revoke_memory_read_grant",
+            "description": "End a memory read grant now. The token stops working at once; the grant stays listed as revoked. Recorded in the admin event log.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "grant_id": { "type": "string", "description": "UUID of the grant (from create_memory_read_grant or list_memory_read_grants)." }
+                },
+                "required": ["grant_id"]
+            }
+        }),
         // ── Memory bulk operations ─────────────────────────────────────────
         serde_json::json!({
             "name": "actor_forget_prefix",
@@ -1021,6 +1053,13 @@ pub async fn dispatch(
         "update_actor_status" => handle_update_actor_status(req_id, args, state, user_id).await,
         "grant_secret_access" => handle_grant_secret_access(req_id, args, state, user_id).await,
         "set_actor_budget" => handle_set_actor_budget(req_id, args, state, user_id).await,
+        "create_memory_read_grant" => {
+            handle_create_memory_read_grant(req_id, args, state, user_id).await
+        }
+        "list_memory_read_grants" => handle_list_memory_read_grants(req_id, state, user_id).await,
+        "revoke_memory_read_grant" => {
+            handle_revoke_memory_read_grant(req_id, args, state, user_id).await
+        }
         "set_actor_llm_tier_ceiling" => {
             handle_set_actor_llm_tier_ceiling(req_id, args, state, user_id).await
         }
@@ -4157,6 +4196,194 @@ async fn handle_actor_remember(
             }
             tracing::error!("actor_remember: {}", e);
             mcp_error(req_id, -32000, "Failed to store memory")
+        }
+    }
+}
+
+// ── Memory read grants ───────────────────────────────────────────────────────
+// Thin wrappers: the store, the scope rule and the audit record are
+// `talos_actor_memory_service::read_grants`.
+
+/// An optional whole number in `min..=max`; a wrong type or a value outside
+/// the range is refused rather than clamped, so the caller knows what
+/// applied.
+fn optional_whole_number(
+    args: &Value,
+    field: &str,
+    min: i64,
+    max: i64,
+) -> Result<Option<i64>, String> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_i64() {
+            Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
+            _ => Err(format!(
+                "{field} must be a whole number between {min} and {max}"
+            )),
+        },
+    }
+}
+
+async fn handle_create_memory_read_grant(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    use talos_actor_memory_service::read_grants;
+    let actor_id = match crate::utils::require_uuid(args, "actor_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let Some(key) = args.get("key").and_then(Value::as_str) else {
+        return mcp_error(
+            req_id,
+            -32602,
+            "key is required: the exact memory key to read",
+        );
+    };
+    let Some(label) = args.get("label").and_then(Value::as_str) else {
+        return mcp_error(req_id, -32602, "label is required: what the grant is for");
+    };
+    let ttl_hours = match optional_whole_number(args, "ttl_hours", 1, read_grants::MAX_TTL_HOURS) {
+        Ok(v) => v,
+        Err(message) => return mcp_error(req_id, -32602, &message),
+    };
+    let max_reads = match optional_whole_number(
+        args,
+        "max_reads",
+        1,
+        i64::from(read_grants::MAX_READS_LIMIT),
+    ) {
+        Ok(v) => v.and_then(|n| i32::try_from(n).ok()),
+        Err(message) => return mcp_error(req_id, -32602, &message),
+    };
+
+    let minted = match read_grants::mint(
+        &state.db_pool,
+        user_id,
+        read_grants::GrantRequest {
+            actor_id,
+            memory_key: key,
+            label,
+            ttl_hours,
+            max_reads,
+        },
+    )
+    .await
+    {
+        Ok(Ok(minted)) => minted,
+        Ok(Err(refusal)) => return mcp_error(req_id, -32602, &refusal.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "create_memory_read_grant failed");
+            return crate::utils::database_error(req_id);
+        }
+    };
+
+    // A typo in the key makes a grant that reads nothing; say so now. A read
+    // that fails is said, not shown as "nothing stored".
+    let key_present = match talos_actor_memory_service::key_exists_at_all(
+        &state.db_pool,
+        actor_id,
+        &minted.memory_key,
+    )
+    .await
+    {
+        Ok(present) => serde_json::json!(present),
+        Err(e) => {
+            tracing::warn!(error = %e, "create_memory_read_grant: could not check the key");
+            Value::Null
+        }
+    };
+    let base = talos_public_url::public_base_url_or(talos_config::get_base_url);
+    let url = format!("{}/memory-grants/document", base.trim_end_matches('/'));
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "grant_id": minted.id.to_string(),
+            "token": minted.raw_token,
+            "actor_id": actor_id.to_string(),
+            "key": minted.memory_key,
+            "key_present": key_present,
+            "expires_at": minted.expires_at.to_rfc3339(),
+            "max_reads": minted.max_reads,
+            "read_with": {
+                "method": "GET",
+                "url": url,
+                "header": "Authorization: Bearer <token>",
+            },
+            "message": "The token is shown once and is not stored. It reads this one key and nothing \
+                        else, from any network that reaches the address, until it expires or is \
+                        revoked (revoke_memory_read_grant). Send it in the Authorization header, \
+                        never in a URL.",
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+async fn handle_list_memory_read_grants(
+    req_id: Option<Value>,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    use talos_actor_memory_service::read_grants;
+    let grants = match read_grants::list(&state.db_pool, user_id).await {
+        Ok(grants) => grants,
+        Err(e) => {
+            tracing::error!(error = %e, "list_memory_read_grants failed");
+            return crate::utils::database_error(req_id);
+        }
+    };
+    let now = chrono::Utc::now();
+    let rows: Vec<Value> = grants
+        .iter()
+        .map(|g| {
+            serde_json::json!({
+                "grant_id": g.id.to_string(),
+                "actor_id": g.actor_id.to_string(),
+                "key": g.memory_key,
+                "label": g.label,
+                "state": g.state(now),
+                "created_at": g.created_at.to_rfc3339(),
+                "expires_at": g.expires_at.to_rfc3339(),
+                "revoked_at": g.revoked_at.map(|t| t.to_rfc3339()),
+                "max_reads": g.max_reads,
+                "read_count": g.read_count,
+                "last_read_at": g.last_read_at.map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect();
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "count": rows.len(),
+            "limit": read_grants::LIST_LIMIT,
+            "grants": rows,
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+async fn handle_revoke_memory_read_grant(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let grant_id = match crate::utils::require_uuid(args, "grant_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    match talos_actor_memory_service::read_grants::revoke(&state.db_pool, user_id, grant_id).await {
+        Ok(true) => mcp_text(
+            req_id,
+            &serde_json::json!({ "grant_id": grant_id.to_string(), "revoked": true }).to_string(),
+        ),
+        // Unknown, another user's, already revoked: one answer.
+        Ok(false) => mcp_error(req_id, -32602, "Grant not found or already revoked"),
+        Err(e) => {
+            tracing::error!(error = %e, "revoke_memory_read_grant failed");
+            crate::utils::database_error(req_id)
         }
     }
 }
