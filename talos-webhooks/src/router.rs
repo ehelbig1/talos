@@ -1489,7 +1489,7 @@ impl WebhookRouter {
                         egress_scope: actor_egress,
                         job_nonce: String::new(),
                         wasm_bytes: None,
-                        capability_world: None,
+                        capability_world: Some(exec_info.capability_world.as_str().to_string()),
                         // MCP-1090: propagate per-module integration_name.
                         // Modules belonging to integrations (e.g., GitHub
                         // webhook → GitHub integration module) need
@@ -3424,7 +3424,7 @@ impl WebhookRouter {
                     http_verb_ceiling: actor_http_verb_ceiling,
                     egress_scope: actor_egress,
                     wasm_bytes: None,
-                    capability_world: None,
+                    capability_world: Some(exec_info.capability_world.as_str().to_string()),
                     // MCP-1090: propagate integration_name (DLQ replay).
                     integration_name: exec_info.integration_name.clone(),
                     expected_wasm_hash: Some(exec_info.content_hash.clone()),

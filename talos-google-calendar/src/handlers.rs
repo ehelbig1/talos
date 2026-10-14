@@ -1889,7 +1889,7 @@ pub async fn process_webhook_events(
             http_verb_ceiling: actor_http_verb_ceiling,
             egress_scope: actor_egress,
             wasm_bytes: None, // PERFORMANCE: Include bytes directly (avoids file I/O)
-            capability_world: None,
+            capability_world: Some(exec_info.capability_world.as_str().to_string()),
             // MCP-1090 (2026-05-16): propagate per-module integration_name
             // from `ModuleExecutionInfo.integration_name`. Pre-fix this site
             // hardcoded None — but gcal-triggered modules ARE part of the

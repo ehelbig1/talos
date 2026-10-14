@@ -415,6 +415,12 @@ pub struct ModuleExecutionInfo {
     /// JobRequest / PipelineStep so the worker scopes integration_state
     /// host fns correctly.
     pub integration_name: Option<String>,
+    /// The module row's capability world — the world every gate checked.
+    /// A module-bound dispatch sends it as the job's world hint so the
+    /// worker links THIS world and refuses a binary that needs more
+    /// (security review 2026-10-14, G-1). Until then the push paths sent no
+    /// hint and the worker linked whatever the binary imported.
+    pub capability_world: CapabilityWorld,
 }
 
 /// Free-function twin of [`ModuleRegistry::redis_conn`] for tasks that hold an
@@ -1550,6 +1556,7 @@ impl ModuleRegistry {
             // dispatcher's default fallback) instead of wrapping to a huge u64.
             max_fuel: module.max_fuel.max(0) as u64,
             integration_name: module.integration_name,
+            capability_world: module.capability_world,
         })
     }
 

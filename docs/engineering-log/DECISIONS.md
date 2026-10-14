@@ -1695,6 +1695,7 @@ enforced by `clippy.toml`.
   96. the CLAUDE.md engineering-log split lost nothing
   97. a documented env var with NO default must be TRANSPORTED
   98. a module-grant secret read names the user it reads for
+  99. a job built with no capability-world hint says why
 
 ### The actor write ceiling → [`2026-10-05-actor-write-ceiling.md`](docs/engineering-log/2026-10-05-actor-write-ceiling.md)
 

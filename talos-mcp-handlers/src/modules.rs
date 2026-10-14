@@ -4936,6 +4936,44 @@ enum InstallSource {
 /// install's grant logic and the catalog listing read one shape whichever
 /// source the entry came from. `name` is the slug and `display_name` the
 /// row's name, as in a manifest.
+/// The world an installed catalog copy runs at: the manifest's, read by the
+/// ONE manifest parser (`CatalogManifest::parse`), which refuses a manifest
+/// that declares none or names one that is not compilable. Never defaulted
+/// (security review 2026-10-14, G-17 — this handler used to default a missing
+/// world to `automation-node`, the widest).
+pub(crate) fn catalog_install_world(
+    meta: &serde_json::Value,
+) -> Result<String, talos_registry::reconcile::ManifestRefusal> {
+    talos_registry::reconcile::CatalogManifest::parse(meta).map(|m| m.capability_world_long)
+}
+
+#[cfg(test)]
+mod catalog_install_world_tests {
+    use super::catalog_install_world;
+    use serde_json::json;
+
+    #[test]
+    fn a_manifest_without_a_world_is_refused_at_install() {
+        let manifest = json!({ "name": "no-world", "allowed_hosts": [] });
+        assert_eq!(
+            catalog_install_world(&manifest),
+            Err(talos_registry::reconcile::ManifestRefusal::NoCapabilityWorld)
+        );
+        let blank = json!({ "name": "blank", "capability_world": "" });
+        assert!(catalog_install_world(&blank).is_err());
+        let not_compilable = json!({ "name": "llm", "capability_world": "llm-node" });
+        assert!(catalog_install_world(&not_compilable).is_err());
+    }
+
+    #[test]
+    fn a_declared_world_is_installed_as_declared() {
+        let manifest = json!({ "name": "reader", "capability_world": "http" });
+        assert_eq!(catalog_install_world(&manifest).unwrap(), "http-node");
+        let trusted = json!({ "name": "auto", "capability_world": "trusted" });
+        assert_eq!(catalog_install_world(&trusted).unwrap(), "automation-node");
+    }
+}
+
 pub(crate) fn registry_entry_manifest(
     entry: &talos_module_repository::SharedRegistryEntry,
 ) -> serde_json::Value {
@@ -5134,20 +5172,26 @@ async fn handle_install_module_from_catalog(
             .map(str::to_string),
     };
 
-    // Extract metadata fields.
-    // capability_world: prefer talos.json, fall back to the #[talos_module(world = "...")] attribute
-    // in the source so modules without full talos.json metadata still compile to the right world.
-    let capability_world_owned: String = meta
-        .get("capability_world")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| extract_world_from_source(&rust_code))
-        .unwrap_or_else(|| "automation-node".to_string());
+    // The world comes from the ONE manifest parser
+    // (`talos_registry::reconcile::CatalogManifest::parse`), which refuses a
+    // manifest that declares none or names an unknown one. Until 2026-10-14
+    // this handler read the manifest itself and DEFAULTED a missing world to
+    // `automation-node`, the widest (security review G-17; CLAUDE.md: "A
+    // manifest must declare its `capability_world` — it is never defaulted").
+    let capability_world_owned: String = match catalog_install_world(&meta) {
+        Ok(world) => world,
+        Err(refusal) => {
+            return mcp_error(
+                req_id,
+                -32602,
+                &format!("The catalog manifest for '{name}' was refused: {refusal}."),
+            )
+        }
+    };
     let capability_world = capability_world_owned.as_str();
 
     // Role RBAC gate (2026-09-10): the module this installs runs at
-    // `capability_world` — defaulting to `automation-node`, the WIDEST
-    // compilable world, when the manifest declares none. `compile_custom_sandbox`
+    // `capability_world`. `compile_custom_sandbox`
     // refuses a role lacking that capability; this surface refused nothing, so
     // an `["http"]`-role agent could install and then run an automation-node
     // module. One shared predicate, same refusal.
@@ -5373,7 +5417,7 @@ async fn handle_install_module_from_catalog(
     // seeder, the OCI publisher and restore_pinned_modules all did. Templates
     // are author-signed; the compiler still gates deps through the allowlist
     // (validate_dependencies) inside create_workspace.
-    let compiled: Option<(Vec<u8>, String)> = match &source {
+    let compiled: Option<(Vec<u8>, String, &'static str)> = match &source {
         InstallSource::Registry(_) => None,
         InstallSource::Disk {
             template,
@@ -5393,19 +5437,28 @@ async fn handle_install_module_from_catalog(
                 .compile_catalog_template(user_id, job_id, compile_name, template)
                 .await
             {
-                Ok(res) if res.success => match res.wasm_bytes {
-                    Some(bytes) => {
-                        let hash = catalog_wasm_content_hash(&bytes);
-                        Some((bytes, hash))
+                Ok(res) if res.success => {
+                    // The copy records the world its binary IS, held within
+                    // the manifest's (security review 2026-10-14, G-1).
+                    let recorded = match talos_compilation::world_to_record(capability_world, &res)
+                    {
+                        Ok(w) => w,
+                        Err(reason) => return mcp_error(req_id, -32003, &reason),
+                    };
+                    match res.wasm_bytes {
+                        Some(bytes) => {
+                            let hash = catalog_wasm_content_hash(&bytes);
+                            Some((bytes, hash, recorded))
+                        }
+                        None => {
+                            return mcp_error(
+                                req_id,
+                                -32603,
+                                "Compilation succeeded but produced no WASM output",
+                            )
+                        }
                     }
-                    None => {
-                        return mcp_error(
-                            req_id,
-                            -32603,
-                            "Compilation succeeded but produced no WASM output",
-                        )
-                    }
-                },
+                }
                 Ok(res) => {
                     let errors: Vec<String> = res
                         .errors
@@ -5444,7 +5497,7 @@ async fn handle_install_module_from_catalog(
                 oci_url: &entry.oci_url,
             }
         }
-        (InstallSource::Disk { template, .. }, Some((bytes, hash))) => {
+        (InstallSource::Disk { template, .. }, Some((bytes, hash, _))) => {
             talos_module_repository::InstalledArtifact::Compiled {
                 wasm_bytes: bytes,
                 content_hash: hash,
@@ -5476,10 +5529,15 @@ async fn handle_install_module_from_catalog(
     let _ = caller_provided_allowed_secrets;
     let _ = (&category, &description); // metadata embedded in modules row directly
 
-    let cw_short = if capability_world == "automation-node" {
-        "trusted"
-    } else {
-        capability_world.trim_end_matches("-node")
+    // A compiled copy records its binary's world; a registry reference
+    // records the manifest's (the worker pulls, verifies and links it at
+    // that world, refusing a binary that needs more).
+    let cw_short = match &compiled {
+        Some((_, _, recorded)) => *recorded,
+        None => capability_world
+            .parse::<talos_capability_world::CapabilityWorld>()
+            .map(|w| w.as_str())
+            .unwrap_or("unknown"),
     };
 
     // Resolve max_fuel with three-tier precedence:

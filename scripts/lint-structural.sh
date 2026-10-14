@@ -9574,6 +9574,35 @@ fi
 
 echo
 
+bold "▶ check 99: a job built with no capability-world hint says why"
+
+# A dispatched job's `capability_world` is the world the worker LINKS. With a
+# hint the worker links that world and refuses a binary that needs more
+# (`talos_wit_inspector::link_world`); with none it links whatever the binary
+# imports. Until 2026-10-14 the pipeline step, the four module-bound push
+# paths and every in-process rehearsal sent none, so a module labelled
+# `minimal` that carried an `automation-node` binary ran as automation
+# (security review 2026-10-14, G-1). The specification — what counts as a job
+# literal, what counts as test code, the opt-out — is in the script's header.
+# Opt-out: `// no-world-hint: <reason>` on the line or the 3 above it.
+# Measured: 7 hits on main @ 59b1081a — the six defects above and the
+# `DispatchJob` Default impl; 1 after (the Default impl, marked); 0 false
+# positives. Limit: textual; a builder that leaves the field at its default is
+# seen only through the marked Default impl.
+CK99_RC=0
+CK99_OUT="$(cd "$ROOT" && python3 scripts/lint-world-hint.py . 2>&1)" || CK99_RC=$?
+if [ "$CK99_RC" -eq 0 ]; then
+    green "✓ every hint-less job construction says why ($(echo "$CK99_OUT" | tail -1))"
+else
+    echo "$CK99_OUT" | sed 's/^/  /'
+    red "✗ a job is built with no capability-world hint and no reason"
+    yellow "  → send the module row's world (the one every gate checked),"
+    yellow "    or mark it // no-world-hint: <reason>"
+    EXIT_CODE=1
+fi
+
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

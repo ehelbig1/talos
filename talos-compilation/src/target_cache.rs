@@ -83,7 +83,11 @@ fn user_cache_dir(root: &Path, user_id: Uuid) -> PathBuf {
 /// callers fall back to the legacy throwaway `{workspace}/target`, so a
 /// cache-infrastructure problem degrades to slow, never to broken.
 pub(crate) fn resolve_for(user_id: Uuid) -> Option<PathBuf> {
-    if !cache_enabled() {
+    // The nil id is not a user: every caller that substitutes it for a
+    // missing identity would share ONE cache directory — the fleet-shared
+    // cache this module exists to forbid (security review 2026-10-14, G-22).
+    // Such a compile runs cold, as `lint_code` with no user already does.
+    if user_id.is_nil() || !cache_enabled() {
         return None;
     }
     let root = cache_root();
@@ -166,6 +170,11 @@ fn sweep_stale(root: &Path, ttl: Duration, now: SystemTime) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_nil_user_gets_no_shared_cache() {
+        assert_eq!(resolve_for(Uuid::nil()), None);
+    }
 
     #[test]
     fn user_dir_is_uuid_keyed_under_root() {

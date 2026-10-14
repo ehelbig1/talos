@@ -392,9 +392,13 @@ impl ParallelWorkflowEngine {
                         Some(a.content_hash.clone())
                     }
                 }),
-                // Pipeline dispatch uses a chain-level capability
-                // world; the adapter drops the per-step value.
-                capability_world: None,
+                // The step module's row world. The NATS chain adapter has
+                // no per-step world field to carry it in (`PipelineStep`),
+                // so the worker's chain path still inspects each step; the
+                // chain path is disabled in every production entry point
+                // (security review 2026-10-14, G-15 / B-8 decide its wire
+                // shape). Set here so an adapter that can carry it does.
+                capability_world: artifact.as_ref().map(|a| a.capability_world.clone()),
                 integration_name: artifact.as_ref().and_then(|a| a.integration_name.clone()),
                 // `PipelineStep` calls this `config`; the adapter maps
                 // `input_payload` to it.

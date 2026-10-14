@@ -4051,13 +4051,29 @@ impl TalosRuntime {
         };
         let module_hash_str = hex::encode(module_hash_bytes);
 
-        // Resolve capability world: prefer the hint from the controller (avoids re-inspecting
-        // a Wizer-snapshotted binary that may have lost embedded WIT world-name strings),
-        // then fall back to binary inspection only when no usable hint is provided.
-        let cap = match capability_world_hint {
-            Some(hint) if !matches!(hint, CapabilityWorld::Unknown) => hint,
-            _ => crate::wit_inspector::inspect_component(wasm_bytes).capability_world,
-        };
+        // Resolve the link world. The hint is the module row's world — the one
+        // every gate (role, actor ceiling, dispatch ceiling) checked — so it is
+        // the world linked; the binary is still inspected, and one whose world
+        // is wider than the hint is refused HERE, before instantiation
+        // (`link_world`, security review 2026-10-14 G-1). Until then a hint
+        // skipped inspection and no hint linked whatever the binary imported.
+        let cap = crate::wit_inspector::link_world(
+            capability_world_hint.as_ref(),
+            &crate::wit_inspector::inspect_component(wasm_bytes),
+        )
+        .map_err(|reason| {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "capability_world_exceeded",
+                hint = ?capability_world_hint,
+                %reason,
+                "refused a module whose binary exceeds the world it was dispatched at"
+            );
+            anyhow::anyhow!(
+                "capability-world-exceeded: the module's binary needs more than the \
+                 world it was dispatched at ({reason})"
+            )
+        })?;
         let mut result_cache_ttl_secs = result_cache_ttl_secs;
         if matches!(cap, crate::wit_inspector::CapabilityWorld::Governance) {
             // Governance nodes must not be cached because they require human interaction

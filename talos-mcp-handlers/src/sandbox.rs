@@ -631,6 +631,17 @@ pub(crate) fn agent_role_permits_world(
             .any(|c| talos_capability_world::world_short(c) == world_base)
 }
 
+/// The world hint an in-process rehearsal passes the runtime: the world its
+/// gates checked (or the module row's world). The runtime links that world and
+/// refuses a binary whose imports need more (`talos_wit_inspector::link_world`,
+/// security review 2026-10-14 G-1). Until then every rehearsal surface passed
+/// no hint, and the runtime linked whatever the binary imported.
+pub(crate) fn checked_world_hint(world: &str) -> talos_worker_runtime::CapabilityWorld {
+    world
+        .parse()
+        .unwrap_or(talos_worker_runtime::CapabilityWorld::Unknown)
+}
+
 /// [`agent_role_permits_world`] as a refusal. `verb` names the operation for
 /// the message ("compile tools for", "run sandbox code in", ...). Refuses with
 /// `-32003`, the code the two original inline gates used.
@@ -1465,6 +1476,13 @@ async fn handle_compile_custom_sandbox(
 
     match compilation {
         Ok(res) if res.success => {
+            // The row records the world the BINARY is, held within the world
+            // that was checked — never the argument's label (security review
+            // 2026-10-14, G-1).
+            let cw_short = match talos_compilation::world_to_record(capability_world, &res) {
+                Ok(w) => w,
+                Err(reason) => return mcp_error(req_id, -32003, &reason),
+            };
             let wasm_bytes = match res.wasm_bytes {
                 Some(b) => b,
                 None => {
@@ -1558,13 +1576,6 @@ async fn handle_compile_custom_sandbox(
                     &language_str,
                 ))
                 .min(50_000_000) as i64;
-            // DB CHECK constraint accepts short forms only ('minimal', 'http', 'trusted'…).
-            let cw_short = if capability_world == "automation-node" {
-                "trusted"
-            } else {
-                capability_world.trim_end_matches("-node")
-            };
-
             // Generate the canonical modules.id up-front so the response
             // can return it deterministically.
             let module_id = uuid::Uuid::new_v4();
@@ -1979,15 +1990,20 @@ async fn handle_run_sandbox(
     // takes an explicit dependencies argument. (This file is in check 68 leg
     // (d)'s scope only because `handle_compile_template`, further down, does
     // resolve a row via `get_template_for_user`.)
+    //
+    // Compiled FOR the world the role gate and the ceiling checked: a body
+    // that declares another world is refused (security review 2026-10-14,
+    // G-1), and the run below links at that world.
     let compilation_result = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        state.compiler.compile_to_wasm_with_config(
+        state.compiler.compile_rust_for_world(
             user_id,
             job_id,
             "run_sandbox",
             &rust_code,
             &serde_json::json!({}),
             None,
+            capability_world,
         ),
     )
     .await;
@@ -2229,7 +2245,9 @@ async fn handle_run_sandbox(
             talos_worker_runtime::runtime::RetryPolicy::in_process_transient(),
             None, // result_cache_ttl_secs
             talos_worker_runtime::runtime::SecurityPolicy::default(),
-            None,  // capability_world_hint
+            // The ceiling-checked world: the runtime links it and refuses a
+            // binary that needs more.
+            Some(checked_world_hint(capability_world)),
             None,  // max_fuel_override
             false, // dry_run
             Some(effective_actor_id),
@@ -4421,7 +4439,9 @@ async fn handle_test_module(
             retry_policy,
             None,
             security_policy,
-            None, // capability_world_hint
+            // The world the role gate above checked: the runtime links it
+            // and refuses a binary that needs more.
+            Some(module.capability_world.clone()),
             // Fuel: enforce the MODULE's own budget so test results are
             // PREDICTIVE of workflow behavior. Pre-fix this was None (the
             // runtime's env default), which masked the interpreter-fuel bug

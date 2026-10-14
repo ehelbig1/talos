@@ -201,6 +201,37 @@ pub fn validate_capability_level(
     Ok(())
 }
 
+/// The world a component is LINKED at, given the dispatcher's world hint and
+/// the inspection of the binary that is about to run. The one decision the
+/// worker makes before it instantiates a component (security review
+/// 2026-10-14, G-1).
+///
+/// - A hint (the module row's world, which every gate checked) is the link
+///   world, and a binary whose inspected world is NOT a subset of it is
+///   refused here, before instantiation — [`validate_capability_level`]. The
+///   hint's tiered linker would refuse the extra imports anyway; this makes
+///   the refusal explicit and names the worlds.
+/// - A hint with an `Unknown` inspection links at the hint: inspection can
+///   lose the world-name strings (a Wizer snapshot), and the hint's linker
+///   resolves only the hint's imports, so nothing wider can link.
+/// - No hint (or an `Unknown` hint) links at the inspected world — the legacy
+///   shape. Every production dispatch now sends a hint; a construction site
+///   that sends none carries `// no-world-hint: <reason>` (lint check 99).
+pub fn link_world(
+    hint: Option<&CapabilityWorld>,
+    inspection: &ComponentInspection,
+) -> Result<CapabilityWorld, String> {
+    match hint {
+        Some(h) if *h != CapabilityWorld::Unknown => {
+            if inspection.capability_world != CapabilityWorld::Unknown {
+                validate_capability_level(inspection, h)?;
+            }
+            Ok(h.clone())
+        }
+        _ => Ok(inspection.capability_world.clone()),
+    }
+}
+
 // ============================================================================
 // Private helpers
 // ============================================================================
@@ -650,6 +681,60 @@ mod tests {
         // Unknown components are rejected regardless of declared level.
         assert!(validate_capability_level(&inspection, &CapabilityWorld::Unknown).is_err());
         assert!(validate_capability_level(&inspection, &CapabilityWorld::Trusted).is_err());
+    }
+
+    // ── link_world ──────────────────────────────────────────────────────────
+
+    fn inspected(world: CapabilityWorld, interfaces: &[&str]) -> ComponentInspection {
+        ComponentInspection {
+            capability_world: world,
+            imported_interfaces: interfaces.iter().map(|s| s.to_string()).collect(),
+            is_talos_node: true,
+        }
+    }
+
+    #[test]
+    fn a_binary_wider_than_its_hint_is_refused() {
+        // A row labelled minimal whose binary imports secrets: the label is
+        // what every gate checked, the binary is what would run.
+        let wide = inspected(CapabilityWorld::Secrets, &["talos:core/secrets"]);
+        let err = link_world(Some(&CapabilityWorld::Minimal), &wide).unwrap_err();
+        assert!(err.contains("outside its declared world"), "{err}");
+        let trusted = inspected(CapabilityWorld::Trusted, &["talos:core/database"]);
+        assert!(link_world(Some(&CapabilityWorld::Http), &trusted).is_err());
+    }
+
+    #[test]
+    fn a_binary_within_its_hint_links_at_the_hint() {
+        let narrow = inspected(CapabilityWorld::Minimal, &[]);
+        assert_eq!(
+            link_world(Some(&CapabilityWorld::Http), &narrow).unwrap(),
+            CapabilityWorld::Http
+        );
+        let exact = inspected(CapabilityWorld::Secrets, &["talos:core/secrets"]);
+        assert_eq!(
+            link_world(Some(&CapabilityWorld::Secrets), &exact).unwrap(),
+            CapabilityWorld::Secrets
+        );
+    }
+
+    #[test]
+    fn an_uninspectable_binary_links_at_its_hint() {
+        let unknown = inspected(CapabilityWorld::Unknown, &[]);
+        assert_eq!(
+            link_world(Some(&CapabilityWorld::Minimal), &unknown).unwrap(),
+            CapabilityWorld::Minimal
+        );
+    }
+
+    #[test]
+    fn without_a_hint_the_inspected_world_is_linked() {
+        let wide = inspected(CapabilityWorld::Trusted, &["talos:core/database"]);
+        assert_eq!(link_world(None, &wide).unwrap(), CapabilityWorld::Trusted);
+        assert_eq!(
+            link_world(Some(&CapabilityWorld::Unknown), &wide).unwrap(),
+            CapabilityWorld::Trusted
+        );
     }
 
     // ── PartialOrd ──────────────────────────────────────────────────────────

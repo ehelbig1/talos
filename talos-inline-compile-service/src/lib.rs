@@ -274,7 +274,11 @@ pub enum NameCollision {
 pub struct CompiledInline {
     wasm_bytes: Vec<u8>,
     node_id: String,
+    /// The world the compile was CHECKED and built for (the input's).
     capability_world: String,
+    /// The world to record: the binary's own, within `capability_world`
+    /// (`talos_compilation::world_to_record`, security review 2026-10-14 G-1).
+    recorded_world: String,
     source_sha256: [u8; 32],
 }
 
@@ -300,6 +304,7 @@ impl CompiledInline {
             wasm_bytes,
             node_id: input.node_id.to_string(),
             capability_world: input.capability_world.to_string(),
+            recorded_world: world_short_for_persistence(input.capability_world),
             source_sha256: source_sha256(input.rust_code),
         }
     }
@@ -529,13 +534,17 @@ impl InlineCompileService {
         let job_id = Uuid::new_v4();
         let compile_result = self
             .compiler
-            .compile_to_wasm_with_config(
+            // FOR the world the ceiling gate above checked: a body that
+            // declares another world is refused (security review 2026-10-14,
+            // G-1).
+            .compile_rust_for_world(
                 input.user_id,
                 job_id,
                 input.node_id,
                 &wrapped_code,
                 &serde_json::json!({}),
                 input.dependencies,
+                &world_full,
             )
             .await;
 
@@ -558,11 +567,15 @@ impl InlineCompileService {
                 error_msgs.join("\n"),
             )));
         }
+        let recorded_world = talos_compilation::world_to_record(&world_full, &res)
+            .map_err(InlineCompileError::CapabilityCeilingViolation)?
+            .to_string();
         let wasm_bytes = res.wasm_bytes.ok_or(InlineCompileError::NoWasmEmitted)?;
         Ok(CompiledInline {
             wasm_bytes,
             node_id: input.node_id.to_string(),
             capability_world: input.capability_world.to_string(),
+            recorded_world,
             source_sha256: source_sha256(input.rust_code),
         })
     }
@@ -579,6 +592,7 @@ impl InlineCompileService {
             wasm_bytes,
             node_id,
             capability_world,
+            recorded_world,
             source_sha256: compiled_sha,
         } = compiled;
         if node_id != input.node_id
@@ -724,7 +738,9 @@ impl InlineCompileService {
         }
 
         // 8. Compute world_short, max_fuel, content_hash, then mirror.
-        let world_short = world_short_for_persistence(input.capability_world);
+        // The binary's world, held within the one checked — never the
+        // input's label.
+        let world_short = recorded_world;
         let max_fuel: i64 = input
             .fuel_budget
             .map(|f| f as i64)
@@ -866,6 +882,11 @@ fn normalise_world_to_node(world: &str) -> String {
 /// `"trusted"` (legacy synonym), everything else just drops the
 /// trailing `"-node"`. Persisted form is the short-name; downstream
 /// readers normalise via `talos_capability_world::parse_*`.
+///
+/// Production records the BINARY's world (`talos_compilation::world_to_record`)
+/// since 2026-10-14; this label form is left for the test-support constructor,
+/// which has no binary to inspect.
+#[cfg(any(test, feature = "test-support"))]
 fn world_short_for_persistence(world: &str) -> String {
     if world == "automation-node" {
         "trusted".to_string()

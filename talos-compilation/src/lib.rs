@@ -845,6 +845,11 @@ impl CompilationService {
 
     /// Compile Rust source to WASM with config
     /// If source_code contains Handlebars syntax, it will be rendered with config first
+    ///
+    /// The binary is reconciled against the world the SOURCE declares. A
+    /// surface that checked a caller's world (a role, an actor ceiling)
+    /// compiles with [`Self::compile_rust_for_world`] instead, so the binary is
+    /// held to the world that was checked.
     pub async fn compile_to_wasm_with_config(
         &self,
         user_id: Uuid,
@@ -853,6 +858,60 @@ impl CompilationService {
         source_code: &str,
         config: &serde_json::Value,
         dependencies: Option<&serde_json::Value>,
+    ) -> Result<CompilationResult> {
+        self.compile_rust(
+            user_id,
+            job_id,
+            name,
+            source_code,
+            config,
+            dependencies,
+            None,
+        )
+        .await
+    }
+
+    /// Compile Rust source for a REQUIRED capability world — the world a
+    /// role gate or an actor ceiling checked before the compile. Every world
+    /// the source declares (`#[talos_module(world = …)]`, `#[talos_node(…)]`,
+    /// `wit_bindgen::generate!({ world: … })`) must be that world, and the
+    /// binary is reconciled against it, so a body cannot name a wider world
+    /// than the one that was checked (security review 2026-10-14, G-1). Until
+    /// then the source's own declaration was the reference and the checked
+    /// world was never applied to a Rust body that carried one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compile_rust_for_world(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        config: &serde_json::Value,
+        dependencies: Option<&serde_json::Value>,
+        world: &str,
+    ) -> Result<CompilationResult> {
+        self.compile_rust(
+            user_id,
+            job_id,
+            name,
+            source_code,
+            config,
+            dependencies,
+            Some(world),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compile_rust(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        config: &serde_json::Value,
+        dependencies: Option<&serde_json::Value>,
+        required_world: Option<&str>,
     ) -> Result<CompilationResult> {
         self.ensure_enabled()?;
         // wasm-security-review (2026-05-22): bound the source size
@@ -969,22 +1028,48 @@ impl CompilationService {
             "Compilation phase: source generated"
         );
 
+        // The world the binary is reconciled against post-compile. A
+        // compile FOR a world (one a gate checked) is held to that world and
+        // refuses a source declaring any other; otherwise the source's own
+        // declaration is the reference. A mismatch means the macro expansion
+        // targeted a different world than the reference — a bait-and-switch
+        // attempt or a typo/comment-confusion bug.
+        let declared_world = match required_world {
+            None => extract_wit_world(&rendered_code),
+            Some(required) => match required_world_declaration(&rendered_code, required) {
+                Ok(world) => world,
+                Err(message) => {
+                    tracing::warn!(
+                        module_name = %name,
+                        required_world = %required,
+                        "world-mismatch: the source declares a world other than the one checked"
+                    );
+                    self.send_event(user_id, job_id, "failed", Some(message.clone()), Some(1.0));
+                    return Ok(CompilationResult {
+                        success: false,
+                        wasm_bytes: None,
+                        errors: vec![CompilationError {
+                            line: None,
+                            column: None,
+                            end_line: None,
+                            end_column: None,
+                            message,
+                            severity: "error".to_string(),
+                        }],
+                        size_bytes: 0,
+                        content_hash: String::new(),
+                        capability_world: CapabilityWorld::Unknown,
+                        imported_interfaces: vec![],
+                    });
+                }
+            },
+        };
+
         // 1. Create temporary workspace
         let (workspace, package_name) = self
             .create_workspace(job_id, name, &rendered_code, dependencies)
             .await?;
         tracing::info!(elapsed_ms = compile_start.elapsed().as_millis() as u64, name, job_id = %job_id, "Compilation phase: workspace created");
-
-        // Compute the source-declared WIT world here so we can compare
-        // it against the binary-inspected world post-compile. A mismatch
-        // means the macro expansion targeted a different world than the
-        // raw-source declaration suggested — either a bait-and-switch
-        // attempt or, more likely, a typo/comment-confusion bug. The
-        // worker's tiered linker will reject the binary at instantiation
-        // (defense-in-depth holds) but flagging the mismatch at compile
-        // time gives operators a clearer failure mode than "module fails
-        // to load on every dispatch".
-        let declared_world = extract_wit_world(&rendered_code);
 
         // L-37: run the rest of compilation in an inner method so the
         // single workspace-cleanup site below covers EVERY exit path
@@ -2184,6 +2269,80 @@ fn reconcile_declared_world(
     Ok(inspection)
 }
 
+/// Every world the source declares, in order: each `world = "…"` /
+/// `world: "…"` on a comment-stripped line (an attribute, a `talos_node`
+/// argument, a `wit_bindgen::generate!` world). [`extract_wit_world`] takes the
+/// first; [`required_world_declaration`] requires ALL of them to agree, so a
+/// decoy declaration ahead of the real macro cannot pass.
+fn source_declared_worlds(source: &str) -> Vec<String> {
+    let stripped = strip_all_comments(source);
+    let mut worlds = Vec::new();
+    for raw_line in stripped.lines() {
+        let line = strip_line_comment(raw_line);
+        for marker in [r#"world: ""#, r#"world = ""#] {
+            let mut rest_of_line = line;
+            while let Some(start) = rest_of_line.find(marker) {
+                let rest = &rest_of_line[start + marker.len()..];
+                match rest.find('"') {
+                    Some(end) => {
+                        worlds.push(rest[..end].to_string());
+                        rest_of_line = &rest[end..];
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    worlds
+}
+
+/// The world a compile FOR `required` reconciles its binary against, or the
+/// `world-mismatch` refusal. `required` must be a compilable world, and every
+/// world the source declares must be the same world (either spelling). A
+/// source that declares none is held to `required` by the post-compile
+/// reconciliation alone. Pure, so the refusal is testable without a build.
+pub fn required_world_declaration(source: &str, required: &str) -> Result<String, String> {
+    let required_world: CapabilityWorld = required.parse().unwrap_or(CapabilityWorld::Unknown);
+    if required_world == CapabilityWorld::Unknown {
+        return Err(format!(
+            "world-mismatch: `{required}` is not a compilable capability world"
+        ));
+    }
+    for declared in source_declared_worlds(source) {
+        let declared_world: CapabilityWorld = declared.parse().unwrap_or(CapabilityWorld::Unknown);
+        if declared_world != required_world {
+            return Err(format!(
+                "world-mismatch: the source declares `{declared}` but this compile was \
+                 authorised for `{}`. A module's world is the one its compile was checked \
+                 at; change the source's `world` to `{}`, or request that world.",
+                required_world.as_node_str(),
+                required_world.as_node_str(),
+            ));
+        }
+    }
+    Ok(required_world.as_node_str().to_string())
+}
+
+/// The world to RECORD for a module just built for `requested`: the world the
+/// compiled binary was found to be (`res.capability_world`, the inspection —
+/// for JS/Python the authoritative world it was built at), never the request's
+/// label. Refused when that world is unknown or is not within `requested`, so
+/// no row is labelled narrower than what it runs (security review 2026-10-14,
+/// G-1). Returns the short form the `modules.capability_world` CHECK accepts
+/// (`trusted` for `automation-node`).
+pub fn world_to_record(requested: &str, res: &CompilationResult) -> Result<&'static str, String> {
+    let detected = &res.capability_world;
+    if *detected == CapabilityWorld::Unknown
+        || !talos_capability_world::ceiling_permits(requested, detected.as_str())
+    {
+        return Err(format!(
+            "world-mismatch: the compiled binary is `{}`, which `{requested}` does not cover",
+            detected.as_node_str()
+        ));
+    }
+    Ok(detected.as_str())
+}
+
 fn extract_wit_world(source: &str) -> String {
     // MCP-637 (2026-05-12) + wasm-security-review (2026-05-22):
     // closes N-8 (extract_wit_world matches first occurrence
@@ -2204,18 +2363,8 @@ fn extract_wit_world(source: &str) -> String {
     // fails when detected > declared, so any extraction mis-match
     // still surfaces as a compile error rather than silently
     // shipping a higher-privilege binary.
-    let stripped = strip_all_comments(source);
-    for raw_line in stripped.lines() {
-        let line = strip_line_comment(raw_line);
-        // Check both syntactic forms on this line.
-        for marker in [r#"world: ""#, r#"world = ""#] {
-            if let Some(start) = line.find(marker) {
-                let rest = &line[start + marker.len()..];
-                if let Some(end) = rest.find('"') {
-                    return rest[..end].to_string();
-                }
-            }
-        }
+    if let Some(first) = source_declared_worlds(source).into_iter().next() {
+        return first;
     }
 
     // Least-privilege default. Override via env for back-compat.
@@ -3071,8 +3220,10 @@ impl CompilationService {
     /// AUTHORITATIVE over in-source annotations — protocol surfaces
     /// (compile_custom_sandbox's `capability_world` arg) validate the world
     /// against actor ceilings BEFORE compiling, so letting a source
-    /// annotation widen it afterwards would bypass that gate. Ignored for
-    /// the Rust path (cargo-component derives the world from the macro).
+    /// annotation widen it afterwards would bypass that gate. For Rust it is
+    /// the world the compile is FOR ([`Self::compile_rust_for_world`]): a
+    /// source declaring another world is refused. (Until 2026-10-14 it was
+    /// ignored for Rust — security review G-1.)
     #[allow(clippy::too_many_arguments)]
     pub async fn compile_to_wasm_with_language_and_world(
         &self,
@@ -3113,13 +3264,14 @@ impl CompilationService {
                 bail!("Go module compilation is not supported")
             }
             _ => {
-                self.compile_to_wasm_with_config(
+                self.compile_rust(
                     user_id,
                     job_id,
                     name,
                     source_code,
                     config,
                     dependencies,
+                    world_override,
                 )
                 .await
             }
@@ -4036,6 +4188,138 @@ mod m13_gate_tests {
             Some(v) => std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", v),
             None => std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK"),
         }
+    }
+}
+
+#[cfg(test)]
+mod compile_for_world_tests {
+    //! A compile FOR a world holds the source to that world (security review
+    //! 2026-10-14, G-1). The role gate and the actor ceiling check the
+    //! caller's `capability_world`; until this date a Rust body that already
+    //! carried its own declaration was built at the body's world.
+    use super::*;
+
+    #[test]
+    fn a_body_declaring_a_wider_world_than_the_checked_one_is_refused() {
+        for body in [
+            r#"#[talos_sdk_macros::talos_module(world = "automation-node")]
+               pub fn run(input: String) -> Result<String, String> { Ok(input) }"#,
+            r#"#[talos_node(world = "automation-node")]
+               pub fn run(input: String) -> Result<String, String> { Ok(input) }"#,
+            r#"wit_bindgen::generate!({ world: "automation-node", path: "wit" });"#,
+        ] {
+            let err = required_world_declaration(body, "minimal-node").unwrap_err();
+            assert!(err.starts_with("world-mismatch:"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_decoy_declaration_ahead_of_the_real_one_does_not_pass() {
+        let body = r##"
+            const NOTE: &str = r#"world = "minimal-node""#;
+            #[talos_sdk_macros::talos_module(world = "automation-node")]
+            pub fn run(input: String) -> Result<String, String> { Ok(input) }
+        "##;
+        assert!(required_world_declaration(body, "minimal-node").is_err());
+    }
+
+    #[test]
+    fn a_body_declaring_the_checked_world_in_either_spelling_compiles_for_it() {
+        let body = r#"#[talos_sdk_macros::talos_module(world = "http")]
+                      pub fn run(i: String) -> Result<String, String> { Ok(i) }"#;
+        assert_eq!(
+            required_world_declaration(body, "http-node").unwrap(),
+            "http-node"
+        );
+        // A body with no declaration is held to the required world by the
+        // post-compile reconciliation.
+        assert_eq!(
+            required_world_declaration("pub fn run() {}", "automation-node").unwrap(),
+            "automation-node"
+        );
+    }
+
+    #[test]
+    fn a_required_world_that_is_not_compilable_is_refused() {
+        assert!(required_world_declaration("pub fn run() {}", "llm-node").is_err());
+        assert!(required_world_declaration("pub fn run() {}", "").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_compile_entry_refuses_a_body_naming_another_world_before_any_build() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let (event_tx, _events) = tokio::sync::broadcast::channel(8);
+        let service = CompilationService::new(root.path().to_path_buf(), event_tx);
+        let body = r#"#[talos_sdk_macros::talos_module(world = "automation-node")]
+pub fn run(input: String) -> Result<String, String> { Ok(input) }"#;
+        let config = serde_json::json!({});
+        let direct = service
+            .compile_rust_for_world(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "m",
+                body,
+                &config,
+                None,
+                "minimal-node",
+            )
+            .await
+            .expect("a refusal is a failed result, not an error");
+        // The language router's Rust arm honours the override the same way
+        // (until 2026-10-14 it ignored it for Rust).
+        let routed = service
+            .compile_to_wasm_with_language_and_world(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "m",
+                body,
+                &config,
+                None,
+                None,
+                Some("minimal-node"),
+            )
+            .await
+            .expect("a refusal is a failed result, not an error");
+        for res in [direct, routed] {
+            assert!(!res.success);
+            assert!(res.wasm_bytes.is_none());
+            assert!(
+                res.errors[0].message.starts_with("world-mismatch:"),
+                "{}",
+                res.errors[0].message
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "the refusal came before any workspace was made"
+        );
+    }
+
+    fn result(world: CapabilityWorld) -> CompilationResult {
+        CompilationResult {
+            success: true,
+            wasm_bytes: Some(vec![]),
+            errors: vec![],
+            size_bytes: 0,
+            content_hash: String::new(),
+            capability_world: world,
+            imported_interfaces: vec![],
+        }
+    }
+
+    #[test]
+    fn the_recorded_world_is_the_binarys_never_wider_than_the_request() {
+        assert_eq!(
+            world_to_record("http-node", &result(CapabilityWorld::Minimal)).unwrap(),
+            "minimal"
+        );
+        assert_eq!(
+            world_to_record("automation-node", &result(CapabilityWorld::Trusted)).unwrap(),
+            "trusted"
+        );
+        assert!(world_to_record("minimal-node", &result(CapabilityWorld::Secrets)).is_err());
+        assert!(world_to_record("http-node", &result(CapabilityWorld::Unknown)).is_err());
     }
 }
 
