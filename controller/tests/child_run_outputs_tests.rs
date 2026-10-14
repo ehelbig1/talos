@@ -314,8 +314,9 @@ async fn a_stranger_reads_the_path_as_a_missing_execution() {
         .contains("a drafted brief"));
 }
 
-/// The child runs appear in their workflow's listing when asked for, with the
-/// top-level execution and the path to read them by; not when not asked.
+/// The child runs appear in their workflow's listing by default, with the
+/// top-level execution and the path to read them by, and in its stats as a
+/// separate block.
 #[tokio::test]
 async fn child_runs_are_listed_with_their_top_level_execution_and_path() {
     leave_row_security_unenforced();
@@ -382,7 +383,8 @@ async fn child_runs_are_listed_with_their_top_level_execution_and_path() {
         true
     );
 
-    // Not asked: no child-run list, and the envelope is as it was.
+    // Listed by default (operator decision, 2026-10-14); `false` leaves the
+    // list out and the envelope is as it was.
     let body = text_json(
         &call(
             &state,
@@ -392,7 +394,67 @@ async fn child_runs_are_listed_with_their_top_level_execution_and_path() {
         )
         .await,
     );
+    assert_eq!(
+        body["child_runs_total"], 1,
+        "listed without being asked: {body}"
+    );
+    let body = text_json(
+        &call(
+            &state,
+            "list_executions",
+            json!({ "workflow_id": chain.c.to_string(), "include_child_runs": false }),
+            owner,
+        )
+        .await,
+    );
     assert!(body.get("child_runs").is_none(), "{body}");
+
+    // The stats count them in their own block, never in the totals.
+    let stats = text_json(
+        &controller::mcp::analytics::dispatch(
+            "get_workflow_stats",
+            Some(json!(1)),
+            &json!({ "workflow_id": chain.c.to_string(), "days": 7 }),
+            &state,
+            agent(owner),
+        )
+        .await
+        .expect("get_workflow_stats is dispatched"),
+    );
+    assert_eq!(stats["total"], 0, "C has no execution of its own: {stats}");
+    assert_eq!(stats["child_runs"]["kind"], "child", "{stats}");
+    assert_eq!(stats["child_runs"]["runs"], 1, "{stats}");
+    assert_eq!(stats["child_runs"]["completed"], 1, "{stats}");
+    assert_eq!(stats["child_runs"]["failed"], 0, "{stats}");
+
+    // And across all workflows: C, which only ever runs as a child, is
+    // listed, with its child runs apart from its (zero) executions.
+    let all = text_json(
+        &controller::mcp::analytics::dispatch(
+            "get_all_workflow_stats",
+            Some(json!(1)),
+            &json!({ "days": 7 }),
+            &state,
+            agent(owner),
+        )
+        .await
+        .expect("get_all_workflow_stats is dispatched"),
+    );
+    let row = |id: Uuid| {
+        all["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["workflow_id"] == json!(id.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} is listed: {all}"))
+    };
+    let c_row = row(chain.c);
+    assert_eq!(c_row["total"], 0, "{c_row}");
+    assert_eq!(c_row["child_runs"]["runs"], 1, "{c_row}");
+    let a_row = row(chain.a);
+    assert_eq!(a_row["total"], 1, "{a_row}");
+    assert_eq!(a_row["child_runs"]["runs"], 0, "{a_row}");
 
     // Another user's workflow is refused before any ledger read.
     let msg = error_message(
