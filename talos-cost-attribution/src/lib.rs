@@ -153,46 +153,79 @@ pub fn spawn_record_dispatch_fuel(pool: PgPool, fuel: DispatchFuel) {
 /// execution are read from the attempt's own `module_executions` row inside
 /// the same statement, so identity comes from the controller's record and
 /// the two ledgers are written atomically.
+///
+/// ONCE per signed result (security review 2026-10-14, B-1): the rollup row
+/// carries the result's nonce, `(execution_id, result_nonce)` is unique, and
+/// `module_executions.fuel_consumed` is added to only when that row was
+/// inserted. A copy of one result delivered again — to this replica or to
+/// another, whose replay cache never saw it — records nothing. An empty nonce
+/// binds NULL and is not deduplicated (an unsigned result; never a verified
+/// one).
 pub const RECORD_MODULE_BOUND_FUEL_SQL: &str = "WITH me AS ( \
+         SELECT actor_id, module_id, COALESCE(workflow_execution_id, id) AS execution_id \
+         FROM module_executions WHERE id = $1 \
+     ), ins AS ( \
+         INSERT INTO execution_cost_rollup \
+             (actor_id, workflow_id, execution_id, node_id, module_id, fuel_consumed, \
+              wall_time_ms, max_fuel, outcome, result_nonce) \
+         SELECT actor_id, NULL, execution_id, NULL, module_id, $2, $3, $4, $5, NULLIF($6, '') \
+         FROM me \
+         ON CONFLICT (execution_id, result_nonce) WHERE result_nonce IS NOT NULL DO NOTHING \
+         RETURNING 1 \
+     ), upd AS ( \
          UPDATE module_executions \
          SET fuel_consumed = COALESCE(fuel_consumed, 0) + $2 \
-         WHERE id = $1 \
-         RETURNING actor_id, module_id, COALESCE(workflow_execution_id, id) AS execution_id \
+         WHERE id = $1 AND EXISTS (SELECT 1 FROM ins) \
+         RETURNING 1 \
      ) \
-     INSERT INTO execution_cost_rollup \
-         (actor_id, workflow_id, execution_id, node_id, module_id, fuel_consumed, \
-          wall_time_ms, max_fuel, outcome) \
-     SELECT actor_id, NULL, execution_id, NULL, module_id, $2, $3, $4, $5 FROM me";
+     SELECT EXISTS (SELECT 1 FROM me) AS found, EXISTS (SELECT 1 FROM upd) AS recorded";
 
-/// See [`RECORD_MODULE_BOUND_FUEL_SQL`]. Returns whether a row was found;
-/// `false` means the attempt had no `module_executions` row and nothing was
-/// written.
+/// What [`record_module_bound_fuel`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleBoundFuelRecord {
+    /// Both ledgers were written.
+    Recorded,
+    /// This result's fuel was already recorded; nothing was written.
+    AlreadyRecorded,
+    /// The attempt has no `module_executions` row; nothing was written.
+    NoRow,
+}
+
+/// See [`RECORD_MODULE_BOUND_FUEL_SQL`]. `result_nonce` is the VERIFIED
+/// result's own `result_nonce`.
 ///
 /// # Errors
 /// Any database error.
 pub async fn record_module_bound_fuel(
     pool: &PgPool,
     module_execution_id: Uuid,
+    result_nonce: &str,
     consumed: u64,
     limit: Option<u64>,
     wall_time_ms: u64,
     outcome: AttemptOutcome,
-) -> Result<bool, sqlx::Error> {
-    let done = sqlx::query(RECORD_MODULE_BOUND_FUEL_SQL)
+) -> Result<ModuleBoundFuelRecord, sqlx::Error> {
+    let (found, recorded): (bool, bool) = sqlx::query_as(RECORD_MODULE_BOUND_FUEL_SQL)
         .bind(module_execution_id)
         .bind(db_i64(consumed))
         .bind(db_i64(wall_time_ms))
         .bind(limit.map(db_i64))
         .bind(outcome.as_str())
-        .execute(pool)
+        .bind(result_nonce)
+        .fetch_one(pool)
         .await?;
-    Ok(done.rows_affected() > 0)
+    Ok(match (found, recorded) {
+        (_, true) => ModuleBoundFuelRecord::Recorded,
+        (true, false) => ModuleBoundFuelRecord::AlreadyRecorded,
+        (false, false) => ModuleBoundFuelRecord::NoRow,
+    })
 }
 
 /// Fire-and-forget [`record_module_bound_fuel`].
 pub fn spawn_record_module_bound_fuel(
     pool: PgPool,
     module_execution_id: Uuid,
+    result_nonce: String,
     consumed: u64,
     limit: Option<u64>,
     wall_time_ms: u64,
@@ -202,6 +235,7 @@ pub fn spawn_record_module_bound_fuel(
         match record_module_bound_fuel(
             &pool,
             module_execution_id,
+            &result_nonce,
             consumed,
             limit,
             wall_time_ms,
@@ -209,8 +243,14 @@ pub fn spawn_record_module_bound_fuel(
         )
         .await
         {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(
+            Ok(ModuleBoundFuelRecord::Recorded) => {}
+            Ok(ModuleBoundFuelRecord::AlreadyRecorded) => tracing::warn!(
+                target: "talos_security",
+                %module_execution_id,
+                "fuel for this signed result was already recorded — a repeated \
+                 delivery of one result; not counted again"
+            ),
+            Ok(ModuleBoundFuelRecord::NoRow) => tracing::warn!(
                 %module_execution_id,
                 "fuel record found no module_executions row — attempt not counted"
             ),

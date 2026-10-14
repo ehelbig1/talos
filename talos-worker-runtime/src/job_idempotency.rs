@@ -326,6 +326,8 @@ mod tests {
 
     fn result(job_id: Uuid) -> JobResult {
         JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id,

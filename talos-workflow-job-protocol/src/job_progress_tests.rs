@@ -115,6 +115,8 @@ fn a_report_is_never_a_valid_result_and_a_result_never_a_report() {
     // payloads apart, so one signature can never serve for the other message.
     let p = signed_hmac(JobProgressState::Admitted);
     let mut r = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         job_id: p.job_id,
         status: JobStatus::Success,
         output_payload: serde_json::json!({}).into(),

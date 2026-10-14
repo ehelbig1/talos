@@ -238,12 +238,15 @@ pub(crate) async fn await_attempt(
         let _ = tx.try_send(bytes);
     };
     let progress_subject = subjects::job_progress_for(inbox);
+    let sent = check.sent_payload;
+    let skip_reply = move |reply: &[u8]| is_earlier_attempt_reply(reply, sent);
     let send = transport.request_with_reply_inbox_and_progress(
         topic,
         inbox,
         &progress_subject,
         payload,
         &on_progress,
+        &skip_reply,
     );
     tokio::pin!(send);
 
@@ -280,6 +283,29 @@ pub(crate) async fn await_attempt(
         run.end(check.expected_job_id, now());
     }
     outcome
+}
+
+/// Is `reply` a result from an EARLIER attempt of the job `sent` dispatched
+/// (security review 2026-10-14, B-9)? A retry keeps the `job_id` and the reply
+/// inbox, so a slow attempt's result can arrive while the next attempt is
+/// awaited; it is not that attempt's answer and the wait goes on. Read off
+/// unverified bytes, which is safe because a `true` only ever DROPS a message:
+/// nothing is accepted on this answer. Anything that does not parse is `false`
+/// and is handed to the dispatcher, which refuses it exactly as before.
+pub(crate) fn is_earlier_attempt_reply(reply: &[u8], sent: &[u8]) -> bool {
+    let Ok(result) = serde_json::from_slice::<talos_workflow_job_protocol::JobResult>(reply) else {
+        return false;
+    };
+    // Only a BOUND result can name an earlier attempt; skip the request parse
+    // for every other reply.
+    if result.workflow_execution_id.is_none() {
+        return false;
+    }
+    let Ok(req) = serde_json::from_slice::<talos_workflow_job_protocol::JobRequest>(sent) else {
+        return false;
+    };
+    result.answers(&req.dispatch_identity())
+        == talos_workflow_job_protocol::ResultAnswer::EarlierAttempt
 }
 
 fn log_verdict(verdict: &ProgressVerdict, check: &ProgressCheck<'_>, excluded: Duration) {

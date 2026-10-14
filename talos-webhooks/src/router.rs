@@ -1604,6 +1604,31 @@ impl WebhookRouter {
                             }
                         })?;
 
+                    // The reply must answer THIS dispatch (security review
+                    // 2026-10-14, B-9): its job, and — for a worker that binds
+                    // them — its attempt and execution. Checked before the
+                    // signature so a cross-wired result never records its
+                    // nonce here. Until this date the router compared nothing,
+                    // so a signed result for another job on this inbox was
+                    // returned as this webhook's response.
+                    if !matches!(
+                        result.answers(&req.dispatch_identity()),
+                        talos_workflow_job_protocol::ResultAnswer::ThisDispatch
+                            | talos_workflow_job_protocol::ResultAnswer::Unbound
+                    ) {
+                        tracing::warn!(
+                            target: "talos_security",
+                            trigger_id = %trigger_id,
+                            expected_job_id = %job_id,
+                            received_job_id = %result.job_id,
+                            "Webhook job result rejected: it does not answer this dispatch"
+                        );
+                        return Err(ModuleDispatchFailure::Answered {
+                            detail: "Job result rejected: it does not answer this dispatch"
+                                .to_string(),
+                        });
+                    }
+
                     // SECURITY: Verify the JobResult HMAC signature before
                     // treating its `output_payload` as authoritative. Without
                     // this gate, an attacker who can publish to NATS could
@@ -1710,6 +1735,7 @@ impl WebhookRouter {
                         talos_cost_attribution::spawn_record_module_bound_fuel(
                             usage_pool.clone(),
                             job_id,
+                            result.result_nonce.clone(),
                             fuel.consumed,
                             fuel.limit,
                             result.execution_time_ms,

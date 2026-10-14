@@ -6399,6 +6399,99 @@ pub struct JobResult {
     /// [`JobResult::spent_fuel`], never directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuel: Option<FuelMeasure>,
+
+    /// The `dispatch_attempt` of the [`JobRequest`] this result answers
+    /// (security review 2026-10-14, B-9). A retry keeps the `job_id` and the
+    /// reply inbox and bumps the attempt; without this a slow attempt's result
+    /// arriving during the next attempt was taken as the next attempt's.
+    /// Stamped by [`JobResult::bind_to_request`] before signing. Bound into
+    /// [`Self::signing_payload`] ONLY when non-zero (`:attempt=<n>`, the
+    /// request's own idiom), so an all-default result signs byte-identically to
+    /// the pre-field format.
+    #[serde(default, skip_serializing_if = "dispatch_attempt_is_default")]
+    pub dispatch_attempt: u32,
+
+    /// The `workflow_execution_id` of the [`JobRequest`] this result answers
+    /// (B-9). `None` from a worker that predates the field. Bound into
+    /// [`Self::signing_payload`] ONLY when present (`:exec=<uuid>`), after
+    /// `:attempt=`. A result that carries it is checked against the dispatch
+    /// it arrives for ([`JobResult::answers`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_execution_id: Option<Uuid>,
+}
+
+/// Which dispatch a [`JobRequest`] is: what a [`JobResult`] for it must name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchIdentity {
+    pub job_id: Uuid,
+    pub dispatch_attempt: u32,
+    pub workflow_execution_id: Uuid,
+}
+
+impl JobRequest {
+    /// The identity a result for this request must name. See
+    /// [`JobResult::answers`].
+    #[must_use]
+    pub fn dispatch_identity(&self) -> DispatchIdentity {
+        DispatchIdentity {
+            job_id: self.job_id,
+            dispatch_attempt: self.dispatch_attempt,
+            workflow_execution_id: self.workflow_execution_id,
+        }
+    }
+}
+
+/// How a [`JobResult`] relates to the dispatch it arrived for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultAnswer {
+    /// Names this job, this attempt and this execution.
+    ThisDispatch,
+    /// Names this job and no execution: a worker that predates the binding.
+    /// Its attempt cannot be told apart, so it is taken as before (the
+    /// rollout case; see the package record).
+    Unbound,
+    /// Names this job and execution and an EARLIER attempt: a slow attempt's
+    /// result. Not this attempt's answer.
+    EarlierAttempt,
+    /// Names another job, another execution, or a LATER attempt than any
+    /// sent. Refused.
+    Mismatch,
+}
+
+impl JobResult {
+    /// Stamp the dispatch this result answers, from the request it answers.
+    /// Call before signing; every worker sign site does.
+    pub fn bind_to_request(&mut self, req: &JobRequest) {
+        self.dispatch_attempt = req.dispatch_attempt;
+        self.workflow_execution_id = Some(req.workflow_execution_id);
+    }
+
+    /// Does this result answer `dispatch`? The ONE rule a receiver applies
+    /// (security review 2026-10-14, B-9). Read only after the signature is
+    /// verified, except to SKIP an [`ResultAnswer::EarlierAttempt`] before it
+    /// is verified (it is never accepted either way).
+    #[must_use]
+    pub fn answers(&self, dispatch: &DispatchIdentity) -> ResultAnswer {
+        if self.job_id != dispatch.job_id {
+            return ResultAnswer::Mismatch;
+        }
+        let Some(execution) = self.workflow_execution_id else {
+            return if self.dispatch_attempt == 0 {
+                ResultAnswer::Unbound
+            } else {
+                // An attempt without an execution is no worker's output.
+                ResultAnswer::Mismatch
+            };
+        };
+        if execution != dispatch.workflow_execution_id {
+            return ResultAnswer::Mismatch;
+        }
+        match self.dispatch_attempt.cmp(&dispatch.dispatch_attempt) {
+            std::cmp::Ordering::Equal => ResultAnswer::ThisDispatch,
+            std::cmp::Ordering::Less => ResultAnswer::EarlierAttempt,
+            std::cmp::Ordering::Greater => ResultAnswer::Mismatch,
+        }
+    }
 }
 
 impl JobResult {
@@ -6547,6 +6640,18 @@ impl JobResult {
             use std::fmt::Write as _;
             let _ = write!(payload, ":fuel={}", fuel.canonical_segment());
         }
+        // B-9 (2026-10-14): the dispatch this result answers, each segment
+        // appended at the end ONLY when non-default, after `:fuel=`. An
+        // unbound result signs byte-identically to the pre-field format; a
+        // bound one cannot have its attempt or execution changed in flight.
+        if self.dispatch_attempt != 0 {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":attempt={}", self.dispatch_attempt);
+        }
+        if let Some(execution) = self.workflow_execution_id {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":exec={execution}");
+        }
         payload.into_bytes()
     }
 
@@ -6659,9 +6764,11 @@ impl JobResult {
     ///
     /// Use this at **passive observer** call sites that consume a
     /// signed result already verified-with-replay-protection by some
-    /// other primary verifier in the same process — e.g. a
-    /// `talos.results.*` audit subscriber whose only side effect is an
-    /// idempotent DB write. HMAC continues to gate forgery and the
+    /// other primary verifier in the same process — e.g. an audit
+    /// subscriber whose only side effect is an idempotent DB write. (The
+    /// `talos.results.*` observer is NOT one: it is the sole consumer of
+    /// module-bound results and so their primary verifier — security review
+    /// 2026-10-14, B-1.) HMAC continues to gate forgery and the
     /// freshness window continues to gate stale-replay; replay
     /// protection is the responsibility of the primary verifier.
     ///
@@ -6749,8 +6856,8 @@ impl JobResult {
         }
     }
 
-    /// Scheme-dispatching **Observer** verify (passive audit subscribers on
-    /// `talos.results.*`): freshness + signature only, NEVER touching the
+    /// Scheme-dispatching **Observer** verify (passive audit subscribers
+    /// downstream of a primary): freshness + signature only, NEVER touching the
     /// process-local replay cache. Routes on `self.crypto_scheme` exactly like
     /// [`Self::verify_dispatch`] but uses the no-replay primitive on both arms,
     /// honouring the verify-once rule (the request-reply dispatcher is the sole
@@ -7016,6 +7123,10 @@ impl SignedMessage for JobProgress {
 #[cfg(test)]
 #[path = "job_progress_tests.rs"]
 mod job_progress_tests;
+
+#[cfg(test)]
+#[path = "result_binding_tests.rs"]
+mod result_binding_tests;
 
 // ============================================================================
 // Pipeline job protocol
@@ -8311,6 +8422,8 @@ mod worker_heartbeat_domain_separation_tests {
 
     fn job_result() -> JobResult {
         let mut r = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::from_u128(7),
@@ -9349,6 +9462,8 @@ mod tests {
     fn test_job_result_sign_and_verify() {
         let key = test_key();
         let mut result = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
@@ -9373,6 +9488,8 @@ mod tests {
     fn test_job_result_tampered_fails() {
         let key = test_key();
         let mut result = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
@@ -9406,6 +9523,8 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         let key = test_key();
         let mut a = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
@@ -9446,6 +9565,8 @@ mod tests {
     fn verifier_observer_then_primary_both_succeed() {
         let key = test_key();
         let mut a = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
@@ -9468,6 +9589,8 @@ mod tests {
     fn verifier_rejects_tampered_signature_in_both_roles() {
         let key = test_key();
         let mut a = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
@@ -9586,6 +9709,8 @@ mod tests {
     fn test_job_result_unsigned_fails() {
         let key = test_key();
         let result = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
@@ -9994,6 +10119,8 @@ mod tests {
         let mut seed = 0x5eed_1234_abcd_0003_u64;
         for i in 0..2_000 {
             let mut res = JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 job_id: Uuid::new_v4(),
                 status: JobStatus::Success,
                 output_payload: arbitrary_json(&mut seed, 4).into(),
@@ -10190,6 +10317,8 @@ mod tests {
 
     fn make_test_result() -> JobResult {
         JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
@@ -11082,6 +11211,8 @@ mod tests {
     fn tampered_job_result_logs_fails_verification() {
         let key = test_key();
         let mut result = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
@@ -11193,6 +11324,8 @@ mod tests {
     fn job_result_with_empty_logs_round_trips() {
         let key = test_key();
         let mut result = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
@@ -12648,6 +12781,8 @@ mod protocol_review_2026_09_tests {
 
     fn result(status: JobStatus, payload: serde_json::Value) -> JobResult {
         JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
@@ -13019,6 +13154,8 @@ mod pre_execution_rejection_tests {
 
     fn rejection(status: JobStatus, payload: serde_json::Value) -> JobResult {
         JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: uuid::Uuid::from_u128(11),

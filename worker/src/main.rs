@@ -430,6 +430,9 @@ fn truncate_oversized_job_result(
     cap: usize,
 ) -> JobResult {
     JobResult {
+        // B-9: the replacement answers the same dispatch the original did.
+        dispatch_attempt: result.dispatch_attempt,
+        workflow_execution_id: result.workflow_execution_id,
         // Preserve the token accounting — the usage was real even though
         // the oversized output is dropped, and the entry vec is small
         // (capped at MAX_LLM_USAGE_ENTRIES) so it can't re-breach the cap.
@@ -523,6 +526,8 @@ async fn publish_result_with_retry(
 /// empty logs/signature/nonce/worker-id (the publish path signs it).
 fn failed_result(job_id: uuid::Uuid, start: &std::time::Instant, msg: &str) -> JobResult {
     JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id,
@@ -866,6 +871,28 @@ mod signature_failure_payload_tests {
             !rendered.contains("worker_input_hash") && !rendered.contains("module_uri"),
             "must not leak request-derived fields: {rendered}"
         );
+    }
+
+    /// Security review 2026-10-14, B-9: a result the worker signs for a
+    /// request names that request's attempt and execution, and the binding is
+    /// under the signature — the dispatcher takes only an answer to the
+    /// attempt it is waiting on.
+    #[test]
+    fn a_signed_result_answers_the_request_it_was_signed_for() {
+        let mut req = unauthenticated_req();
+        req.dispatch_attempt = 2;
+        let ring = talos_workflow_engine_core::WorkerKeyRing::single(
+            talos_workflow_engine_core::WorkerSharedKey::new(vec![0x24; 32]),
+        );
+        let mut result = failed_result(req.job_id, &std::time::Instant::now(), "x");
+        sign_job_result_for(&mut result, &req, &ring).expect("sign");
+        assert_eq!(
+            result.answers(&req.dispatch_identity()),
+            talos_workflow_job_protocol::ResultAnswer::ThisDispatch
+        );
+        result
+            .verify_no_replay_dispatch(&ring, &[], 300, true)
+            .expect("the bound result verifies");
     }
 
     fn unauthenticated_req() -> JobRequest {
@@ -1218,6 +1245,19 @@ fn sign_job_result(
     }
 }
 
+/// Sign `result` as the answer to `req`: stamp the attempt and execution it
+/// answers (security review 2026-10-14, B-9), then [`sign_job_result`]. Every
+/// result the worker publishes for a request goes through here; the dispatcher
+/// takes only an answer to the attempt it is waiting on.
+fn sign_job_result_for(
+    result: &mut JobResult,
+    req: &talos_workflow_job_protocol::JobRequest,
+    shared_key: &talos_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    result.bind_to_request(req);
+    sign_job_result(result, shared_key)
+}
+
 /// Ed25519 verifying keys that may vouch for a CACHED result signed by
 /// `worker_id` (the idempotency cache's Redis tier re-verifies before it
 /// re-publishes). The fleet's registered keys (`TALOS_WORKER_PUBLIC_KEYS`, a
@@ -1391,6 +1431,8 @@ async fn execute_job(
         // enable the env on both sides while investigating a real
         // controller↔worker signing divergence, then unset it.
         return JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: req.job_id,
@@ -1772,6 +1814,8 @@ async fn execute_job(
             _span.end_success();
 
             JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
                 crypto_scheme: 0,
                 job_id: req.job_id,
@@ -1796,6 +1840,8 @@ async fn execute_job(
             _span.end_error(&sanitized_error);
 
             JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
                 crypto_scheme: 0,
                 job_id: req.job_id,
@@ -1820,6 +1866,8 @@ async fn execute_job(
             _span.end_error(&error_msg);
 
             JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 // Timeout drops the execution future, but usage folded
                 // before the deadline is preserved via the shared Arc.
                 // A detached in-flight stream reader could in principle
@@ -3238,12 +3286,21 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         !stale_failure
                                     });
-                                    if let Some(cached) = cached {
+                                    if let Some(mut cached) = cached {
                                         ::tracing::info!(
                                             job_id = %req.job_id,
                                             "idempotency: re-publishing cached result for re-seen \
                                              job_id (transport retry); skipping re-execution"
                                         );
+                                        // B-9 (2026-10-14): the cached result names the
+                                        // attempt that produced it; the dispatcher takes
+                                        // only an answer to the attempt it is waiting on.
+                                        // Re-bind to THIS request and re-sign (a fresh
+                                        // nonce). The output and its fuel are the cached
+                                        // run's: that run is what this answers with.
+                                        if let Err(e) = sign_job_result_for(&mut cached, &req, &key_clone) {
+                                            ::tracing::error!(job_id = %req.job_id, error = %e, "CRITICAL: Failed to re-sign cached job result");
+                                        }
                                         if let Err(e) = publish_result_with_retry(
                                             &nc_clone, &cached, 3, reply_to, &key_clone,
                                         )
@@ -3258,9 +3315,10 @@ async fn main() -> anyhow::Result<()> {
 
                                 let mut result = execute_job(&cx, req.clone(), runtime_clone, key_clone.clone(), &nc_clone).await;
 
+                                // B-9 (2026-10-14): name the dispatch this answers.
                                 // L-11: bind worker identity for audit attribution.
                                 // RFC 0010 P2: Ed25519 when configured, else HMAC.
-                                if let Err(e) = sign_job_result(&mut result, &key_clone) {
+                                if let Err(e) = sign_job_result_for(&mut result, &req, &key_clone) {
                                     ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign job result");
                                 }
 
@@ -3686,9 +3744,25 @@ mod result_publish_tests {
 
     // ─── M-7: JobResult publish-size cap ──────────────────────────────────
 
+    /// B-9: the replacement answers the dispatch the original answered.
+    #[test]
+    fn truncate_oversized_keeps_the_dispatch_the_result_answers() {
+        let mut original = failed_result(uuid::Uuid::new_v4(), &std::time::Instant::now(), "x");
+        original.dispatch_attempt = 3;
+        original.workflow_execution_id = Some(uuid::Uuid::new_v4());
+        let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
+        assert_eq!(replacement.dispatch_attempt, 3);
+        assert_eq!(
+            replacement.workflow_execution_id,
+            original.workflow_execution_id
+        );
+    }
+
     #[test]
     fn truncate_oversized_replaces_payload_and_marks_failed() {
         let original = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: uuid::Uuid::new_v4(),
@@ -3732,6 +3806,8 @@ mod result_publish_tests {
         // The replacement itself must fit comfortably under any
         // reasonable cap, otherwise we'd loop forever.
         let original = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: uuid::Uuid::new_v4(),

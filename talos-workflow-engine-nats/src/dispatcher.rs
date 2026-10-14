@@ -24,8 +24,8 @@ use talos_workflow_engine_core::{
     MIN_REMAINING_FOR_ATTEMPT_SECS,
 };
 use talos_workflow_job_protocol::{
-    EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineJobResult,
-    PipelineStep,
+    DispatchIdentity, EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest,
+    PipelineJobResult, PipelineStep, ResultAnswer,
 };
 use uuid::Uuid;
 
@@ -808,36 +808,64 @@ pub(crate) async fn execute_job_with_retry(
                 let job_result: JobResult = serde_json::from_slice(&response)
                     .map_err(|e| format!("Failed to parse job result: {}", e))?;
 
-                // The reply must be FOR THIS JOB. Checked BEFORE signature
+                // The reply must answer THIS DISPATCH. Checked BEFORE signature
                 // verification so a stray or cross-wired result never records
                 // its nonce into this process's replay cache (a mismatched
                 // result is refused whether or not it is honestly signed).
-                // Until 2026-09-10 nothing here compared the two ids, so a
+                // Until 2026-09-10 nothing here compared the job ids, so a
                 // correctly-signed result for job B landing on job A's inbox
                 // would have been returned as A's output. Not retried: the
                 // worker may already have run job A, and re-dispatching risks
                 // a duplicate side effect for a condition that is a bug or an
                 // attack, never a transient.
-                if job_result.job_id != expected_job_id {
-                    tracing::error!(
-                        target: "talos_security",
-                        expected_job_id = %expected_job_id,
-                        received_job_id = %job_result.job_id,
-                        "job result rejected: reply job_id does not match the dispatched job"
-                    );
-                    return Err(format!(
-                        "Job result rejected: reply carries job_id {} but job_id {} was dispatched",
-                        job_result.job_id, expected_job_id
-                    ));
+                //
+                // Security review 2026-10-14, B-9: a retry keeps the job id and
+                // the inbox, so the job id alone took a slow attempt's result
+                // as the next attempt's. A bound result now names its attempt
+                // and execution, read against the request THIS attempt sent
+                // (`current_payload`, so a failed re-sign is still matched
+                // against what went out). The transport drops an
+                // earlier-attempt reply before it gets here; one that arrives
+                // anyway is refused, never taken. An UNBOUND result (a worker
+                // that predates the binding) is taken as before.
+                let live = dispatched_request_identity(&current_payload)?;
+                match job_result.answers(&live) {
+                    ResultAnswer::ThisDispatch | ResultAnswer::Unbound => {}
+                    answer => {
+                        let why = if job_result.job_id != expected_job_id {
+                            "reply job_id does not match the dispatched job"
+                        } else if answer == ResultAnswer::EarlierAttempt {
+                            "reply answers an earlier attempt of this job"
+                        } else {
+                            "reply names another execution or an attempt never sent"
+                        };
+                        tracing::error!(
+                            target: "talos_security",
+                            expected_job_id = %expected_job_id,
+                            received_job_id = %job_result.job_id,
+                            live_attempt = live.dispatch_attempt,
+                            received_attempt = job_result.dispatch_attempt,
+                            "job result rejected: {why}"
+                        );
+                        return Err(if job_result.job_id != expected_job_id {
+                            format!(
+                                "Job result rejected: reply carries job_id {} but job_id {} was dispatched",
+                                job_result.job_id, expected_job_id
+                            )
+                        } else {
+                            format!("Job result rejected: {why}")
+                        });
+                    }
                 }
 
                 // Verify signature if worker key is available.
                 // L-4: typed Primary verifier — this dispatcher is the
                 // sole inline consumer of the reply on this inbox, and
                 // it converts the result into the engine's durable
-                // side effect. Any audit observer subscribing to a
-                // separate `talos.results.*` topic uses
-                // `Verifier::Observer` (see controller/src/main.rs).
+                // side effect. Results with no reply inbox go to
+                // `talos.results.*`, whose observer
+                // (`talos-job-result-observer`) is THEIR one primary
+                // verifier; a result never reaches both.
                 if let Some(ring) = verify_ring {
                     // RFC 0010 P2: `verify_dispatch` routes on the result's
                     // `crypto_scheme` — Ed25519 against the public key(s)
@@ -1341,6 +1369,15 @@ fn dispatched_identity(payload: &[u8]) -> Result<(Uuid, u32), String> {
     serde_json::from_slice::<JobRequest>(payload)
         .map(|r| (r.job_id, r.dispatch_attempt))
         .map_err(|e| format!("Failed to read job_id from the dispatch payload: {e}"))
+}
+
+/// The full identity of the request a payload carries — what a result for it
+/// must name ([`JobResult::answers`], security review 2026-10-14, B-9). Read
+/// off the payload actually sent for the live attempt.
+fn dispatched_request_identity(payload: &[u8]) -> Result<DispatchIdentity, String> {
+    serde_json::from_slice::<JobRequest>(payload)
+        .map(|r| r.dispatch_identity())
+        .map_err(|e| format!("Failed to read the dispatch identity from the payload: {e}"))
 }
 
 /// MCP-1212: deserialize a signed JobRequest payload, re-sign it with a
@@ -2661,6 +2698,8 @@ mod p3_full_loop_tests {
 
                 // Send back a signed JobResult so the dispatcher completes.
                 let mut jr = JobResult {
+                    dispatch_attempt: 0,
+                    workflow_execution_id: None,
                     llm_usage: vec![],
                     job_id: req.job_id,
                     status: JobStatus::Success,
@@ -3316,6 +3355,8 @@ mod budget_clamp_loop_tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             let jr = JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 llm_usage: vec![],
                 job_id: echo_job_id(&payload),
                 status: if self.succeed {
@@ -3596,6 +3637,8 @@ mod budget_clamp_loop_tests {
             };
             let failing = n <= self.fail_first;
             let jr = JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 llm_usage: vec![],
                 job_id,
                 status: if failing {
@@ -3632,6 +3675,8 @@ mod budget_clamp_loop_tests {
         async fn request(&self, _topic: &str, _payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let jr = JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 llm_usage: vec![],
                 job_id: uuid::Uuid::new_v4(), // never the dispatched one
                 status: JobStatus::Success,
@@ -3670,6 +3715,205 @@ mod budget_clamp_loop_tests {
             1,
             "a mismatched reply is refused, not retried"
         );
+    }
+
+    /// B-9 (2026-10-14) test transport: replies on the signed inbox. Each send
+    /// gets the replies `script` returns for it (built from the request that
+    /// send carried), in order. With `honour_skip` a reply the dispatcher's
+    /// `skip_reply` names is dropped, as the NATS transport drops it; without,
+    /// the first reply is returned whatever it is (a transport that cannot
+    /// skip).
+    use talos_workflow_job_protocol::JobRequest;
+
+    struct AttemptScriptTransport {
+        sends: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        script: fn(usize, &JobRequest) -> Vec<JobResult>,
+        honour_skip: bool,
+    }
+
+    #[async_trait]
+    impl JobTransport for AttemptScriptTransport {
+        async fn request(&self, _: &str, _: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+            unreachable!("the inbox path is taken")
+        }
+        fn new_reply_inbox(&self) -> Option<String> {
+            Some("_INBOX.attempts".to_string())
+        }
+        async fn request_with_reply_inbox_and_progress(
+            &self,
+            _topic: &str,
+            _inbox: &str,
+            _progress_subject: &str,
+            payload: Vec<u8>,
+            _on_progress: &(dyn Fn(Vec<u8>) + Send + Sync),
+            skip_reply: &(dyn for<'r> Fn(&'r [u8]) -> bool + Send + Sync),
+        ) -> Result<Vec<u8>, BoxError> {
+            let req: JobRequest = serde_json::from_slice(&payload).expect("a JobRequest");
+            let n = {
+                let mut g = self.sends.lock().expect("lock");
+                g.push(payload);
+                g.len() - 1
+            };
+            for reply in (self.script)(n, &req) {
+                let bytes = serde_json::to_vec(&reply).expect("serialize");
+                if self.honour_skip && skip_reply(&bytes) {
+                    continue;
+                }
+                return Ok(bytes);
+            }
+            Err("no reply".into())
+        }
+    }
+
+    fn bound_reply(req: &JobRequest, attempt: u32, ok: bool, out: serde_json::Value) -> JobResult {
+        let mut r = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
+            llm_usage: vec![],
+            job_id: req.job_id,
+            status: if ok {
+                JobStatus::Success
+            } else {
+                JobStatus::Failed
+            },
+            output_payload: out.into(),
+            logs: vec![],
+            execution_time_ms: 1,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+            crypto_scheme: 0,
+            fuel: None,
+        };
+        r.bind_to_request(req);
+        r.dispatch_attempt = attempt;
+        r
+    }
+
+    /// Attempt 0 fails (transient); while attempt 1 is awaited, attempt 0's
+    /// late SUCCESS arrives on the shared inbox ahead of attempt 1's own.
+    fn slow_first_attempt(n: usize, req: &JobRequest) -> Vec<JobResult> {
+        if n == 0 {
+            vec![bound_reply(
+                req,
+                0,
+                false,
+                serde_json::json!({"error": "connection reset"}),
+            )]
+        } else {
+            vec![
+                bound_reply(req, 0, true, serde_json::json!({"from": "attempt 0"})),
+                bound_reply(
+                    req,
+                    req.dispatch_attempt,
+                    true,
+                    serde_json::json!({"from": "live"}),
+                ),
+            ]
+        }
+    }
+
+    async fn run_attempt_script(
+        t: &AttemptScriptTransport,
+        key: &[u8; 32],
+    ) -> Result<serde_json::Value, String> {
+        execute_job_with_retry(
+            t,
+            "test.topic".to_string(),
+            super::resign_payload_tests::signed_request(key),
+            30,
+            2,
+            1,
+            Some(key),
+            None,
+            None,
+            None,
+            None,
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            &AlwaysTransient,
+            &NoExpr,
+            Some("_INBOX.attempts".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Security review 2026-10-14, B-9: a slow attempt's result is not the
+    /// next attempt's answer. The inbox drops it and the live attempt's own
+    /// result is returned.
+    #[tokio::test]
+    async fn a_slow_attempts_result_is_not_taken_as_the_next_attempts() {
+        let key = [9u8; 32];
+        let t = AttemptScriptTransport {
+            sends: Arc::new(std::sync::Mutex::new(Vec::new())),
+            script: slow_first_attempt,
+            honour_skip: true,
+        };
+        let out = run_attempt_script(&t, &key)
+            .await
+            .expect("attempt 1 answers");
+        assert_eq!(out, serde_json::json!({"from": "live"}));
+        assert_eq!(t.sends.lock().expect("lock").len(), 2);
+    }
+
+    /// The same reply through a transport that cannot skip it is REFUSED,
+    /// never taken as attempt 1's output.
+    #[tokio::test]
+    async fn an_earlier_attempts_result_that_reaches_the_dispatcher_is_refused() {
+        let key = [9u8; 32];
+        let t = AttemptScriptTransport {
+            sends: Arc::new(std::sync::Mutex::new(Vec::new())),
+            script: slow_first_attempt,
+            honour_skip: false,
+        };
+        let err = run_attempt_script(&t, &key)
+            .await
+            .expect_err("an earlier attempt's result is not this attempt's answer");
+        assert!(err.contains("earlier attempt"), "{err}");
+    }
+
+    /// A result naming another execution, or an attempt never sent, is refused.
+    #[tokio::test]
+    async fn a_result_for_another_execution_or_an_unsent_attempt_is_refused() {
+        fn other_execution(_: usize, req: &JobRequest) -> Vec<JobResult> {
+            let mut r = bound_reply(req, req.dispatch_attempt, true, serde_json::json!({}));
+            r.workflow_execution_id = Some(uuid::Uuid::from_u128(77));
+            vec![r]
+        }
+        fn unsent_attempt(_: usize, req: &JobRequest) -> Vec<JobResult> {
+            vec![bound_reply(
+                req,
+                req.dispatch_attempt + 1,
+                true,
+                serde_json::json!({}),
+            )]
+        }
+        let key = [9u8; 32];
+        for script in [
+            other_execution as fn(usize, &JobRequest) -> Vec<JobResult>,
+            unsent_attempt,
+        ] {
+            let t = AttemptScriptTransport {
+                sends: Arc::new(std::sync::Mutex::new(Vec::new())),
+                script,
+                honour_skip: true,
+            };
+            let err = run_attempt_script(&t, &key).await.expect_err("refused");
+            assert!(
+                err.contains("another execution or an attempt never sent"),
+                "{err}"
+            );
+            assert_eq!(
+                t.sends.lock().expect("lock").len(),
+                1,
+                "refused, not retried"
+            );
+        }
     }
 
     /// THE CALL-SITE GUARD. `resign_payload_for_retry` taking an attempt is
@@ -3768,6 +4012,8 @@ mod budget_clamp_loop_tests {
                 return Err("nats: connection closed".into());
             }
             let mut jr = JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 llm_usage: vec![],
                 job_id,
                 status: if failing {
@@ -4133,6 +4379,8 @@ mod liveness_redispatch_tests {
     /// the reference fleet (measured 2026-09-22: `TALOS_SIGNATURE_DIAG=`).
     fn stale_dispatch_result(job_id: uuid::Uuid) -> JobResult {
         JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id,
@@ -4156,6 +4404,8 @@ mod liveness_redispatch_tests {
 
     fn module_failure_result(job_id: uuid::Uuid) -> JobResult {
         JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id,
@@ -4172,6 +4422,8 @@ mod liveness_redispatch_tests {
 
     fn success_result(job_id: uuid::Uuid) -> JobResult {
         JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id,
@@ -4648,6 +4900,8 @@ mod fuel_sink_tests {
             };
             let (status, output, fuel) = self.script[n.min(self.script.len() - 1)].clone();
             let mut jr = JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 llm_usage: self.usage.clone(),
                 job_id,
                 status,

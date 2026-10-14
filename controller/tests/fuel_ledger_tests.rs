@@ -14,7 +14,7 @@
 mod common;
 
 use sqlx::{Pool, Postgres};
-use talos_cost_attribution::{AttemptOutcome, DispatchFuel};
+use talos_cost_attribution::{AttemptOutcome, DispatchFuel, ModuleBoundFuelRecord};
 use uuid::Uuid;
 
 struct Fixture {
@@ -205,6 +205,7 @@ async fn module_bound_fuel_takes_its_identity_from_the_row() {
     let found = talos_cost_attribution::record_module_bound_fuel(
         &pool,
         row,
+        "1760000000:nonce-a",
         250,
         Some(1_000),
         9,
@@ -212,7 +213,7 @@ async fn module_bound_fuel_takes_its_identity_from_the_row() {
     )
     .await
     .expect("record");
-    assert!(found);
+    assert_eq!(found, ModuleBoundFuelRecord::Recorded);
 
     let got: (
         Option<Uuid>,
@@ -253,6 +254,7 @@ async fn module_bound_fuel_takes_its_identity_from_the_row() {
     let unknown = talos_cost_attribution::record_module_bound_fuel(
         &pool,
         Uuid::new_v4(),
+        "1760000000:nonce-b",
         250,
         None,
         9,
@@ -260,12 +262,83 @@ async fn module_bound_fuel_takes_its_identity_from_the_row() {
     )
     .await
     .expect("record");
-    assert!(!unknown, "no row, nothing written");
+    assert_eq!(
+        unknown,
+        ModuleBoundFuelRecord::NoRow,
+        "no row, nothing written"
+    );
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_cost_rollup")
         .fetch_one(&pool)
         .await
         .expect("count");
     assert_eq!(count, 1);
+}
+
+/// Security review 2026-10-14, B-1: one signed result's fuel is recorded
+/// ONCE, however many times it is delivered. The observer's replay cache is
+/// per replica, so a copy of a result delivered to another replica of the
+/// queue group passes its verify; the ledger is where it must stop. A second
+/// result (a different nonce) for the same attempt row is a different
+/// delivery and is counted.
+#[tokio::test]
+async fn a_module_bound_results_fuel_is_recorded_once_per_signed_result() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let f = fixture(&pool).await;
+    let row = seed_module_execution(&pool, &f).await;
+
+    let record = |nonce: &'static str| {
+        let pool = pool.clone();
+        async move {
+            talos_cost_attribution::record_module_bound_fuel(
+                &pool,
+                row,
+                nonce,
+                250,
+                Some(1_000),
+                9,
+                AttemptOutcome::Completed,
+            )
+            .await
+            .expect("record")
+        }
+    };
+    assert_eq!(
+        record("1760000000:once").await,
+        ModuleBoundFuelRecord::Recorded
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            record("1760000000:once").await,
+            ModuleBoundFuelRecord::AlreadyRecorded
+        );
+    }
+    let fuel_and_rows = || async {
+        let total: Option<i64> =
+            sqlx::query_scalar("SELECT fuel_consumed FROM module_executions WHERE id = $1")
+                .bind(row)
+                .fetch_one(&pool)
+                .await
+                .expect("read row");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_cost_rollup WHERE execution_id = $1",
+        )
+        .bind(row)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        (total, rows)
+    };
+    assert_eq!(
+        fuel_and_rows().await,
+        (Some(250), 1),
+        "a repeat changes nothing"
+    );
+
+    assert_eq!(
+        record("1760000000:other").await,
+        ModuleBoundFuelRecord::Recorded
+    );
+    assert_eq!(fuel_and_rows().await, (Some(500), 2));
 }
 
 /// The learner must not be fed its own exhaustions: adaptive fuel ceilings
@@ -312,6 +385,8 @@ async fn the_result_observer_records_a_failed_attempts_fuel() {
 
     let key = b"fuel-ledger-observer-key-0123456789abcdef".to_vec();
     let mut result = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         job_id: row,
         status: JobStatus::Failed,
         // A failed attempt has no in-band figure; only the signed field
