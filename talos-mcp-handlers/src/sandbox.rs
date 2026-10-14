@@ -338,7 +338,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "test_module",
             "description": ([
-                "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n  - `trigger_input`: the run's trigger payload (goes to `data[\"__trigger_input__\"]`, where the engine writes it for every node of a workflow run)\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. Its memory WRITES are applied too, unless `memory_writes: \"discard\"`, which rehearses against the actor's memory without changing it; either way the reply's `memory` lists the keys read and the writes asked for. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call) and `llm_calls` ({calls: [{call, provider, model, prompt_tokens, completion_tokens, stop_reason, duration_ms}], not_listed}: each call in the order made, the first 20 listed and the rest counted), so you can see how close a run came to its fuel and token limits and WHICH call hit one. `stop_reason` is the provider's own word: `length` (or `max_tokens`) means the call was cut off at its token budget, and for a model that reasons first the budget may have gone entirely on reasoning, leaving an empty answer; completion_tokens includes reasoning, which no provider here reports separately. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. ",
+                "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n  - `trigger_input`: the run's trigger payload (goes to `data[\"__trigger_input__\"]`, where the engine writes it for every node of a workflow run)\n  - `__started_by__` is always {\"kind\": \"test\"}: in a workflow run the engine writes how the run was started there (action_link, manual, schedule, …), and a rehearsal is a test\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. Its memory WRITES are applied too, unless `memory_writes: \"discard\"`, which rehearses against the actor's memory without changing it; either way the reply's `memory` lists the keys read and the writes asked for. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call) and `llm_calls` ({calls: [{call, provider, model, prompt_tokens, completion_tokens, stop_reason, duration_ms}], not_listed}: each call in the order made, the first 20 listed and the rest counted), so you can see how close a run came to its fuel and token limits and WHICH call hit one. `stop_reason` is the provider's own word: `length` (or `max_tokens`) means the call was cut off at its token budget, and for a model that reasons first the budget may have gone entirely on reasoning, leaving an empty answer; completion_tokens includes reasoning, which no provider here reports separately. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. ",
                 TEST_MODULE_NETWORK_NOTE,
                 "\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
             ]
@@ -6287,6 +6287,25 @@ mod rehearsal_tool_tests {
         assert_eq!(p["__accumulated__"]["from"], "arg");
     }
 
+    /// A rehearsal says it is one: `__started_by__ = {"kind": "test"}`, the
+    /// engine's key, set last so a copy in `input` or `config` (here, one
+    /// claiming a tap on an action link) never stands in for it.
+    #[test]
+    fn a_rehearsal_says_it_was_started_as_a_test() {
+        assert_eq!(
+            talos_worker_runtime::rehearsal::REHEARSAL_STARTED_BY_KEY,
+            talos_workflow_engine_core::reserved_keys::STARTED_BY,
+            "the worker spells the engine's key"
+        );
+        let p = test_module_payload(
+            &json!({"__started_by__": {"kind": "action_link"}}),
+            &json!({"__started_by__": {"kind": "action_link"}}),
+            None,
+            None,
+        );
+        assert_eq!(p["__started_by__"], json!({"kind": "test"}));
+    }
+
     /// A module that reads the run's trigger is rehearsed by passing it as
     /// `trigger_input`: it lands at the root `__trigger_input__`, where the
     /// engine writes it for every node, and nowhere else.
@@ -6472,13 +6491,17 @@ mod rehearsal_tool_tests {
     }
 
     /// The legacy shapes are unchanged: an empty config or input adds no
-    /// sub-object.
+    /// sub-object. Every rehearsal also says it is a test (2026-10-14).
     #[test]
     fn empty_config_and_input_add_no_sub_objects() {
+        let test = json!({"kind": "test"});
         let p = test_module_payload(&json!({}), &json!({}), None, None);
-        assert_eq!(p, json!({}));
+        assert_eq!(p, json!({"__started_by__": test}));
         let p = test_module_payload(&json!({"K": 1}), &json!({}), None, None);
-        assert_eq!(p, json!({"K": 1, "config": {"K": 1}}));
+        assert_eq!(
+            p,
+            json!({"K": 1, "config": {"K": 1}, "__started_by__": test})
+        );
     }
 
     #[test]
