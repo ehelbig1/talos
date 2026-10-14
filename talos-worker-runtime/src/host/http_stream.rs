@@ -380,7 +380,11 @@ impl wit_http_stream::Host for TalosContext {
             );
             return Err(stream_deny_forbidden(self, reason_class::PRIVATE_IP));
         }
-        let host_match = match host_allowlist_match_kind(&self.allowed_hosts, &host) {
+        let host_match = match host_allowlist_match_kind(
+            &self.allowed_hosts,
+            &host,
+            parsed.port_or_known_default(),
+        ) {
             Some(kind) => kind,
             None => {
                 self.record_capability_denied("http-stream", "allowed-hosts", &host)

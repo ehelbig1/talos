@@ -71,6 +71,10 @@ mod http_admission_characterization_tests;
 /// surface, not only `http::fetch` (2026-09-24).
 #[cfg(test)]
 mod vault_body_parity_tests;
+/// A credential travels only to a host named in `allowed_hosts`, on every
+/// surface that substitutes one (E-3, 2026-10-14).
+#[cfg(test)]
+mod vault_destination_tests;
 
 mod cache;
 mod crypto;

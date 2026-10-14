@@ -321,7 +321,13 @@ mod tier1_egress_tests {
 /// `is_external_llm_host`). This function is the operator-grant gate,
 /// not the platform deny-gate.
 pub fn host_allowlist_match(allowed: &[String], host: &str) -> bool {
-    host_allowlist_match_kind(allowed, host).is_some()
+    host_allowlist_match_kind(allowed, host, None).is_some()
+}
+
+/// [`host_allowlist_match`] for a request whose port is known: an entry that
+/// names a port (`api.example.com:8443`) admits only that port.
+pub(crate) fn host_allowlist_match_at(allowed: &[String], host: &str, port: Option<u16>) -> bool {
+    host_allowlist_match_kind(allowed, host, port).is_some()
 }
 
 /// HOW an allowlist admitted a host. The write-ceiling strict-egress gate
@@ -338,12 +344,66 @@ pub(crate) enum HostMatchKind {
     Wildcard,
 }
 
+/// One `allowed_hosts` entry split into its host pattern and the port it
+/// names, if any (E-10, 2026-10-14).
+///
+/// `api.example.com:8443` names port 8443; `api.example.com` names none and
+/// admits every port, as every entry did before. The port is the digits after
+/// the LAST `:`, and only when the host part is non-empty and itself has no
+/// `:` — so a bare IPv6 literal is never misread as `host:port`. An entry
+/// whose suffix is not a valid port (`host:`, `host:99999`, `host:0`) keeps
+/// the whole string as its host pattern, which matches no URL host: a
+/// malformed port fails closed rather than widening to every port.
+pub(crate) fn split_allowlist_entry(entry: &str) -> (&str, Option<u16>) {
+    if let Some((host, port)) = entry.rsplit_once(':') {
+        let digits = !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+        if !host.is_empty() && !host.contains(':') && digits {
+            if let Ok(p) = port.parse::<u16>() {
+                if p != 0 {
+                    return (host, Some(p));
+                }
+            }
+        }
+    }
+    (entry, None)
+}
+
 /// Like [`host_allowlist_match`] but reports HOW the host matched
 /// (`None` = not admitted). A named match wins over a coexisting `"*"`
 /// entry — `["*", "api.example.com"]` reports `Exact` for that host —
 /// because the strict-egress gate must credit explicit operator intent
 /// wherever it exists.
-pub(crate) fn host_allowlist_match_kind(allowed: &[String], host: &str) -> Option<HostMatchKind> {
+///
+/// `port` is the request's `port_or_known_default()`. An entry that names a
+/// port admits the host only on that port; `None` (port unknown) never
+/// satisfies a port-bearing entry. `"*"` and port-less entries ignore it.
+pub(crate) fn host_allowlist_match_kind(
+    allowed: &[String],
+    host: &str,
+    port: Option<u16>,
+) -> Option<HostMatchKind> {
+    match_allowlist(allowed, host, PortRule::Is(port))
+}
+
+/// Is `host` NAMED in `allowed_hosts` — by an exact or suffix entry, not only
+/// by `"*"`? Ports on entries are ignored: this asks what the operator typed,
+/// not which port the request uses (admission has already decided that).
+/// The secret-destination rule in `resolve_vault_placed` reads it.
+pub(crate) fn host_named_in_allowlist(allowed: &[String], host: &str) -> bool {
+    matches!(
+        match_allowlist(allowed, host, PortRule::Ignored),
+        Some(HostMatchKind::Exact | HostMatchKind::Suffix)
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PortRule {
+    Is(Option<u16>),
+    Ignored,
+}
+
+/// The one allowlist walk both questions above ask.
+fn match_allowlist(allowed: &[String], host: &str, port: PortRule) -> Option<HostMatchKind> {
     if allowed.is_empty() {
         return None;
     }
@@ -355,10 +415,16 @@ pub(crate) fn host_allowlist_match_kind(allowed: &[String], host: &str) -> Optio
     // dotless form a client sends.
     let host_lower = host.trim_end_matches('.').to_ascii_lowercase();
     let mut saw_wildcard = false;
-    for pattern in allowed {
-        if pattern == "*" {
+    for entry in allowed {
+        if entry == "*" {
             saw_wildcard = true;
             continue;
+        }
+        let (pattern, entry_port) = split_allowlist_entry(entry);
+        if let (PortRule::Is(request_port), Some(required)) = (port, entry_port) {
+            if request_port != Some(required) {
+                continue;
+            }
         }
         // Patterns starting with `.` are suffix patterns by design — preserve
         // that leading dot, only strip the TRAILING one. `.example.com.` and
@@ -389,22 +455,25 @@ mod host_allowlist_match_kind_tests {
     #[test]
     fn reports_exact_suffix_wildcard_and_none() {
         assert_eq!(
-            host_allowlist_match_kind(&v(&["api.example.com"]), "api.example.com"),
+            host_allowlist_match_kind(&v(&["api.example.com"]), "api.example.com", None),
             Some(HostMatchKind::Exact)
         );
         assert_eq!(
-            host_allowlist_match_kind(&v(&[".example.com"]), "api.example.com"),
+            host_allowlist_match_kind(&v(&[".example.com"]), "api.example.com", None),
             Some(HostMatchKind::Suffix)
         );
         assert_eq!(
-            host_allowlist_match_kind(&v(&["*"]), "anything.example.com"),
+            host_allowlist_match_kind(&v(&["*"]), "anything.example.com", None),
             Some(HostMatchKind::Wildcard)
         );
         assert_eq!(
-            host_allowlist_match_kind(&v(&["other.com"]), "api.example.com"),
+            host_allowlist_match_kind(&v(&["other.com"]), "api.example.com", None),
             None
         );
-        assert_eq!(host_allowlist_match_kind(&[], "api.example.com"), None);
+        assert_eq!(
+            host_allowlist_match_kind(&[], "api.example.com", None),
+            None
+        );
     }
 
     #[test]
@@ -414,17 +483,109 @@ mod host_allowlist_match_kind_tests {
         // for everything else.
         let allowed = v(&["*", "api.example.com", ".trusted.com"]);
         assert_eq!(
-            host_allowlist_match_kind(&allowed, "api.example.com"),
+            host_allowlist_match_kind(&allowed, "api.example.com", None),
             Some(HostMatchKind::Exact)
         );
         assert_eq!(
-            host_allowlist_match_kind(&allowed, "svc.trusted.com"),
+            host_allowlist_match_kind(&allowed, "svc.trusted.com", None),
             Some(HostMatchKind::Suffix)
         );
         assert_eq!(
-            host_allowlist_match_kind(&allowed, "elsewhere.io"),
+            host_allowlist_match_kind(&allowed, "elsewhere.io", None),
             Some(HostMatchKind::Wildcard)
         );
+    }
+
+    /// E-10: an entry that names a port admits the host on that port only.
+    #[test]
+    fn an_entry_with_a_port_admits_only_that_port() {
+        let allowed = v(&["internal-gw.example.com:443"]);
+        assert_eq!(
+            host_allowlist_match_kind(&allowed, "internal-gw.example.com", Some(443)),
+            Some(HostMatchKind::Exact)
+        );
+        // The defect: any port on an allowed host was admitted.
+        assert_eq!(
+            host_allowlist_match_kind(&allowed, "internal-gw.example.com", Some(9200)),
+            None
+        );
+        // Port unknown never satisfies an entry that requires one.
+        assert_eq!(
+            host_allowlist_match_kind(&allowed, "internal-gw.example.com", None),
+            None
+        );
+        // A suffix entry can carry a port too.
+        let suffix = v(&[".example.com:8443"]);
+        assert_eq!(
+            host_allowlist_match_kind(&suffix, "api.example.com", Some(8443)),
+            Some(HostMatchKind::Suffix)
+        );
+        assert_eq!(
+            host_allowlist_match_kind(&suffix, "api.example.com", Some(443)),
+            None
+        );
+        // Control: an entry without a port admits every port, as before.
+        let bare = v(&["internal-gw.example.com"]);
+        for port in [Some(443), Some(9200), None] {
+            assert_eq!(
+                host_allowlist_match_kind(&bare, "internal-gw.example.com", port),
+                Some(HostMatchKind::Exact)
+            );
+        }
+        // A port-bearing entry that does not match falls through to "*".
+        let mixed = v(&["*", "api.example.com:443"]);
+        assert_eq!(
+            host_allowlist_match_kind(&mixed, "api.example.com", Some(8443)),
+            Some(HostMatchKind::Wildcard)
+        );
+    }
+
+    #[test]
+    fn a_malformed_port_fails_closed() {
+        use super::split_allowlist_entry;
+        assert_eq!(
+            split_allowlist_entry("a.example.com:8443"),
+            ("a.example.com", Some(8443))
+        );
+        assert_eq!(
+            split_allowlist_entry("a.example.com"),
+            ("a.example.com", None)
+        );
+        for bad in [
+            "a.example.com:",
+            "a.example.com:99999",
+            "a.example.com:0",
+            "a.example.com:8a",
+        ] {
+            assert_eq!(split_allowlist_entry(bad), (bad, None), "{bad}");
+            // The whole string is the pattern, and no URL host contains ':'.
+            assert_eq!(
+                host_allowlist_match_kind(&v(&[bad]), "a.example.com", Some(443)),
+                None,
+                "{bad} must not widen to every port"
+            );
+        }
+        // An IPv6 literal is never read as host:port.
+        assert_eq!(split_allowlist_entry("::1"), ("::1", None));
+    }
+
+    #[test]
+    fn named_ignores_entry_ports_and_never_counts_the_wildcard() {
+        use super::host_named_in_allowlist;
+        assert!(host_named_in_allowlist(
+            &v(&["api.example.com:8443"]),
+            "api.example.com"
+        ));
+        assert!(host_named_in_allowlist(
+            &v(&[".example.com"]),
+            "api.example.com"
+        ));
+        assert!(!host_named_in_allowlist(&v(&["*"]), "api.example.com"));
+        assert!(!host_named_in_allowlist(
+            &v(&["*", "other.example"]),
+            "api.example.com"
+        ));
+        assert!(!host_named_in_allowlist(&[], "api.example.com"));
     }
 }
 
@@ -591,8 +752,18 @@ pub(crate) fn classify_url_scheme(scheme: &str, insecure_opt_in: bool) -> UrlSch
 /// Read once per execution, by `TalosContext::new` (through
 /// `DevEgressOptIns::from_env`); every scheme gate reads
 /// `TalosContext::dev_egress` and nothing else calls this.
+///
+/// E-6 (2026-10-14): ignored in production, like its sibling
+/// `WORKER_ALLOW_PRIVATE_HOST_TARGETS` — the one rule is
+/// [`super::limits::dev_only_egress_toggle`].
 pub(crate) fn insecure_http_opt_in() -> bool {
-    talos_config::bool_env_or_default("WASM_ALLOW_INSECURE_HTTP", false)
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    super::limits::dev_only_egress_toggle(
+        "WASM_ALLOW_INSECURE_HTTP",
+        &WARNED,
+        "plaintext http:// is admitted on every egress surface, vault:// \
+         substitutions included.",
+    )
 }
 
 #[cfg(test)]

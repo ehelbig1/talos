@@ -208,7 +208,11 @@ impl wit_webhook::Host for TalosContext {
             return Err(webhook_deny(self, reason_class::PRIVATE_IP));
         }
 
-        if !host_allowlist_match(&self.allowed_hosts, &host) {
+        if !host_allowlist_match_at(
+            &self.allowed_hosts,
+            &host,
+            parsed_url.port_or_known_default(),
+        ) {
             self.record_capability_denied("webhook", "allowed-hosts", &host)
                 .await;
             tracing::warn!(

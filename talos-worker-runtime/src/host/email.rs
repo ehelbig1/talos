@@ -214,13 +214,16 @@ impl wit_email::Host for TalosContext {
             };
 
         if let (Some(url), Some((key, key_source))) = (api_url, api_key) {
+            // E-1 (2026-10-14): the API URL goes through the SAME admission
+            // every other egress surface uses, before the key is put on the
+            // wire — scheme, empty allowlist, denied IP literal,
+            // `allowed_hosts`, egress posture, then the DNS pre-check. The
+            // URL is the one judged AND the one sent.
+            let url = self.admit_email_api_url(&url).await?;
             // The key leaves the host in the request below: ledger the use
             // against the API's HOST (package BL). The URL is itself a
             // configured secret, so only its host is recorded.
-            let destination = reqwest::Url::parse(&url)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_string))
-                .unwrap_or_else(|| "unparseable-email-api-url".to_string());
+            let destination = url.host_str().unwrap_or_default().to_string();
             self.record_secret_use(
                 crate::context::SecretUseSurface::EmailApiKey,
                 &destination,
@@ -268,7 +271,7 @@ impl wit_email::Host for TalosContext {
             let response = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 client
-                    .post(&url)
+                    .post(url.as_str())
                     .header("Authorization", format!("Bearer {}", key))
                     .header("Content-Type", "application/json")
                     .json(&body)
@@ -333,3 +336,76 @@ impl wit_email::Host for TalosContext {
         __result
     }
 }
+
+impl TalosContext {
+    /// E-1 (2026-10-14): the egress admission for the email API URL.
+    ///
+    /// `email::send` was the sixth egress surface and the only one that never
+    /// passed through the shared admission: whatever `EMAIL_API_URL` named —
+    /// a plaintext URL, a private or metadata IP literal, a host outside the
+    /// module's `allowed_hosts` — was POSTed with `EMAIL_API_KEY` as its
+    /// bearer, and the status came back as a success/failure oracle. The
+    /// connect-time resolver never sees an IP literal, so it did not cover
+    /// this either.
+    ///
+    /// Now: [`admit_url`](super::egress_admission::admit_url) (scheme, empty
+    /// allowlist, denied IP literal, `allowed_hosts` incl. a named port,
+    /// egress posture) and then, for a hostname, `validate_no_dns_rebinding`
+    /// — `webhook::send`'s order. A refusal is recorded on the WORM ledger
+    /// under `email-send` with the admission's policy token; the target is a
+    /// host or IP, never the URL (the URL is a configured secret). The guest
+    /// gets `sendfailed`, as for every other refusal on this surface.
+    ///
+    /// The URL returned is the one that was judged; the caller sends it.
+    pub(crate) async fn admit_email_api_url(
+        &mut self,
+        raw: &str,
+    ) -> Result<url::Url, wit_email::Error> {
+        use super::egress_admission::{admit_url, UrlRefusal};
+        let admitted = match admit_url(raw, &self.url_policy()) {
+            Ok(a) => a,
+            Err(refusal) => {
+                let (policy, target) = match &refusal {
+                    UrlRefusal::Policy(p) => (p.policy, p.target.clone()),
+                    // Neither carries anything worth a target, and the raw
+                    // string is a secret.
+                    UrlRefusal::TooLong { .. } | UrlRefusal::Unparsable => {
+                        ("invalid-email-api-url", String::new())
+                    }
+                };
+                self.record_capability_denied("email-send", policy, &target)
+                    .await;
+                tracing::warn!(
+                    policy,
+                    target = %target,
+                    module_id = ?self.module_id,
+                    "wit_email::send refused: EMAIL_API_URL is not admitted by the egress gate"
+                );
+                return Err(wit_email::Error::Sendfailed);
+            }
+        };
+        if let Some(scheme) = &admitted.insecure_opt_in {
+            tracing::warn!(
+                scheme = %scheme,
+                host = %admitted.host,
+                "email::send: insecure-scheme request allowed by WASM_ALLOW_INSECURE_HTTP=1"
+            );
+        }
+        if matches!(admitted.url.host(), Some(url::Host::Domain(_))) {
+            // A private answer is recorded by `validate_no_dns_rebinding`; a
+            // resolver failure is not a denial, and either way nothing is sent.
+            if self
+                .validate_no_dns_rebinding(&admitted.host, "email-send")
+                .await
+                .is_err()
+            {
+                return Err(wit_email::Error::Sendfailed);
+            }
+        }
+        Ok(admitted.url)
+    }
+}
+
+#[cfg(test)]
+#[path = "email_admission_tests.rs"]
+mod email_admission_tests;

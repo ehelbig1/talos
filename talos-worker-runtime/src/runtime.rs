@@ -734,16 +734,29 @@ fn aot_hmac_input(cap: &crate::wit_inspector::CapabilityWorld, serialized: &[u8]
 /// scope (a `Tier1 + Public` actor reaches its declared hosts through the
 /// allowlisted host-fn path; raw sockets bypass that allowlist and stay off).
 /// `socket_addr_permitted` in `context.rs` is the belt to this suspender.
+///
+/// **E-2 (2026-10-14): two more conditions.**
+/// * `Database` is no longer a socket world. Its SQL travels over signed
+///   NATS-RPC (`talos.database.query`) and needs no TCP; the grant let a
+///   `database-node` module open a raw connection to any public IP:port,
+///   outside `allowed_hosts`, `allowed_methods`, the write ceiling and every
+///   rate limit. No `database-node` catalog template uses raw sockets (the
+///   package record lists them). Operator decision D-2 can restore it.
+/// * The module must declare `"*"` in `allowed_hosts`. Raw sockets cannot be
+///   confined to a host list — they dial addresses, not names — so a module
+///   whose operator NAMED its hosts gets none: the named list is its
+///   containment, and only `talos:core/http` honours it. A `"*"` module
+///   already reaches any public host over HTTP, so a socket adds no reach.
 fn socket_grant(
     cap: &crate::wit_inspector::CapabilityWorld,
     max_llm_tier: talos_workflow_job_protocol::LlmTier,
     egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
+    allowed_hosts: &[String],
 ) -> bool {
     use crate::wit_inspector::CapabilityWorld;
-    matches!(
-        cap,
-        CapabilityWorld::Network | CapabilityWorld::Database | CapabilityWorld::Trusted
-    ) && !matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1)
+    matches!(cap, CapabilityWorld::Network | CapabilityWorld::Trusted)
+        && allowed_hosts.iter().any(|h| h == "*")
+        && !matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1)
         && !crate::context::resolve_local_egress_only(egress_scope, max_llm_tier)
 }
 
@@ -753,25 +766,27 @@ mod socket_grant_tests {
     use crate::wit_inspector::CapabilityWorld;
     use talos_workflow_job_protocol::{EgressScope, LlmTier};
 
+    fn star() -> Vec<String> {
+        vec!["*".to_string()]
+    }
+
     #[test]
-    fn only_network_database_trusted_get_sockets_at_tier2() {
-        for cap in [
-            CapabilityWorld::Network,
-            CapabilityWorld::Database,
-            CapabilityWorld::Trusted,
-        ] {
+    fn only_network_and_trusted_get_sockets_at_tier2() {
+        for cap in [CapabilityWorld::Network, CapabilityWorld::Trusted] {
             assert!(
-                socket_grant(&cap, LlmTier::Tier2, None),
+                socket_grant(&cap, LlmTier::Tier2, None, &star()),
                 "{cap:?} should grant"
             );
         }
         // Every other world — including Http, the one the pipeline path
-        // used to over-grant — must NOT get raw sockets.
+        // used to over-grant, and Database (E-2, 2026-10-14), whose SQL goes
+        // over signed NATS-RPC — must NOT get raw sockets.
         for cap in [
             CapabilityWorld::Minimal,
             CapabilityWorld::Http,
             CapabilityWorld::Secrets,
             CapabilityWorld::Agent,
+            CapabilityWorld::Database,
             CapabilityWorld::Filesystem,
             CapabilityWorld::Messaging,
             CapabilityWorld::Cache,
@@ -779,28 +794,46 @@ mod socket_grant_tests {
             CapabilityWorld::Unknown,
         ] {
             assert!(
-                !socket_grant(&cap, LlmTier::Tier2, None),
+                !socket_grant(&cap, LlmTier::Tier2, None, &star()),
                 "{cap:?} must deny"
             );
         }
     }
 
+    /// E-2: raw sockets dial addresses, not names, so a module whose
+    /// operator NAMED its hosts gets none — the named list is its
+    /// containment, and only `talos:core/http` can honour it.
+    #[test]
+    fn a_named_host_list_gets_no_sockets() {
+        for cap in [CapabilityWorld::Network, CapabilityWorld::Trusted] {
+            for hosts in [
+                vec!["api.example.com".to_string()],
+                vec![".example.com".to_string()],
+                vec![],
+            ] {
+                assert!(
+                    !socket_grant(&cap, LlmTier::Tier2, None, &hosts),
+                    "{cap:?} with {hosts:?} must deny"
+                );
+            }
+            // A wildcard beside a named entry is still a wildcard.
+            let mixed = vec!["api.example.com".to_string(), "*".to_string()];
+            assert!(socket_grant(&cap, LlmTier::Tier2, None, &mixed));
+        }
+    }
+
     #[test]
     fn tier1_never_gets_sockets() {
-        for cap in [
-            CapabilityWorld::Network,
-            CapabilityWorld::Database,
-            CapabilityWorld::Trusted,
-        ] {
+        for cap in [CapabilityWorld::Network, CapabilityWorld::Trusted] {
             assert!(
-                !socket_grant(&cap, LlmTier::Tier1, None),
+                !socket_grant(&cap, LlmTier::Tier1, None, &star()),
                 "Tier-1 must deny raw sockets even for {cap:?}"
             );
             // An explicit `Public` override does not re-open raw sockets for
             // a Tier-1 actor: its egress goes through the allowlisted host-fn
             // path, never raw TCP.
             assert!(
-                !socket_grant(&cap, LlmTier::Tier1, Some(EgressScope::Public)),
+                !socket_grant(&cap, LlmTier::Tier1, Some(EgressScope::Public), &star()),
                 "Tier-1 + egress_scope=public must still deny raw sockets for {cap:?}"
             );
         }
@@ -811,13 +844,9 @@ mod socket_grant_tests {
     /// PRIVATE addresses — so the actor could open TCP to any public IP.
     #[test]
     fn tier2_local_egress_scope_never_gets_sockets() {
-        for cap in [
-            CapabilityWorld::Network,
-            CapabilityWorld::Database,
-            CapabilityWorld::Trusted,
-        ] {
+        for cap in [CapabilityWorld::Network, CapabilityWorld::Trusted] {
             assert!(
-                !socket_grant(&cap, LlmTier::Tier2, Some(EgressScope::Local)),
+                !socket_grant(&cap, LlmTier::Tier2, Some(EgressScope::Local), &star()),
                 "Tier-2 + egress_scope=local must deny raw sockets for {cap:?}"
             );
             // Control: the same actor with the default (public) scope keeps
@@ -825,10 +854,125 @@ mod socket_grant_tests {
             assert!(socket_grant(
                 &cap,
                 LlmTier::Tier2,
-                Some(EgressScope::Public)
+                Some(EgressScope::Public),
+                &star()
             ));
-            assert!(socket_grant(&cap, LlmTier::Tier2, None));
+            assert!(socket_grant(&cap, LlmTier::Tier2, None, &star()));
         }
+    }
+
+    // ── the WASI layer itself ───────────────────────────────────────────────
+    // The predicate above is only what the runtime ASKS. These drive the
+    // `wasi:sockets` host implementation a guest's `TcpStream::connect` and
+    // `ToSocketAddrs` reach, on a context built the way a job builds one.
+    //
+    // Measured 2026-10-14: since wasmtime 48 the upstream default for TCP is
+    // OFF (`AllowedNetworkUses` derives `Default`; 47 defaulted tcp and udp to
+    // ON) and Talos never calls `allow_tcp(true)`, so on this tree NO store —
+    // granted or not — can create a TCP socket. The grant still decides guest
+    // DNS (`allow_ip_name_lookup`) and the address check. The package record
+    // carries this as a finding for the operator; the last test pins it so
+    // that turning TCP back on is a decision, not a side effect.
+
+    use crate::context::TalosContext;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use wasmtime_wasi::p2::bindings::sockets::network::{ErrorCode, IpAddressFamily};
+    use wasmtime_wasi::p2::bindings::sockets::{
+        instance_network, ip_name_lookup, tcp_create_socket,
+    };
+    use wasmtime_wasi::sockets::WasiSocketsCtxView;
+    use wasmtime_wasi::WasiView;
+
+    /// The context a job of `cap` with `hosts` gets: the grant is computed by
+    /// `socket_grant`, exactly as `execute_job_with_full_features` does.
+    fn job_context(cap: CapabilityWorld, hosts: &[&str]) -> TalosContext {
+        let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+        let grant = socket_grant(&cap, LlmTier::Tier2, None, &hosts);
+        TalosContext::new(
+            cap,
+            hosts,
+            vec!["GET".to_string()],
+            128,
+            HashMap::new(),
+            None,
+            None,
+            grant,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("context builds")
+    }
+
+    fn code(e: wasmtime_wasi::p2::SocketError) -> ErrorCode {
+        e.downcast().expect("an error code")
+    }
+
+    /// What a guest's TCP socket creation gets.
+    fn guest_tcp(ctx: &mut TalosContext) -> Result<(), ErrorCode> {
+        let view = ctx.ctx();
+        let mut s = WasiSocketsCtxView {
+            ctx: view.ctx.sockets(),
+            table: view.table,
+        };
+        tcp_create_socket::Host::create_tcp_socket(&mut s, IpAddressFamily::Ipv4)
+            .map(|_| ())
+            .map_err(code)
+    }
+
+    /// What a guest's name lookup gets. Asked with an IP-literal name, which
+    /// the host answers without a resolver once lookup is allowed — so the
+    /// test sends no DNS query either way.
+    fn guest_lookup(ctx: &mut TalosContext) -> Result<(), ErrorCode> {
+        let view = ctx.ctx();
+        let mut s = WasiSocketsCtxView {
+            ctx: view.ctx.sockets(),
+            table: view.table,
+        };
+        let net = instance_network::Host::instance_network(&mut s).expect("network");
+        ip_name_lookup::Host::resolve_addresses(&mut s, net, "203.0.113.9".to_string())
+            .map(|_| ())
+            .map_err(code)
+    }
+
+    /// The finding's case: a `database-node` guest, even under `"*"`, has no
+    /// network surface at all — no guest DNS (the side channel the review
+    /// named), no TCP.
+    #[tokio::test]
+    async fn a_database_guest_has_no_network() {
+        let mut ctx = job_context(CapabilityWorld::Database, &["*"]);
+        assert_eq!(
+            guest_lookup(&mut ctx),
+            Err(ErrorCode::PermanentResolverFailure)
+        );
+        assert_eq!(guest_tcp(&mut ctx), Err(ErrorCode::AccessDenied));
+    }
+
+    #[tokio::test]
+    async fn a_named_host_list_has_no_network() {
+        let mut ctx = job_context(CapabilityWorld::Network, &["api.example.com"]);
+        assert_eq!(
+            guest_lookup(&mut ctx),
+            Err(ErrorCode::PermanentResolverFailure)
+        );
+        assert_eq!(guest_tcp(&mut ctx), Err(ErrorCode::AccessDenied));
+    }
+
+    /// CONTROL: a granted store's lookup is answered, so the two refusals
+    /// above are the grant's and not the host's.
+    #[tokio::test]
+    async fn a_granted_store_can_look_up_a_name() {
+        let mut ctx = job_context(CapabilityWorld::Network, &["*"]);
+        assert_eq!(guest_lookup(&mut ctx), Ok(()));
+    }
+
+    /// PIN (stated above): TCP itself is off for every store on this tree.
+    #[tokio::test]
+    async fn tcp_is_off_even_for_a_granted_store() {
+        let mut ctx = job_context(CapabilityWorld::Network, &["*"]);
+        assert_eq!(guest_tcp(&mut ctx), Err(ErrorCode::AccessDenied));
     }
 }
 
@@ -4533,17 +4677,14 @@ impl TalosRuntime {
         // raw-socket use: local Ollama goes through the native `llm::*` path, and
         // loopback/private targets are SSRF-blocked regardless.
         //
-        // CONTAINMENT CAVEAT (Tier-2 network/database/trusted worlds): when raw
-        // sockets ARE granted below, the per-module `allowed_hosts` list is NOT a
-        // containment boundary for that module — `allowed_hosts` is enforced only
-        // on the `talos:core/http` host-fn path, whereas raw `wasi:sockets` traffic
-        // is gated ONLY by the private-IP SSRF classifier. A Tier-2 module in these
-        // worlds can therefore reach any PUBLIC host over raw TCP regardless of its
-        // configured `allowed_hosts`. This is by design for the socket-capable
-        // worlds; operators who need host-level egress confinement for such a module
-        // must run it Tier-1 (raw sockets denied, forcing traffic through the
-        // host-fn allowlist) or not grant it a socket-capable world.
-        let allow_wasi_network = socket_grant(&cap, max_llm_tier, egress_scope);
+        // CONTAINMENT (E-2, 2026-10-14): raw sockets are granted only to a
+        // Tier-2 `network`/`trusted` module whose `allowed_hosts` holds `"*"` —
+        // one that already reaches any public host over `talos:core/http`. A
+        // module with a NAMED host list gets no sockets, because raw
+        // `wasi:sockets` traffic is gated only by the private-IP SSRF
+        // classifier and could not honour the list. `database` is no longer a
+        // socket world. See `socket_grant`.
+        let allow_wasi_network = socket_grant(&cap, max_llm_tier, egress_scope, &allowed_hosts);
 
         // Select the correct linker + cache for this tier.
         let (linker, cache, tier) = self.select_tier(&cap)?;
@@ -5197,7 +5338,7 @@ impl TalosRuntime {
         // actor-less, runs Tier2-default (no max_llm_tier param). Not a tier-1 actor
         // execution path; raw sockets are still SSRF-gated by socket_addr_check.
         let allow_wasi_network =
-            socket_grant(&cap, talos_workflow_job_protocol::LlmTier::Tier2, None);
+            socket_grant(&cap, talos_workflow_job_protocol::LlmTier::Tier2, None, &[]);
         let (linker, cache, tier) = self.select_tier(&cap)?;
 
         let mut context = TalosContext::new(
@@ -5490,13 +5631,14 @@ impl TalosRuntime {
             // Inspect capability world → tiered linker + cache.
             let cap = crate::wit_inspector::inspect_component(&step.wasm_bytes).capability_world;
             // Raw `wasi:sockets` is granted through the SAME chokepoint as the
-            // single-node path (`socket_grant`): only `Network`/`Database`/
-            // `Trusted`, never Tier-1. This site previously used
+            // single-node path (`socket_grant`): only `Network`/`Trusted` with a
+            // `"*"` host grant, never Tier-1. This site previously used
             // `!(Minimal|Unknown)`, which handed raw TCP to `Http`/`Secrets`/
             // `Agent`/… pipeline steps that the single-node path denies —
             // letting a Tier-2 module bypass its `allowed_hosts` confinement by
             // running as a pipeline step. Do not re-inline the predicate here.
-            let allow_wasi_network = socket_grant(&cap, max_llm_tier, egress_scope);
+            let allow_wasi_network =
+                socket_grant(&cap, max_llm_tier, egress_scope, &step.allowed_hosts);
             let (linker, cache, tier) = self.select_tier(&cap)?;
 
             // Get or compile InstancePre.
