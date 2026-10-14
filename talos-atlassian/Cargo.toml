@@ -9,6 +9,13 @@ publish.workspace = true
 [dependencies]
 talos-http-utils = { path = "../talos-http-utils" }
 anyhow.workspace = true
+# The delivery-token replay cache (push_replay): two-generation, keyed on the
+# token's SHA-256; the shared guard when the controller registered one.
+arc-swap.workspace = true
+dashmap.workspace = true
+hex.workspace = true
+sha2.workspace = true
+talos-replay-guard = { path = "../talos-replay-guard" }
 async-trait.workspace = true
 axum = { workspace = true, features = ["json"] }
 # The delivery JWT's header is read before the library is asked anything

@@ -21,6 +21,7 @@ pub mod integration;
 pub mod push;
 pub mod push_jwt;
 pub mod push_receiver;
+pub mod push_replay;
 pub mod push_scheduler;
 
 pub use handlers::{

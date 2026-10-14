@@ -59,6 +59,13 @@ pub trait ReplayGuard: Send + Sync {
     /// invariant the process-local caches maintain).
     async fn check_and_record(&self, key: &str, ttl_secs: u64) -> ReplayOutcome;
 
+    /// Forget `key`, so it can be recorded again. For a caller that recorded
+    /// a single-use credential and then answered its sender with a retryable
+    /// failure (the Jira receiver, 2026-10-14): the sender's retry, which may
+    /// carry the same credential, must not be refused as a replay. Best
+    /// effort — a backend error leaves the key to expire with its TTL.
+    async fn release(&self, _key: &str) {}
+
     /// Short label for logs/metrics.
     fn name(&self) -> &'static str {
         "replay-guard"
@@ -125,6 +132,20 @@ impl ReplayGuard for RedisReplayGuard {
                 );
                 ReplayOutcome::Unavailable
             }
+        }
+    }
+
+    async fn release(&self, key: &str) {
+        let full = format!("{}{}", self.prefix, key);
+        let mut conn = self.conn.clone();
+        let res: redis::RedisResult<i64> =
+            redis::cmd("DEL").arg(&full).query_async(&mut conn).await;
+        if let Err(e) = res {
+            tracing::warn!(
+                target: "talos_security",
+                error = %e,
+                "distributed replay guard: a released key could not be deleted; it expires with its TTL"
+            );
         }
     }
 
