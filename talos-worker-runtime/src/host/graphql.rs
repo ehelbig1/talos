@@ -1049,7 +1049,7 @@ impl TalosContext {
                 return Err(gql_deny(self, reason_class::PRIVATE_IP));
             }
 
-            if !host_allowlist_match(&allowed_hosts, &host) {
+            if !host_allowlist_match_at(&allowed_hosts, &host, parsed.port_or_known_default()) {
                 self.record_capability_denied("graphql", "allowed-hosts", &host)
                     .await;
                 return Err(gql_deny(self, reason_class::ALLOWED_HOSTS));
@@ -1586,7 +1586,7 @@ mod linear_fragment_scan_tests {
             "the clamp must precede every other statement"
         );
         let allowlist = body
-            .find("host_allowlist_match(&allowed_hosts, &host)")
+            .find("host_allowlist_match_at(&allowed_hosts, &host, ")
             .expect("allowlist check");
         let rate = body
             .find(&["self.check_rate_limit(&self.graphql_", "query_count"].concat())

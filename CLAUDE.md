@@ -418,6 +418,7 @@ introduced per-org v4 per table).
 - `check_secret_allowlist(key_path)` enforces BOTH the per-module `allowed_secrets` grant AND the host-reserved deny-list (`is_reserved_host_secret_path`). The deny-list blocks LLM provider keys even with `allowed_secrets: ["*"]`.
 - The allowlist matcher lives in ONE place: `job_protocol::vault_path_permitted`. Both controller (validation) and worker (runtime enforcement) import from there.
 - A tool that reports a declared secret grant as missing reads `SecretsManager::list_dispatch_readable_key_paths` (the key paths a dispatch for that user can read; it refuses rather than truncate) and asks `talos_workflow_creation_helpers::grant_has_a_stored_secret` per grant. Do not compare a grant entry to a stored path for equality, and do not give such a tool an ownership rule of its own (2026-10-13).
+- A `vault://` value is substituted only into a request whose host is NAMED in `allowed_hosts` (an exact or suffix entry; `"*"` names nothing), and never into a message-bus header: `talos_worker_runtime::host::vault::secret_destination_refusal`, asked by `resolve_vault_placed`. A host function that sends to a URL, including one read from configuration, admits it through `egress_admission::admit_url` (and `validate_no_dns_rebinding` for a name) before the send (2026-10-14, `docs/engineering-log/packages/2026-10-14-one-egress-admission.md`).
 
 ## Security Rules (MUST follow)
 - NEVER log sensitive values (tokens, cookies, API keys, secrets). Log presence only.

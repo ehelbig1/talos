@@ -505,7 +505,30 @@ pub(crate) const MAX_INBOUND_HEADER_VALUE_BYTES: usize = 16 * 1024;
 // result now via the recognised-falsy arm).
 pub(crate) fn allow_private_host_targets() -> bool {
     static WARNED: std::sync::Once = std::sync::Once::new();
-    let raw_enabled = talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false);
+    dev_only_egress_toggle(
+        "WORKER_ALLOW_PRIVATE_HOST_TARGETS",
+        &WARNED,
+        "SSRF defense relaxed for hostnames in allowed_hosts. \
+         IP literals to private ranges remain blocked.",
+    )
+}
+
+/// The one rule for a dev-only egress toggle: read `var` from the
+/// environment and REFUSE it in production (`talos_config::is_production`),
+/// warning once per process either way. Both opt-ins in
+/// [`DevEgressOptIns`] go through it — `WORKER_ALLOW_PRIVATE_HOST_TARGETS`
+/// since 2026-05-22 and `WASM_ALLOW_INSECURE_HTTP` since E-6 (2026-10-14),
+/// which until then had no production refusal: a Helm value copied from a
+/// dev overlay made every surface plaintext-capable, `vault://` headers
+/// included.
+///
+/// [`DevEgressOptIns`]: crate::context::DevEgressOptIns
+pub(crate) fn dev_only_egress_toggle(
+    var: &'static str,
+    warned: &'static std::sync::Once,
+    relaxed: &'static str,
+) -> bool {
+    let raw_enabled = talos_config::bool_env_or_default(var, false);
     // wasm-security-review (2026-05-22): refuse to honour the flag
     // in production. The flag is a dev-only convenience (reaching
     // `host.docker.internal` etc.) and shouldn't widen the SSRF
@@ -513,20 +536,17 @@ pub(crate) fn allow_private_host_targets() -> bool {
     let is_prod = talos_config::is_production();
     let enabled = raw_enabled && !is_prod;
     if raw_enabled {
-        WARNED.call_once(|| {
+        warned.call_once(|| {
             if is_prod {
                 tracing::warn!(
-                    "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true is ignored in production. \
+                    "{var}=true is ignored in production. \
                      The env toggle is dev-only — unset it on this deployment, or \
                      unset RUST_ENV=production if this is a single-pod dev cluster."
                 );
             } else {
                 // L-2: visible at runtime, not silent.
                 tracing::warn!(
-                    "WORKER_ALLOW_PRIVATE_HOST_TARGETS=true — \
-                     SSRF defense relaxed for hostnames in allowed_hosts. \
-                     IP literals to private ranges remain blocked. \
-                     Dev-only — production deployments ignore this flag."
+                    "{var}=true — {relaxed} Dev-only — production deployments ignore this flag."
                 );
             }
         });

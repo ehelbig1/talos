@@ -459,12 +459,6 @@ fn dry_run_response(method: &str, host: &str) -> HostFutureIncomingResponse {
 // The send path: the execution's hardened client, never a raw connect.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A timeout the guest did not set in its `request-options`: upstream's own
-/// default (`wasmtime_wasi_http::default_send_request`), the value Wasmtime 47
-/// also filled in before calling the hook. The job's wall-clock bound still
-/// ends a call long before it.
-const DEFAULT_WASI_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
-
 /// The request/response I/O-completion future the hook API passes around.
 type IoFuture = Box<dyn Future<Output = wasmtime_wasi_http::Result<()>> + Send>;
 
@@ -504,33 +498,120 @@ impl WasiHttpHooks for HardenedWasiHttpHooks {
     }
 }
 
+/// A guest-set `request-options` timeout through the clamp `talos:core/http`
+/// applies (E-9, 2026-10-14): unset is `fetch`'s default, and a value outside
+/// `[MIN_HTTP_TIMEOUT_MS, MAX_HTTP_TIMEOUT_MS]` is pulled inside it. Until
+/// then an unset timeout was upstream's 600 s and a set one was unbounded.
+fn clamped_timeout(requested: Option<Duration>) -> Duration {
+    let ms = requested.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
+    Duration::from_millis(crate::circuit_breaker::clamp_guest_timeout_ms(ms))
+}
+
+/// Was this send refused because the guest's request body passed the cap?
+/// The `Limited` wrapper's error travels inside reqwest's error chain as the
+/// payload of an `io::Error`; a `source()` walk skips that payload, so each
+/// `io::Error` is opened with `get_ref`.
+fn request_body_over_cap(e: &reqwest::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if io
+                .get_ref()
+                .is_some_and(|inner| inner.is::<http_body_util::LengthLimitError>())
+            {
+                return true;
+            }
+        }
+        cur = err.source();
+    }
+    false
+}
+
+/// The caps `talos:core/http::fetch` puts on a response's headers, as the
+/// `wasi:http` error a guest receives.
+fn response_header_violation(headers: &http::HeaderMap) -> Option<wasmtime_wasi_http::Error> {
+    use super::limits::{MAX_INBOUND_HEADERS, MAX_INBOUND_HEADER_VALUE_BYTES};
+    if headers.len() > MAX_INBOUND_HEADERS {
+        return Some(wasmtime_wasi_http::Error::HttpResponseHeaderSectionSize(
+            u32::try_from(MAX_INBOUND_HEADERS).ok(),
+        ));
+    }
+    headers
+        .iter()
+        .find(|(_, v)| v.as_bytes().len() > MAX_INBOUND_HEADER_VALUE_BYTES)
+        .map(|(k, v)| wasmtime_wasi_http::Error::HttpResponseHeaderSize {
+            field_name: Some(k.to_string()),
+            field_size: u32::try_from(v.as_bytes().len()).ok(),
+        })
+}
+
+/// The send. Since E-9 (2026-10-14) it carries the caps `talos:core/http::fetch`
+/// has: the guest timeouts clamped, an outbound header-count cap, the request
+/// body capped at [`MAX_OUTBOUND_HTTP_BODY_BYTES`] while it streams, the
+/// inbound header caps, and a circuit-breaker permit from the same
+/// process-global breaker, settled exactly as `fetch` settles it.
+///
+/// [`MAX_OUTBOUND_HTTP_BODY_BYTES`]: super::limits::MAX_OUTBOUND_HTTP_BODY_BYTES
 async fn send_via_hardened_client(
     client: reqwest::Client,
     request: http::Request<WasiBody>,
     options: Option<RequestOptions>,
 ) -> wasmtime_wasi_http::Result<http::Response<WasiBody>> {
+    use super::limits::{MAX_OUTBOUND_HEADERS, MAX_OUTBOUND_HTTP_BODY_BYTES};
     use wasmtime_wasi_http::Error;
 
-    let first_byte_timeout = options
-        .and_then(|o| o.first_byte_timeout)
-        .unwrap_or(DEFAULT_WASI_HTTP_TIMEOUT);
-    let between_bytes_timeout = options
-        .and_then(|o| o.between_bytes_timeout)
-        .unwrap_or(DEFAULT_WASI_HTTP_TIMEOUT);
+    let first_byte_timeout = clamped_timeout(options.and_then(|o| o.first_byte_timeout));
+    let between_bytes_timeout = clamped_timeout(options.and_then(|o| o.between_bytes_timeout));
 
     let (parts, body) = request.into_parts();
-    let stream = TryStreamExt::map_err(http_body_util::BodyStream::new(body), |e| {
-        std::io::Error::other(format!("{e:?}"))
-    })
-    .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
+    if parts.headers.len() > MAX_OUTBOUND_HEADERS {
+        return Err(Error::HttpRequestHeaderSectionSize(
+            u32::try_from(MAX_OUTBOUND_HEADERS).ok(),
+        ));
+    }
+    // Capped while it streams: the guest writes the body through an
+    // `outgoing-body` stream, so there is no length to check up front.
+    let body = http_body_util::Limited::new(body, MAX_OUTBOUND_HTTP_BODY_BYTES);
+    let stream =
+        TryStreamExt::map_err(http_body_util::BodyStream::new(body), std::io::Error::other)
+            .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
     let request = http::Request::from_parts(parts, reqwest::Body::wrap_stream(stream));
     let request = reqwest::Request::try_from(request).map_err(|_| Error::HttpRequestUriInvalid)?;
 
-    let response = tokio::time::timeout(first_byte_timeout, client.execute(request))
-        .await
-        .map_err(|_| Error::ConnectionReadTimeout)?
-        .map_err(|e| {
-            if e.is_timeout() {
+    // The breaker `fetch` consults, keyed the same way (`host:port`).
+    let target = crate::circuit_breaker::BreakerTarget::from_url(request.url())
+        .ok_or(Error::HttpRequestUriInvalid)?;
+    let Some(mut permit) =
+        crate::circuit_breaker::get_global_circuit_breaker().begin_request(&target)
+    else {
+        tracing::warn!(
+            target = %target.key(),
+            "wasi:http request refused: circuit breaker open"
+        );
+        return Err(Error::DestinationUnavailable);
+    };
+    let timeout_ms = u64::try_from(first_byte_timeout.as_millis()).unwrap_or(u64::MAX);
+
+    let response = match tokio::time::timeout(first_byte_timeout, client.execute(request)).await {
+        Err(_) => {
+            permit.settle_send_error(false, true, timeout_ms);
+            return Err(Error::ConnectionReadTimeout);
+        }
+        Ok(Err(e)) => {
+            let over_cap = request_body_over_cap(&e);
+            if over_cap {
+                // The guest's own body, refused by this process: nothing was
+                // learned about the host.
+                permit.settle_no_evidence();
+            } else {
+                permit.settle_send_error(e.is_builder(), e.is_timeout(), timeout_ms);
+            }
+            return Err(if over_cap {
+                Error::HttpRequestBodySize(u64::try_from(MAX_OUTBOUND_HTTP_BODY_BYTES).ok())
+            } else if e.is_timeout() {
                 Error::ConnectionTimeout
             } else if e.is_connect() {
                 // Includes the SSRF resolver refusing a private / public-under-
@@ -538,8 +619,20 @@ async fn send_via_hardened_client(
                 Error::ConnectionRefused
             } else {
                 Error::HttpProtocolError
-            }
-        })?;
+            });
+        }
+        Ok(Ok(response)) => {
+            permit.settle_response(response.status().as_u16());
+            response
+        }
+    };
+    if let Some(violation) = response_header_violation(response.headers()) {
+        tracing::warn!(
+            target = %target.key(),
+            "wasi:http response refused: header caps exceeded"
+        );
+        return Err(violation);
+    }
 
     let (parts, body) = http::Response::<reqwest::Body>::from(response).into_parts();
     let body = harden_response_body(body, max_response_bytes(), between_bytes_timeout);
@@ -1185,6 +1278,185 @@ mod tests {
                 "harden_response_body(body, max_response_bytes(), between_bytes_timeout)"
             ),
             "{body}"
+        );
+    }
+
+    // ── E-9 (2026-10-14): the send path's parity caps ─────────────────────
+    // Driven through `send_via_hardened_client` itself with a PLAIN client
+    // (no SSRF resolver), so a loopback listener can answer: what is under
+    // test is the caps this function applies, not the resolver, which has
+    // its own tests above.
+
+    fn plain_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client")
+    }
+
+    fn wasi_body(bytes: Vec<u8>) -> WasiBody {
+        http_body_util::Full::new(Bytes::from(bytes))
+            .map_err(|never: std::convert::Infallible| match never {})
+            .boxed_unsync()
+    }
+
+    fn post(port: u16, body: Vec<u8>) -> http::Request<WasiBody> {
+        http::Request::builder()
+            .method("POST")
+            .uri(format!("http://127.0.0.1:{port}/x"))
+            .body(wasi_body(body))
+            .expect("request")
+    }
+
+    /// A loopback listener that reads what it is sent and answers with `raw`.
+    async fn answering(raw: Vec<u8>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(&raw).await;
+                let _ = s.flush().await;
+            }
+        });
+        port
+    }
+
+    fn ok_response(extra_headers: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n{extra_headers}\r\n{{}}"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn guest_timeouts_are_clamped_like_fetch() {
+        use super::super::limits::MAX_HTTP_TIMEOUT_MS;
+        let max = Duration::from_millis(u64::from(MAX_HTTP_TIMEOUT_MS));
+        // Unset: `fetch`'s default, no longer upstream's 600 s.
+        assert_eq!(
+            clamped_timeout(None),
+            Duration::from_millis(crate::circuit_breaker::clamp_guest_timeout_ms(None))
+        );
+        assert!(clamped_timeout(None) <= max);
+        assert_eq!(clamped_timeout(Some(Duration::from_secs(600))), max);
+        assert_eq!(
+            clamped_timeout(Some(Duration::from_secs(u64::MAX / 2))),
+            max
+        );
+        assert!(clamped_timeout(Some(Duration::from_millis(1))) > Duration::from_millis(1));
+    }
+
+    /// CONTROL for the cap tests below: an ordinary request is answered.
+    #[tokio::test]
+    async fn an_ordinary_request_is_answered() {
+        let port = answering(ok_response("")).await;
+        let resp = send_via_hardened_client(plain_client(), post(port, b"{}".to_vec()), None)
+            .await
+            .expect("answered");
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_request_body_is_refused() {
+        use super::super::limits::MAX_OUTBOUND_HTTP_BODY_BYTES;
+        let port = answering(ok_response("")).await;
+        let err = send_via_hardened_client(
+            plain_client(),
+            post(port, vec![b'x'; MAX_OUTBOUND_HTTP_BODY_BYTES + 1]),
+            None,
+        )
+        .await
+        .expect_err("over the cap");
+        assert!(
+            matches!(err, wasmtime_wasi_http::Error::HttpRequestBodySize(_)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_outbound_headers_are_refused_before_a_connect() {
+        use super::super::limits::MAX_OUTBOUND_HEADERS;
+        let mut req = post(1, b"{}".to_vec());
+        for i in 0..=MAX_OUTBOUND_HEADERS {
+            req.headers_mut().insert(
+                http::HeaderName::try_from(format!("x-h{i}")).unwrap(),
+                http::HeaderValue::from_static("v"),
+            );
+        }
+        let err = send_via_hardened_client(plain_client(), req, None)
+            .await
+            .expect_err("over the cap");
+        assert!(
+            matches!(
+                err,
+                wasmtime_wasi_http::Error::HttpRequestHeaderSectionSize(_)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_header_caps_apply() {
+        use super::super::limits::{MAX_INBOUND_HEADERS, MAX_INBOUND_HEADER_VALUE_BYTES};
+        let many: String = (0..=MAX_INBOUND_HEADERS)
+            .map(|i| format!("x-h{i}: v\r\n"))
+            .collect();
+        // Over HTTP/1 hyper refuses more than 100 response headers itself, so
+        // the count cap is asserted on the function the send path calls, and
+        // the wire leg only that the response is refused.
+        let port = answering(ok_response(&many)).await;
+        let r = send_via_hardened_client(plain_client(), post(port, b"{}".to_vec()), None).await;
+        assert!(r.is_err(), "too many headers");
+        let mut headers = http::HeaderMap::new();
+        for i in 0..=MAX_INBOUND_HEADERS {
+            headers.insert(
+                http::HeaderName::try_from(format!("x-h{i}")).unwrap(),
+                http::HeaderValue::from_static("v"),
+            );
+        }
+        assert!(matches!(
+            response_header_violation(&headers),
+            Some(wasmtime_wasi_http::Error::HttpResponseHeaderSectionSize(_))
+        ));
+        headers.remove("x-h0");
+        assert!(response_header_violation(&headers).is_none(), "at the cap");
+
+        let big = format!(
+            "x-big: {}\r\n",
+            "v".repeat(MAX_INBOUND_HEADER_VALUE_BYTES + 1)
+        );
+        let port = answering(ok_response(&big)).await;
+        let err = send_via_hardened_client(plain_client(), post(port, b"{}".to_vec()), None)
+            .await
+            .expect_err("a header value over the cap");
+        assert!(
+            matches!(
+                err,
+                wasmtime_wasi_http::Error::HttpResponseHeaderSize { ref field_name, .. }
+                    if field_name.as_deref() == Some("x-big")
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The process-global breaker `fetch` consults now gates this path too.
+    #[tokio::test]
+    async fn an_exhausted_circuit_refuses_without_sending() {
+        let port = answering(ok_response("")).await;
+        let key = format!("127.0.0.1:{port}");
+        crate::circuit_breaker::get_global_circuit_breaker().force_half_open(&key, 0);
+        let err = send_via_hardened_client(plain_client(), post(port, b"{}".to_vec()), None)
+            .await
+            .expect_err("circuit refuses");
+        assert!(
+            matches!(err, wasmtime_wasi_http::Error::DestinationUnavailable),
+            "{err:?}"
         );
     }
 

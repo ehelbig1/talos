@@ -1674,6 +1674,17 @@ impl TalosContext {
         let local_egress_only = resolve_local_egress_only(egress_scope, max_llm_tier);
         if allow_wasi_network {
             builder.inherit_network();
+            // Guest DNS stays on for a granted store. Since E-2 (2026-10-14)
+            // the grant reaches only a Tier-2, public-egress `network` /
+            // `trusted` module that declares `"*"` — one that already reaches
+            // any public host over `talos:core/http`, so a lookup is no
+            // channel it did not have. Every other store has no network at
+            // all, lookup included.
+            //
+            // Note, measured 2026-10-14: TCP itself is NOT enabled here. Since
+            // wasmtime 48 `WasiCtxBuilder` defaults TCP to off and nothing
+            // calls `allow_tcp(true)`, so no store can create a TCP socket
+            // (`runtime::socket_grant_tests::tcp_is_off_even_for_a_granted_store`).
             builder.allow_ip_name_lookup(true);
 
             // SECURITY: Disable raw UDP sockets.  Talos HTTP is TCP-only;
@@ -4107,7 +4118,12 @@ mod secret_use_ledger_tests {
         secrets.insert(PATH.to_string(), "tok-plaintext".to_string());
         let mut c = TalosContext::new(
             CapabilityWorld::Http,
-            vec!["gmail.googleapis.com".to_string()],
+            // Every destination these tests resolve for is NAMED: since E-3
+            // (2026-10-14) a credential is substituted only for a named host.
+            ["gmail.googleapis.com", "other.example.com", "h"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             ["GET", "POST", "PUT", "PATCH", "DELETE"]
                 .iter()
                 .map(|s| s.to_string())

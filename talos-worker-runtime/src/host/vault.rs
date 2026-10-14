@@ -479,6 +479,92 @@ impl<'a> VaultPlacement<'a> {
     }
 }
 
+/// Audit `policy` token for a `vault://` substitution refused because of
+/// WHERE the credential was going (E-3).
+pub(crate) const SECRET_DESTINATION_POLICY: &str = "secret-destination";
+
+/// Why a destination may not receive a substituted credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretDestinationRefusal {
+    /// The surface has no destination host at all (a NATS header).
+    NoDestination,
+    /// The host is admitted only by the `"*"` entry — nobody named it.
+    WildcardOnly,
+}
+
+/// The secret→destination rule (E-3, 2026-10-14), pure.
+///
+/// A granted secret used to be substitutable into a request to ANY admitted
+/// host: under `allowed_hosts: ["*"]` a one-line change to a module (or a
+/// prompt-injected URL in its config) sent an OAuth token to a host of the
+/// guest's choosing, and a NATS header — a surface with no destination at all
+/// — carried one too. Now a credential is substituted only when the
+/// destination host is NAMED in `allowed_hosts` (exact or suffix entry; see
+/// [`super::egress::host_named_in_allowlist`]). The remedy for a module that
+/// sends a credential under `"*"` is to name the destination beside it: a named
+/// entry is credited even with `"*"` present.
+///
+/// `destination` is the request's host on every HTTP surface; it is not read
+/// for `MessagingHeader`.
+pub(crate) fn secret_destination_refusal(
+    surface: SecretUseSurface,
+    allowed_hosts: &[String],
+    destination: &str,
+) -> Option<SecretDestinationRefusal> {
+    match surface {
+        SecretUseSurface::MessagingHeader => Some(SecretDestinationRefusal::NoDestination),
+        _ if super::egress::host_named_in_allowlist(allowed_hosts, destination) => None,
+        _ => Some(SecretDestinationRefusal::WildcardOnly),
+    }
+}
+
+#[cfg(test)]
+mod secret_destination_tests {
+    use super::{secret_destination_refusal, SecretDestinationRefusal, SecretUseSurface};
+
+    fn v(h: &[&str]) -> Vec<String> {
+        h.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_named_destination_passes_and_a_wildcard_only_one_does_not() {
+        let s = SecretUseSurface::HttpHeader;
+        assert_eq!(
+            secret_destination_refusal(s, &v(&["api.example.com"]), "api.example.com"),
+            None
+        );
+        assert_eq!(
+            secret_destination_refusal(s, &v(&[".example.com"]), "api.example.com"),
+            None
+        );
+        assert_eq!(
+            secret_destination_refusal(s, &v(&["*"]), "attacker.example"),
+            Some(SecretDestinationRefusal::WildcardOnly)
+        );
+        // Naming the destination beside "*" is the remedy.
+        assert_eq!(
+            secret_destination_refusal(s, &v(&["*", "api.example.com"]), "api.example.com"),
+            None
+        );
+        assert_eq!(
+            secret_destination_refusal(s, &v(&["*", "api.example.com"]), "other.example"),
+            Some(SecretDestinationRefusal::WildcardOnly)
+        );
+    }
+
+    #[test]
+    fn a_message_bus_header_is_never_a_destination() {
+        assert_eq!(
+            secret_destination_refusal(
+                SecretUseSurface::MessagingHeader,
+                &v(&["*", "events.example"]),
+                "events.example"
+            ),
+            Some(SecretDestinationRefusal::NoDestination)
+        );
+    }
+}
+
 impl TalosContext {
     /// Resolve `host` and reject if any A/AAAA record falls in the
     /// private/loopback/link-local/CGNAT/IPv4-mapped-IPv6 deny-list.
@@ -869,6 +955,48 @@ impl TalosContext {
                  (vault_path_hash={vault_path_hash}) but this actor's ceiling is \
                  Tier-1 (local Ollama only); external provider credentials are refused."
             ));
+        }
+
+        // E-3 (2026-10-14): a credential travels only to a destination the
+        // operator NAMED. The two gates above ask whether this module may use
+        // the secret at all; this one asks where it is going. A host admitted
+        // only by `"*"` was named by nobody, and a NATS header has no
+        // destination to name.
+        if let Some(refusal) = secret_destination_refusal(surface, &self.allowed_hosts, destination)
+        {
+            let target = match refusal {
+                SecretDestinationRefusal::NoDestination => surface.as_str().to_string(),
+                SecretDestinationRefusal::WildcardOnly => destination.to_string(),
+            };
+            self.record_capability_denied(
+                placement.audit_label(),
+                SECRET_DESTINATION_POLICY,
+                &target,
+            )
+            .await;
+            tracing::warn!(
+                vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
+                vault_path_hash = %vault_path_hash,
+                header_name,
+                surface = surface.as_str(),
+                target = %target,
+                actor_id = ?self.actor_id,
+                "vault:// substitution refused: the destination is not named in allowed_hosts"
+            );
+            return Err(match refusal {
+                SecretDestinationRefusal::NoDestination => format!(
+                    "Header '{header_name}' references a vault secret \
+                     (vault_path_hash={vault_path_hash}) on a message bus publish; a \
+                     credential is never substituted where there is no destination host."
+                ),
+                SecretDestinationRefusal::WildcardOnly => format!(
+                    "'{header_name}' references a vault secret \
+                     (vault_path_hash={vault_path_hash}) bound for '{destination}', which \
+                     this module reaches only through the \"*\" host grant. A credential \
+                     travels only to a host named in allowed_hosts: add '{destination}' \
+                     to the module's allowed_hosts (update_module_hosts)."
+                ),
+            });
         }
 
         let exec_id = self

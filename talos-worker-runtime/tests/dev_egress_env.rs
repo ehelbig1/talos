@@ -12,11 +12,17 @@
 //! no other test. Inside the binary every test takes [`EnvGuard`], which holds
 //! one lock for its lifetime and puts the variables back when it drops — a
 //! second test added here must take it too.
+//!
+//! It also owns `EMAIL_API_URL` / `EMAIL_API_KEY` (E-1, 2026-10-14): the
+//! operator-wide fallback `email::send` reads from the environment, which is
+//! the one route by which that URL reaches a real POST in a test.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use talos_worker_runtime::bindings::talos::core::email as wit_email;
 use talos_worker_runtime::bindings::talos::core::http::{self as wit_http, Host};
 use talos_worker_runtime::context::{DevEgressOptIns, TalosContext};
 use talos_worker_runtime::expose_fallback::ExposeFallback;
@@ -26,7 +32,15 @@ use talos_workflow_job_protocol::LlmTier;
 const PRIVATE_TARGETS: &str = "WORKER_ALLOW_PRIVATE_HOST_TARGETS";
 const INSECURE_HTTP: &str = "WASM_ALLOW_INSECURE_HTTP";
 const RUST_ENV: &str = "RUST_ENV";
-const VARS: [&str; 3] = [PRIVATE_TARGETS, INSECURE_HTTP, RUST_ENV];
+const EMAIL_URL: &str = "EMAIL_API_URL";
+const EMAIL_KEY: &str = "EMAIL_API_KEY";
+const VARS: [&str; 5] = [
+    PRIVATE_TARGETS,
+    INSECURE_HTTP,
+    RUST_ENV,
+    EMAIL_URL,
+    EMAIL_KEY,
+];
 
 static ENV: Mutex<()> = Mutex::new(());
 
@@ -178,8 +192,9 @@ async fn the_environment_reaches_a_context_and_production_refuses_the_private_ta
         "both opt-ins set in the environment: the loopback listener answers: {out:?}"
     );
 
-    // Production: the private-target toggle is ignored however it is set, and
-    // the same request is refused again.
+    // Production: BOTH toggles are ignored however they are set (the insecure
+    // one since E-6, 2026-10-14), so the plaintext request is refused again by
+    // the scheme gate, before the address is looked at.
     env.set(RUST_ENV, Some("production"));
     let (opt_ins, out) = opt_ins_and_fetch(port).await;
     assert!(
@@ -187,8 +202,13 @@ async fn the_environment_reaches_a_context_and_production_refuses_the_private_ta
         "RUST_ENV=production ignores WORKER_ALLOW_PRIVATE_HOST_TARGETS"
     );
     assert!(
-        matches!(out, Err(wit_http::Error::Forbiddenhost)),
-        "in production a name resolving to loopback is refused with the toggle set: {out:?}"
+        !opt_ins.insecure_http,
+        "RUST_ENV=production ignores WASM_ALLOW_INSECURE_HTTP"
+    );
+    assert_eq!(opt_ins, DevEgressOptIns::default());
+    assert!(
+        matches!(out, Err(wit_http::Error::Invalidurl)),
+        "in production plaintext http is refused with the toggle set: {out:?}"
     );
 
     // Read once: a context keeps the answer it was built with. Built while
@@ -209,4 +229,96 @@ async fn the_environment_reaches_a_context_and_production_refuses_the_private_ta
         matches!(out, Err(wit_http::Error::Invalidurl)),
         "control: a context built after the clearing is refused again: {out:?}"
     );
+}
+
+/// Loopback server answering every connection `200 {}`, counting accepts.
+async fn spawn_counting_server() -> (u16, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut buf = vec![0u8; 16384];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await;
+            let _ = socket.flush().await;
+        }
+    });
+    (port, accepted)
+}
+
+fn email_context(hosts: &[&str]) -> TalosContext {
+    TalosContext::new(
+        CapabilityWorld::Http,
+        hosts.iter().map(|h| h.to_string()).collect(),
+        vec!["POST".to_string()],
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        Arc::new(ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .expect("context builds")
+}
+
+fn email() -> wit_email::Message {
+    wit_email::Message {
+        to: vec!["someone@example.test".to_string()],
+        cc: None,
+        bcc: None,
+        subject: "s".to_string(),
+        body: "b".to_string(),
+        html: None,
+        attachments: None,
+    }
+}
+
+/// E-1: `EMAIL_API_URL` from the environment passes the egress admission.
+/// Before 2026-10-14 a private IP literal there was dialled with the API key
+/// as its bearer, under any `allowed_hosts` — the connect-time resolver never
+/// sees a literal.
+#[tokio::test]
+async fn the_email_api_url_from_the_environment_passes_the_egress_admission() {
+    let env = EnvGuard::cleared();
+    let (port, accepted) = spawn_counting_server().await;
+    env.set(EMAIL_KEY, Some("test-key"));
+
+    // A private literal under "*": refused before any connection.
+    let private = format!("https://127.0.0.1:{port}/v3/mail/send");
+    env.set(EMAIL_URL, Some(&private));
+    let mut ctx = email_context(&["*"]);
+    let out = wit_email::Host::send(&mut ctx, email()).await;
+    assert!(
+        matches!(out, Err(wit_email::Error::Sendfailed)),
+        "a private literal is refused: {out:?}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        0,
+        "the refused URL must never be dialled"
+    );
+
+    // CONTROL: the same listener, by a NAME the module lists, with both dev
+    // opt-ins set — the send reaches it, so the refusal above is the
+    // literal's and the environment does reach the surface.
+    env.set(INSECURE_HTTP, Some("1"));
+    env.set(PRIVATE_TARGETS, Some("1"));
+    let named = format!("http://localhost:{port}/v3/mail/send");
+    env.set(EMAIL_URL, Some(&named));
+    let mut ctx = email_context(&["localhost"]);
+    let out = wit_email::Host::send(&mut ctx, email()).await;
+    assert!(out.is_ok(), "an admitted URL is sent: {out:?}");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }

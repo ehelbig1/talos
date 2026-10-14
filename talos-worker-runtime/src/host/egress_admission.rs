@@ -155,7 +155,9 @@ pub(crate) fn admit_parsed_url(
             DenialKind::Forbidden,
         ));
     }
-    let Some(host_match) = host_allowlist_match_kind(policy.allowed_hosts, &host) else {
+    let Some(host_match) =
+        host_allowlist_match_kind(policy.allowed_hosts, &host, url.port_or_known_default())
+    else {
         return Err(refuse(
             "allowed-hosts",
             host,
@@ -304,6 +306,31 @@ mod tests {
                 reason_class::TIER1_EGRESS
             )
         );
+    }
+
+    /// E-10: `admit_url` judges the URL's port against an entry that names
+    /// one — the explicit port and the scheme's default alike.
+    #[test]
+    fn an_entry_with_a_port_admits_that_port_only() {
+        let h = hosts(&["internal-gw.example.com:443"]);
+        let p = policy(&h, LlmTier::Tier2, false, false);
+        assert!(admit_url("https://internal-gw.example.com/x", &p).is_ok());
+        assert!(admit_url("https://internal-gw.example.com:443/x", &p).is_ok());
+        assert_eq!(
+            policy_of(admit_url("https://internal-gw.example.com:9200/x", &p)),
+            (
+                "allowed-hosts",
+                "internal-gw.example.com".into(),
+                reason_class::ALLOWED_HOSTS
+            )
+        );
+        // Control: the same host without a port in its entry admits :9200.
+        let bare = hosts(&["internal-gw.example.com"]);
+        assert!(admit_url(
+            "https://internal-gw.example.com:9200/x",
+            &policy(&bare, LlmTier::Tier2, false, false)
+        )
+        .is_ok());
     }
 
     #[test]
