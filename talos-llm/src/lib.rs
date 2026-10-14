@@ -444,6 +444,79 @@ impl LlmClient {
 // Tier 1: Ollama (Local LLM) Client
 // ============================================================================
 
+/// A local completion: the text, and what the backend said about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatReply {
+    /// The answer (`message.content`), trimmed. Reasoning is not part of it.
+    pub text: String,
+    /// The backend's own word for why generation stopped (`stop`,
+    /// `length`). `length` with an empty `text` is a call that spent its
+    /// whole budget reasoning.
+    pub stop_reason: Option<String>,
+    /// Prompt tokens evaluated.
+    pub prompt_tokens: Option<u64>,
+    /// Tokens generated, INCLUDING any reasoning.
+    pub completion_tokens: Option<u64>,
+}
+
+/// The request [`OllamaClient::complete_with_options`] sends first, for a
+/// caller that wants to see (or test) what its options come to without a
+/// backend.
+#[must_use]
+pub fn local_request_with_options(
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+    apply_options: impl Fn(&mut serde_json::Value),
+) -> serde_json::Value {
+    local_body_with_options(
+        model,
+        system_prompt,
+        user_prompt,
+        max_tokens,
+        Some(false),
+        apply_options,
+    )
+    .0
+}
+
+/// The request [`OllamaClient::complete_with_options`] sends, and whether
+/// the caller's options set `think` themselves.
+///
+/// Pure, so what options can and cannot change is testable without a
+/// backend: whatever `apply_options` did, the model and the messages are the
+/// ones this call was made with.
+fn local_body_with_options(
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+    think: Option<bool>,
+    apply_options: impl Fn(&mut serde_json::Value),
+) -> (serde_json::Value, bool) {
+    // Built without `think`, so "did the options set it" is read off the
+    // body rather than guessed from the options' shape.
+    let mut body = build_chat_body(model, system_prompt, user_prompt, max_tokens, None, None);
+    let messages = body.get("messages").cloned();
+    apply_options(&mut body);
+    if !body.is_object() {
+        body = build_chat_body(model, system_prompt, user_prompt, max_tokens, None, None);
+    }
+    body["model"] = json!(model);
+    if let Some(messages) = messages {
+        body["messages"] = messages;
+    }
+    body["stream"] = json!(false);
+    let callers_think = body.get("think").is_some();
+    if !callers_think {
+        if let Some(t) = think {
+            body["think"] = json!(t);
+        }
+    }
+    (body, callers_think)
+}
+
 /// Native `/api/chat` request body. Pure so the option wiring is
 /// unit-testable: `think` is only serialized when explicitly set (models
 /// without a reasoning mode can reject the field), `json_format` maps to
@@ -823,7 +896,13 @@ impl OllamaClient {
     /// Error strings keep their shape: an HTTP status still reads
     /// `Ollama returned HTTP <status>`, which `complete_structured` and
     /// `complete_with_schema` match on for their `think` retry.
-    async fn chat(&self, model: &str, mut body: serde_json::Value) -> Result<String> {
+    async fn chat(&self, model: &str, body: serde_json::Value) -> Result<String> {
+        self.chat_reply(model, body).await.map(|reply| reply.text)
+    }
+
+    /// [`Self::chat`], keeping what the backend said beside the text: why
+    /// generation stopped and what it cost.
+    async fn chat_reply(&self, model: &str, mut body: serde_json::Value) -> Result<ChatReply> {
         use talos_local_inference::{gate, stream};
 
         // Every caller of this client treats its answer as LOCAL inference —
@@ -906,7 +985,64 @@ impl OllamaClient {
             .trim()
             .to_string();
 
-        Ok(text)
+        Ok(ChatReply {
+            text,
+            stop_reason: body
+                .get("done_reason")
+                .and_then(|v| v.as_str())
+                .map(|reason| {
+                    reason
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(40)
+                        .collect()
+                }),
+            prompt_tokens: body.get("prompt_eval_count").and_then(|v| v.as_u64()),
+            completion_tokens: body.get("eval_count").and_then(|v| v.as_u64()),
+        })
+    }
+
+    /// A completion with the caller's provider options applied to the
+    /// request, returning why generation stopped and what it cost.
+    ///
+    /// `apply_options` receives the body [`Self::complete`] would send
+    /// (thinking off) and may tune it; the operator's `local_llm_complete`
+    /// tool passes the worker's own option translation, so a prompt tried
+    /// through the tool is sent as a module would send it.
+    ///
+    /// What the options cannot do is decided HERE and not left to the
+    /// closure: after it runs, `model` is set back to the model this call
+    /// was made for (the one the locality check below is asked about), the
+    /// messages are restored, and streaming is the transport's choice. So
+    /// options cannot make this a call to a model that was not checked.
+    ///
+    /// The `think: false` retry of [`Self::complete`] applies only while the
+    /// options leave `think` alone; a caller that set it gets one attempt.
+    pub async fn complete_with_options(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+        apply_options: impl Fn(&mut serde_json::Value),
+    ) -> Result<ChatReply> {
+        let body_for = |think: Option<bool>| {
+            local_body_with_options(
+                model,
+                system_prompt,
+                user_prompt,
+                max_tokens,
+                think,
+                &apply_options,
+            )
+        };
+        let (first, callers_think) = body_for(Some(false));
+        match self.chat_reply(model, first).await {
+            Err(e) if !callers_think && e.to_string().contains("HTTP 400") => {
+                self.chat_reply(model, body_for(None).0).await
+            }
+            other => other,
+        }
     }
 
     /// Force `model` resident in VRAM with a one-token generation.
@@ -1114,8 +1250,60 @@ mod ollama_chat_tests;
 
 #[cfg(test)]
 mod chat_body_tests {
-    use super::build_chat_body;
+    use super::{build_chat_body, local_body_with_options};
     use serde_json::json;
+
+    /// Whatever the caller's options do to the request, the model is the
+    /// one the call was made for (and so the one checked for locality), the
+    /// messages are the caller's prompts, and streaming is not theirs to set.
+    #[test]
+    fn options_cannot_move_a_completion_to_another_model_or_prompt() {
+        let hijack = |body: &mut serde_json::Value| {
+            body["model"] = json!("someone-elses:cloud");
+            body["messages"] = json!([{ "role": "user", "content": "other" }]);
+            body["stream"] = json!(true);
+            body["options"]["temperature"] = json!(0.9);
+        };
+        let (body, _) =
+            local_body_with_options("local-model", "sys", "ask", 64, Some(false), hijack);
+        assert_eq!(body["model"], "local-model");
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "system", "content": "sys" }, { "role": "user", "content": "ask" }])
+        );
+        assert_eq!(body["stream"], false);
+        // What options are FOR still applies.
+        assert_eq!(body["options"]["temperature"], 0.9);
+        assert_eq!(body["options"]["num_predict"], 64);
+
+        // A closure that replaces the body with something that is not a
+        // request leaves the request the call would have made.
+        let (body, _) =
+            local_body_with_options("local-model", "", "ask", 64, None, |b| *b = json!("x"));
+        assert_eq!(body["model"], "local-model");
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "ask" }])
+        );
+    }
+
+    /// Thinking is off unless the options say otherwise; when they do, the
+    /// caller's value stands and the call is not retried without it.
+    #[test]
+    fn think_is_off_by_default_and_the_callers_when_they_set_it() {
+        let (body, callers) = local_body_with_options("m", "", "ask", 8, Some(false), |_| {});
+        assert_eq!((body["think"].clone(), callers), (json!(false), false));
+        // The retry attempt: no `think` field at all.
+        let (body, callers) = local_body_with_options("m", "", "ask", 8, None, |_| {});
+        assert!(body.get("think").is_none() && !callers);
+
+        let set = |body: &mut serde_json::Value| body["think"] = json!(true);
+        let (body, callers) = local_body_with_options("m", "", "ask", 8, Some(false), set);
+        assert_eq!((body["think"].clone(), callers), (json!(true), true));
+        let set = |body: &mut serde_json::Value| body["think"] = json!("high");
+        let (body, callers) = local_body_with_options("m", "", "ask", 8, Some(false), set);
+        assert_eq!((body["think"].clone(), callers), (json!("high"), true));
+    }
 
     #[test]
     fn schema_body_sets_format_object_and_pins_temperature() {

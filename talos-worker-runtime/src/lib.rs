@@ -27,6 +27,7 @@ pub mod job_span;
 pub mod local_llm_fleet;
 pub mod metrics;
 pub mod module_fetcher;
+pub mod provider_options;
 pub mod reason_class;
 pub mod rehearsal;
 pub mod runtime;

@@ -131,6 +131,58 @@ fn thinking_counts_as_progress_but_not_as_content() {
     assert_eq!(parsed.text, "answer");
 }
 
+/// What a local model sends when it spends its whole budget reasoning
+/// (measured on Ollama 0.35.0, `think: true`, `num_predict: 40`): every
+/// chunk carries `thinking` and no `content`, and the last line says
+/// `done_reason: "length"` with `eval_count` equal to the budget. The module
+/// must be told: an empty text with `stop_reason: "length"`, and the
+/// reasoning counted in the completion tokens, since nothing else reports it.
+#[test]
+fn a_reply_cut_off_while_reasoning_says_length_and_has_no_text() {
+    let thinking = |text: &str| {
+        line(serde_json::json!({
+            "message": {"role": "assistant", "content": "", "thinking": text}, "done": false
+        }))
+    };
+    let wire = [
+        thinking("The user wants "),
+        thinking("17 times 23, so"),
+        line(serde_json::json!({
+            "model": "m", "created_at": "t",
+            "message": {"role": "assistant", "content": ""},
+            "done": true, "done_reason": "length",
+            "prompt_eval_count": 34, "eval_count": 40
+        })),
+    ]
+    .concat();
+    let parsed = adapter_for("ollama")
+        .parse_completion(&assemble(wire.as_bytes(), 1 << 20).unwrap())
+        .unwrap();
+    assert_eq!(parsed.text, "");
+    assert_eq!(parsed.stop_reason.as_deref(), Some("length"));
+    assert_eq!(
+        (parsed.input_tokens, parsed.output_tokens),
+        (Some(34), Some(40))
+    );
+
+    // Cut off while writing the answer: the same word, with the text so far.
+    let wire = [
+        chunk("Rivers carry"),
+        line(serde_json::json!({
+            "message": {"role": "assistant", "content": ""},
+            "done": true, "done_reason": "length", "prompt_eval_count": 18, "eval_count": 5
+        })),
+    ]
+    .concat();
+    let parsed = adapter_for("ollama")
+        .parse_completion(&assemble(wire.as_bytes(), 1 << 20).unwrap())
+        .unwrap();
+    assert_eq!(
+        (parsed.text.as_str(), parsed.stop_reason.as_deref()),
+        ("Rivers carry", Some("length"))
+    );
+}
+
 #[test]
 fn a_final_line_without_its_newline_is_still_read() {
     let wire = [chunk("x"), done_line().trim_end().to_string()].concat();

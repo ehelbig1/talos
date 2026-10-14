@@ -312,12 +312,17 @@ impl wit_llm_tools::Host for TalosContext {
 
         // R2 token ledger: fold provider-reported usage into the per-job
         // accumulator (drained into the signed JobResult at completion).
-        crate::context::fold_llm_usage(
+        crate::context::record_llm_call(
             &self.llm_usage,
-            adapter.name(),
-            &model,
-            parsed.input_tokens.unwrap_or(0),
-            parsed.output_tokens.unwrap_or(0),
+            crate::context::LlmCallRecord {
+                provider: adapter.name().to_string(),
+                model: model.clone(),
+                prompt_tokens: parsed.input_tokens,
+                completion_tokens: parsed.output_tokens,
+                stop_reason: parsed.stop_reason.clone(),
+                // This path does not time the exchange.
+                duration_ms: None,
+            },
         );
 
         // A local prompt Ollama silently truncated (see `complete_inner`).

@@ -376,6 +376,62 @@ Talos ships with pre-built module templates for common tasks:
 
 Use the `createModuleFromTemplate` mutation to instantiate any template with custom configuration.
 
+## LLM completion, and why it stopped
+
+`talos::core::llm::complete(&req)` returns
+`CompletionResponse { text, model, usage, stop_reason }`.
+`complete_with_options(&req, Some(options))` is the same call with provider
+options: a JSON object as text, at most 8 KiB, for example
+`{"think": false, "response_format": {"type": "json_object"}}`. Options tune
+the request; `model`, `messages`, `system` and `stream` in them are dropped.
+
+`stop_reason` is the provider's own word, passed through unchanged:
+
+| Provider | Finished | Cut off at `max_tokens` |
+|---|---|---|
+| local (Ollama) | `stop` | `length` |
+| Anthropic | `end_turn` | `max_tokens` |
+| OpenAI | `stop` | `length` |
+| Gemini | `STOP` | `MAX_TOKENS` |
+
+The local row is measured. The other rows are those providers' documented
+values, which the host passes through and does not rewrite.
+
+**A module that asks for JSON checks `stop_reason` before it parses.** A
+call cut off at `max_tokens` returns incomplete text, and for a model that
+reasons before it answers the text can be EMPTY: reasoning counts against
+`max_tokens`, so a call with `"think": true` and too small a budget spends
+all of it thinking and returns nothing, with `stop_reason: "length"`.
+Measured on a local model: `max_tokens: 40` with thinking on returned no
+content, `done_reason: "length"` and 40 completion tokens. Fail the node
+with a message that says so rather than hand an empty string to a JSON
+parser:
+
+```rust
+let resp = llm::complete_with_options(&req, Some(options))?;
+if matches!(resp.stop_reason.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            Some("length" | "max_tokens")) {
+    return Err(format!(
+        "the model was cut off at max_tokens ({} chars of answer); raise MAX_TOKENS or turn thinking off",
+        resp.text.len()
+    ));
+}
+```
+
+`usage.output_tokens` includes reasoning. No provider path here reports
+reasoning tokens on their own.
+
+Two tools show this without a workflow:
+
+* `test_module` returns `llm_calls` beside `llm_usage`: each call the run
+  made, in order, with its tokens, `stop_reason` and duration (the first 20
+  listed, the rest counted). A total of 1,566 completion tokens over two
+  calls says little; "call 2: 1,500 tokens, `length`" says which call ran
+  out.
+* `local_llm_complete` takes the same `options` object, checked and applied
+  by the same code as a module's call, and returns `stop_reason` and
+  `usage`. Thinking is off there unless `options` sets it.
+
 ## LLM Tool Use
 
 The `llm-tools` interface enables function calling (tool use) with LLM providers. Available in `secrets-node`, `database-node`, and `automation-node` worlds.

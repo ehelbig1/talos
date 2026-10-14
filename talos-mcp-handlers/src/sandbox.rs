@@ -338,7 +338,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "test_module",
             "description": ([
-                "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n  - `trigger_input`: the run's trigger payload (goes to `data[\"__trigger_input__\"]`, where the engine writes it for every node of a workflow run)\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call), so you can see how close a run came to its fuel and token limits. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. ",
+                "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n  - `trigger_input`: the run's trigger payload (goes to `data[\"__trigger_input__\"]`, where the engine writes it for every node of a workflow run)\n\nREHEARSAL: pass `http_fixtures` (recorded HTTP responses) and the module's `http::fetch` calls are answered from them instead of being sent — no request, no DNS lookup, no secret resolved — while its host and verb grants are still enforced. Use it to measure fuel and check parsing against a realistic response before the service is connected; the reply gains `http_replay`.\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. RESULT: besides `output` / `error`, the reply carries `fuel` ({consumed, limit}, also when the run failed) and `llm_usage` (per provider+model: prompt_tokens, completion_tokens, calls; null when the module made no LLM call) and `llm_calls` ({calls: [{call, provider, model, prompt_tokens, completion_tokens, stop_reason, duration_ms}], not_listed}: each call in the order made, the first 20 listed and the rest counted), so you can see how close a run came to its fuel and token limits and WHICH call hit one. `stop_reason` is the provider's own word: `length` (or `max_tokens`) means the call was cut off at its token budget, and for a model that reasons first the budget may have gone entirely on reasoning, leaving an empty answer; completion_tokens includes reasoning, which no provider here reports separately. FUEL LIMIT: the run is held to the module's own `max_fuel` unless `config.max_fuel` is set, which overrides it exactly as a node's config does in a workflow (capped at the engine's per-node ceiling, 50M); `fuel.limit_source` says which applied. What a rehearsal cannot show is the adaptive-fuel floor a node may gain from its own history. ",
                 TEST_MODULE_NETWORK_NOTE,
                 "\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
             ]
@@ -3098,10 +3098,10 @@ pub(crate) fn rendered_llm_usage(
     let guard = acc
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if guard.is_empty() {
+    if guard.totals().is_empty() {
         return serde_json::Value::Null;
     }
-    let mut rows: Vec<(&(String, String), &(u64, u64, u32))> = guard.iter().collect();
+    let mut rows: Vec<(&(String, String), &(u64, u64, u32))> = guard.totals().iter().collect();
     rows.sort_by(|a, b| a.0.cmp(b.0));
     serde_json::Value::Array(
         rows.into_iter()
@@ -3116,6 +3116,42 @@ pub(crate) fn rendered_llm_usage(
             })
             .collect(),
     )
+}
+
+/// Each LLM call the run made, in the order made: `null` when it made none.
+///
+/// The totals above answer "how much"; this answers "which call". A module
+/// that calls the model twice and gets nothing usable back needs to see that
+/// one call stopped for `length` at exactly its token budget. `stop_reason`
+/// is the provider's own word, unchanged. `completion_tokens` includes any
+/// reasoning: no provider path here reports reasoning tokens on their own.
+/// Bounded upstream (`MAX_LLM_CALL_RECORDS`); `not_listed` counts the rest.
+pub(crate) fn rendered_llm_calls(
+    acc: &talos_worker_runtime::context::LlmUsageAcc,
+) -> serde_json::Value {
+    let guard = acc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.calls().is_empty() {
+        return serde_json::Value::Null;
+    }
+    let calls: Vec<serde_json::Value> = guard
+        .calls()
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            serde_json::json!({
+                "call": index + 1,
+                "provider": call.provider,
+                "model": call.model,
+                "prompt_tokens": call.prompt_tokens,
+                "completion_tokens": call.completion_tokens,
+                "stop_reason": call.stop_reason,
+                "duration_ms": call.duration_ms,
+            })
+        })
+        .collect();
+    serde_json::json!({ "calls": calls, "not_listed": guard.calls_not_listed() })
 }
 
 /// Fuel one in-process run consumed against its limit; `null` when no attempt
@@ -4338,8 +4374,7 @@ async fn handle_test_module(
     // What the run spent, reported on both arms: a failed run has no output
     // to carry `__fuel_consumed__`, and nothing else says how many tokens an
     // LLM-backed module used against its MAX_TOKENS.
-    let llm_usage: talos_worker_runtime::context::LlmUsageAcc =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let llm_usage = talos_worker_runtime::context::LlmUsageAcc::default();
     let fuel: talos_worker_runtime::context::FuelAcc =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let start = std::time::Instant::now();
@@ -4462,6 +4497,7 @@ async fn handle_test_module(
                     "duration_ms": duration_ms,
                     "fuel": rendered_test_fuel(&fuel, fuel_limit),
                     "llm_usage": rendered_llm_usage(&llm_usage),
+                    "llm_calls": rendered_llm_calls(&llm_usage),
                     "memory_write": memory_write_note,
                     // Denied/failed host calls this run. Present on the
                     // SUCCESS arm too: a module can swallow a failed fetch in
@@ -4482,6 +4518,7 @@ async fn handle_test_module(
                 "duration_ms": duration_ms,
                 "fuel": rendered_test_fuel(&fuel, fuel_limit),
                 "llm_usage": rendered_llm_usage(&llm_usage),
+                    "llm_calls": rendered_llm_calls(&llm_usage),
                 // The whole point: an opaque `networkerror` here is now
                 // accompanied by the host's reason for it.
                 "host_diagnostics": collected_host_diagnostics(&host_diags),
@@ -4893,12 +4930,22 @@ fn html_escape(s: &str) -> String {
 //     pub temperature: Option<f32>,
 //     pub system_prompt: Option<String>,     // NOT a System-role Message
 // }
-// pub struct CompletionResponse { pub text: String, pub model: String, pub usage: Option<TokenUsage> }
+// pub struct CompletionResponse {
+//     pub text: String, pub model: String, pub usage: Option<TokenUsage>,
+//     pub stop_reason: Option<String>,       // the provider's own word: "stop", "end_turn", "length", "max_tokens", …
+// }
 // pub fn complete(req: &CompletionRequest) -> Result<CompletionResponse, Error>;
+// pub fn complete_with_options(req: &CompletionRequest, options: Option<&str>) -> Result<CompletionResponse, Error>;
 //
-// There is NO `json_mode` / `stop` / `tools` on CompletionRequest. If you
-// need JSON output, prompt-engineer for it and parse defensively. If you
+// There is NO `json_mode` / `stop` / `tools` on CompletionRequest. Provider
+// features go in `options`, a JSON object as text (at most 8 KiB), e.g.
+// `{"think": false, "response_format": {"type": "json_object"}}`. If you
 // need tool use, see `talos::core::llm_tools::complete_with_tools`.
+//
+// CHECK `stop_reason` BEFORE PARSING an answer you asked for as JSON. "length"
+// (or "max_tokens") means the call was cut off at max_tokens: the text is
+// incomplete, and for a model that reasons first it can be EMPTY, the whole
+// budget having gone on reasoning. Fail with a message that says so.
 //
 // ── Shape A (RECOMMENDED): talos::core::llm host functions ─────────────
 pub fn run(input: String) -> Result<String, String> {
@@ -6165,7 +6212,6 @@ mod sandbox_method_default_tests {
 mod rehearsal_tool_tests {
     use super::{rendered_fuel, rendered_llm_usage, test_module_payload};
     use serde_json::json;
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     /// The payload matches the engine's node input: keys at the root, the two
@@ -6388,22 +6434,63 @@ mod rehearsal_tool_tests {
 
     #[test]
     fn usage_is_null_without_a_call_and_sorted_with_several() {
-        let acc = Arc::new(Mutex::new(HashMap::new()));
+        use talos_worker_runtime::context::{fold_llm_usage, LlmUsageAcc};
+        let acc = LlmUsageAcc::default();
         assert!(rendered_llm_usage(&acc).is_null());
-        acc.lock().unwrap().insert(
-            ("ollama".to_string(), "qwen3.6".to_string()),
-            (120u64, 40u64, 2u32),
-        );
-        acc.lock().unwrap().insert(
-            ("anthropic".to_string(), "m".to_string()),
-            (7u64, 3u64, 1u32),
-        );
+        fold_llm_usage(&acc, "ollama", "qwen3.6", 100, 30);
+        fold_llm_usage(&acc, "ollama", "qwen3.6", 20, 10);
+        fold_llm_usage(&acc, "anthropic", "m", 7, 3);
         let v = rendered_llm_usage(&acc);
         assert_eq!(v[0]["provider"], "anthropic");
         assert_eq!(v[1]["provider"], "ollama");
         assert_eq!(v[1]["prompt_tokens"], 120);
         assert_eq!(v[1]["completion_tokens"], 40);
         assert_eq!(v[1]["calls"], 2);
+    }
+
+    /// The observed reply was `[{"calls": 2, "completion_tokens": 1566, …}]`:
+    /// one total for two calls. Working backwards, the second call had used
+    /// all 1,500 of its tokens reasoning and was cut off. Each call is now
+    /// shown, in order, with why it stopped.
+    #[test]
+    fn each_call_is_listed_in_order_with_its_stop_reason_beside_the_total() {
+        use super::rendered_llm_calls;
+        use talos_worker_runtime::context::{
+            record_llm_call, LlmCallRecord, LlmUsageAcc, MAX_LLM_CALL_RECORDS,
+        };
+        let acc = LlmUsageAcc::default();
+        assert!(rendered_llm_calls(&acc).is_null());
+        let call = |completion: u64, stop: &str, ms: u64| LlmCallRecord {
+            provider: "ollama".into(),
+            model: "local-model".into(),
+            prompt_tokens: Some(400),
+            completion_tokens: Some(completion),
+            stop_reason: Some(stop.into()),
+            duration_ms: Some(ms),
+        };
+        record_llm_call(&acc, call(66, "stop", 900));
+        record_llm_call(&acc, call(1500, "length", 41_000));
+
+        assert_eq!(rendered_llm_usage(&acc)[0]["completion_tokens"], 1566);
+        let v = rendered_llm_calls(&acc);
+        assert_eq!(v["not_listed"], 0);
+        assert_eq!(
+            v["calls"],
+            json!([
+                { "call": 1, "provider": "ollama", "model": "local-model", "prompt_tokens": 400,
+                  "completion_tokens": 66, "stop_reason": "stop", "duration_ms": 900 },
+                { "call": 2, "provider": "ollama", "model": "local-model", "prompt_tokens": 400,
+                  "completion_tokens": 1500, "stop_reason": "length", "duration_ms": 41_000 },
+            ])
+        );
+
+        // Bounded: the first calls are listed, the rest counted.
+        for _ in 0..MAX_LLM_CALL_RECORDS {
+            record_llm_call(&acc, call(1, "stop", 1));
+        }
+        let v = rendered_llm_calls(&acc);
+        assert_eq!(v["calls"].as_array().unwrap().len(), MAX_LLM_CALL_RECORDS);
+        assert_eq!(v["not_listed"], 2);
     }
 
     #[test]
