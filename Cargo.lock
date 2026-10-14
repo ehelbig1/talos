@@ -10314,6 +10314,7 @@ dependencies = [
  "regex",
  "serde_json",
  "talos-text-util",
+ "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
  "uuid",
 ]
