@@ -183,6 +183,20 @@ pub struct ChildRunOfWorkflow {
     pub duration_ms: i64,
 }
 
+/// One workflow's recorded runs as somebody's child inside a window, for
+/// `get_workflow_stats`' separate `child_runs` block (2026-10-14).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChildRunWindowStats {
+    /// Recorded runs in `[since, now]`.
+    pub runs: i64,
+    /// Of them, classified `failed` at the write site.
+    pub failed: i64,
+    /// Mean wall time of those runs, milliseconds. `None` with no runs.
+    pub avg_duration_ms: Option<f64>,
+    /// The newest run's start. `None` with no runs.
+    pub last_started_at: Option<DateTime<Utc>>,
+}
+
 /// What the ledger knows about one child inside a window — the two
 /// execution-derived readiness components, from the one table that can see a
 /// sub-workflow run.
@@ -458,6 +472,44 @@ impl ChildRunLedger {
             });
         }
         Ok((out, total))
+    }
+
+    /// [`ChildRunWindowStats`] for one workflow since `since`, as one
+    /// statement. Owner-scoped at the app layer and under RLS.
+    ///
+    /// The caller renders [`Self::since`] beside it: a window that starts
+    /// before the ledger's first row is only partly covered.
+    ///
+    /// # Errors
+    /// Any database failure.
+    pub async fn window_stats_for_child(
+        &self,
+        child_workflow_id: Uuid,
+        user_id: Uuid,
+        since: DateTime<Utc>,
+    ) -> Result<ChildRunWindowStats> {
+        let mut tx = talos_db::begin_user_scoped(&self.pool, user_id).await?;
+        let row = sqlx::query(
+            "SELECT COUNT(*)::bigint AS runs, \
+                    COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed, \
+                    AVG(duration_ms)::float8 AS avg_duration_ms, \
+                    MAX(started_at) AS last_started_at \
+             FROM sub_workflow_runs \
+             WHERE child_workflow_id = $1 AND user_id = $2 AND started_at >= $3",
+        )
+        .bind(child_workflow_id)
+        .bind(user_id)
+        .bind(since)
+        .fetch_one(&mut *tx)
+        .await
+        .context("child_run_window_stats")?;
+        tx.commit().await?;
+        Ok(ChildRunWindowStats {
+            runs: row.try_get::<Option<i64>, _>("runs")?.unwrap_or_default(),
+            failed: row.try_get::<Option<i64>, _>("failed")?.unwrap_or_default(),
+            avg_duration_ms: row.try_get("avg_duration_ms")?,
+            last_started_at: row.try_get("last_started_at")?,
+        })
     }
 
     /// How many recorded runs each of `child_workflow_ids` has had since

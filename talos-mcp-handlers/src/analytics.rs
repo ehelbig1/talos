@@ -376,7 +376,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
             "name": "get_workflow_stats",
-            "description": "Get execution statistics for a workflow over a time period. Returns success/failure counts, avg duration, and top error fingerprints.",
+            "description": "Get execution statistics for a workflow over a time period. Returns success/failure counts, avg duration, and top error fingerprints. Those count the workflow's own executions; its runs as another run's sub-workflow (or judge, ensemble, dispatch or loop body) are a SEPARATE `child_runs` block over the same window ({runs, completed, failed, success_rate_percent, avg_duration_secs, last_started_at, covered_from, window_partially_covered}), never added to the totals. `runs: null` means the child-run ledger could not say, not zero.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -865,6 +865,59 @@ pub async fn dispatch(
     }
 }
 
+/// `get_workflow_stats`' `child_runs` block: this workflow's recorded runs
+/// as somebody's child in the window, kept apart from the execution totals.
+///
+/// UNKNOWN is not zero (the ledger's rule, RFC 0012): an unreadable ledger,
+/// or an empty one, renders `runs: null` with the reason; a window that
+/// starts before the ledger's first row says the count covers only from
+/// then (`covered_from`, `window_partially_covered`).
+fn child_runs_block(
+    stats: Option<talos_child_run_ledger::ChildRunWindowStats>,
+    ledger_since: Result<Option<chrono::DateTime<chrono::Utc>>, ()>,
+    window_start: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    const NOTE: &str = "Runs of this workflow as another run's sub-workflow (or judge, ensemble, \
+         dispatch or loop body). A child run has no execution row of its own, so these are NOT \
+         in total / succeeded / failed above. list_executions lists them under child_runs.";
+    let unknown = |reason: &str| {
+        serde_json::json!({
+            "kind": "child",
+            "runs": null,
+            "failed": null,
+            "success_rate_percent": null,
+            "note": NOTE,
+            "measurement": { "complete": false, "reason": reason },
+        })
+    };
+    let (Some(stats), Ok(since)) = (stats, ledger_since) else {
+        return unknown("the child-run ledger could not be read; this is unknown, not zero");
+    };
+    let Some(since) = since else {
+        return unknown(
+            "the child-run ledger holds no rows at all, so nothing was being recorded; \
+             this is unknown, not zero",
+        );
+    };
+    let covered_from = since.max(window_start);
+    let completed = stats.runs - stats.failed;
+    let success_rate = (stats.runs > 0).then(|| {
+        talos_analytics_repository::format_percent(completed as f64 / stats.runs as f64 * 100.0)
+    });
+    serde_json::json!({
+        "kind": "child",
+        "runs": stats.runs,
+        "completed": completed,
+        "failed": stats.failed,
+        "success_rate_percent": success_rate,
+        "avg_duration_secs": stats.avg_duration_ms.map(|ms| (ms / 100.0).round() / 10.0),
+        "last_started_at": stats.last_started_at.map(|t| t.to_rfc3339()),
+        "covered_from": covered_from.to_rfc3339(),
+        "window_partially_covered": since > window_start,
+        "note": NOTE,
+    })
+}
+
 async fn handle_get_workflow_stats(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -937,6 +990,31 @@ async fn handle_get_workflow_stats(
 
     let success_rate = stats.success_rate_percent();
 
+    // This workflow's runs as somebody's child (a sub-workflow, judge,
+    // ensemble, loop body …), from the child-run ledger, over the same
+    // window: a separate block, never added to the totals above, which count
+    // execution rows (2026-10-14, operator decision).
+    let window_start = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
+    let ledger = talos_child_run_ledger::ChildRunLedger::new(state.db_pool.clone());
+    let ledger_since = ledger.since().await;
+    let child_stats = ledger
+        .window_stats_for_child(wf_id, user_id, window_start)
+        .await;
+    if let Err(e) = ledger_since
+        .as_ref()
+        .map(|_| ())
+        .and(child_stats.as_ref().map(|_| ()))
+    {
+        tracing::error!(
+            workflow_id = %wf_id,
+            error = %e,
+            event_kind = "report_field_not_measured",
+            field = "child_runs",
+            "get_workflow_stats: the child-run ledger could not be read; child_runs is null, not zero"
+        );
+    }
+    let child_runs = child_runs_block(child_stats.ok(), ledger_since.map_err(|_| ()), window_start);
+
     let result = serde_json::json!({
         "workflow_id": wf_id.to_string(),
         "period_days": days,
@@ -947,6 +1025,7 @@ async fn handle_get_workflow_stats(
         "success_rate_percent": talos_analytics_repository::format_percent(success_rate),
         "avg_duration_secs": avg_duration_secs,
         "top_error_fingerprints": fp_list,
+        "child_runs": child_runs,
     });
 
     mcp_text(
@@ -12706,6 +12785,74 @@ mod readiness_improvement_tests {
                 talos_analytics_repository::child_unmeasured_reason(absent),
                 talos_analytics_repository::CHILD_UNMEASURED_REASON
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod child_runs_block_tests {
+    use super::child_runs_block;
+    use chrono::{Duration, Utc};
+    use talos_child_run_ledger::ChildRunWindowStats;
+
+    fn stats(runs: i64, failed: i64) -> ChildRunWindowStats {
+        ChildRunWindowStats {
+            runs,
+            failed,
+            avg_duration_ms: (runs > 0).then_some(2_340.0),
+            last_started_at: (runs > 0).then(Utc::now),
+        }
+    }
+
+    #[test]
+    fn a_covered_window_counts_child_runs_apart() {
+        let start = Utc::now() - Duration::days(7);
+        let b = child_runs_block(
+            Some(stats(4, 1)),
+            Ok(Some(start - Duration::days(30))),
+            start,
+        );
+        assert_eq!(b["kind"], "child");
+        assert_eq!(b["runs"], 4);
+        assert_eq!(b["completed"], 3);
+        assert_eq!(b["failed"], 1);
+        assert_eq!(b["success_rate_percent"], 75.0);
+        assert_eq!(b["avg_duration_secs"], 2.3);
+        assert_eq!(b["window_partially_covered"], false);
+        assert_eq!(b["covered_from"], start.to_rfc3339());
+    }
+
+    #[test]
+    fn a_window_older_than_the_ledger_says_from_when_it_counts() {
+        let start = Utc::now() - Duration::days(30);
+        let since = Utc::now() - Duration::days(3);
+        let b = child_runs_block(Some(stats(2, 0)), Ok(Some(since)), start);
+        assert_eq!(b["window_partially_covered"], true);
+        assert_eq!(b["covered_from"], since.to_rfc3339());
+    }
+
+    #[test]
+    fn no_runs_is_zero_runs_and_no_rate() {
+        let start = Utc::now() - Duration::days(7);
+        let b = child_runs_block(
+            Some(stats(0, 0)),
+            Ok(Some(start - Duration::days(1))),
+            start,
+        );
+        assert_eq!(b["runs"], 0);
+        assert!(b["success_rate_percent"].is_null(), "no rate from no runs");
+    }
+
+    #[test]
+    fn unknown_is_null_with_a_reason_never_zero() {
+        let start = Utc::now() - Duration::days(7);
+        for b in [
+            child_runs_block(None, Ok(Some(start)), start),
+            child_runs_block(Some(stats(0, 0)), Err(()), start),
+            child_runs_block(Some(stats(0, 0)), Ok(None), start),
+        ] {
+            assert!(b["runs"].is_null(), "{b}");
+            assert_eq!(b["measurement"]["complete"], false, "{b}");
         }
     }
 }

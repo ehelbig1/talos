@@ -78,6 +78,10 @@ C wrote.
 
 ## The operator's decision
 
+**Answered 2026-10-14: option (2)**, built in
+`2026-10-14-child-runs-by-default.md`. The text below is the question as it
+was asked.
+
 **Should a workflow's child runs count in its stats, SLA and readiness by
 default, or only when asked?**
 

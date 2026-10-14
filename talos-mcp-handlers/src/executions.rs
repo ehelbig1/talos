@@ -24,14 +24,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_executions",
-            "description": "List recent executions for ONE workflow (workflow_id required) with status, time, and error info. For a cross-workflow listing use list_recent_executions instead. Each row carries `started_by`: {kind, id?, integration?}, where kind is one of schedule (id = the schedule), webhook (id = the trigger), manual (trigger_workflow), api (the web UI or a GraphQL caller), test (test_workflow), test_draft, call_workflow, bulk_trigger, trigger_as_actors, enqueue, continuation, action_link (id = the link), push_channel (id = the channel, with its integration), actor_dispatch, handoff, replay (id = the execution replayed), chain, evaluation, or not_recorded for a row that says nothing about how it started (never assumed to be manual); and `is_test`, true for a run test_workflow made. A dry run is not marked on the row: get_execution_status shows a `dry_run` block for one. A run of this workflow as another workflow's sub-workflow (or judge, ensemble, loop body, ...) has no execution row of its own: pass include_child_runs: true to get them as a separate `child_runs` list, each marked kind: \"child\" with the top-level `execution_id` it ran under and the node `path` to pass to get_sub_workflow_output.",
+            "description": "List recent executions for ONE workflow (workflow_id required) with status, time, and error info. For a cross-workflow listing use list_recent_executions instead. Each row carries `started_by`: {kind, id?, integration?}, where kind is one of schedule (id = the schedule), webhook (id = the trigger), manual (trigger_workflow), api (the web UI or a GraphQL caller), test (test_workflow), test_draft, call_workflow, bulk_trigger, trigger_as_actors, enqueue, continuation, action_link (id = the link), push_channel (id = the channel, with its integration), actor_dispatch, handoff, replay (id = the execution replayed), chain, evaluation, or not_recorded for a row that says nothing about how it started (never assumed to be manual); and `is_test`, true for a run test_workflow made. A dry run is not marked on the row: get_execution_status shows a `dry_run` block for one. A run of this workflow as another workflow's sub-workflow (or judge, ensemble, loop body, ...) has no execution row of its own: they are listed by default as a separate `child_runs` list (include_child_runs: false leaves it out), each marked kind: \"child\" with the top-level `execution_id` it ran under and the node `path` to pass to get_sub_workflow_output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workflow_id": { "type": "string" },
                     "limit": { "type": "number", "description": "Max results (default 60)" },
                     "offset": { "type": "number", "description": "Skip this many results (default 0)" },
-                    "include_child_runs": { "type": "boolean", "description": "Also list this workflow's runs as a child of another run, in `child_runs` (same limit and offset, paged separately). Default false." }
+                    "include_child_runs": { "type": "boolean", "description": "List this workflow's runs as a child of another run, in `child_runs` (same limit and offset, paged separately). Default true; false leaves the list out." }
                 },
                 "required": ["workflow_id"]
             }
@@ -1140,11 +1140,10 @@ async fn handle_list_executions(
 }
 
 /// Whether `list_executions` lists a workflow's child runs when the caller
-/// does not say. `false` until the operator decides otherwise
-/// (`docs/engineering-log/packages/2026-10-14-child-run-outputs.md`):
-/// flipping it adds a `child_runs` list to every listing and changes no
-/// count.
-const LIST_CHILD_RUNS_BY_DEFAULT: bool = false;
+/// does not say. `true` by operator decision (2026-10-14,
+/// `docs/engineering-log/packages/2026-10-14-child-runs-by-default.md`):
+/// the `child_runs` list sits beside `executions` and changes no count.
+const LIST_CHILD_RUNS_BY_DEFAULT: bool = true;
 
 /// One child run in `list_executions`' `child_runs` list. `execution_id` is
 /// the TOP-LEVEL execution and `path` the node ids down to the dispatching
