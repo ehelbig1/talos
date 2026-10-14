@@ -892,6 +892,16 @@ pub struct ParallelWorkflowEngine {
     /// child's or the parent's outcome. `None` (tests / out-of-tree consumers)
     /// records nothing.
     pub(crate) child_run_recorder: Option<Arc<dyn talos_workflow_engine_core::ChildRunRecorder>>,
+    /// Reads how an execution was started, once per top-level run (see
+    /// `talos_workflow_engine_core::StartedByResolver`). Not carried into a
+    /// child engine: a child has no row of its own and is given its parent's
+    /// word instead.
+    pub(crate) started_by_resolver: Option<Arc<dyn talos_workflow_engine_core::StartedByResolver>>,
+    /// The run's start kind, handed to every module dispatch as
+    /// `__started_by__` (set-or-REMOVE). Filled by the resolver when a
+    /// top-level run starts, or set by whoever hydrates a child engine.
+    /// Behind a lock because the read happens inside `&self` run methods.
+    pub(crate) started_by: Arc<std::sync::RwLock<Option<String>>>,
     /// Seals per-dispatch plaintext secrets into the opaque
     /// `(ciphertext, nonce)` pair forwarded on the wire. Defaults to
     /// [`talos_workflow_job_protocol::AesGcmSecretEnvelope`] — a
@@ -1041,6 +1051,9 @@ pub struct AdapterSet {
     operator_digest_reader: Option<Arc<dyn talos_workflow_engine_core::OperatorDigestReader>>,
     judge_score_recorder: Option<Arc<dyn talos_workflow_engine_core::JudgeScoreRecorder>>,
     child_run_recorder: Option<Arc<dyn talos_workflow_engine_core::ChildRunRecorder>>,
+    /// The parent run's start kind, a value, so the child carries it without
+    /// reading a row it does not have.
+    started_by: Option<String>,
     secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
     user_id: Option<Uuid>,
     actor_id: Option<Uuid>,
@@ -1155,6 +1168,7 @@ impl AdapterSet {
         // The ledger port travels into every sub-engine, so a NESTED child
         // (depth 2+) is recorded too — it is a child run like any other.
         engine.child_run_recorder = self.child_run_recorder;
+        engine.set_started_by_kind(self.started_by);
         engine.secret_envelope = self.secret_envelope;
         engine.user_id = self.user_id;
         engine.actor_id = self.actor_id;
@@ -1279,6 +1293,8 @@ impl ParallelWorkflowEngine {
             operator_digest_reader: None,
             judge_score_recorder: None,
             child_run_recorder: None,
+            started_by_resolver: None,
+            started_by: Arc::new(std::sync::RwLock::new(None)),
             secret_envelope: Arc::new(talos_workflow_job_protocol::AesGcmSecretEnvelope),
             sandbox_root: Some(default_sandbox_root().to_path_buf()),
             agent_loop_max_history: DEFAULT_AGENT_LOOP_MAX_HISTORY,
@@ -1328,6 +1344,7 @@ impl ParallelWorkflowEngine {
             operator_digest_reader: self.operator_digest_reader.clone(),
             judge_score_recorder: self.judge_score_recorder.clone(),
             child_run_recorder: self.child_run_recorder.clone(),
+            started_by: self.started_by_kind(),
             secret_envelope: self.secret_envelope.clone(),
             user_id: self.user_id,
             actor_id: self.actor_id,
@@ -2022,6 +2039,12 @@ impl ParallelWorkflowEngine {
         execution_id: Uuid,
         chain_dispatch: ChainDispatch,
     ) -> Result<WorkflowContext, String> {
+        // How the run was started, read once from its row. A child engine
+        // has no resolver (it was given its parent's word) and skips this.
+        if let Some(resolver) = &self.started_by_resolver {
+            let kind = resolver.started_by_kind(execution_id, self.user_id).await;
+            self.set_started_by_kind(kind);
+        }
         // Workflow-level timeout enforcement was hoisted into the
         // public wrappers (`run_with_transport` /
         // `run_with_seed_with_transport`) so the typed

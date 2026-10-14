@@ -147,6 +147,7 @@ mod sanitizer;
 mod secret_envelope;
 mod secrets;
 mod shared_key;
+mod started_by;
 mod sub_actor_context;
 mod system_node;
 mod transport;
@@ -215,6 +216,7 @@ pub use secrets::{
     MintReadiness, SecretsResolver,
 };
 pub use shared_key::{WorkerKeyRing, WorkerSharedKey};
+pub use started_by::StartedByResolver;
 pub use sub_actor_context::{SubworkflowActorContextResolver, SubworkflowBinding};
 pub use system_node::{JoinMode, SystemNodeKind};
 pub use transport::JobTransport;
