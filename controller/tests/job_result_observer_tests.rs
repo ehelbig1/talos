@@ -141,6 +141,13 @@ async fn one_replica_handles_each_worker_result() {
     // ── CONTROL: on this broker, two PLAIN subscribers each driving the
     // production per-message handler BOTH handle every result. So "one
     // replica" below is the queue group's doing, not the rig's.
+    //
+    // The two stand-ins share THIS process, and so its one replay cache: the
+    // handler is the primary verifier for these results (security review
+    // 2026-10-14, B-1), so the second stand-in to see a signed result refuses
+    // it as a replay — correct for one process, and not what this control
+    // measures. It therefore drives the handler with no key ring: what it
+    // proves is delivery. Two real replicas are two processes.
     {
         let mut pools = Vec::new();
         let mut tasks = Vec::new();
@@ -158,9 +165,8 @@ async fn one_replica_handles_each_worker_result() {
             let svc = service(&pool);
             tasks.push(tokio::spawn(async move {
                 let _conn = conn;
-                let ring = ring();
                 while let Some(msg) = sub.next().await {
-                    let _ = handle_result_message(&msg.payload, &svc, Some(&ring)).await;
+                    let _ = handle_result_message(&msg.payload, &svc, None).await;
                 }
             }));
             pools.push(pool);
