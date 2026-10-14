@@ -39,8 +39,43 @@ add_action_links_node(
   connect_from: "compose", connect_to: "send")
 ```
 
+If the workflow already has an edge `compose → send`, the call REPLACES it:
+`compose → links` is plain, and `links → send` keeps the type and condition
+of the edge it replaced, so a send that was conditional on `notify == true`
+is still conditional. The reply lists what was replaced (`replaced_edges`).
+With no such edge, the two edges are added. If several edges would be
+replaced and they do not carry the same condition, the call is refused: wire
+that one by hand with `add_edge` / `remove_edge`.
+
+Calling the tool again for a `node_id` that already exists changes what the
+node may start, and nothing else: `targets` is replaced by the list given,
+`ttl_hours` is changed when given, and no edge and no other setting of the
+node (`continue_on_error`, for one) is touched. `connect_from` /
+`connect_to` are not applied to an existing node, and the reply says so.
+
+The node can also be written when the workflow is created:
+
+```
+create_workflow(name, nodes: [
+  { id: "compose", module_id: "…" },
+  { id: "links", node_type: "action_links",
+    targets: { "list": "<workflow id>" }, ttl_hours: 72 },
+  { id: "send", module_id: "…" } ],
+  edges: [ { source: "compose", target: "links" },
+           { source: "links", target: "send", condition: "notify == true" } ])
+```
+
 `targets` is the list of workflows a link from this node may start. You
 write it; a module cannot add to it.
+
+The same rule applies whichever tool writes it (`add_action_links_node`,
+`update_node_config`, an import, a copy, the web editor): 1 to 16 entries,
+each a name of 1 to 40 letters, digits, `_` and `-` mapped to the id of a
+workflow of yours. A write that breaks it is refused and names the node and
+the entry; for a workflow, "does not exist" and "is not yours" are one
+answer. A target the workflow already names is not asked about again when
+something else in the graph is edited, so a workflow whose target you have
+since deleted stays editable; the link for it is simply not minted (below).
 
 ## What the compose module returns
 
@@ -76,10 +111,15 @@ The node returns the same output with every placeholder replaced,
 }
 ```
 
-Reasons: `unknown_target`, `workflow_not_owned`, `payload_not_an_object`,
-`payload_too_large`, `label_empty`, `too_many_links` (64 per run),
-`unavailable`, `dry_run`, `link_address_misconfigured` (see "The address a link
-is on").
+Reasons: `unknown_target`, `workflow_not_owned`, `workflow_archived`,
+`payload_not_an_object`, `payload_too_large`, `label_empty`, `too_many_links`
+(64 per run), `unavailable`, `dry_run`, `link_address_misconfigured` (see "The
+address a link is on").
+
+A target is checked every time a link is made, not only when the node was
+written. One that was deleted since, or is no longer yours, is
+`workflow_not_owned`; one you have archived is `workflow_archived`. Either
+way no link exists for it and its placeholder becomes the fallback.
 
 The node never fails the run. If links cannot be minted at all, every
 placeholder becomes its fallback (or `#`) and the message still sends.

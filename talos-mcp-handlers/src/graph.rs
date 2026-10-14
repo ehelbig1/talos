@@ -434,6 +434,11 @@ pub(crate) fn graph_write_response(
             ))
         }
         Err(e) => {
+            // What an `action_links` node may start: a refusal the caller
+            // can act on, not a failed write.
+            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, req_id) {
+                return Err(resp);
+            }
             tracing::error!(workflow_id = %wf_id, site, "graph write failed: {}", e);
             Err(mcp_error(
                 req_id.clone(),
@@ -1430,7 +1435,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_action_links_node",
-            "description": "Add an action-links node to an existing workflow, between the node that composes a message and the node that sends it. Controller-side system node: it turns the links a module ASKS for into real ones. The compose module returns its output with `__action_links__: [{id, target, label, payload, fallback?}]` and writes `talos-action:<id>` wherever a link belongs (an href); this node mints one link per request and passes the output on with every placeholder replaced, the request removed, and `__action_links_report__: {available, requested, minted, not_minted: [{id, reason, fell_back}]}` added. A link opens a confirmation page naming the workflow and the label; when its owner confirms, the TARGET workflow starts once with `payload` as its trigger input. The page SHOWS the label and the target workflow's name, so both travel over the address the link is on (the deployment's public address unless the operator set TALOS_ACTION_LINKS_BASE_URL): write a label that says what the action does and keep names, ticket titles and other private text out of it. WHAT A LINK MAY START is decided here, not by the module: `targets` maps a short name to a workflow you own, and a request naming anything else is refused (`unknown_target`). Links are single-use, expire (`ttl_hours`, default 72, max 336), and are stored only as a hash. If a link cannot be minted its placeholder becomes the request's `fallback` (a mailto: or https: link) or `#`, so the message still sends. Under a dry run (test_workflow, call_workflow or trigger_workflow with dry_run: true) NO link is minted: every request falls back and is listed under not_minted with reason `dry_run`. The target workflow starts through the same gates as trigger_workflow (pause, liveness, its actor's budget and ceilings, input schema, concurrency limit).",
+            "description": "Add an action-links node to an existing workflow, between the node that composes a message and the node that sends it. Controller-side system node: it turns the links a module ASKS for into real ones. The compose module returns its output with `__action_links__: [{id, target, label, payload, fallback?}]` and writes `talos-action:<id>` wherever a link belongs (an href); this node mints one link per request and passes the output on with every placeholder replaced, the request removed, and `__action_links_report__: {available, requested, minted, not_minted: [{id, reason, fell_back}]}` added. A link opens a confirmation page naming the workflow and the label; when its owner confirms, the TARGET workflow starts once with `payload` as its trigger input. The page SHOWS the label and the target workflow's name, so both travel over the address the link is on (the deployment's public address unless the operator set TALOS_ACTION_LINKS_BASE_URL): write a label that says what the action does and keep names, ticket titles and other private text out of it. WHAT A LINK MAY START is decided here, not by the module: `targets` maps a short name to a workflow you own, and a request naming anything else is refused (`unknown_target`). Links are single-use, expire (`ttl_hours`, default 72, max 336), and are stored only as a hash. If a link cannot be minted its placeholder becomes the request's `fallback` (a mailto: or https: link) or `#`, so the message still sends. Under a dry run (test_workflow, call_workflow or trigger_workflow with dry_run: true) NO link is minted: every request falls back and is listed under not_minted with reason `dry_run`. The target workflow starts through the same gates as trigger_workflow (pause, liveness, its actor's budget and ceilings, input schema, concurrency limit). WIRING: give connect_from and connect_to to put the node on a path. If an edge connect_from → connect_to already exists it is REPLACED by connect_from → node → connect_to, and the edge out of the node keeps the replaced edge's type and condition (a send that was conditional stays conditional); the reply lists `replaced_edges`. CALLING THIS AGAIN for a node_id that already exists is an update of `targets` (the whole list is replaced by the one given) and of `ttl_hours` when given, and of nothing else: no edge is added and no other setting of the node changes (`updated_existing: true`). The node can also be created inline: create_workflow / create_workflow_from_spec accept node_type: \"action_links\".",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4333,41 +4338,154 @@ async fn for_each_preview(
     })
 }
 
+/// What wiring an `action_links` node into a graph did to its edges.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct LinkWiring {
+    /// Each edge `from → to` that was REPLACED by `from → node → to`, as it
+    /// was stored.
+    pub(crate) replaced: Vec<serde_json::Value>,
+    /// Each edge that was added, `(source, target)`.
+    pub(crate) added: Vec<(String, String)>,
+}
+
+fn edge_joins(edge: &serde_json::Value, source: &str, target: &str) -> bool {
+    edge.get("source").and_then(|v| v.as_str()) == Some(source)
+        && edge.get("target").and_then(|v| v.as_str()) == Some(target)
+}
+
+/// Everything an edge says besides which two nodes it joins and which edge
+/// it is: its type and its condition.
+fn edge_terms(edge: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let mut terms = edge.as_object().cloned().unwrap_or_default();
+    for key in ["source", "target", "id"] {
+        terms.remove(key);
+    }
+    terms
+}
+
+/// Put `node_id` between `froms` and `to`.
+///
+/// An `action_links` node belongs ON a path: `compose → links → send`. When
+/// the graph already has `compose → send`, adding the node beside that edge
+/// leaves the unminted message going out as well, so an edge `from → to`
+/// that exists is REPLACED: `from → node` plain, and `node → to` carrying
+/// the replaced edge's type and condition (a send that was conditional on
+/// `notify == true` stays conditional). With no such edge the two edges are
+/// simply added. An edge that already exists is never added twice.
+///
+/// # Errors
+/// When several edges would be replaced and they do not carry the same type
+/// and condition: one `node → to` edge cannot stand for both.
+pub(crate) fn splice_node_into_edges(
+    edges: &mut Vec<serde_json::Value>,
+    node_id: &str,
+    froms: &[String],
+    to: Option<&str>,
+) -> Result<LinkWiring, String> {
+    let mut wiring = LinkWiring::default();
+    if let Some(to) = to {
+        for from in froms {
+            let mut kept = Vec::with_capacity(edges.len());
+            for edge in edges.drain(..) {
+                if edge_joins(&edge, from, to) {
+                    wiring.replaced.push(edge);
+                } else {
+                    kept.push(edge);
+                }
+            }
+            *edges = kept;
+        }
+    }
+    let carried = wiring.replaced.first().map(edge_terms).unwrap_or_default();
+    if wiring
+        .replaced
+        .iter()
+        .any(|edge| edge_terms(edge) != carried)
+    {
+        // Nothing was saved; the caller discards this copy of the graph.
+        return Err(format!(
+            "The edges into '{}' that '{node_id}' would replace do not carry the same type and \
+             condition, and one edge out of '{node_id}' cannot stand for both. Add the node with \
+             one connect_from at a time, or wire it with add_edge / remove_edge.",
+            to.unwrap_or("?")
+        ));
+    }
+    for from in froms {
+        if !edges.iter().any(|edge| edge_joins(edge, from, node_id)) {
+            edges.push(serde_json::json!({ "source": from, "target": node_id }));
+            wiring.added.push((from.clone(), node_id.to_string()));
+        }
+    }
+    if let Some(to) = to {
+        if !edges.iter().any(|edge| edge_joins(edge, node_id, to)) {
+            let mut edge = carried;
+            edge.insert("source".to_string(), serde_json::json!(node_id));
+            edge.insert("target".to_string(), serde_json::json!(to));
+            edges.push(serde_json::Value::Object(edge));
+            wiring.added.push((node_id.to_string(), to.to_string()));
+        }
+    }
+    Ok(wiring)
+}
+
+/// A second `add_action_links_node` call for a node id that exists: an
+/// UPDATE of what the node may start and how long its links live, and of
+/// nothing else. The node's other settings (`continue_on_error`, its
+/// position, anything else in its `data`) and every edge stay as they are.
+///
+/// `Ok(false)` when no node has that id.
+///
+/// # Errors
+/// When the id belongs to a node that is not an `action_links` node: this
+/// tool does not turn one kind of node into another.
+pub(crate) fn update_existing_action_links_node(
+    graph: &mut serde_json::Value,
+    node_id: &str,
+    targets: &serde_json::Map<String, serde_json::Value>,
+    ttl_hours: Option<u64>,
+) -> Result<bool, String> {
+    let Some(node) = graph
+        .get_mut("nodes")
+        .and_then(|n| n.as_array_mut())
+        .and_then(|nodes| {
+            nodes
+                .iter_mut()
+                .find(|n| n.get("id").and_then(|v| v.as_str()) == Some(node_id))
+        })
+    else {
+        return Ok(false);
+    };
+    if !talos_workflow_engine_core::action_links::is_action_links_node(node) {
+        return Err(format!(
+            "Node '{node_id}' exists and is not an action-links node. Choose another node_id, \
+             or remove that node first."
+        ));
+    }
+    let Some(node) = node.as_object_mut() else {
+        return Err(format!("Node '{node_id}' is not an object"));
+    };
+    let data = node.entry("data").or_insert_with(|| serde_json::json!({}));
+    if !data.is_object() {
+        *data = serde_json::json!({});
+    }
+    data["targets"] = serde_json::Value::Object(targets.clone());
+    if let Some(hours) = ttl_hours {
+        data["ttl_hours"] = serde_json::json!(hours);
+    }
+    Ok(true)
+}
+
 // ── add_action_links_node ────────────────────────────────────────────────────
 
-/// Read and check the `targets` argument: 1 to 16 entries, each a usable
-/// name mapped to a workflow UUID. Pure, so the refusals are testable
-/// without a database; ownership is checked by the handler.
+/// Read and check the `targets` argument with the rule every graph write is
+/// held to (`check_action_targets`): 1 to 16 entries, each a usable name
+/// mapped to a workflow UUID. Whether each workflow is the caller's is asked
+/// where the graph is written (`talos_workflow_repository::action_link_targets`).
 pub(crate) fn parse_action_link_targets(
     args: &serde_json::Value,
 ) -> Result<std::collections::BTreeMap<String, uuid::Uuid>, String> {
-    use talos_workflow_engine_core::action_links::{action_name_valid, MAX_ACTION_TARGETS};
-    let Some(raw) = args.get("targets").and_then(serde_json::Value::as_object) else {
-        return Err(
-            "Missing or invalid 'targets': an object of target name → workflow UUID".to_string(),
-        );
-    };
-    if raw.is_empty() || raw.len() > MAX_ACTION_TARGETS {
-        return Err(format!(
-            "'targets' must name 1 to {MAX_ACTION_TARGETS} workflows; got {}",
-            raw.len()
-        ));
-    }
-    let mut targets = std::collections::BTreeMap::new();
-    for (name, value) in raw {
-        if !action_name_valid(name) {
-            // The name is caller-supplied: echo a bounded, printable prefix.
-            let shown: String = name.chars().filter(|c| !c.is_control()).take(60).collect();
-            return Err(format!(
-                "Target name '{shown}' is not usable: 1-40 characters of letters, digits, '_' and '-'"
-            ));
-        }
-        let Some(id) = value.as_str().and_then(|s| uuid::Uuid::parse_str(s).ok()) else {
-            return Err(format!("Target '{name}' must be a workflow UUID"));
-        };
-        targets.insert(name.clone(), id);
-    }
-    Ok(targets)
+    talos_workflow_engine_core::action_links::check_action_targets(args.get("targets"))
+        .map_err(|fault| fault.to_string())
 }
 
 async fn handle_add_action_links_node(
@@ -4380,24 +4498,43 @@ async fn handle_add_action_links_node(
         Ok(t) => t,
         Err(message) => return mcp_error(req_id, -32602, &message),
     };
-    // Each target must be a workflow the caller owns. One answer for
-    // "does not exist" and "is not yours". The mint re-checks ownership
-    // every time a link is made; this is the early, readable refusal.
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
-    for (name, id) in &targets {
-        if !state.workflow_repo.workflow_exists(*id, user_id).await {
-            return mcp_error(
-                req_id,
-                -32602,
-                &format!("Target '{name}': workflow {id} not found or not accessible"),
-            );
-        }
-    }
+    // Each target must be a workflow the caller owns. That is asked in front
+    // of the write, for this tool and every other one, with one answer for
+    // "does not exist" and "is not yours". The mint asks again every time a
+    // link is made.
     // Clamp mirrors the graph parser (a hand-edited graph re-clamps there).
     let ttl_hours = args
         .get("ttl_hours")
         .and_then(serde_json::Value::as_u64)
         .map(|v| v.clamp(1, 336));
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let Some(workflow_id) = args
+        .get("workflow_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+    else {
+        return mcp_error(req_id, -32602, "Missing or invalid 'workflow_id' parameter");
+    };
+    let node_id = match crate::utils::require_node_id(args, "node_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let connect_from: Vec<String> = match args.get("connect_from") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(arr)) => {
+            if arr.len() > 50 {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    "connect_from must contain ≤ 50 source nodes",
+                );
+            }
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        }
+        _ => vec![],
+    };
     let connect_to = args
         .get("connect_to")
         .and_then(|v| v.as_str())
@@ -4407,45 +4544,151 @@ async fn handle_add_action_links_node(
         .iter()
         .map(|(name, id)| (name.clone(), serde_json::json!(id.to_string())))
         .collect();
-    let mut data = serde_json::Map::new();
-    data.insert(
-        "targets".to_string(),
-        serde_json::Value::Object(target_json.clone()),
-    );
-    if let Some(hours) = ttl_hours {
-        data.insert("ttl_hours".to_string(), serde_json::json!(hours));
+
+    if !state
+        .workflow_repo
+        .workflow_exists(workflow_id, user_id)
+        .await
+    {
+        return crate::utils::workflow_not_found_error(req_id);
+    }
+    // Owner-scoped AND versioned: a read-modify-write that must not
+    // overwrite a concurrent edit (see `save_graph_json`).
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, workflow_id, user_id, &req_id).await {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let mut graph: serde_json::Value = serde_json::from_str(&graph_json_str)
+        .unwrap_or_else(|_| serde_json::json!({"nodes": [], "edges": []}));
+
+    // A node with this id already: update what it may start, and nothing
+    // else. No edge is added and no other setting of the node is touched.
+    let updated_existing =
+        match update_existing_action_links_node(&mut graph, &node_id, &target_json, ttl_hours) {
+            Ok(existed) => existed,
+            Err(message) => return mcp_error(req_id, -32602, &message),
+        };
+    let mut wiring = LinkWiring::default();
+    if !updated_existing {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "targets".to_string(),
+            serde_json::Value::Object(target_json.clone()),
+        );
+        if let Some(hours) = ttl_hours {
+            data.insert("ttl_hours".to_string(), serde_json::json!(hours));
+        }
+        upsert_system_node_into_graph(
+            &mut graph,
+            serde_json::json!({
+                "id": node_id,
+                "type": "system:action_links",
+                "kind": "action_links",
+                "data": data,
+                "position": { "x": 300, "y": 300 }
+            }),
+        );
+        if !graph.get("edges").is_some_and(serde_json::Value::is_array) {
+            graph["edges"] = serde_json::json!([]);
+        }
+        let Some(edges) = graph.get_mut("edges").and_then(|e| e.as_array_mut()) else {
+            return mcp_error(req_id, -32000, "The workflow graph has no edge list");
+        };
+        wiring = match splice_node_into_edges(edges, &node_id, &connect_from, connect_to.as_deref())
+        {
+            Ok(w) => w,
+            Err(message) => return mcp_error(req_id, -32602, &message),
+        };
+        // `connect_from` / `connect_to` are edge writes like any other.
+        if let Err(resp) = reject_if_cyclic(&graph, &req_id) {
+            return resp;
+        }
     }
 
-    let added = match upsert_system_node(
-        &req_id,
-        args,
+    if let Err(resp) = save_graph_json(
         state,
-        &agent,
-        "action_links",
-        serde_json::Value::Object(data),
+        workflow_id,
+        user_id,
+        graph_version,
+        &serde_json::to_string(&graph).unwrap_or_default(),
+        &req_id,
     )
     .await
     {
-        Ok(a) => a,
-        Err(resp) => return resp,
+        return resp;
+    }
+    let auto_publish_note = maybe_auto_publish(
+        state,
+        workflow_id,
+        user_id,
+        "Auto-published after adding action_links node",
+    )
+    .await
+    .message_suffix()
+    .to_string();
+
+    let stored_ttl = graph
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|n| n.get("id").and_then(|v| v.as_str()) == Some(node_id.as_str()))
+        })
+        .and_then(|n| n.pointer("/data/ttl_hours"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(72);
+    let edges_asked_for = !connect_from.is_empty() || connect_to.is_some();
+    let message = if updated_existing {
+        format!(
+            "Action-links node '{node_id}' already existed in workflow {workflow_id}: its targets{} \
+             were updated and nothing else was changed.{}{auto_publish_note}",
+            if ttl_hours.is_some() { " and ttl_hours" } else { "" },
+            if edges_asked_for {
+                " connect_from / connect_to were NOT applied to an existing node; use add_edge / remove_edge."
+            } else {
+                ""
+            },
+        )
+    } else {
+        format!(
+            "Action-links node '{node_id}' added to workflow {workflow_id}.{} The node before it asks \
+             for links with `__action_links__: [{{id, target, label, payload, fallback?}}]` and writes \
+             `talos-action:<id>` where each belongs; this node replaces them and reports under \
+             `__action_links_report__`.{auto_publish_note}",
+            if wiring.replaced.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " It REPLACED {} existing edge(s) into '{}': the edge out of '{node_id}' carries \
+                     their type and condition.",
+                    wiring.replaced.len(),
+                    connect_to.as_deref().unwrap_or("?"),
+                )
+            },
+        )
     };
 
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&serde_json::json!({
-            "workflow_id": added.workflow_id.to_string(),
-            "node_id": added.node_id,
+            "workflow_id": workflow_id.to_string(),
+            "node_id": node_id,
             "node_type": "action_links",
             "targets": target_json,
-            "ttl_hours": ttl_hours.unwrap_or(72),
+            "ttl_hours": stored_ttl,
             "downstream": connect_to,
-            "message": format!(
-                "Action-links node '{}' added to workflow {}. The node before it asks for links with \
-                 `__action_links__: [{{id, target, label, payload, fallback?}}]` and writes \
-                 `talos-action:<id>` where each belongs; this node replaces them and reports under \
-                 `__action_links_report__`.{}",
-                added.node_id, added.workflow_id, added.auto_publish_note
-            ),
+            "updated_existing": updated_existing,
+            "replaced_edges": wiring.replaced,
+            "added_edges": wiring
+                .added
+                .iter()
+                .map(|(source, target)| serde_json::json!({ "source": source, "target": target }))
+                .collect::<Vec<_>>(),
+            "message": message,
         }))
         .unwrap_or_default(),
     )
@@ -5018,6 +5261,11 @@ async fn handle_duplicate_workflow(
                 match state.workflow_repo.copy_input_schema(wf_id, new_id).await {
                     Ok(_) => true,
                     Err(e) => {
+                        if let Some(resp) =
+                            crate::utils::action_targets_refusal_response(&e, &req_id)
+                        {
+                            return resp;
+                        }
                         tracing::warn!(
                             target: "talos_audit",
                             wf_id = %wf_id,
@@ -8149,6 +8397,177 @@ mod fan_in_posture_tests {
                 p.id
             );
         }
+    }
+
+    fn edge(source: &str, target: &str) -> serde_json::Value {
+        json!({ "source": source, "target": target })
+    }
+
+    #[test]
+    fn a_node_put_on_an_existing_edge_replaces_it_and_keeps_its_condition() {
+        use super::{splice_node_into_edges, LinkWiring};
+        // A conditional edge: the send only happens when there is something
+        // to send. The spliced path must still say so.
+        let conditional = json!({ "id": "e7", "source": "compose", "target": "phone",
+            "edge_type": "conditional", "condition": "notify == true" });
+        let mut edges = vec![edge("gather", "compose"), conditional.clone()];
+        let wiring =
+            splice_node_into_edges(&mut edges, "links", &["compose".to_string()], Some("phone"))
+                .expect("spliced");
+        assert_eq!(
+            edges,
+            vec![
+                edge("gather", "compose"),
+                edge("compose", "links"),
+                // The replaced edge's type and condition, and not its id.
+                json!({ "source": "links", "target": "phone",
+                        "edge_type": "conditional", "condition": "notify == true" }),
+            ]
+        );
+        assert_eq!(
+            wiring,
+            LinkWiring {
+                replaced: vec![conditional],
+                added: vec![
+                    ("compose".into(), "links".into()),
+                    ("links".into(), "phone".into())
+                ],
+            }
+        );
+
+        // A plain edge is replaced by two plain edges.
+        let mut edges = vec![edge("compose", "phone")];
+        splice_node_into_edges(&mut edges, "links", &["compose".to_string()], Some("phone"))
+            .expect("spliced");
+        assert_eq!(
+            edges,
+            vec![edge("compose", "links"), edge("links", "phone")]
+        );
+    }
+
+    #[test]
+    fn with_no_edge_to_replace_the_node_is_wired_as_before_and_never_twice() {
+        use super::splice_node_into_edges;
+        let mut edges = vec![edge("gather", "compose")];
+        let wiring =
+            splice_node_into_edges(&mut edges, "links", &["compose".to_string()], Some("phone"))
+                .expect("wired");
+        assert!(wiring.replaced.is_empty());
+        assert_eq!(
+            edges,
+            vec![
+                edge("gather", "compose"),
+                edge("compose", "links"),
+                edge("links", "phone")
+            ]
+        );
+        // The same call again adds nothing.
+        let again =
+            splice_node_into_edges(&mut edges, "links", &["compose".to_string()], Some("phone"))
+                .expect("wired");
+        assert!(again.added.is_empty() && again.replaced.is_empty());
+        assert_eq!(edges.len(), 3);
+
+        // Only one end named: one edge, and nothing is replaced.
+        let mut edges = vec![edge("compose", "phone")];
+        splice_node_into_edges(&mut edges, "links", &["compose".to_string()], None).expect("wired");
+        assert_eq!(
+            edges,
+            vec![edge("compose", "phone"), edge("compose", "links")]
+        );
+        let mut edges = vec![edge("compose", "phone")];
+        splice_node_into_edges(&mut edges, "links", &[], Some("phone")).expect("wired");
+        assert_eq!(
+            edges,
+            vec![edge("compose", "phone"), edge("links", "phone")]
+        );
+    }
+
+    #[test]
+    fn several_replaced_edges_must_agree_and_a_doubled_edge_is_replaced_whole() {
+        use super::splice_node_into_edges;
+        let froms = ["a".to_string(), "b".to_string()];
+        // Both edges into `send` carry the same condition: one edge out of
+        // the node can stand for both.
+        let cond = |source: &str| {
+            json!({ "source": source, "target": "send",
+            "edge_type": "conditional", "condition": "ok == true" })
+        };
+        let mut edges = vec![cond("a"), cond("b")];
+        let wiring = splice_node_into_edges(&mut edges, "links", &froms, Some("send")).expect("ok");
+        assert_eq!(wiring.replaced.len(), 2);
+        assert_eq!(
+            edges,
+            vec![
+                edge("a", "links"),
+                edge("b", "links"),
+                json!({ "source": "links", "target": "send",
+                        "edge_type": "conditional", "condition": "ok == true" }),
+            ]
+        );
+        // They disagree: refused, and the caller saves nothing.
+        let mut edges = vec![cond("a"), edge("b", "send")];
+        let refusal =
+            splice_node_into_edges(&mut edges, "links", &froms, Some("send")).unwrap_err();
+        assert!(
+            refusal.contains("do not carry the same type and condition"),
+            "{refusal}"
+        );
+        // An edge stored twice (an earlier call's leftover) is replaced whole.
+        let mut edges = vec![edge("a", "send"), edge("a", "send")];
+        splice_node_into_edges(&mut edges, "links", &["a".to_string()], Some("send")).expect("ok");
+        assert_eq!(edges, vec![edge("a", "links"), edge("links", "send")]);
+    }
+
+    #[test]
+    fn a_second_call_for_an_existing_node_updates_what_it_may_start_and_nothing_else() {
+        use super::update_existing_action_links_node;
+        let id = uuid::Uuid::from_u128(9).to_string();
+        let new_targets = json!({ "bills": id }).as_object().cloned().unwrap();
+        let mut graph = json!({
+            "nodes": [
+                { "id": "links", "type": "system:action_links", "kind": "action_links",
+                  "position": { "x": 10, "y": 20 },
+                  "data": { "targets": { "list": id }, "ttl_hours": 24, "continue_on_error": true } },
+                { "id": "collect", "type": "system:collect", "kind": "collect", "data": {} },
+            ],
+            "edges": [{ "source": "compose", "target": "links" }],
+        });
+        let before_edges = graph["edges"].clone();
+        assert_eq!(
+            update_existing_action_links_node(&mut graph, "links", &new_targets, None),
+            Ok(true)
+        );
+        let node = &graph["nodes"][0];
+        assert_eq!(
+            node["data"]["targets"],
+            json!({ "bills": id }),
+            "the list is replaced"
+        );
+        assert_eq!(node["data"]["ttl_hours"], 24, "an omitted lifetime is kept");
+        assert_eq!(
+            node["data"]["continue_on_error"], true,
+            "the node's flag is kept"
+        );
+        assert_eq!(node["position"], json!({ "x": 10, "y": 20 }));
+        assert_eq!(graph["edges"], before_edges, "no edge is touched");
+
+        assert_eq!(
+            update_existing_action_links_node(&mut graph, "links", &new_targets, Some(48)),
+            Ok(true)
+        );
+        assert_eq!(graph["nodes"][0]["data"]["ttl_hours"], 48);
+
+        // No such node: the caller adds one.
+        assert_eq!(
+            update_existing_action_links_node(&mut graph, "other", &new_targets, None),
+            Ok(false)
+        );
+        // The id is some other kind of node: it is not turned into this one.
+        let refusal = update_existing_action_links_node(&mut graph, "collect", &new_targets, None)
+            .unwrap_err();
+        assert!(refusal.contains("is not an action-links node"), "{refusal}");
+        assert_eq!(graph["nodes"][1]["kind"], "collect");
     }
 
     #[test]

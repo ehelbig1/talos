@@ -787,6 +787,10 @@ impl WorkflowRepository {
         // CHECK enforces (see `begin_personal_org_write`). The resolved org
         // is bound as `org_id` ($12) so the row's org matches the scope.
         let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+        crate::action_link_targets::refuse_unowned_targets_on_conn(
+            &mut tx, user_id, None, graph_json,
+        )
+        .await?;
 
         sqlx::query(
             "INSERT INTO workflows \
@@ -927,6 +931,10 @@ impl WorkflowRepository {
         intent: Option<&serde_json::Value>,
         org_id: Uuid,
     ) -> Result<(Uuid, i64)> {
+        crate::action_link_targets::refuse_unowned_targets_on_conn(
+            &mut *conn, user_id, None, graph_json,
+        )
+        .await?;
         // Returns the new row's `graph_version` too (the column default), so
         // the caller never hard-codes what a fresh graph's version is.
         let created = sqlx::query_as::<_, (Uuid, i64)>(
@@ -973,6 +981,36 @@ impl WorkflowRepository {
         intent: Option<&serde_json::Value>,
         expected_graph_version: Option<i64>,
     ) -> Result<crate::GraphWrite> {
+        // The targets of an `action_links` node must be workflows of the
+        // OWNER's (a link is minted as the owner) that the accessor could
+        // also write. Asked only when the graph has such a node. A row the
+        // accessor cannot write then gets the answer the statement below
+        // would give, without its graph being compared with anything.
+        if crate::action_link_targets::names_action_targets(graph_json)? {
+            let Some(owner) = sqlx::query_scalar::<_, Uuid>(
+                "SELECT user_id FROM workflows \
+                 WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))",
+            )
+            .bind(workflow_id)
+            .bind(user_id)
+            .bind(writable_org_ids)
+            .fetch_optional(&mut *conn)
+            .await?
+            else {
+                return Ok(crate::GraphWrite::NotFound);
+            };
+            crate::action_link_targets::refuse_unowned_targets(
+                &mut *conn,
+                crate::action_link_targets::Writer {
+                    owner,
+                    accessor: user_id,
+                    writable_org_ids,
+                },
+                Some(workflow_id),
+                graph_json,
+            )
+            .await?;
+        }
         let row = sqlx::query(
             r#"
             WITH written AS (
@@ -2035,6 +2073,10 @@ impl WorkflowRepository {
         // RFC 0006 / RFC 0005 S3: scope to the creator's personal org so the
         // org-pin WITH CHECK enforces; bind the resolved org as `org_id` ($7).
         let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+        crate::action_link_targets::refuse_unowned_targets_on_conn(
+            &mut tx, user_id, None, graph_json,
+        )
+        .await?;
         sqlx::query(
             // `module_uri` is `NOT NULL` with NO default and this INSERT
             // omitted it, so every call failed with 23502 and
@@ -2079,6 +2121,10 @@ impl WorkflowRepository {
         // RFC 0006 / RFC 0005 S3: scope to the creator's personal org so the
         // org-pin WITH CHECK enforces; bind the resolved org as `org_id` ($8).
         let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+        crate::action_link_targets::refuse_unowned_targets_on_conn(
+            &mut tx, user_id, None, graph_json,
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO workflows (id, user_id, name, description, graph_json, is_enabled, capabilities, module_uri, org_id) \
              VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8)",
@@ -2259,6 +2305,10 @@ impl WorkflowRepository {
         // RFC 0006 / RFC 0005 S3: scope to the creator's personal org so the
         // org-pin WITH CHECK enforces; bind the resolved org as `org_id` ($6).
         let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+        crate::action_link_targets::refuse_unowned_targets_on_conn(
+            &mut tx, user_id, None, graph_json,
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO workflows (id, user_id, name, module_uri, graph_json, tags, created_at, updated_at, org_id) \
              VALUES ($1, $2, $3, '', $4, $5, NOW(), NOW(), $6)",
@@ -2321,6 +2371,13 @@ impl WorkflowRepository {
         user_id: Uuid,
         graph_json: &str,
     ) -> Result<u64> {
+        crate::action_link_targets::refuse_unowned_targets_on_pool(
+            &self.db_pool,
+            user_id,
+            Some(workflow_id),
+            graph_json,
+        )
+        .await?;
         let result = sqlx::query(
             "UPDATE workflows SET graph_json = $1, updated_at = NOW() \
              WHERE id = $2 AND user_id = $3",
@@ -2598,6 +2655,13 @@ impl WorkflowRepository {
         existing_id: Option<Uuid>,
     ) -> Result<Uuid> {
         let id: Uuid = if let Some(eid) = existing_id {
+            crate::action_link_targets::refuse_unowned_targets_on_pool(
+                &self.db_pool,
+                user_id,
+                Some(eid),
+                graph_json,
+            )
+            .await?;
             // Defense-in-depth: scope the UPDATE by user_id even though the
             // caller resolved `existing_id` from a user-scoped lookup.
             // Failing closed (no row returned) protects against future
@@ -2619,6 +2683,10 @@ impl WorkflowRepository {
             // resolved org as `org_id` ($4). (The UPDATE branch above doesn't
             // move org_id, so it stays unscoped — permit-via-unset.)
             let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+            crate::action_link_targets::refuse_unowned_targets_on_conn(
+                &mut tx, user_id, None, graph_json,
+            )
+            .await?;
             let new_id: Uuid = sqlx::query_scalar(
                 "INSERT INTO workflows (user_id, name, module_uri, graph_json, created_at, updated_at, org_id) \
                  VALUES ($1, $2, '', $3, NOW(), NOW(), $4) \

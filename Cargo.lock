@@ -8428,6 +8428,7 @@ dependencies = [
  "talos-random",
  "talos-secrets-manager",
  "talos-text-util",
+ "talos-workflow-liveness",
  "talos-workflow-repository",
  "tokio",
  "tracing",
@@ -10313,6 +10314,7 @@ dependencies = [
  "regex",
  "serde_json",
  "talos-text-util",
+ "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
  "uuid",
 ]

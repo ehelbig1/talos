@@ -97,16 +97,24 @@ where
 /// concurrent committed writer makes the UPDATE re-check `graph_version`
 /// against the NEW row version and match nothing; the snapshot SELECT still
 /// sees the row, so that race reads as `Conflict`, which is what it is.
-pub async fn write_workflow_graph_if_unchanged<'e, E>(
-    executor: E,
+pub async fn write_workflow_graph_if_unchanged(
+    pool: &sqlx::PgPool,
     workflow_id: Uuid,
     user_id: Uuid,
     graph_json: &str,
     expected_version: i64,
-) -> Result<GraphWrite>
-where
-    E: sqlx::PgExecutor<'e>,
-{
+) -> Result<GraphWrite> {
+    // What an `action_links` node may start is checked in front of the write
+    // (`crate::action_link_targets`). This took any executor until
+    // 2026-10-13; both callers passed the pool, and the check needs reads of
+    // its own.
+    crate::action_link_targets::refuse_unowned_targets_on_pool(
+        pool,
+        user_id,
+        Some(workflow_id),
+        graph_json,
+    )
+    .await?;
     let row = sqlx::query(
         "WITH written AS ( \
              UPDATE workflows SET graph_json = $1, updated_at = NOW() \
@@ -120,7 +128,7 @@ where
     .bind(workflow_id)
     .bind(user_id)
     .bind(expected_version)
-    .fetch_one(executor)
+    .fetch_one(pool)
     .await?;
     Ok(GraphWrite::classify(
         row.try_get::<Option<i64>, _>("written_version")?,

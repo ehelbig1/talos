@@ -454,6 +454,89 @@ async fn an_unusable_address_setting_mints_nothing_and_a_usable_one_is_where_the
 
 /// The store's own guarantees: a workflow that is not the minting user's is
 /// refused, and a link is claimed exactly once however it is submitted.
+/// The node's `targets` were checked when they were written. That says
+/// nothing about now: a target deleted since, handed to another user since,
+/// or archived since gets NO link, with a stated reason, and the message
+/// still goes out with the fallback in its place.
+#[tokio::test]
+async fn a_target_that_was_valid_when_written_and_is_not_now_gets_no_link() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let owner = create_test_user(&ctx.auth_service, "action_links_stale@example.com").await;
+    let other = create_test_user(&ctx.auth_service, "action_links_stale2@example.com").await;
+    let live = create_test_workflow(&pool, owner, "al-live").await;
+    let gone = create_test_workflow(&pool, owner, "al-gone").await;
+    let moved = create_test_workflow(&pool, owner, "al-moved").await;
+    let retired = create_test_workflow(&pool, owner, "al-retired").await;
+
+    // All four were the owner's when the node was written. Then:
+    sqlx::query("DELETE FROM workflows WHERE id = $1")
+        .bind(gone)
+        .execute(&pool)
+        .await
+        .expect("delete");
+    sqlx::query("UPDATE workflows SET user_id = $2 WHERE id = $1")
+        .bind(moved)
+        .bind(other)
+        .execute(&pool)
+        .await
+        .expect("change hands");
+    sqlx::query("UPDATE workflows SET status = 'archived' WHERE id = $1")
+        .bind(retired)
+        .execute(&pool)
+        .await
+        .expect("archive");
+
+    let targets = BTreeMap::from([
+        ("live".to_string(), live),
+        ("gone".to_string(), gone),
+        ("moved".to_string(), moved),
+        ("retired".to_string(), retired),
+    ]);
+    let request = |name: &str| {
+        json!({ "id": name, "target": name, "label": format!("Do {name}"), "payload": {},
+                "fallback": format!("mailto:me@example.com?subject={name}") })
+    };
+    let output = run_links_node(
+        &pool,
+        owner,
+        targets,
+        json!({
+            "text": "talos-action:live talos-action:gone talos-action:moved talos-action:retired",
+            ACTION_LINKS_REQUEST: [request("live"), request("gone"), request("moved"), request("retired")],
+        }),
+        false,
+    )
+    .await;
+
+    let report = &output[ACTION_LINKS_REPORT];
+    assert_eq!(report["requested"], 4, "{report}");
+    assert_eq!(report["minted"], 1, "{report}");
+    assert_eq!(
+        report["not_minted"],
+        json!([
+            { "id": "gone", "reason": "workflow_not_owned", "fell_back": true },
+            { "id": "moved", "reason": "workflow_not_owned", "fell_back": true },
+            { "id": "retired", "reason": "workflow_archived", "fell_back": true },
+        ]),
+        "{report}"
+    );
+    let text = output["text"].as_str().expect("text");
+    assert_eq!(text.matches("/action-links/").count(), 1, "one link");
+    for name in ["gone", "moved", "retired"] {
+        assert!(
+            text.contains(&format!("mailto:me@example.com?subject={name}")),
+            "{name} falls back"
+        );
+    }
+    // Nothing exists that could start any of the three.
+    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT workflow_id FROM workflow_action_tokens")
+        .fetch_all(&pool)
+        .await
+        .expect("token rows");
+    assert_eq!(rows, vec![live], "a token exists only for the live target");
+}
+
 #[tokio::test]
 async fn a_link_is_minted_only_for_its_owner_and_claimed_exactly_once() {
     let ctx = setup_test_context().await;

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use talos_dlp_provider::bound_execution_payload;
 use uuid::Uuid;
 
+pub mod action_link_targets;
 mod executions;
 mod graph_export;
 pub mod graph_version;
@@ -20,6 +21,7 @@ mod stats;
 mod templates;
 mod workflows;
 
+pub use action_link_targets::{action_targets_refusal, ActionTargetsRefusal};
 pub use executions::*;
 pub use graph_export::*;
 pub use graph_version::{GraphWrite, VersionedGraph};
