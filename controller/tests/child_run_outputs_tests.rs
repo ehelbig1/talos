@@ -427,6 +427,35 @@ async fn child_runs_are_listed_with_their_top_level_execution_and_path() {
     assert_eq!(stats["child_runs"]["completed"], 1, "{stats}");
     assert_eq!(stats["child_runs"]["failed"], 0, "{stats}");
 
+    // And across all workflows: C, which only ever runs as a child, is
+    // listed, with its child runs apart from its (zero) executions.
+    let all = text_json(
+        &controller::mcp::analytics::dispatch(
+            "get_all_workflow_stats",
+            Some(json!(1)),
+            &json!({ "days": 7 }),
+            &state,
+            agent(owner),
+        )
+        .await
+        .expect("get_all_workflow_stats is dispatched"),
+    );
+    let row = |id: Uuid| {
+        all["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["workflow_id"] == json!(id.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} is listed: {all}"))
+    };
+    let c_row = row(chain.c);
+    assert_eq!(c_row["total"], 0, "{c_row}");
+    assert_eq!(c_row["child_runs"]["runs"], 1, "{c_row}");
+    let a_row = row(chain.a);
+    assert_eq!(a_row["total"], 1, "{a_row}");
+    assert_eq!(a_row["child_runs"]["runs"], 0, "{a_row}");
+
     // Another user's workflow is refused before any ledger read.
     let msg = error_message(
         &call(

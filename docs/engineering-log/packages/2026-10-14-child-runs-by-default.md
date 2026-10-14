@@ -1,4 +1,4 @@
-# Child runs are listed by default, and stats give them their own block (2026-10-14)
+# Child runs are listed by default, and the stats give them their own block (2026-10-14)
 
 The operator's answer to the decision `2026-10-14-child-run-outputs.md` left
 open: should a workflow's child runs (its runs as another run's sub-workflow,
@@ -29,13 +29,23 @@ assume a row is a top-level run, which is the double count measured on
   row says so (`window_partially_covered: true`, `covered_from` = the first
   row). No runs is `runs: 0` with a null rate, never a 0 % rate.
 
-## Not done
+## Across all workflows
 
-* **`get_all_workflow_stats`.** It lists only workflows that have execution
-  rows in the window (`HAVING COUNT(we.id) > 0`), so a workflow used only as a
-  child is not in it at all. Adding a child block there means changing which
-  workflows it lists and how it ranks them, which is a change of its own. The
-  per-workflow tool is the one this decision named.
+* **`get_all_workflow_stats` lists and ranks child runs too** (operator, same
+  day). It listed only workflows with execution rows in the window
+  (`HAVING COUNT(we.id) > 0`), so a workflow used only as a child was not in it
+  at all. Now:
+  * each row carries its own `child_runs` block, apart from its totals;
+  * rows are ranked by failures of either kind, then runs of either kind, so a
+    child-only workflow is listed (with `total: 0`);
+  * both reads (the execution summaries and one grouped ledger read,
+    `ChildRunLedger::window_stats_by_workflow`) take up to 500 rows (one
+    user's workflows) and the merge truncates to 50 after ranking, so no
+    workflow reads as "no runs" because it fell past one list's cut.
+  * Unknown is not zero here either: an unreadable or empty ledger, or a
+    ledger read that hit its cap, makes every row's `child_runs` null and the
+    top-level `child_runs` says why. A child-only row past a capped execution
+    read is `total: null, executions_unknown: true`.
 * SLA and readiness: unchanged. They already count child runs (RFC 0012 P2).
 
 ## Tests
@@ -45,6 +55,12 @@ assume a row is a top-level run, which is the double count measured on
   `include_child_runs: false` leaves it out. Its `get_workflow_stats` has
   `total: 0` and `child_runs: {kind: "child", runs: 1, completed: 1,
   failed: 0}`.
+* the same test: `get_all_workflow_stats` lists the grandchild workflow (no
+  executions of its own) with `total: 0, child_runs.runs: 1`, and the
+  top-level workflow with `total: 1, child_runs.runs: 0`.
+* `talos-mcp-handlers` `all_workflow_stats_merge_tests` (3): a child-only
+  workflow is listed and four child failures outrank one execution failure;
+  unknown is null, never zero; at most 50 rows.
 * `talos-mcp-handlers` `child_runs_block_tests` (4): a covered window; a
   window older than the ledger; no runs is zero runs and no rate; unreadable
   and empty ledgers are null with a reason.

@@ -516,7 +516,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_all_workflow_stats",
-            "description": "Aggregate dashboard across all workflows. Returns per-workflow stats (total, succeeded, failed, avg duration) for the top 50 most active workflows sorted by failure count.",
+            "description": "Aggregate dashboard across all workflows. Returns per-workflow stats (total, succeeded, failed, avg duration) for the top 50 workflows, ranked by failures then runs. Each row also has a SEPARATE `child_runs` block {runs, completed, failed, avg_duration_secs, last_started_at}: its runs as another run's sub-workflow (or judge, ensemble, dispatch or loop body), never added to its totals; failures and runs of both kinds count toward the ranking, so a workflow that only runs as a child is listed too. `child_runs: null` means the child-run ledger could not say, not zero (the top-level `child_runs` says why).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3648,6 +3648,111 @@ async fn handle_get_workflow_call_tree(
     )
 }
 
+/// How many workflows `get_all_workflow_stats` returns.
+const ALL_STATS_LIMIT: usize = 50;
+/// How many rows each of its two reads may return before merging: one
+/// user's workflows, so the merge ranks on everything, not on two separate
+/// top-50s (a workflow past one cut would read as "no runs").
+const ALL_STATS_READ_LIMIT: i64 = 500;
+
+/// `get_all_workflow_stats`' rows: each workflow's own executions and, apart,
+/// its runs as somebody's child (2026-10-14, operator decision), ranked by
+/// failures of either kind, then runs of either kind.
+///
+/// `child` is `None` when the child-run ledger could not say (unreadable,
+/// empty, or `truncated`): every row's `child_runs` is then `null`, never 0.
+/// An execution list that hit its read cap marks every row whose execution
+/// counts were not read `executions_unknown`.
+fn merge_all_workflow_stats(
+    exec: &[talos_analytics_repository::WorkflowStatSummaryRow],
+    exec_truncated: bool,
+    child: Option<&[talos_child_run_ledger::ChildRunWorkflowStats]>,
+) -> Vec<serde_json::Value> {
+    use std::collections::HashMap;
+    struct Row {
+        id: Uuid,
+        name: Option<String>,
+        exec: Option<(i64, i64, i64, Option<f64>)>,
+        child: Option<talos_child_run_ledger::ChildRunWindowStats>,
+    }
+    let mut rows: HashMap<Uuid, Row> = HashMap::new();
+    for r in exec {
+        rows.insert(
+            r.id,
+            Row {
+                id: r.id,
+                name: Some(r.name.clone()),
+                exec: Some((r.total, r.succeeded, r.failed, r.avg_duration_secs)),
+                child: None,
+            },
+        );
+    }
+    for c in child.unwrap_or_default() {
+        let row = rows.entry(c.workflow_id).or_insert_with(|| Row {
+            id: c.workflow_id,
+            name: c.name.clone(),
+            exec: None,
+            child: None,
+        });
+        row.child = Some(c.stats);
+    }
+    let mut rows: Vec<Row> = rows.into_values().collect();
+    let key = |r: &Row| {
+        let (total, failed) = r.exec.map_or((0, 0), |(t, _, f, _)| (t, f));
+        let (runs, child_failed) = r.child.map_or((0, 0), |c| (c.runs, c.failed));
+        (failed + child_failed, total + runs)
+    };
+    rows.sort_by(|a, b| key(b).cmp(&key(a)).then_with(|| a.id.cmp(&b.id)));
+    rows.truncate(ALL_STATS_LIMIT);
+    let round2 = |v: f64| {
+        if v.is_finite() {
+            (v * 100.0).round() / 100.0
+        } else {
+            0.0
+        }
+    };
+    rows.into_iter()
+        .map(|r| {
+            let mut obj = serde_json::json!({
+                "workflow_id": r.id.to_string(),
+                "name": r.name,
+            });
+            match r.exec {
+                Some((total, succeeded, failed, avg)) => {
+                    obj["total"] = serde_json::json!(total);
+                    obj["succeeded"] = serde_json::json!(succeeded);
+                    obj["failed"] = serde_json::json!(failed);
+                    obj["avg_duration_secs"] = serde_json::json!(round2(avg.unwrap_or(0.0)));
+                }
+                // Not in the execution read: no executions in the window,
+                // unless that read hit its cap.
+                None if !exec_truncated => {
+                    obj["total"] = serde_json::json!(0);
+                    obj["succeeded"] = serde_json::json!(0);
+                    obj["failed"] = serde_json::json!(0);
+                    obj["avg_duration_secs"] = serde_json::Value::Null;
+                }
+                None => {
+                    obj["total"] = serde_json::Value::Null;
+                    obj["executions_unknown"] = serde_json::json!(true);
+                }
+            }
+            obj["child_runs"] = match (child, r.child) {
+                (None, _) => serde_json::Value::Null,
+                (Some(_), None) => serde_json::json!({ "runs": 0, "completed": 0, "failed": 0 }),
+                (Some(_), Some(c)) => serde_json::json!({
+                    "runs": c.runs,
+                    "completed": c.runs - c.failed,
+                    "failed": c.failed,
+                    "avg_duration_secs": c.avg_duration_ms.map(|ms| (ms / 100.0).round() / 10.0),
+                    "last_started_at": c.last_started_at.map(|t| t.to_rfc3339()),
+                }),
+            };
+            obj
+        })
+        .collect()
+}
+
 async fn handle_get_all_workflow_stats(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -3659,51 +3764,79 @@ async fn handle_get_all_workflow_stats(
         Err(resp) => return resp,
     };
 
-    match state
+    let exec_rows = match state
         .analytics_repo
-        .list_workflow_stat_summaries(user_id, days, 50)
+        .list_workflow_stat_summaries(user_id, days, ALL_STATS_READ_LIMIT)
         .await
     {
-        Ok(rows) => {
-            // MCP-101 (2026-05-08): round avg_duration_secs to 2 decimals
-            // (same round_2dp pattern as MCP-30 / MCP-79). Pre-fix this
-            // emitted raw f64 from the SQL EXTRACT(EPOCH FROM ...) divide,
-            // producing 16-digit drift like 20.367137142857143.
-            let stats: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|r| {
-                    let avg = r.avg_duration_secs.unwrap_or(0.0);
-                    let avg_rounded = if avg.is_finite() {
-                        (avg * 100.0).round() / 100.0
-                    } else {
-                        0.0
-                    };
-                    serde_json::json!({
-                        "workflow_id": r.id.to_string(),
-                        "name": r.name,
-                        "total": r.total,
-                        "succeeded": r.succeeded,
-                        "failed": r.failed,
-                        "avg_duration_secs": avg_rounded,
-                    })
-                })
-                .collect();
-            mcp_text(
-                req_id,
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "days": days,
-                    "count": stats.len(),
-                    "workflow_count": stats.len(),
-                    "workflows": stats,
-                }))
-                .unwrap_or_default(),
-            )
-        }
+        Ok(rows) => rows,
         Err(e) => {
             tracing::error!("Failed to fetch workflow stats: {}", e);
-            mcp_error(req_id, -32000, "Failed to fetch workflow stats")
+            return mcp_error(req_id, -32000, "Failed to fetch workflow stats");
         }
-    }
+    };
+    let exec_truncated = exec_rows.len() as i64 >= ALL_STATS_READ_LIMIT;
+
+    // Child runs over the same window, one grouped ledger read. UNKNOWN is
+    // not zero: an unreadable or empty ledger, or a read that hit its cap,
+    // leaves every row's `child_runs` null and says why.
+    let window_start = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
+    let ledger = talos_child_run_ledger::ChildRunLedger::new(state.db_pool.clone());
+    let ledger_since = ledger.since().await;
+    let child_rows = ledger
+        .window_stats_by_workflow(user_id, window_start, ALL_STATS_READ_LIMIT)
+        .await;
+    let (child, child_summary) = match (&ledger_since, &child_rows) {
+        (Ok(Some(since)), Ok(rows)) if (rows.len() as i64) < ALL_STATS_READ_LIMIT => (
+            Some(rows.as_slice()),
+            serde_json::json!({
+                "covered_from": (*since).max(window_start).to_rfc3339(),
+                "window_partially_covered": *since > window_start,
+            }),
+        ),
+        (Ok(Some(_)), Ok(_)) => (
+            None,
+            serde_json::json!({ "measurement": { "complete": false,
+                "reason": "more workflows ran as a child than one read covers; per-workflow child counts are unknown, not zero" } }),
+        ),
+        (Ok(None), Ok(_)) => (
+            None,
+            serde_json::json!({ "measurement": { "complete": false,
+                "reason": "the child-run ledger holds no rows at all; child runs are unknown, not zero" } }),
+        ),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::error!(
+                error = %e,
+                event_kind = "report_field_not_measured",
+                field = "child_runs",
+                "get_all_workflow_stats: the child-run ledger could not be read; child_runs is null, not zero"
+            );
+            (
+                None,
+                serde_json::json!({ "measurement": { "complete": false,
+                    "reason": "the child-run ledger could not be read; child runs are unknown, not zero" } }),
+            )
+        }
+    };
+    let stats = merge_all_workflow_stats(&exec_rows, exec_truncated, child);
+    let mut child_summary = child_summary;
+    child_summary["note"] = serde_json::json!(
+        "Each row's child_runs are its runs as another run's sub-workflow (or judge, ensemble, \
+         dispatch or loop body). A child run has no execution row, so they are NOT in total / \
+         succeeded / failed. Rows are ranked by failures of either kind, then runs of either kind, \
+         so a workflow that only ever runs as a child is listed too."
+    );
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "days": days,
+            "count": stats.len(),
+            "workflow_count": stats.len(),
+            "workflows": stats,
+            "child_runs": child_summary,
+        }))
+        .unwrap_or_default(),
+    )
 }
 
 /// Which report `get_error_report` should produce, derived from the
@@ -12854,5 +12987,78 @@ mod child_runs_block_tests {
             assert!(b["runs"].is_null(), "{b}");
             assert_eq!(b["measurement"]["complete"], false, "{b}");
         }
+    }
+}
+
+#[cfg(test)]
+mod all_workflow_stats_merge_tests {
+    use super::merge_all_workflow_stats;
+    use talos_analytics_repository::WorkflowStatSummaryRow;
+    use talos_child_run_ledger::{ChildRunWindowStats, ChildRunWorkflowStats};
+    use uuid::Uuid;
+
+    fn exec(id: Uuid, total: i64, failed: i64) -> WorkflowStatSummaryRow {
+        WorkflowStatSummaryRow {
+            id,
+            name: format!("wf-{total}-{failed}"),
+            total,
+            succeeded: total - failed,
+            failed,
+            avg_duration_secs: Some(1.234),
+        }
+    }
+
+    fn child(id: Uuid, runs: i64, failed: i64) -> ChildRunWorkflowStats {
+        ChildRunWorkflowStats {
+            workflow_id: id,
+            name: Some("made-up-child".into()),
+            stats: ChildRunWindowStats {
+                runs,
+                failed,
+                avg_duration_ms: Some(500.0),
+                last_started_at: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_child_only_workflow_is_listed_and_ranked_by_either_kind_of_failure() {
+        let (top, child_only, quiet) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let execs = [exec(top, 10, 1), exec(quiet, 3, 0)];
+        let children = [child(child_only, 6, 4), child(top, 2, 0)];
+        let rows = merge_all_workflow_stats(&execs, false, Some(&children));
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|r| r["workflow_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![child_only.to_string(), top.to_string(), quiet.to_string()],
+            "four child failures outrank one execution failure"
+        );
+        assert_eq!(rows[0]["total"], 0, "no executions of its own");
+        assert_eq!(rows[0]["child_runs"]["runs"], 6);
+        assert_eq!(rows[0]["child_runs"]["completed"], 2);
+        assert_eq!(rows[1]["total"], 10, "totals are executions only");
+        assert_eq!(rows[1]["child_runs"]["runs"], 2);
+        assert_eq!(rows[2]["child_runs"]["runs"], 0, "known, and none");
+    }
+
+    #[test]
+    fn unknown_is_null_never_zero() {
+        let id = Uuid::new_v4();
+        let rows = merge_all_workflow_stats(&[exec(id, 2, 0)], false, None);
+        assert!(rows[0]["child_runs"].is_null());
+        // A child-only workflow past a truncated execution read: its own
+        // counts are unknown.
+        let rows = merge_all_workflow_stats(&[], true, Some(&[child(id, 1, 0)]));
+        assert!(rows[0]["total"].is_null());
+        assert_eq!(rows[0]["executions_unknown"], true);
+    }
+
+    #[test]
+    fn at_most_fifty_rows() {
+        let execs: Vec<_> = (0..70).map(|i| exec(Uuid::new_v4(), i + 1, 0)).collect();
+        assert_eq!(merge_all_workflow_stats(&execs, false, Some(&[])).len(), 50);
     }
 }

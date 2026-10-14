@@ -197,6 +197,18 @@ pub struct ChildRunWindowStats {
     pub last_started_at: Option<DateTime<Utc>>,
 }
 
+/// [`ChildRunWindowStats`] for one workflow, as
+/// [`ChildRunLedger::window_stats_by_workflow`] returns them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildRunWorkflowStats {
+    /// The workflow that ran as a child.
+    pub workflow_id: Uuid,
+    /// Its name, when the row still exists and is the caller's.
+    pub name: Option<String>,
+    /// Its child runs in the window.
+    pub stats: ChildRunWindowStats,
+}
+
 /// What the ledger knows about one child inside a window — the two
 /// execution-derived readiness components, from the one table that can see a
 /// sub-workflow run.
@@ -510,6 +522,58 @@ impl ChildRunLedger {
             avg_duration_ms: row.try_get("avg_duration_ms")?,
             last_started_at: row.try_get("last_started_at")?,
         })
+    }
+
+    /// [`ChildRunWorkflowStats`] for every workflow of `user_id` that ran as
+    /// a child since `since`: one grouped statement, most failures first,
+    /// then most runs, at most `limit` (clamped to [`MAX_LIST_LIMIT`]).
+    /// Owner-scoped at the app layer and under RLS.
+    ///
+    /// # Errors
+    /// Any database failure.
+    pub async fn window_stats_by_workflow(
+        &self,
+        user_id: Uuid,
+        since: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<ChildRunWorkflowStats>> {
+        let limit = limit.clamp(1, MAX_LIST_LIMIT);
+        let mut tx = talos_db::begin_user_scoped(&self.pool, user_id).await?;
+        let rows = sqlx::query(
+            "SELECT s.child_workflow_id, w.name, \
+                    COUNT(*)::bigint AS runs, \
+                    COUNT(*) FILTER (WHERE s.status = 'failed')::bigint AS failed, \
+                    AVG(s.duration_ms)::float8 AS avg_duration_ms, \
+                    MAX(s.started_at) AS last_started_at \
+             FROM sub_workflow_runs s \
+             LEFT JOIN workflows w ON w.id = s.child_workflow_id AND w.user_id = $1 \
+             WHERE s.user_id = $1 AND s.started_at >= $2 \
+             GROUP BY s.child_workflow_id, w.name \
+             ORDER BY COUNT(*) FILTER (WHERE s.status = 'failed') DESC, COUNT(*) DESC, \
+                      s.child_workflow_id \
+             LIMIT $3",
+        )
+        .bind(user_id)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .context("child_run_window_stats_by_workflow")?;
+        tx.commit().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(ChildRunWorkflowStats {
+                workflow_id: r.try_get("child_workflow_id")?,
+                name: r.try_get("name")?,
+                stats: ChildRunWindowStats {
+                    runs: r.try_get::<Option<i64>, _>("runs")?.unwrap_or_default(),
+                    failed: r.try_get::<Option<i64>, _>("failed")?.unwrap_or_default(),
+                    avg_duration_ms: r.try_get("avg_duration_ms")?,
+                    last_started_at: r.try_get("last_started_at")?,
+                },
+            });
+        }
+        Ok(out)
     }
 
     /// How many recorded runs each of `child_workflow_ids` has had since
