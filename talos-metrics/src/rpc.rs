@@ -147,6 +147,12 @@ rpc_outcome_table! {
     Timeout = "timeout" => Finding;
     /// The platform failed for a reason it could not classify.
     Internal = "internal" => Finding;
+    /// The subscriber already held its whole admission allowance of messages
+    /// (`kernel::ADMISSION_PER_PERMIT` per execution permit), so this one was
+    /// dropped before it was parsed and never answered (security review
+    /// 2026-10-14, B-6). A flood, or a subject too small for its load; the
+    /// caller sees its own timeout.
+    Shed = "shed" => Finding;
 }
 
 macro_rules! rpc_subject_table {
@@ -174,7 +180,7 @@ macro_rules! rpc_subject_table {
             /// its own terminal `match` over its own error enum.
             ///
             /// This is the pre-seed set, and it is deliberately NOT the cross
-            /// product: 64 pairs against 7 × 18 = 126. Seeding the product
+            /// product: 73 pairs against 7 × 19 = 133. Seeding the product
             /// would seed 62 combinations no call site can reach, which is
             /// check 58's own defect (a series nothing can move reads as a
             /// wired signal that does not exist).
@@ -191,40 +197,40 @@ macro_rules! rpc_subject_table {
 rpc_subject_table! {
     /// Neo4j graph-RAG search. `graph_rpc::GraphSearchRequest`.
     GraphSearch = "talos.graph.search" => [
-        Ok, Invalid, Unauthorized, Replay, NotAvailable, Timeout, Internal,
+        Ok, Invalid, Unauthorized, Replay, NotAvailable, Timeout, Internal, Shed,
     ];
     /// RFC 0011 model inference. `ml_rpc::MlPredictRequest`.
     MlPredict = "talos.ml.predict" => [
         Ok, Invalid, Unauthorized, Replay, NotFound, NotPromoted, NotAvailable,
-        StaleDeadline, Timeout, Internal,
+        StaleDeadline, Timeout, Internal, Shed,
     ];
     /// Human-correction few-shot anchors for the LLM teacher leg.
     /// `ml_rpc::MlFewShotRequest`.
     MlFewShot = "talos.ml.fewshot" => [
         Ok, Invalid, Unauthorized, Replay, NotFound, NotPromoted, NotAvailable,
-        StaleDeadline, Timeout, Internal,
+        StaleDeadline, Timeout, Internal, Shed,
     ];
     /// All actor-memory access. `memory_rpc::MemoryOp`.
     MemoryOp = "talos.memory.op" => [
         Ok, Invalid, Unauthorized, Replay, NotFound, StorageFull, WriteCeiling,
-        Timeout, Internal,
+        Timeout, Internal, Shed,
     ];
     /// Sandbox SQL via the `database` WIT.
     /// `database_rpc::DatabaseRpcRequest`.
     DatabaseQuery = "talos.database.query" => [
         Ok, Invalid, Unauthorized, Replay, AlwaysBlocked, DisallowedFunction,
         StatementNotPermitted, WriteCeiling, TooLarge, QueryError,
-        ConnectionFailed, Timeout,
+        ConnectionFailed, Timeout, Shed,
     ];
     /// `execution_state` durability, fire-and-forget.
     /// `state_rpc::StateWriteRequest`.
     StateWrite = "talos.state.write" => [
-        Ok, Invalid, Unauthorized, Replay, NotFound, TooLarge, StorageFull, QueryError, Timeout,
+        Ok, Invalid, Unauthorized, Replay, NotFound, TooLarge, StorageFull, QueryError, Timeout, Shed,
     ];
     /// Per-user integration watch state. `integration_state_rpc::IntegrationOp`.
     IntegrationStateOp = "talos.integration_state.op" => [
         Ok, Invalid, Unauthorized, Replay, NotFound, StorageFull, WriteCeiling,
-        Timeout, Internal,
+        Timeout, Internal, Shed,
     ];
 }
 
@@ -251,12 +257,13 @@ mod tests {
     #[test]
     fn the_table_is_not_empty_and_the_counts_are_pinned() {
         assert_eq!(RpcSubject::ALL.len(), 7, "subject count changed");
-        assert_eq!(RpcOutcome::ALL.len(), 18, "outcome vocabulary changed");
+        assert_eq!(RpcOutcome::ALL.len(), 19, "outcome vocabulary changed");
         assert_eq!(
             seeded_pairs().count(),
             // 64 until 2026-10-14; +2 when `talos.state.write` gained
-            // `not_found` and `storage_full` (security review B-3).
-            66,
+            // `not_found` and `storage_full` (security review B-3); +7 when
+            // every subject gained `shed` (security review B-6).
+            73,
             "the reachable (subject, outcome) set changed; re-derive it from \
              talos-rpc-subscribers/src/lib.rs (the_declared_table_matches_the_source \
              does this mechanically) before changing this number"
@@ -335,6 +342,7 @@ mod tests {
                 "not_available",
                 "query_error",
                 "replay",
+                "shed",
                 "stale_deadline",
                 "timeout",
                 "unauthorized",

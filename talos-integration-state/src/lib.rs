@@ -56,6 +56,9 @@ pub fn escape_like_pattern(s: &str) -> String {
 /// documented in `integration_state_rpc.rs`.
 pub const MAX_ROWS_PER_INTEGRATION_USER: i64 = 10_000;
 
+/// The largest serialised value one integration-state row holds.
+pub const MAX_VALUE_BYTES: usize = 64 * 1024;
+
 /// Derive a 64-bit Postgres advisory-lock key from
 /// `(integration_name, user_id)`. Used by the SET path to serialise
 /// the count-check + INSERT against the cap (MCP-717). Collisions
@@ -452,7 +455,7 @@ async fn seal_value(
     value: &serde_json::Value,
 ) -> Result<SealedValue, IntegrationStateError> {
     let value_str = value.to_string();
-    if value_str.len() > 64 * 1024 {
+    if value_str.len() > MAX_VALUE_BYTES {
         return Err(IntegrationStateError::InvalidInput(
             "value exceeds 64 KiB cap".into(),
         ));

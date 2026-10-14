@@ -19,6 +19,37 @@ use talos_workflow_job_protocol::{ClaimResponse, DispatchSigningKey, SecretClaim
 
 use crate::{handle_secret_claim, InFlightSeals};
 
+/// The largest `SecretClaim` a worker sends, in bytes, with ample headroom: a
+/// claim is two ids, a 32-byte key, a nonce and a 64-byte signature (security
+/// review 2026-10-14, B-6). A larger message is dropped unread.
+pub const MAX_CLAIM_BYTES: usize = 16 * 1024;
+
+/// Claims handled at once per replica. Sealing is CPU-cheap, so this is a
+/// bound on a flood, not on legitimate traffic (one claim per sealed
+/// dispatch). Above it a claim is dropped unread; the worker's claim times out
+/// and its dispatch fails, as for any lost claim.
+pub const MAX_CLAIMS_IN_FLIGHT: usize = 64;
+
+/// Whether a claim message is taken, and why not.
+#[derive(Debug)]
+enum ClaimIntake {
+    Admitted(tokio::sync::OwnedSemaphorePermit),
+    TooLarge,
+    Saturated,
+}
+
+/// Decide whether a claim is read, before it is parsed: its raw length, then
+/// one of the responder's slots (held for the claim's whole handling).
+fn claim_intake(slots: &Arc<tokio::sync::Semaphore>, payload_len: usize) -> ClaimIntake {
+    if payload_len > MAX_CLAIM_BYTES {
+        return ClaimIntake::TooLarge;
+    }
+    match slots.clone().try_acquire_owned() {
+        Ok(slot) => ClaimIntake::Admitted(slot),
+        Err(_) => ClaimIntake::Saturated,
+    }
+}
+
 /// Run the claim responder loop until the subscription closes. Spawn this once
 /// at controller boot on the process's claim subject (the same string the
 /// dispatcher stamps into `JobRequest.claim_inbox`). `max_age_secs` is the
@@ -40,7 +71,35 @@ pub async fn run_claim_responder(
         "RFC 0010 P3 claim responder listening"
     );
 
-    while let Some(msg) = sub.next().await {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CLAIMS_IN_FLIGHT));
+    // Per-claim work is tracked here, never a bare `tokio::spawn`: the tasks
+    // are bounded by `slots` and end with the responder.
+    let mut handling: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let mut dropped: u64 = 0;
+    loop {
+        let msg = tokio::select! {
+            Some(_) = handling.join_next(), if !handling.is_empty() => continue,
+            next = sub.next() => match next {
+                Some(m) => m,
+                None => break,
+            },
+        };
+        let slot = match claim_intake(&slots, msg.payload.len()) {
+            ClaimIntake::Admitted(slot) => slot,
+            refused => {
+                dropped += 1;
+                // At most one line per 1 024 drops: a flood is not a log flood.
+                if dropped % 1024 == 1 {
+                    tracing::warn!(
+                        target: "talos_security",
+                        reason = if matches!(refused, ClaimIntake::TooLarge) { "too_large" } else { "saturated" },
+                        dropped,
+                        "claim dropped unread"
+                    );
+                }
+                continue;
+            }
+        };
         let Some(reply) = msg.reply.clone() else {
             tracing::warn!(
                 target: "talos_security",
@@ -54,7 +113,8 @@ pub async fn run_claim_responder(
         // Handle each claim on its own task so a slow seal never head-of-line
         // blocks the responder. Sealing is CPU-cheap (2 X25519 + AES-GCM), so
         // this is bounded by concurrency, not latency.
-        tokio::spawn(async move {
+        handling.spawn(async move {
+            let _slot = slot;
             let response = build_response(&msg.payload, &in_flight, &controller_key, max_age_secs);
             match serde_json::to_vec(&response) {
                 Ok(bytes) => {
@@ -124,6 +184,28 @@ mod tests {
     use crate::REGISTRY_TEST_LOCK as REGISTRY_LOCK;
     use std::collections::HashMap;
     use talos_workflow_job_protocol::{set_dynamic_worker_public_keys, WorkerEphemeral};
+
+    /// Security review 2026-10-14, B-6: a claim is read only when it is
+    /// small enough and a slot is free; the check runs on the raw length,
+    /// before any parse.
+    #[test]
+    fn a_claim_is_read_only_within_its_size_and_the_responders_slots() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(matches!(
+            claim_intake(&slots, MAX_CLAIM_BYTES + 1),
+            ClaimIntake::TooLarge
+        ));
+        let held = match claim_intake(&slots, 100) {
+            ClaimIntake::Admitted(slot) => slot,
+            other => panic!("expected a slot, got {other:?}"),
+        };
+        assert!(matches!(claim_intake(&slots, 100), ClaimIntake::Saturated));
+        drop(held);
+        assert!(matches!(
+            claim_intake(&slots, 100),
+            ClaimIntake::Admitted(_)
+        ));
+    }
 
     #[test]
     fn build_response_seals_valid_claim_and_rejects_garbage() {

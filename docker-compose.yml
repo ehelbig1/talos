@@ -1014,6 +1014,11 @@ services:
       # own copy to gate the `__memory_write__` envelope, which reaches the
       # same table without any host call.
       TALOS_WRITE_CEILING_ENFORCED: "1"
+      # B-5: a dispatch runs once per fleet (the controller's Redis replay
+      # guard, keyed on the dispatch nonce). Same switch and fail policy as
+      # the controller service.
+      TALOS_DISTRIBUTED_REPLAY: ${TALOS_DISTRIBUTED_REPLAY:-true}
+      TALOS_REPLAY_FAIL_CLOSED: ${TALOS_REPLAY_FAIL_CLOSED:-false}
       NATS_URL: nats://nats:4222
       # The WORKER credential (see the nats service). The binary reads
       # NATS_USER/NATS_PASSWORD whatever the user is called; the VALUES are
