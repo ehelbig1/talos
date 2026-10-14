@@ -166,6 +166,7 @@ mod inherited_grants_pins;
 #[cfg(test)]
 mod install_grants_pin;
 pub mod knowledge_graph;
+mod local_caller;
 pub mod ml;
 pub mod modules;
 pub mod ollama;
@@ -487,7 +488,8 @@ pub fn create_router(
         ));
 
     // Local development route — NO auth required.
-    // SECURITY: Only available when RUST_ENV != "production".
+    // SECURITY: Only available when RUST_ENV != "production", and only to a
+    // caller on this machine (`local_caller`).
     // Uses a default admin agent identity for local development.
     let is_production = talos_config::is_production();
 
@@ -498,122 +500,135 @@ pub fn create_router(
         tracing::info!(
             "MCP local endpoint ENABLED (optimized build) at /mcp/local (development mode)"
         );
-        let local_state = state.clone();
-        let local_db = db_pool.clone();
-
-        let local_route = Router::new().route(
-            "/local",
-            get(local_get_handler).post(move |Json(payload): Json<JsonRpcRequest>| {
-                let state = local_state.clone();
-                let db = local_db.clone();
-                async move {
-                    // JSON-RPC 2.0 §5: notifications (no `id`) must NOT receive a
-                    // response body. Returning {"id":null,...} causes Zod validation
-                    // failures in bridges that require id to be string|number, not null.
-                    //
-                    // Hoisted ABOVE the identity resolution on 2026-09-08: a
-                    // notification needs no user, and the resolution below can now
-                    // REFUSE, which must not put a body on a notification.
-                    if payload.method.starts_with("notifications/") {
-                        return axum::http::StatusCode::ACCEPTED.into_response();
-                    }
-
-                    // Resolve the local dev user: use the first registered user if
-                    // one exists (preserves continuity when the web UI was used to
-                    // register), otherwise create a synthetic dev user so that FK
-                    // constraints always have a valid user_id.
-                    //
-                    // Both reads were swallowed (`.ok().flatten()`), and the comment
-                    // that stood here NAMED the consequence without preventing it:
-                    // "a fresh database leaves agent.user_id = None, causing every
-                    // user-scoped INSERT to write NULL and every user-scoped SELECT
-                    // to return zero rows — tools appear to succeed but nothing
-                    // persists." That is the reported-success-on-a-failed-read class
-                    // in its purest form, and it is worse than a claim in one field:
-                    // EVERY tool on the endpoint then reports success while writing
-                    // nowhere. `Ok(None)` from the first read is a genuinely fresh
-                    // database and still falls through to creation; an `Err` from
-                    // either read, or a creation that produced no user, now REFUSES
-                    // the request instead of serving it identity-less.
-                    let sysrepo = talos_system_repo::SystemRepository::new(db.clone());
-                    let dev_user_id: uuid::Uuid = match sysrepo.find_first_user_id().await {
-                        Ok(Some(existing)) => existing,
-                        Ok(None) => {
-                            tracing::info!(
-                                "Fresh database — creating synthetic dev user for local MCP endpoint"
-                            );
-                            match sysrepo.ensure_dev_user().await {
-                                Ok(Some(id)) => id,
-                                other => {
-                                    tracing::error!(
-                                        event_kind = "local_dev_identity_unresolved",
-                                        created = other.as_ref().map(Option::is_some).unwrap_or(false),
-                                        error = other.as_ref().err().map(ToString::to_string),
-                                        "MCP /local: could not provision the dev user; refusing rather than serving an identity-less request"
-                                    );
-                                    return Json(local_identity_refusal(payload.id)).into_response();
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                event_kind = "local_dev_identity_unresolved",
-                                error = %e,
-                                "MCP /local: could not read the user table; refusing rather than serving an identity-less request"
-                            );
-                            return Json(local_identity_refusal(payload.id)).into_response();
-                        }
-                    };
-
-                    // Create a default local agent identity
-                    let agent = std::sync::Arc::new(auth::AgentIdentity {
-                        agent_id: uuid::Uuid::nil(),
-                        name: "local-dev".to_string(),
-                        role_name: "System Administrator".to_string(),
-                        allowed_capabilities: vec!["*".to_string()],
-                        user_id: Some(dev_user_id),
-                    });
-
-                    let response = match payload.method.as_str() {
-                        "initialize" => handle_initialize(payload),
-                        "tools/list" => {
-                            handle_tools_list(payload)
-                        }
-                        "tools/call" => {
-                            handle_tools_call(payload, state.clone(), agent.clone()).await
-                        }
-                        "resources/list" => {
-                            handle_resources_list(payload, state.db_pool.clone(), agent.clone())
-                                .await
-                        }
-                        "resources/read" => {
-                            handle_resources_read(
-                                payload,
-                                state.db_pool.clone(),
-                                state.execution_repo.clone(),
-                                agent.clone(),
-                            )
-                            .await
-                        }
-                        _ => JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id: payload.id,
-                            result: None,
-                            error: Some(JsonRpcError {
-                                code: -32601,
-                                message: "Method not found".to_string(),
-                                data: None,
-                            }),
-                            error_kind: None,
-                        },
-                    };
-                    Json(response).into_response()
-                }
-            }),
-        );
+        let local_route = local_router(state.clone(), db_pool.clone());
 
         authenticated.merge(local_route).with_state(state)
     }
+}
+
+/// The tokenless local-development MCP route (`/local` under `/mcp`).
+///
+/// Mounted by [`create_router`] only outside production, and answered only
+/// for a caller on this machine ([`local_caller`]): the build mode says
+/// nothing about who can reach the port. A function of its own so a test can
+/// drive the route as it is served.
+pub fn local_router(state: McpState, db_pool: sqlx::PgPool) -> Router<McpState> {
+    let local_state = state;
+    let local_db = db_pool;
+
+    Router::new().route(
+        "/local",
+        get(local_get_handler).post(move |Json(payload): Json<JsonRpcRequest>| {
+            let state = local_state.clone();
+            let db = local_db.clone();
+            async move {
+                // JSON-RPC 2.0 §5: notifications (no `id`) must NOT receive a
+                // response body. Returning {"id":null,...} causes Zod validation
+                // failures in bridges that require id to be string|number, not null.
+                //
+                // Hoisted ABOVE the identity resolution on 2026-09-08: a
+                // notification needs no user, and the resolution below can now
+                // REFUSE, which must not put a body on a notification.
+                if payload.method.starts_with("notifications/") {
+                    return axum::http::StatusCode::ACCEPTED.into_response();
+                }
+
+                // Resolve the local dev user: use the first registered user if
+                // one exists (preserves continuity when the web UI was used to
+                // register), otherwise create a synthetic dev user so that FK
+                // constraints always have a valid user_id.
+                //
+                // Both reads were swallowed (`.ok().flatten()`), and the comment
+                // that stood here NAMED the consequence without preventing it:
+                // "a fresh database leaves agent.user_id = None, causing every
+                // user-scoped INSERT to write NULL and every user-scoped SELECT
+                // to return zero rows — tools appear to succeed but nothing
+                // persists." That is the reported-success-on-a-failed-read class
+                // in its purest form, and it is worse than a claim in one field:
+                // EVERY tool on the endpoint then reports success while writing
+                // nowhere. `Ok(None)` from the first read is a genuinely fresh
+                // database and still falls through to creation; an `Err` from
+                // either read, or a creation that produced no user, now REFUSES
+                // the request instead of serving it identity-less.
+                let sysrepo = talos_system_repo::SystemRepository::new(db.clone());
+                let dev_user_id: uuid::Uuid = match sysrepo.find_first_user_id().await {
+                    Ok(Some(existing)) => existing,
+                    Ok(None) => {
+                        tracing::info!(
+                            "Fresh database — creating synthetic dev user for local MCP endpoint"
+                        );
+                        match sysrepo.ensure_dev_user().await {
+                            Ok(Some(id)) => id,
+                            other => {
+                                tracing::error!(
+                                    event_kind = "local_dev_identity_unresolved",
+                                    created = other.as_ref().map(Option::is_some).unwrap_or(false),
+                                    error = other.as_ref().err().map(ToString::to_string),
+                                    "MCP /local: could not provision the dev user; refusing rather than serving an identity-less request"
+                                );
+                                return Json(local_identity_refusal(payload.id)).into_response();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            event_kind = "local_dev_identity_unresolved",
+                            error = %e,
+                            "MCP /local: could not read the user table; refusing rather than serving an identity-less request"
+                        );
+                        return Json(local_identity_refusal(payload.id)).into_response();
+                    }
+                };
+
+                // Create a default local agent identity
+                let agent = std::sync::Arc::new(auth::AgentIdentity {
+                    agent_id: uuid::Uuid::nil(),
+                    name: "local-dev".to_string(),
+                    role_name: "System Administrator".to_string(),
+                    allowed_capabilities: vec!["*".to_string()],
+                    user_id: Some(dev_user_id),
+                });
+
+                let response = match payload.method.as_str() {
+                    "initialize" => handle_initialize(payload),
+                    "tools/list" => {
+                        handle_tools_list(payload)
+                    }
+                    "tools/call" => {
+                        handle_tools_call(payload, state.clone(), agent.clone()).await
+                    }
+                    "resources/list" => {
+                        handle_resources_list(payload, state.db_pool.clone(), agent.clone())
+                            .await
+                    }
+                    "resources/read" => {
+                        handle_resources_read(
+                            payload,
+                            state.db_pool.clone(),
+                            state.execution_repo.clone(),
+                            agent.clone(),
+                        )
+                        .await
+                    }
+                    _ => JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: payload.id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32601,
+                            message: "Method not found".to_string(),
+                            data: None,
+                        }),
+                        error_kind: None,
+                    },
+                };
+                Json(response).into_response()
+            }
+        }),
+    )
+    // Both verbs. A caller that is not on this machine finds no route here;
+    // see `local_caller`.
+    .route_layer(axum::middleware::from_fn(local_caller::local_callers_only))
 }
 
 /// The `/mcp/local` refusal when no dev identity could be resolved.

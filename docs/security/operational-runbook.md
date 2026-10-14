@@ -1004,7 +1004,11 @@ Before pointing this at anything sensitive — especially before exposing
 the controller to the public internet — verify every box:
 
 - [ ] `RUST_ENV=production` set on controller. This disables `/mcp/local`
-      (the unauthenticated dev endpoint) and other dev-mode shortcuts.
+      (the unauthenticated dev endpoint) and other dev-mode shortcuts. A
+      non-production build answers `/mcp/local` only for a caller on its
+      own machine and `404`s a request that came through a proxy or a
+      tunnel; `talos_mcp_auth_total{outcome="local_route_refused"}` counts
+      those, and should read 0.
 - [ ] `KEK_PROVIDER=vault` set + `VAULT_ADDR` / `VAULT_TOKEN` configured.
       `KEK_PROVIDER=env` (with `TALOS_MASTER_KEY` in env or file) is
       dev-only — production deployments must use Vault transit so the

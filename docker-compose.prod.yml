@@ -27,8 +27,11 @@
 # gates: the plaintext-URL refusals above, the env-KEK guard (check 45), the
 # explicit-Sigstore-policy demand on the worker, the PROMETHEUS_SCRAPE_TOKEN
 # / REGISTRY_PUBLISH_TOKEN fail-closed 403s, and production-only CSP/cookie
-# strictness. Rate limits, HSTS, CSRF and the reverse-proxy posture do NOT
-# depend on RUST_ENV and stay on. If you need RUST_ENV=production, put TLS
+# strictness. It also MOUNTS the development MCP route `/mcp/local`, which
+# has no token; that route answers only a caller on the controller's own
+# machine, so a request through the nginx below (which sets X-Forwarded-For)
+# gets 404 — use `/mcp` with an agent token. Rate limits, HSTS, CSRF and the
+# reverse-proxy posture do NOT depend on RUST_ENV and stay on. If you need RUST_ENV=production, put TLS
 # on all three backends first (or deploy the Helm chart, which does), then
 # change the three URLs to `postgres://…?sslmode=require`, `rediss://` and
 # `tls://` and flip this value — it will refuse to boot until you have.
