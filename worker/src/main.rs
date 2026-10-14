@@ -430,6 +430,9 @@ fn truncate_oversized_job_result(
     cap: usize,
 ) -> JobResult {
     JobResult {
+        // B-9: the replacement answers the same dispatch the original did.
+        dispatch_attempt: result.dispatch_attempt,
+        workflow_execution_id: result.workflow_execution_id,
         // Preserve the token accounting — the usage was real even though
         // the oversized output is dropped, and the entry vec is small
         // (capped at MAX_LLM_USAGE_ENTRIES) so it can't re-breach the cap.
@@ -523,6 +526,8 @@ async fn publish_result_with_retry(
 /// empty logs/signature/nonce/worker-id (the publish path signs it).
 fn failed_result(job_id: uuid::Uuid, start: &std::time::Instant, msg: &str) -> JobResult {
     JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id,
@@ -1391,6 +1396,8 @@ async fn execute_job(
         // enable the env on both sides while investigating a real
         // controller↔worker signing divergence, then unset it.
         return JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: req.job_id,
@@ -1772,6 +1779,8 @@ async fn execute_job(
             _span.end_success();
 
             JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
                 crypto_scheme: 0,
                 job_id: req.job_id,
@@ -1796,6 +1805,8 @@ async fn execute_job(
             _span.end_error(&sanitized_error);
 
             JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
                 crypto_scheme: 0,
                 job_id: req.job_id,
@@ -1820,6 +1831,8 @@ async fn execute_job(
             _span.end_error(&error_msg);
 
             JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
                 // Timeout drops the execution future, but usage folded
                 // before the deadline is preserved via the shared Arc.
                 // A detached in-flight stream reader could in principle
@@ -3686,9 +3699,25 @@ mod result_publish_tests {
 
     // ─── M-7: JobResult publish-size cap ──────────────────────────────────
 
+    /// B-9: the replacement answers the dispatch the original answered.
+    #[test]
+    fn truncate_oversized_keeps_the_dispatch_the_result_answers() {
+        let mut original = failed_result(uuid::Uuid::new_v4(), &std::time::Instant::now(), "x");
+        original.dispatch_attempt = 3;
+        original.workflow_execution_id = Some(uuid::Uuid::new_v4());
+        let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
+        assert_eq!(replacement.dispatch_attempt, 3);
+        assert_eq!(
+            replacement.workflow_execution_id,
+            original.workflow_execution_id
+        );
+    }
+
     #[test]
     fn truncate_oversized_replaces_payload_and_marks_failed() {
         let original = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: uuid::Uuid::new_v4(),
@@ -3732,6 +3761,8 @@ mod result_publish_tests {
         // The replacement itself must fit comfortably under any
         // reasonable cap, otherwise we'd loop forever.
         let original = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: uuid::Uuid::new_v4(),

@@ -222,6 +222,7 @@ impl JobTransport for QueueingTransport {
         progress_subject: &str,
         _payload: Vec<u8>,
         on_progress: &(dyn Fn(Vec<u8>) + Send + Sync),
+        _skip_reply: &(dyn for<'r> Fn(&'r [u8]) -> bool + Send + Sync),
     ) -> Result<Vec<u8>, BoxError> {
         assert_eq!(progress_subject, "_INBOX.t.progress");
         if self.report_progress {

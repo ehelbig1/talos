@@ -31,6 +31,8 @@ fn ring() -> WorkerKeyRing {
 
 fn signed(job_id: Uuid, status: JobStatus, key: &[u8]) -> Vec<u8> {
     let mut r = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         job_id,
         status,
         output_payload: serde_json::json!({"ok": true, "error": FAILURE_TEXT}).into(),
@@ -500,4 +502,88 @@ mod bounded_wait_has_one_home {
              re-invent the wait and flake twice: {offenders:?}"
         );
     }
+}
+
+/// Security review 2026-10-14, B-1: the observer is the ONE primary verifier
+/// for module-bound results, so a second delivery of one signed result is
+/// refused and its fuel is not counted again. No broker: the handler is driven
+/// directly, as a queue-group replica would call it.
+///
+/// A copy delivered to ANOTHER replica passes that replica's verify (its replay
+/// cache never saw the nonce); the ledger's once-per-nonce rule is what stops
+/// it there, pinned by
+/// `fuel_ledger_tests::a_module_bound_results_fuel_is_recorded_once_per_signed_result`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_delivery_of_one_result_is_refused_and_counts_no_fuel() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let row = Uuid::new_v4();
+    let s = Seed {
+        user: Uuid::new_v4(),
+        actor: Uuid::new_v4(),
+        module: Uuid::new_v4(),
+        execs: vec![row],
+    };
+    seed(&pool, &s).await;
+    let svc = service(&pool);
+
+    let mut r = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: Some(row),
+        job_id: row,
+        status: JobStatus::Failed,
+        output_payload: serde_json::json!({"error": FAILURE_TEXT}).into(),
+        logs: vec![],
+        execution_time_ms: 7,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+        crypto_scheme: 0,
+        llm_usage: vec![],
+        fuel: Some(talos_workflow_job_protocol::FuelMeasure {
+            consumed: 250,
+            limit: 1_000,
+        }),
+    };
+    r.sign_with_worker_id(KEY, "worker-test").expect("sign");
+    let bytes = serde_json::to_vec(&r).expect("serialize");
+
+    assert_eq!(
+        handle_result_message(&bytes, &svc, Some(&ring())).await,
+        ObservedResult::Failed
+    );
+    let fuel = || {
+        let pool = pool.clone();
+        async move {
+            let total: Option<i64> =
+                sqlx::query_scalar("SELECT fuel_consumed FROM module_executions WHERE id = $1")
+                    .bind(row)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("fuel");
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM execution_cost_rollup WHERE execution_id = $1",
+            )
+            .bind(row)
+            .fetch_one(&pool)
+            .await
+            .expect("rollup");
+            (total, rows)
+        }
+    };
+    eventually("the first delivery's fuel is recorded", || async {
+        fuel().await == (Some(250), 1)
+    })
+    .await;
+
+    for _ in 0..3 {
+        assert_eq!(
+            handle_result_message(&bytes, &svc, Some(&ring())).await,
+            ObservedResult::Unverified,
+            "a repeated delivery of one signed result is a replay"
+        );
+    }
+    // The fuel write is fire-and-forget; give a wrongly admitted copy time to
+    // land before reading.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fuel().await, (Some(250), 1), "no copy counted fuel again");
 }

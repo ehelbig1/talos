@@ -1511,9 +1511,14 @@ impl ModuleExecutionService {
     /// [`talos_cost_attribution::record_module_bound_fuel`], never taken from
     /// the worker. Call it for every verified result, success or failure: a
     /// failed attempt spent its fuel and the hourly budget must see it.
+    ///
+    /// `result_nonce` is the verified result's own nonce: the fuel of one
+    /// signed result is recorded once, however many times it is delivered
+    /// (security review 2026-10-14, B-1).
     pub fn record_attempt_fuel(
         &self,
         module_execution_id: Uuid,
+        result_nonce: &str,
         consumed: u64,
         limit: Option<u64>,
         wall_time_ms: u64,
@@ -1522,6 +1527,7 @@ impl ModuleExecutionService {
         talos_cost_attribution::spawn_record_module_bound_fuel(
             self.db_pool.clone(),
             module_execution_id,
+            result_nonce.to_string(),
             consumed,
             limit,
             wall_time_ms,

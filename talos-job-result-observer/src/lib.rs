@@ -13,8 +13,14 @@
 //! instead of once. It now queue-subscribes in
 //! [`CONTROLLER_RESULTS_QUEUE_GROUP`]: one replica handles each result.
 //!
-//! Observer role (verify-once rule): this site calls the NO-REPLAY verifier
-//! and never touches the nonce cache.
+//! PRIMARY verifier (verify-once rule; security review 2026-10-14, B-1). Until
+//! then this site called the no-replay verifier as a passive observer, but it
+//! is the SOLE consumer of `talos.results.*` and its fuel write was additive,
+//! so one captured result republished inside its freshness window was counted
+//! once per copy. It now calls `verify_dispatch`, which records the nonce in
+//! this process's replay cache; the cache cannot see a copy delivered to
+//! ANOTHER replica of the queue group, so the fuel write is also once per
+//! signed result in the database (`talos_cost_attribution::record_module_bound_fuel`).
 
 use std::sync::Arc;
 
@@ -116,7 +122,7 @@ pub fn classify_job_result_parse_error(err: &serde_json::Error) -> &'static str 
     }
 }
 
-/// Handle one `talos.results.*` payload: parse, verify (no-replay), write.
+/// Handle one `talos.results.*` payload: parse, verify (primary), write.
 pub async fn handle_result_message(
     payload: &[u8],
     service: &ModuleExecutionService,
@@ -131,52 +137,19 @@ pub async fn handle_result_message(
     };
     let job_id = result.job_id;
 
-    // SECURITY: Verify HMAC-SHA256 signature + freshness
-    // window. Rejects results injected by any process that
-    // can publish to NATS but does not know the pre-shared
-    // key.
+    // SECURITY: verify the signature and freshness, and record the nonce.
     //
-    // Post-r301 the worker single-publishes: it sends a
-    // result to EITHER the request-reply inbox OR
-    // `talos.results.{job_id}` based on whether the
-    // requester awaited the reply, never both. So this
-    // subscriber only sees results that no other in-process
-    // verifier has handled — there's no second verify to
-    // race.
-    //
-    // We still call `verify_no_replay` here (not `verify`)
-    // as defense-in-depth: it keeps this subscriber
-    // safe-by-default if a future code path re-introduces a
-    // dual-publish or a sibling subscriber, and the side
-    // effect (`UPDATE module_executions WHERE status IN
-    // ('pending','running')`) is idempotent under replay
-    // anyway. HMAC + freshness still catch forgery and
-    // stale-replay; the worker is the primary
-    // replay-cache writer for fire-and-forget results.
-    //
-    // Today every NATS-dispatched code path uses
-    // request-reply, so this subscriber is mostly dormant
-    // — kept as the canonical landing point for future
-    // truly-async dispatches (work-queue style).
-    // L-4: typed Observer verifier — this audit
-    // subscriber on `talos.results.*` only writes
-    // an idempotent UPDATE; primary verification
-    // happens at the request-reply inbox in the
-    // engine dispatcher / webhook handler. Using
-    // `Verifier::Observer` documents the role at
-    // the type level so a future refactor can't
-    // accidentally convert this site to a primary
-    // verifier and reintroduce the r300 regression.
+    // The worker single-publishes: a result goes to EITHER the signed reply
+    // inbox OR `talos.results.{job_id}`, never both, and nothing else in the
+    // controller subscribes here. So this is the ONE primary verifier for
+    // these results in the process (verify-once rule) — the dispatcher and
+    // the webhook router are primary for the reply-inbox results, which never
+    // reach this subject. Security review 2026-10-14, B-1: this used to be a
+    // no-replay "observer" verify on the belief that its writes were
+    // idempotent; the fuel write was not.
     if let Some(ring) = key_ring {
-        // RFC 0010 P2: scheme-routing Observer verify —
-        // Ed25519 against the keys registered for this
-        // worker_id, or legacy HMAC against the ring
-        // while `result_accept_legacy_hmac()`. NEVER
-        // records the replay cache (Observer role): the
-        // request-reply dispatcher is the sole Primary
-        // verifier, per the verify-once rule.
         let worker_ed_keys = talos_workflow_job_protocol::worker_public_keys(&result.worker_id);
-        if let Err(e) = result.verify_no_replay_dispatch(
+        if let Err(e) = result.verify_dispatch(
             ring,
             &worker_ed_keys,
             300,
@@ -210,6 +183,7 @@ pub async fn handle_result_message(
     if let Some(fuel) = result.spent_fuel() {
         service.record_attempt_fuel(
             job_id,
+            &result.result_nonce,
             fuel.consumed,
             fuel.limit,
             result.execution_time_ms,

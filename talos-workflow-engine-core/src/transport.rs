@@ -124,6 +124,14 @@ pub trait JobTransport: Send + Sync {
     /// progress and delegates, so a transport that does not override it keeps
     /// the pre-P2 behaviour exactly: the attempt window never pauses.
     ///
+    /// A message on the inbox for which `skip_reply` returns `true` is not the
+    /// reply: it is dropped and the wait goes on (security review 2026-10-14,
+    /// B-9). A retry keeps the inbox, so a slow attempt's result can arrive
+    /// while the next attempt is awaited; the dispatcher passes a predicate
+    /// that names exactly that result. The default cannot skip (it delegates
+    /// to a single-reply call), and the dispatcher refuses such a result
+    /// rather than take it.
+    ///
     /// [`request_with_reply_inbox`]: Self::request_with_reply_inbox
     async fn request_with_reply_inbox_and_progress(
         &self,
@@ -132,6 +140,7 @@ pub trait JobTransport: Send + Sync {
         _progress_subject: &str,
         payload: Vec<u8>,
         _on_progress: &(dyn Fn(Vec<u8>) + Send + Sync),
+        _skip_reply: &(dyn for<'r> Fn(&'r [u8]) -> bool + Send + Sync),
     ) -> Result<Vec<u8>, BoxError> {
         self.request_with_reply_inbox(topic, reply_inbox, payload)
             .await

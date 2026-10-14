@@ -515,6 +515,8 @@ fn unsigned_request_fails_verification() {
 fn tampered_job_result_status_fails() {
     let key = test_key();
     let mut result = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
@@ -542,6 +544,8 @@ fn tampered_job_result_status_fails() {
 fn tampered_job_result_execution_time_fails() {
     let key = test_key();
     let mut result = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
@@ -688,6 +692,8 @@ fn tampered_pipeline_step_integration_name_fails() {
 
 fn signed_job_result(key: &[u8]) -> JobResult {
     let mut result = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
@@ -938,6 +944,8 @@ fn pipeline_verify_no_replay_does_not_pollute_cache() {
 fn tampered_job_result_worker_id_fails() {
     let key = test_key();
     let mut result = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
@@ -994,6 +1002,8 @@ fn worker_id_invalid_chars_rejected_at_sign_time() {
     // worker_id fails closed without producing an artifact at all.
     let key = test_key();
     let mut result = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
@@ -1028,6 +1038,8 @@ fn worker_id_empty_passes_for_backcompat() {
     // fixtures; empty must still verify cleanly.
     let key = test_key();
     let mut result = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),

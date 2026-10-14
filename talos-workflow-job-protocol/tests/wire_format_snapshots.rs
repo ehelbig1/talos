@@ -303,6 +303,8 @@ fn job_request_signature_snapshot() {
 #[test]
 fn job_result_json_snapshot() {
     let result = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
@@ -333,6 +335,8 @@ fn job_result_json_snapshot() {
 #[test]
 fn job_result_non_default_fuel_json_snapshot() {
     let result = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
@@ -351,6 +355,131 @@ fn job_result_non_default_fuel_json_snapshot() {
     let actual = serde_json::to_string(&result).expect("serialize");
     let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","status":"Failed","output_payload":{"error":"fuel exhausted"},"logs":[],"execution_time_ms":7,"signature":[222,173,190,239],"result_nonce":"0:00000000000000000000000000000000","worker_id":"snapshot-worker-01","crypto_scheme":0,"fuel":{"consumed":5000000,"limit":5000000}}"#;
     assert_eq!(actual, expected, "JobResult fuel wire format drifted");
+}
+
+/// MAC of a `JobResult` under `key`, over a HAND-ROLLED signing payload:
+/// the pre-binding format (`job_id:status:nonce:sha256(output):ms:sha256(logs):worker_id`),
+/// then exactly the B-9 segments the caller passes. Fuel and LLM usage are not
+/// used by these fixtures. Production verify must accept it, so the formula
+/// cannot drift from `JobResult::signing_payload` unnoticed.
+fn result_mac(result: &JobResult, key: &[u8], segments: &str) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    let status = match result.status {
+        JobStatus::Success => "success",
+        JobStatus::Failed => "failed",
+        JobStatus::TimedOut => "timedout",
+    };
+    let payload = format!(
+        "{}:{}:{}:{}:{}:{}:{}{}",
+        result.job_id,
+        status,
+        result.result_nonce,
+        hex::encode(Sha256::digest(result.output_payload.raw_bytes())),
+        result.execution_time_ms,
+        hex::encode(Sha256::digest(result.logs.join("\n").as_bytes())),
+        result.worker_id,
+        segments,
+    );
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key).expect("hmac key");
+    mac.update(payload.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn snapshot_result(nonce: &str) -> JobResult {
+    JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
+        llm_usage: vec![],
+        crypto_scheme: 0,
+        job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
+        status: JobStatus::Success,
+        output_payload: json!({"out": 42}).into(),
+        logs: vec!["info: ok".into()],
+        execution_time_ms: 7,
+        signature: vec![],
+        result_nonce: nonce.into(),
+        worker_id: "snapshot-worker-01".into(),
+        fuel: None,
+    }
+}
+
+/// B-9 (2026-10-14), the ALL-DEFAULT half: a result that names no attempt and
+/// no execution signs over the pre-binding payload, byte for byte, so a
+/// controller and a worker on either side of the change agree on every result
+/// a pre-binding worker sends.
+#[test]
+fn an_unbound_job_result_signs_the_pre_binding_bytes() {
+    let mut result = snapshot_result("0:0000000000000000000000000000000d");
+    result.signature = result_mac(&result, &TEST_KEY, "");
+    assert_eq!(
+        hex::encode(&result.signature),
+        "7da2618ddafaebd26a58fe6f93b6cb2550fc16bc365332ca01268a36daecad02",
+        "the unbound JobResult signing payload drifted"
+    );
+    result
+        .verify_no_replay(&TEST_KEY, u64::MAX)
+        .expect("an unbound result signs exactly the pre-binding payload");
+}
+
+/// B-9 (2026-10-14), the NON-DEFAULT half: the JSON a bound result adds and
+/// the MAC over its `:attempt=` and `:exec=` segments.
+#[test]
+fn job_result_non_default_dispatch_binding_snapshot() {
+    let mut result = snapshot_result("0:0000000000000000000000000000000e");
+    result.dispatch_attempt = 2;
+    result.workflow_execution_id = Some(det_uuid(2));
+    result.signature = result_mac(
+        &result,
+        &TEST_KEY,
+        ":attempt=2:exec=00000000-0000-0000-0000-000000000002",
+    );
+
+    let actual = serde_json::to_string(&result).expect("serialize");
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","status":"Success","output_payload":{"out":42},"logs":["info: ok"],"execution_time_ms":7,"signature":[209,179,35,67,81,134,235,105,236,213,162,123,14,94,90,95,74,51,224,166,141,249,141,144,203,253,191,57,121,60,90,55],"result_nonce":"0:0000000000000000000000000000000e","worker_id":"snapshot-worker-01","crypto_scheme":0,"dispatch_attempt":2,"workflow_execution_id":"00000000-0000-0000-0000-000000000002"}"#;
+    assert_eq!(
+        actual, expected,
+        "JobResult dispatch-binding wire format drifted"
+    );
+    assert_eq!(
+        hex::encode(&result.signature),
+        "d1b323435186eb69ecd5a27b0e5e5a5f4a33e0a68df98d90cbfdbf39793c5a37",
+        "the JobResult `:attempt=`/`:exec=` signing segments drifted"
+    );
+    result
+        .verify_no_replay(&TEST_KEY, u64::MAX)
+        .expect("hand-rolled signature must verify against production verify");
+}
+
+/// The binding is SIGNED: stripping it, or moving a result to another attempt
+/// or another execution, fails verification.
+#[test]
+fn a_results_dispatch_binding_cannot_be_stripped_or_moved() {
+    let mut signed = snapshot_result("0:0000000000000000000000000000000f");
+    signed.dispatch_attempt = 1;
+    signed.workflow_execution_id = Some(det_uuid(2));
+    signed.signature = result_mac(
+        &signed,
+        &TEST_KEY,
+        ":attempt=1:exec=00000000-0000-0000-0000-000000000002",
+    );
+    signed
+        .verify_no_replay(&TEST_KEY, u64::MAX)
+        .expect("the honest result verifies");
+    for (what, tamper) in [
+        ("strip the attempt", (0, Some(det_uuid(2)))),
+        ("move to a later attempt", (2, Some(det_uuid(2)))),
+        ("strip the execution", (1, None)),
+        ("move to another execution", (1, Some(det_uuid(3)))),
+    ] {
+        let mut t = signed.clone();
+        t.dispatch_attempt = tamper.0;
+        t.workflow_execution_id = tamper.1;
+        assert!(
+            t.verify_no_replay(&TEST_KEY, u64::MAX).is_err(),
+            "{what} must invalidate the signature"
+        );
+    }
 }
 
 #[test]

@@ -137,6 +137,7 @@ impl JobTransport for NatsTransport {
         progress_subject: &str,
         payload: Vec<u8>,
         on_progress: &(dyn Fn(Vec<u8>) + Send + Sync),
+        skip_reply: &(dyn for<'r> Fn(&'r [u8]) -> bool + Send + Sync),
     ) -> Result<Vec<u8>, BoxError> {
         let mut sub = self
             .client
@@ -162,7 +163,23 @@ impl JobTransport for NatsTransport {
         let _ = self.client.flush().await;
         loop {
             tokio::select! {
-                msg = sub.next() => return reply_from(msg, topic),
+                msg = sub.next() => {
+                    // B-9: a reply the dispatcher names as not this
+                    // attempt's (a slow earlier attempt's result on the shared
+                    // inbox) is dropped and the wait goes on. A 503 control
+                    // message has an empty body and is never skipped.
+                    let skip = msg
+                        .as_ref()
+                        .is_some_and(|m| m.status.is_none() && skip_reply(&m.payload));
+                    if skip {
+                        tracing::debug!(
+                            topic,
+                            "dropped a reply from an earlier attempt of this job; still waiting"
+                        );
+                        continue;
+                    }
+                    return reply_from(msg, topic);
+                }
                 Some(p) = progress.next() => on_progress(p.payload.to_vec()),
             }
         }

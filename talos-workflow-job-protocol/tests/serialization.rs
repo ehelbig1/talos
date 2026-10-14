@@ -55,6 +55,8 @@ fn job_request_roundtrip() {
 #[test]
 fn job_result_roundtrip() {
     let res = JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
         llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
