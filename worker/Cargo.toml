@@ -58,6 +58,7 @@ talos-random = { path = "../talos-random" }
 # Redis (OCI module cache wiring in main.rs)
 redis = { workspace = true, features = ["default", "tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }  # rustls for rediss:// (Upstash, ElastiCache TLS)
 talos-redis = { path = "../talos-redis" }
+talos-replay-guard = { path = "../talos-replay-guard" }
 # rustls direct dep so worker/main.rs can install the ring CryptoProvider
 # at startup — required since rustls 0.23 stopped auto-selecting one when
 # multiple crates pull rustls in (redis + reqwest in our case).
@@ -77,6 +78,7 @@ wasmtime = { workspace = true, features = ["async", "component-model", "parallel
 wat = "1"  # Convert WAT text to a minimal component for AOT tests
 wit-component = "0.224"
 wit-parser = "0.224"  # Resolve the minimal-node world for kill-switch integration fixtures
+async-trait.workspace = true  # dispatch_replay tests: a stand-in shared store
 
 [features]
 default = []

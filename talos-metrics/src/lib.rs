@@ -2151,10 +2151,10 @@ pub struct TalosMetrics {
     /// on `record_rpc_metric` and must never be added here — it is
     /// caller-supplied and unbounded.
     ///
-    /// **Pre-seeded, and only over the reachable pairs.** All 64 pairs a call
+    /// **Pre-seeded, and only over the reachable pairs.** All 73 pairs a call
     /// site can pass are seeded at 0 from `rpc::seeded_pairs()`, which IS the
-    /// per-subject table; the cross product would be 7 × 18 = 126 and would
-    /// seed 62 combinations nothing can increment (check 58's defect). Seeding
+    /// per-subject table; the cross product would be 7 × 19 = 133 and would
+    /// seed 60 combinations nothing can increment (check 58's defect). Seeding
     /// matters because `TalosRPCSubjectFailing` selects on this counter and
     /// `increase(...) > 0` over an ABSENT series matches nothing — the
     /// detector silenced by exactly the condition it detects.
@@ -4839,7 +4839,7 @@ mod tests {
             );
             declared.insert(line);
         }
-        assert_eq!(declared.len(), 66, "the table changed; re-derive it");
+        assert_eq!(declared.len(), 73, "the table changed; re-derive it");
 
         // (b) nothing outside the table. A seeded combination nothing can
         // increment reads as a wired signal that does not exist (check 58).
@@ -4849,8 +4849,8 @@ mod tests {
             .collect();
         assert_eq!(
             exported.len(),
-            66,
-            "expected exactly the 66 reachable pairs, got {}:\n{}",
+            73,
+            "expected exactly the 73 reachable pairs, got {}:\n{}",
             exported.len(),
             exported.join("\n")
         );
@@ -4957,8 +4957,8 @@ mod tests {
             "bucket layout changed; the no-seed cost argument is stale"
         );
         // The counter is seeded, so its line count does not move.
-        assert_eq!(lines(&cold, "talos_rpc_calls_total"), 66);
-        assert_eq!(lines(&warm, "talos_rpc_calls_total"), 66);
+        assert_eq!(lines(&cold, "talos_rpc_calls_total"), 73);
+        assert_eq!(lines(&warm, "talos_rpc_calls_total"), 73);
     }
 
     /// The DEFERRED-push counter (package ES) is seeded over its whole closed
@@ -5609,7 +5609,7 @@ mod tests {
         let rendered = m.render_prometheus().expect("render");
 
         // `talos_rpc_calls_total` is alerted (`TalosRPCSubjectFailing`) and
-        // seeded too, but its 64 pairs are asserted EXHAUSTIVELY and in BOTH
+        // seeded too, but its 73 pairs are asserted EXHAUSTIVELY and in BOTH
         // directions by `the_rpc_instrument_seeds_exactly_the_reachable_pairs`
         // below — listing them here would be a second, hand-maintained copy of
         // the table, which is the drift the table exists to remove.

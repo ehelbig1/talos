@@ -12611,6 +12611,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-nats",
+ "async-trait",
  "bytes",
  "futures-util",
  "hex",
@@ -12627,6 +12628,7 @@ dependencies = [
  "talos-nats-tls",
  "talos-random",
  "talos-redis",
+ "talos-replay-guard",
  "talos-shutdown",
  "talos-task-supervision",
  "talos-worker-runtime",

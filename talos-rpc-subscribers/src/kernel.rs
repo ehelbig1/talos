@@ -58,6 +58,12 @@
 //!   an unauthenticated flood consume permits ahead of legitimate
 //!   traffic AND would invert the `queue_ms` / `exec_ms` split that
 //!   operator dashboards are keyed on. Don't.
+//! * The ADMISSION allowance (security review 2026-10-14, B-6) is a
+//!   different thing and sits in front of everything: `intake` takes one of
+//!   `max_in_flight × ADMISSION_PER_PERMIT` slots before the handler is even
+//!   called, holds it for the message's whole life, and with none free drops
+//!   the message unread (`shed`). It bounds what a flood costs; it does not
+//!   move the execution permit, so `queue_ms` / `exec_ms` mean what they did.
 //! * Outcome-tag mapping (each protocol's error enum → metric tag).
 
 use futures::StreamExt;
@@ -100,6 +106,81 @@ pub(crate) struct RpcSubscriberSpec {
 /// before aborting the remainder. Matches the pre-extraction literal
 /// `10` every subscriber passed to `graceful_drain`.
 pub(crate) const DRAIN_DEADLINE_SECS: u64 = 10;
+
+/// How many messages a subscriber holds per execution permit — parsed,
+/// verified, queued for a permit or executing — before it sheds the next one
+/// unparsed (security review 2026-10-14, B-6). The execution permit is still
+/// taken where the module docs say, after admission; this bound is in front
+/// of everything, so a flood costs at most `max_in_flight ×
+/// ADMISSION_PER_PERMIT` parses at a time instead of one task per message.
+pub(crate) const ADMISSION_PER_PERMIT: usize = 8;
+
+const SHED_LOG_EVERY_SECS: u64 = 10;
+static SHED_SINCE_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SHED_LAST_LOG_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one shed message; `Some(count since the last line)` when a WARN is
+/// due. Process-wide across subjects (the counter carries the per-subject
+/// figure).
+fn shed_log_due() -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    let shed = SHED_SINCE_LOG.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let last = SHED_LAST_LOG_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < SHED_LOG_EVERY_SECS {
+        return None;
+    }
+    SHED_LAST_LOG_SECS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .ok()?;
+    let _ = shed;
+    Some(SHED_SINCE_LOG.swap(0, Ordering::Relaxed))
+}
+
+/// Take one admission slot for a message and spawn its handler with the slot
+/// held for the handler's whole life, or — with no slot free — drop the
+/// message unread and count it `shed`. `handler` is only called (and so the
+/// message only parsed) when a slot was taken. Returns whether it spawned.
+pub(crate) fn intake<Fut>(
+    in_flight: &mut tokio::task::JoinSet<()>,
+    admission: &Arc<tokio::sync::Semaphore>,
+    subject: &'static str,
+    handler: impl FnOnce() -> Fut,
+) -> bool
+where
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let Ok(slot) = admission.clone().try_acquire_owned() else {
+        if let Some(rpc) = RpcSubject::ALL.iter().find(|s| s.as_str() == subject) {
+            talos_metrics::record_rpc_call(
+                *rpc,
+                RpcOutcome::Shed,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            );
+        }
+        // Counted every time; logged at most once per `SHED_LOG_EVERY_SECS`
+        // so a flood cannot become a log flood.
+        if let Some(shed) = shed_log_due() {
+            tracing::warn!(
+                target: "talos_rpc",
+                subject,
+                outcome = RpcOutcome::Shed.as_str(),
+                shed_since_last_log = shed,
+                "rpc shed: a subscriber's admission allowance is full; messages dropped unread"
+            );
+        }
+        return false;
+    };
+    let fut = handler();
+    in_flight.spawn(async move {
+        let _slot = slot;
+        fut.await;
+    });
+    true
+}
 
 /// Per-op permit-guard timeout (docs/platform-primitive-checklist.md
 /// §3). Bounds how long a single handler may hold a semaphore permit
@@ -184,6 +265,10 @@ pub(crate) fn spawn_rpc_subscriber<H, Fut>(
 {
     spawn_supervised(spec.task, async move {
         let sem = Arc::new(tokio::sync::Semaphore::new(spec.max_in_flight));
+        // B-6: the admission allowance, in front of the parse.
+        let admission = Arc::new(tokio::sync::Semaphore::new(
+            spec.max_in_flight.saturating_mul(ADMISSION_PER_PERMIT),
+        ));
         tracing::info!(
             subject = spec.subject,
             max_in_flight = spec.max_in_flight,
@@ -234,7 +319,9 @@ pub(crate) fn spawn_rpc_subscriber<H, Fut>(
                         None => break,
                     },
                 };
-                in_flight.spawn(handler(msg, sem.clone()));
+                intake(&mut in_flight, &admission, spec.subject, || {
+                    handler(msg, sem.clone())
+                });
             }
             // Inner loop exited.
             if shutdown_requested {
@@ -427,6 +514,54 @@ pub(crate) fn log_op_error(
 
 /// Live-broker behaviour of TWO subscriber kernels on one subject — the
 /// shape of two controller replicas (chart default `replicaCount: 2`).
+#[cfg(test)]
+mod intake_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Security review 2026-10-14, B-6: with no admission slot the handler is
+    /// never called, so the message is never parsed, verified or looked up.
+    #[tokio::test]
+    async fn a_message_is_not_parsed_without_an_admission_slot() {
+        let admission = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut in_flight = tokio::task::JoinSet::new();
+        let parsed = Arc::new(AtomicUsize::new(0));
+        let p = parsed.clone();
+        let spawned = intake(&mut in_flight, &admission, "talos.memory.op", move || {
+            p.fetch_add(1, Ordering::SeqCst);
+            async {}
+        });
+        assert!(!spawned);
+        assert_eq!(parsed.load(Ordering::SeqCst), 0);
+        assert!(in_flight.is_empty());
+    }
+
+    /// A taken slot is held for the handler's whole life and returned after.
+    #[tokio::test]
+    async fn an_admitted_message_holds_its_slot_until_its_handler_ends() {
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut in_flight = tokio::task::JoinSet::new();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        assert!(intake(
+            &mut in_flight,
+            &admission,
+            "talos.memory.op",
+            move || async move {
+                let _ = wait.await;
+            }
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(admission.available_permits(), 0);
+        assert!(
+            !intake(&mut in_flight, &admission, "talos.memory.op", || async {}),
+            "a second message is shed while the first holds the only slot"
+        );
+        release.send(()).expect("release");
+        in_flight.join_next().await.expect("joined").expect("ok");
+        assert_eq!(admission.available_permits(), 1);
+    }
+}
+
 /// Gated on `TALOS_TEST_NATS_URL` / `TALOS_TEST_NATS_PERM_URL`; named
 /// explicitly in `scripts/test-integration.sh`, because a gated test nobody
 /// names is a green skip.

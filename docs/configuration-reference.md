@@ -462,8 +462,8 @@ into both deployments.
 | `MCP_TOKEN_REVALIDATION_INTERVAL_SECS` | `60` | controller | MCP token revalidation cadence | |
 | `TALOS_WRITE_CEILING_ENFORCED` | `false` | both | Enforce actor write ceiling. **Set it on BOTH** — the worker gates mutating host calls, the controller gates the `__memory_write__` envelope it persists on node completion (#750); on the worker alone a `readonly` actor is refused one route and permitted the other. The worker reports its value to the controller at self-registration, diagnostic only, outside the registration proof (`get_platform_info.fleet.write_ceiling`). | 🔒 (posture) |
 | `TALOS_WRITE_CEILING_STRICT_EGRESS` | `false` | worker | Strict egress under the write ceiling; inert unless the flag above is on. Reported alongside it at self-registration. | 🔒 (posture) |
-| `TALOS_DISTRIBUTED_REPLAY` | off | controller | Enable distributed replay | |
-| `TALOS_REPLAY_FAIL_CLOSED` | unset ⇒ `is_production()` (closed in production, open elsewhere); an explicit `1/true/yes/on` or `0/false/no/off` always wins | controller | Fail closed on replay-guard errors | 🔒 (posture) |
+| `TALOS_DISTRIBUTED_REPLAY` | off | controller, worker | Enable distributed replay: on the controller, cross-replica single use of signed RPCs; on the worker, a dispatch runs once per fleet (its nonce is recorded in Redis) | |
+| `TALOS_REPLAY_FAIL_CLOSED` | unset ⇒ `is_production()` (closed in production, open elsewhere); an explicit `1/true/yes/on` or `0/false/no/off` always wins | controller, worker | Fail closed on replay-guard errors (a worker then refuses every dispatch while Redis is unreachable) | 🔒 (posture) |
 | `TALOS_VERSION` | derived from build | both | Build/version string override | |
 | `TALOS_BASE_URL` | none (optional) | controller | Platform base-URL override for status responses (see duplicates) | |
 

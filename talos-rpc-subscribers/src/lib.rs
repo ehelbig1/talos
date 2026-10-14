@@ -103,6 +103,7 @@ pub(crate) async fn crossreplica_replay_ok(
 impl admission::AdmittableRpc for talos_memory::graph_rpc::GraphSearchRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::graph_rpc::SUBJECT_GRAPH_SEARCH;
     const SIGNING_SUBJECT: &'static str = talos_memory::graph_rpc::SUBJECT_NAME;
+    const MAX_WIRE_BYTES: usize = admission::wire_cap(talos_memory::graph_rpc::MAX_QUERY_LEN);
     fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
@@ -120,6 +121,9 @@ impl admission::AdmittableRpc for talos_memory::graph_rpc::GraphSearchRequest {
 impl admission::AdmittableRpc for talos_memory::ml_rpc::MlPredictRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_ML_PREDICT;
     const SIGNING_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_NAME;
+    const MAX_WIRE_BYTES: usize = admission::wire_cap(
+        talos_memory::ml_rpc::MAX_INPUTS * talos_memory::ml_rpc::MAX_INPUT_BYTES,
+    );
     fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
@@ -137,6 +141,7 @@ impl admission::AdmittableRpc for talos_memory::ml_rpc::MlPredictRequest {
 impl admission::AdmittableRpc for talos_memory::ml_rpc::MlFewShotRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_ML_FEWSHOT;
     const SIGNING_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_NAME_FEWSHOT;
+    const MAX_WIRE_BYTES: usize = admission::wire_cap(talos_memory::ml_rpc::MAX_INPUT_BYTES);
     fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
@@ -154,6 +159,8 @@ impl admission::AdmittableRpc for talos_memory::ml_rpc::MlFewShotRequest {
 impl admission::AdmittableRpc for talos_memory::memory_rpc::MemoryRpcRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::memory_rpc::SUBJECT_MEMORY_OP;
     const SIGNING_SUBJECT: &'static str = talos_memory::memory_rpc::SUBJECT_NAME;
+    const MAX_WIRE_BYTES: usize =
+        admission::wire_cap(talos_memory::MAX_VALUE_BYTES + talos_memory::MAX_METADATA_BYTES);
     fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
@@ -171,6 +178,10 @@ impl admission::AdmittableRpc for talos_memory::memory_rpc::MemoryRpcRequest {
 impl admission::AdmittableRpc for talos_memory::database_rpc::DatabaseRpcRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::database_rpc::SUBJECT_DATABASE_QUERY;
     const SIGNING_SUBJECT: &'static str = talos_memory::database_rpc::SUBJECT_NAME;
+    const MAX_WIRE_BYTES: usize = admission::wire_cap(
+        talos_memory::database_rpc::MAX_SQL_BYTES
+            + talos_memory::database_rpc::MAX_PARAMS_BYTES_TOTAL,
+    );
     fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
@@ -188,6 +199,9 @@ impl admission::AdmittableRpc for talos_memory::database_rpc::DatabaseRpcRequest
 impl admission::AdmittableRpc for talos_memory::state_rpc::StateWriteRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::state_rpc::SUBJECT_STATE_WRITE;
     const SIGNING_SUBJECT: &'static str = talos_memory::state_rpc::SUBJECT_NAME;
+    const MAX_WIRE_BYTES: usize = admission::wire_cap(
+        talos_memory::state_rpc::MAX_STATE_KEY_LEN + talos_memory::state_rpc::MAX_STATE_VALUE_BYTES,
+    );
     fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
@@ -206,6 +220,7 @@ impl admission::AdmittableRpc for talos_memory::integration_state_rpc::Integrati
     const WIRE_SUBJECT: &'static str =
         talos_memory::integration_state_rpc::SUBJECT_INTEGRATION_STATE_OP;
     const SIGNING_SUBJECT: &'static str = talos_memory::integration_state_rpc::SUBJECT_NAME;
+    const MAX_WIRE_BYTES: usize = admission::wire_cap(talos_integration_state::MAX_VALUE_BYTES);
     fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
@@ -266,6 +281,56 @@ mod admission_identity_tests {
 
     fn identity<T: AdmittableRpc>() -> (&'static str, &'static str) {
         (T::WIRE_SUBJECT, T::SIGNING_SUBJECT)
+    }
+
+    /// B-6: every protocol's raw wire cap is below the broker's 8 MiB
+    /// `max_payload` (`deploy/nats/nats.conf`, the chart's NATS ConfigMap) —
+    /// a cap at or above it would be the broker's — and above the content a
+    /// legitimate request carries.
+    #[test]
+    fn every_wire_cap_sits_between_its_content_and_the_broker_limit() {
+        const BROKER_MAX_PAYLOAD: usize = 8 * 1024 * 1024;
+        for (subject, cap, content) in [
+            (
+                "graph",
+                <talos_memory::graph_rpc::GraphSearchRequest as AdmittableRpc>::MAX_WIRE_BYTES,
+                talos_memory::graph_rpc::MAX_QUERY_LEN,
+            ),
+            (
+                "ml_predict",
+                <talos_memory::ml_rpc::MlPredictRequest as AdmittableRpc>::MAX_WIRE_BYTES,
+                talos_memory::ml_rpc::MAX_INPUTS * talos_memory::ml_rpc::MAX_INPUT_BYTES,
+            ),
+            (
+                "ml_fewshot",
+                <talos_memory::ml_rpc::MlFewShotRequest as AdmittableRpc>::MAX_WIRE_BYTES,
+                talos_memory::ml_rpc::MAX_INPUT_BYTES,
+            ),
+            (
+                "memory",
+                <talos_memory::memory_rpc::MemoryRpcRequest as AdmittableRpc>::MAX_WIRE_BYTES,
+                talos_memory::MAX_VALUE_BYTES + talos_memory::MAX_METADATA_BYTES,
+            ),
+            (
+                "database",
+                <talos_memory::database_rpc::DatabaseRpcRequest as AdmittableRpc>::MAX_WIRE_BYTES,
+                talos_memory::database_rpc::MAX_SQL_BYTES
+                    + talos_memory::database_rpc::MAX_PARAMS_BYTES_TOTAL,
+            ),
+            (
+                "state",
+                <talos_memory::state_rpc::StateWriteRequest as AdmittableRpc>::MAX_WIRE_BYTES,
+                talos_memory::state_rpc::MAX_STATE_VALUE_BYTES,
+            ),
+            (
+                "integration_state",
+                <talos_memory::integration_state_rpc::IntegrationStateRequest as AdmittableRpc>::MAX_WIRE_BYTES,
+                talos_integration_state::MAX_VALUE_BYTES,
+            ),
+        ] {
+            assert!(cap < BROKER_MAX_PAYLOAD, "{subject}: {cap}");
+            assert!(cap > content, "{subject}: {cap} <= {content}");
+        }
     }
 
     #[test]
@@ -4389,10 +4454,22 @@ mod rpc_instrument_table_pins {
                     found.insert(variant.as_str().to_string());
                 }
             }
+            // An outcome the KERNEL emits (`kernel::intake`'s `shed`) is
+            // reachable from every subscriber that runs on the kernel.
+            if region.contains("kernel::spawn_rpc_subscriber") {
+                for variant in KERNEL_EMITTED {
+                    found.insert(variant.as_str().to_string());
+                }
+            }
             map.insert(subject.as_str().to_string(), found);
         }
         map
     }
+
+    /// Outcomes `kernel.rs` records for any subscriber (security review
+    /// 2026-10-14, B-6: `intake` sheds a message unread). Pinned to appear
+    /// there by `the_variant_identifiers_are_derivable_and_unambiguous`.
+    const KERNEL_EMITTED: [RpcOutcome; 1] = [RpcOutcome::Shed];
 
     /// The Rust identifier for a variant, derived from its label rather than
     /// hand-listed: `not_promoted` -> `NotPromoted`.
@@ -4414,10 +4491,23 @@ mod rpc_instrument_table_pins {
     #[test]
     fn the_variant_identifiers_are_derivable_and_unambiguous() {
         const SRC: &str = include_str!("lib.rs");
+        const KERNEL_SRC: &str = include_str!("kernel.rs");
+        for o in KERNEL_EMITTED {
+            let ident = variant_ident(o);
+            assert!(
+                KERNEL_SRC.contains(&format!("RpcOutcome::{ident}")),
+                "`RpcOutcome::{ident}` is declared kernel-emitted but kernel.rs never records it"
+            );
+        }
         for o in RpcOutcome::ALL {
             let ident = variant_ident(*o);
+            let src = if KERNEL_EMITTED.contains(o) {
+                KERNEL_SRC
+            } else {
+                SRC
+            };
             assert!(
-                SRC.contains(&format!("RpcOutcome::{ident}")),
+                src.contains(&format!("RpcOutcome::{ident}")),
                 "derived identifier `RpcOutcome::{ident}` for label `{}` appears nowhere in \
                  lib.rs — either the derivation is wrong (and the scan below is vacuous) or \
                  the outcome has no call site at all, which makes its 7 x 1 slice of the \

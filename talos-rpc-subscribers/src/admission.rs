@@ -59,6 +59,27 @@ pub(crate) trait AdmittableRpc: DeserializeOwned {
     /// definition (it is the claim under test), which is fine: a forged id
     /// simply misses the cache and yields the "unverifiable" wording.
     fn worker_id(&self) -> &str;
+    /// The largest wire payload a legitimate request of this protocol can
+    /// be, in bytes (security review 2026-10-14, B-6). Checked against the
+    /// RAW message length before anything is parsed: a larger payload is
+    /// `Malformed` without a JSON parse, a signature check or a store round
+    /// trip. Derived from the protocol's own field limits by [`wire_cap`],
+    /// so no legitimate request reaches it.
+    const MAX_WIRE_BYTES: usize;
+}
+
+/// Fixed headroom for a request's envelope (ids, nonce, signature, field
+/// names) on top of its content limits.
+pub(crate) const WIRE_ENVELOPE_BYTES: usize = 64 * 1024;
+
+/// The most a JSON string can grow when serialised: a control character is
+/// written as `\u00XX`, six bytes for one.
+pub(crate) const JSON_ESCAPE_FACTOR: usize = 6;
+
+/// A protocol's raw wire cap from its content limit: every content byte at
+/// its worst-case JSON escape, plus the envelope.
+pub(crate) const fn wire_cap(content_bytes: usize) -> usize {
+    content_bytes * JSON_ESCAPE_FACTOR + WIRE_ENVELOPE_BYTES
 }
 
 /// Proof that a request passed parse → verify → cross-replica replay →
@@ -287,6 +308,15 @@ pub(crate) fn is_canonical_rpc_nonce(nonce: &str) -> bool {
 pub(crate) async fn admit_from_bytes<T: AdmittableRpc>(
     payload: &[u8],
 ) -> Result<Admitted<T>, AdmitError> {
+    // B-6: the raw length first — nothing about an oversized message is
+    // worth a parse.
+    if payload.len() > T::MAX_WIRE_BYTES {
+        return Err(AdmitError::Malformed(format!(
+            "payload of {} bytes exceeds this subject's {} byte limit",
+            payload.len(),
+            T::MAX_WIRE_BYTES
+        )));
+    }
     let req: T =
         serde_json::from_slice(payload).map_err(|e| AdmitError::Malformed(e.to_string()))?;
     // Short-circuit order preserved verbatim: per-protocol verify first (its
@@ -376,6 +406,7 @@ mod admission_tests {
     impl AdmittableRpc for FakeReq {
         const WIRE_SUBJECT: &'static str = "talos.test.admission";
         const SIGNING_SUBJECT: &'static str = "admission_test_rpc";
+        const MAX_WIRE_BYTES: usize = 64 * 1024;
         fn verify_classified(&self) -> Result<(), VerifyFailure> {
             match self.failure_index {
                 Some(i) => Err(FAILURE_CLASSES[i]),
@@ -390,6 +421,24 @@ mod admission_tests {
         }
         fn worker_id(&self) -> &str {
             &self.worker_id
+        }
+    }
+
+    /// Security review 2026-10-14, B-6: an oversized payload is refused on
+    /// its raw length, before a JSON parse (these bytes are not JSON at all,
+    /// and the refusal is the size one, not a parse error).
+    #[tokio::test]
+    async fn an_oversized_payload_is_refused_before_it_is_parsed() {
+        let payload = vec![b'x'; FakeReq::MAX_WIRE_BYTES + 1];
+        match admit_from_bytes::<FakeReq>(&payload).await {
+            Err(AdmitError::Malformed(m)) => assert!(m.contains("byte limit"), "{m}"),
+            other => panic!("expected the size refusal, got {:?}", other.is_ok()),
+        }
+        // At the cap the parse runs (and fails on these bytes as a parse).
+        let payload = vec![b'x'; FakeReq::MAX_WIRE_BYTES];
+        match admit_from_bytes::<FakeReq>(&payload).await {
+            Err(AdmitError::Malformed(m)) => assert!(!m.contains("byte limit"), "{m}"),
+            other => panic!("expected a parse error, got {:?}", other.is_ok()),
         }
     }
 

@@ -873,6 +873,12 @@ worker:
     # together or a readonly actor is refused one route and permitted the
     # other on the same job.
     TALOS_WRITE_CEILING_ENFORCED: "1"
+    # A dispatch runs once per FLEET, not once per worker (security review
+    # 2026-10-14, B-5): the worker records each dispatch's nonce in the same
+    # Redis replay guard the controller uses for RPC, so a captured job
+    # re-published to the queue group is refused by every other worker. The
+    # same switch and fail policy as `controller.env`.
+    TALOS_DISTRIBUTED_REPLAY: "true"
 
   # Sigstore enforcement for OCI template signatures. The publish workflow
   # (.github/workflows/template-publish.yml) signs every artifact via

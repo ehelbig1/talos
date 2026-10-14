@@ -33,6 +33,7 @@ use worker::{circuit_breaker, metrics, metrics_server, sql_validator};
 
 use worker::runtime::TalosRuntime;
 
+mod dispatch_replay;
 #[cfg(test)]
 mod fuel_emission_pin;
 #[cfg(test)]
@@ -1201,6 +1202,42 @@ fn worker_result_signing_key() -> Option<&'static talos_workflow_job_protocol::D
         }
     })
     .as_ref()
+}
+
+/// B-5 (2026-10-14): register the fleet-wide dispatch replay guard, under the
+/// controller's own switch (`TALOS_DISTRIBUTED_REPLAY`) and fail policy
+/// (`TALOS_REPLAY_FAIL_CLOSED`). Without it (no Redis, or the switch off) the
+/// process-local nonce cache is the whole defence, as before.
+async fn register_dispatch_replay_guard(client: &redis::Client) {
+    if !talos_config::bool_env_or_default("TALOS_DISTRIBUTED_REPLAY", false) {
+        ::tracing::warn!(
+            target: "talos_security",
+            "TALOS_DISTRIBUTED_REPLAY is off — a replayed dispatch is refused only by the \
+             worker that saw it first"
+        );
+        return;
+    }
+    match talos_replay_guard::RedisReplayGuard::connect(client).await {
+        Ok(guard) => {
+            let guard = guard.with_prefix(dispatch_replay::KEY_PREFIX);
+            match talos_replay_guard::register_shared_replay_guard(Arc::new(guard)) {
+                Ok(()) => ::tracing::info!(
+                    target: "talos_security",
+                    fail_closed = talos_replay_guard::fail_closed_from_env(),
+                    "dispatch replay guard registered (Redis) — a dispatch runs once per fleet"
+                ),
+                Err(e) => {
+                    ::tracing::error!(target: "talos_security", error = %e, "dispatch replay guard not registered")
+                }
+            }
+        }
+        Err(e) => ::tracing::error!(
+            target: "talos_security",
+            error = %e,
+            "TALOS_DISTRIBUTED_REPLAY is on but the Redis replay guard could not connect — \
+             fleet-wide dispatch replay protection NOT active"
+        ),
+    }
 }
 
 /// Sign a `JobResult`, preferring the per-worker Ed25519 key when configured
@@ -2942,6 +2979,7 @@ async fn main() -> anyhow::Result<()> {
     worker::local_llm_fleet::install_timeout_series();
     if let Some(ref client) = redis_client {
         worker::job_idempotency::init_redis(client.as_ref().clone()).await;
+        register_dispatch_replay_guard(client.as_ref()).await;
         // RFC 0014 P3b: queue local LLM calls with the controller and the
         // other workers, not only within this process. Never fatal.
         worker::local_llm_fleet::install(client.as_ref().clone()).await;
@@ -3168,6 +3206,24 @@ async fn main() -> anyhow::Result<()> {
                                         dvc.accept_legacy_hmac,
                                     )
                                     .is_ok();
+                                // B-5 (2026-10-14): once per fleet, not per worker.
+                                if request_authentic
+                                    && !dispatch_replay::first_use_fleet_wide(
+                                        talos_replay_guard::shared_replay_guard().as_deref(),
+                                        &dispatch_replay::dispatch_key("job", req.job_id, &req.job_nonce),
+                                        talos_replay_guard::fail_closed_from_env(),
+                                    )
+                                    .await
+                                {
+                                    ::tracing::warn!(
+                                        target: "talos_security",
+                                        job_id = %req.job_id,
+                                        "dispatch refused: its nonce was already used on this fleet, \
+                                         or the shared replay store could not be asked; not run, no reply"
+                                    );
+                                    drop(permit);
+                                    return;
+                                }
                                 if request_authentic && !req.dry_run {
                                     // Tier 1: in-process (same-worker retry, free).
                                     // Tier 2: Redis (queue-group retry landed on a
@@ -3431,6 +3487,25 @@ async fn main() -> anyhow::Result<()> {
                                         dvc.accept_legacy_hmac,
                                     )
                                     .is_ok();
+                                // B-5 (2026-10-14): once per fleet, not per worker.
+                                if request_authentic
+                                    && !dispatch_replay::first_use_fleet_wide(
+                                        talos_replay_guard::shared_replay_guard().as_deref(),
+                                        &dispatch_replay::dispatch_key("pipeline", req.job_id, &req.job_nonce),
+                                        talos_replay_guard::fail_closed_from_env(),
+                                    )
+                                    .await
+                                {
+                                    ::tracing::warn!(
+                                        target: "talos_security",
+                                        job_id = %req.job_id,
+                                        "pipeline dispatch refused: its nonce was already used on \
+                                         this fleet, or the shared replay store could not be asked; \
+                                         not run, no reply"
+                                    );
+                                    drop(permit);
+                                    return;
+                                }
                                 if request_authentic {
                                     // Tier 1: in-process; tier 2: Redis (retry on a
                                     // sibling queue-group worker). Redis bytes are
