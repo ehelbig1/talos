@@ -48,6 +48,8 @@ const MAX_ACTIONS: usize = 3;
 const MAX_ACTION_TITLE_CHARS: usize = 40;
 const MAX_URL_BYTES: usize = 2000;
 const MAX_TAG_BYTES: usize = 64;
+/// The most notifications one node sends, in order (`notifications`).
+const MAX_PARTS: usize = 6;
 
 #[derive(Deserialize)]
 struct RawNotification {
@@ -73,6 +75,8 @@ struct RawAction {
     link: Option<String>,
     #[serde(default)]
     one_tap: bool,
+    #[serde(default)]
+    keep: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -88,6 +92,10 @@ struct Action {
     /// The phone may act on this without opening a browser, where the
     /// service can. The link must then be one that acts on a POST.
     one_tap: bool,
+    /// Using this action should leave the notification where it is, where
+    /// the service can: a message with two things to do keeps the second
+    /// after the first is done.
+    keep: bool,
 }
 
 struct Notification {
@@ -188,6 +196,7 @@ fn check_notification(
                 title,
                 link,
                 one_tap: a.one_tap,
+                keep: a.keep,
             })
         })
         .take(MAX_ACTIONS)
@@ -205,8 +214,52 @@ fn check_notification(
     }))
 }
 
+/// Read what the upstream node composed: one `notification`, or
+/// `notifications`, an ordered list of 1 to [`MAX_PARTS`]. An empty result
+/// is "nothing to send" (`skip: true`).
+///
+/// Every part is held to the rules one notification is held to, and the
+/// whole list is refused if any part breaks one: nothing is sent in place of
+/// what was composed, and half a message is not what was composed.
+fn check_notifications(
+    single: Option<RawNotification>,
+    list: Option<Vec<RawNotification>>,
+    skip: Option<bool>,
+) -> Result<Vec<Notification>, String> {
+    if skip == Some(true) {
+        return Ok(Vec::new());
+    }
+    let Some(list) = list else {
+        return Ok(check_notification(single, skip)?.into_iter().collect());
+    };
+    if single.is_some() {
+        return Err(
+            "Give `notification` or `notifications`, not both (docs/notification-contract.md)"
+                .to_string(),
+        );
+    }
+    let total = list.len();
+    if total == 0 || total > MAX_PARTS {
+        return Err(format!(
+            "`notifications` must hold 1 to {MAX_PARTS} notifications; got {total}"
+        ));
+    }
+    list.into_iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            check_notification(Some(raw), None)
+                .map_err(|e| format!("notification {} of {total}: {e}", index + 1))?
+                .ok_or_else(|| format!("notification {} of {total} is empty", index + 1))
+        })
+        .collect()
+}
+
 /// What every adapter returns, in the same words, so a workflow that reads
 /// the result does not change when the service does.
+///
+/// For a list the counts are sums over its parts, `link_sent`,
+/// `link_dropped` and `tag_sent` say whether that was so for any part, and
+/// `status` is the last answer.
 #[derive(Serialize)]
 struct Verdict {
     provider: &'static str,
@@ -215,13 +268,103 @@ struct Verdict {
     dry_run: bool,
     /// The service's HTTP status; absent when nothing was sent.
     status: Option<u16>,
+    /// How many notifications were composed, and how many were delivered.
+    /// On success they are equal: a part that fails, fails the node.
+    parts_total: usize,
+    parts_sent: usize,
     actions_sent: usize,
     actions_dropped: usize,
     /// Actions delivered as a background POST rather than a link to open.
     one_tap_actions: usize,
+    /// Actions the service will keep the notification for (`keep`).
+    kept_actions: usize,
     link_sent: bool,
     link_dropped: bool,
     tag_sent: bool,
+}
+
+/// What one part comes to as its adapter delivers it. The two things a
+/// service may not be able to do (`one_tap_actions`, `kept_actions`) and
+/// whether it was given the tag are the adapter's to say.
+struct PartTally {
+    actions_sent: usize,
+    actions_dropped: usize,
+    one_tap_actions: usize,
+    kept_actions: usize,
+    link_sent: bool,
+    link_dropped: bool,
+    tag_sent: bool,
+}
+
+impl Verdict {
+    fn new(provider: &'static str, dry_run: bool) -> Self {
+        Verdict {
+            provider,
+            sent: false,
+            skipped: false,
+            dry_run,
+            status: None,
+            parts_total: 0,
+            parts_sent: 0,
+            actions_sent: 0,
+            actions_dropped: 0,
+            one_tap_actions: 0,
+            kept_actions: 0,
+            link_sent: false,
+            link_dropped: false,
+            tag_sent: false,
+        }
+    }
+
+    fn count(&mut self, part: &PartTally) {
+        self.parts_total += 1;
+        self.actions_sent += part.actions_sent;
+        self.actions_dropped += part.actions_dropped;
+        self.one_tap_actions += part.one_tap_actions;
+        self.kept_actions += part.kept_actions;
+        self.link_sent |= part.link_sent;
+        self.link_dropped |= part.link_dropped;
+        self.tag_sent |= part.tag_sent;
+    }
+}
+
+/// Deliver the parts in order, one request each, and stop at the first that
+/// fails: a later part (the one with the buttons) arrives only if everything
+/// before it did.
+///
+/// A failed part FAILS the node, as a refused single notification does, so
+/// `continue_on_error` and error edges work as for any failure. The error
+/// says how far it got. One notification fails with exactly the adapter's
+/// own words, as it always has.
+fn send_in_order<F>(
+    verdict: &mut Verdict,
+    parts: &[Notification],
+    mut send_one: F,
+) -> Result<(), String>
+where
+    F: FnMut(&Notification) -> Result<u16, String>,
+{
+    let total = parts.len();
+    for (index, part) in parts.iter().enumerate() {
+        match send_one(part) {
+            Ok(status) => {
+                verdict.parts_sent += 1;
+                verdict.status = Some(status);
+            }
+            Err(e) if total == 1 => return Err(e),
+            Err(e) => {
+                return Err(format!(
+                    "notification {} of {total} was not delivered: {e}. {} delivered before \
+                     it, none after. Do not retry this node: it would send the delivered \
+                     ones again.",
+                    index + 1,
+                    index
+                ))
+            }
+        }
+    }
+    verdict.sent = verdict.parts_sent > 0;
+    Ok(())
 }
 
 /// An https base address with no query or fragment, without its trailing `/`.
@@ -284,6 +427,8 @@ struct Incoming {
     config: Cfg,
     #[serde(default)]
     notification: Option<RawNotification>,
+    #[serde(default)]
+    notifications: Option<Vec<RawNotification>>,
     #[serde(default)]
     skip: Option<bool>,
 }
@@ -400,35 +545,34 @@ pub fn run(input: String) -> Result<String, String> {
     let dry_run = cfg.dry_run.unwrap_or(false);
     let reply = reply_title(cfg.reply_title.as_deref())?;
 
-    let mut verdict = Verdict {
-        provider: PROVIDER,
-        sent: false,
-        skipped: false,
-        dry_run,
-        status: None,
-        actions_sent: 0,
-        actions_dropped: 0,
-        one_tap_actions: 0,
-        link_sent: false,
-        link_dropped: false,
-        tag_sent: false,
-    };
-    let Some(n) = check_notification(incoming.notification, incoming.skip)? else {
+    let parts = check_notifications(incoming.notification, incoming.notifications, incoming.skip)?;
+    let mut verdict = Verdict::new(PROVIDER, dry_run);
+    if parts.is_empty() {
         verdict.skipped = true;
         return serde_json::to_string(&verdict).map_err(|e| e.to_string());
-    };
-    // A reply box is not one of the notification's actions and is not
-    // counted as one; an action it displaces is counted as dropped.
-    verdict.actions_sent = actions_shown(n.actions.len(), reply.is_some());
-    verdict.actions_dropped = n.actions_dropped + (n.actions.len() - verdict.actions_sent);
-    verdict.link_sent = n.link.is_some();
-    verdict.link_dropped = n.link_dropped;
-    verdict.tag_sent = n.tag.is_some();
+    }
+    for n in &parts {
+        // A reply box is not one of the notification's actions and is not
+        // counted as one; an action it displaces is counted as dropped.
+        let shown = actions_shown(n.actions.len(), reply.is_some());
+        verdict.count(&PartTally {
+            actions_sent: shown,
+            actions_dropped: n.actions_dropped + (n.actions.len() - shown),
+            // The companion app opens an action's link; it cannot POST in
+            // the background, and it dismisses the notification on a tap.
+            one_tap_actions: 0,
+            kept_actions: 0,
+            link_sent: n.link.is_some(),
+            link_dropped: n.link_dropped,
+            tag_sent: n.tag.is_some(),
+        });
+    }
 
     logging::log(
         Level::Info,
         &format!(
-            "notify-home-assistant: {} action(s), {} dropped, reply_box={}, dry_run={}",
+            "notify-home-assistant: {} notification(s), {} action(s), {} dropped, reply_box={}, dry_run={}",
+            verdict.parts_total,
             verdict.actions_sent,
             verdict.actions_dropped,
             reply.is_some(),
@@ -439,30 +583,32 @@ pub fn run(input: String) -> Result<String, String> {
         return serde_json::to_string(&verdict).map_err(|e| e.to_string());
     }
 
-    let req = talos::core::http::Request {
-        method: talos::core::http::Method::Post,
-        url: format!("{base}/api/services/notify/{service}"),
-        headers: vec![
-            ("Authorization".to_string(), auth.to_string()),
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ],
-        body: ha_body(&n, reply)?,
-        timeout_ms: Some(cfg.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000)),
-    };
-    // The KIND of failure stays in the message: the platform retries a
-    // timeout or a network error and does not retry a refused host, and it
-    // can only tell them apart by this word.
-    let resp = talos::core::http::fetch(&req).map_err(|e| {
-        format!(
-            "home-assistant: {} could not be reached ({e:?})",
-            host_of(&base)
-        )
+    let timeout_ms = Some(cfg.timeout_ms.unwrap_or(10_000).clamp(1_000, 30_000));
+    send_in_order(&mut verdict, &parts, |n| {
+        let req = talos::core::http::Request {
+            method: talos::core::http::Method::Post,
+            url: format!("{base}/api/services/notify/{service}"),
+            headers: vec![
+                ("Authorization".to_string(), auth.to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body: ha_body(n, reply)?,
+            timeout_ms,
+        };
+        // The KIND of failure stays in the message: the platform retries a
+        // timeout or a network error and does not retry a refused host, and
+        // it can only tell them apart by this word.
+        let resp = talos::core::http::fetch(&req).map_err(|e| {
+            format!(
+                "home-assistant: {} could not be reached ({e:?})",
+                host_of(&base)
+            )
+        })?;
+        if !(200..300).contains(&resp.status) {
+            return Err(format!("home-assistant: {} answered {}", host_of(&base), resp.status));
+        }
+        Ok(resp.status)
     })?;
-    if !(200..300).contains(&resp.status) {
-        return Err(format!("home-assistant: {} answered {}", host_of(&base), resp.status));
-    }
-    verdict.sent = true;
-    verdict.status = Some(resp.status);
     serde_json::to_string(&verdict).map_err(|e| e.to_string())
 }
 

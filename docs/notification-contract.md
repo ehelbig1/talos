@@ -29,14 +29,27 @@ Adapters today: `notify-ntfy`, `notify-home-assistant`.
     "actions": [                         // optional; at most 3
       { "title": "Done",                 // cut at 40 characters
         "link": "https://…",             // what the action opens, or POSTs to
-        "one_tap": true }                // act in the background where the
+        "one_tap": true,                 // act in the background where the
                                          // service can; the link must then be
                                          // one that acts on a POST
+        "keep": true }                   // using this action leaves the
+                                         // notification where it is, where
+                                         // the service can (default false)
     ]
   },
   "skip": false                          // true: send nothing, and say so
 }
 ```
+
+A message in several parts is `notifications` instead: an ordered list of 1
+to 6 objects of that same shape.
+
+```jsonc
+{ "notifications": [ { "body": "…" }, { "body": "…" },
+                     { "body": "Post it?", "actions": [ … ] } ] }
+```
+
+Give one or the other, never both.
 
 Rules every adapter applies, from one shared block of source:
 
@@ -50,6 +63,15 @@ Rules every adapter applies, from one shared block of source:
   and counted.
 * No service vocabulary: no topic, no entity id, no device name. Those are
   the adapter's config.
+* A list is sent in order, one request per notification, and **stops at the
+  first that fails**: a later part (the one with the buttons) arrives only if
+  everything before it did. A failed part FAILS the node, as a refused
+  single notification does, and the error says how far it got
+  ("notification 3 of 5 was not delivered: …. 2 delivered before it, none
+  after"). `continue_on_error` and error edges work as for any failure.
+* A list is refused WHOLE, before anything is sent, if it is empty, longer
+  than six, given together with `notification`, or if any one part breaks a
+  rule above. Half a message is not what was composed.
 
 ## What every adapter returns
 
@@ -57,14 +79,22 @@ Rules every adapter applies, from one shared block of source:
 { "provider": "ntfy",       // which adapter delivered
   "sent": true, "skipped": false, "dry_run": false,
   "status": 200,            // the service's HTTP status; null when nothing was sent
+  "parts_total": 1,         // notifications composed
+  "parts_sent": 1,          // notifications delivered (0 on a dry run or a skip)
   "actions_sent": 2, "actions_dropped": 1,
   "one_tap_actions": 1,     // actions delivered as a background POST
+  "kept_actions": 0,        // actions the service keeps the notification for
   "link_sent": true, "link_dropped": false,
   "tag_sent": false }       // whether this service was given the tag
 ```
 
-`one_tap_actions` and `tag_sent` are the two things a service may not be
-able to do. They are reported rather than hidden so a workflow can tell
+For a list the counts are sums over its parts, `link_sent`, `link_dropped`
+and `tag_sent` say whether that was so for any part, and `status` is the last
+answer. On success `parts_sent` equals `parts_total`; a list that stops
+part-way is an error, not a verdict.
+
+`one_tap_actions`, `kept_actions` and `tag_sent` are the three things a
+service may not be able to do. They are reported rather than hidden so a workflow can tell
 which it got. A refusal by the service fails the node with the host and the
 status, never the response body.
 
@@ -76,10 +106,10 @@ To make an action DO something, give it an action link
 `action_links` node between compose and send replaces each with a real
 https URL. With `one_tap: true`:
 
-| Adapter | A tap on the action |
-|---|---|
-| `notify-ntfy` | the phone POSTs to the link in the background; the workflow starts. One tap. |
-| `notify-home-assistant` | opens the link; the confirmation page is shown. Two taps. |
+| Adapter | A tap on the action | `keep: true` |
+|---|---|---|
+| `notify-ntfy` | the phone POSTs to the link in the background; the workflow starts. One tap. | the notification stays (`kept_actions` counts it); without it, the first action used dismisses the notification |
+| `notify-home-assistant` | opens the link; the confirmation page is shown. Two taps. | not available: the notification is dismissed (`kept_actions` is 0) |
 
 ```
 compose  ──►  action_links  ──►  send (notify-*)
@@ -113,32 +143,37 @@ A `link` belongs on a short message whose whole point is the place it opens.
 ### Several parts
 
 One notification is one body of at most 1500 characters. A composer with
-more to say returns `parts`, an array of notifications, and the workflow
-sends them one after another with a chain of nodes:
+more to say returns `notifications`, the ordered list above, and ONE send
+node delivers it:
 
 ```
-compose → links → part1 → send1 → part2 → send2 → …
+compose → links → send (notify-*)
 ```
 
-`partN` is a small module that picks part N out of the composer's output and
-returns it as `notification`; `sendN` is the adapter again. Each
-`partN → sendN` edge is conditional on `notify == true` and each
-`sendN → part(N+1)` edge is plain, so a part is sent only after the one
-before it was, and a failed send stops the rest.
-
-Two things to know about that chain:
-
-* **The chain has a fixed length and the composer does not know it.** A
-  composer that returns one part more than the workflow has nodes for loses
-  its LAST part without a word, and the last part is the one that carries
-  the buttons. Give the composer the number of parts its workflow can send
-  (a config key) and have it fail, or fold the overflow into the last part,
-  rather than return more.
-* **The `action_links` node already covers every part.** It replaces
+* **Order and failure** are the adapter's: in order, one request each, and
+  nothing after a part that failed.
+* **The `action_links` node covers every part.** It replaces
   `talos-action:<id>` wherever it appears in the composer's output,
-  including inside each element of `parts` and each action's `link`, and its
-  `__action_links_report__` counts across the whole output. One
-  `action_links` node before the first `part` node is enough.
+  including inside each element of the list and each action's `link`, and
+  its `__action_links_report__` counts across the whole output.
+* **Time.** Each part is one request with its own `TIMEOUT_MS` (10 seconds
+  by default, 30 at most). The send node's `timeout_secs` must cover the
+  worst case, `parts × TIMEOUT_MS`: six parts at the default is the default
+  node timeout of 60 seconds, with nothing to spare. Raise `timeout_secs`
+  or lower `TIMEOUT_MS` for a long list.
+* **Do not set `retry_count` on a node that sends a list.** An adapter
+  keeps nothing between attempts, so a retry sends the delivered parts
+  again. A notify node is not retried unless you ask: its module allows
+  `POST`, and a module that changes state gets no retry by default.
+
+Before 2026-10-13 a list was a hand-wired chain,
+`compose → links → part1 → send1 → part2 → send2 → …`, with a small module
+per part and a conditional edge into each send. That chain still works (each
+`sendN` receives a single `notification`), but its length is fixed in the
+workflow and the composer does not know it: a composer that returns one part
+more than the chain has nodes for loses its last part, the one with the
+buttons, without a word. Move such a workflow to one send node and
+`notifications`.
 
 ## Adding an adapter
 
