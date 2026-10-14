@@ -2581,6 +2581,7 @@ pub async fn recall_semantic_filtered(
         memory_type_filter,
         exclude_kinds,
         unjudged_only.as_deref(),
+        true,
     )
     .await?;
     Ok(SearchOutcome {
@@ -2617,7 +2618,17 @@ pub async fn recall_keyword(
     query: &str,
     limit: i64,
 ) -> Result<Vec<MemoryHit>> {
-    recall_keyword_inner(pool, actor_id, query, limit.clamp(1, 50), None, &[], None).await
+    recall_keyword_inner(
+        pool,
+        actor_id,
+        query,
+        limit.clamp(1, 50),
+        None,
+        &[],
+        None,
+        false,
+    )
+    .await
 }
 
 async fn recall_keyword_inner(
@@ -2630,6 +2641,12 @@ async fn recall_keyword_inner(
     // `Some(model)` restricts the match to rows the vector path could not
     // judge (`embedding IS NULL` or embedded under a different model).
     unjudged_only: Option<&str>,
+    // `true` when this is SEMANTIC recall's fallback: `scratchpad` rows are
+    // bookkeeping (a counter, a trace), never embedded on purpose, so the
+    // vector path never returns one and neither may its fallback. Until
+    // 2026-10-14 the fallback matched them by key whenever the vector path
+    // came back empty. An explicit keyword search still finds them.
+    semantic_fallback: bool,
 ) -> Result<Vec<MemoryHit>> {
     // Tokenize the query into meaningful terms, then OR-match each as a
     // separate ILIKE. A natural-language question like "which pull
@@ -2678,6 +2695,7 @@ async fn recall_keyword_inner(
                     OR metadata->>'kind' != ALL($5::text[])) \
                AND ($6::text IS NULL OR embedding IS NULL \
                     OR embedding_model IS DISTINCT FROM $6) \
+               AND (NOT $7::bool OR memory_type <> 'scratchpad') \
              ORDER BY updated_at DESC, id \
              LIMIT $3",
         )
@@ -2687,6 +2705,7 @@ async fn recall_keyword_inner(
         .bind(memory_type_filter)
         .bind(exclude_kinds)
         .bind(unjudged_only)
+        .bind(semantic_fallback)
         .fetch_all(pool)
         .await?;
         return rows_to_memory_hits(rows).await;
@@ -2724,6 +2743,7 @@ async fn recall_keyword_inner(
                 OR metadata->>'kind' != ALL($5::text[])) \
            AND ($6::text IS NULL OR embedding IS NULL \
                 OR embedding_model IS DISTINCT FROM $6) \
+           AND (NOT $7::bool OR memory_type <> 'scratchpad') \
          ORDER BY updated_at DESC, id \
          LIMIT $3",
     )
@@ -2733,6 +2753,7 @@ async fn recall_keyword_inner(
     .bind(memory_type_filter)
     .bind(exclude_kinds)
     .bind(unjudged_only)
+    .bind(semantic_fallback)
     .fetch_all(pool)
     .await
     .context("recall_keyword")?;
