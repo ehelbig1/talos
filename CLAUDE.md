@@ -101,6 +101,12 @@ Accepted `__memory_write__` fields:
 * `key` (string, required) — the actor_memory key
 * `value` (JSON, default null) — the stored payload
 * `memory_type` (string, default `"episodic"`)
+  A BOOKKEEPING write (a counter, a tally, a step log) is `"scratchpad"` with an explicit
+  `ttl_hours` (2026-10-14): never embedded, never sent for graph extraction,
+  never backfilled, never in `__actor_context__` or semantic recall, and read
+  by key as any other row. Do not add an "unindexed" flag beside it. Every
+  other type pays an embedding and, unless its `metadata.kind` is synthetic,
+  an entity extraction by the local model on every write
 * `metadata` (JSON object, optional) — stored in the dedicated
   `actor_memory.metadata` JSONB column. Readers can filter via
   `agent_memory::search_filtered(exclude_kinds: [...])`. Use this to stamp
