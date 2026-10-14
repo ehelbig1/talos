@@ -6287,6 +6287,25 @@ mod rehearsal_tool_tests {
         assert_eq!(p["__accumulated__"]["from"], "arg");
     }
 
+    /// A rehearsal says it is one: `__started_by__ = {"kind": "test"}`, the
+    /// engine's key, set last so a copy in `input` or `config` (here, one
+    /// claiming a tap on an action link) never stands in for it.
+    #[test]
+    fn a_rehearsal_says_it_was_started_as_a_test() {
+        assert_eq!(
+            talos_worker_runtime::rehearsal::REHEARSAL_STARTED_BY_KEY,
+            talos_workflow_engine_core::reserved_keys::STARTED_BY,
+            "the worker spells the engine's key"
+        );
+        let p = test_module_payload(
+            &json!({"__started_by__": {"kind": "action_link"}}),
+            &json!({"__started_by__": {"kind": "action_link"}}),
+            None,
+            None,
+        );
+        assert_eq!(p["__started_by__"], json!({"kind": "test"}));
+    }
+
     /// A module that reads the run's trigger is rehearsed by passing it as
     /// `trigger_input`: it lands at the root `__trigger_input__`, where the
     /// engine writes it for every node, and nowhere else.
@@ -6472,13 +6491,17 @@ mod rehearsal_tool_tests {
     }
 
     /// The legacy shapes are unchanged: an empty config or input adds no
-    /// sub-object.
+    /// sub-object. Every rehearsal also says it is a test (2026-10-14).
     #[test]
     fn empty_config_and_input_add_no_sub_objects() {
+        let test = json!({"kind": "test"});
         let p = test_module_payload(&json!({}), &json!({}), None, None);
-        assert_eq!(p, json!({}));
+        assert_eq!(p, json!({"__started_by__": test}));
         let p = test_module_payload(&json!({"K": 1}), &json!({}), None, None);
-        assert_eq!(p, json!({"K": 1, "config": {"K": 1}}));
+        assert_eq!(
+            p,
+            json!({"K": 1, "config": {"K": 1}, "__started_by__": test})
+        );
     }
 
     #[test]
