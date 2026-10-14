@@ -85,6 +85,61 @@ https URL. With `one_tap: true`:
 compose  ──►  action_links  ──►  send (notify-*)
 ```
 
+## What a phone shows is not what was sent
+
+Two things learned from messages that were delivered whole and still did not
+work. Both are about the phone, so they hold whichever adapter sends.
+
+* **A notification shows less than the message holds.** A body is cut at
+  1500 characters by the contract, but a notification stops showing it long
+  before that: a 599-character body was complete inside the app and ended at
+  about 430 characters in the notification itself. A button under a long
+  body therefore sits under a part of it. The reader answers a question they
+  could not finish reading.
+* **A `link` takes over the tap.** A notification with `link` opens that
+  address when it is tapped. Tapping to read the rest of a long message then
+  opens the link (a tracker page, say) instead of the message.
+
+So, for anything longer than a few lines:
+
+1. **Send the content first, with no button and no `link`.** Tapping it
+   opens the message, which is what the reader wants to do with it.
+2. **Then send a short message of its own that asks the question and
+   carries the buttons.** Short enough to be shown whole (a few lines), so
+   the buttons sit under all of it.
+
+A `link` belongs on a short message whose whole point is the place it opens.
+
+### Several parts
+
+One notification is one body of at most 1500 characters. A composer with
+more to say returns `parts`, an array of notifications, and the workflow
+sends them one after another with a chain of nodes:
+
+```
+compose → links → part1 → send1 → part2 → send2 → …
+```
+
+`partN` is a small module that picks part N out of the composer's output and
+returns it as `notification`; `sendN` is the adapter again. Each
+`partN → sendN` edge is conditional on `notify == true` and each
+`sendN → part(N+1)` edge is plain, so a part is sent only after the one
+before it was, and a failed send stops the rest.
+
+Two things to know about that chain:
+
+* **The chain has a fixed length and the composer does not know it.** A
+  composer that returns one part more than the workflow has nodes for loses
+  its LAST part without a word, and the last part is the one that carries
+  the buttons. Give the composer the number of parts its workflow can send
+  (a config key) and have it fail, or fold the overflow into the last part,
+  rather than return more.
+* **The `action_links` node already covers every part.** It replaces
+  `talos-action:<id>` wherever it appears in the composer's output,
+  including inside each element of `parts` and each action's `link`, and its
+  `__action_links_report__` counts across the whole output. One
+  `action_links` node before the first `part` node is enough.
+
 ## Adding an adapter
 
 1. `module-templates/notify-<service>/template.rs`: copy the contract block

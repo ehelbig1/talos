@@ -680,6 +680,73 @@ mod tests {
         );
     }
 
+    /// A message in several parts carries its buttons in the LAST part. One
+    /// node in front of the parts must cover all of them: every element of
+    /// the list, each action's link, and one report across the list.
+    #[test]
+    fn placeholders_inside_every_part_of_a_list_are_replaced_and_counted_once() {
+        let part = |n: usize, actions: JsonValue| json!({ "title": format!("Part {n}"), "body": format!("text {n}"), "actions": actions });
+        let input = json!({
+            "parts": [
+                part(1, json!([])),
+                part(2, json!([{ "title": "Open", "link": "talos-action:open" }])),
+                part(3, json!([
+                    { "title": "Post", "link": "talos-action:post", "one_tap": true },
+                    { "title": "Tick", "link": "talos-action:tick", "one_tap": true },
+                ])),
+            ],
+            ACTION_LINKS_REQUEST: [
+                request("open", "list"), request("post", "list"),
+                request("tick", "bills"), request("stray", "nowhere"),
+            ],
+        });
+        let (planned, unidentified) = plan_action_links(&input, &targets());
+        assert_eq!((planned.len(), unidentified), (4, 0));
+        let resolved: Vec<ResolvedLink> = planned
+            .iter()
+            .map(|p| ResolvedLink {
+                id: p.id.clone(),
+                url: p
+                    .spec
+                    .is_ok()
+                    .then(|| format!("https://t.example/action-links/{}", p.id)),
+                fallback: p.fallback.clone(),
+                refused: p.spec.as_ref().err().map(|e| (*e).to_string()),
+            })
+            .collect();
+        let out = apply_action_links(input, &resolved, unidentified, None);
+
+        assert_eq!(out["parts"][0]["actions"], json!([]));
+        assert_eq!(
+            out["parts"][1]["actions"][0]["link"],
+            "https://t.example/action-links/open"
+        );
+        assert_eq!(
+            out["parts"][2]["actions"][0]["link"],
+            "https://t.example/action-links/post"
+        );
+        assert_eq!(
+            out["parts"][2]["actions"][1]["link"],
+            "https://t.example/action-links/tick"
+        );
+        assert!(!out.to_string().contains(ACTION_PLACEHOLDER_PREFIX));
+        // One report, over the whole list.
+        let report = &out[ACTION_LINKS_REPORT];
+        assert_eq!(
+            (report["requested"].clone(), report["minted"].clone()),
+            (json!(4), json!(3))
+        );
+        assert_eq!(
+            report["not_minted"],
+            json!([{ "id": "stray", "reason": "unknown_target", "fell_back": false }])
+        );
+        assert!(out["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p.get(ACTION_LINKS_REPORT).is_none()));
+    }
+
     #[test]
     fn when_nothing_can_be_minted_every_link_falls_back_and_the_report_says_why() {
         let input = json!({
