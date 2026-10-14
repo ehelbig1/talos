@@ -25,6 +25,7 @@ pub mod pending_approvals_reader;
 pub mod retry_classifier;
 pub mod rhai_helpers;
 pub mod sanitizer;
+pub mod started_by_resolver;
 pub mod sub_actor_context_resolver;
 pub mod user_errors;
 pub mod workflow_chains;

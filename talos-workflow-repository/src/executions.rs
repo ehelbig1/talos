@@ -1105,6 +1105,39 @@ impl WorkflowRepository {
     /// (or equivalent) advances it.
     ///
     /// N T5-N1: encryption symmetry as for `mark_execution_completed`.
+    /// What started execution `execution_id`, read from its row exactly as
+    /// `list_executions` reads it ([`crate::started_by`]). `None` when the
+    /// row is not `user_id`'s or does not exist.
+    ///
+    /// The engine asks this once when a top-level run starts, to hand every
+    /// module it dispatches the run's start kind (`__started_by__`).
+    pub async fn started_by_of_execution(
+        &self,
+        execution_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<crate::StartedBy>> {
+        let row = sqlx::query(
+            "SELECT provenance, is_test_execution, replayed_from_id, \
+                    triggered_by_module_execution_id \
+             FROM workflow_executions WHERE id = $1 AND user_id = $2",
+        )
+        .bind(execution_id)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let provenance: Option<serde_json::Value> = r.try_get("provenance")?;
+        Ok(Some(crate::started_by(
+            provenance.as_ref(),
+            r.try_get::<Option<bool>, _>("is_test_execution")?
+                .unwrap_or(false),
+            r.try_get("replayed_from_id")?,
+            r.try_get("triggered_by_module_execution_id")?,
+        )))
+    }
+
     pub async fn mark_execution_waiting(
         &self,
         execution_id: Uuid,
