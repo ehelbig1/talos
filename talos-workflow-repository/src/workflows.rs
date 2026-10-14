@@ -278,6 +278,11 @@ impl WorkflowRepository {
         type_filter: Option<&str>,
         tag_filter: Option<&str>,
         runs_only: bool,
+        // Exact, case-sensitive name (2026-10-14).
+        name_exact: Option<&str>,
+        // Case-insensitive substring of the name, matched with `strpos` so a
+        // `%` or `_` in it is a literal character, not a pattern.
+        name_contains: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<WorkflowSummary>, i64)> {
@@ -313,6 +318,16 @@ impl WorkflowRepository {
             param_idx += 1;
             c
         });
+        let name_exact_clause = name_exact.map(|_| {
+            let c = format!("w.name = ${}", param_idx);
+            param_idx += 1;
+            c
+        });
+        let name_contains_clause = name_contains.map(|_| {
+            let c = format!("strpos(lower(w.name), lower(${})) > 0", param_idx);
+            param_idx += 1;
+            c
+        });
         let limit_param = param_idx;
         param_idx += 1;
         let offset_param = param_idx;
@@ -324,6 +339,12 @@ impl WorkflowRepository {
             conditions.push(c);
         }
         if let Some(ref c) = tag_clause {
+            conditions.push(c);
+        }
+        if let Some(ref c) = name_exact_clause {
+            conditions.push(c);
+        }
+        if let Some(ref c) = name_contains_clause {
             conditions.push(c);
         }
         let runs_clause = runs_only.then(runs_sql);
@@ -353,6 +374,14 @@ impl WorkflowRepository {
         if let Some(tg) = tag_filter {
             data_q = data_q.bind(tg);
             count_q = count_q.bind(tg);
+        }
+        if let Some(n) = name_exact {
+            data_q = data_q.bind(n);
+            count_q = count_q.bind(n);
+        }
+        if let Some(n) = name_contains {
+            data_q = data_q.bind(n);
+            count_q = count_q.bind(n);
         }
         data_q = data_q.bind(limit).bind(offset);
 

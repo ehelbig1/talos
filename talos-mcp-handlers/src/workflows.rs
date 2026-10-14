@@ -97,7 +97,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
             "name": "list_workflows",
-            "description": "List workflows owned by the current user. Returns id, name, status, type, tags, node/edge counts, and last execution time. Supports pagination and filtering by status, type, and tag. To list the workflows that actually RUN, pass runs: true: `status: \"active\"` means PUBLISHED, and a draft with an enabled schedule runs too, so it leaves those out.",
+            "description": "List workflows owned by the current user. Returns id, name, status, type, tags, node/edge counts, and last execution time. Supports pagination and filtering by status, type, tag, exact `name` and `name_contains`. To list the workflows that actually RUN, pass runs: true: `status: \"active\"` means PUBLISHED, and a draft with an enabled schedule runs too, so it leaves those out.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -106,7 +106,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "status": { "type": "string", "description": "Filter by workflow status: 'draft', 'active', 'archived' (the schema enum from migration 20260318000000). 'active' means published; it is NOT 'everything that runs' (see runs)." },
                     "runs": { "type": "boolean", "description": "When true, list only workflows the platform runs: not archived, not disabled, and with a way to start — an enabled schedule, an enabled webhook trigger, or a run in the last 7 days (which is how a workflow started by a push channel, an action link or another workflow is found). Includes drafts. Combines with status, type and tag. Default false." },
                     "type": { "type": "string", "description": "Filter by workflow_type: 'production', 'test', 'internal', 'template'" },
-                    "tag": { "type": "string", "description": "Filter to workflows that have this tag" }
+                    "tag": { "type": "string", "description": "Filter to workflows that have this tag" },
+                    "name": { "type": "string", "description": "Only the workflow with exactly this name (case-sensitive). Names are unique per user, so this returns at most one unless names were forced to collide." },
+                    "name_contains": { "type": "string", "description": "Only workflows whose name contains this text, ignoring case. `%` and `_` match themselves." }
                 },
             }
         }),
@@ -369,7 +371,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflow",
-            "description": "Canonical workflow-read tool — the `view` parameter selects the output shape. view='full' (default): the full definition of a workflow including all nodes, their configs, and edges. Each node surfaces: module_name (human-readable, including built-in nodes like 'Collect (built-in)'), config, skip_condition (when set), continue_on_error (when set), timeout_secs (when set on the node; a `timeout_secs` inside config takes precedence at run time), description (when set), and retry_count/retry_backoff_ms/retry_condition (only when non-default retry settings are explicitly configured). Workflow-level fields include readiness_score, capabilities, and tags. view='summary': comprehensive one-call operational overview — workflow definition, execution stats (last 7 days), version info, module dependencies, active schedules count, and active webhooks count (replaces the deprecated get_workflow_summary; for authoring/debugging use get_workflow_identity instead). view='raw_json': the raw graph JSON exactly as the engine's parser sees it — `{nodes: [...], edges: [...]}` with each node carrying its `kind`, `data`, `position`, etc. fields verbatim; useful for debugging parser-level issues the structured view papers over (replaces the deprecated get_workflow_raw_json; honors the `source` parameter). Each view emits the same JSON its legacy tool produced; the deprecated names still dispatch with a deprecation notice.",
+            "description": "Canonical workflow-read tool — the `view` parameter selects the output shape. SHAPE NOTE: here `nodes` and `edges` are TOP-LEVEL keys (with the nodes enriched: module_name, …); export_workflow instead nests the stored graph under `graph_json` (`bundle.graph_json.nodes`), so a script written against one does not read the other. view='full' (default): the full definition of a workflow including all nodes, their configs, and edges. Each node surfaces: module_name (human-readable, including built-in nodes like 'Collect (built-in)'), config, skip_condition (when set), continue_on_error (when set), timeout_secs (when set on the node; a `timeout_secs` inside config takes precedence at run time), description (when set), and retry_count/retry_backoff_ms/retry_condition (only when non-default retry settings are explicitly configured). Workflow-level fields include readiness_score, capabilities, and tags. view='summary': comprehensive one-call operational overview — workflow definition, execution stats (last 7 days), version info, module dependencies, active schedules count, and active webhooks count (replaces the deprecated get_workflow_summary; for authoring/debugging use get_workflow_identity instead). view='raw_json': the raw graph JSON exactly as the engine's parser sees it — `{nodes: [...], edges: [...]}` with each node carrying its `kind`, `data`, `position`, etc. fields verbatim; useful for debugging parser-level issues the structured view papers over (replaces the deprecated get_workflow_raw_json; honors the `source` parameter). Each view emits the same JSON its legacy tool produced; the deprecated names still dispatch with a deprecation notice.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -405,7 +407,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "export_workflow",
-            "description": "Export a workflow as a portable bundle including module metadata. Can be re-imported with import_workflow.",
+            "description": "Export a workflow as a portable bundle including module metadata. Can be re-imported with import_workflow. SHAPE: {version, name, graph_json, modules, exported_at}, with the stored graph NESTED under `graph_json` (`graph_json.nodes`, `graph_json.edges`, as stored, not enriched). get_workflow instead returns `nodes` and `edges` at the TOP level, so a script written against one does not read the other.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1169,6 +1171,18 @@ async fn handle_list_workflows(
         },
     };
 
+    // Name filters (2026-10-14): finding one workflow by name used to mean
+    // paging the whole list. A wrong type or an empty string is refused, not
+    // read as "no filter", which would answer with every workflow.
+    let name_exact = match name_filter_arg(args, "name") {
+        Ok(v) => v,
+        Err(msg) => return crate::utils::mcp_error(req_id, -32602, &msg),
+    };
+    let name_contains = match name_filter_arg(args, "name_contains") {
+        Ok(v) => v,
+        Err(msg) => return crate::utils::mcp_error(req_id, -32602, &msg),
+    };
+
     // A wrong type is refused: read as `false` it would return the whole
     // list where the caller asked for the workflows that run.
     let runs_only = match crate::utils::validate_optional_bool(args, "runs", false, &req_id) {
@@ -1229,6 +1243,8 @@ async fn handle_list_workflows(
             type_filter.as_deref(),
             tag_filter.as_deref(),
             runs_only,
+            name_exact.as_deref(),
+            name_contains.as_deref(),
             limit,
             offset,
         )
@@ -1313,6 +1329,34 @@ async fn handle_list_workflows(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// The longest name filter `list_workflows` accepts, in characters.
+const NAME_FILTER_MAX_CHARS: usize = 256;
+
+/// One of `list_workflows`' name filters: absent or null is no filter; a
+/// non-empty string (trimmed, at most [`NAME_FILTER_MAX_CHARS`]) is the
+/// filter; anything else is refused with a message naming the argument.
+fn name_filter_arg(args: &serde_json::Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                Err(format!("'{key}' must not be empty"))
+            } else if t.chars().count() > NAME_FILTER_MAX_CHARS {
+                Err(format!(
+                    "'{key}' is longer than {NAME_FILTER_MAX_CHARS} characters"
+                ))
+            } else {
+                Ok(Some(t.to_string()))
+            }
+        }
+        Some(v) => Err(format!(
+            "'{key}' must be a string, got {}",
+            crate::utils::json_type_name(v)
+        )),
+    }
 }
 
 /// Successful validation outcome for `validate_new_workflow_name`.
@@ -14844,5 +14888,57 @@ mod actor_budget_block_tests {
                 "{name}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod list_and_shape_tests {
+    use super::name_filter_arg;
+    use serde_json::json;
+
+    #[test]
+    fn a_name_filter_is_a_trimmed_non_empty_string_or_refused() {
+        assert_eq!(name_filter_arg(&json!({}), "name"), Ok(None));
+        assert_eq!(name_filter_arg(&json!({"name": null}), "name"), Ok(None));
+        assert_eq!(
+            name_filter_arg(&json!({"name": "  pa-morning  "}), "name"),
+            Ok(Some("pa-morning".to_string()))
+        );
+        for bad in [json!(""), json!("   "), json!(3), json!(["a"])] {
+            assert!(
+                name_filter_arg(&json!({"name": bad}), "name").is_err(),
+                "{bad}"
+            );
+        }
+        let long = "x".repeat(super::NAME_FILTER_MAX_CHARS + 1);
+        assert!(name_filter_arg(&json!({"name_contains": long}), "name_contains").is_err());
+    }
+
+    /// `search` is not a list_workflows argument: it is still reported as
+    /// ignored, in the structured result as well as the warning (the one
+    /// decorator, 2026-10-13); the two new filters are declared.
+    #[test]
+    fn list_workflows_reports_an_undeclared_search_and_declares_the_name_filters() {
+        let args = json!({"search": "pa-", "name": "a", "name_contains": "b"});
+        assert_eq!(
+            crate::utils::unknown_argument_names("list_workflows", &args),
+            vec!["search".to_string()]
+        );
+    }
+
+    /// Both read tools say how their shapes differ.
+    #[test]
+    fn get_workflow_and_export_workflow_state_their_different_shapes() {
+        let tools = crate::tool_hints::all_static_tools();
+        let desc = |n: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == n)
+                .and_then(|t| t["description"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(desc("get_workflow").contains("export_workflow instead nests"));
+        assert!(desc("export_workflow").contains("get_workflow instead returns"));
     }
 }
