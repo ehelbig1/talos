@@ -1156,9 +1156,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
             "name": "update_node_config",
-            "description": "Update a node's configuration, retry settings, or position; or remove a node or edge. \
-                Prefer the dedicated remove_edge tool for edge removal and the standalone node delete via \
-                workflow graph tools for node removal — they have clearer required-field contracts. \
+            "description": "Update a node's configuration, retry settings, or position; or remove (delete) a node or edge. \
+                To remove a node, action: \"remove_node\" here is the only way: there is no separate \
+                delete-node tool. To remove an edge, the dedicated remove_edge tool does the same as \
+                action: \"remove_edge\" here. \
                 \
                 IMPORTANT — update_config vs merge_config: 'update_config' REPLACES the node's entire \
                 config object with the given 'config' value — any existing key not present in the new \

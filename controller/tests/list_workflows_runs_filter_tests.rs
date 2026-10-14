@@ -113,7 +113,7 @@ async fn names(
     runs_only: bool,
 ) -> (Vec<String>, i64) {
     let (rows, total) = repo
-        .list_workflows_paginated(user, status, None, None, runs_only, 200, 0)
+        .list_workflows_paginated(user, status, None, None, runs_only, None, None, 200, 0)
         .await
         .expect("list");
     let mut names: Vec<String> = rows.into_iter().map(|w| w.name).collect();
@@ -233,4 +233,66 @@ async fn the_two_scheduled_counts_come_from_one_statement_and_reconcile() {
     assert!(scheduled.active <= active_workflows);
     assert!(scheduled.active <= scheduled.not_archived);
     assert!(scheduled.not_archived > active_workflows);
+}
+
+/// The name filters (2026-10-14): exact, and a case-insensitive substring in
+/// which `%` and `_` are literal characters. Neither reaches another user's
+/// workflows.
+#[tokio::test]
+async fn name_filters_find_one_workflow_by_name() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let repo = WorkflowRepository::new(pool.clone());
+    let user = seed_user(&pool).await;
+    let stranger = seed_user(&pool).await;
+    for name in [
+        "made-up-weekly-report",
+        "made-up-100%-done",
+        "Made-Up-Morning",
+    ] {
+        workflow(&pool, user, name, "draft", true).await;
+    }
+    workflow(&pool, stranger, "made-up-weekly-report", "draft", true).await;
+
+    let names = |exact: Option<&'static str>, contains: Option<&'static str>| {
+        let repo = &repo;
+        async move {
+            let (rows, total) = repo
+                .list_workflows_paginated(user, None, None, None, false, exact, contains, 200, 0)
+                .await
+                .expect("list");
+            let mut names: Vec<String> = rows.into_iter().map(|w| w.name).collect();
+            names.sort();
+            assert_eq!(total, names.len() as i64, "total counts the same filter");
+            names
+        }
+    };
+
+    assert_eq!(
+        names(Some("made-up-weekly-report"), None).await,
+        vec!["made-up-weekly-report"],
+        "exact, and only the caller's"
+    );
+    assert!(
+        names(Some("made-up-weekly"), None).await.is_empty(),
+        "exact is exact"
+    );
+    assert!(
+        names(Some("made-up-morning"), None).await.is_empty(),
+        "exact is case-sensitive"
+    );
+    assert_eq!(
+        names(None, Some("MORNING")).await,
+        vec!["Made-Up-Morning"],
+        "contains ignores case"
+    );
+    assert_eq!(
+        names(None, Some("100%")).await,
+        vec!["made-up-100%-done"],
+        "`%` is a literal character, not a wildcard"
+    );
+    assert!(
+        names(None, Some("_")).await.is_empty(),
+        "`_` matches only an underscore"
+    );
+    assert_eq!(names(None, Some("made-up")).await.len(), 3);
 }

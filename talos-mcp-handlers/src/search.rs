@@ -1393,6 +1393,85 @@ pub(crate) const TOOL_GROUPS: &[(&str, &[&str])] = &[
 /// of 16 of the 21 tool domains, so the 36 tools of the other five (machine
 /// learning, Ollama, the knowledge graph, ops alerts, evaluation) could not
 /// be found: searching `ml_predict` returned an unrelated tool.
+/// Words a caller uses for the same act as a tool's own word (2026-10-14):
+/// tools say `remove_*` and `delete_*` for removing things, and a caller who
+/// asks for "delete edge" means `remove_edge`. Small and closed on purpose:
+/// a synonym list that grows becomes a second search engine.
+fn synonyms(token: &str) -> &'static [&'static str] {
+    match token {
+        "delete" => &["remove"],
+        "remove" => &["delete"],
+        _ => &[],
+    }
+}
+
+/// What a result matched, said from the match itself (2026-10-14). Until
+/// then the label was read off the SUMMED score, so two words each found in
+/// a name read `exact_name`. The four answers, strongest first:
+/// `exact_name` (the query is the tool's name, as typed or as an
+/// identifier), `action_match` (the query is one of its `action` values),
+/// `name_match` (a word is in its name), `description_match`.
+fn relevance_label(tool: &serde_json::Value, query: &str) -> &'static str {
+    let name = tool
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_lowercase();
+    let words: Vec<&str> = query
+        .split(|c: char| c.is_whitespace() || c == '_')
+        .filter(|t| t.len() >= 3)
+        .collect();
+    let spellings = |w: &str| -> Vec<String> {
+        std::iter::once(w.to_string())
+            .chain(synonyms(w).iter().map(|s| (*s).to_string()))
+            .collect()
+    };
+    let as_identifier: Vec<String> = match words.as_slice() {
+        [] => vec![query.to_string()],
+        [first, rest @ ..] => {
+            let mut acc = spellings(first);
+            for w in rest {
+                acc = acc
+                    .iter()
+                    .flat_map(|a| spellings(w).into_iter().map(move |s| format!("{a}_{s}")))
+                    .take(8)
+                    .collect();
+            }
+            acc
+        }
+    };
+    if name == query || as_identifier.contains(&name) {
+        "exact_name"
+    } else if tool_action_names(tool)
+        .iter()
+        .any(|a| as_identifier.iter().any(|j| j == a))
+    {
+        "action_match"
+    } else if words
+        .iter()
+        .any(|w| spellings(w).iter().any(|s| name.contains(s.as_str())))
+    {
+        "name_match"
+    } else {
+        "description_match"
+    }
+}
+
+/// The values a tool's `action` argument takes (its `enum`), lowercased.
+/// Empty for a tool without one.
+fn tool_action_names(tool: &serde_json::Value) -> Vec<String> {
+    tool.pointer("/inputSchema/properties/action/enum")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_lowercase)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn rank_tools(all_tools: Vec<serde_json::Value>, query: &str) -> Vec<(u32, serde_json::Value)> {
     // Tokenize the query: split on whitespace and underscores so multi-word
     // queries like "create workflow blank new" and underscore-joined queries
@@ -1410,6 +1489,29 @@ fn rank_tools(all_tools: Vec<serde_json::Value>, query: &str) -> Vec<(u32, serde
         } else {
             v
         }
+    };
+
+    // The query as one identifier, in each delete/remove spelling: "delete
+    // node" is also `delete_node` and `remove_node`. Bounded: at most 8.
+    let joined: Vec<String> = {
+        let mut variants: Vec<Vec<&str>> = vec![Vec::new()];
+        for &tok in &tokens {
+            let spellings: Vec<&str> = std::iter::once(tok)
+                .chain(synonyms(tok).iter().copied())
+                .collect();
+            variants = variants
+                .into_iter()
+                .flat_map(|v| {
+                    spellings.iter().map(move |s| {
+                        let mut v = v.clone();
+                        v.push(s);
+                        v
+                    })
+                })
+                .take(8)
+                .collect();
+        }
+        variants.into_iter().map(|v| v.join("_")).collect()
     };
 
     // Score each tool against every token independently.
@@ -1430,22 +1532,44 @@ fn rank_tools(all_tools: Vec<serde_json::Value>, query: &str) -> Vec<(u32, serde
                 .to_string();
             let name_lower = name.to_lowercase();
             let desc_lower = desc.to_lowercase();
+            // A tool whose name, or one of whose `action` values, IS the
+            // query as an identifier ("remove node" -> `remove_node`, an
+            // action of `update_node_config`) is what was asked for, above
+            // every tool that merely mentions the words (2026-10-14).
+            let actions = tool_action_names(&tool);
+            let identifier_bonus: u32 = if joined
+                .iter()
+                .any(|j| *j == name_lower || actions.iter().any(|a| a == j))
+            {
+                4
+            } else {
+                0
+            };
 
             let score: u32 = tokens
                 .iter()
                 .map(|&tok| {
-                    if name_lower == tok {
-                        3 // Exact name match
-                    } else if name_lower.contains(tok) {
-                        2 // Name substring match
-                    } else if desc_lower.contains(tok) {
-                        1 // Description contains token
-                    } else {
-                        0
-                    }
+                    // A token scores as its best spelling: itself or a word
+                    // the tools use for the same act (`delete` / `remove`).
+                    std::iter::once(tok)
+                        .chain(synonyms(tok).iter().copied())
+                        .map(|t| {
+                            if name_lower == t {
+                                3 // Exact name match
+                            } else if name_lower.contains(t) {
+                                2 // Name substring match
+                            } else if desc_lower.contains(t) {
+                                1 // Description contains token
+                            } else {
+                                0
+                            }
+                        })
+                        .max()
+                        .unwrap_or(0)
                 })
                 .sum();
 
+            let score = score + identifier_bonus;
             if score == 0 {
                 None
             } else {
@@ -1514,12 +1638,8 @@ async fn handle_tool_search(
     let results: Vec<serde_json::Value> = scored
         .into_iter()
         .take(limit)
-        .map(|(score, tool)| {
-            let relevance = match score {
-                3 => "exact_name",
-                2 => "name_match",
-                _ => "description_match",
-            };
+        .map(|(_score, tool)| {
+            let relevance = relevance_label(&tool, &query);
             if compact {
                 serde_json::json!({
                     "name": tool.get("name"),
@@ -1633,6 +1753,65 @@ mod tool_search_coverage_tests {
             .into_iter()
             .filter_map(|(_, tool)| tool["name"].as_str().map(str::to_string))
             .collect()
+    }
+
+    /// A result's `relevance` says what matched, not how high it scored.
+    #[test]
+    fn relevance_says_what_matched() {
+        use super::relevance_label;
+        let tools = all_static_tools();
+        let tool = |n: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == n)
+                .unwrap_or_else(|| panic!("{n} is listed"))
+                .clone()
+        };
+        assert_eq!(
+            relevance_label(&tool("remove_edge"), "delete edge"),
+            "exact_name"
+        );
+        assert_eq!(
+            relevance_label(&tool("remove_edge"), "remove_edge"),
+            "exact_name"
+        );
+        assert_eq!(
+            relevance_label(&tool("update_node_config"), "remove node"),
+            "action_match"
+        );
+        assert_eq!(
+            relevance_label(&tool("add_collect_node"), "remove node"),
+            "name_match"
+        );
+        assert_eq!(
+            relevance_label(&tool("add_action_links_node"), "remove node"),
+            "name_match",
+            "two words in a name is not the name"
+        );
+    }
+
+    /// The one way to remove a node is `update_node_config`'s
+    /// `action: "remove_node"` (likewise an edge, `remove_edge`): asking for
+    /// it in words finds it among the first results tool_search returns
+    /// (default 10), not behind every tool whose name contains `node`.
+    #[test]
+    fn removing_a_node_or_an_edge_finds_the_tool_that_does_it() {
+        for (query, tool) in [
+            ("remove node", "update_node_config"),
+            ("delete node", "update_node_config"),
+            ("remove a node", "update_node_config"),
+            ("remove_node", "update_node_config"),
+            ("remove edge", "remove_edge"),
+            ("delete edge", "remove_edge"),
+        ] {
+            let hits = found(&query.to_lowercase());
+            let at = hits.iter().position(|n| n == tool);
+            assert!(
+                at.is_some_and(|i| i < 3),
+                "{query}: {tool} at {at:?} in {:?}",
+                &hits[..hits.len().min(12)]
+            );
+        }
     }
 
     /// Every tool this server lists can be found by its own name. Measured
