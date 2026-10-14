@@ -37,10 +37,11 @@ pub use talos_memory::{
 /// keep working through this re-export.
 pub use talos_graph_rag::GRAPH_SERVICE;
 
+pub mod actor_context;
 /// Actor-context assembly (memory recall + graph-RAG + ranking), moved here from
 /// `talos-workflow-repository` on 2026-09-12 so a persistence crate no longer
 /// depends on services.
-pub mod actor_context;
+pub mod read_grants;
 pub use actor_context::MemoryScope;
 
 /// Adapter that hands graph extraction to `GRAPH_SERVICE` via the

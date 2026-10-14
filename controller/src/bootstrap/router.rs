@@ -3598,6 +3598,17 @@ pub(crate) fn build_router(
         .layer(Extension(webhook_limiter.clone()))
         .layer(Extension(whitelist.clone()));
 
+    // Memory read grants: a bearer token that reads ONE key of ONE actor's
+    // memory. The token is in the `Authorization` header, never the path;
+    // the scope was fixed when the owner minted the grant, so the request has
+    // no parameter. Read-only (GET). Every refusal is one 404. The webhook
+    // limiter guards enumeration, as for the capability routes above.
+    let memory_grant_routes = Router::new()
+        .route("/memory-grants/document", get(webhooks::memory_grant_read))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(webhook_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
     // Public suspension callback routes.
     // Auth is the 64-hex correlation_id (256-bit random) embedded in the URL.
     // Rate-limited to prevent enumeration brute-force.
@@ -4009,6 +4020,7 @@ pub(crate) fn build_router(
         .merge(correction_routes)
         .merge(approval_action_routes)
         .merge(action_link_routes)
+        .merge(memory_grant_routes)
         .merge(suspension_callback_routes)
         .merge(google_calendar_routes)
         .merge(google_calendar_webhook_routes)

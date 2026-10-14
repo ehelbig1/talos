@@ -421,6 +421,8 @@ pub const BLOCKED_TABLES_LIST: &[&str] = &[
     "ops_alert_correction_tokens",
     "workflow_action_tokens",
     "worker_provisioning_tokens",
+    // Hashes of bearer tokens that read one actor-memory key (2026-10-13).
+    "memory_read_grants",
 ];
 
 /// MCP-627 / MCP-1002: the precompiled per-table word-boundary regex set
