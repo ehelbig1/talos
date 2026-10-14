@@ -1,8 +1,8 @@
 {
   "name": "notify-ntfy",
-  "version": "v1.0.0",
+  "version": "v1.1.0",
   "display_name": "Notify: ntfy",
-  "description": "Send a phone notification through an ntfy server (ntfy.sh or one you run). INPUT (the same for every notify-* adapter): the node before this one returns `notification: {title?, body, priority?: low|normal|high, tag?, link?, actions?: [{title, link, one_tap?}]}`; `skip: true` sends nothing. Links must be https; anything else is not sent and is counted. At most 3 actions. OUTPUT (the same for every adapter): {provider, sent, skipped, dry_run, status, actions_sent, actions_dropped, one_tap_actions, link_sent, link_dropped, tag_sent}. To change service, swap this module on the send node (swap_node_module) and set the other adapter's config; nothing upstream changes. See docs/notification-contract.md. WHAT NTFY DOES WITH IT: priority low/normal/high is sent as 2/3/4; `link` is what a tap opens; an action marked one_tap is sent as a background POST, so a Talos action link acts on ONE tap with no page to confirm; other actions open their link; `tag` is not sent (tag_sent is false). A response that is not 2xx fails the node with the host and the status, never the body. GRANTS: installs with NO allowed hosts and no secrets, so it can reach nothing until you say what it may reach: set the server's host with update_module_hosts and the token's exact path with update_module_secrets. Use one installed copy per server. CREDENTIALS: the module never holds one; AUTH_HEADER carries a vault:// reference the host replaces when the request is sent.",
+  "description": "Send a phone notification through an ntfy server (ntfy.sh or one you run). INPUT (the same for every notify-* adapter): the node before this one returns `notification: {title?, body, priority?: low|normal|high, tag?, link?, actions?: [{title, link, one_tap?, keep?}]}`, or `notifications`, an ordered list of 1 to 6 of them (never both); `skip: true` sends nothing. A list is sent in order, one request each, and stops at the first that fails: that FAILS the node and the error says how far it got. Do not set retry_count on a node that sends a list (a retry would resend the delivered ones), and make timeout_secs cover parts \u00d7 TIMEOUT_MS. Links must be https; anything else is not sent and is counted. At most 3 actions. OUTPUT (the same for every adapter): {provider, sent, skipped, dry_run, status, parts_total, parts_sent, actions_sent, actions_dropped, one_tap_actions, kept_actions, link_sent, link_dropped, tag_sent}; for a list the counts are sums. To change service, swap this module on the send node (swap_node_module) and set the other adapter's config; nothing upstream changes. See docs/notification-contract.md. WHAT NTFY DOES WITH IT: priority low/normal/high is sent as 2/3/4; `link` is what a tap opens; an action marked one_tap is sent as a background POST, so a Talos action link acts on ONE tap with no page to confirm; other actions open their link; using an action dismisses the notification unless the action is marked keep (kept_actions counts those); `tag` is not sent (tag_sent is false). A response that is not 2xx fails the node with the host and the status, never the body. GRANTS: installs with NO allowed hosts and no secrets, so it can reach nothing until you say what it may reach: set the server's host with update_module_hosts and the token's exact path with update_module_secrets. Use one installed copy per server. CREDENTIALS: the module never holds one; AUTH_HEADER carries a vault:// reference the host replaces when the request is sent.",
   "category": "Communication",
   "capability_world": "http-node",
   "block": {"role": "sender", "contract": "notification"},
@@ -13,10 +13,11 @@
   "requires_secrets": [],
   "requires_approval_for": [],
   "recommended_fuel": {
-    "expected_items": 1,
-    "bytes_per_item": 4000,
+    "expected_items": 6,
+    "bytes_per_item": 3000,
     "llm_output_bytes": 0,
-    "safety_multiplier": 3.0
+    "fuel_per_byte": 100,
+    "safety_multiplier": 2.0
   },
   "config_schema": {
     "type": "object",

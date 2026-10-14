@@ -1,8 +1,10 @@
 # Recorded run
 
-Made-up data: one notification with a title, a body, a link and three
-actions (the most the contract allows) and a reply box from config, so the
-run builds the largest message this adapter can, answered by a made-up 200.
+Made-up data: the largest message the contract allows. `notifications` holds
+six parts, each with a title, a 1,500-character body, a link, a tag and three
+actions, with the reply box from config, each answered by a made-up 200. The
+fuel limit in `talos.json` is sized from this run, so it covers the longest
+list.
 
 `input.json` is the upstream node's output, `config.json` the node config,
 `http.json` the service's answer, and `grants.json` names the host the
