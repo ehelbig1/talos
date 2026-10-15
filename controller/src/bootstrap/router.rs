@@ -965,6 +965,28 @@ pub(crate) const CORS_MAX_AGE: &str = "3600";
 // allowlist; reading the raw env at request-time was the source of
 // the multi-origin ACAO drift bug that MCP-1168 closed.
 
+/// Whether a path's only credential is the capability token in it: an action link, tapped
+/// straight from a phone notification (docs/action-links.md, "the one-tap form"). Its reply
+/// may be read from any origin, with no credentials: reading it tells a holder of the link
+/// nothing the link did not (a page saying done, already used or invalid, and the link's
+/// label, which is not private), no cookie or header is honoured there, and a cross-origin
+/// POST reaches it whatever the response headers say. Without this, the phone's web client
+/// shows "Failed to fetch" for a tap that worked.
+pub(crate) fn is_capability_link_path(path: &str) -> bool {
+    path.starts_with("/action-links/")
+}
+
+/// The CORS answer for a request: the `Access-Control-Allow-Origin` value to send, if any,
+/// and whether credentials are allowed. A capability link answers every origin and no
+/// credentials; everything else echoes an allow-listed origin, with credentials.
+pub(crate) fn cors_answer(path: &str, echoed_origin: Option<&str>) -> (Option<String>, bool) {
+    if is_capability_link_path(path) {
+        (Some("*".to_string()), false)
+    } else {
+        (echoed_origin.map(str::to_string), true)
+    }
+}
+
 pub(crate) async fn cors_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
     use axum::http::Method;
 
@@ -1001,6 +1023,7 @@ pub(crate) async fn cors_middleware(req: Request<axum::body::Body>, next: Next) 
         .as_deref()
         .filter(|o| talos_config::is_allowed_origin(o))
         .map(|s| s.to_string());
+    let (allow_origin, credentials) = cors_answer(req.uri().path(), echoed_origin.as_deref());
 
     // Handle preflight OPTIONS requests immediately
     if req.method() == Method::OPTIONS {
@@ -1012,7 +1035,7 @@ pub(crate) async fn cors_middleware(req: Request<axum::body::Body>, next: Next) 
         // MCP-1168: only set ACAO when the request's Origin is in
         // the allowlist. Browsers without ACAO refuse the response,
         // which is the correct CORS deny shape.
-        if let Some(o) = &echoed_origin {
+        if let Some(o) = &allow_origin {
             if let Ok(v) = HeaderValue::from_str(o) {
                 headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
             }
@@ -1025,10 +1048,12 @@ pub(crate) async fn cors_middleware(req: Request<axum::body::Body>, next: Next) 
             header::ACCESS_CONTROL_ALLOW_HEADERS,
             HeaderValue::from_static(CORS_ALLOW_HEADERS),
         );
-        headers.insert(
-            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-            HeaderValue::from_static("true"),
-        );
+        if credentials {
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                HeaderValue::from_static("true"),
+            );
+        }
         headers.insert(
             header::ACCESS_CONTROL_MAX_AGE,
             HeaderValue::from_static(CORS_MAX_AGE),
@@ -1045,7 +1070,7 @@ pub(crate) async fn cors_middleware(req: Request<axum::body::Body>, next: Next) 
     let mut response = next.run(req).await;
 
     let headers = response.headers_mut();
-    if let Some(o) = &echoed_origin {
+    if let Some(o) = &allow_origin {
         if let Ok(v) = HeaderValue::from_str(o) {
             headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
         }
@@ -1058,10 +1083,12 @@ pub(crate) async fn cors_middleware(req: Request<axum::body::Body>, next: Next) 
         header::ACCESS_CONTROL_ALLOW_HEADERS,
         HeaderValue::from_static(CORS_ALLOW_HEADERS),
     );
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-        HeaderValue::from_static("true"),
-    );
+    if credentials {
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+    }
     // MCP-1168: append-or-set `Vary: Origin`. The security_headers
     // layer sets `Vary: Cookie` already; both must apply so caches
     // partition by both axes.
@@ -4802,6 +4829,102 @@ mod second_factor_injection_pin {
         assert!(
             !branch.contains("SecondFactorVerified"),
             "an API-key request must not be marked second-factor verified"
+        );
+    }
+}
+
+/// An action link's reply is readable from any origin, with no credentials; every other
+/// route keeps the allow-listed, credentialed answer. Driven through the real middleware.
+#[cfg(test)]
+mod capability_link_cors_tests {
+    use super::{cors_answer, cors_middleware, is_capability_link_path};
+    use axum::body::Body;
+    use axum::http::{header, Request};
+    use axum::middleware::from_fn;
+    use tower::ServiceExt;
+
+    /// The phone's web client: not on any deployment's allow-list.
+    const NTFY: &str = "https://ntfy.example.test";
+
+    fn app() -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/action-links/{token}",
+                axum::routing::post(|| async { "Done" }),
+            )
+            .route("/graphql", axum::routing::post(|| async { "{}" }))
+            .layer(from_fn(cors_middleware))
+    }
+
+    async fn answer(method: &str, path: &str) -> (Option<String>, Option<String>) {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::ORIGIN, NTFY)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let get = |h| {
+            response
+                .headers()
+                .get(h)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        (
+            get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_tap_on_an_action_link_can_be_read_by_the_phone_and_carries_no_credentials() {
+        let token = format!("/action-links/{}", "a".repeat(64));
+        for method in ["POST", "OPTIONS"] {
+            assert_eq!(
+                answer(method, &token).await,
+                (Some("*".to_string()), None),
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_other_route_still_refuses_an_origin_that_is_not_allowed() {
+        for method in ["POST", "OPTIONS"] {
+            assert_eq!(
+                answer(method, "/graphql").await,
+                (None, Some("true".to_string())),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_action_link_path_is_answered_to_every_origin() {
+        assert!(is_capability_link_path("/action-links/abc"));
+        for path in [
+            "/action-links",
+            "/graphql",
+            "/approvals/abc",
+            "/corrections/abc/high",
+            "/api/action-links/abc",
+            "//action-links/abc",
+        ] {
+            assert!(!is_capability_link_path(path), "{path}");
+        }
+        // An allow-listed origin is still echoed, with credentials, everywhere else.
+        assert_eq!(
+            cors_answer("/graphql", Some("https://app.example.test")),
+            (Some("https://app.example.test".to_string()), true)
+        );
+        assert_eq!(cors_answer("/graphql", None), (None, true));
+        assert_eq!(
+            cors_answer("/action-links/abc", Some("https://app.example.test")),
+            (Some("*".to_string()), false)
         );
     }
 }
