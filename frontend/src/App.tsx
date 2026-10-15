@@ -9,13 +9,12 @@ import {
 } from "react-router";
 import { RouterProvider } from "react-router/dom";
 import { TooltipProvider } from "@radix-ui/react-tooltip";
-import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
 import { AuthForm } from "@/components/auth/AuthForm";
 import { OAuthCallback } from "@/components/auth/OAuthCallback";
 import { useTokenRefresh } from "@/hooks/useTokenRefresh";
 import { useGetApprovalsQuery } from "@/generated/graphql";
-import { Zap, Activity, Loader2 } from "lucide-react";
+import { Zap, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { CompilationStatus } from "@/components/CompilationStatus";
@@ -33,16 +32,25 @@ const ModelReview = lazy(() => import("@/pages/ModelReview"));
 const AlertTriage = lazy(() => import("@/pages/AlertTriage"));
 
 /** The primary navigation, in the order a new user meets the product. */
-const NAV_ITEMS: { to: string; label: string; end?: boolean }[] = [
-  { to: "/", label: "Workflows", end: true },
+const NAV_ITEMS: {
+  to: string;
+  label: string;
+  end?: boolean;
+  /** Other paths this entry is the home of (the editor belongs to Workflows). */
+  alsoActiveOn?: string[];
+}[] = [
+  { to: "/", label: "Workflows", end: true, alsoActiveOn: ["/editor"] },
   { to: "/briefings", label: "Briefings" },
-  { to: "/editor", label: "Editor" },
   { to: "/actors", label: "Actors" },
-  { to: "/models", label: "Models" },
-  { to: "/alerts", label: "Alerts" },
   { to: "/library", label: "Library" },
   { to: "/settings", label: "Settings" },
 ];
+
+function isHomeOf(item: (typeof NAV_ITEMS)[number], pathname: string): boolean {
+  return (item.alsoActiveOn ?? []).some(
+    (p) => pathname === p || pathname.startsWith(p + "/"),
+  );
+}
 
 function LoadingScreen() {
   return (
@@ -62,6 +70,7 @@ function LoadingScreen() {
 
 function AuthenticatedApp() {
   const { user, logout } = useAuth();
+  const { pathname } = useLocation();
   useTokenRefresh();
 
   const { data: approvalsData } = useGetApprovalsQuery(
@@ -111,9 +120,13 @@ function AuthenticatedApp() {
                 key={item.to}
                 to={item.to}
                 end={item.end}
-                className={navLinkClass}
+                className={({ isActive }) =>
+                  navLinkClass({
+                    isActive: isActive || isHomeOf(item, pathname),
+                  })
+                }
               >
-                {({ isActive }) => (
+                {({ isActive: routeActive }) => (
                   <>
                     <span className="flex items-center gap-2">
                       {item.label}
@@ -126,7 +139,7 @@ function AuthenticatedApp() {
                         </span>
                       )}
                     </span>
-                    {isActive && (
+                    {(routeActive || isHomeOf(item, pathname)) && (
                       <span className="absolute -bottom-[13px] left-3 right-3 h-0.5 bg-primary rounded-full" />
                     )}
                   </>
@@ -136,26 +149,6 @@ function AuthenticatedApp() {
           </div>
 
           <div className="ml-auto flex items-center gap-4">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <NavLink
-                  to="/system-health"
-                  aria-label="System health"
-                  className={({ isActive }) =>
-                    cn(
-                      "p-2 rounded-lg transition-premium border",
-                      isActive
-                        ? "text-primary bg-primary/5 border-primary/20"
-                        : "text-muted-foreground hover:text-white hover:bg-white/5 border-transparent",
-                    )
-                  }
-                >
-                  <Activity className="w-4 h-4" />
-                </NavLink>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">System health</TooltipContent>
-            </Tooltip>
-
             <div className="h-6 w-px bg-white/10" />
 
             <div

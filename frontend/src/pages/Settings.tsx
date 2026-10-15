@@ -1,6 +1,7 @@
 import React, { Suspense, lazy, useCallback, useState, useEffect } from "react";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { useAuth } from "@/contexts/AuthContext";
+import { Link } from "react-router";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/ui";
 import {
@@ -24,6 +25,9 @@ import {
   Search,
   Layers,
   type LucideIcon,
+  Activity,
+  AlertTriangle,
+  BrainCircuit,
 } from "lucide-react";
 
 // Lazy-loaded panel chunks with module references for prefetching.
@@ -44,8 +48,6 @@ const oauthImport = () => import("@/components/settings/OAuthManager");
 const schedulesImport = () => import("@/components/settings/SchedulesManager");
 const securityImport = () => import("@/components/settings/SecurityManager");
 const webhooksImport = () => import("@/components/settings/WebhookManager");
-const templatesImport = () =>
-  import("@/components/settings/ModuleTemplatesBrowser");
 const capabilityCeilingImport = () =>
   import("@/components/settings/CapabilityCeilingManager");
 
@@ -84,9 +86,6 @@ const SecurityManager = lazy(() =>
 const WebhookManager = lazy(() =>
   webhooksImport().then((m) => ({ default: m.default })),
 );
-const ModuleTemplatesBrowser = lazy(() =>
-  templatesImport().then((m) => ({ default: m.default })),
-);
 const CapabilityCeilingManager = lazy(() =>
   capabilityCeilingImport().then((m) => ({ default: m.default })),
 );
@@ -108,7 +107,6 @@ const prefetchMap: Record<string, () => Promise<unknown>> = {
   schedules: schedulesImport,
   security: securityImport,
   webhooks: webhooksImport,
-  templates: templatesImport,
   "capability-ceiling": capabilityCeilingImport,
 };
 
@@ -118,6 +116,8 @@ interface SidebarItem {
   value: string;
   label: string;
   icon: LucideIcon;
+  /** A page of its own, listed here so it has a home; it is not a section. */
+  to?: string;
 }
 
 interface SidebarCategory {
@@ -139,7 +139,12 @@ const SIDEBAR_CATEGORIES: SidebarCategory[] = [
     label: "Workflow",
     items: [
       { value: "schedules", label: "Schedules", icon: Calendar },
-      { value: "templates", label: "Templates", icon: Layout },
+      {
+        value: "templates",
+        label: "Templates",
+        icon: Layout,
+        to: "/library#templates",
+      },
     ],
   },
   {
@@ -160,6 +165,24 @@ const SIDEBAR_CATEGORIES: SidebarCategory[] = [
     ],
   },
   {
+    label: "Operations",
+    items: [
+      {
+        value: "system-health",
+        label: "System health",
+        icon: Activity,
+        to: "/system-health",
+      },
+      { value: "alerts", label: "Alerts", icon: AlertTriangle, to: "/alerts" },
+      {
+        value: "models",
+        label: "Model review",
+        icon: BrainCircuit,
+        to: "/models",
+      },
+    ],
+  },
+  {
     label: "Admin",
     items: [
       { value: "organizations", label: "Organizations", icon: Building },
@@ -172,6 +195,16 @@ const SIDEBAR_CATEGORIES: SidebarCategory[] = [
 ];
 
 const ALL_ITEMS: SidebarItem[] = SIDEBAR_CATEGORIES.flatMap((c) => c.items);
+/** The sections this page renders itself (a hash may name one of these). */
+const SECTION_ITEMS: SidebarItem[] = ALL_ITEMS.filter((i) => !i.to);
+
+const sidebarItemClass = (isActive: boolean) =>
+  cn(
+    "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-premium",
+    isActive
+      ? "bg-primary/10 text-primary"
+      : "text-muted-foreground hover:text-foreground hover:bg-white/5",
+  );
 
 // ─── Sidebar component ────────────────────────────────────────────────────────
 
@@ -226,29 +259,33 @@ function SettingsSidebar({
               {category.items.map((item) => {
                 const Icon = item.icon;
                 const isActive = active === item.value;
+                const content = (
+                  <>
+                    <Icon
+                      className={cn(
+                        "h-4 w-4 shrink-0",
+                        isActive ? "text-primary" : "text-muted-foreground/70",
+                      )}
+                    />
+                    {item.label}
+                  </>
+                );
                 return (
                   <li key={item.value}>
-                    <button
-                      onClick={() => onSelect(item.value)}
-                      onMouseEnter={() => onPrefetch(item.value)}
-                      onFocus={() => onPrefetch(item.value)}
-                      className={cn(
-                        "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-premium",
-                        isActive
-                          ? "bg-primary/10 text-primary"
-                          : "text-muted-foreground hover:text-foreground hover:bg-white/5",
-                      )}
-                    >
-                      <Icon
-                        className={cn(
-                          "h-4 w-4 shrink-0",
-                          isActive
-                            ? "text-primary"
-                            : "text-muted-foreground/70",
-                        )}
-                      />
-                      {item.label}
-                    </button>
+                    {item.to ? (
+                      <Link to={item.to} className={sidebarItemClass(false)}>
+                        {content}
+                      </Link>
+                    ) : (
+                      <button
+                        onClick={() => onSelect(item.value)}
+                        onMouseEnter={() => onPrefetch(item.value)}
+                        onFocus={() => onPrefetch(item.value)}
+                        className={sidebarItemClass(isActive)}
+                      >
+                        {content}
+                      </button>
+                    )}
                   </li>
                 );
               })}
@@ -291,7 +328,7 @@ export default function Settings() {
   // Initialize from URL hash, fall back to "integrations".
   const [active, setActive] = useState<string>(() => {
     const hash = window.location.hash.slice(1);
-    return ALL_ITEMS.some((i) => i.value === hash) ? hash : "integrations";
+    return SECTION_ITEMS.some((i) => i.value === hash) ? hash : "integrations";
   });
 
   // Keep URL hash in sync when active section changes.
@@ -333,17 +370,22 @@ export default function Settings() {
         <div className="absolute right-0 inset-y-0 w-8 bg-gradient-to-l from-background to-transparent z-10 pointer-events-none" />
         <div className="flex gap-2 overflow-x-auto px-8 py-4 border-b border-white/5 bg-surface-2/40 backdrop-blur-xl custom-scrollbar">
           {ALL_ITEMS.map((item) => {
-            const isActive = active === item.value;
-            return (
+            const isActive = !item.to && active === item.value;
+            const pill = cn(
+              "whitespace-nowrap text-xs font-medium px-3 py-2 rounded-full border transition-premium shrink-0",
+              isActive
+                ? "bg-primary/10 text-primary border-primary/20"
+                : "bg-surface-4/60 text-muted-foreground border-white/5 hover:text-foreground",
+            );
+            return item.to ? (
+              <Link key={item.value} to={item.to} className={pill}>
+                {item.label}
+              </Link>
+            ) : (
               <button
                 key={item.value}
                 onClick={() => setActive(item.value)}
-                className={cn(
-                  "whitespace-nowrap text-xs font-medium px-3 py-2 rounded-full border transition-premium shrink-0",
-                  isActive
-                    ? "bg-primary/10 text-primary border-primary/20"
-                    : "bg-surface-4/60 text-muted-foreground border-white/5 hover:text-foreground",
-                )}
+                className={pill}
               >
                 {item.label}
               </button>
@@ -437,13 +479,6 @@ export default function Settings() {
               <ErrorBoundary>
                 <Suspense fallback={<PanelLoading />}>
                   <WebhookManager />
-                </Suspense>
-              </ErrorBoundary>
-            )}
-            {active === "templates" && (
-              <ErrorBoundary>
-                <Suspense fallback={<PanelLoading />}>
-                  <ModuleTemplatesBrowser />
                 </Suspense>
               </ErrorBoundary>
             )}
