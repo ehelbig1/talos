@@ -87,6 +87,28 @@ pub fn required_fuel_floor(max_tokens: u64, context_byte_budget: u64) -> u64 {
         .saturating_add(context_byte_budget.saturating_mul(FUEL_PER_CONTEXT_BYTE))
 }
 
+/// The most fuel any one node is given: the engine clamps every node's budget to
+/// `talos_workflow_engine::DEFAULT_MAX_FUEL_PER_NODE`, which the dispatcher pins
+/// equal to this protocol constant, and nothing in a deployment raises it.
+pub const NODE_FUEL_CEILING: u64 = talos_workflow_job_protocol::MAX_JOB_FUEL;
+
+/// What an author is told when a node asks for more fuel than any node is given;
+/// `None` at or below the ceiling. The one wording for the validator's
+/// `fuel-above-ceiling` warning and the node-config write replies: a budget above
+/// the ceiling is accepted and clamped at dispatch, so without this the only sign
+/// is a fuel-exhausted failure at the ceiling, and raising `max_fuel` again
+/// changes nothing (2026-10-15: a check node set to 250M ran out at 50M).
+pub fn fuel_above_ceiling(requested: u64) -> Option<String> {
+    (requested > NODE_FUEL_CEILING).then(|| {
+        format!(
+            "max_fuel {requested} is above the {NODE_FUEL_CEILING} every node is capped at, so \
+             the node runs under {NODE_FUEL_CEILING} and the rest is never given. Raising \
+             max_fuel cannot help a node that needs more: make it cheaper (less copying, fewer \
+             passes over its input) or split it into smaller nodes."
+        )
+    })
+}
+
 /// Whether a node in `capability_world` receives `__actor_context__` by
 /// default, honouring an explicit per-node `needs_memory`.
 ///
@@ -3144,6 +3166,31 @@ pub fn validate_prepared_with_children(
                     node_id: Some(node_label.to_string()),
                     category: "fuel-sizing".into(),
                 });
+            }
+
+            // ── A budget above the per-node ceiling (Warning) ──────────────────
+            //
+            // The same baseline as `resolve_node_max_fuel` (node-scoped
+            // `data.max_fuel` ?? `modules.max_fuel`): above the ceiling it is
+            // clamped at dispatch, silently, so the author is told here.
+            for node in &nodes {
+                let cfg = node_dispatch_config(node);
+                let module_fuel = talos_workflow_engine_core::node_module_id(node)
+                    .and_then(|t| template_fuel.get(&t))
+                    .and_then(|(fuel, _)| fuel.filter(|f| *f > 0).map(|f| f as u64));
+                let Some(requested) = cfg.get("max_fuel").and_then(|v| v.as_u64()).or(module_fuel)
+                else {
+                    continue;
+                };
+                if let Some(note) = fuel_above_ceiling(requested) {
+                    let node_label = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        message: format!("Node '{node_label}': {note}"),
+                        node_id: Some(node_label.to_string()),
+                        category: "fuel-above-ceiling".into(),
+                    });
+                }
             }
 
             // ── Retry envelope vs the workflow budget (Warning) ──────────────
@@ -7911,6 +7958,60 @@ mod fleet_convergence_tests {
         // And it is a WARNING, so it must NOT make the workflow invalid —
         // the count contract the fleet response now states explicitly.
         assert!(result.valid, "a retry-envelope overrun is not an error");
+    }
+
+    /// A budget above the per-node ceiling is clamped at dispatch, so it is
+    /// warned about: the node's own `max_fuel`, or the module row's when the
+    /// node sets none. At the ceiling, or below, nothing is said.
+    #[test]
+    fn a_node_asking_for_more_fuel_than_any_node_is_given_is_warned_about() {
+        let node = |data: serde_json::Value| serde_json::json!({"nodes": [{"id": "check", "type": module_id().to_string(), "retry_count": 0, "data": data}], "edges": []});
+        let ceiling_warnings =
+            |graph: serde_json::Value, module_fuel: Option<i64>| -> Vec<String> {
+                let mut template = http_get_template(vec![]);
+                template.max_fuel = module_fuel;
+                let result = validate_prepared(prepared(graph, vec![template]));
+                assert!(result.valid, "a budget above the ceiling is not an error");
+                result
+                    .issues
+                    .iter()
+                    .filter(|i| i.category == "fuel-above-ceiling")
+                    .map(|i| i.message.clone())
+                    .collect()
+            };
+        let over = ceiling_warnings(node(serde_json::json!({"max_fuel": 250_000_000u64})), None);
+        assert_eq!(over.len(), 1, "{over:#?}");
+        assert!(
+            over[0].starts_with(
+                "Node 'check': max_fuel 250000000 is above the 50000000 every node is capped at"
+            ),
+            "{}",
+            over[0]
+        );
+        assert!(
+            over[0].contains("Raising max_fuel cannot help"),
+            "{}",
+            over[0]
+        );
+        // The module row's budget, when the node sets none.
+        assert_eq!(
+            ceiling_warnings(node(serde_json::json!({})), Some(60_000_000)).len(),
+            1
+        );
+        // The node's own budget wins over the module row's, as at dispatch.
+        assert!(ceiling_warnings(
+            node(serde_json::json!({"max_fuel": 40_000_000u64})),
+            Some(60_000_000)
+        )
+        .is_empty());
+        // At the ceiling exactly, and with no budget at all: nothing to say.
+        assert!(ceiling_warnings(
+            node(serde_json::json!({"max_fuel": super::NODE_FUEL_CEILING})),
+            None
+        )
+        .is_empty());
+        assert!(ceiling_warnings(node(serde_json::json!({})), None).is_empty());
+        assert_eq!(super::NODE_FUEL_CEILING, 50_000_000);
     }
 
     /// The ERROR the fleet view missed, and the reason it missed it.

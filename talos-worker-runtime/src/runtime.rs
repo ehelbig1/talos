@@ -197,11 +197,18 @@ pub fn fuel_exhausted_message(
         Some(c) => format!("consumed {c} instructions of a {limit}-instruction budget"),
         None => format!("did not finish within its {limit}-instruction budget"),
     };
+    // At the per-node ceiling a larger max_fuel is clamped back to it, so "configurable" would
+    // send the author to raise a number that changes nothing (2026-10-15: 250M asked, 50M run).
+    let how = if limit >= talos_workflow_job_protocol::MAX_JOB_FUEL {
+        "the most any node is given: a larger per-node max_fuel is clamped to it, so make the module cheaper or split it"
+    } else {
+        "configurable via WASM_FUEL_LIMIT or per-node max_fuel config"
+    };
     format!(
         "WASM fuel exhausted{where_}: the module {observed} and did not finish, \
          so its actual requirement is UNKNOWN — only that it exceeds {limit}. \
          Split into smaller modules or reduce payload size. \
-         Current fuel limit: {limit} (configurable via WASM_FUEL_LIMIT or per-node max_fuel config)."
+         Current fuel limit: {limit} ({how})."
     )
 }
 
@@ -303,6 +310,13 @@ mod fuel_exhausted_message_tests {
 
     #[test]
     fn pipeline_step_is_named_when_present() {
+        // At the per-node ceiling the message does not send the author to raise max_fuel.
+        let ceiling = talos_workflow_job_protocol::MAX_JOB_FUEL;
+        let at = fuel_exhausted_message(Some(ceiling), ceiling, None);
+        assert!(at.contains(&format!("Current fuel limit: {ceiling} (the most any node is given: a larger per-node max_fuel is clamped to it")), "{at}");
+        assert!(!at.contains("configurable"), "{at}");
+        assert!(fuel_exhausted_message(Some(ceiling - 1), ceiling - 1, None)
+            .contains("configurable via WASM_FUEL_LIMIT or per-node max_fuel config"));
         let msg = fuel_exhausted_message(Some(5), 10, Some("enrich"));
         assert!(msg.contains("in pipeline step 'enrich'"), "{msg}");
         assert!(!fuel_exhausted_message(Some(5), 10, None).contains("pipeline step"));
