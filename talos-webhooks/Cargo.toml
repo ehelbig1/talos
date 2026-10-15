@@ -61,6 +61,9 @@ talos-worker-fleet = { path = "../talos-worker-fleet" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
+# The verification-token hash the create stores, applied to a delivered token
+# before the constant-time compare (F-3).
+talos-webhook-repository = { path = "../talos-webhook-repository" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }

@@ -103,8 +103,6 @@ async fn world() -> World {
         Arc::new(controller::secrets::SecretsManager::new(pool.clone()).expect("secrets manager"));
     secrets.initialize().await.expect("initialize secrets");
     let svc = GoogleCalendarService::new(pool.clone(), secrets);
-    svc.with_worker_shared_key(vec![7_u8; 32])
-        .expect("shared key");
     svc.with_api_base_url_for_tests(&base);
     World {
         svc: Arc::new(svc),
@@ -260,6 +258,43 @@ async fn a_workflow_is_bound_only_by_its_owner_to_the_owners_own_channel() {
     assert_eq!(cleared.workflow_id, None);
     assert_eq!(stored_binding(&w, alice).await, None);
     assert_eq!(audit(&w, alice, "workflow_unbound").await.len(), 1);
+}
+
+/// The owner's own workflow, archived or disabled, is refused: the trigger
+/// would refuse every push it started, so the binding would never fire
+/// (security review 2026-10-14, F-7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archived_workflow_cannot_be_bound() {
+    let w = world().await;
+    let (alice, alice_cal) = user_with_calendar(&w).await;
+    let channel = w
+        .svc
+        .create_watch_channel(alice_cal, CALENDAR, WEBHOOK, None)
+        .await
+        .expect("channel");
+    let archived = common::create_test_workflow(&w.pool, alice, "archived").await;
+    let disabled = common::create_test_workflow(&w.pool, alice, "disabled").await;
+    sqlx::query("UPDATE workflows SET status = 'archived' WHERE id = $1")
+        .bind(archived)
+        .execute(&w.pool)
+        .await
+        .expect("archive");
+    sqlx::query("UPDATE workflows SET is_enabled = false WHERE id = $1")
+        .bind(disabled)
+        .execute(&w.pool)
+        .await
+        .expect("disable");
+
+    for not_startable in [archived, disabled] {
+        assert_eq!(
+            bind_channel_workflow(&w.pool, alice, channel.id, Some(not_startable))
+                .await
+                .unwrap_err(),
+            BindWorkflowRefusal::WorkflowNotBindable
+        );
+    }
+    assert_eq!(stored_binding(&w, alice).await, None);
+    assert!(audit(&w, alice, "workflow_bound").await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

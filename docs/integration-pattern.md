@@ -17,8 +17,8 @@ touching any code:
    — you don't need any of this. Add the OAuth integration and
    let workflows poll on schedule.
 2. **What's the webhook-auth shape?** One of:
-   - (a) Upstream lets ME supply an opaque token → **HMAC-signed**
-     (gcal's `webhook_token.rs`).
+   - (a) Upstream lets ME supply an opaque token → **random per
+     channel, hashed in the row** (gcal's `webhook_token.rs`).
    - (b) Upstream signs with THEIR keys → **JWT verification**
      (gmail's `pubsub_jwt.rs`).
    Decide now; different crypto surface.
@@ -199,19 +199,24 @@ plus typed response decoders.
 
 Two shapes we've built:
 
-**(a) HMAC-signed opaque token** — we issue the token, we verify it.
-See `google_calendar/webhook_token.rs`. Use when the upstream lets
-us supply a `token` field (Google Calendar's `X-Goog-Channel-Token`,
-Slack's `X-Slack-Signature` bootstrap, etc.).
+**(a) An opaque token we issue, hashed in the channel row** — we
+issue the token, we verify it. See `google_calendar/webhook_token.rs`
+(`mint_channel_token` / `channel_token_admits`) and Google Cloud's
+push token. Use when the upstream lets us supply a `token` field
+(Google Calendar's `X-Goog-Channel-Token`, a Pub/Sub push URL).
 
-- Embed `user_id` in the token + cryptographically bind to whatever
-  request-level identifier the upstream passes (channel id,
-  resource id). This lets the webhook resolve user without a DB
-  lookup by an upstream-supplied value.
-- HMAC-SHA256, truncated to 16 bytes (128-bit strength, header-size
-  friendly). Constant-time compare via `subtle::ConstantTimeEq`.
-- **Domain-separate** — prefix a constant string in the HMAC input
-  so a token signed in another context can't cross over.
+- 32 random bytes from `talos_random`, per channel. Store only the
+  token's SHA-256 in the channel row; compare on the hash in
+  constant time (`subtle::ConstantTimeEq`). The token goes to the
+  upstream once and is never stored.
+- **Never derive the token from a key a worker holds.** Until
+  2026-10-14 the gcal token was an HMAC under `WORKER_SHARED_KEY`,
+  so any worker could forge a push for any user (security review
+  F-6). A controller-only key would also do; a per-channel random
+  token needs no key and no rotation story.
+- If the per-user state store needs the user before the row read,
+  carry the user id in the token as a routing hint — it is not an
+  authenticator; the row's hash is.
 - Reject tokens > a reasonable length cap before any crypto work
   (DoS lever).
 
@@ -660,13 +665,15 @@ answer pattern if you find yourself in the "yes" case.
 - **Does the upstream support rotating the webhook secret
   without dropping pushes?** Slack: yes (overlap window). Stripe:
   yes. Gmail Pub/Sub: effectively yes (JWK rotation handled by
-  the verifier). Custom-HMAC integrations (gcal-style): NO by
-  default — rotating `WORKER_SHARED_KEY` invalidates every
-  active token simultaneously.
-  - If rotating HMAC secret: either accept a dispatch outage
-    (worst case 7 days until all channels naturally expire +
-    re-create) OR implement dual-verify with N/N+1 key windows.
-    Document either choice in the operator runbook.
+  the verifier). Per-channel random tokens (gcal since 2026-10-14):
+  nothing to rotate — each renewal mints a new token. A keyed-HMAC
+  token (gcal before that date) is invalidated all at once by a key
+  rotation.
+  - Changing a token scheme under live channels needs a dual-verify
+    window: gcal admits a legacy worker-key token only for a row
+    with no stored hash, and only until 2026-12-01
+    (`LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX`); channels renew weekly,
+    so every live one has moved over well before the end date.
 
 ### Backfill on first-watch
 

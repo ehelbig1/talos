@@ -381,8 +381,9 @@ pub const BLOCKED_TABLES_LIST: &[&str] = &[
     //     (AES-256-GCM ciphertext, mig 018) + a still-PLAINTEXT
     //     `verification_token VARCHAR` (mig 004, never dropped).
     //   * `webhook_triggers` (renamed from `webhook_listeners` in mig 015)
-    //     — still-PLAINTEXT `verification_token TEXT NOT NULL` (the inbound
-    //     webhook bearer) + `signing_secret_enc` BYTEA / `signing_key_id`
+    //     — the inbound webhook bearer, PLAINTEXT `verification_token` until
+    //     2026-10-14, now only its SHA-256 `verification_token_hash`
+    //     (migrations 20261014220000/220100) + `signing_secret_enc` BYTEA / `signing_key_id`
     //     (mig 20260312000200; plaintext `signing_secret` dropped in
     //     20260408000002).
     //   * `google_calendar_watch_channels` — had a still-PLAINTEXT

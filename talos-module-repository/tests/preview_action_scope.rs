@@ -406,7 +406,7 @@ async fn cleanup_deletes_exactly_what_the_survey_listed() {
 /// A module a webhook trigger binds directly (`webhook_triggers.module_id`).
 async fn bind_webhook(pool: &Pool<Postgres>, user_id: Uuid, module_id: Uuid) {
     sqlx::query(
-        "INSERT INTO webhook_triggers (name, module_id, verification_token, user_id) \
+        "INSERT INTO webhook_triggers (name, module_id, verification_token_hash, user_id) \
          VALUES ('bound', $1, $2, $3)",
     )
     .bind(module_id)

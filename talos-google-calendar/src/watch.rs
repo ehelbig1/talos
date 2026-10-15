@@ -44,6 +44,9 @@ use talos_integration_helpers::audit::{
 use talos_integration_helpers::state_store::{
     ttl_with_grace, ChannelStore, RowUpdate, UpdateOutcome,
 };
+use talos_integration_helpers::watch_binding::{
+    workflow_is_bindable, WorkflowBindingRefusal, WORKFLOW_NOT_BINDABLE_MESSAGE,
+};
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{
     IndexedSlots, IntegrationOp, IntegrationOpResult, ListFilter, StoredEntry,
@@ -94,6 +97,14 @@ pub struct WatchChannelRow {
     /// bytes they had. A renewal carries it to the row that replaces this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<Uuid>,
+    /// Hex SHA-256 of the channel's `X-Goog-Channel-Token`
+    /// ([`webhook_token::mint_channel_token`]); the token itself went to
+    /// Google once and is not stored. Absent from every row written before
+    /// 2026-10-14: such a row's channel carries a legacy worker-key token,
+    /// admitted only until `LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX`, and keeps
+    /// the exact bytes it had. A renewal mints a new token and a new hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_hash: Option<String>,
 }
 
 impl WatchChannelRow {
@@ -194,8 +205,17 @@ impl BindWorkflowRefusal {
     pub fn user_facing_message(self) -> &'static str {
         match self {
             Self::ChannelNotFound => "No such watch channel. List your channels again: a renewal gives a channel a new id.",
-            Self::WorkflowNotBindable => "No such workflow.",
+            Self::WorkflowNotBindable => WORKFLOW_NOT_BINDABLE_MESSAGE,
             Self::Unreadable => "The binding could not be checked, so nothing was changed. Try again.",
+        }
+    }
+}
+
+impl From<WorkflowBindingRefusal> for BindWorkflowRefusal {
+    fn from(r: WorkflowBindingRefusal) -> Self {
+        match r {
+            WorkflowBindingRefusal::NotBindable => Self::WorkflowNotBindable,
+            WorkflowBindingRefusal::Unreadable => Self::Unreadable,
         }
     }
 }
@@ -227,24 +247,9 @@ pub async fn bind_channel_workflow(
     workflow_id: Option<Uuid>,
 ) -> std::result::Result<WatchChannel, BindWorkflowRefusal> {
     if let Some(workflow_id) = workflow_id {
-        let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
-        match repo.get_workflow(workflow_id, user_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                tracing::warn!(
-                    target: "talos_audit",
-                    event_kind = "gcal_watch_workflow_binding_refused",
-                    %user_id,
-                    %workflow_id,
-                    "refusing to bind a watch channel to a workflow this user does not own"
-                );
-                return Err(BindWorkflowRefusal::WorkflowNotBindable);
-            }
-            Err(e) => {
-                tracing::error!(%user_id, %workflow_id, error = %e, "gcal watch binding: workflow read failed");
-                return Err(BindWorkflowRefusal::Unreadable);
-            }
-        }
+        workflow_is_bindable(pool, user_id, workflow_id, GCAL_INTEGRATION_NAME)
+            .await
+            .map_err(BindWorkflowRefusal::from)?;
     }
 
     let store = ChannelStore::new(pool.clone(), GCAL_INTEGRATION_NAME, CHANNEL_KEY_PREFIX);
@@ -458,10 +463,6 @@ impl GoogleCalendarService {
         // The row a renewal is replacing; `None` for a first create.
         renewed_from: Option<Uuid>,
     ) -> Result<WatchChannel> {
-        let shared_key = self
-            .worker_shared_key()
-            .context("WORKER_SHARED_KEY not configured; webhook tokens cannot be signed")?;
-
         // Fetch a fresh access token for the Google API call.
         let integration_obj = self
             .get_integration(user_id, integration_id)
@@ -476,13 +477,15 @@ impl GoogleCalendarService {
         let access_token = self.get_access_token(&integration_obj).await?;
 
         // Pre-generate the UUID that will become the `X-Goog-Channel-ID`
-        // on the Google side. Sign it BEFORE the API call so a network
-        // failure mid-create doesn't leave a signed row without a live
-        // Google channel (or vice versa).
+        // on the Google side, and the channel's token: random, from the
+        // operating system's source, with only its hash kept in the row
+        // (F-6, 2026-10-14 — it was an HMAC under the worker shared key).
         let channel_uuid = Uuid::new_v4();
         let google_channel_id = channel_uuid.to_string();
-        let verification_token =
-            webhook_token::sign_channel_token(user_id, &google_channel_id, shared_key);
+        let webhook_token::MintedChannelToken {
+            token: verification_token,
+            token_hash,
+        } = webhook_token::mint_channel_token(user_id);
 
         // Create the watch on Google's side.
         let api_client = self.watch_api_client();
@@ -518,6 +521,7 @@ impl GoogleCalendarService {
             updated_at_ms: now_ms,
             renewed_from,
             workflow_id,
+            token_hash: Some(token_hash),
         };
 
         self.upsert_channel_row(user_id, &row).await.map_err(|e| {
@@ -1067,12 +1071,13 @@ impl GoogleCalendarService {
 
     /// Look up a watch channel by `(user_id, google_channel_id)`.
     /// `Ok(None)` if the channel is unknown (caller treats this as a
-    /// stale webhook to be silently ignored).
+    /// stale webhook to be silently ignored). The ROW, because the webhook
+    /// checks the delivered token against its `token_hash`.
     pub(crate) async fn find_channel_by_google_id(
         &self,
         user_id: Uuid,
         google_channel_id: &str,
-    ) -> Result<Option<WatchChannel>> {
+    ) -> Result<Option<WatchChannelRow>> {
         let filter = ListFilter {
             idx_str_1_eq: Some(google_channel_id.to_string()),
             ..Default::default()
@@ -1084,8 +1089,7 @@ impl GoogleCalendarService {
             .into_iter()
             .next()
         {
-            let row = decode_row(&entry)?;
-            Ok(Some(row.to_watch_channel(user_id)))
+            Ok(Some(decode_row(&entry)?))
         } else {
             Ok(None)
         }
@@ -1223,13 +1227,6 @@ impl GoogleCalendarService {
         }
         Ok(None)
     }
-
-    /// Accessor for the HMAC key used to sign webhook tokens. Held by
-    /// the service as an optional because tests may construct one
-    /// without a key; production construction always sets it.
-    fn worker_shared_key(&self) -> Option<&[u8]> {
-        self.shared_key.get().map(|k| k.as_slice())
-    }
 }
 
 #[cfg(test)]
@@ -1291,6 +1288,10 @@ mod hot_path_tests {
         });
         let row: WatchChannelRow = serde_json::from_value(before.clone()).expect("an old row");
         assert_eq!(row.workflow_id, None);
+        assert_eq!(
+            row.token_hash, None,
+            "a channel created before 2026-10-14 has no hash"
+        );
         assert_eq!(serde_json::to_value(&row).expect("serialize"), before);
         assert_eq!(row.to_watch_channel(Uuid::nil()).workflow_id, None);
 
@@ -1327,7 +1328,7 @@ mod hot_path_tests {
     #[test]
     fn a_binding_refusal_does_not_say_whose_the_workflow_is() {
         let said = BindWorkflowRefusal::WorkflowNotBindable.user_facing_message();
-        assert_eq!(said, "No such workflow.");
+        assert_eq!(said, WORKFLOW_NOT_BINDABLE_MESSAGE);
         for r in [
             BindWorkflowRefusal::ChannelNotFound,
             BindWorkflowRefusal::WorkflowNotBindable,
@@ -1357,6 +1358,7 @@ mod hot_path_tests {
             updated_at_ms: 1,
             renewed_from: None,
             workflow_id: None,
+            token_hash: Some("stored-hash".into()),
         }
     }
 
@@ -1365,6 +1367,11 @@ mod hot_path_tests {
         let r = advanced_message_number(row(5), 6, 42).expect("newer message");
         assert_eq!((r.last_message_number, r.updated_at_ms), (6, 42));
         assert_eq!(r.sync_token.as_deref(), Some("current"));
+        assert_eq!(
+            r.token_hash.as_deref(),
+            Some("stored-hash"),
+            "a message number keeps the token hash"
+        );
         assert!(advanced_message_number(row(5), 5, 42).is_none());
         assert!(advanced_message_number(row(5), 4, 42).is_none());
     }

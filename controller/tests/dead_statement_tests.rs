@@ -115,7 +115,7 @@ async fn list_workflow_webhooks_returns_the_row_it_could_never_return() {
 
     let hook_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO webhook_triggers (id, name, verification_token, workflow_id, user_id, enabled) \
+        "INSERT INTO webhook_triggers (id, name, verification_token_hash, workflow_id, user_id, enabled) \
          VALUES ($1, 'hook', 'tok', $2, $3, true)",
     )
     .bind(hook_id)
@@ -157,7 +157,7 @@ async fn list_webhooks_for_modules_returns_the_row_it_could_never_return() {
     let module_id = seed_module(&pool, user_id).await;
     let hook_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO webhook_triggers (id, name, verification_token, workflow_id, module_id, user_id, enabled) \
+        "INSERT INTO webhook_triggers (id, name, verification_token_hash, workflow_id, module_id, user_id, enabled) \
          VALUES ($1, 'hook', 'tok', $2, $3, $4, false)",
     )
     .bind(hook_id)

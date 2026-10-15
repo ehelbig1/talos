@@ -9626,6 +9626,110 @@ fi
 
 echo
 
+bold "▶ check 101: a token is not minted from Uuid::new_v4()"
+
+# CLAUDE.md (2026-10-08): bytes for a key, nonce, salt or bearer token come
+# from `talos_random::fill` / `talos_random::bytes`. A UUIDv4 carries 122
+# random bits, but it is not the sanctioned source, and the `rand`-crate grep
+# that guards the rule cannot see it. Until 2026-10-14 the MCP
+# `create_webhook` minted the webhook's bearer `verification_token` as
+# `Uuid::new_v4().to_string()` (security review 2026-10-14, G-25); both
+# create paths now call `talos_webhook_repository::mint_verification_token`.
+#
+# Refuses a binding whose NAME contains `token` (case-insensitive, not ending
+# in `_id`/`_ids` — the id of a token row is not a token) when its VALUE is a
+# UUID: `let <name> = [uuid::]Uuid::new_v4()…`, the same inside `format!(…)`,
+# or a struct field `<name>: [uuid::]Uuid::new_v4()…`. Test code is skipped
+# by path (`/tests/`, `*_tests.rs`, `tests.rs`); comment lines are skipped.
+# Opt-out: `// allow-uuid-token: <reason>` on the line or one of the 3 above.
+# Measured: on main @ a8ede4a9, 1 hit outside test paths (the G-25 defect,
+# talos-mcp-handlers/src/webhooks.rs) and 6 in test paths (skipped: four
+# OAuth `state_token`s, one `tok-<uuid>` header, one `token_id`); 0 after;
+# 0 false positives. Limit: textual and one line — a UUID bound to another
+# name first and then renamed to a token is not seen, nor is a token
+# assembled across lines.
+CK101_HITS=0
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"; rest="${hit#*:}"; lineno="${rest%%:*}"; text="${rest#*:}"
+    case "$file" in */tests/*|*_tests.rs|*/tests.rs) continue ;; esac
+    case "$(printf '%s' "$text" | sed -E 's/^[[:space:]]+//')" in //*) continue ;; esac
+    start=$((lineno > 3 ? lineno - 3 : 1))
+    if sed -n "${start},${lineno}p" "$file" | grep -q 'allow-uuid-token:'; then
+        continue
+    fi
+    printf '  %s\n' "$hit"
+    CK101_HITS=$((CK101_HITS + 1))
+done < <(cd "$ROOT" && grep -rEin --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" \
+            '(let[[:space:]]+(mut[[:space:]]+)?[a-z0-9_]*token[a-z0-9_]*[[:space:]]*(:[^=]*)?=[[:space:]]*(format!\([^;]*)?|[a-z0-9_]*token[a-z0-9_]*[[:space:]]*:[[:space:]]*)(uuid::)?Uuid::new_v4\(\)' . 2>/dev/null \
+        | grep -viE '(let[[:space:]]+(mut[[:space:]]+)?|[[:space:]])[a-z0-9_]*token[a-z0-9_]*_ids?[[:space:]]*[:=]' || true)
+if [ "$CK101_HITS" -gt 0 ]; then
+    red "✗ $CK101_HITS token(s) minted from Uuid::new_v4()"
+    yellow "  → mint from talos_random::bytes / talos_random::fill (a webhook token: talos_webhook_repository::mint_verification_token)"
+    yellow "  → or mark it // allow-uuid-token: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ no token minted from Uuid::new_v4()"
+fi
+
+echo
+
+bold "▶ check 102: every push-channel workflow binding asks workflow_is_bindable"
+
+# A push channel's workflow binding names what a push on it starts. Until
+# 2026-10-14 only Gmail asked whether the workflow could be bound; Google
+# Calendar, Google Cloud and Jira each read `get_workflow(user)` themselves
+# and bound an archived or disabled workflow, which the trigger then refused
+# at every push (security review 2026-10-14, F-7). The one question is now
+# `talos_integration_helpers::watch_binding::workflow_is_bindable`: ownership
+# AND the trigger's own dispatch gate.
+#
+# For every definition of `fn bind_channel_workflow` / `fn
+# bind_registration_workflow` (free functions, closed by the next line that is
+# a bare `}` at column 0), the body must call `workflow_is_bindable(` and must
+# not call `get_workflow(` itself. Opt-out: `// allow-unchecked-workflow-binding:
+# <reason>` inside the body. Measured: on main @ a8ede4a9, 4 definitions, 3
+# hits (gcal, gcp, atlassian; gmail asked a private copy); 0 after; 0 false
+# positives. Limit: a create path that names a workflow (gmail's
+# `create_watch`) is not a bind function by name and is not checked here —
+# it calls the same function, pinned by its DB test.
+CK102_HITS=0
+CK102_DEFS=0
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    while IFS= read -r verdict; do
+        [ -z "$verdict" ] && continue
+        CK102_DEFS=$((CK102_DEFS + 1))
+        case "$verdict" in
+            OK:*) ;;
+            *) printf '  %s:%s\n' "$file" "${verdict#*:}"; CK102_HITS=$((CK102_HITS + 1)) ;;
+        esac
+    done < <(awk '
+        /^(pub(\([a-z]+\))? )?async fn bind_(channel|registration)_workflow[^A-Za-z0-9_]/ { inb=1; start=NR; body=""; next }
+        inb { body = body "\n" $0 }
+        inb && /^}/ {
+            inb=0
+            if (body ~ /allow-unchecked-workflow-binding:/) { print "OK:" start; next }
+            if (body ~ /workflow_is_bindable\(/ && body !~ /get_workflow\(/) { print "OK:" start }
+            else if (body !~ /workflow_is_bindable\(/) { print "MISSING:" start ": does not call workflow_is_bindable" }
+            else { print "HANDROLLED:" start ": reads get_workflow itself" }
+        }' "$ROOT/$file")
+done < <(cd "$ROOT" && grep -rlE --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" \
+            'async fn bind_(channel|registration)_workflow' . 2>/dev/null | sed 's|^\./||' || true)
+if [ "$CK102_DEFS" -eq 0 ]; then
+    red "✗ check 102 matched no bind_channel_workflow definition — the scan is broken, not the code"
+    EXIT_CODE=1
+elif [ "$CK102_HITS" -gt 0 ]; then
+    red "✗ $CK102_HITS push-channel workflow binding(s) skip workflow_is_bindable"
+    yellow "  → call talos_integration_helpers::watch_binding::workflow_is_bindable (ownership + the trigger's dispatch gate)"
+    yellow "  → or mark it // allow-unchecked-workflow-binding: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ every push-channel workflow binding asks workflow_is_bindable ($CK102_DEFS definitions)"
+fi
+
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

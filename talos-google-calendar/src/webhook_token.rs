@@ -1,4 +1,32 @@
-//! Signed webhook token for Google Calendar push notifications.
+//! Webhook token for Google Calendar push notifications.
+//!
+//! # Since 2026-10-14: a random per-channel token, hashed in the row
+//!
+//! Security review 2026-10-14, F-6: the token below was an HMAC under the
+//! fleet-wide `WORKER_SHARED_KEY`, which every worker holds, so a worker could
+//! mint a valid token for any `(user, channel)`. A channel created now carries
+//!
+//! ```text
+//! token = base64url( user_id (16 bytes) || 32 random bytes )   — 64 chars
+//! ```
+//!
+//! and its row stores only `token_hash` = hex SHA-256 of the token
+//! ([`mint_channel_token`]). The user id stays in the token so the handler can
+//! scope its row read to one user (integration_state is per-user); it is a
+//! routing hint, not an authenticator. [`channel_token_admits`] decides,
+//! after the row is read: a row with a hash admits only the token whose
+//! SHA-256 it is (constant-time), and never a WSK-minted token.
+//!
+//! **The dual-verify window.** A row written before this change has no hash,
+//! and its channel's token is the legacy HMAC. Such a row is still admitted
+//! by the legacy check below until [`LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX`]
+//! (2026-12-01T00:00:00Z). Google channels live 7 days and are renewed at
+//! < 24 h remaining, and a renewal mints a new channel with a hashed token, so
+//! every live channel has moved over within a week of the deploy. After the
+//! end date a legacy token is refused everywhere, and the legacy code below
+//! is dead and should be deleted.
+//!
+//! # The legacy token (verified only inside the window)
 //!
 //! # Problem
 //!
@@ -86,8 +114,10 @@ fn mac_input(user_id: Uuid, channel_id: &str) -> Vec<u8> {
     buf
 }
 
-/// Sign a new channel token. `channel_id` is the Google channel UUID
-/// we supply to the watch-create call. `key` is the HMAC key.
+/// Sign a LEGACY channel token, as channels were created before 2026-10-14.
+/// Nothing mints one any more; the tests use it to prove what the window
+/// admits and what it refuses.
+#[cfg(test)]
 pub fn sign_channel_token(user_id: Uuid, channel_id: &str, key: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -106,11 +136,14 @@ pub fn sign_channel_token(user_id: Uuid, channel_id: &str, key: &[u8]) -> String
     URL_SAFE_NO_PAD.encode(out)
 }
 
-/// Verify an incoming token and extract the bound `user_id`.
+/// Verify an incoming LEGACY token and extract the bound `user_id`.
 ///
 /// Returns `None` on any failure: bad base64, wrong length, or MAC
 /// mismatch. Callers MUST NOT log the token — it is a bearer secret.
 /// The comparison is constant-time; do not short-circuit elsewhere.
+///
+/// Admits nothing on its own since 2026-10-14: [`channel_token_admits`] asks
+/// it only for a row with no stored hash, and only inside the window.
 pub fn verify_channel_token(token: &str, channel_id: &str, key: &[u8]) -> Option<Uuid> {
     // Reject outrageously long tokens before any crypto work, bounding
     // the DoS cost of a flood of garbage webhooks. The base64 of a
@@ -144,6 +177,121 @@ pub fn verify_channel_token(token: &str, channel_id: &str, key: &[u8]) -> Option
     }
 }
 
+/// The end of the dual-verify window: 2026-12-01T00:00:00Z. Before it, a
+/// channel row with no stored hash (created before 2026-10-14) is still
+/// admitted by its legacy WSK token; from it on, never. Recorded in
+/// `docs/engineering-log/packages/2026-10-14-inbound-credentials-hashed-and-scoped.md`.
+pub const LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX: i64 = 1_796_083_200;
+
+/// Random bytes in a channel token, after the 16-byte user id.
+const CHANNEL_SECRET_LEN: usize = 32;
+
+/// Decoded length of a hashed-form token: user id + secret. Distinct from the
+/// legacy [`TOKEN_DECODED_LEN`], so the two forms cannot be confused.
+const HASHED_TOKEN_DECODED_LEN: usize = 16 + CHANNEL_SECRET_LEN;
+
+/// A newly minted channel token: `token` goes to Google once, at watch
+/// create, and is never stored; `token_hash` goes in the channel row.
+pub struct MintedChannelToken {
+    pub token: String,
+    pub token_hash: String,
+}
+
+/// The stored form of a channel token: hex SHA-256 of its bytes.
+#[must_use]
+pub fn channel_token_hash(token: &str) -> String {
+    talos_text_util::sha256_hex(token)
+}
+
+/// Mint a channel's token: the owning user id and 32 bytes from the operating
+/// system's source, base64url (64 chars, within Google's 256-char limit).
+#[must_use]
+pub fn mint_channel_token(user_id: Uuid) -> MintedChannelToken {
+    let mut raw = Vec::with_capacity(HASHED_TOKEN_DECODED_LEN);
+    raw.extend_from_slice(user_id.as_bytes());
+    raw.extend_from_slice(&talos_random::bytes::<CHANNEL_SECRET_LEN>());
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let token = URL_SAFE_NO_PAD.encode(raw);
+    let token_hash = channel_token_hash(&token);
+    MintedChannelToken { token, token_hash }
+}
+
+/// Which form a delivered token has. Neither form is authenticated by this:
+/// it says which user's rows to read, and which check applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelTokenForm {
+    /// Minted since 2026-10-14; checked against the row's stored hash.
+    Hashed,
+    /// An HMAC under the worker shared key; checked only inside the window.
+    Legacy,
+}
+
+/// The user a delivered token NAMES, and its form. `None` for anything that
+/// is neither form (empty, oversized, bad base64, wrong length). No key, no
+/// I/O: what it returns is unauthenticated.
+#[must_use]
+pub fn claimed_channel_user(token: &str) -> Option<(Uuid, ChannelTokenForm)> {
+    if token.is_empty() || token.len() > 64 {
+        return None;
+    }
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let decoded = URL_SAFE_NO_PAD.decode(token).ok()?;
+    let form = match decoded.len() {
+        HASHED_TOKEN_DECODED_LEN => ChannelTokenForm::Hashed,
+        TOKEN_DECODED_LEN => ChannelTokenForm::Legacy,
+        _ => return None,
+    };
+    let user_id_bytes: [u8; 16] = decoded[..16].try_into().ok()?;
+    Some((Uuid::from_bytes(user_id_bytes), form))
+}
+
+/// Does `token` authenticate a push for the channel row it was routed to?
+///
+/// * The row has a `token_hash` (every channel created or renewed since
+///   2026-10-14): only the hashed-form token whose SHA-256 that is, compared
+///   in constant time. A legacy token is refused, whatever its MAC — a worker
+///   holds that key (F-6).
+/// * The row has none (created before): only a legacy token whose MAC verifies
+///   under `legacy_key` for this channel and this user, and only before
+///   [`LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX`].
+///
+/// `user_id` is the row's owner (the user the row was read under).
+#[must_use]
+pub fn channel_token_admits(
+    token: &str,
+    channel_id: &str,
+    user_id: Uuid,
+    stored_hash: Option<&str>,
+    legacy_key: Option<&[u8]>,
+    now_unix: i64,
+) -> bool {
+    let Some((claimed, form)) = claimed_channel_user(token) else {
+        return false;
+    };
+    if claimed != user_id {
+        return false;
+    }
+    match (stored_hash, form) {
+        (Some(stored), ChannelTokenForm::Hashed) => {
+            !stored.is_empty()
+                && stored
+                    .as_bytes()
+                    .ct_eq(channel_token_hash(token).as_bytes())
+                    .into()
+        }
+        (None, ChannelTokenForm::Legacy) => {
+            now_unix < LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX
+                && legacy_key.and_then(|key| verify_channel_token(token, channel_id, key))
+                    == Some(user_id)
+        }
+        // A hashed row never takes a key-minted token; a legacy row never
+        // takes a hashed-form token (it has nothing to compare it with).
+        (Some(_), ChannelTokenForm::Legacy) | (None, ChannelTokenForm::Hashed) => false,
+    }
+}
+
 /// Is this an `X-Goog-Channel-ID` Talos could have minted? Channel ids are
 /// UUIDs generated at watch creation (`Uuid::new_v4().to_string()`), so the
 /// legitimate population is 36 chars of `[0-9a-f-]`. The check is
@@ -157,6 +305,176 @@ pub fn channel_id_shape_ok(channel_id: &str) -> bool {
         && channel_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[cfg(test)]
+mod hashed_token_tests {
+    use super::*;
+
+    const CH: &str = "0f6e1d2c-3b4a-4958-8776-655443322110";
+    const BEFORE_END: i64 = LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX - 1;
+    const AT_END: i64 = LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX;
+
+    fn worker_key() -> Vec<u8> {
+        vec![0x5Au8; 32]
+    }
+
+    #[test]
+    fn the_window_ends_on_2026_12_01() {
+        let end = chrono::DateTime::<chrono::Utc>::from_timestamp(
+            LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX,
+            0,
+        )
+        .expect("a real instant");
+        assert_eq!(end.to_rfc3339(), "2026-12-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn a_minted_token_names_its_user_and_its_hash_admits_it() {
+        let user = Uuid::new_v4();
+        let minted = mint_channel_token(user);
+        assert_eq!(minted.token.len(), 64);
+        assert_ne!(minted.token, minted.token_hash);
+        assert_eq!(minted.token_hash, channel_token_hash(&minted.token));
+        assert_eq!(
+            claimed_channel_user(&minted.token),
+            Some((user, ChannelTokenForm::Hashed))
+        );
+        assert!(channel_token_admits(
+            &minted.token,
+            CH,
+            user,
+            Some(&minted.token_hash),
+            Some(&worker_key()),
+            AT_END + 1_000_000,
+        ));
+        assert_ne!(mint_channel_token(user).token, minted.token);
+    }
+
+    /// F-6, the key scope: every worker holds the worker shared key, so a
+    /// token minted under it — for the right user and the right channel —
+    /// must not open a channel created since the change, inside the window
+    /// or out of it.
+    #[test]
+    fn a_token_minted_under_the_worker_key_is_refused_by_a_hashed_channel() {
+        let user = Uuid::new_v4();
+        let row = mint_channel_token(user);
+        let forged = sign_channel_token(user, CH, &worker_key());
+        for now in [BEFORE_END, AT_END] {
+            assert!(!channel_token_admits(
+                &forged,
+                CH,
+                user,
+                Some(&row.token_hash),
+                Some(&worker_key()),
+                now,
+            ));
+        }
+    }
+
+    #[test]
+    fn a_hashed_channel_refuses_another_token_and_another_users() {
+        let user = Uuid::new_v4();
+        let row = mint_channel_token(user);
+        let other = mint_channel_token(user);
+        assert!(!channel_token_admits(
+            &other.token,
+            CH,
+            user,
+            Some(&row.token_hash),
+            None,
+            0
+        ));
+        // The row's own token, routed to another user's row, is refused.
+        assert!(!channel_token_admits(
+            &row.token,
+            CH,
+            Uuid::new_v4(),
+            Some(&row.token_hash),
+            None,
+            0
+        ));
+        // The stored digest is not itself a credential, and an empty stored
+        // hash admits nothing.
+        assert!(!channel_token_admits(
+            &row.token_hash,
+            CH,
+            user,
+            Some(&row.token_hash),
+            None,
+            0
+        ));
+        assert!(!channel_token_admits(
+            &row.token,
+            CH,
+            user,
+            Some(""),
+            None,
+            0
+        ));
+        assert!(!channel_token_admits(
+            "",
+            CH,
+            user,
+            Some(&row.token_hash),
+            None,
+            0
+        ));
+    }
+
+    /// The dual-verify window: a channel created before the change keeps
+    /// verifying its legacy token until the end date, and not after it.
+    #[test]
+    fn a_legacy_channel_verifies_its_legacy_token_only_inside_the_window() {
+        let user = Uuid::new_v4();
+        let legacy = sign_channel_token(user, CH, &worker_key());
+        assert!(channel_token_admits(
+            &legacy,
+            CH,
+            user,
+            None,
+            Some(&worker_key()),
+            BEFORE_END
+        ));
+        assert!(!channel_token_admits(
+            &legacy,
+            CH,
+            user,
+            None,
+            Some(&worker_key()),
+            AT_END
+        ));
+        // Without the key, or for another channel, or another user: refused.
+        assert!(!channel_token_admits(
+            &legacy, CH, user, None, None, BEFORE_END
+        ));
+        assert!(!channel_token_admits(
+            &legacy,
+            "another-channel",
+            user,
+            None,
+            Some(&worker_key()),
+            BEFORE_END
+        ));
+        assert!(!channel_token_admits(
+            &legacy,
+            CH,
+            Uuid::new_v4(),
+            None,
+            Some(&worker_key()),
+            BEFORE_END
+        ));
+        // A hashed-form token has nothing to be compared with on such a row.
+        let minted = mint_channel_token(user);
+        assert!(!channel_token_admits(
+            &minted.token,
+            CH,
+            user,
+            None,
+            Some(&worker_key()),
+            BEFORE_END
+        ));
+    }
 }
 
 #[cfg(test)]

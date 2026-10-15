@@ -1143,6 +1143,39 @@ async fn one_users_delivery_cannot_start_another_users_workflow() {
     assert!(refusals(&w, bob).await.is_empty());
 }
 
+/// The owner's own workflow, archived or disabled, is refused: the trigger
+/// would refuse every delivery it started, so the binding would never fire
+/// (security review 2026-10-14, F-7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archived_workflow_cannot_be_bound() {
+    let w = world().await;
+    let (alice, _, _) = user_with_jira(&w).await;
+    let alices = registered(&w, alice).await;
+    let archived = common::create_test_workflow(&w.pool, alice, "archived").await;
+    let disabled = common::create_test_workflow(&w.pool, alice, "disabled").await;
+    sqlx::query("UPDATE workflows SET status = 'archived' WHERE id = $1")
+        .bind(archived)
+        .execute(&w.pool)
+        .await
+        .expect("archive");
+    sqlx::query("UPDATE workflows SET is_enabled = false WHERE id = $1")
+        .bind(disabled)
+        .execute(&w.pool)
+        .await
+        .expect("disable");
+
+    for not_startable in [archived, disabled] {
+        assert_eq!(
+            bind_registration_workflow(&w.pool, alice, alices.id, Some(not_startable))
+                .await
+                .unwrap_err(),
+            BindWorkflowRefusal::WorkflowNotBindable
+        );
+    }
+    assert_eq!(stored_binding(&w, alice).await, None);
+    assert!(audit(&w, alice, "jira_workflow_bound").await.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_workflow_is_bound_only_by_its_owner_to_the_owners_own_channel() {
     let w = world().await;
