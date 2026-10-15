@@ -47,8 +47,8 @@ Package 10 of the review's remediation.
   review's proposed lint ("every column a `*_grant*` tool writes has a reader")
   was not built: with the tool gone it has no subject.
 - **C-4 / C-11.** Every audit insert stores `key_hash` (hex SHA-256 of the
-  path, read from the row at insert time; migration `20261014191000` adds and
-  backfills it), and every secret a dispatch is handed — by module grant or by
+  path, read from the row at insert time; migration `20261015120000` adds it, with
+  no backfill: the table is append-only — see `2026-10-15-audit-key-hash-no-backfill.md`), and every secret a dispatch is handed — by module grant or by
   path — gets one `dispatch_read` row (`actor_type = 'dispatch'`, the user,
   the module) in the same statement as the access counter. The audit read uses
   the manage rule, so its visibility is the secret's. CLAUDE.md's sentence

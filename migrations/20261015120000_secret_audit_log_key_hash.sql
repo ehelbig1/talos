@@ -8,16 +8,20 @@
 -- insert time — audit rows are written before a delete), and every secret a
 -- dispatch is handed gets a `dispatch_read` row (actor_type `dispatch`).
 --
--- Backfill: the rows whose secret still exists. A row whose secret is gone
--- has no path to hash and stays NULL.
+-- Replaces 20261014191000, which did the same with a backfill and never applied on
+-- the reference deployment (removed; see
+-- docs/engineering-log/packages/2026-10-15-audit-key-hash-no-backfill.md).
+--
+-- No backfill. `secret_audit_log` is append-only: `trg_secret_audit_log_immutable`
+-- (20260408000001) refuses every UPDATE, so a backfill fails on any database
+-- that holds an audit row — it passed CI only because a test database holds
+-- none (a row trigger does not fire on zero rows), and it stopped the reference
+-- deployment's migrate (2026-10-15). Rewriting history is also what the policy
+-- exists to forbid. Rows written before this column stay NULL; while their
+-- secret exists they are attributed through `secret_id`, as they always were.
 -- Index: an operator's question is "who read this path, when".
 
 ALTER TABLE secret_audit_log ADD COLUMN IF NOT EXISTS key_hash TEXT;
-
-UPDATE secret_audit_log l
-SET key_hash = encode(sha256(convert_to(s.key_path, 'UTF8')), 'hex')
-FROM secrets s
-WHERE s.id = l.secret_id AND l.key_hash IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_secret_audit_log_key_hash
     ON secret_audit_log (key_hash, "timestamp")
