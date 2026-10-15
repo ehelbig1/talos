@@ -14,7 +14,16 @@ import { AuthForm } from "@/components/auth/AuthForm";
 import { OAuthCallback } from "@/components/auth/OAuthCallback";
 import { useTokenRefresh } from "@/hooks/useTokenRefresh";
 import { useGetApprovalsQuery } from "@/generated/graphql";
-import { Zap, Loader2 } from "lucide-react";
+import {
+  Zap,
+  Loader2,
+  Workflow,
+  Newspaper,
+  Bot,
+  BookOpen,
+  Settings as SettingsIcon,
+  type LucideIcon,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { CompilationStatus } from "@/components/CompilationStatus";
@@ -35,15 +44,23 @@ const AlertTriage = lazy(() => import("@/pages/AlertTriage"));
 const NAV_ITEMS: {
   to: string;
   label: string;
+  /** Shown in place of the label below the md breakpoint. */
+  icon: LucideIcon;
   end?: boolean;
   /** Other paths this entry is the home of (the editor belongs to Workflows). */
   alsoActiveOn?: string[];
 }[] = [
-  { to: "/", label: "Workflows", end: true, alsoActiveOn: ["/editor"] },
-  { to: "/briefings", label: "Briefings" },
-  { to: "/actors", label: "Actors" },
-  { to: "/library", label: "Library" },
-  { to: "/settings", label: "Settings" },
+  {
+    to: "/",
+    label: "Workflows",
+    icon: Workflow,
+    end: true,
+    alsoActiveOn: ["/editor"],
+  },
+  { to: "/briefings", label: "Briefings", icon: Newspaper },
+  { to: "/actors", label: "Actors", icon: Bot },
+  { to: "/library", label: "Library", icon: BookOpen },
+  { to: "/settings", label: "Settings", icon: SettingsIcon },
 ];
 
 function isHomeOf(item: (typeof NAV_ITEMS)[number], pathname: string): boolean {
@@ -103,13 +120,13 @@ function AuthenticatedApp() {
         <nav
           role="navigation"
           aria-label="Main navigation"
-          className="h-14 flex items-center px-6 gap-8 shrink-0 z-50 border-b border-white/5 bg-surface-1/60 backdrop-blur-xl"
+          className="h-14 flex items-center px-4 md:px-6 gap-4 md:gap-8 shrink-0 z-50 border-b border-white/5 bg-surface-1/60 backdrop-blur-xl"
         >
           <NavLink to="/" className="flex items-center gap-3">
             <div className="p-1.5 bg-primary/10 rounded-lg border border-primary/20">
               <Zap className="w-4 h-4 text-primary" fill="currentColor" />
             </div>
-            <span className="text-sm font-semibold text-white tracking-tight font-outfit">
+            <span className="hidden md:inline text-sm font-semibold text-white tracking-tight font-outfit">
               Talos
             </span>
           </NavLink>
@@ -120,6 +137,8 @@ function AuthenticatedApp() {
                 key={item.to}
                 to={item.to}
                 end={item.end}
+                aria-label={item.label}
+                title={item.label}
                 className={({ isActive }) =>
                   navLinkClass({
                     isActive: isActive || isHomeOf(item, pathname),
@@ -129,7 +148,8 @@ function AuthenticatedApp() {
                 {({ isActive: routeActive }) => (
                   <>
                     <span className="flex items-center gap-2">
-                      {item.label}
+                      <item.icon className="w-4 h-4 md:hidden" aria-hidden />
+                      <span className="hidden md:inline">{item.label}</span>
                       {item.to === "/settings" && pendingCount > 0 && (
                         <span
                           className="inline-flex items-center justify-center min-w-4 h-4 px-1 text-2xs font-semibold bg-warning text-warning-foreground rounded-full"
@@ -149,7 +169,7 @@ function AuthenticatedApp() {
           </div>
 
           <div className="ml-auto flex items-center gap-4">
-            <div className="h-6 w-px bg-white/10" />
+            <div className="hidden lg:block h-6 w-px bg-white/10" />
 
             <div
               className="hidden lg:flex flex-col items-end leading-tight max-w-[220px]"

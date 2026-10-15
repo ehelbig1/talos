@@ -243,9 +243,9 @@ function Workspace() {
         {/* Right Inspector - Slide in/out */}
         <div
           className={cn(
-            "border-l border-white/5 bg-surface-1/60 backdrop-blur-3xl transition-[width] duration-200 z-20",
+            "border-l border-white/5 bg-surface-1/60 backdrop-blur-3xl transition-[width] duration-200 z-20 overflow-hidden",
           )}
-          style={{ width: showInspector ? "420px" : "0px" }}
+          style={{ width: showInspector ? "min(420px, 100vw)" : "0px" }}
         >
           <ErrorBoundary
             fallback={(e) => (

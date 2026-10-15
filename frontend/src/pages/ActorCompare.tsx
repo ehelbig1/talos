@@ -65,7 +65,7 @@ export default function ActorCompare() {
     <div className="min-h-screen bg-background text-white relative overflow-hidden font-inter">
       {/* Ambient background glows */}
 
-      <div className="max-w-7xl mx-auto px-8 py-10 space-y-12 relative z-10">
+      <div className="max-w-7xl mx-auto px-6 md:px-6 md:px-8 py-8 md:py-10 space-y-12 relative z-10">
         <PageHeader
           backTo={{ to: "/actors", label: "Actors" }}
           title="Compare actors"

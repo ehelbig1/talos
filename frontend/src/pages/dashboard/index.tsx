@@ -283,7 +283,7 @@ export default function Dashboard() {
     return (
       <div className="h-full overflow-auto bg-background relative text-foreground/80 custom-scrollbar">
         <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-surface-1 via-background to-background" />
-        <div className="relative max-w-7xl mx-auto px-10 py-16">
+        <div className="relative max-w-7xl mx-auto px-6 md:px-6 md:px-8 py-8 md:py-10">
           <div className="mb-12 h-12 w-80 rounded-2xl animate-pulse bg-surface-3/40" />
           <SkeletonStatRow className="mb-12" />
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
@@ -304,7 +304,7 @@ export default function Dashboard() {
       {/* Dynamic background */}
       <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/10 via-background to-background opacity-50" />
 
-      <div className="relative max-w-7xl mx-auto px-8 py-10">
+      <div className="relative max-w-7xl mx-auto px-6 md:px-6 md:px-8 py-8 md:py-10">
         {/* Header Section */}
         <PageHeader
           title="Workflows"

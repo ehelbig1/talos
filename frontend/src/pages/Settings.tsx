@@ -1,7 +1,7 @@
 import React, { Suspense, lazy, useCallback, useState, useEffect } from "react";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { useAuth } from "@/contexts/AuthContext";
-import { Link } from "react-router";
+import { Link, useNavigate } from "react-router";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/ui";
 import {
@@ -296,6 +296,7 @@ export default function Settings() {
   const { user, logout } = useAuth();
 
   // Initialize from URL hash, fall back to "integrations".
+  const navigate = useNavigate();
   const [active, setActive] = useState<string>(
     () => resolveHash(window.location.hash.slice(1))?.section ?? "integrations",
   );
@@ -357,32 +358,31 @@ export default function Settings() {
         />
       </header>
 
-      {/* Mobile nav — horizontal scrollable pills, shown only below sm breakpoint */}
-      <div className="sm:hidden relative shrink-0 z-20">
-        <div className="flex gap-2 overflow-x-auto px-8 py-4 border-b border-white/5 bg-surface-2/40 custom-scrollbar">
-          {ALL_ITEMS.map((item) => {
-            const isActive = !item.to && active === item.value;
-            const pill = cn(
-              "whitespace-nowrap text-xs font-medium px-3 py-2 rounded-full border transition-ui shrink-0",
-              isActive
-                ? "bg-primary/10 text-primary border-primary/20"
-                : "bg-surface-4/60 text-muted-foreground border-white/5 hover:text-foreground",
-            );
-            return item.to ? (
-              <Link key={item.value} to={item.to} className={pill}>
-                {item.label}
-              </Link>
-            ) : (
-              <button
-                key={item.value}
-                onClick={() => setActive(item.value)}
-                className={pill}
-              >
-                {item.label}
-              </button>
-            );
-          })}
-        </div>
+      {/* Below sm the sidebar is a select: every section, grouped, on one tap. */}
+      <div className="sm:hidden shrink-0 px-6 py-3 border-b border-white/5 bg-surface-2/40 relative z-20">
+        <label htmlFor="settings-section" className="sr-only">
+          Settings section
+        </label>
+        <select
+          id="settings-section"
+          value={active}
+          onChange={(e) => {
+            const item = ALL_ITEMS.find((i) => i.value === e.target.value);
+            if (item?.to) navigate(item.to);
+            else setActive(e.target.value);
+          }}
+          className="w-full h-10 bg-surface-3/60 border border-white/10 text-white rounded-xl px-3 text-sm focus:outline-none focus:border-primary/40"
+        >
+          {SIDEBAR_CATEGORIES.map((category) => (
+            <optgroup key={category.label} label={category.label}>
+              {category.items.map((item) => (
+                <option key={item.value} value={item.value}>
+                  {item.label}
+                </option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
       </div>
 
       {/* Two-column layout */}
@@ -395,7 +395,7 @@ export default function Settings() {
 
         {/* Content area */}
         <main className="flex-1 overflow-y-auto custom-scrollbar">
-          <div className="max-w-6xl mx-auto px-8 py-10">
+          <div className="max-w-6xl mx-auto px-6 md:px-6 md:px-8 py-8 md:py-10">
             {active === "integrations" && (
               <ErrorBoundary>
                 <Suspense fallback={<PanelLoading />}>

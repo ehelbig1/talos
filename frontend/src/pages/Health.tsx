@@ -601,7 +601,7 @@ export default function Health() {
       {/* Dynamic Glow Background */}
       <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/5 via-background to-background opacity-50" />
 
-      <div className="max-w-7xl mx-auto px-8 py-10 relative z-10">
+      <div className="max-w-7xl mx-auto px-6 md:px-6 md:px-8 py-8 md:py-10 relative z-10">
         {/* Page header */}
         <PageHeader
           title="System health"
