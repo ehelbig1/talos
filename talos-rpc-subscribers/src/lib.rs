@@ -4454,7 +4454,7 @@ mod rpc_instrument_table_pins {
                     found.insert(variant.as_str().to_string());
                 }
             }
-            // An outcome the KERNEL emits (`kernel::intake`'s `shed`) is
+            // An outcome the KERNEL emits (`kernel::admit`'s `shed`) is
             // reachable from every subscriber that runs on the kernel.
             if region.contains("kernel::spawn_rpc_subscriber") {
                 for variant in KERNEL_EMITTED {
@@ -4467,7 +4467,7 @@ mod rpc_instrument_table_pins {
     }
 
     /// Outcomes `kernel.rs` records for any subscriber (security review
-    /// 2026-10-14, B-6: `intake` sheds a message unread). Pinned to appear
+    /// 2026-10-14, B-6: `admit` sheds a message unread). Pinned to appear
     /// there by `the_variant_identifiers_are_derivable_and_unambiguous`.
     const KERNEL_EMITTED: [RpcOutcome; 1] = [RpcOutcome::Shed];
 

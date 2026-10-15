@@ -59,10 +59,11 @@
 //!   traffic AND would invert the `queue_ms` / `exec_ms` split that
 //!   operator dashboards are keyed on. Don't.
 //! * The ADMISSION allowance (security review 2026-10-14, B-6) is a
-//!   different thing and sits in front of everything: `intake` takes one of
+//!   different thing and sits in front of everything: `admit` takes one of
 //!   `max_in_flight × ADMISSION_PER_PERMIT` slots before the handler is even
-//!   called, holds it for the message's whole life, and with none free drops
-//!   the message unread (`shed`). It bounds what a flood costs; it does not
+//!   called, holds it for the message's whole life, and with none free within
+//!   `ADMISSION_WAIT` drops the message unread (`shed`). A burst waits; a
+//!   flood is shed. It bounds what a flood costs; it does not
 //!   move the execution permit, so `queue_ms` / `exec_ms` mean what they did.
 //! * Outcome-tag mapping (each protocol's error enum → metric tag).
 
@@ -115,6 +116,16 @@ pub(crate) const DRAIN_DEADLINE_SECS: u64 = 10;
 /// ADMISSION_PER_PERMIT` parses at a time instead of one task per message.
 pub(crate) const ADMISSION_PER_PERMIT: usize = 8;
 
+/// How long a message waits for an admission slot before it is shed. A
+/// burst — a worker fleet's fire-and-forget `talos.state.write`s, many jobs'
+/// memory reads at once — is DELAYED here, not dropped: slots free as
+/// handlers finish, and while the loop waits the NATS client buffers what
+/// follows. Only a backlog that does not drain within this window is a flood,
+/// and is shed. Until this was added (2026-10-14) a slot was asked for once,
+/// and a burst past the allowance on a slow runner lost writes
+/// (`a_fire_and_forget_message_executes_once`).
+pub(crate) const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 const SHED_LOG_EVERY_SECS: u64 = 10;
 static SHED_SINCE_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SHED_LAST_LOG_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -139,20 +150,24 @@ fn shed_log_due() -> Option<u64> {
     Some(SHED_SINCE_LOG.swap(0, Ordering::Relaxed))
 }
 
-/// Take one admission slot for a message and spawn its handler with the slot
-/// held for the handler's whole life, or — with no slot free — drop the
-/// message unread and count it `shed`. `handler` is only called (and so the
-/// message only parsed) when a slot was taken. Returns whether it spawned.
-pub(crate) fn intake<Fut>(
-    in_flight: &mut tokio::task::JoinSet<()>,
+/// Take one admission slot for a message, waiting up to `wait` for one to
+/// free; with none free by then, count the message `shed` and answer `None`
+/// (the caller drops it unread). The caller calls the handler — and so
+/// parses the message — only with a slot in hand, and holds the slot for the
+/// handler's whole life ([`spawn_admitted`]).
+pub(crate) async fn admit(
     admission: &Arc<tokio::sync::Semaphore>,
     subject: &'static str,
-    handler: impl FnOnce() -> Fut,
-) -> bool
-where
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    let Ok(slot) = admission.clone().try_acquire_owned() else {
+    wait: std::time::Duration,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let slot = match admission.clone().try_acquire_owned() {
+        Ok(slot) => Some(slot),
+        Err(_) => tokio::time::timeout(wait, admission.clone().acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok),
+    };
+    if slot.is_none() {
         if let Some(rpc) = RpcSubject::ALL.iter().find(|s| s.as_str() == subject) {
             talos_metrics::record_rpc_call(
                 *rpc,
@@ -169,17 +184,26 @@ where
                 subject,
                 outcome = RpcOutcome::Shed.as_str(),
                 shed_since_last_log = shed,
-                "rpc shed: a subscriber's admission allowance is full; messages dropped unread"
+                "rpc shed: a subscriber's admission allowance stayed full; messages dropped unread"
             );
         }
-        return false;
-    };
-    let fut = handler();
+    }
+    slot
+}
+
+/// Spawn an admitted message's handler future with its slot held until the
+/// future ends.
+pub(crate) fn spawn_admitted<Fut>(
+    in_flight: &mut tokio::task::JoinSet<()>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+    fut: Fut,
+) where
+    Fut: Future<Output = ()> + Send + 'static,
+{
     in_flight.spawn(async move {
         let _slot = slot;
         fut.await;
     });
-    true
 }
 
 /// Per-op permit-guard timeout (docs/platform-primitive-checklist.md
@@ -319,9 +343,9 @@ pub(crate) fn spawn_rpc_subscriber<H, Fut>(
                         None => break,
                     },
                 };
-                intake(&mut in_flight, &admission, spec.subject, || {
-                    handler(msg, sem.clone())
-                });
+                if let Some(slot) = admit(&admission, spec.subject, ADMISSION_WAIT).await {
+                    spawn_admitted(&mut in_flight, slot, handler(msg, sem.clone()));
+                }
             }
             // Inner loop exited.
             if shutdown_requested {
@@ -519,46 +543,71 @@ mod intake_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Security review 2026-10-14, B-6: with no admission slot the handler is
-    /// never called, so the message is never parsed, verified or looked up.
+    /// Security review 2026-10-14, B-6: with no admission slot by the end of
+    /// the wait there is no slot, so the loop never calls the handler and the
+    /// message is never parsed, verified or looked up.
     #[tokio::test]
-    async fn a_message_is_not_parsed_without_an_admission_slot() {
+    async fn no_slot_by_the_end_of_the_wait_means_no_slot() {
         let admission = Arc::new(tokio::sync::Semaphore::new(0));
-        let mut in_flight = tokio::task::JoinSet::new();
-        let parsed = Arc::new(AtomicUsize::new(0));
-        let p = parsed.clone();
-        let spawned = intake(&mut in_flight, &admission, "talos.memory.op", move || {
-            p.fetch_add(1, Ordering::SeqCst);
-            async {}
-        });
-        assert!(!spawned);
-        assert_eq!(parsed.load(Ordering::SeqCst), 0);
-        assert!(in_flight.is_empty());
+        let slot = admit(
+            &admission,
+            "talos.memory.op",
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(slot.is_none());
     }
 
     /// A taken slot is held for the handler's whole life and returned after.
     #[tokio::test]
     async fn an_admitted_message_holds_its_slot_until_its_handler_ends() {
         let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let short = std::time::Duration::from_millis(20);
         let mut in_flight = tokio::task::JoinSet::new();
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
-        assert!(intake(
-            &mut in_flight,
-            &admission,
-            "talos.memory.op",
-            move || async move {
-                let _ = wait.await;
-            }
-        ));
+        let slot = admit(&admission, "talos.memory.op", short)
+            .await
+            .expect("slot");
+        spawn_admitted(&mut in_flight, slot, async move {
+            let _ = wait.await;
+        });
         tokio::task::yield_now().await;
         assert_eq!(admission.available_permits(), 0);
         assert!(
-            !intake(&mut in_flight, &admission, "talos.memory.op", || async {}),
-            "a second message is shed while the first holds the only slot"
+            admit(&admission, "talos.memory.op", short).await.is_none(),
+            "a second message is shed when the first holds the only slot past the wait"
         );
         release.send(()).expect("release");
         in_flight.join_next().await.expect("joined").expect("ok");
         assert_eq!(admission.available_permits(), 1);
+    }
+
+    /// A burst is delayed, not dropped: a message that arrives while every
+    /// slot is held is admitted as soon as one frees within the wait.
+    #[tokio::test]
+    async fn a_message_waits_for_a_slot_that_frees_within_the_window() {
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut in_flight = tokio::task::JoinSet::new();
+        let first = admit(&admission, "talos.state.write", std::time::Duration::ZERO)
+            .await
+            .expect("first slot");
+        spawn_admitted(&mut in_flight, first, async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        });
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = ran.clone();
+        let second = admit(
+            &admission,
+            "talos.state.write",
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("the second message is admitted once the first finishes");
+        spawn_admitted(&mut in_flight, second, async move {
+            r.fetch_add(1, Ordering::SeqCst);
+        });
+        while in_flight.join_next().await.is_some() {}
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 }
 

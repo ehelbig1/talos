@@ -107,3 +107,24 @@ of the review's remediation.
   timeout.
 - Deploy order: none. The worker's key namespace is its own; the controller
   is unchanged for dispatch.
+
+## Follow-up: a burst waits, a flood is shed (2026-10-14, same day)
+
+The admission slot was asked for once (`try_acquire`), so a burst past
+`max_in_flight × ADMISSION_PER_PERMIT` on a slow runner shed legitimate
+messages. For the fire-and-forget `talos.state.write` that is a lost durability
+write, not a retried call; `kernel_two_replica_tests::a_fire_and_forget_message_executes_once`
+failed this way in CI (#1303, shard 2) while passing on `main`'s run, which is
+what a timing-dependent loss looks like.
+
+`kernel::admit` now waits up to `ADMISSION_WAIT` (2 s) for a slot to free
+before it sheds; slots free as handlers finish, and the NATS client buffers
+what follows while the loop waits. Only a backlog that does not drain within
+the window is shed. The handler is still called — and the message parsed —
+only with a slot in hand (`admit` then `spawn_admitted`).
+
+- Test: `intake_tests::a_message_waits_for_a_slot_that_frees_within_the_window`.
+- Mutation: the wait removed (one `try_acquire`) → that test FAIL; restored → PASS.
+- `kernel_two_replica_tests` pass three runs in a row against a broker.
+- Stated limit: while the loop waits it does not observe shutdown; the wait is
+  2 s against a 10 s drain deadline.
