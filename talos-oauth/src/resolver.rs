@@ -218,7 +218,11 @@ impl SecretsResolver for ControllerSecretsResolver {
             HashMap::new()
         } else {
             self.sm
-                .get_secrets_by_paths(&vault_paths, user_id)
+                .get_secrets_by_paths(
+                    &vault_paths,
+                    user_id,
+                    talos_secrets_manager::PathReadAudit::Dispatch,
+                )
                 .await
                 .map_err(boxed)?
         };
@@ -325,17 +329,10 @@ impl SecretsResolver for ControllerSecretsResolver {
     async fn resolve_llm_keys(
         &self,
         user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError> {
-        // SecretsManager returns Zeroizing<String> values for the cache; the
-        // SecretsResolver trait is defined in the open-source workflow engine
-        // crate and cannot depend on the zeroize crate, so we deref-clone here.
-        // The cache copy stays zeroized; the returned plaintext lives only as
-        // long as the engine's `encrypt_into_job` consumes it (microseconds).
-        let zeroizing_map = self.sm.get_llm_vault_keys(user_id).await.map_err(boxed)?;
-        Ok(zeroizing_map
-            .into_iter()
-            .map(|(k, v)| (k, v.as_str().to_string()))
-            .collect())
+    ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
+        // The cache's `Zeroizing` values, handed on unchanged (C2-4): no
+        // plain copy of a provider key is made between the store and the seal.
+        self.sm.get_llm_vault_keys(user_id).await.map_err(boxed)
     }
 
     async fn refresh_vault_paths(&self, paths: &[String]) {

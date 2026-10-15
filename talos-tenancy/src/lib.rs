@@ -156,9 +156,50 @@ impl TenantReadScope {
     }
 }
 
+/// THE SQL fragment for "may this user use this module": a module they own,
+/// one of an org they belong to NOW, or a catalog row (no owner, no org).
+/// `$t` is the table prefix (`""` or `"m."`), `$u` the user's placeholder,
+/// and — in the three-argument form — `$orgs` a placeholder carrying the
+/// user's org ids; the two-argument form reads membership itself.
+///
+/// One home (security review 2026-10-15, C2-6): `SecretsManager`'s
+/// `allowed_modules` reachability check and `ModuleRepository`'s reader
+/// predicate were two hand-written copies of this rule; a visibility arm added
+/// to one would have refused a grant, or reached a module, the other did not.
+#[macro_export]
+macro_rules! module_visible_to {
+    ($t:literal, $u:literal) => {
+        $crate::module_visible_to!(@rule $t, $u,
+            concat!("IN (SELECT om.org_id FROM organization_members om WHERE om.user_id = ", $u, ")"))
+    };
+    ($t:literal, $u:literal, $orgs:literal) => {
+        $crate::module_visible_to!(@rule $t, $u, concat!("= ANY(", $orgs, ")"))
+    };
+    (@rule $t:literal, $u:literal, $member:expr) => {
+        concat!(
+            "(", $t, "user_id = ", $u,
+            " OR (", $t, "user_id IS NULL AND ", $t, "org_id IS NULL)",
+            " OR ", $t, "org_id ", $member, ")"
+        )
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_visibility_is_one_fragment_in_both_forms() {
+        assert_eq!(
+            module_visible_to!("m.", "$2"),
+            "(m.user_id = $2 OR (m.user_id IS NULL AND m.org_id IS NULL) OR m.org_id IN \
+             (SELECT om.org_id FROM organization_members om WHERE om.user_id = $2))"
+        );
+        assert_eq!(
+            module_visible_to!("", "$2", "$3"),
+            "(user_id = $2 OR (user_id IS NULL AND org_id IS NULL) OR org_id = ANY($3))"
+        );
+    }
 
     #[test]
     fn org_scope_emits_canonical_set_local() {

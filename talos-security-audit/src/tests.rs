@@ -2516,3 +2516,19 @@ fn the_replay_guard_is_reported_from_its_own_state() {
         Status::Info
     );
 }
+
+/// C2-3 (2026-10-15): the secret audit log's size and history are reported,
+/// informational, and an unreadable catalogue says so.
+#[test]
+fn the_secret_audit_log_extent_is_reported() {
+    let c = check_secret_audit_log_extent(&Ok((Some(35_900), Some(41))));
+    assert_eq!(c.status, Status::Info);
+    assert!(c.detail.contains("about 35900"), "{}", c.detail);
+    assert!(c.detail.contains("41 day(s)"), "{}", c.detail);
+    let empty = check_secret_audit_log_extent(&Ok((None, None)));
+    assert!(empty.detail.contains("oldest none"), "{}", empty.detail);
+    assert_eq!(
+        check_secret_audit_log_extent(&Err("x".to_string())).status,
+        Status::Warn
+    );
+}

@@ -485,7 +485,11 @@ impl SlackIntegrationService {
             .as_ref()
             .ok_or_else(|| anyhow!("SecretsManager not configured"))?;
         let secrets = sm
-            .get_secrets_by_paths(std::slice::from_ref(&vault_path), Some(integration.user_id))
+            .get_secrets_by_paths(
+                std::slice::from_ref(&vault_path),
+                Some(integration.user_id),
+                talos_secrets_manager::PathReadAudit::Controller,
+            )
             .await
             .context("Failed to fetch Slack bot token from vault")?;
 

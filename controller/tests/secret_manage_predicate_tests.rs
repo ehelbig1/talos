@@ -118,7 +118,69 @@ async fn a_member_who_left_the_org_cannot_manage_or_read_the_secrets_they_create
         .expect("rotate")
         .is_some());
 
+    // The upsert path (C2-1, 2026-10-15): the creator's upsert of an org
+    // secret they made works while they are a member…
+    let up_path = "manage/org-upserted";
+    let (up_id, inserted) = secrets
+        .upsert_secret(
+            "org-upserted",
+            up_path,
+            "u1",
+            "default",
+            None,
+            creator,
+            vec![],
+            Some(org),
+        )
+        .await
+        .expect("upsert while a member");
+    assert!(inserted);
+    secrets
+        .upsert_secret(
+            "org-upserted",
+            up_path,
+            "u2",
+            "default",
+            None,
+            creator,
+            vec![],
+            Some(org),
+        )
+        .await
+        .expect("re-upsert while a member");
+
     leave_org(&pool, org, creator).await;
+
+    // …and after leaving it is refused, the stored value untouched.
+    let ciphertext = |pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT encrypted_value FROM secrets WHERE id = $1")
+            .bind(up_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let before = ciphertext(pool.clone()).await;
+    assert!(
+        secrets
+            .upsert_secret(
+                "org-upserted",
+                up_path,
+                "attacker-value",
+                "default",
+                None,
+                creator,
+                vec![],
+                Some(org)
+            )
+            .await
+            .is_err(),
+        "upsert after leaving"
+    );
+    assert_eq!(
+        ciphertext(pool.clone()).await,
+        before,
+        "the value is unchanged"
+    );
 
     assert!(
         secrets
@@ -159,7 +221,11 @@ async fn a_member_who_left_the_org_cannot_manage_or_read_the_secrets_they_create
     );
     assert!(
         secrets
-            .get_secrets_by_paths(&[path.to_string()], Some(creator))
+            .get_secrets_by_paths(
+                &[path.to_string()],
+                Some(creator),
+                talos_secrets_manager::PathReadAudit::Dispatch
+            )
             .await
             .expect("read")
             .is_empty(),
@@ -218,7 +284,11 @@ async fn a_personal_secret_is_its_owners_alone() {
         .contains(&path.to_string()));
     assert_eq!(
         secrets
-            .get_secrets_by_paths(&[path.to_string()], Some(owner))
+            .get_secrets_by_paths(
+                &[path.to_string()],
+                Some(owner),
+                talos_secrets_manager::PathReadAudit::Dispatch
+            )
             .await
             .expect("read")
             .get(path)
@@ -329,6 +399,7 @@ async fn a_dispatch_records_one_audit_row_per_delivered_secret() {
         .get_secrets_by_paths(
             &paths.iter().map(|p| (*p).to_string()).collect::<Vec<_>>(),
             Some(user),
+            talos_secrets_manager::PathReadAudit::Dispatch,
         )
         .await
         .expect("read");
@@ -365,4 +436,116 @@ async fn a_dispatch_records_one_audit_row_per_delivered_secret() {
             .await
             .expect("counter");
     assert_eq!(counted, 3);
+
+    // C2-2 (2026-10-15): the controller's own read is recorded as such, and
+    // the LLM-key cache fill records nothing.
+    secrets
+        .get_secrets_by_paths(
+            &["audit/a".to_string()],
+            Some(user),
+            talos_secrets_manager::PathReadAudit::Controller,
+        )
+        .await
+        .expect("controller read");
+    secrets
+        .get_secrets_by_paths(
+            &["audit/b".to_string()],
+            Some(user),
+            talos_secrets_manager::PathReadAudit::NotRecorded,
+        )
+        .await
+        .expect("unrecorded read");
+    let labels: Vec<(String, String)> = sqlx::query_as(
+        "SELECT action, actor_type FROM secret_audit_log \
+         WHERE action IN ('dispatch_read', 'controller_read') ORDER BY action",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("labels");
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|(a, t)| a == "controller_read" && t == "system")
+            .count(),
+        1,
+        "the controller's read: {labels:?}"
+    );
+    assert_eq!(
+        labels.iter().filter(|(a, _)| a == "dispatch_read").count(),
+        3,
+        "nothing more for the dispatch, nothing for the cache fill: {labels:?}"
+    );
+}
+
+/// C2-6 (2026-10-15): the two readers of "may this user use this module" —
+/// a secret's `allowed_modules` check and `ModuleRepository`'s reader — are
+/// one fragment (`talos_tenancy::module_visible_to!`), and agree over a
+/// module the user owns, a catalog row, one of an org they belong to, a
+/// stranger's and an id that names nothing.
+#[tokio::test]
+async fn the_two_module_visibility_readers_agree() {
+    leave_row_security_unenforced();
+    let (pool, _db) = common::isolated_db_pool().await;
+    let secrets = manager(&pool).await;
+    let user = seed_user(&pool).await;
+    let stranger = seed_user(&pool).await;
+    let colleague = seed_user(&pool).await;
+    let org = seed_org(&pool, colleague, &[user, colleague]).await;
+    let module = |owner: Option<Uuid>, org: Option<Uuid>, kind: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO modules (id, name, kind, user_id, org_id) VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(id)
+            .bind(format!("visibility-{}", id.simple()))
+            .bind(kind)
+            .bind(owner)
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("seed module");
+            id
+        }
+    };
+    let own = module(Some(user), None, "sandbox").await;
+    let catalog = module(None, None, "catalog").await;
+    let shared = module(Some(colleague), Some(org), "sandbox").await;
+    let foreign = module(Some(stranger), None, "sandbox").await;
+    let missing = Uuid::new_v4();
+    let all = [own, catalog, shared, foreign, missing];
+
+    let repo = talos_module_repository::ModuleRepository::new(pool.clone());
+    let read: std::collections::HashSet<Uuid> = repo
+        .get_modules_by_ids_for_reader(&all, user, &[org])
+        .await
+        .expect("reader")
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    for (i, id) in all.iter().enumerate() {
+        let granted = secrets
+            .create_secret(
+                "visibility",
+                &format!("visibility/m{i}"),
+                "v",
+                None,
+                user,
+                vec![*id],
+                None,
+            )
+            .await
+            .is_ok();
+        assert_eq!(
+            granted,
+            read.contains(id),
+            "the two readers disagree on case {i}"
+        );
+    }
+    assert_eq!(
+        read,
+        [own, catalog, shared].into_iter().collect(),
+        "own, catalog and org modules; not a stranger's, not a missing id"
+    );
 }

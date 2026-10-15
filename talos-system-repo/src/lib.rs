@@ -147,6 +147,24 @@ impl SystemRepository {
         Ok(count)
     }
 
+    /// How large `secret_audit_log` is and how far back it goes: the planner's
+    /// row estimate (`pg_class.reltuples`, `None` before the table was first
+    /// analysed — a `count(*)` over an append-only table that grows with
+    /// every dispatch is the cost this avoids) and the oldest row's age in
+    /// whole days (`None` when empty), for `security_audit`
+    /// (security review 2026-10-15, C2-3).
+    pub async fn secret_audit_log_extent(&self) -> Result<(Option<i64>, Option<i64>)> {
+        let row: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT (SELECT NULLIF(reltuples, -1)::bigint FROM pg_class \
+                     WHERE oid = 'public.secret_audit_log'::regclass), \
+                    (SELECT EXTRACT(DAY FROM now() - min(\"timestamp\"))::bigint \
+                     FROM secret_audit_log)",
+        )
+        .fetch_one(&self.db_pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Resolve an `agent_roles` row id by exact name.
     /// A role's id and the capabilities it grants an agent, by name.
     pub async fn find_role_by_name(&self, role_name: &str) -> Result<Option<(Uuid, Vec<String>)>> {

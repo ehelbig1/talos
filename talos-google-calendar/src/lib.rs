@@ -392,6 +392,7 @@ impl GoogleCalendarService {
             .get_secrets_by_paths(
                 std::slice::from_ref(&access_token_path),
                 Some(integration.user_id),
+                talos_secrets_manager::PathReadAudit::Controller,
             )
             .await
             .context("Failed to fetch Calendar access token from vault")?;
