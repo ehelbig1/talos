@@ -169,6 +169,7 @@ pub async fn resolve_disagreement(
                     *dataset_id,
                     *tenancy,
                     vec![AppendExample {
+                        origin: None,
                         features_text,
                         label: label.clone(),
                         source: ExampleSource::Correction,

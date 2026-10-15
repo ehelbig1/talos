@@ -578,10 +578,50 @@ pub fn grant_list_has_wildcard(entries: &[String]) -> bool {
     entries.iter().any(|e| e.trim() == "*")
 }
 
+/// Whether an `allowed_secrets` list names a WILDCARD: `*` (every stored
+/// secret) or a `<prefix>/*` glob (every secret under a namespace, stated as
+/// such). A bearer credential writes neither (security review 2026-10-15,
+/// A2-3: the marketplace install already refused `/*` from another
+/// publisher, `update_module_secrets` did not — two surfaces, two rules).
+///
+/// A bare entry (`oauth/gmail`) is not refused, although
+/// `vault_path_permitted` matches it as a prefix too: so does every exact path
+/// (`a/b` permits `a/b/c`), so the two cannot be told apart by their text, and
+/// a bare OAuth namespace beside a `vault://` reference in node config is the
+/// platform's documented grant for every OAuth module. The per-path rule
+/// (only a path a secret is stored at) is the one recorded as not built.
+#[must_use]
+pub fn secret_grant_list_has_wildcard(entries: &[String]) -> bool {
+    entries.iter().any(|e| {
+        let e = e.trim();
+        e == "*" || e.ends_with("/*")
+    })
+}
+
+/// THE grant rule for every writer of a module's `allowed_secrets` /
+/// `allowed_hosts` that an MCP token or API key can reach (security review
+/// 2026-10-15, A2-1): a caller that may not loosen writes no wildcard
+/// ([`secret_grant_list_has_wildcard`], [`grant_list_has_wildcard`]); a
+/// second-factor session may. `Err` is the sentence to answer with.
+pub fn refuse_wildcard_grant(
+    authority: ChangeAuthority,
+    allowed_secrets: &[String],
+    allowed_hosts: &[String],
+) -> Result<(), &'static str> {
+    if authority.may_loosen()
+        || !(secret_grant_list_has_wildcard(allowed_secrets)
+            || grant_list_has_wildcard(allowed_hosts))
+    {
+        return Ok(());
+    }
+    Err(WILDCARD_GRANT_NEEDS_SECOND_FACTOR)
+}
+
 /// The sentence a refused wildcard grant answers with.
 pub const WILDCARD_GRANT_NEEDS_SECOND_FACTOR: &str =
-    "A '*' grant (every stored secret, or every host) needs a session verified with two-factor \
-     authentication; an MCP agent token or an API key may only name exact paths and hosts.";
+    "A '*' grant (every stored secret, or every host) or a '<prefix>/*' secret grant needs a \
+     session verified with two-factor authentication; an MCP agent token or an API key may \
+     only name exact paths and hosts.";
 
 /// The one sentence a refused loosening answers with, on every surface.
 pub const LOOSENING_NEEDS_SECOND_FACTOR: &str =
@@ -1454,6 +1494,43 @@ mod change_authority_tests {
         assert_eq!(
             role_capabilities_above("trusted-node", &caps(&["no-such-world"])),
             vec!["no-such-world"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod wildcard_grant_tests {
+    use super::*;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A2-1 / A2-3 (2026-10-15): one rule for every bearer-reachable grant
+    /// writer — no `*` secret or host, no `<prefix>/*` secret glob; exact
+    /// paths, bare namespaces and named hosts pass; a second-factor session
+    /// may write any of them.
+    #[test]
+    fn a_bearer_writes_no_wildcard_grant() {
+        let bearer = ChangeAuthority::BearerCredential;
+        let session = ChangeAuthority::SecondFactorSession;
+        for secrets in [v(&["*"]), v(&["svc/*"]), v(&["a/b", " svc/* "])] {
+            assert_eq!(
+                refuse_wildcard_grant(bearer, &secrets, &[]),
+                Err(WILDCARD_GRANT_NEEDS_SECOND_FACTOR),
+                "{secrets:?}"
+            );
+            assert_eq!(refuse_wildcard_grant(session, &secrets, &[]), Ok(()));
+        }
+        assert!(refuse_wildcard_grant(bearer, &[], &v(&["*"])).is_err());
+        assert!(refuse_wildcard_grant(session, &[], &v(&["*"])).is_ok());
+        assert_eq!(
+            refuse_wildcard_grant(
+                bearer,
+                &v(&["svc/api_key", "oauth/gmail"]),
+                &v(&["api.example.test", "*.example.test"])
+            ),
+            Ok(())
         );
     }
 }

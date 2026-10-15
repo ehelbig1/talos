@@ -9906,6 +9906,51 @@ fi
 
 echo
 
+bold "▶ check 106: every call that compiles module source or writes a module's grants passes both gates"
+
+# Security review 2026-10-15 (A2-1, A2-2, G2-1): "one gate for every compile
+# surface" was asserted per package, not per call site, and two writers the
+# 2026-10-14 package's list did not contain — `add_node_to_workflow`'s inline
+# compile and `import_workflow` — compiled outside the role / user-ceiling
+# gate and the bearer wildcard-grant rule. This check enumerates the sites
+# instead of trusting a list: every production call of `compile_and_persist`,
+# `compile_checked`, `compile_to_wasm_with_config`,
+# `compile_to_wasm_with_language_and_world`, `compile_rust_for_world`,
+# `compile_catalog_template`, `update_module_allowed_secrets` or
+# `update_module_allowed_hosts` outside `talos-compilation` sits in a function
+# that names a world gate (`require_world_permitted`,
+# `require_grant_edit_permitted`) and a grant gate (`refuse_wildcard_grant`,
+# `refuse_bearer_grant`). The specification — the function's extent (brace
+# depth, so a nested `fn` above the call is not the enclosing one), what is
+# test code (each `#[cfg(test)]` item, not the rest of the file) — is in
+# `scripts/lint-compile-gate.py`'s header.
+# Opt-out: `// compile-gate-elsewhere: <where>` on the call line or 3 above —
+# where the covering gate is, or why none applies.
+# Measured on main @ 7e267e5f + this package: 17 sites; 2 carry both gates in
+# the calling function (compile_custom_sandbox, run_sandbox); 15 are marked,
+# each with the gate that covers it; 0 false positives. The enumeration found
+# one writer the review did not name — `restore_pinned_modules` compiled
+# catalog templates with no role or ceiling check — gated in this package.
+# Limit: textual; a gate's result is not checked, a marker's reason is not
+# verified.
+if cg_out=$(python3 scripts/lint-compile-gate.py --self-test 2>&1); then :; else
+    printf '%s\n' "$cg_out"
+    red "✗ check 106 self-test failed (python3 scripts/lint-compile-gate.py --self-test)"
+    EXIT_CODE=1
+fi
+if cg_out=$(cd "$ROOT" && python3 scripts/lint-compile-gate.py . 2>&1); then
+    green "✓ every compile / grant-write site passes both gates (${cg_out##*$'\n'})"
+else
+    printf '%s\n' "$cg_out"
+    red "✗ a call compiles module source or writes a module's grants outside the gates (check 106)"
+    yellow "  → call crate::sandbox::require_world_permitted and"
+    yellow "    talos_capability_world::refuse_wildcard_grant in the calling function, or mark"
+    yellow "    the call // compile-gate-elsewhere: <where the covering gate is>"
+    EXIT_CODE=1
+fi
+
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

@@ -179,6 +179,7 @@ async fn process_bridge(
                 dataset_id,
                 tenancy,
                 vec![AppendExample {
+                    origin: None,
                     features_text: features_text.to_string(),
                     label: label.to_string(),
                     source: ExampleSource::Correction,

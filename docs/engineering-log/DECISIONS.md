@@ -1702,6 +1702,7 @@ enforced by `clippy.toml`.
   103. is_production() is read only where build posture is decided
   104. a repository function that takes user_id binds it
   105. a migration does not UPDATE, DELETE or TRUNCATE an append-only audit table
+  106. every call that compiles module source or writes a module's grants passes both gates
 
 ### The actor write ceiling → [`2026-10-05-actor-write-ceiling.md`](docs/engineering-log/2026-10-05-actor-write-ceiling.md)
 

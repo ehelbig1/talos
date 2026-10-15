@@ -744,23 +744,22 @@ async fn require_grant_edit_permitted(
 }
 
 /// The grant arguments of a compile or a sandbox run, as an MCP bearer token
-/// may give them (security review 2026-10-14, A-2 / G-23): no `*` in
-/// `allowed_secrets` or `allowed_hosts` (`-32003`), and both lists within the
-/// registry's size bounds (`-32602`). The repository applies the same `*`
-/// rule to an `update_module_*` write.
+/// may give them (security review 2026-10-14, A-2 / G-23): the one grant rule,
+/// `talos_capability_world::refuse_wildcard_grant` — no `*`, no `<prefix>/*`
+/// secret glob (`-32003`) — and both lists within the registry's size bounds
+/// (`-32602`). The repository and the inline-compile service apply the same
+/// rule to their writes.
 fn refuse_bearer_grant(
     req_id: &Option<serde_json::Value>,
     allowed_secrets: &[String],
     allowed_hosts: &[String],
 ) -> Result<(), JsonRpcResponse> {
-    if talos_capability_world::grant_list_has_wildcard(allowed_secrets)
-        || talos_capability_world::grant_list_has_wildcard(allowed_hosts)
-    {
-        return Err(mcp_denied(
-            req_id.clone(),
-            -32003,
-            talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR,
-        ));
+    if let Err(sentence) = talos_capability_world::refuse_wildcard_grant(
+        talos_capability_world::ChangeAuthority::BearerCredential,
+        allowed_secrets,
+        allowed_hosts,
+    ) {
+        return Err(mcp_denied(req_id.clone(), -32003, sentence));
     }
     talos_registry::validate_allowed_secrets_bounds(allowed_secrets)
         .and_then(|()| talos_registry::validate_allowed_hosts(allowed_hosts))
@@ -2658,6 +2657,7 @@ async fn handle_compile_template(
     let job_id = uuid::Uuid::new_v4();
     let result = state
         .compiler
+        // compile-gate-elsewhere: world: require_world_permitted above; grants: the template's own manifest grants, not the caller's
         .compile_to_wasm_with_config(
             user_id,
             job_id,
@@ -3733,6 +3733,7 @@ async fn handle_update_module_secrets(
     // `*` is refused there for this bearer token (2026-10-14, A-2).
     let change = match state
         .module_repo
+        // compile-gate-elsewhere: world: require_grant_edit_permitted above; grants: the repository write refuses a wildcard for ChangeAuthority::BearerCredential (refuse_wildcard_grant)
         .update_module_allowed_secrets(
             module_id,
             user_id,
@@ -3885,6 +3886,7 @@ async fn handle_update_module_hosts(
     // there for this bearer token (2026-10-14, A-2).
     let change = match state
         .module_repo
+        // compile-gate-elsewhere: world: require_grant_edit_permitted above; grants: the repository write refuses a wildcard for ChangeAuthority::BearerCredential (refuse_wildcard_grant)
         .update_module_allowed_hosts(
             module_id,
             user_id,

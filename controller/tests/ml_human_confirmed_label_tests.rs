@@ -169,6 +169,52 @@ async fn a_human_label_is_gold_only_from_a_run_an_action_link_started() {
     );
     assert_eq!(landed(&pool, "tap-2").await["tap-2"], "correction");
 
+    // A tap says so at rest (I2-5): `label_json.origin = "tap"`; a model's
+    // label carries no origin.
+    let origin = |key: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT label_json->>'origin' FROM ml_examples WHERE example_key = $1",
+            )
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(origin("tap-1").await.as_deref(), Some("tap"));
+    assert_eq!(origin("teacher-1").await, None);
+
+    // The dataset's classes are now {keep, archive}: a tap naming any other
+    // label is dropped, never a phantom gold class (I2-1); the ordinary item
+    // beside it lands, so the flow ran.
+    //
+    // MUTATION that turns it red: make `keep_known_human_labels` keep every
+    // item.
+    complete(
+        &hook,
+        actor,
+        Some("action_link"),
+        &json!({ "__ml_distill__": { "model": model, "items": [
+            { "features_text": "Subject: made-up phantom", "label": "made-up-phantom",
+              "example_key": "tap-phantom", "human_confirmed": true },
+            { "features_text": "Subject: made-up kept", "label": "keep",
+              "example_key": "tap-known", "human_confirmed": true },
+            { "features_text": "Subject: made-up beside", "label": "archive",
+              "example_key": "beside-phantom" }
+        ] } }),
+    );
+    let s = landed(&pool, "beside-phantom").await;
+    assert_eq!(
+        s["tap-known"], "correction",
+        "a tap naming a class still lands"
+    );
+    assert!(
+        !s.contains_key("tap-phantom"),
+        "a tap naming no class of the dataset minted a gold class"
+    );
+
     // Any other start: the claim is refused and nothing is appended for it,
     // while an ordinary item in the same envelope still lands.
     //

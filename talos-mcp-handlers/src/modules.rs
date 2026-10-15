@@ -5451,6 +5451,7 @@ async fn handle_install_module_from_catalog(
             let job_id = uuid::Uuid::new_v4();
             match state
                 .compiler
+                // compile-gate-elsewhere: world: require_world_permitted above; grants: the template's manifest grants (grants_for_install), not the caller's
                 .compile_catalog_template(user_id, job_id, compile_name, template)
                 .await
             {
@@ -5852,6 +5853,41 @@ async fn handle_restore_pinned_modules(
             }
         };
 
+        // The world this template builds, held to the caller's role and
+        // capability ceiling as the install was (security review 2026-10-15,
+        // found enumerating compile sites for A2-2): a ceiling lowered since
+        // the install does not bring a module above it back. Refused, this
+        // module is reported and the rest are restored.
+        let world = match catalog_install_world(template.manifest()) {
+            Ok(w) => w,
+            Err(refusal) => {
+                failed.push(serde_json::json!({
+                    "module": module_name,
+                    "reason": format!("the catalog manifest was refused: {refusal}"),
+                }));
+                continue;
+            }
+        };
+        if crate::sandbox::require_world_permitted(
+            &req_id,
+            &state.actor_repo,
+            &agent,
+            &world,
+            "restore a module for",
+        )
+        .await
+        .is_err()
+        {
+            failed.push(serde_json::json!({
+                "module": module_name,
+                "reason": format!(
+                    "this module runs at '{world}', which your agent role or your capability \
+                     ceiling does not permit; nothing was restored"
+                ),
+            }));
+            continue;
+        }
+
         let compile_name = module_dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -5860,6 +5896,7 @@ async fn handle_restore_pinned_modules(
         let job_id = uuid::Uuid::new_v4();
         let compilation = state
             .compiler
+            // compile-gate-elsewhere: world: require_world_permitted above; grants: none written (restore_missing_module_wasm writes bytes only)
             .compile_catalog_template(user_id, job_id, &compile_name, &template)
             .await;
 

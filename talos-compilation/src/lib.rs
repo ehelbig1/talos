@@ -2355,6 +2355,14 @@ fn source_declared_worlds(source: &str) -> Vec<String> {
     worlds
 }
 
+/// The first world the source declares, if any — the label a caller with no
+/// other claim asks a compile to be checked at (`import_workflow`'s bundle
+/// with no `capability_world`, 2026-10-15). `compile_rust_for_world` still
+/// requires every declaration to agree with it.
+pub fn source_declared_world(source: &str) -> Option<String> {
+    source_declared_worlds(source).into_iter().next()
+}
+
 /// The world a compile FOR `required` reconciles its binary against, or the
 /// `world-mismatch` refusal. `required` must be a compilable world, and every
 /// world the source declares must be the same world (either spelling). A

@@ -157,7 +157,17 @@ pub struct AppendExample {
     /// Dedupe/upsert key (e.g. gmail message id). Rows with the same key
     /// REPLACE earlier ones — corrections beat bootstrap labels.
     pub example_key: Option<String>,
+    /// Where a gold label came from, stored as `label_json.origin` when set:
+    /// [`TAP_ORIGIN`] for a person's tap recorded by a workflow
+    /// (`__ml_distill__` with `human_confirmed`), `None` for everything else
+    /// — an operator's correction included (security review 2026-10-15,
+    /// I2-5: a tap and an operator correction were indistinguishable at
+    /// rest). A key in the JSON, so no migration and no reader changes.
+    pub origin: Option<&'static str>,
 }
+
+/// `label_json.origin` of a label a person tapped.
+pub const TAP_ORIGIN: &str = "tap";
 
 /// Output of the connection-free preparation phase: encrypted + embedded,
 /// ready for a short batched INSERT.
@@ -531,7 +541,12 @@ impl DatasetService {
                             features_enc: ciphertext,
                             features_key_id: key_id,
                             features_format: format,
-                            label_json: serde_json::json!({ "label": ex.label }),
+                            label_json: match ex.origin {
+                                Some(origin) => {
+                                    serde_json::json!({ "label": ex.label, "origin": origin })
+                                }
+                                None => serde_json::json!({ "label": ex.label }),
+                            },
                             embedding,
                             source: ex.source.as_str(),
                             example_key: ex.example_key,

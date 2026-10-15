@@ -94,6 +94,7 @@ async fn append(svc: &DatasetService, pool: &sqlx::PgPool, ds: Uuid, rows: &[(&s
     let examples = rows
         .iter()
         .map(|(key, text)| AppendExample {
+            origin: None,
             features_text: (*text).to_string(),
             label: "archive".to_string(),
             source: ExampleSource::LlmProduction,

@@ -1491,6 +1491,7 @@ async fn handle_run_scratch_session(
         std::time::Duration::from_secs(60),
         // Compiled FOR the stored world the gates checked (security review
         // 2026-10-14, G-1): a body declaring another world is refused.
+        // compile-gate-elsewhere: world: validate_scratch_world (require_world_permitted) above; grants: a scratch run is in-process and carries no module grant
         state.compiler.compile_rust_for_world(
             user_id,
             job_id,

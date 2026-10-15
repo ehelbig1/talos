@@ -521,6 +521,7 @@ pub(crate) async fn run_publish_templates_cli(args: &[String]) -> anyhow::Result
 
         eprintln!("publish-templates: compiling {name} v{tag}");
         let result = svc
+            // compile-gate-elsewhere: operator CLI publishing catalog templates: no user, no caller grant; the template's manifest is its grant
             .compile_catalog_template(uuid::Uuid::nil(), uuid::Uuid::new_v4(), &name, &template)
             .await
             .with_context(|| format!("compile_catalog_template({name})"))?;

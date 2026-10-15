@@ -254,6 +254,7 @@ impl ModulesMutations {
             // a uniform bug turned into a protocol-dependent one. Structural
             // lint check 68 leg (d) now gates this call.
             let result = compiler
+                // compile-gate-elsewhere: world: this mutation's user-ceiling check above (GraphQL createModuleFromTemplate); grants: the template's own manifest grants
                 .compile_to_wasm_with_config(
                     user_id,
                     job_id,

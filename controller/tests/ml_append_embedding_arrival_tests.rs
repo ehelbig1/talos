@@ -93,6 +93,7 @@ async fn append(dsvc: &DatasetService, pool: &sqlx::PgPool, ds: Uuid) -> usize {
         .iter()
         .enumerate()
         .map(|(i, text)| AppendExample {
+            origin: None,
             features_text: (*text).to_string(),
             label: if i == 0 { "critical" } else { "noise" }.to_string(),
             source: ExampleSource::LlmProduction,

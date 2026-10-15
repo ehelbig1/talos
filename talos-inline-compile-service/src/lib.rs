@@ -126,6 +126,13 @@ pub enum InlineCompileError {
     #[error("{0}")]
     NameCollision(String),
 
+    /// The caller may not write the grant it asked for: a wildcard from a
+    /// bearer credential, or a network world with no host list (the
+    /// every-host default is a wildcard). Maps to `-32003`. Nothing was
+    /// compiled or written.
+    #[error("{0}")]
+    GrantRefused(String),
+
     /// The deployment has module compilation turned off
     /// (`TALOS_MODULE_COMPILATION=false`). Maps to `-32000`. The message is
     /// the operator's stated policy and is said verbatim, unlike `Internal`.
@@ -151,6 +158,7 @@ impl InlineCompileError {
         match self {
             Self::InvalidArg(_) | Self::DependencyValidation(_) | Self::NameCollision(_) => -32602,
             Self::CapabilityCeilingViolation(_) => -32603,
+            Self::GrantRefused(_) => -32003,
             Self::LintFailed(_)
             | Self::CompilationFailed(_)
             | Self::SharedModuleOverwrite(_)
@@ -172,6 +180,7 @@ impl InlineCompileError {
             | Self::CompilationFailed(msg)
             | Self::SharedModuleOverwrite(msg)
             | Self::PermissionDrift(msg)
+            | Self::GrantRefused(msg)
             | Self::NameCollision(msg) => msg.clone(),
             // Display format adds the "Dependency validation failed: "
             // prefix around the raw allowlist-validator message, so the
@@ -243,6 +252,10 @@ pub struct InlineCompileInput<'a> {
     /// What to do when a module owned by `user_id` already carries
     /// `node_id` as its name. See [`NameCollision`].
     pub on_name_collision: NameCollision,
+    /// Who is asking: an MCP agent token or an API key may write no
+    /// wildcard grant and does not receive the every-host default
+    /// (security review 2026-10-15, A2-1). Checked before the compile.
+    pub authority: talos_capability_world::ChangeAuthority,
 }
 
 /// How [`InlineCompileService`] treats an existing same-named module.
@@ -371,6 +384,7 @@ impl InlineCompileService {
         &self,
         input: InlineCompileInput<'_>,
     ) -> Result<InlineCompileOutcome, InlineCompileError> {
+        // compile-gate-elsewhere: inside the service: grants by resolve_grant in compile_checked; world by each caller (add_node_to_workflow, create_workflow_from_spec)
         let compiled = self.compile_checked(&input).await?;
         self.persist_compiled(&input, compiled).await
     }
@@ -430,6 +444,14 @@ impl InlineCompileService {
         //     itself must not trust an unvalidated deps map from a
         //     future caller (GraphQL, etc.).
         validate_service_dependencies(input.dependencies)?;
+
+        // 1d. The grant the module will be written with, held to the one
+        //     grant rule before anything is compiled (A2-1, 2026-10-15):
+        //     every caller reaches this, so neither `add_node_to_workflow`
+        //     nor `create_workflow_from_spec` can write a `*` (or a
+        //     `<prefix>/*` secret glob) for a bearer, nor hand one the
+        //     every-host default of a network world.
+        resolve_grant(input)?;
 
         // 2. Pre-compile actor capability ceiling check. The handler
         //    runs a post-compile check too; this short-circuits the
@@ -537,6 +559,7 @@ impl InlineCompileService {
             // FOR the world the ceiling gate above checked: a body that
             // declares another world is refused (security review 2026-10-14,
             // G-1).
+            // compile-gate-elsewhere: inside compile_checked, after resolve_grant; world by each caller (add_node_to_workflow, create_workflow_from_spec)
             .compile_rust_for_world(
                 input.user_id,
                 job_id,
@@ -604,15 +627,8 @@ impl InlineCompileService {
             )));
         }
 
-        // 6. Resolve allowed_hosts from caller-explicit or world default.
-        let allowed_hosts = talos_workflow_creation_helpers::resolve_default_allowed_hosts(
-            input.capability_world,
-            input.explicit_allowed_hosts.clone(),
-        );
-        // Caller's allowed_secrets list (when not passed, empty — matches
-        // pre-extraction behaviour for the persistence write).
-        let allowed_secrets: Vec<String> =
-            input.explicit_allowed_secrets.clone().unwrap_or_default();
+        // 6. The grant, as checked before the compile (`resolve_grant`).
+        let (allowed_hosts, allowed_secrets) = resolve_grant(input)?;
         // Caller's allowed_methods. Until 2026-09-25 the mirror write below
         // passed a literal `&[]` here, so an explicit list was compared by the
         // drift guard and then DROPPED — and since an empty list denies every
@@ -854,6 +870,25 @@ fn name_collision_error(node_id: &str, existing: Uuid) -> InlineCompileError {
 // -----------------------------------------------------------------------------
 // Pure helpers
 // -----------------------------------------------------------------------------
+
+/// The `(allowed_hosts, allowed_secrets)` an inline module is written with:
+/// the caller's lists, or the world's host default, held to
+/// `talos_capability_world::refuse_wildcard_grant` for the caller's
+/// authority. A missing secret list is empty.
+fn resolve_grant(
+    input: &InlineCompileInput<'_>,
+) -> Result<(Vec<String>, Vec<String>), InlineCompileError> {
+    let hosts = talos_workflow_creation_helpers::resolve_default_allowed_hosts(
+        input.capability_world,
+        input.explicit_allowed_hosts.clone(),
+        input.authority,
+    )
+    .map_err(|m| InlineCompileError::GrantRefused(m.to_string()))?;
+    let secrets = input.explicit_allowed_secrets.clone().unwrap_or_default();
+    talos_capability_world::refuse_wildcard_grant(input.authority, &secrets, &hosts)
+        .map_err(|m| InlineCompileError::GrantRefused(m.to_string()))?;
+    Ok((hosts, secrets))
+}
 
 /// Validates `dependencies` against the canonical crate allowlist
 /// (`talos_compilation::dependency_allowlist::validate_dependencies`)

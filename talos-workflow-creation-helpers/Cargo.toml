@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 regex.workspace = true
+# `ChangeAuthority`: who may receive the every-host default (A2-1).
+talos-capability-world = { path = "../talos-capability-world" }
 # Compile-only parse of a `skip_condition` (`validate_graph_structure`).
 rhai.workspace = true
 serde_json.workspace = true
