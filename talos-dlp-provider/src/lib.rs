@@ -489,6 +489,12 @@ const PATTERN_SPECS: &[(&str, &str)] = &[
         r"\b(?:sk[-_]|ghp_|ghs_|gho_|ghu_|ghr_|github_pat_|xoxb-|xoxp-|xoxa-|xoxr-|xapp-|glpat-|npm_|rk_test_|rk_live_|hf_|xai-|SG\.|whsec_|ATATT|shpat_|shpss_|shpca_|shppa_|dop_v1_|sq0atp-|sq0csp-|lin_api_|PMAK-)[A-Za-z0-9\-_]{6,}",
         "[REDACTED:API_KEY]",
     ),
+    // 2026-10-14 (security review I-5): an ntfy access token — `tk_` and
+    // exactly 29 letters and digits. The live notification adapter sends one
+    // as a bearer token. Its own entry, with the exact length, because a
+    // three-letter prefix on the shared `{6,}` body would catch prose
+    // identifiers (`tk_items`).
+    (r"\btk_[A-Za-z0-9]{29}\b", "[REDACTED:API_KEY]"),
     // MCP-521: AWS Access Key IDs. Real AWS access key IDs are
     // EXACTLY 20 characters: `AKIA` (long-term IAM user) or
     // `ASIA` (STS temporary credential) followed by exactly 16
@@ -2046,6 +2052,27 @@ mod tests {
             result.contains("[REDACTED:API_KEY]"),
             "GitHub ghr_ token must redact: {result}"
         );
+    }
+
+    /// I-5 (2026-10-14): an ntfy access token is redacted; a `tk_` word of
+    /// another length is not.
+    #[test]
+    fn ntfy_access_token_redacted() {
+        let token = format!(
+            "tk_{}",
+            "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o"
+                .chars()
+                .take(29)
+                .collect::<String>()
+        );
+        assert_eq!(token.len(), 32);
+        // Not behind `Bearer` (that pattern has its own label): an error body
+        // that quotes the token.
+        let result = redact_str(&format!("ntfy said: {token} is not allowed"));
+        assert!(!result.contains(&token), "ntfy token must redact: {result}");
+        assert!(result.contains("[REDACTED:API_KEY]"), "{result}");
+        let prose = "the tk_items list and tk_short";
+        assert_eq!(redact_str(prose), prose, "no false positive on prose");
     }
 
     #[test]

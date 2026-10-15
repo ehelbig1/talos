@@ -311,34 +311,72 @@ pub async fn mint(
     }))
 }
 
+/// The grant a token names, while it may still be read: unrevoked, unexpired,
+/// reads left, its actor still the minting user's and not terminated. `g` is
+/// `memory_read_grants`, `a` is `actors`; `$1` is the token's hash. A macro so
+/// each statement stays a `&'static str` literal.
+macro_rules! live_grant {
+    () => {
+        "g.token_hash = $1 \
+         AND g.revoked_at IS NULL \
+         AND g.expires_at > NOW() \
+         AND (g.max_reads IS NULL OR g.read_count < g.max_reads) \
+         AND a.id = g.actor_id AND a.user_id = g.user_id AND a.status <> 'terminated'"
+    };
+}
+
 /// Use a grant once: the ONE place its scope is enforced.
 ///
 /// `None` for a token that is unknown, malformed, expired, revoked, out of
-/// reads, or whose actor is no longer the minting user's. The read is
-/// counted by the statement that admits it.
+/// reads, whose actor is no longer the minting user's, or whose actor is
+/// terminated (2026-10-14, security review I-8: terminating an actor ends its
+/// grants). The read is counted by the statement that admits it.
 ///
 /// # Errors
 /// When the database cannot be reached.
 pub async fn claim_read(pool: &Pool<Postgres>, provided: &str) -> Result<Option<GrantScope>> {
+    grant_scope(pool, provided, true).await
+}
+
+/// The grant's scope by the same predicates as [`claim_read`], without
+/// counting a read: [`read_granted_document`] asks it first, so a read is
+/// counted only when there is a document to hand out (I-8 — a one-read grant
+/// to a key not yet written was spent by the first probe).
+async fn peek_grant(pool: &Pool<Postgres>, provided: &str) -> Result<Option<GrantScope>> {
+    grant_scope(pool, provided, false).await
+}
+
+async fn grant_scope(
+    pool: &Pool<Postgres>,
+    provided: &str,
+    count_the_read: bool,
+) -> Result<Option<GrantScope>> {
     if !token_shape_valid(provided) {
         return Ok(None);
     }
     let provided_hash = talos_text_util::sha256_hex(provided);
-    let Some(row) = sqlx::query(
-        "UPDATE memory_read_grants g \
-         SET read_count = g.read_count + 1, last_read_at = NOW() \
-         FROM actors a \
-         WHERE g.token_hash = $1 \
-           AND g.revoked_at IS NULL \
-           AND g.expires_at > NOW() \
-           AND (g.max_reads IS NULL OR g.read_count < g.max_reads) \
-           AND a.id = g.actor_id AND a.user_id = g.user_id \
-         RETURNING g.id, g.token_hash, g.user_id, g.actor_id, g.memory_key",
-    )
-    .bind(&provided_hash)
-    .fetch_optional(pool)
-    .await
-    .context("claim read grant")?
+    // One predicate, two statements: the peek and the counting claim admit
+    // exactly the same grants.
+    let statement = if count_the_read {
+        concat!(
+            "UPDATE memory_read_grants g \
+             SET read_count = g.read_count + 1, last_read_at = NOW() \
+             FROM actors a WHERE ",
+            live_grant!(),
+            " RETURNING g.id, g.token_hash, g.user_id, g.actor_id, g.memory_key"
+        )
+    } else {
+        concat!(
+            "SELECT g.id, g.token_hash, g.user_id, g.actor_id, g.memory_key \
+             FROM memory_read_grants g, actors a WHERE ",
+            live_grant!()
+        )
+    };
+    let Some(row) = sqlx::query(statement)
+        .bind(&provided_hash)
+        .fetch_optional(pool)
+        .await
+        .context("claim read grant")?
     else {
         return Ok(None);
     };
@@ -366,10 +404,20 @@ pub async fn read_granted_document(
     pool: &Pool<Postgres>,
     provided: &str,
 ) -> Result<Option<GrantedDocument>> {
-    let Some(scope) = claim_read(pool, provided).await? else {
+    let Some(scope) = peek_grant(pool, provided).await? else {
         return Ok(None);
     };
     let found = talos_memory::recall_exact(pool, scope.actor_id, &scope.memory_key).await?;
+    // Counted only now, by the statement that enforces the grant: a missing
+    // key spends nothing, and a grant a concurrent read exhausted in between
+    // hands out nothing.
+    let Some(found) = found else {
+        return Ok(None);
+    };
+    let Some(scope) = claim_read(pool, provided).await? else {
+        return Ok(None);
+    };
+    let found = Some(found);
     tracing::info!(
         target: "talos_audit",
         event_kind = "memory_read_grant_used",

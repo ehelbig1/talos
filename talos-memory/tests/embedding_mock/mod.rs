@@ -108,6 +108,10 @@ pub fn configure(url: &str, dims: usize, timeout_secs: u64, max_in_flight: Optio
     std::env::set_var("EMBEDDING_TIMEOUT_SECS", timeout_secs.to_string());
     std::env::remove_var("EMBEDDING_API_KEY");
     std::env::remove_var("OPENAI_API_KEY");
+    // The mock is on-host and these binaries embed for a tier-1 caller
+    // (`local_only = true`), which needs the operator's attestation
+    // (security review 2026-10-14, I-4).
+    std::env::set_var("TALOS_EMBEDDING_TIER1_LOCAL_OK", "true");
     match max_in_flight {
         Some(v) => std::env::set_var("TALOS_EMBEDDING_MAX_IN_FLIGHT", v),
         None => std::env::remove_var("TALOS_EMBEDDING_MAX_IN_FLIGHT"),

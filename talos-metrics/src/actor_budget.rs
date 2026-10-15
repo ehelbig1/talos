@@ -72,3 +72,25 @@ impl BudgetMode {
         }
     }
 }
+
+/// Which LLM spending budget a read failed for, in
+/// `talos_llm_budget_read_failures_total{budget}` (security review 2026-10-14,
+/// I-2): the actor's own daily ceiling (`actor`, which then ALLOWS — cost
+/// accounting, the recorded H6 posture) or the deployment's platform-key
+/// ceiling (`platform`, which then REFUSES the external call).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LlmBudget {
+    Actor,
+    Platform,
+}
+
+impl LlmBudget {
+    pub const ALL: &'static [Self] = &[Self::Actor, Self::Platform];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Actor => "actor",
+            Self::Platform => "platform",
+        }
+    }
+}

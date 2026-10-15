@@ -222,14 +222,29 @@ async fn handle_graph_query(
     // default for negative / fractional / wrong-type inputs and had no
     // upper bound — `max_hops: 999999` would trigger unbounded graph
     // traversal. validate_range_u64 catches every wrong-input mode and
-    // enforces a sane ceiling. Cap rationale: 10 hops covers any
-    // realistic actor-memory entity graph; 500 nodes keeps the result
-    // payload under MCP response timeouts.
-    let max_hops = match crate::utils::validate_range_u64(args, "max_hops", 1, 10, 2, &req_id) {
+    // enforces a ceiling.
+    // The bounds the tool's schema states and the service enforces (I-7,
+    // 2026-10-14: the handler accepted 10 / 500 and the service quietly
+    // reduced them).
+    let max_hops = match crate::utils::validate_range_u64(
+        args,
+        "max_hops",
+        1,
+        talos_graph_rag::MAX_GRAPH_QUERY_HOPS as u64,
+        2,
+        &req_id,
+    ) {
         Ok(v) => v as usize,
         Err(resp) => return resp,
     };
-    let max_nodes = match crate::utils::validate_range_u64(args, "max_nodes", 1, 500, 20, &req_id) {
+    let max_nodes = match crate::utils::validate_range_u64(
+        args,
+        "max_nodes",
+        1,
+        talos_graph_rag::MAX_GRAPH_QUERY_NODES as u64,
+        20,
+        &req_id,
+    ) {
         Ok(v) => v as usize,
         Err(resp) => return resp,
     };

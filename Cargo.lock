@@ -7668,6 +7668,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-execution-finalizer",
  "talos-memory",
+ "talos-metrics",
  "talos-ops-alert-store",
  "talos-secrets-manager",
  "talos-tenancy",

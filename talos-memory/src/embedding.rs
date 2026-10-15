@@ -123,6 +123,25 @@ impl EmbeddingConfig {
     /// Voyage, Cohere, …). The classification errs CLOSED — an ambiguous
     /// public-looking FQDN is treated as EXTERNAL (tier-1 skips it) rather than
     /// risking egress.
+    /// Whether a TIER-1 actor's text may be sent to this provider: the
+    /// operator has ATTESTED the embedder is on-host
+    /// (`TALOS_EMBEDDING_TIER1_LOCAL_OK`, default false) AND the URL is not
+    /// obviously public ([`Self::is_local_provider`]). Until 2026-10-14 the
+    /// URL's shape alone decided, and a single-label name (a Kubernetes
+    /// Service fronting a hosted API) or a VPC relay's private address read as
+    /// on-host (security review I-4). The same posture as graph-RAG's
+    /// `TALOS_GRAPH_RAG_TIER1_LOCAL_OK`.
+    #[must_use]
+    pub fn tier1_permitted(&self) -> bool {
+        self.tier1_permitted_with(talos_config::embedding_tier1_local_ok())
+    }
+
+    /// [`Self::tier1_permitted`] with the attestation passed in.
+    #[must_use]
+    pub fn tier1_permitted_with(&self, attested_on_host: bool) -> bool {
+        attested_on_host && self.is_local_provider()
+    }
+
     pub fn is_local_provider(&self) -> bool {
         // Extract the host from `scheme://[user@]host[:port]/path`.
         let after_scheme = self.api_url.split("://").nth(1).unwrap_or(&self.api_url);
@@ -336,14 +355,15 @@ pub async fn generate_embedding(text: &str, local_only: bool) -> Option<Vec<f32>
     // operator to configure a local in-cluster embedder for tier-1. Fail-closed,
     // matching the worker's 5 LLM surfaces + raw-socket gate (PR #156): the
     // controller-side embedding path was the unguarded sibling egress channel.
-    if local_only && !config.is_local_provider() {
+    if local_only && !config.tier1_permitted() {
         tracing::warn!(
             target: "talos_audit",
             event_kind = "tier1_embedding_skipped_external_provider",
             endpoint = %config.api_url,
             "tier-1 embedding SKIPPED: the configured embedding provider is external, \
-             and a tier-1 actor's data must not leave the host. Configure a local \
-             (in-cluster Ollama) EMBEDDING_API_URL to enable semantic memory for tier-1 actors."
+             or not attested on-host, and a tier-1 actor's data must not leave the host. \
+             Configure a local (in-cluster Ollama) EMBEDDING_API_URL and attest it with \
+             TALOS_EMBEDDING_TIER1_LOCAL_OK=true to enable semantic memory for tier-1 actors."
         );
         return None;
     }
@@ -835,6 +855,25 @@ mod tier_egress_tests {
             model: "m".into(),
             dimensions: 768,
         }
+    }
+
+    /// I-4 (2026-10-14): the attestation decides, not the URL's shape — a
+    /// single-label Service fronting a hosted API, a VPC relay's private
+    /// address and the in-cluster Ollama all read as local, and none is
+    /// permitted for a tier-1 actor without it. The shape still refuses an
+    /// obviously public host when attested.
+    #[test]
+    fn tier1_embedding_needs_the_attestation() {
+        for url in [
+            "http://embed-proxy:8080/v1/embeddings",
+            "http://10.0.0.5/embed",
+            "http://ollama:11434/v1/embeddings",
+        ] {
+            assert!(cfg(url).is_local_provider(), "{url}");
+            assert!(!cfg(url).tier1_permitted_with(false), "unattested: {url}");
+            assert!(cfg(url).tier1_permitted_with(true), "attested: {url}");
+        }
+        assert!(!cfg("https://api.openai.com/v1/embeddings").tier1_permitted_with(true));
     }
 
     #[test]

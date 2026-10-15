@@ -31,6 +31,13 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// The most relationship hops one graph query traverses, and the most nodes
+/// it returns. The `graph_query` tool refuses a larger ask with these bounds
+/// rather than reducing it silently (security review 2026-10-14, I-7); the
+/// service clamps to them for every other caller.
+pub const MAX_GRAPH_QUERY_HOPS: usize = 3;
+pub const MAX_GRAPH_QUERY_NODES: usize = 50;
+
 /// Graph RAG service backed by Neo4j.
 pub struct GraphRagService {
     graph: Arc<neo4rs::Graph>,
@@ -757,22 +764,16 @@ impl GraphRagService {
     /// skips extraction without failing the memory write.
     ///
     /// Returns `Zeroizing<String>` (not plain `String`) so the
-    /// H6: is this actor over its daily LLM-token ceiling? Mirrors
-    /// `talos_memory_consolidation::external_budget_exhausted` — an absent
-    /// repo / policy / ceiling, or a read error, all answer `false` (allow):
-    /// this is cost accounting on a best-effort background path, and the
-    /// data-egress AUTHORIZATION is the tier gate above it.
+    /// Whether the external extraction call must be skipped:
+    /// `ActorRepository::external_llm_spend_refused`, the one check this and
+    /// memory consolidation ask (the platform-key ceiling, then the actor's
+    /// own; security review 2026-10-14, I-2). No repository wired (a test
+    /// harness) allows, as before.
     async fn external_budget_exhausted(&self, actor_id: Uuid) -> bool {
         let Some(repo) = &self.actor_repo else {
             return false;
         };
-        let Ok(Some(policy)) = repo.get_actor_budget_policy(actor_id).await else {
-            return false;
-        };
-        let Some(max) = policy.max_llm_tokens_per_day.filter(|m| *m > 0) else {
-            return false;
-        };
-        matches!(repo.sum_llm_tokens_last_24h(actor_id).await, Ok(spent) if spent >= max)
+        repo.external_llm_spend_refused(actor_id).await
     }
 
     /// H6: fold an Anthropic `usage` block into the actor's LLM token ledger
@@ -1431,8 +1432,8 @@ impl GraphRagService {
         max_nodes: usize,
     ) -> Result<serde_json::Value> {
         let actor_str = actor_id.to_string();
-        let hops = max_hops.min(3) as i64; // Cap at 3 to prevent expensive traversals
-        let limit = max_nodes.min(50) as i64;
+        let hops = max_hops.min(MAX_GRAPH_QUERY_HOPS) as i64; // Cap to prevent expensive traversals
+        let limit = max_nodes.min(MAX_GRAPH_QUERY_NODES) as i64;
 
         // Tokens under MIN_FULLTEXT_TOKEN_CHARS are dropped; with none left the
         // fulltext seed is skipped and only the exact-name match below runs.

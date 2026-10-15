@@ -25,7 +25,7 @@ pub mod rpc;
 pub mod security;
 pub mod vault_token;
 pub mod webhook;
-pub use actor_budget::{BudgetCap, BudgetMode};
+pub use actor_budget::{BudgetCap, BudgetMode, LlmBudget};
 pub use embedding::{EmbeddingGateOutcome, EmbeddingOutcome};
 pub use execution::ModuleExecutionOutcome;
 pub use execution_pause::{PauseGatePath, PauseRefusal};
@@ -647,6 +647,21 @@ pub fn record_rotation_audit_arm_on(metrics: &TalosMetrics, outcome: RotationAud
     metrics
         .rotation_audit_arm_total
         .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
+/// Count one LLM budget that could not be read. Inert without [`set_global`].
+pub fn record_llm_budget_read_failure(budget: LlmBudget) {
+    if let Some(m) = global() {
+        record_llm_budget_read_failure_on(m, budget);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_llm_budget_read_failure_on(metrics: &TalosMetrics, budget: LlmBudget) {
+    metrics
+        .llm_budget_read_failures_total
+        .with_label_values(&[budget.as_str()])
         .inc();
 }
 
@@ -2035,6 +2050,9 @@ pub struct TalosMetrics {
     // × `BudgetMode::ALL`, seeded at 0; no alert (a refusal is the budget
     // working; `on_budget_exceeded = 'alert'` raises an ops alert instead).
     pub actor_budget_refusals_total: CounterVec,
+    /// `talos_llm_budget_read_failures_total{budget}` — see
+    /// [`record_llm_budget_read_failure`].
+    pub llm_budget_read_failures_total: CounterVec,
     pub google_jwk_refresh_total: CounterVec,
     /// Embedding-provider calls by outcome (see [`EmbeddingOutcome`]).
     pub embedding_requests_total: CounterVec,
@@ -3635,6 +3653,27 @@ impl TalosMetrics {
             }
         }
 
+        // LLM budget reads that failed (security review 2026-10-14, I-2)
+        let llm_budget_read_failures_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_llm_budget_read_failures_total",
+                "Reads of an LLM spending budget that failed, by budget: actor (the \
+                 actor's daily token ceiling; the external call is then ALLOWED — cost \
+                 accounting fails open by decision) | platform (the deployment's \
+                 TALOS_PLATFORM_LLM_TOKENS_PER_DAY ceiling on the platform key; the call is \
+                 then REFUSED). Recorded by ActorRepository::external_llm_spend_refused, \
+                 the one check graph-RAG extraction and memory consolidation ask. \
+                 talos_metrics::LlmBudget, both values pre-seeded at 0.",
+            ),
+            &["budget"],
+        )?;
+        registry.register(Box::new(llm_budget_read_failures_total.clone()))?;
+        for budget in LlmBudget::ALL {
+            llm_budget_read_failures_total
+                .with_label_values(&[budget.as_str()])
+                .inc_by(0.0);
+        }
+
         // Google push authentication
         let google_push_refusals_total = CounterVec::new(
             prometheus::Opts::new(
@@ -4444,6 +4483,7 @@ impl TalosMetrics {
             execution_pause_refusals_total,
             webhook_duplicate_suppressed_total,
             actor_budget_refusals_total,
+            llm_budget_read_failures_total,
             google_jwk_refresh_total,
             embedding_requests_total,
             embedding_gate_total,
@@ -5197,6 +5237,28 @@ mod tests {
             !warm.contains("talos_vault_token_ttl_seconds{lifetime=\"periodic\"}"),
             "a class the token is no longer must be removed, not left stale"
         );
+    }
+
+    /// Both LLM budget read-failure series are seeded at 0 and moved by the
+    /// recorder (I-2, 2026-10-14).
+    #[test]
+    fn llm_budget_read_failures_are_seeded_and_the_recorder_moves_them() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        for budget in LlmBudget::ALL {
+            assert!(cold.contains(&format!(
+                "talos_llm_budget_read_failures_total{{budget=\"{}\"}} 0",
+                budget.as_str()
+            )));
+            record_llm_budget_read_failure_on(&m, *budget);
+        }
+        let warm = m.render_prometheus().expect("render");
+        for budget in LlmBudget::ALL {
+            assert!(warm.contains(&format!(
+                "talos_llm_budget_read_failures_total{{budget=\"{}\"}} 1",
+                budget.as_str()
+            )));
+        }
     }
 
     /// Every `(cap, mode)` pair of the actor-budget counter is seeded at 0 and

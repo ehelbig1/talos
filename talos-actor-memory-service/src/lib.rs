@@ -167,6 +167,19 @@ pub async fn start_graph_backfill(
         }
     }
     let guard = BackfillGuard(actor_id);
+    // And across replicas (security review 2026-10-14, I-3): the slot above
+    // is this process's alone, so N replicas ran N backfills of one actor —
+    // N × the LLM calls. One attempt, no wait: a held lock is "already
+    // running".
+    let Some(fleet_lock) = talos_db::try_named_advisory_lock(
+        pool,
+        &format!("graph_backfill:{actor_id}"),
+        std::time::Duration::ZERO,
+    )
+    .await?
+    else {
+        return Ok(BackfillStart::AlreadyRunning);
+    };
 
     // Load the ciphertext rows inline (one bounded SELECT — fast) so the
     // response carries an exact queued count; the slow part (decrypt +
@@ -184,6 +197,7 @@ pub async fn start_graph_backfill(
     };
 
     if rows.is_empty() {
+        fleet_lock.release().await;
         drop(guard);
         return Ok(BackfillStart::Started { queued: 0 });
     }
@@ -238,6 +252,9 @@ pub async fn start_graph_backfill(
             failed,
             "graph backfill complete"
         );
+        // A task that panics drops it instead, which detaches the
+        // connection and so frees the lock too.
+        fleet_lock.release().await;
     });
 
     Ok(BackfillStart::Started { queued })

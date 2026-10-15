@@ -1630,6 +1630,83 @@ impl ActorRepository {
     /// Total LLM tokens (prompt + completion) attributed to an actor over
     /// the trailing 24 hours — the read side of the
     /// `max_llm_tokens_per_day` budget ceiling.
+    /// Whether an EXTERNAL LLM call the controller would make on `actor_id`'s
+    /// behalf with the platform key (graph-RAG extraction, memory
+    /// consolidation) must be skipped — the ONE check both ask (security
+    /// review 2026-10-14, I-2; until then each kept a copy).
+    ///
+    /// * The deployment's platform-key ceiling
+    ///   (`talos_config::platform_llm_tokens_per_day`): external tokens spent
+    ///   with no execution behind them, every actor and user, trailing 24 h.
+    ///   An unreadable sum REFUSES — a cost gate on a shared key fails closed.
+    /// * The actor's own `max_llm_tokens_per_day`, when it has one. An
+    ///   unreadable policy or sum ALLOWS — the recorded H6 posture (cost
+    ///   accounting; the tier gate is the authorization) — but is now logged
+    ///   at WARN and counted.
+    ///
+    /// Both read failures count `talos_llm_budget_read_failures_total`.
+    pub async fn external_llm_spend_refused(&self, actor_id: Uuid) -> bool {
+        match self.platform_llm_tokens_last_24h().await {
+            Ok(spent) if spent >= talos_config::platform_llm_tokens_per_day() => return true,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "talos_llm_budget",
+                    error = %e,
+                    "the platform LLM token ceiling could not be read; refusing the external call"
+                );
+                talos_metrics::record_llm_budget_read_failure(talos_metrics::LlmBudget::Platform);
+                return true;
+            }
+        }
+        let policy = match self.get_actor_budget_policy(actor_id).await {
+            Ok(policy) => policy,
+            Err(e) => {
+                tracing::warn!(
+                    target: "talos_llm_budget",
+                    %actor_id,
+                    error = %e,
+                    "an actor's LLM budget could not be read; allowing (cost accounting fails open)"
+                );
+                talos_metrics::record_llm_budget_read_failure(talos_metrics::LlmBudget::Actor);
+                return false;
+            }
+        };
+        let Some(max) = policy
+            .and_then(|p| p.max_llm_tokens_per_day)
+            .filter(|m| *m > 0)
+        else {
+            return false;
+        };
+        match self.sum_llm_tokens_last_24h(actor_id).await {
+            Ok(spent) => spent >= max,
+            Err(e) => {
+                tracing::warn!(
+                    target: "talos_llm_budget",
+                    %actor_id,
+                    error = %e,
+                    "an actor's LLM token spend could not be read; allowing (cost accounting fails open)"
+                );
+                talos_metrics::record_llm_budget_read_failure(talos_metrics::LlmBudget::Actor);
+                false
+            }
+        }
+    }
+
+    /// External (non-`ollama`) LLM tokens spent with no execution behind them
+    /// — the controller's own calls on the platform key — over the trailing
+    /// 24 hours, every actor and user.
+    pub async fn platform_llm_tokens_last_24h(&self) -> Result<i64> {
+        let spent: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint FROM llm_usage \
+             WHERE recorded_at > now() - interval '24 hours' \
+               AND execution_id IS NULL AND provider <> 'ollama'",
+        )
+        .fetch_one(&self.db_pool)
+        .await?;
+        Ok(spent)
+    }
+
     pub async fn sum_llm_tokens_last_24h(&self, actor_id: Uuid) -> Result<i64> {
         Ok(talos_actor_budget_refusal::llm_tokens_last_24h(&self.db_pool, actor_id).await?)
     }

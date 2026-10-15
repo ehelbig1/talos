@@ -178,7 +178,7 @@ pub fn tool_schemas() -> Vec<Value> {
                 "allow_external_llm": { "type": "boolean", "description": "Opt-in for a non-local (Tier-2) fallback provider; default false" },
                 "k": { "type": "integer", "description": "kNN neighborhood (default 7)" },
                 "confidence_threshold": { "type": "number", "description": "Serving confidence gate 0-1 (default 0.6)" },
-                "max_examples": { "type": "integer", "description": "Dataset growth cap" },
+                "max_examples": { "type": "integer", "description": "Dataset growth cap: past it the oldest non-correction examples are evicted. Default 50000 when omitted." },
                 "policy": { "type": "object", "description": "Advanced: full policy override; omit for the safe default" }
             }, "required": ["name", "labels", "actor_id"] }
         }),

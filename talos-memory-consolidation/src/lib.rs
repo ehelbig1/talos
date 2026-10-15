@@ -91,21 +91,16 @@ pub fn plan_action(
 /// meets/exceeds it — the loop then skips the rare external call rather than
 /// pushing an already-over-budget actor further over.
 ///
-/// **Fail-OPEN by design.** This is a COST control, not a security control —
-/// egress is already governed fail-CLOSED by the tier gate + local-first
-/// routing. A missing budget row means "no ceiling" (the platform default); a
-/// DB error on either read must not strand background maintenance. So any
-/// absent-policy / unset-ceiling / non-positive-ceiling / read-error case
-/// returns `false` (allow). Mirrors the ledger's own "accounting, not
-/// authorization" posture.
+/// **The actor's ceiling fails OPEN by design.** It is a COST control, not a
+/// security control — egress is already governed fail-CLOSED by the tier gate
+/// + local-first routing. A missing budget row means "no ceiling"; a DB error
+/// on either read must not strand background maintenance, so it allows —
+/// logged at WARN and counted since 2026-10-14. The DEPLOYMENT's platform-key
+/// ceiling (`TALOS_PLATFORM_LLM_TOKENS_PER_DAY`) is consulted first and fails
+/// closed (security review 2026-10-14, I-2).
 async fn external_budget_exhausted(actor_repo: &ActorRepository, actor_id: uuid::Uuid) -> bool {
-    let Ok(Some(policy)) = actor_repo.get_actor_budget_policy(actor_id).await else {
-        return false;
-    };
-    let Some(max) = policy.max_llm_tokens_per_day.filter(|m| *m > 0) else {
-        return false;
-    };
-    matches!(actor_repo.sum_llm_tokens_last_24h(actor_id).await, Ok(spent) if spent >= max)
+    // The one check graph-RAG asks too (security review 2026-10-14, I-2).
+    actor_repo.external_llm_spend_refused(actor_id).await
 }
 
 /// Run ONE external-provider structured summarization for a tier-2 actor,

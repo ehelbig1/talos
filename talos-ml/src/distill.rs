@@ -108,6 +108,10 @@ static DISTILL_PERMITS: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceL
 type FlowLockMap = std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>;
 static MODEL_FLOW_LOCKS: OnceLock<std::sync::Mutex<FlowLockMap>> = OnceLock::new();
 
+/// How long a distill flow waits for another replica's flow on the same model
+/// before it drops its envelope (I-3).
+const FLEET_FLOW_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Acquire (or create) the per-model lock arc. Cloning under the map lock
 /// keeps strong-count observations consistent with [`ModelFlowGuard`]'s
 /// removal check.
@@ -502,6 +506,24 @@ async fn process_distill(
         model_id: resolved.model_id,
     };
     let _flow_guard = model_flow_lock(resolved.model_id).lock_owned().await;
+    // The mutex serialises this replica; the shadow-before-append invariant
+    // needs every replica serialised (security review 2026-10-14, I-3), so the
+    // section also holds the model's fleet-wide advisory lock. A replica that
+    // cannot take it within the wait drops this envelope rather than run the
+    // section unserialised. Dropped on any early return, it frees the lock.
+    let Some(fleet_lock) = talos_db::try_named_advisory_lock(
+        &ctx.db_pool,
+        &format!("ml_flow:{}", resolved.model_id),
+        FLEET_FLOW_LOCK_WAIT,
+    )
+    .await
+    .context("take the model's fleet flow lock")?
+    else {
+        anyhow::bail!(
+            "model '{model_name}': another replica held its distill flow for {}s; envelope dropped",
+            FLEET_FLOW_LOCK_WAIT.as_secs()
+        );
+    };
 
     // 1. Shadow FIRST (shadow/hybrid/fast_primary): predict these items
     // BEFORE they enter the dataset — `knn_search` includes fresh
@@ -588,6 +610,8 @@ async fn process_distill(
         .await
         .context("insert distill examples")?;
     tx.commit().await.context("commit distill write tx")?;
+
+    fleet_lock.release().await;
 
     tracing::info!(
         target: "talos_ml",

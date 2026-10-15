@@ -691,6 +691,65 @@ pub async fn release_advisory_lock(
     }
 }
 
+/// A session advisory lock held on a connection of its own, keyed by name:
+/// cross-replica single flight for work that spans transactions (security
+/// review 2026-10-14, I-3 — a process-local mutex serialised one replica
+/// only). [`Self::release`] unlocks and hands the connection back; dropped
+/// without it, the connection is DETACHED, which ends the session and so
+/// frees the lock server-side — a lock can never ride a pooled connection
+/// into its next borrower.
+pub struct NamedAdvisoryLock {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    id: i64,
+}
+
+impl NamedAdvisoryLock {
+    /// Unlock and return the connection to the pool
+    /// ([`release_advisory_lock`], which detaches on an unlock failure).
+    pub async fn release(mut self) {
+        if let Some(conn) = self.conn.take() {
+            release_advisory_lock(conn, self.id).await;
+        }
+    }
+}
+
+impl Drop for NamedAdvisoryLock {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            drop(conn.detach());
+        }
+    }
+}
+
+/// Take the session advisory lock named `key` (hashed with
+/// `hashtextextended`, so every replica derives the same id), waiting up to
+/// `wait` for a holder to finish; `Ok(None)` when it is still held then. A
+/// `wait` of zero is a single attempt — "is one already running?".
+pub async fn try_named_advisory_lock(
+    pool: &Pool<Postgres>,
+    key: &str,
+    wait: std::time::Duration,
+) -> Result<Option<NamedAdvisoryLock>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let id: i64 = sqlx::query_scalar("SELECT hashtextextended($1, 0)")
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if try_advisory_lock(&mut conn, id).await? {
+            return Ok(Some(NamedAdvisoryLock {
+                conn: Some(conn),
+                id,
+            }));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Returns `true` when `db_url` pins an sslmode that GUARANTEES a TLS
 /// connection: `require`, `verify-ca`, or `verify-full`. Returns `false` for an
 /// absent sslmode or the non-guaranteeing modes (`disable`, `allow`, `prefer` —

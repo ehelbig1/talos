@@ -1068,8 +1068,9 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     match embedding::EmbeddingConfig::cached() {
-        Some(c) if !c.is_local_provider() => {}
-        // Host-local provider, or none configured → no egress; no gate needed.
+        Some(c) if !c.tier1_permitted() => {}
+        // An attested host-local provider, or none configured → no egress; no
+        // gate needed.
         _ => return false,
     }
     match sqlx::query_scalar::<_, String>("SELECT max_llm_tier FROM actors WHERE id = $1")
