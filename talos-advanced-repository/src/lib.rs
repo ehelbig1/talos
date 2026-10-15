@@ -3962,6 +3962,7 @@ impl AdvancedRepository {
     /// the record must not be able to go missing, and (until 2026-09-21) a
     /// failure between the two statements left listings removed and nothing
     /// published. Returns `(published, removed_stale)`.
+    // allow-unbound-user-id: deployment-wide (the system publisher's listings); `user_id` is the operator recorded in admin_event_log, not a tenant filter
     pub async fn republish_system_templates_recorded(&self, user_id: Uuid) -> Result<(u64, u64)> {
         let mut tx = self.db_pool.begin().await?;
         // Phase 5.1: unified `modules` table; canonical id match only.

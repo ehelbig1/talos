@@ -1700,7 +1700,7 @@ enforced by `clippy.toml`.
   101. a token is not minted from Uuid::new_v4()
   102. every push-channel workflow binding asks workflow_is_bindable
   103. is_production() is read only where build posture is decided
-  104. a repository function that takes user_id binds it
+  104. a data-access function that takes user_id binds it
   105. a migration does not UPDATE, DELETE or TRUNCATE an append-only audit table
 
 ### The actor write ceiling → [`2026-10-05-actor-write-ceiling.md`](docs/engineering-log/2026-10-05-actor-write-ceiling.md)
