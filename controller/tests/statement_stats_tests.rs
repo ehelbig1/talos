@@ -739,7 +739,15 @@ async fn entries_from_a_dropped_database_are_counted_and_disclosed() {
     const WINDOWS: usize = 8;
     let mut evicted_in_every_window = Vec::new();
     for _ in 0..WINDOWS {
-        let (before, evictions_before) = reading(machine_json(
+        // The report reads the entry count and the eviction counter in two
+        // statements (count first), so a sweep between them inside ONE report
+        // pairs a pre-sweep count with a post-sweep counter. Taken 2026-10-15
+        // (before=2558 after=2486 with both counters equal): the eviction
+        // counter is compared across separate reports that BRACKET the pair.
+        let (_, evictions_before) = reading(machine_json(
+            &report(&state, admin, serde_json::json!({})).await,
+        ));
+        let (before, _) = reading(machine_json(
             &report(&state, admin, serde_json::json!({})).await,
         ));
 
@@ -771,7 +779,10 @@ async fn entries_from_a_dropped_database_are_counted_and_disclosed() {
         .await
         .expect("drop the victim database");
 
-        let (after, evictions_after) = reading(machine_json(
+        let (after, _) = reading(machine_json(
+            &report(&state, admin, serde_json::json!({})).await,
+        ));
+        let (_, evictions_after) = reading(machine_json(
             &report(&state, admin, serde_json::json!({})).await,
         ));
         if evictions_after != evictions_before {
