@@ -3492,7 +3492,22 @@ async fn handle_hot_update_module(
             -32000,
             talos_compilation::COMPILATION_SERVICE_ERROR_MESSAGE,
         )),
-        Err(e) => Some(mcp_error(req_id.clone(), -32000, &e.to_string())),
+        // The caller's own compile errors, and two fixed sentences: each is
+        // meant for the caller, so each is said.
+        Err(e @ HotUpdateError::Compilation(_))
+        | Err(e @ HotUpdateError::NoWasmBytes)
+        | Err(e @ HotUpdateError::CompilationDisabled) => {
+            Some(mcp_error(req_id.clone(), -32000, &e.to_string()))
+        }
+        // A database failure's text can carry table, column, constraint and
+        // connection detail (security review 2026-10-14, A-13: this arm was a
+        // catch-all `e.to_string()`). Logged in full here; the caller gets
+        // the generic funnel's answer. Every variant is named: a new one must
+        // decide what its caller sees.
+        Err(e @ HotUpdateError::DatabaseWrite(_)) => {
+            tracing::error!(error = %e, "hot_update_module: database write failed");
+            Some(crate::utils::database_error(req_id.clone()))
+        }
     }
 }
 
@@ -6831,5 +6846,37 @@ mod fuel_per_byte_tests {
             ],
             "the set of tools that take a fuel_budget changed; check the new one declares the rate"
         );
+    }
+}
+
+#[cfg(test)]
+mod hot_update_error_text_tests {
+    /// SOURCE PIN (textual; security review 2026-10-14, A-13): the
+    /// `hot_update_module` reply names every `HotUpdateError` variant it
+    /// answers, so no internal error reaches the caller through a catch-all
+    /// `e.to_string()`, and a database failure answers with the generic
+    /// funnel, not its text.
+    #[test]
+    fn hot_update_has_no_to_string_catch_all_and_a_database_failure_is_generic() {
+        let src = include_str!("sandbox.rs");
+        let at = src
+            .find("async fn handle_hot_update_module")
+            .expect("the handler");
+        let body = &src[at..];
+        let body = &body[..body.find("\n}\n").expect("the handler's end")];
+        assert!(
+            !body.contains(&["Err(e) =>", " Some("].concat()),
+            "an unnamed catch-all arm answers the caller with an error's text"
+        );
+        let database_arm = body
+            .find("Err(e @ HotUpdateError::DatabaseWrite(_))")
+            .expect("the database arm is named");
+        let arm = &body[database_arm..];
+        let arm = &arm[..arm.find("\n        }\n").expect("the arm's end")];
+        assert!(
+            arm.contains("crate::utils::database_error(req_id.clone())"),
+            "{arm}"
+        );
+        assert!(!arm.contains("e.to_string()"), "{arm}");
     }
 }

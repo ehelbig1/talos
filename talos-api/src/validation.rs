@@ -381,6 +381,25 @@ pub fn validate_workflow_execution_timeout(graph_json: &str) -> Result<()> {
     talos_workflow_types::validate_graph_timeouts(graph_json).map_err(safe_err)
 }
 
+/// The structural checks every writer of a whole graph runs
+/// (`talos_workflow_creation_helpers::validate_graph_structure`: node ids,
+/// node and edge counts, acyclicity), and — this being an authoring surface
+/// — a `skip_condition` that does not parse is refused, as `create_workflow`
+/// and `update_node_config` refuse it (security review 2026-10-14, G-26).
+/// Text that is not JSON passes here: the engine cannot load it, and the
+/// save path has its own answer for it.
+pub fn validate_workflow_graph_structure(graph_json: &str) -> Result<()> {
+    let Ok(graph) = serde_json::from_str::<serde_json::Value>(graph_json) else {
+        return Ok(());
+    };
+    let found =
+        talos_workflow_creation_helpers::validate_graph_structure(&graph).map_err(safe_err)?;
+    match found.skip_condition_faults.into_iter().next() {
+        Some(fault) => Err(safe_err(fault)),
+        None => Ok(()),
+    }
+}
+
 /// Validates JSON string field (prevents massive JSON payloads and deep nesting).
 pub fn validate_json_field(field_name: &str, value: &str) -> Result<()> {
     // JSON fields are limited to the max payload size

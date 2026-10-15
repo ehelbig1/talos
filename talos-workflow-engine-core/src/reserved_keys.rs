@@ -1122,6 +1122,37 @@ pub fn strip_engine_authored_keys(input: &mut serde_json::Value) {
     }
 }
 
+/// Output-side protocol keys a ROOT trigger payload never legitimately
+/// carries, removed at the engine's root trigger seed only.
+///
+/// Unlike [`ENGINE_AUTHORED_INPUT_KEYS`] these are written BY MODULES and
+/// read by the engine, so they cannot be stripped from module output (that
+/// would silence the protocol). But a trigger is not a module: a run's
+/// trigger comes from outside it (a webhook body, a caller's payload).
+///
+/// * [`crate::action_links::ACTION_LINKS_REQUEST`] — an `action_links` node
+///   whose only parent is the trigger planned links from the TRIGGER, so a
+///   webhook caller wrote the label and payload of a link the owner was then
+///   mailed (security review 2026-10-14, G-12). A link request reaches the
+///   node only as a module's output in the same run.
+///
+/// Not applied at a CHILD's seed: a child's trigger is its parent's node
+/// input, already stripped at the parent's root, so a request there was
+/// written by a module of the parent run.
+pub const ROOT_TRIGGER_REFUSED_OUTPUT_KEYS: &[&str] = &[crate::action_links::ACTION_LINKS_REQUEST];
+
+/// What the engine does to a ROOT trigger payload before it seeds the run:
+/// [`strip_engine_authored_keys`], and every
+/// [`ROOT_TRIGGER_REFUSED_OUTPUT_KEYS`] key removed.
+pub fn strip_root_trigger_keys(input: &mut serde_json::Value) {
+    if let Some(obj) = input.as_object_mut() {
+        strip_engine_authored_keys_from_map(obj);
+        for refused in ROOT_TRIGGER_REFUSED_OUTPUT_KEYS {
+            obj.remove(*refused);
+        }
+    }
+}
+
 /// [`strip_engine_authored_keys`] over an already-borrowed object map.
 pub fn strip_engine_authored_keys_from_map(obj: &mut serde_json::Map<String, serde_json::Value>) {
     for reserved in ENGINE_AUTHORED_INPUT_KEYS {
@@ -1972,5 +2003,45 @@ mod tests {
         let mut input = json!("a bare string trigger");
         strip_engine_authored_keys(&mut input);
         assert_eq!(input, json!("a bare string trigger"));
+    }
+}
+
+#[cfg(test)]
+mod root_trigger_strip_tests {
+    use super::*;
+
+    /// A ROOT trigger loses `__action_links__` as well as the engine-authored
+    /// keys (security review 2026-10-14, G-12); a module's OUTPUT keeps it,
+    /// because the output-side strip is the engine-authored list alone.
+    #[test]
+    fn a_root_trigger_loses_link_requests_and_module_output_keeps_them() {
+        let payload = || {
+            serde_json::json!({
+                "html": "<a href=\"talos-action:x\">x</a>",
+                crate::action_links::ACTION_LINKS_REQUEST: [{ "id": "x", "target": "list" }],
+                STALENESS: { "any_stale": false },
+            })
+        };
+        let mut trigger = payload();
+        strip_root_trigger_keys(&mut trigger);
+        assert_eq!(
+            trigger,
+            serde_json::json!({ "html": "<a href=\"talos-action:x\">x</a>" })
+        );
+
+        let mut output = payload();
+        strip_engine_authored_keys(&mut output);
+        assert!(
+            output
+                .get(crate::action_links::ACTION_LINKS_REQUEST)
+                .is_some(),
+            "the output-side strip silenced the action-link protocol"
+        );
+        assert!(output.get(STALENESS).is_none());
+
+        // A non-object trigger is left alone.
+        let mut bare = serde_json::json!("ping");
+        strip_root_trigger_keys(&mut bare);
+        assert_eq!(bare, serde_json::json!("ping"));
     }
 }

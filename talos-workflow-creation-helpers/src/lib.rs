@@ -11,6 +11,12 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+mod graph_structure;
+pub use graph_structure::{
+    stored_skip_condition, validate_graph_structure, validate_rhai_expression,
+    validate_skip_condition, GraphStructure,
+};
+
 const STRUCTURAL_NODE_TYPES: &[&str] = &[
     "collect",
     "loop",

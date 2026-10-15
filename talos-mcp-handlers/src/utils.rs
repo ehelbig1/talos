@@ -348,22 +348,25 @@ pub fn render_freshness_contract(
     }))
 }
 
-/// The refusal to give when a graph write failed because of what an
-/// `action_links` node in it may start, or `None` when it failed for any
-/// other reason.
+/// The refusal to give when a graph write failed on one of the rules every
+/// graph write is held to — what an `action_links` or `expression_dispatch`
+/// node may start, and the per-node and workflow caps — or `None` when it
+/// failed for any other reason.
 ///
-/// The rule lives in front of the statements that write a graph
-/// (`talos_workflow_repository::action_link_targets`), so every tool is held
-/// to it whether or not it calls this; this only turns the typed refusal
-/// into words a caller can act on. The words name the node and the entry,
-/// and give one answer for a workflow that does not exist and one that is
-/// not the caller's.
-pub fn action_targets_refusal_response(
+/// The rules live in front of the statements that write a graph
+/// (`talos_workflow_repository::{action_link_targets, graph_caps}`), so every
+/// tool is held to them whether or not it calls this; this only turns the
+/// typed refusal into words a caller can act on
+/// (`talos_workflow_repository::graph_write_refusal`). For a target the words
+/// name the node and the entry, and give one answer for a workflow that does
+/// not exist and one that is not the caller's; for a cap they are the cap's
+/// own sentence, the one `update_node_config` gives.
+pub fn graph_write_refusal_response(
     error: &anyhow::Error,
     req_id: &Option<serde_json::Value>,
 ) -> Option<super::types::JsonRpcResponse> {
-    talos_workflow_repository::action_targets_refusal(error)
-        .map(|refusal| super::mcp_error(req_id.clone(), -32602, &refusal.to_string()))
+    talos_workflow_repository::graph_write_refusal(error)
+        .map(|refusal| super::mcp_error(req_id.clone(), -32602, &refusal))
 }
 
 pub fn ensure_graph_within_caps(

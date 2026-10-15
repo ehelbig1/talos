@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""A statement that writes a workflow's graph is preceded by the targets rule.
+"""A statement that writes a workflow's graph is preceded by both graph rules.
 
-An `action_links` node's `targets` lists the workflows a link minted by that
-node may start. The rule for what may be written there (shape, and that each
-workflow is the owner's) lives in ONE place,
-`talos_workflow_repository::action_link_targets`, in front of the statements
-that write `workflows.graph_json`. Until 2026-10-13 it lived in one tool's
-handler, and every other tool that wrote or copied a graph stored whatever it
-was given (`docs/engineering-log/packages/2026-10-13-action-link-targets-one-rule.md`).
+Two rules hold every write of `workflows.graph_json`, each in ONE place, in
+front of the statements that write the column:
 
-This check keeps a new writer from skipping it:
+* What a node may start: an `action_links` node's `targets`, and the declared
+  `targets` of an `expression_dispatch` node (shape, and that each workflow
+  is the owner's) — `talos_workflow_repository::action_link_targets`
+  (`refuse_unowned_targets…`). Until 2026-10-13 it lived in one tool's
+  handler (`docs/engineering-log/packages/2026-10-13-action-link-targets-one-rule.md`).
+* The per-node and workflow caps (`timeout_secs`, `retry_count`, the wall
+  clock, …) — `talos_workflow_repository::graph_caps`
+  (`refuse_over_cap_graph`). Until 2026-10-15 the handlers that remembered
+  called it, and `duplicate_workflow` / `promote_workflow` did not
+  (`docs/engineering-log/packages/2026-10-15-every-graph-writer-passes-the-same-gates.md`).
+
+This check keeps a new writer from skipping either:
 
     check-graph-writers.py [ROOT]     exit 1 and name each statement
     check-graph-writers.py --self-test
 
 A statement is an `INSERT INTO workflows` whose column list names
 `graph_json`, or an `UPDATE workflows` that sets `graph_json`. The function
-it sits in must call `refuse_unowned_targets…` BEFORE the statement.
+it sits in must call `refuse_unowned_targets…` AND `refuse_over_cap_graph`
+BEFORE the statement. A Rust string continuation (a backslash, then a line break)
+between `workflows` and its column list is whitespace to Postgres and to
+this check: until 2026-10-15 it was not, and two writers
+(`create_workflow`, `insert_promoted_workflow`) were invisible to it.
 
 Scope: `*.rs` outside `tests/` directories and `*_tests.rs` files (a test
 seeds rows by SQL on purpose). A statement that provably cannot change what
@@ -36,11 +46,14 @@ import re
 import sys
 import tempfile
 
-GUARD = "refuse_unowned_targets"
+GUARDS = (
+    ("refuse_unowned_targets", "talos_workflow_repository::action_link_targets"),
+    ("refuse_over_cap_graph", "talos_workflow_repository::graph_caps"),
+)
 MARKER = re.compile(r"//\s*graph-write-unchecked:\s*\S")
 SKIP_DIRS = {"target", ".git", "node_modules", ".sqlx", "graphify-out", ".claude"}
 
-_INSERT = re.compile(r"INSERT\s+INTO\s+workflows\b(?!_)\s*\(([^)]*)\)", re.S)
+_INSERT = re.compile(r"INSERT\s+INTO\s+workflows\b(?!_)(?:\s|\\)*\(([^)]*)\)", re.S)
 _UPDATE = re.compile(r"UPDATE\s+workflows\b(?!_)(.*?)(?:\bWHERE\b|\bRETURNING\b|;|\"\s*[,)]\s*\n)", re.S)
 _FN = re.compile(r"^[ \t]*(?:pub(?:\([a-z: ]+\))?\s+)?(?:async\s+)?fn\s+(\w+)", re.M)
 
@@ -74,11 +87,12 @@ def problems_in(rel: str, text: str) -> list[str]:
             out.append(f"{rel}:{line}: writes workflows.graph_json outside any function")
             continue
         start, name = enclosing[-1]
-        if GUARD not in text[start:at]:
-            out.append(
-                f"{rel}:{line}: `{name}` writes workflows.graph_json without first calling "
-                f"`{GUARD}…` (talos_workflow_repository::action_link_targets)"
-            )
+        for guard, home in GUARDS:
+            if guard not in text[start:at]:
+                out.append(
+                    f"{rel}:{line}: `{name}` writes workflows.graph_json without first calling "
+                    f"`{guard}…` ({home})"
+                )
     return out
 
 
@@ -107,6 +121,7 @@ def problems(root: str) -> list[str]:
 def _self_test() -> int:
     good = '''
     pub async fn create(&self, graph_json: &str) -> Result<()> {
+        crate::graph_caps::refuse_over_cap_graph(graph_json)?;
         crate::action_link_targets::refuse_unowned_targets_on_conn(&mut tx, u, None, graph_json).await?;
         sqlx::query(
             "INSERT INTO workflows (id, user_id, graph_json) \\
@@ -117,6 +132,22 @@ def _self_test() -> int:
     no_guard = '''
     pub async fn save(&self, graph_json: &str) -> Result<()> {
         sqlx::query("UPDATE workflows SET graph_json = $1, updated_at = NOW() WHERE id = $2")
+    }
+    '''
+    continuation = '''
+    pub async fn create(&self, graph_json: &str) -> Result<()> {
+        crate::action_link_targets::refuse_unowned_targets_on_conn(&mut tx, u, None, graph_json).await?;
+        sqlx::query(
+            "INSERT INTO workflows \\
+             (id, user_id, graph_json) \\
+             VALUES ($1, $2, $3)",
+        )
+    }
+    '''
+    only_targets = '''
+    pub async fn create(&self, graph_json: &str) -> Result<()> {
+        refuse_unowned_targets_on_pool(pool, u, None, graph_json).await?;
+        sqlx::query("UPDATE workflows SET graph_json = $1 WHERE id = $2");
     }
     '''
     guard_after = '''
@@ -153,9 +184,12 @@ def _self_test() -> int:
     '''
     cases = [
         ("good", good, 0),
-        ("no guard", no_guard, 1),
-        ("guard after the statement", guard_after, 1),
-        ("guard in the function before", guard_in_the_function_before, 1),
+        # Each missing guard is its own problem.
+        ("no guard", no_guard, 2),
+        ("only the targets rule", only_targets, 1),
+        ("a continuation before the column list, caps missing", continuation, 1),
+        ("guard after the statement", guard_after, 2),
+        ("guard in the function before", guard_in_the_function_before, 2),
         ("marked", marked, 0),
         ("not a graph write", not_a_graph_write, 0),
     ]
@@ -180,7 +214,9 @@ def _self_test() -> int:
             with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
                 fh.write(text)
         got = problems(root)
-        if len(got) != 1 or not got[0].startswith(os.path.join("crate", "src", "lib.rs") + ":"):
+        if len(got) != 2 or not all(
+            g.startswith(os.path.join("crate", "src", "lib.rs") + ":") for g in got
+        ):
             failures += 1
             print(f"self-test FAILED: tree walk: {got}")
         elif "`save`" not in got[0]:
@@ -199,15 +235,19 @@ def main(argv: list[str]) -> int:
     root = argv[1] if len(argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     found = problems(root)
     if found:
-        print("A statement writes a workflow graph without the action-link targets rule in front of it:")
+        print("A statement writes a workflow graph without both graph rules in front of it:")
         for line in found:
             print(f"  {line}")
         print(
-            "Call talos_workflow_repository::action_link_targets::refuse_unowned_targets_on_conn / "
-            "_on_pool before the statement, or mark it `// graph-write-unchecked: <why>`."
+            "Call talos_workflow_repository::graph_caps::refuse_over_cap_graph and "
+            "action_link_targets::refuse_unowned_targets_on_conn / _on_pool before the "
+            "statement, or mark it `// graph-write-unchecked: <why>`."
         )
         return 1
-    print("check-graph-writers: every statement that writes workflows.graph_json is behind the targets rule")
+    print(
+        "check-graph-writers: every statement that writes workflows.graph_json is behind "
+        "the targets rule and the caps"
+    )
     return 0
 
 

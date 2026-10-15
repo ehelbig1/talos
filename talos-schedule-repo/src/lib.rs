@@ -84,14 +84,16 @@ impl ScheduleRepository {
     /// `is_unique_violation()` to detect the
     /// `workflow_schedules_workflow_id_key` collision and produce a
     /// caller-friendly "schedule already exists" message.
+    ///
+    /// Takes a [`talos_schedule_spec::ScheduleSpec`]: its only constructor
+    /// runs every cron and timezone check, so this write cannot store a
+    /// schedule that skipped them, and it carries the first due time.
     pub async fn create_schedule(
         &self,
         schedule_id: Uuid,
         workflow_id: Uuid,
         user_id: Uuid,
-        cron_expression: &str,
-        timezone: &str,
-        next_trigger_at: Option<chrono::DateTime<chrono::Utc>>,
+        schedule: &talos_schedule_spec::ScheduleSpec,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO workflow_schedules \
@@ -101,9 +103,9 @@ impl ScheduleRepository {
         .bind(schedule_id)
         .bind(workflow_id)
         .bind(user_id)
-        .bind(cron_expression)
-        .bind(timezone)
-        .bind(next_trigger_at)
+        .bind(schedule.cron_expression())
+        .bind(schedule.timezone())
+        .bind(schedule.next_trigger_at())
         .execute(&self.db_pool)
         .await?;
         Ok(())

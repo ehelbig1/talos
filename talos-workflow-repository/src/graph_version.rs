@@ -108,6 +108,8 @@ pub async fn write_workflow_graph_if_unchanged(
     // (`crate::action_link_targets`). This took any executor until
     // 2026-10-13; both callers passed the pool, and the check needs reads of
     // its own.
+    // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
+    crate::graph_caps::refuse_over_cap_graph(graph_json)?;
     crate::action_link_targets::refuse_unowned_targets_on_pool(
         pool,
         user_id,

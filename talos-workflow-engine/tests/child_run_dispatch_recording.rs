@@ -246,6 +246,7 @@ async fn a_dispatch_node_records_one_child_run() {
                 // A Rhai string literal, so no name resolution is involved.
                 dispatch_expression: format!("\"{child_wf}\""),
                 timeout_secs: 30,
+                targets: None,
             },
         )
         .build()
@@ -303,6 +304,7 @@ async fn a_dispatch_child_that_cannot_run_is_recorded_as_failed() {
             SystemNodeKind::DynamicDispatch {
                 dispatch_expression: format!("\"{child_wf}\""),
                 timeout_secs: 30,
+                targets: None,
             },
         )
         .build()

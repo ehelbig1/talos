@@ -39,9 +39,14 @@ use sqlx::{PgConnection, PgPool};
 use talos_workflow_engine_core::action_links::{
     action_targets_in_graph, stored_action_target_ids, NodeActionTargets, TargetsFault,
 };
+use talos_workflow_engine_core::dispatch_targets::{
+    dispatch_targets_in_graph, stored_dispatch_target_ids, DispatchTargetsFault,
+    NodeDispatchTargets,
+};
 use uuid::Uuid;
 
 pub use talos_workflow_engine_core::action_links::ActionTargetsRefusal;
+pub use talos_workflow_engine_core::dispatch_targets::DispatchTargetsRefusal;
 
 /// The refusal a graph write failed with, when that is why it failed.
 #[must_use]
@@ -49,19 +54,45 @@ pub fn action_targets_refusal(error: &anyhow::Error) -> Option<&ActionTargetsRef
     error.downcast_ref::<ActionTargetsRefusal>()
 }
 
-/// The `action_links` nodes of the graph about to be written, read strictly.
-/// Text that is not JSON has no nodes the engine could load.
-fn written_targets(graph_json: &str) -> Result<Vec<NodeActionTargets>> {
-    let Ok(graph) = serde_json::from_str::<serde_json::Value>(graph_json) else {
-        return Ok(Vec::new());
-    };
-    action_targets_in_graph(&graph).map_err(anyhow::Error::new)
+/// The `expression_dispatch` refusal a graph write failed with, when that is
+/// why it failed.
+#[must_use]
+pub fn dispatch_targets_refusal(error: &anyhow::Error) -> Option<&DispatchTargetsRefusal> {
+    error.downcast_ref::<DispatchTargetsRefusal>()
 }
 
-/// Whether the graph about to be written has an `action_links` node at all.
+/// What the graph about to be written says its nodes may start, read
+/// strictly: the `action_links` nodes' targets and the DECLARED targets of
+/// its `expression_dispatch` nodes (security review 2026-10-14, G-7). Text
+/// that is not JSON has no nodes the engine could load.
+#[derive(Debug, Default)]
+struct WrittenTargets {
+    links: Vec<NodeActionTargets>,
+    dispatch: Vec<NodeDispatchTargets>,
+}
+
+impl WrittenTargets {
+    fn is_empty(&self) -> bool {
+        self.links.is_empty() && self.dispatch.is_empty()
+    }
+}
+
+fn written_targets(graph_json: &str) -> Result<WrittenTargets> {
+    let Ok(graph) = serde_json::from_str::<serde_json::Value>(graph_json) else {
+        return Ok(WrittenTargets::default());
+    };
+    Ok(WrittenTargets {
+        links: action_targets_in_graph(&graph).map_err(anyhow::Error::new)?,
+        dispatch: dispatch_targets_in_graph(&graph).map_err(anyhow::Error::new)?,
+    })
+}
+
+/// Whether the graph about to be written names a workflow a node may start
+/// (an `action_links` node, or an `expression_dispatch` node that declares
+/// targets).
 ///
 /// # Errors
-/// The refusal, when it has one whose `targets` breaks the shape rule.
+/// The refusal, when one of them breaks the shape rule.
 pub(crate) fn names_action_targets(graph_json: &str) -> Result<bool> {
     Ok(!written_targets(graph_json)?.is_empty())
 }
@@ -102,13 +133,16 @@ pub(crate) async fn refuse_unowned_targets(
     existing_workflow: Option<Uuid>,
     graph_json: &str,
 ) -> Result<()> {
-    let nodes = written_targets(graph_json)?;
-    if nodes.is_empty() {
+    let written = written_targets(graph_json)?;
+    if written.is_empty() {
         return Ok(());
     }
 
-    let already_named: HashSet<Uuid> = match existing_workflow {
-        None => HashSet::new(),
+    // What the stored graph already names, per kind: an `action_links`
+    // target is not excused by an `expression_dispatch` declaration, or the
+    // reverse.
+    let (links_named, dispatch_named): (HashSet<Uuid>, HashSet<Uuid>) = match existing_workflow {
+        None => (HashSet::new(), HashSet::new()),
         Some(workflow_id) => {
             let stored: Option<String> = sqlx::query_scalar(
                 "SELECT graph_json::text FROM workflows WHERE id = $1 AND user_id = $2",
@@ -119,15 +153,28 @@ pub(crate) async fn refuse_unowned_targets(
             .await?;
             stored
                 .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                .map(|graph| stored_action_target_ids(&graph))
+                .map(|graph| {
+                    (
+                        stored_action_target_ids(&graph),
+                        stored_dispatch_target_ids(&graph),
+                    )
+                })
                 .unwrap_or_default()
         }
     };
 
-    let introduced: Vec<Uuid> = nodes
+    let introduced: Vec<Uuid> = written
+        .links
         .iter()
         .flat_map(|node| node.targets.values().copied())
-        .filter(|id| !already_named.contains(id))
+        .filter(|id| !links_named.contains(id))
+        .chain(
+            written
+                .dispatch
+                .iter()
+                .flat_map(|node| node.targets.iter().copied())
+                .filter(|id| !dispatch_named.contains(id)),
+        )
         .collect::<HashSet<Uuid>>()
         .into_iter()
         .collect();
@@ -152,13 +199,25 @@ pub(crate) async fn refuse_unowned_targets(
     .into_iter()
     .collect();
 
-    for node in &nodes {
+    for node in &written.links {
         for (name, workflow_id) in &node.targets {
-            if !already_named.contains(workflow_id) && !owned.contains(workflow_id) {
+            if !links_named.contains(workflow_id) && !owned.contains(workflow_id) {
                 return Err(anyhow::Error::new(ActionTargetsRefusal {
                     node: node.node.clone(),
                     fault: TargetsFault::NotAccessible {
                         name: name.clone(),
+                        workflow_id: *workflow_id,
+                    },
+                }));
+            }
+        }
+    }
+    for node in &written.dispatch {
+        for workflow_id in &node.targets {
+            if !dispatch_named.contains(workflow_id) && !owned.contains(workflow_id) {
+                return Err(anyhow::Error::new(DispatchTargetsRefusal {
+                    node: node.node.clone(),
+                    fault: DispatchTargetsFault::NotAccessible {
                         workflow_id: *workflow_id,
                     },
                 }));
@@ -222,9 +281,33 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_dispatch_declaration_is_refused_before_any_read_and_names_its_node() {
+        let graph = serde_json::json!({ "nodes": [
+            { "id": "route", "type": "system:dispatch",
+              "data": { "dispatch_expression": "inputs.route", "targets": "everything" } }
+        ]})
+        .to_string();
+        let error = written_targets(&graph).unwrap_err();
+        let refusal = dispatch_targets_refusal(&error).expect("typed refusal");
+        assert_eq!(refusal.node, "route");
+        assert_eq!(refusal.fault, DispatchTargetsFault::NotAList);
+        assert_eq!(
+            crate::graph_write_refusal(&error).as_deref(),
+            Some(refusal.to_string().as_str())
+        );
+        assert!(dispatch_targets_refusal(&anyhow::anyhow!("connection reset")).is_none());
+    }
+
+    #[test]
     fn a_graph_without_the_node_and_text_that_is_not_json_have_nothing_to_check() {
         assert!(
             written_targets(r#"{"nodes":[{"id":"a","kind":"collect"}]}"#)
+                .unwrap()
+                .is_empty()
+        );
+        // An `expression_dispatch` node that declares nothing names nothing.
+        assert!(
+            written_targets(r#"{"nodes":[{"id":"d","kind":"dispatch","data":{}}]}"#)
                 .unwrap()
                 .is_empty()
         );

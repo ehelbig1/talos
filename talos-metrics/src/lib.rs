@@ -348,6 +348,16 @@ pub fn record_dispatch_refusal(path: talos_workflow_liveness::dispatch::Dispatch
     }
 }
 
+/// Count one `expression_dispatch` run refused because its resolved workflow
+/// is not among the node's declared `targets`. The ONE increment site of
+/// `talos_expression_dispatch_target_refusals_total`. Inert when metrics are
+/// not wired (unit tests), mirroring [`global`]'s contract.
+pub fn record_expression_dispatch_target_refusal() {
+    if let Some(m) = global() {
+        m.expression_dispatch_target_refusals_total.inc();
+    }
+}
+
 /// Record a terminal workflow-execution outcome on the process-global
 /// `talos_workflow_executions_total{status}` counter. Inert when metrics
 /// aren't wired (unit tests, any process without `set_global`) — never
@@ -1943,6 +1953,13 @@ pub struct TalosMetrics {
     /// protocol can explain.
     pub scheduler_readiness_holds_total: Counter,
 
+    /// `expression_dispatch` runs refused because the workflow the
+    /// expression resolved to is not among the node's DECLARED `targets`
+    /// (security review 2026-10-14, G-7). The refusal is the author's
+    /// declaration working; a sustained rise means something upstream keeps
+    /// naming a workflow the author did not list — worth a look, not a page.
+    pub expression_dispatch_target_refusals_total: Counter,
+
     /// Scheduler polls held after a resume: a gap of 45 s or more between
     /// polls (host suspended, VM paused), then the on-time polls waited for
     /// before dispatch starts again. 0 forever on a host that never sleeps.
@@ -3445,6 +3462,20 @@ impl TalosMetrics {
         // scheduler that never started.
         scheduler_readiness_holds_total.inc_by(0.0);
 
+        let expression_dispatch_target_refusals_total = Counter::new(
+            "talos_expression_dispatch_target_refusals_total",
+            "expression_dispatch runs refused because the workflow the \
+             expression resolved to is not among the node's declared targets. \
+             The author's declaration working, not a fault: a sustained rise \
+             means an upstream input keeps naming a workflow the author did \
+             not list.",
+        )?;
+        registry.register(Box::new(expression_dispatch_target_refusals_total.clone()))?;
+        // One live emitter (`record_expression_dispatch_target_refusal`); its
+        // healthy steady state is zero, so it is seeded: an ABSENT series
+        // makes `increase(...) > 0` match nothing.
+        expression_dispatch_target_refusals_total.inc_by(0.0);
+
         let scheduler_resume_holds_total = Counter::new(
             "talos_scheduler_resume_holds_total",
             "Scheduler poll iterations held after a resume: the poll that saw \
@@ -4428,6 +4459,7 @@ impl TalosMetrics {
             rank_training_fetches_total,
             rank_training_lookback_shortfall_days,
             scheduler_readiness_holds_total,
+            expression_dispatch_target_refusals_total,
             scheduler_resume_holds_total,
             host_suspended_seconds_total,
             scheduler_readiness_degraded,
@@ -5814,6 +5846,7 @@ mod tests {
             r#"talos_scheduler_dispatches_total{outcome="fenced",phase="steady"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="cancelled",phase="steady"} 0"#,
             "talos_scheduler_readiness_holds_total 0",
+            "talos_expression_dispatch_target_refusals_total 0",
             "talos_scheduler_readiness_degraded 0",
         ] {
             assert!(

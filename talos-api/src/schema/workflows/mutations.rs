@@ -279,6 +279,8 @@ impl WorkflowsMutations {
         // × up to 100 concurrent executions per workflow. Sibling to
         // MCP-584 (HTTP), MCP-1215 (LLM streaming) wall-clock caps.
         crate::validation::validate_workflow_execution_timeout(&input.graph_json)?;
+        // Ids, counts, acyclicity, a parsing skip_condition (review G-26).
+        crate::validation::validate_workflow_graph_structure(&input.graph_json)?;
         // MCP-1182: enforce 1-100 cap on max_concurrent_executions
         // (sibling to MCP `set_concurrency_limit` / GraphQL
         // `set_concurrency_limit` mutation). Pre-fix create_workflow
@@ -366,9 +368,9 @@ impl WorkflowsMutations {
             )
             .await
             .map_err(|e| {
-                // See the update below: the one refusal with words of its own.
-                if let Some(refusal) = talos_workflow_repository::action_targets_refusal(&e) {
-                    return async_graphql::Error::new(refusal.to_string()).extend_safe();
+                // See the update below: the refusals with words of their own.
+                if let Some(refusal) = talos_workflow_repository::graph_write_refusal(&e) {
+                    return async_graphql::Error::new(refusal).extend_safe();
                 }
                 tracing::error!(error = %e, "graphql: workflow insert failed");
                 async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -491,6 +493,8 @@ impl WorkflowsMutations {
         // clean workflow and PATCH execution_timeout_secs to 86400 via
         // update_workflow to bypass the create-time cap.
         crate::validation::validate_workflow_execution_timeout(&input.graph_json)?;
+        // Ids, counts, acyclicity, a parsing skip_condition (review G-26).
+        crate::validation::validate_workflow_graph_structure(&input.graph_json)?;
         // MCP-1182: enforce 1-100 cap on max_concurrent_executions
         // here too. update_workflow took CreateWorkflowInput so the
         // gap was symmetrical with create_workflow above. Without
@@ -541,11 +545,13 @@ impl WorkflowsMutations {
             )
             .await
             .map_err(|e| {
-                // What an `action_links` node may start: a refusal the
+                // The rules every graph write is held to (what an
+                // `action_links` or `expression_dispatch` node may start, the
+                // per-node and workflow caps): a refusal the
                 // caller can act on (it names the node and the entry, and
                 // gives one answer for "does not exist" and "is not yours").
-                if let Some(refusal) = talos_workflow_repository::action_targets_refusal(&e) {
-                    return async_graphql::Error::new(refusal.to_string()).extend_safe();
+                if let Some(refusal) = talos_workflow_repository::graph_write_refusal(&e) {
+                    return async_graphql::Error::new(refusal).extend_safe();
                 }
                 tracing::error!(error = %e, "graphql: workflow update failed");
                 async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -887,29 +893,14 @@ impl WorkflowsMutations {
         // than the explicit "must have 5 or 6 space-separated fields"
         // diagnostic. Same UX-parity class as MCP-292
         // ("GraphQL must mirror MCP").
-        let field_count = cron_expression.split_whitespace().count();
-        if !(5..=6).contains(&field_count) {
-            return Err(async_graphql::Error::new(
-                "Invalid cron expression: must have 5 or 6 space-separated fields",
-            )
-            .extend_safe());
-        }
-
-        // Validate cron expression
-        talos_scheduler::validate_cron(&cron_expression)
-            .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
-        // Enforce minimum 1-minute interval to prevent runaway scheduler load
-        talos_scheduler::validate_cron_min_interval(&cron_expression, 60)
-            .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
-
-        // Validate timezone
-        talos_scheduler::validate_timezone(&tz)
-            .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
-
-        // Calculate next trigger time (pure — compute before opening the
-        // tx so the unit of work stays scoped to the two DB ops).
-        let next_trigger = talos_scheduler::calculate_next_trigger(&cron_expression, &tz)
-            .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
+        //
+        // Since 2026-10-15 the field count, the parse, the 1-minute floor, the
+        // timezone and the first due time are `ScheduleSpec::validated` — the
+        // one home every schedule writer takes its value from. Pure, so it
+        // runs before the tx and the unit of work stays scoped to the two DB
+        // ops.
+        let spec = talos_scheduler::ScheduleSpec::validated(&cron_expression, &tz)
+            .map_err(|e| async_graphql::Error::new(e.to_string()).extend_safe())?;
 
         // RFC 0005 S3: the org-WRITE-access check + the upsert share ONE
         // request-scoped unit of work — the ownership read gets the
@@ -941,19 +932,12 @@ impl WorkflowsMutations {
         }
 
         // Upsert: insert or update on conflict (workflow_id is UNIQUE)
-        let row = talos_scheduler::upsert_schedule_on_conn(
-            uow.conn(),
-            workflow_id,
-            user_id,
-            &cron_expression,
-            &tz,
-            next_trigger,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "graphql: schedule upsert failed");
-            async_graphql::Error::new("Request could not be completed").extend_safe()
-        })?;
+        let row = talos_scheduler::upsert_schedule_on_conn(uow.conn(), workflow_id, user_id, &spec)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: schedule upsert failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
@@ -1063,44 +1047,19 @@ impl WorkflowsMutations {
         // create_schedule above. The existing row's cron_expression
         // already passed this gate at create time, but if the caller
         // supplies a new cron_expression here it must too.
-        let field_count = new_cron.split_whitespace().count();
-        if !(5..=6).contains(&field_count) {
-            return Err(async_graphql::Error::new(
-                "Invalid cron expression: must have 5 or 6 space-separated fields",
-            )
-            .extend_safe());
-        }
-
-        // Validate cron expression
-        talos_scheduler::validate_cron(&new_cron)
-            .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
-        // Enforce minimum 1-minute interval to prevent runaway scheduler load
-        talos_scheduler::validate_cron_min_interval(&new_cron, 60)
-            .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
-
-        // Validate timezone
-        talos_scheduler::validate_timezone(&new_tz)
-            .map_err(|e| async_graphql::Error::new(e).extend_safe())?;
-
-        // Calculate next trigger time (only when enabled)
-        let next_trigger = if new_enabled {
-            Some(
-                talos_scheduler::calculate_next_trigger(&new_cron, &new_tz)
-                    .map_err(|e| async_graphql::Error::new(e).extend_safe())?,
-            )
-        } else {
-            None
-        };
+        // Since 2026-10-15: `ScheduleSpec::validated`, the one home (field
+        // count, parse, 1-minute floor, timezone, first due time). A disabled
+        // schedule is stored with no due time.
+        let spec = talos_scheduler::ScheduleSpec::validated(&new_cron, &new_tz)
+            .map_err(|e| async_graphql::Error::new(e.to_string()).extend_safe())?;
 
         let row = talos_scheduler::update_schedule_on_conn(
             uow.conn(),
             workflow_id,
             user_id,
             &scope.accessible_org_ids,
-            &new_cron,
-            &new_tz,
+            &spec,
             new_enabled,
-            next_trigger,
         )
         .await
         .map_err(|e| {

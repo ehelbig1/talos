@@ -278,6 +278,70 @@ async fn the_node_mints_links_only_for_its_targets_and_passes_the_message_on() {
     assert!(!used, "a GET used the link up");
 }
 
+/// An `action_links` node at the graph ROOT plans from the trigger payload,
+/// so a webhook caller wrote the label and payload of a real link the owner
+/// was then mailed (security review 2026-10-14, G-12). The engine drops
+/// `__action_links__` from a root trigger: `trigger → links → send` with a
+/// trigger carrying a request writes NO token row, with the real minter and a
+/// target the running user owns.
+#[tokio::test]
+async fn a_root_trigger_carrying_a_link_request_writes_no_token_row() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let owner = create_test_user(&ctx.auth_service, "action_links_root@example.com").await;
+    let list = create_test_workflow(&pool, owner, "al-root-list").await;
+
+    let send = Uuid::new_v4();
+    let graph = WorkflowGraphBuilder::new()
+        .add_system_node(
+            "links",
+            SystemNodeKind::ActionLinks {
+                targets: BTreeMap::from([("list".to_string(), list)]),
+                ttl_hours: Some(24),
+            },
+        )
+        .add_module("send", send, None)
+        .edge("links", "send")
+        .build()
+        .expect("graph builds");
+    let mut engine = minimal_engine();
+    engine.set_user_id(owner);
+    engine.set_module_fetcher(Arc::new(
+        InMemoryModuleFetcher::new().with_module(send, stub_artifact(send)),
+    ));
+    engine.set_action_link_minter(Arc::new(
+        talos_engine::action_link_minter::PostgresActionLinkMinter::new(pool.clone()),
+    ));
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph).unwrap())
+        .await
+        .expect("load graph");
+    engine
+        .run_with_trigger_input_transport(
+            Arc::new(ScriptedDispatcher {
+                output: json!({ "sent": true }),
+            }),
+            None,
+            // What a webhook caller would send.
+            json!({
+                "html": "<a href=\"talos-action:approve\">ok</a>",
+                ACTION_LINKS_REQUEST: [
+                    { "id": "approve", "target": "list", "label": "Approve payroll",
+                      "payload": { "op": "drop", "item": "*" } },
+                ],
+            }),
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("run succeeds");
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_action_tokens")
+        .fetch_one(&pool)
+        .await
+        .expect("count tokens");
+    assert_eq!(rows, 0, "a trigger payload minted a link");
+}
+
 /// A dry run is a rehearsal, and a link starts a real workflow: with the real
 /// minter wired and a workflow the running user owns, a dry run through the
 /// node writes NO token row and its output carries no link.

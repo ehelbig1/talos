@@ -362,6 +362,9 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
         Some(SystemNodeKind::DynamicDispatch {
             dispatch_expression: data.get("dispatch_expression")?.as_str()?.to_string(),
             timeout_secs: child_timeout_secs(data, 30),
+            targets: talos_workflow_engine_core::dispatch_targets::parse_dispatch_targets(
+                data.get(talos_workflow_engine_core::dispatch_targets::DISPATCH_TARGETS_KEY),
+            ),
         })
     } else if k == "capability_dispatch" {
         let data = node.get("data")?;
