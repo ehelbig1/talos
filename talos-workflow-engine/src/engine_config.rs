@@ -309,6 +309,24 @@ impl ParallelWorkflowEngine {
     /// loop-body path has no such merge step, so it routes through this helper.
     /// Shared by the loop-body dispatch site and its unit test so the override
     /// extraction can't silently drift.
+    /// Whether a `sub_workflow` node asks for its child's trigger to be its OWN input
+    /// (`"child_trigger": "input"` in its data) instead of the outer run's trigger.
+    ///
+    /// The default (absent, or anything else) is the outer trigger (2026-10-14,
+    /// `docs/engineering-log/packages/2026-10-14-child-trigger-input.md`). The opt-in
+    /// is for a node that relays a request to a workflow written to be started by
+    /// one: a gap report handing its gaps to the brief workflow, a check result
+    /// handing its comment to the posting workflow. The input is stripped of every
+    /// `__` key, as the child's seed is, so a module upstream still cannot author an
+    /// engine key; what it can do is what the workflow's author chose by setting this.
+    pub(crate) fn subworkflow_trigger_from_input(&self, node_id: &Uuid) -> bool {
+        self.node_configs
+            .get(node_id)
+            .and_then(|cfg| cfg.get("child_trigger"))
+            .and_then(|v| v.as_str())
+            == Some("input")
+    }
+
     pub(crate) fn node_config_max_fuel(&self, node_id: &Uuid) -> Option<u64> {
         self.node_configs
             .get(node_id)

@@ -1573,7 +1573,18 @@ impl ParallelWorkflowEngine {
         // child's trigger, and the child's own strip cannot drop the real one.
         // Until 2026-10-14 it rode in the seed and that strip removed it, so
         // only a ROOT `sub_workflow` node's child saw the outer trigger.
-        let outer_trigger = self.extract_trigger_input(results);
+        // Unless the node asks for its own input to be its child's trigger
+        // (`child_trigger: "input"`): then the child is started by what this node
+        // relays, stripped of every `__` key as the seed is.
+        let outer_trigger = if self.subworkflow_trigger_from_input(&node_id) {
+            let mut relayed = inputs.clone();
+            if let Some(obj) = relayed.as_object_mut() {
+                obj.retain(|k, _| !k.starts_with("__"));
+            }
+            Some(relayed)
+        } else {
+            self.extract_trigger_input(results)
+        };
         tracing::info!(
             %node_id,
             sub_workflow_id = %sub_wf_id,
