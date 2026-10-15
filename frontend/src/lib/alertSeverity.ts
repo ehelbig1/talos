@@ -37,3 +37,40 @@ export const ASSIGNABLE_SEVERITIES = [
 export function severityStyle(sev: string | null | undefined): string {
   return (sev && SEVERITY_STYLE[sev]) || SEVERITY_STYLE.unclassified;
 }
+
+/** Severities a count in the nav should include: everything active except
+ *  noise, which is suppressed from attention by definition. */
+const COUNTED_IN_NAV = new Set([
+  "critical",
+  "high",
+  "medium",
+  "low",
+  "info",
+  "unclassified",
+]);
+
+/** Severities from most to least urgent, for picking a badge's colour. */
+const URGENCY = ["critical", "high", "medium", "low", "info", "unclassified"];
+
+export interface SeverityCount {
+  severity: string;
+  count: number;
+}
+
+/** Active alerts the nav badge counts, and the most urgent severity among
+ *  them (null when there is nothing to show). */
+export function navAlertSummary(active: ReadonlyArray<SeverityCount>): {
+  count: number;
+  worst: string | null;
+} {
+  let count = 0;
+  let worst: string | null = null;
+  for (const { severity, count: n } of active) {
+    if (n <= 0 || !COUNTED_IN_NAV.has(severity)) continue;
+    count += n;
+    const rank = URGENCY.indexOf(severity);
+    const worstRank = worst === null ? Infinity : URGENCY.indexOf(worst);
+    if (rank !== -1 && rank < worstRank) worst = severity;
+  }
+  return { count, worst };
+}
