@@ -1114,7 +1114,7 @@ async fn handle_list_workflows(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-221 (2026-05-08): pre-fix `tag: "   "` was passed verbatim to
     // SQL `'tag' = ANY(tags)` — matched nothing because no workflow
     // has a whitespace tag, so the response was a confident
@@ -1574,7 +1574,7 @@ async fn handle_create_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     let (wf_name, name_collision_warning) =
         match validate_new_workflow_name(&req_id, args, state.as_ref(), user_id).await {
@@ -2159,7 +2159,7 @@ async fn handle_add_node_to_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -2958,7 +2958,7 @@ async fn handle_trigger_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     let workflow_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
@@ -3348,7 +3348,7 @@ async fn handle_dispatch_to_actor(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // 1. Validate actor_id (required, owned by caller).
     let actor_id = match crate::utils::require_uuid(args, "actor_id", req_id.clone()) {
@@ -3529,7 +3529,7 @@ async fn handle_test_workflow_draft(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     if let Err(resp) =
         crate::utils::enforce_executions_not_paused(&state.workflow_repo, req_id.clone()).await
@@ -3831,7 +3831,7 @@ async fn handle_cleanup_workflows(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-212 (2026-05-08): trim BEFORE the SQL pattern is built. The
     // pre-MCP-178 fix only used trim() in the emptiness check; the
     // un-trimmed value still flowed into `workflow_repo.cleanup_workflows`
@@ -3959,7 +3959,7 @@ async fn handle_delete_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -4014,7 +4014,7 @@ async fn handle_rename_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -4268,7 +4268,7 @@ async fn handle_get_workflow_full(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -4496,7 +4496,7 @@ async fn handle_get_workflow_raw_json(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -5280,7 +5280,7 @@ async fn handle_validate_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return Some(resp),
@@ -5751,7 +5751,7 @@ async fn handle_call_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     if let Err(resp) =
         crate::utils::enforce_executions_not_paused(&state.workflow_repo, req_id.clone()).await
@@ -6464,7 +6464,7 @@ async fn handle_clone_workflow(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return Some(resp),
@@ -6565,7 +6565,7 @@ async fn handle_export_workflow(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return Some(resp),
@@ -6657,7 +6657,7 @@ async fn handle_import_workflow(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let bundle = match args.get("bundle") {
         Some(b) if b.is_object() => b,
         _ => {
@@ -7009,7 +7009,7 @@ async fn handle_batch_delete_workflows(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-250 (2026-05-08): dedup workflow_ids upfront — duplicate UUIDs
     // in the input array would produce stale `blocked_ids` / `deleted_ids`
     // counts where total != deleted+blocked. Same shape as MCP-249.
@@ -7130,7 +7130,7 @@ async fn handle_bulk_trigger_workflow(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // Check if executions are paused
     if let Err(resp) =
         crate::utils::enforce_executions_not_paused(&state.workflow_repo, req_id.clone()).await
@@ -7537,7 +7537,7 @@ async fn handle_trigger_workflow_as_actors(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // Check if executions are paused
     if let Err(resp) =
@@ -8079,7 +8079,7 @@ async fn handle_set_workflow_actor_id(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return Some(resp),
@@ -8198,7 +8198,7 @@ async fn handle_set_workflow_description(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return Some(resp),
@@ -8312,7 +8312,7 @@ async fn handle_test_subworkflow_contract(
 ) -> JsonRpcResponse {
     use talos_subworkflow_contract::{run_contract_test, ContractKind, ContractTestError};
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id: uuid::Uuid = match args
         .get("workflow_id")
         .and_then(|v| v.as_str())
@@ -8408,7 +8408,7 @@ async fn handle_test_workflow(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // Check if executions are paused
     if let Err(resp) =
         crate::utils::enforce_executions_not_paused(&state.workflow_repo, req_id.clone()).await
@@ -9101,7 +9101,7 @@ async fn handle_get_workflow_health(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id: uuid::Uuid = match args
         .get("workflow_id")
         .and_then(|v| v.as_str())
@@ -9280,7 +9280,7 @@ async fn handle_get_workflow_summary(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id: uuid::Uuid = match args
         .get("workflow_id")
         .and_then(|v| v.as_str())
@@ -9493,7 +9493,7 @@ async fn handle_disable_workflow(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return Some(resp),
@@ -9530,7 +9530,7 @@ async fn handle_enable_workflow(
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return Some(resp),
@@ -9570,7 +9570,7 @@ async fn handle_create_workflow_from_description(
         validate_input, CreateFromDescriptionOutcome, CreateFromDescriptionRequest, InputError,
     };
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     let description = args.get("description").and_then(|v| v.as_str());
     if let Err(e) = validate_input(description) {
@@ -10224,7 +10224,7 @@ async fn handle_instantiate_workflow_pattern(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // list: true — enumerate available patterns without creating a workflow
     // MCP-246 (2026-05-08): pre-fix `list: "true"` (string) silently became
@@ -10738,7 +10738,7 @@ async fn handle_get_workflow_quickstart(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     let wf_id: uuid::Uuid = match args
         .get("workflow_id")
@@ -11185,7 +11185,7 @@ async fn handle_add_edge_to_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
@@ -11501,7 +11501,7 @@ async fn handle_swap_node_module(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // ── Parse inputs ────────────────────────────────────────────────────────
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
@@ -11886,7 +11886,7 @@ async fn handle_set_workflow_input_schema(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -11964,7 +11964,7 @@ async fn handle_validate_workflow_input(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -12247,7 +12247,7 @@ async fn handle_set_workflow_type(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -12318,7 +12318,7 @@ async fn handle_archive_workflows_by_prefix(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // MCP-174 / MCP-211 (2026-05-08): trim the prefix BEFORE the SQL
     // LIKE pattern is built. Pre-MCP-174 the trim was only applied
@@ -12505,7 +12505,7 @@ async fn handle_set_workflow_execution_timeout(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -12637,7 +12637,7 @@ async fn handle_create_workflow_from_spec(
 ) -> JsonRpcResponse {
     use talos_workflow_creation::{CreateFromSpecOutcome, CreateFromSpecRequest};
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // MCP-219 (2026-05-08): pre-fix accepted whitespace-only `name`
     // and persisted it verbatim — a real probe got back
@@ -12956,7 +12956,7 @@ async fn handle_plan_and_execute_workflow(
 ) -> JsonRpcResponse {
     use uuid::Uuid;
 
-    let user_id = agent.user_id.unwrap_or_else(Uuid::nil);
+    let user_id = agent.user_id;
 
     // MCP-219 (2026-05-08): pre-fix `!n.is_empty()` accepted
     // whitespace-only names. Same persistence-class bug as MCP-218
@@ -13273,7 +13273,7 @@ async fn handle_check_semantic_cache(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let workflow_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -13398,7 +13398,7 @@ async fn handle_write_semantic_cache(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let workflow_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -13518,9 +13518,7 @@ async fn handle_create_tree_of_thoughts_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    use uuid::Uuid;
-
-    let user_id = agent.user_id.unwrap_or_else(Uuid::nil);
+    let user_id = agent.user_id;
 
     // MCP-219 (2026-05-08): pre-fix `!n.is_empty()` accepted
     // whitespace-only names. Same persistence-class bug as MCP-218
@@ -13722,7 +13720,7 @@ async fn handle_import_yaml_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // MCP-214 (2026-05-08): pre-fix empty / whitespace-only YAML was
     // sent to `parse_yaml`, surfacing the misleading
@@ -13880,7 +13878,7 @@ async fn handle_export_yaml_workflow(
     state: Arc<McpState>,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,

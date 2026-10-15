@@ -752,7 +752,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let is_admin = agent.is_admin();
     match name {
         "get_workflow_stats" => Some(handle_get_workflow_stats(req_id, args, state, user_id).await),

@@ -115,7 +115,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-1201 (2026-05-17): all read-only. Write operations were
     // removed; the GraphQL surface (require_2fa + SecretsWrite) is the
     // single point of secret mutation. `agent.has_capability(...)` is

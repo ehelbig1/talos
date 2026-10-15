@@ -148,7 +148,7 @@ async fn the_role_gate_refuses_a_world_the_agent_lacks() {
         name: "spec-gate-http-only".to_string(),
         role_name: "http-only".to_string(),
         allowed_capabilities: vec!["http".to_string()],
-        user_id: Some(user),
+        user_id: user,
     });
 
     let refused = call_spec(

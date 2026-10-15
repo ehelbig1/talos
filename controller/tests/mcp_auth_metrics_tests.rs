@@ -223,16 +223,20 @@ async fn every_path_through_the_middleware_moves_its_own_outcome() {
         before[&McpAuthOutcome::InvalidToken] + 1.0
     );
 
-    // Authenticated, bound to no user: the 403 `refuse_unscoped_agent` builds.
+    // Authenticated, bound to no user: the 403 `unscoped_agent_refusal`
+    // builds, returned before an identity exists (D-7) — so nothing is
+    // cached, and the second call is refused the same way.
     let orphan = format!("tok-{}", Uuid::new_v4().simple());
     seed_agent(&pool, &orphan, &orphan, None).await;
-    assert_eq!(
-        call(&app, "198.51.100.5", Some(&orphan)).await,
-        StatusCode::FORBIDDEN
-    );
+    for _ in 0..2 {
+        assert_eq!(
+            call(&app, "198.51.100.5", Some(&orphan)).await,
+            StatusCode::FORBIDDEN
+        );
+    }
     assert_eq!(
         count(McpAuthOutcome::UnscopedAgent),
-        before[&McpAuthOutcome::UnscopedAgent] + 1.0
+        before[&McpAuthOutcome::UnscopedAgent] + 2.0
     );
 
     // The limiter: request cap+1 from one IP inside one window. The first

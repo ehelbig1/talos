@@ -643,7 +643,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-323/324/325/326/327: the deployment-wide admin handlers
     // (`query_paginated`, `set_archive_policy`, `publish_built_in_templates`,
     // plus cross-file siblings) now do their own
@@ -1151,7 +1151,7 @@ async fn handle_create_scratch_session(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-169 (2026-05-08): reject whitespace-only session names.
     // Pre-fix `!n.is_empty()` accepted "                " and persisted
     // it in upsert_scratch_session, polluting list_scratch_sessions.
@@ -1261,7 +1261,7 @@ async fn handle_run_scratch_session(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-169 (2026-05-08): reject whitespace-only session names.
     // Pre-fix `!n.is_empty()` accepted "                " and persisted
     // it in upsert_scratch_session, polluting list_scratch_sessions.
@@ -2385,7 +2385,7 @@ async fn handle_install_from_marketplace(
     state: &McpState,
     agent: &auth::AgentIdentity,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let listing_id = match crate::utils::require_uuid(args, "listing_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -2783,15 +2783,6 @@ async fn handle_star_module(
         Ok(id) => id,
         Err(resp) => return resp,
     };
-
-    // Reject nil user_id — agents without a bound user cannot own a star.
-    if user_id == uuid::Uuid::nil() {
-        return mcp_error(
-            req_id,
-            -32600,
-            "Agent must have a bound user_id to star modules",
-        );
-    }
 
     // Verify the listing exists and is public before touching the stars table.
     let listing_exists = state.advanced_repo.check_listing_exists(listing_id).await;

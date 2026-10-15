@@ -247,7 +247,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-330 / MCP-331: deployment-wide admin handlers
     // (`set_wasm_config`, `get_secret_access_log`) now compute their
     // own `is_platform_admin(user_id)` gate; the agent-level
@@ -329,25 +329,18 @@ async fn handle_whoami(
     // .max_capability_world NOT NULL DEFAULT 'http-node'`), and it is a
     // measured answer. Only `Err` is unmeasured.
     let mut readings = talos_measurement::Readings::new();
-    let (email, org, ceiling, is_admin) = match agent.user_id {
-        Some(uid) => {
-            let email = readings
-                .record("email", repo.get_user_email(uid).await)
-                .flatten();
-            let org = readings
-                .record("organization", repo.get_user_org_summary(uid).await)
-                .flatten();
-            let ceiling = readings.record(
-                "capability_ceiling",
-                repo.user_capability_ceiling(uid).await,
-            );
-            let is_admin = readings.record("is_platform_admin", repo.is_platform_admin(uid).await);
-            (email, org, ceiling, is_admin)
-        }
-        // No user id on the token: nothing to read, and the pre-existing
-        // answer is a measured one about an unbound agent.
-        None => (None, None, Some("http-node".to_string()), Some(false)),
-    };
+    let uid = agent.user_id;
+    let email = readings
+        .record("email", repo.get_user_email(uid).await)
+        .flatten();
+    let org = readings
+        .record("organization", repo.get_user_org_summary(uid).await)
+        .flatten();
+    let ceiling = readings.record(
+        "capability_ceiling",
+        repo.user_capability_ceiling(uid).await,
+    );
+    let is_admin = readings.record("is_platform_admin", repo.is_platform_admin(uid).await);
     let body = serde_json::json!({
         "agent": {
             "id": agent.agent_id.to_string(),
@@ -355,7 +348,7 @@ async fn handle_whoami(
             "role": agent.role_name,
         },
         "user": {
-            "id": agent.user_id.map(|u| u.to_string()),
+            "id": agent.user_id.to_string(),
             "email": email,
         },
         "organization": org.map(|(id, name)| serde_json::json!({
@@ -1305,14 +1298,11 @@ async fn handle_get_platform_info(
     // flag: a gate that cannot read its rule withholds, never grants.
     // allow-benign-default: `false` costs the caller the fleet block; it
     // grants nothing.
-    let caller_is_platform_admin = match agent.user_id {
-        Some(uid) => state
-            .actor_repo
-            .is_platform_admin(uid)
-            .await
-            .unwrap_or(false),
-        None => false,
-    };
+    let caller_is_platform_admin = state
+        .actor_repo
+        .is_platform_admin(agent.user_id)
+        .await
+        .unwrap_or(false);
     let (fleet, fleet_note) = if caller_is_platform_admin {
         (
             build_fleet_report(&state.db_pool, &build_version).await,

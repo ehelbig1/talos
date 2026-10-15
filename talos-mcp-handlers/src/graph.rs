@@ -1058,7 +1058,7 @@ pub(crate) async fn upsert_system_node(
     kind: &str,
     data: serde_json::Value,
 ) -> Result<AddedSystemNode, JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let workflow_id = match args
         .get("workflow_id")
         .and_then(|v| v.as_str())
@@ -2237,7 +2237,7 @@ async fn handle_set_speculative_prefetch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -2340,7 +2340,7 @@ async fn handle_update_node_config(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -3103,7 +3103,7 @@ async fn handle_update_node_positions(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -3276,7 +3276,7 @@ async fn handle_duplicate_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -3401,7 +3401,7 @@ async fn handle_add_edge(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -3561,7 +3561,7 @@ async fn handle_remove_edge(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -3626,7 +3626,7 @@ async fn handle_add_loop_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let workflow_id = match args
         .get("workflow_id")
         .and_then(|v| v.as_str())
@@ -4270,7 +4270,7 @@ async fn handle_set_for_each_connection(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let workflow_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -4678,7 +4678,7 @@ async fn handle_add_action_links_node(
         .get("ttl_hours")
         .and_then(serde_json::Value::as_u64)
         .map(|v| v.clamp(1, 336));
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let Some(workflow_id) = args
         .get("workflow_id")
         .and_then(|v| v.as_str())
@@ -4873,7 +4873,7 @@ async fn handle_add_sub_workflow_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let sub_workflow_id = match args
         .get("sub_workflow_id")
         .and_then(|v| v.as_str())
@@ -4974,7 +4974,7 @@ async fn handle_copy_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let source_wf_id = match crate::utils::require_uuid(args, "source_workflow_id", req_id.clone())
     {
         Ok(id) => id,
@@ -5105,7 +5105,7 @@ async fn handle_set_node_description(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -5234,7 +5234,7 @@ async fn handle_duplicate_workflow(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
@@ -5477,7 +5477,7 @@ async fn handle_add_skip_condition(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let workflow_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -5605,7 +5605,7 @@ async fn handle_add_capability_dispatch_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-234 (2026-05-08): trim each capability AND apply the same
     // strict format validation that set_workflow_capabilities uses
     // (lowercase alphanumeric + hyphens, 1-50 chars). Pre-fix:
@@ -5862,7 +5862,7 @@ async fn handle_set_continue_on_error(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let workflow_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -5976,7 +5976,7 @@ async fn handle_add_error_handler(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(Uuid::nil);
+    let user_id = agent.user_id;
 
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
@@ -6319,7 +6319,7 @@ async fn handle_fix_fan_in(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(Uuid::nil);
+    let user_id = agent.user_id;
 
     let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
@@ -6500,7 +6500,7 @@ async fn handle_preview_capability_dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // MCP-233 (2026-05-08): trim each capability and reject whitespace-
     // only entries. Pre-fix `required_capabilities: ["   "]` was passed
@@ -6772,7 +6772,7 @@ async fn handle_add_agent_loop_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let body_workflow_id = match args
         .get("body_workflow_id")
         .and_then(|v| v.as_str())
@@ -6854,7 +6854,7 @@ async fn handle_add_react_loop_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let body_workflow_id = match args
         .get("body_workflow_id")
         .and_then(|v| v.as_str())
@@ -6983,7 +6983,7 @@ async fn handle_add_judge_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let judge_workflow_id =
         match args
             .get("judge_workflow_id")
@@ -7255,7 +7255,7 @@ async fn handle_probe_inline_judge(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let workflow_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -7381,7 +7381,7 @@ async fn handle_add_ensemble_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let child_workflow_id = match args
         .get("child_workflow_id")
         .and_then(|v| v.as_str())
@@ -7575,7 +7575,7 @@ async fn handle_add_reflective_retry_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let child_workflow_id = match args
         .get("child_workflow_id")
         .and_then(|v| v.as_str())
@@ -7680,7 +7680,7 @@ async fn handle_add_llm_dispatch_node(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let classifier_workflow_id = match args
         .get("classifier_workflow_id")
         .and_then(|v| v.as_str())
