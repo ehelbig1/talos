@@ -9328,12 +9328,14 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-admin-event-log",
+ "talos-capability-world",
  "talos-db",
  "talos-module-payload-encryption",
  "talos-push-channel-inventory",
  "talos-secrets-manager",
  "talos-workflow-liveness",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

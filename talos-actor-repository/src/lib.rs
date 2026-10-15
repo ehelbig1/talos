@@ -283,6 +283,10 @@ pub enum CapabilityGrantRevocation {
     /// The caller tried to withdraw their own grant, and that would widen
     /// their ceiling to the default. Nothing changed.
     SelfRevokeWouldWiden { world: String },
+    /// Withdrawing ANOTHER user's grant would widen their ceiling, and the
+    /// caller is a bearer credential that cannot prove a second factor
+    /// (security review 2026-10-14, G-4). Nothing changed.
+    WideningNeedsSecondFactor { world: String },
 }
 
 impl CapabilityGrantRevocation {
@@ -618,6 +622,20 @@ pub struct CeilingChange {
     pub previous: Option<String>,
 }
 
+/// What a per-actor ceiling write did.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CeilingWrite {
+    /// The column changed and the change was recorded.
+    Changed(CeilingChange),
+    /// No such actor for this user; nothing was written.
+    NoSuchActor,
+    /// The change loosens the ceiling and the caller is a bearer credential
+    /// ([`talos_capability_world::ChangeAuthority::may_loosen`]); nothing
+    /// changed. Carries the value the column holds.
+    LooseningRefused { previous: Option<String> },
+}
+
 /// The three per-actor ceilings that share one recorded writer. A closed set,
 /// so every statement below is a static string (check 88 PREPAREs each one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -695,6 +713,28 @@ impl ActorCeiling {
             Self::WriteCeiling => ("previous_ceiling", "new_ceiling"),
             Self::HttpVerbCeiling => ("previous_http_verb_ceiling", "new_http_verb_ceiling"),
         }
+    }
+
+    /// How much a value of this column permits, for telling a loosening from a
+    /// tightening (security review 2026-10-14, G-5). A value the column's
+    /// fail-closed parser would not recognise ranks lowest, as the parser
+    /// reads it. A cleared egress override ranks between `local` and
+    /// `public` (it is `public` for a tier-2 actor) and a cleared verb
+    /// override between `readonly` and `write` (it inherits the write
+    /// ceiling): clearing an explicit `local` or `readonly` therefore counts
+    /// as loosening, the refusing answer.
+    fn permits_rank(self, value: Option<&str>) -> u8 {
+        match (self, value) {
+            (Self::LlmTier, Some("tier2")) | (Self::WriteCeiling, Some("write")) => 1,
+            (Self::LlmTier | Self::WriteCeiling, _) => 0,
+            (Self::EgressScope, Some("public")) | (Self::HttpVerbCeiling, Some("write")) => 2,
+            (Self::EgressScope | Self::HttpVerbCeiling, None) => 1,
+            (Self::EgressScope | Self::HttpVerbCeiling, Some(_)) => 0,
+        }
+    }
+
+    fn is_loosening(self, previous: Option<&str>, new: Option<&str>) -> bool {
+        self.permits_rank(new) > self.permits_rank(previous)
     }
 
     /// How an absent value renders: a cleared egress override is the
@@ -3133,22 +3173,24 @@ impl ActorRepository {
         Ok(result.rows_affected())
     }
 
-    /// Set an actor's LLM data-egress ceiling, and record it. `Ok(None)` =
-    /// no such actor for this user (nothing written); `Ok(Some(change))`
-    /// carries the value the column held before. The change and its
-    /// `actor_llm_tier_ceiling_set` row commit in ONE transaction — see
+    /// Set an actor's LLM data-egress ceiling, and record it. See
+    /// [`CeilingWrite`] for the three answers; `tier1 -> tier2` is a
+    /// loosening, made only for `authority` that may loosen. The change and
+    /// its `actor_llm_tier_ceiling_set` row commit in ONE transaction — see
     /// [`ActorCeiling`].
     pub async fn set_actor_max_llm_tier(
         &self,
         actor_id: Uuid,
         user_id: Uuid,
         tier: talos_workflow_job_protocol::LlmTier,
-    ) -> Result<Option<CeilingChange>> {
+        authority: talos_capability_world::ChangeAuthority,
+    ) -> Result<CeilingWrite> {
         self.set_actor_ceiling_recorded(
             actor_id,
             user_id,
             ActorCeiling::LlmTier,
             Some(tier.as_signing_str()),
+            authority,
         )
         .await
     }
@@ -3173,12 +3215,14 @@ impl ActorRepository {
         actor_id: Uuid,
         user_id: Uuid,
         ceiling: talos_workflow_job_protocol::WriteCeiling,
-    ) -> Result<Option<CeilingChange>> {
+        authority: talos_capability_world::ChangeAuthority,
+    ) -> Result<CeilingWrite> {
         self.set_actor_ceiling_recorded(
             actor_id,
             user_id,
             ActorCeiling::WriteCeiling,
             Some(ceiling.as_signing_str()),
+            authority,
         )
         .await
     }
@@ -3207,18 +3251,21 @@ impl ActorRepository {
     /// public-egress SSRF gate, and both tightening (`public`→`local`) and
     /// loosening (`local`→`public`) are legitimate operator actions — the
     /// LLM-provider gate stays keyed to `max_llm_tier` regardless, so this can
-    /// never open external-LLM egress.
+    /// never open external-LLM egress. A loosening is still a loosening: it is
+    /// made only for `authority` that may loosen (2026-10-14).
     pub async fn set_actor_egress_scope(
         &self,
         actor_id: Uuid,
         user_id: Uuid,
         scope: Option<talos_workflow_job_protocol::EgressScope>,
-    ) -> Result<Option<CeilingChange>> {
+        authority: talos_capability_world::ChangeAuthority,
+    ) -> Result<CeilingWrite> {
         self.set_actor_ceiling_recorded(
             actor_id,
             user_id,
             ActorCeiling::EgressScope,
             scope.map(|s| s.as_signing_str()),
+            authority,
         )
         .await
     }
@@ -3241,12 +3288,14 @@ impl ActorRepository {
         actor_id: Uuid,
         user_id: Uuid,
         ceiling: Option<talos_workflow_job_protocol::WriteCeiling>,
-    ) -> Result<Option<CeilingChange>> {
+        authority: talos_capability_world::ChangeAuthority,
+    ) -> Result<CeilingWrite> {
         self.set_actor_ceiling_recorded(
             actor_id,
             user_id,
             ActorCeiling::HttpVerbCeiling,
             ceiling.map(|c| c.as_signing_str()),
+            authority,
         )
         .await
     }
@@ -3259,13 +3308,21 @@ impl ActorRepository {
     /// value outside any lock and wrote the record after the change had
     /// committed, best-effort: a failed record left the change applied and
     /// untraced.
+    ///
+    /// A LOOSENING ([`ActorCeiling::is_loosening`], judged against the value
+    /// read under the row lock) is made only for a caller that proved a second
+    /// factor; for a bearer credential nothing is written and the answer is
+    /// [`CeilingWrite::LooseningRefused`] (security review 2026-10-14, G-5).
+    /// Until then the owner's MCP token — the token a prompt-injected agent
+    /// holds — could move a tier-1 actor to tier 2 and was only recorded.
     async fn set_actor_ceiling_recorded(
         &self,
         actor_id: Uuid,
         user_id: Uuid,
         which: ActorCeiling,
         new: Option<&str>,
-    ) -> Result<Option<CeilingChange>> {
+        authority: talos_capability_world::ChangeAuthority,
+    ) -> Result<CeilingWrite> {
         let mut tx = self.db_pool.begin().await?;
         if which.needs_grant_guc() {
             // The `actors_write_ceiling_grant_guard` trigger (migration
@@ -3285,8 +3342,22 @@ impl ActorRepository {
             .await?;
         let Some(previous) = previous else {
             tx.rollback().await?;
-            return Ok(None);
+            return Ok(CeilingWrite::NoSuchActor);
         };
+        if !authority.may_loosen() && which.is_loosening(previous.as_deref(), new) {
+            tx.rollback().await?;
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "actor_ceiling_loosening_refused",
+                %actor_id,
+                %user_id,
+                ceiling = which.label(),
+                previous = previous.as_deref().unwrap_or(which.unset_label()),
+                requested = new.unwrap_or(which.unset_label()),
+                "a bearer credential asked to loosen an actor ceiling; refused"
+            );
+            return Ok(CeilingWrite::LooseningRefused { previous });
+        }
         sqlx::query(which.update_sql())
             .bind(new)
             .bind(actor_id)
@@ -3307,7 +3378,7 @@ impl ActorRepository {
         )
         .await?;
         tx.commit().await?;
-        Ok(Some(CeilingChange { previous }))
+        Ok(CeilingWrite::Changed(CeilingChange { previous }))
     }
 
     /// Resolve all three per-actor engine ceilings — `max_llm_tier`,
@@ -3489,6 +3560,11 @@ impl ActorRepository {
     /// overwrite is not lost (`previous_world`, `null` when there was none).
     /// The row is locked first so two concurrent grants record the ceiling
     /// each actually replaced.
+    ///
+    /// A self-grant of the world the user already holds changes nothing and
+    /// records nothing (security review 2026-10-14, G-18): it used to rewrite
+    /// `granted_by`, `granted_at` and `notes`, so a user could replace an
+    /// admin's attribution and justification with their own.
     pub async fn upsert_capability_grant(
         &self,
         target_user_id: Uuid,
@@ -3504,6 +3580,10 @@ impl ActorRepository {
         .bind(target_user_id)
         .fetch_optional(&mut *tx)
         .await?;
+        if granter_id == target_user_id && previous.as_deref() == Some(max_capability_world) {
+            tx.rollback().await?;
+            return Ok(());
+        }
         sqlx::query(
             "INSERT INTO user_capability_grants (user_id, max_capability_world, granted_by, notes) \
              VALUES ($1, $2, $3, $4) \
@@ -3554,11 +3634,18 @@ impl ActorRepository {
     /// platform admin's included; revoking ANOTHER user's grant is the admin
     /// act the callers authorise. The row is locked before the check, so a
     /// concurrent grant cannot slip between the read and the delete.
+    ///
+    /// Withdrawing another user's grant when that widens THEIR ceiling is the
+    /// same expansion as a cross-user grant, and is made only for `authority`
+    /// that may loosen — a session with a verified second factor (2026-10-14,
+    /// G-4). A platform admin's MCP token could do it until then, though the
+    /// grant twin had been refused over MCP for that very reason.
     pub async fn delete_capability_grant(
         &self,
         target_user_id: Uuid,
         revoked_by: Uuid,
         notes: Option<&str>,
+        authority: talos_capability_world::ChangeAuthority,
     ) -> Result<CapabilityGrantRevocation> {
         let mut tx = self.db_pool.begin().await?;
         let held: Option<String> = sqlx::query_scalar(
@@ -3577,6 +3664,10 @@ impl ActorRepository {
         {
             tx.rollback().await?;
             return Ok(CapabilityGrantRevocation::SelfRevokeWouldWiden { world: withdrawn });
+        }
+        if !authority.may_loosen() && talos_capability_world::withdrawing_grant_widens(&withdrawn) {
+            tx.rollback().await?;
+            return Ok(CapabilityGrantRevocation::WideningNeedsSecondFactor { world: withdrawn });
         }
         sqlx::query("DELETE FROM user_capability_grants WHERE user_id = $1")
             .bind(target_user_id)

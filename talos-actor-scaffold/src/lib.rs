@@ -369,14 +369,26 @@ pub async fn scaffold_actor(
     if let Some(tier) = req.llm_tier {
         match deps
             .actor_repo
-            .set_actor_max_llm_tier(actor_id, user_id, llm_tier_to_protocol(tier))
+            // The actor was created above at the column default, `tier2`, so
+            // either tier is a tightening or no change: the bearer authority
+            // never refuses here.
+            .set_actor_max_llm_tier(
+                actor_id,
+                user_id,
+                llm_tier_to_protocol(tier),
+                talos_capability_world::ChangeAuthority::BearerCredential,
+            )
             .await
         {
-            Ok(Some(_)) => {
+            Ok(talos_actor_repository::CeilingWrite::Changed(_)) => {
                 outcome.llm_tier_set =
                     Some(llm_tier_to_protocol(tier).as_signing_str().to_string());
             }
-            Ok(None) => {
+            Ok(talos_actor_repository::CeilingWrite::LooseningRefused { .. }) => {
+                outcome.llm_tier_warning =
+                    Some(talos_capability_world::LOOSENING_NEEDS_SECOND_FACTOR.to_string());
+            }
+            Ok(talos_actor_repository::CeilingWrite::NoSuchActor) => {
                 outcome.llm_tier_warning = Some(
                     "set_actor_max_llm_tier returned 0 rows — actor may have been deleted concurrently"
                         .to_string(),

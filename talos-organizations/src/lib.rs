@@ -338,6 +338,14 @@ impl OrganizationService {
             ));
         }
 
+        // A personal organization is its owner alone (security review
+        // 2026-10-14, A-1): every org-less resource the owner creates is
+        // stamped with it, so a second member would see — and an Admin would
+        // change — everything the owner has. Read under a share lock in the
+        // same transaction as the insert; the database refuses it too
+        // (`refuse_personal_org_member`).
+        let mut tx = db.begin().await.context("Failed to begin transaction")?;
+        refuse_personal_org(&mut tx, org_id).await?;
         let member = sqlx::query_as::<_, OrgMember>(
             r#"
             INSERT INTO organization_members (org_id, user_id, role, invited_by)
@@ -349,9 +357,10 @@ impl OrganizationService {
         .bind(user_id)
         .bind(role.as_str())
         .bind(invited_by)
-        .fetch_one(db)
+        .fetch_one(&mut *tx)
         .await
         .context("Failed to add member (user may already be a member)")?;
+        tx.commit().await.context("Failed to commit transaction")?;
 
         Ok(member)
     }
@@ -699,6 +708,10 @@ impl OrganizationService {
     ) -> Result<Organization> {
         let mut tx = db.begin().await.context("Failed to begin transaction")?;
 
+        // A personal organization's owner is its user (A-1); it is never
+        // transferred.
+        refuse_personal_org(&mut tx, org_id).await?;
+
         // Verify the caller is actually an owner (inside the transaction to
         // avoid TOCTOU races).
         let caller_role = sqlx::query_scalar::<_, String>(
@@ -775,6 +788,27 @@ impl OrganizationService {
         tx.commit().await.context("Failed to commit transaction")?;
 
         Ok(org)
+    }
+}
+
+/// The message a membership or ownership change on a personal organization
+/// is refused with.
+pub const PERSONAL_ORG_REFUSAL: &str =
+    "A personal organization has exactly one member, its owner; create a shared organization to invite others";
+
+/// Refuse when `org_id` is a personal organization, read under a share lock
+/// in the caller's transaction (security review 2026-10-14, A-1).
+async fn refuse_personal_org(tx: &mut sqlx::Transaction<'_, Postgres>, org_id: Uuid) -> Result<()> {
+    let personal: Option<bool> =
+        sqlx::query_scalar("SELECT is_personal FROM organizations WHERE id = $1 FOR SHARE")
+            .bind(org_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .context("Failed to read the organization")?;
+    match personal {
+        Some(true) => Err(anyhow!(PERSONAL_ORG_REFUSAL)),
+        Some(false) => Ok(()),
+        None => Err(anyhow!("Organization not found")),
     }
 }
 

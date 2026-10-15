@@ -310,6 +310,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "set_actor_llm_tier_ceiling",
             "description": "Set the LLM data-egress ceiling for an actor. \
+                OVER MCP THIS TOOL ONLY TIGHTENS (2026-10-14): a change that loosens the ceiling is refused with -32003; make it signed in to the dashboard with two-factor authentication (GraphQL setActorCeiling). \
                 'tier1' = local Ollama only (payloads stay on-host; use for actors handling medical, financial, relationship content). \
                 'tier2' = external providers allowed (Anthropic/OpenAI/Gemini). \
                 Enforced at the worker's llm::complete host function — tier-1 actors fail-closed on external provider attempts. \
@@ -331,6 +332,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "set_actor_egress_scope",
             "description": "Set the blanket NETWORK-EGRESS scope for an actor — INDEPENDENT of the LLM tier. \
+                OVER MCP THIS TOOL ONLY TIGHTENS (2026-10-14): a change that loosens the ceiling is refused with -32003; make it signed in to the dashboard with two-factor authentication (GraphQL setActorCeiling). \
                 'local' = deny ALL public network egress (fully air-gapped; the actor's modules can't reach any public host). \
                 'public' = permit public egress (subject to each module's allowed_hosts + SSRF filtering). \
                 Clearing to null falls back to the tier-derived default (tier1 => local, tier2 => public). \
@@ -352,6 +354,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "set_actor_write_ceiling",
             "description": "Set the data-mutation (WRITE) ceiling for an actor — a default-deny gate on data-mutating operations. \
+                OVER MCP THIS TOOL ONLY TIGHTENS (2026-10-14): a change that loosens the ceiling is refused with -32003; make it signed in to the dashboard with two-factor authentication (GraphQL setActorCeiling). \
                 'readonly' = the actor's workflows may only READ; every mutating host surface (actor-memory writes, DB DML, non-GET HTTP, webhook/email/messaging/object-storage/integration-state writes, GraphQL execute) is refused at the worker. \
                 'write' = mutation permitted (subject to the module's capability grant). \
                 Enforcement is worker-side, gated by TALOS_WRITE_CEILING_ENFORCED — a WORKER-ONLY flag that is default OFF, so the ceiling can be recorded on a deployment where nothing enforces it. \
@@ -374,6 +377,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "set_actor_http_verb_ceiling",
             "description": "Override the VERB-INFERRED half of an actor's write ceiling, without granting the rest of it. \
+                OVER MCP THIS TOOL ONLY TIGHTENS (2026-10-14): a change that loosens the ceiling is refused with -32003; make it signed in to the dashboard with two-factor authentication (GraphQL setActorCeiling). \
                 BACKGROUND: max_write_ceiling governs FIFTEEN gated ops. THREE of them — http::fetch, http::fetch_all and graphql::execute — decide 'is this a mutation?' by INFERRING it from the HTTP verb, and that inference over-refuses by design: GET is the only verb the gate can call a read, so a POST that is a READ on the target API (Plaid's /accounts/balance/get, Elasticsearch's _search, most client_id+secret APIs) is refused under 'readonly'. Until 2026-09-24 the only way to clear that refusal was max_write_ceiling='write', which ALSO grants the twelve CATEGORICAL ops the actor never needed: agent-memory writes, database DML, email, NATS publish, webhook send, object storage, integration state. \
                 THIS TOOL sets that one axis. 'write' = the three inferring gates permit any verb; the twelve categorical ops still follow max_write_ceiling. 'readonly' = non-GET HTTP is refused even for a max_write_ceiling='write' actor (a TIGHTENING: an actor that may keep notes but must not POST anywhere). 'inherit' (or null, or omitting the argument) CLEARS the override, restoring the single-axis behaviour. \
                 THE INTENDED SHAPE for a read-only integration whose reads are POSTs is max_write_ceiling='readonly' PLUS this override at 'write'. \
@@ -787,7 +791,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "revoke_capability_ceiling",
-            "description": "Revoke a user's capability ceiling grant, reverting them to the default 'http-node' ceiling. You cannot revoke your own grant when that would widen your ceiling (a 'minimal-node' or 'governance-node' grant); a platform admin must.",
+            "description": "Revoke a user's capability ceiling grant, reverting them to the default 'http-node' ceiling. You cannot revoke your own grant when that would widen your ceiling (a 'minimal-node' or 'governance-node' grant); a platform admin must. Over MCP you also cannot revoke ANOTHER user's grant when that would widen theirs (2026-10-14): that needs a session with two-factor authentication (GraphQL revokeCapabilityCeiling).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2837,11 +2841,25 @@ async fn handle_set_actor_llm_tier_ceiling(
     // without its record, and a failed record fails the call.
     let change = match state
         .actor_repo
-        .set_actor_max_llm_tier(actor_id, user_id, tier)
+        .set_actor_max_llm_tier(
+            actor_id,
+            user_id,
+            tier,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
     {
-        Ok(Some(change)) => change,
-        Ok(None) => return mcp_error(req_id, -32602, "Actor not found or access denied"),
+        Ok(talos_actor_repository::CeilingWrite::Changed(change)) => change,
+        Ok(talos_actor_repository::CeilingWrite::NoSuchActor) => {
+            return mcp_error(req_id, -32602, "Actor not found or access denied")
+        }
+        Ok(talos_actor_repository::CeilingWrite::LooseningRefused { .. }) => {
+            return mcp_denied(
+                req_id,
+                -32003,
+                talos_capability_world::LOOSENING_NEEDS_SECOND_FACTOR,
+            )
+        }
         Err(e) => {
             tracing::error!(%actor_id, error = %e, "set_actor_llm_tier_ceiling failed");
             return mcp_error(req_id, -32603, "Failed to update actor tier ceiling");
@@ -2908,11 +2926,25 @@ async fn handle_set_actor_egress_scope(
     // Change + record in ONE transaction (package CT).
     let change = match state
         .actor_repo
-        .set_actor_egress_scope(actor_id, user_id, scope)
+        .set_actor_egress_scope(
+            actor_id,
+            user_id,
+            scope,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
     {
-        Ok(Some(change)) => change,
-        Ok(None) => return mcp_error(req_id, -32602, "Actor not found or access denied"),
+        Ok(talos_actor_repository::CeilingWrite::Changed(change)) => change,
+        Ok(talos_actor_repository::CeilingWrite::NoSuchActor) => {
+            return mcp_error(req_id, -32602, "Actor not found or access denied")
+        }
+        Ok(talos_actor_repository::CeilingWrite::LooseningRefused { .. }) => {
+            return mcp_denied(
+                req_id,
+                -32003,
+                talos_capability_world::LOOSENING_NEEDS_SECOND_FACTOR,
+            )
+        }
         Err(e) => {
             tracing::error!(%actor_id, error = %e, "set_actor_egress_scope failed");
             return mcp_error(req_id, -32603, "Failed to update actor egress scope");
@@ -2981,11 +3013,25 @@ async fn handle_set_actor_write_ceiling(
     // Change + record in ONE transaction (package CT).
     let change = match state
         .actor_repo
-        .set_actor_max_write_ceiling(actor_id, user_id, ceiling)
+        .set_actor_max_write_ceiling(
+            actor_id,
+            user_id,
+            ceiling,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
     {
-        Ok(Some(change)) => change,
-        Ok(None) => return mcp_error(req_id, -32602, "Actor not found or access denied"),
+        Ok(talos_actor_repository::CeilingWrite::Changed(change)) => change,
+        Ok(talos_actor_repository::CeilingWrite::NoSuchActor) => {
+            return mcp_error(req_id, -32602, "Actor not found or access denied")
+        }
+        Ok(talos_actor_repository::CeilingWrite::LooseningRefused { .. }) => {
+            return mcp_denied(
+                req_id,
+                -32003,
+                talos_capability_world::LOOSENING_NEEDS_SECOND_FACTOR,
+            )
+        }
         Err(e) => {
             tracing::error!(%actor_id, error = %e, "set_actor_write_ceiling failed");
             return mcp_error(req_id, -32603, "Failed to update actor write ceiling");
@@ -3076,11 +3122,25 @@ async fn handle_set_actor_http_verb_ceiling(
     // CT + the 20260924120000 escalation trigger).
     let change = match state
         .actor_repo
-        .set_actor_http_verb_ceiling(actor_id, user_id, ceiling)
+        .set_actor_http_verb_ceiling(
+            actor_id,
+            user_id,
+            ceiling,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
     {
-        Ok(Some(change)) => change,
-        Ok(None) => return mcp_error(req_id, -32602, "Actor not found or access denied"),
+        Ok(talos_actor_repository::CeilingWrite::Changed(change)) => change,
+        Ok(talos_actor_repository::CeilingWrite::NoSuchActor) => {
+            return mcp_error(req_id, -32602, "Actor not found or access denied")
+        }
+        Ok(talos_actor_repository::CeilingWrite::LooseningRefused { .. }) => {
+            return mcp_denied(
+                req_id,
+                -32003,
+                talos_capability_world::LOOSENING_NEEDS_SECOND_FACTOR,
+            )
+        }
         Err(e) => {
             tracing::error!(%actor_id, error = %e, "set_actor_http_verb_ceiling failed");
             return mcp_error(req_id, -32603, "Failed to update actor http-verb ceiling");
@@ -5313,7 +5373,12 @@ async fn handle_revoke_capability_ceiling(
 
     match state
         .actor_repo
-        .delete_capability_grant(target_user_id, revoker_id, notes.as_deref())
+        .delete_capability_grant(
+            target_user_id,
+            revoker_id,
+            notes.as_deref(),
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
     {
         Ok(talos_actor_repository::CapabilityGrantRevocation::Revoked { .. }) => {
@@ -5355,6 +5420,30 @@ async fn handle_revoke_capability_ceiling(
                 req_id,
                 -32603,
                 &talos_actor_repository::CapabilityGrantRevocation::self_revoke_refusal(&world),
+            )
+        }
+        // Withdrawing another user's `minimal-node` / `governance-node` grant
+        // widens THEIR ceiling, the expansion a cross-user grant is refused
+        // here for (2026-10-14, G-4). Nothing was changed.
+        Ok(talos_actor_repository::CapabilityGrantRevocation::WideningNeedsSecondFactor {
+            world,
+        }) => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "capability_revoke_widening_refused",
+                user_id = %revoker_id,
+                target_user_id = %target_user_id,
+                world = %world,
+                "cross-user revoke refused over MCP: it would widen the target's capability ceiling"
+            );
+            mcp_denied(
+                req_id,
+                -32003,
+                &format!(
+                    "Withdrawing this user's '{world}' grant would widen their capability ceiling. \
+                     {}",
+                    talos_capability_world::LOOSENING_NEEDS_SECOND_FACTOR
+                ),
             )
         }
         Err(e) => {

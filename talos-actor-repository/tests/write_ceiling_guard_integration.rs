@@ -128,18 +128,34 @@ async fn guard_blocks_bulk_clobber_but_allows_sanctioned_grant() {
     // (B) The sanctioned path grants write (it sets the GUC internally).
     let repo = ActorRepository::new(pool.clone());
     let granted = repo
-        .set_actor_max_write_ceiling(actor, user, WriteCeiling::Write)
+        .set_actor_max_write_ceiling(
+            actor,
+            user,
+            WriteCeiling::Write,
+            talos_capability_world::ChangeAuthority::SecondFactorSession,
+        )
         .await
         .expect("sanctioned grant should not error");
-    assert!(granted.is_some(), "grant should report a row updated");
+    assert!(
+        matches!(granted, talos_actor_repository::CeilingWrite::Changed(_)),
+        "grant should report a row updated"
+    );
     assert_eq!(ceiling_of(&pool, actor).await, "write");
 
     // (C) Locking back down (write->readonly) is always allowed.
     let locked = repo
-        .set_actor_max_write_ceiling(actor, user, WriteCeiling::ReadOnly)
+        .set_actor_max_write_ceiling(
+            actor,
+            user,
+            WriteCeiling::ReadOnly,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
         .expect("lock-down should not error");
-    assert!(locked.is_some());
+    assert!(matches!(
+        locked,
+        talos_actor_repository::CeilingWrite::Changed(_)
+    ));
     assert_eq!(ceiling_of(&pool, actor).await, "readonly");
 
     // Package CT: each sanctioned change is recorded with what it replaced;

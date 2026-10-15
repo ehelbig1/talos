@@ -156,26 +156,35 @@ async fn actor_ceiling_changes_are_recorded_with_what_they_replaced() {
         &state,
         user,
         "set_actor_egress_scope",
-        serde_json::json!({"actor_id": aid, "scope": "public"}),
+        serde_json::json!({"actor_id": aid, "scope": "local"}),
     )
     .await;
     assert_eq!(text_json(&egress)["previous_egress_scope"], "default");
-    let cleared = call(
-        &state,
-        user,
-        "set_actor_egress_scope",
-        serde_json::json!({"actor_id": aid, "scope": null}),
-    )
-    .await;
-    assert_eq!(text_json(&cleared)["previous_egress_scope"], "public");
-    let write = call(
-        &state,
-        user,
-        "set_actor_write_ceiling",
-        serde_json::json!({"actor_id": aid, "ceiling": "write"}),
-    )
-    .await;
-    assert_eq!(text_json(&write)["previous_ceiling"], "readonly");
+    // A loosening is made only with a second factor (2026-10-14, G-5), which
+    // MCP cannot prove; the recording is the same writer's either way.
+    let repo = talos_actor_repository::ActorRepository::new(pool.clone());
+    let second_factor = talos_capability_world::ChangeAuthority::SecondFactorSession;
+    assert_eq!(
+        repo.set_actor_egress_scope(actor, user, None, second_factor)
+            .await
+            .unwrap(),
+        talos_actor_repository::CeilingWrite::Changed(talos_actor_repository::CeilingChange {
+            previous: Some("local".into())
+        })
+    );
+    assert_eq!(
+        repo.set_actor_max_write_ceiling(
+            actor,
+            user,
+            talos_workflow_job_protocol::WriteCeiling::Write,
+            second_factor,
+        )
+        .await
+        .unwrap(),
+        talos_actor_repository::CeilingWrite::Changed(talos_actor_repository::CeilingChange {
+            previous: Some("readonly".into())
+        })
+    );
 
     assert_eq!(
         events(&pool, "actor_llm_tier_ceiling_set", actor).await,
@@ -184,8 +193,8 @@ async fn actor_ceiling_changes_are_recorded_with_what_they_replaced() {
     assert_eq!(
         events(&pool, "actor_egress_scope_set", actor).await,
         vec![
-            serde_json::json!({"previous_egress_scope": "default", "new_egress_scope": "public"}),
-            serde_json::json!({"previous_egress_scope": "public", "new_egress_scope": "default"}),
+            serde_json::json!({"previous_egress_scope": "default", "new_egress_scope": "local"}),
+            serde_json::json!({"previous_egress_scope": "local", "new_egress_scope": "default"}),
         ]
     );
     assert_eq!(
@@ -231,11 +240,12 @@ async fn an_actor_ceiling_change_that_cannot_be_recorded_does_not_happen() {
         ),
         (
             "set_actor_egress_scope",
-            serde_json::json!({"actor_id": aid, "scope": "public"}),
+            serde_json::json!({"actor_id": aid, "scope": "local"}),
         ),
+        // No change of value, so not a loosening: it reaches the record.
         (
             "set_actor_write_ceiling",
-            serde_json::json!({"actor_id": aid, "ceiling": "write"}),
+            serde_json::json!({"actor_id": aid, "ceiling": "readonly"}),
         ),
     ] {
         let resp = call(&state, user, tool, args).await;
@@ -493,10 +503,15 @@ async fn the_recorded_writers_refuse_another_users_row_and_record_nothing() {
 
     let actors = talos_actor_repository::ActorRepository::new(pool.clone());
     let tier = actors
-        .set_actor_max_llm_tier(actor, stranger, talos_workflow_job_protocol::LlmTier::Tier1)
+        .set_actor_max_llm_tier(
+            actor,
+            stranger,
+            talos_workflow_job_protocol::LlmTier::Tier1,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
         .unwrap();
-    assert!(tier.is_none());
+    assert_eq!(tier, talos_actor_repository::CeilingWrite::NoSuchActor);
     let modules = talos_module_repository::ModuleRepository::new(pool.clone());
     let hosts = modules
         .update_module_allowed_hosts(
@@ -504,6 +519,7 @@ async fn the_recorded_writers_refuse_another_users_row_and_record_nothing() {
             stranger,
             &["evil.example.com".to_string()],
             &|_: &[String], new: &[String]| new.to_vec(),
+            talos_capability_world::ChangeAuthority::BearerCredential,
         )
         .await
         .unwrap();
@@ -533,12 +549,17 @@ async fn the_recorded_writers_refuse_another_users_row_and_record_nothing() {
     );
     // Control: the owner's own change is recorded.
     let own = actors
-        .set_actor_max_llm_tier(actor, owner, talos_workflow_job_protocol::LlmTier::Tier1)
+        .set_actor_max_llm_tier(
+            actor,
+            owner,
+            talos_workflow_job_protocol::LlmTier::Tier1,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
         .unwrap();
     assert_eq!(
         own,
-        Some(talos_actor_repository::CeilingChange {
+        talos_actor_repository::CeilingWrite::Changed(talos_actor_repository::CeilingChange {
             previous: Some("tier2".into())
         })
     );

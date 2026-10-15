@@ -38,6 +38,14 @@ export type ActorActionLogEntry = {
   workflowId?: Maybe<Scalars["UUID"]["output"]>;
 };
 
+/** Which per-actor security ceiling `setActorCeiling` sets. */
+export enum ActorCeilingKind {
+  EgressScope = "EGRESS_SCOPE",
+  HttpVerbCeiling = "HTTP_VERB_CEILING",
+  LlmTier = "LLM_TIER",
+  WriteCeiling = "WRITE_CEILING",
+}
+
 export type ActorDetails = {
   __typename?: "ActorDetails";
   createdAt: Scalars["String"]["output"];
@@ -1060,6 +1068,13 @@ export type MutationRoot = {
    */
   reEncryptSecretsToOrg: ReEncryptionResult;
   refreshToken: AuthPayload;
+  /**
+   * Register an MCP agent and return its token, shown once. The role's
+   * capabilities scope the capability WORLDS the agent may compile,
+   * install and run at — and only within the caller's own capability
+   * ceiling. They are not a read/write boundary: every MCP tool is
+   * available to the agent for its user's own data.
+   */
   registerMcpAgent: McpAgentCreated;
   removeMember: Scalars["Boolean"]["output"];
   replayDeadLetterEntry: Scalars["Boolean"]["output"];
@@ -1099,6 +1114,16 @@ export type MutationRoot = {
    * re-key them; `dekMigrationStatus` counts them as pending until then.
    */
   rotateOrgDek: DekRotationResult;
+  /**
+   * Set one of an actor's per-actor security ceilings — the LLM tier
+   * (`tier1`/`tier2`), the egress scope (`local`/`public`, null = the
+   * tier-derived default), the write ceiling (`readonly`/`write`) or the
+   * HTTP-verb override (`readonly`/`write`, null = inherit). The MCP tools
+   * `set_actor_*` may only TIGHTEN these; loosening one needs this
+   * mutation, from a session with a verified second factor (security
+   * review 2026-10-14, G-5).
+   */
+  setActorCeiling: Scalars["Boolean"]["output"];
   setConcurrencyLimit: Scalars["Boolean"]["output"];
   /**
    * Bind (or unbind, with a null `actorId`) a workflow's default actor —
@@ -1339,6 +1364,12 @@ export type MutationRootRotateMasterKeyArgs = {
 
 export type MutationRootRotateOrgDekArgs = {
   orgId: Scalars["UUID"]["input"];
+};
+
+export type MutationRootSetActorCeilingArgs = {
+  actorId: Scalars["UUID"]["input"];
+  ceiling: ActorCeilingKind;
+  value?: InputMaybe<Scalars["String"]["input"]>;
 };
 
 export type MutationRootSetConcurrencyLimitArgs = {

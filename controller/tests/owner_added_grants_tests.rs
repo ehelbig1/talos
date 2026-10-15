@@ -112,13 +112,25 @@ async fn what_the_owner_adds_is_recorded_with_the_grant_and_survives_a_reinstall
 
     // The owner grants one host and one secret path.
     let hosts = repo
-        .update_module_allowed_hosts(module, owner, &v(&["home.example.test"]), &beyond)
+        .update_module_allowed_hosts(
+            module,
+            owner,
+            &v(&["home.example.test"]),
+            &beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
         .unwrap()
         .expect("the owner's module");
     assert_eq!(hosts.owner_added, v(&["home.example.test"]));
     let secrets = repo
-        .update_module_allowed_secrets(module, owner, &v(&["svc/token"]), &beyond)
+        .update_module_allowed_secrets(
+            module,
+            owner,
+            &v(&["svc/token"]),
+            &beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
         .unwrap()
         .expect("the owner's module");
@@ -147,7 +159,13 @@ async fn what_the_owner_adds_is_recorded_with_the_grant_and_survives_a_reinstall
 
     // Someone else cannot touch the grant or its record.
     let other = repo
-        .update_module_allowed_hosts(module, stranger, &v(&["evil.example.test"]), &beyond)
+        .update_module_allowed_hosts(
+            module,
+            stranger,
+            &v(&["evil.example.test"]),
+            &beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
         .unwrap();
     assert!(other.is_none());
@@ -181,7 +199,13 @@ async fn what_the_owner_adds_is_recorded_with_the_grant_and_survives_a_reinstall
 
     // Removing the host removes it from the record.
     let cleared = repo
-        .update_module_allowed_hosts(module, owner, &[], &beyond)
+        .update_module_allowed_hosts(
+            module,
+            owner,
+            &[],
+            &beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -222,6 +246,7 @@ async fn an_inherited_entry_is_never_recorded_as_the_owners() {
             owner,
             &v(&["api.example.test", "mine.example.test"]),
             &beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
         )
         .await
         .unwrap()
@@ -234,6 +259,7 @@ async fn an_inherited_entry_is_never_recorded_as_the_owners() {
             owner,
             &v(&["api.example.test", "mine.example.test"]),
             &beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
         )
         .await
         .unwrap()
@@ -294,14 +320,26 @@ async fn module_info_shows_which_grants_the_owner_added() {
     let module = install(&repo, owner, &[], &[], &OwnerAddedGrants::default())
         .await
         .expect("first install");
-    repo.update_module_allowed_hosts(module, owner, &v(&["home.example.test"]), &beyond)
-        .await
-        .unwrap()
-        .expect("the owner's module");
-    repo.update_module_allowed_secrets(module, owner, &v(&["svc/token"]), &beyond)
-        .await
-        .unwrap()
-        .expect("the owner's module");
+    repo.update_module_allowed_hosts(
+        module,
+        owner,
+        &v(&["home.example.test"]),
+        &beyond,
+        talos_capability_world::ChangeAuthority::BearerCredential,
+    )
+    .await
+    .unwrap()
+    .expect("the owner's module");
+    repo.update_module_allowed_secrets(
+        module,
+        owner,
+        &v(&["svc/token"]),
+        &beyond,
+        talos_capability_world::ChangeAuthority::BearerCredential,
+    )
+    .await
+    .unwrap()
+    .expect("the owner's module");
 
     // The repository read carries the record the writers stored.
     let stored = repo

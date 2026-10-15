@@ -7,6 +7,16 @@ type ActorActionLogEntry {
 	executionId: UUID
 }
 
+"""
+Which per-actor security ceiling `setActorCeiling` sets.
+"""
+enum ActorCeilingKind {
+	LLM_TIER
+	EGRESS_SCOPE
+	WRITE_CEILING
+	HTTP_VERB_CEILING
+}
+
 type ActorDetails {
 	id: UUID!
 	name: String!
@@ -990,6 +1000,13 @@ type ModuleExecutionLog {
 }
 
 type MutationRoot {
+	"""
+	Register an MCP agent and return its token, shown once. The role's
+	capabilities scope the capability WORLDS the agent may compile,
+	install and run at — and only within the caller's own capability
+	ceiling. They are not a read/write boundary: every MCP tool is
+	available to the agent for its user's own data.
+	"""
 	registerMcpAgent(name: String!, roleName: String!): McpAgentCreated!
 	createActor(input: CreateActorInput!): ActorSummary!
 	updateActorStatus(id: UUID!, status: String!): ActorSummary!
@@ -1018,6 +1035,21 @@ type MutationRoot {
 		"""
 		name: String
 	): ActorSummary!
+	"""
+	Set one of an actor's per-actor security ceilings — the LLM tier
+	(`tier1`/`tier2`), the egress scope (`local`/`public`, null = the
+	tier-derived default), the write ceiling (`readonly`/`write`) or the
+	HTTP-verb override (`readonly`/`write`, null = inherit). The MCP tools
+	`set_actor_*` may only TIGHTEN these; loosening one needs this
+	mutation, from a session with a verified second factor (security
+	review 2026-10-14, G-5).
+	"""
+	setActorCeiling(		actorId: UUID!,		ceiling: ActorCeilingKind!,
+		"""
+		The new value; null clears egress_scope or http_verb_ceiling.
+		"""
+		value: String
+	): Boolean!
 	revokeMcpAgent(id: UUID!): Boolean!
 	signup(input: SignupInput!): AuthPayload!
 	login(input: LoginInput!): AuthPayload!

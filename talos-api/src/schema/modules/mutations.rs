@@ -90,6 +90,27 @@ impl ModulesMutations {
             (*user_id, template)
         };
 
+        // The module runs at the template's world, so the caller's own
+        // capability ceiling must permit it (security review 2026-10-14, G-3;
+        // the MCP surfaces ask `require_world_permitted`). The read fails
+        // closed.
+        {
+            let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
+            let repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+            let ceiling = repo.user_capability_ceiling(user_id).await.map_err(|e| {
+                tracing::error!(error = %e, "create_module_from_template: ceiling read failed");
+                async_graphql::Error::new("Could not verify your capability ceiling").extend_safe()
+            })?;
+            let world = template.capability_world.as_str();
+            if !talos_capability_world::ceiling_permits(&ceiling, world) {
+                return Err(async_graphql::Error::new(format!(
+                    "Your capability ceiling is '{ceiling}', so you cannot create a module in the \
+                     '{world}' world. A platform admin grants a wider ceiling."
+                ))
+                .extend_safe());
+            }
+        }
+
         // MCP-832 (2026-05-14): MCP-769 sweep — replace shallow length-only
         // check with focused content-discipline via `validate_display_name`
         // (trim + reject empty-after-trim + length cap + control-char /

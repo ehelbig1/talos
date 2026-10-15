@@ -5015,6 +5015,49 @@ pub(crate) fn registry_catalog_items(
     items
 }
 
+/// The per-user installed-module quota, shared by the catalog and the
+/// marketplace install (the marketplace counted nothing until 2026-10-14,
+/// G-24). `Some` is the refusal.
+pub(crate) async fn refuse_over_module_quota(
+    req_id: Option<serde_json::Value>,
+    state: &McpState,
+    user_id: uuid::Uuid,
+) -> Option<JsonRpcResponse> {
+    // Enforce per-user installed module limit to prevent storage exhaustion.
+    // MCP-368 (2026-05-11): pre-fix `.unwrap_or(0)` silently bypassed
+    // the cap on any DB error — count = 0 < 500, the install proceeded
+    // past the gate. Fail-CLOSED on quota errors. Same MCP-366/367
+    // family applied to the install_module_from_catalog quota.
+    const MAX_INSTALLED_MODULES_PER_USER: i64 = 500;
+    let module_count = match state.module_repo.count_user_modules(user_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "count_user_modules (module quota) failed; refusing install to avoid silent cap bypass"
+            );
+            return Some(mcp_error(
+                req_id,
+                -32000,
+                "Module quota check failed (database error). Refusing install to avoid silent cap bypass; retry after the database recovers.",
+            ));
+        }
+    };
+    if module_count >= MAX_INSTALLED_MODULES_PER_USER {
+        return Some(mcp_error(
+            req_id,
+            -32602,
+            &format!(
+                "Installed module limit reached ({} / {}). Delete unused modules with \
+                 delete_module before installing new ones.",
+                module_count, MAX_INSTALLED_MODULES_PER_USER
+            ),
+        ));
+    }
+    None
+}
+
 async fn handle_install_module_from_catalog(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -5043,37 +5086,8 @@ async fn handle_install_module_from_catalog(
 
     let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
 
-    // Enforce per-user installed module limit to prevent storage exhaustion.
-    // MCP-368 (2026-05-11): pre-fix `.unwrap_or(0)` silently bypassed
-    // the cap on any DB error — count = 0 < 500, the install proceeded
-    // past the gate. Fail-CLOSED on quota errors. Same MCP-366/367
-    // family applied to the install_module_from_catalog quota.
-    const MAX_INSTALLED_MODULES_PER_USER: i64 = 500;
-    let module_count = match state.module_repo.count_user_modules(user_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(
-                user_id = %user_id,
-                error = %e,
-                "count_user_modules (module quota) failed; refusing install to avoid silent cap bypass"
-            );
-            return mcp_error(
-                req_id,
-                -32000,
-                "Module quota check failed (database error). Refusing install to avoid silent cap bypass; retry after the database recovers.",
-            );
-        }
-    };
-    if module_count >= MAX_INSTALLED_MODULES_PER_USER {
-        return mcp_error(
-            req_id,
-            -32602,
-            &format!(
-                "Installed module limit reached ({} / {}). Delete unused modules with \
-                 delete_module before installing new ones.",
-                module_count, MAX_INSTALLED_MODULES_PER_USER
-            ),
-        );
+    if let Some(resp) = refuse_over_module_quota(req_id.clone(), state, user_id).await {
+        return resp;
     }
 
     // What the key names. A shared catalog row that names a registry
@@ -5195,12 +5209,15 @@ async fn handle_install_module_from_catalog(
     // refuses a role lacking that capability; this surface refused nothing, so
     // an `["http"]`-role agent could install and then run an automation-node
     // module. One shared predicate, same refusal.
-    if let Err(resp) = crate::sandbox::require_agent_role_permits_world(
+    if let Err(resp) = crate::sandbox::require_world_permitted(
         &req_id,
+        &state.actor_repo,
         &agent,
         capability_world,
         "install a catalog module for",
-    ) {
+    )
+    .await
+    {
         return resp;
     }
 

@@ -51,6 +51,19 @@ async fn seed_user(pool: &sqlx::PgPool) -> Uuid {
     id
 }
 
+/// The user's own ceiling is checked before the actor's (2026-10-14, G-3);
+/// these tests are about the ACTOR ceiling, so the user's is set wide.
+async fn grant_wide_user_ceiling(pool: &sqlx::PgPool, user_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO user_capability_grants (user_id, max_capability_world, granted_by) \
+         VALUES ($1, 'automation-node', $1)",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("grant");
+}
+
 async fn seed_workflow(pool: &sqlx::PgPool, user_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -100,6 +113,7 @@ async fn seed_actor(pool: &sqlx::PgPool, user_id: Uuid, max_world: &str) -> Uuid
 async fn run_sandbox_refuses_when_the_capability_ceiling_cannot_be_read() {
     let (pool, _db) = common::isolated_db_pool().await;
     let user_id = seed_user(&pool).await;
+    grant_wide_user_ceiling(&pool, user_id).await;
     let actor_id = seed_actor(&pool, user_id, "minimal-node").await;
     let state = mcp_state(pool.clone()).await;
 
@@ -173,6 +187,7 @@ async fn run_sandbox_refuses_when_the_capability_ceiling_cannot_be_read() {
 async fn compile_custom_sandbox_refuses_when_the_capability_ceiling_cannot_be_read() {
     let (pool, _db) = common::isolated_db_pool().await;
     let user_id = seed_user(&pool).await;
+    grant_wide_user_ceiling(&pool, user_id).await;
     let actor_id = seed_actor(&pool, user_id, "minimal-node").await;
     let state = mcp_state(pool.clone()).await;
 

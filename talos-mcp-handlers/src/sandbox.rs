@@ -642,27 +642,156 @@ pub(crate) fn checked_world_hint(world: &str) -> talos_worker_runtime::Capabilit
         .unwrap_or(talos_worker_runtime::CapabilityWorld::Unknown)
 }
 
-/// [`agent_role_permits_world`] as a refusal. `verb` names the operation for
-/// the message ("compile tools for", "run sandbox code in", ...). Refuses with
-/// `-32003`, the code the two original inline gates used.
-pub(crate) fn require_agent_role_permits_world(
+/// The two gates every surface that compiles, installs or runs a module at a
+/// world passes: the agent's ROLE permits the world
+/// ([`agent_role_permits_world`]), and so does the USER's own capability
+/// ceiling (`user_capability_grants`, the bound a platform admin sets).
+/// `verb` names the operation for the message ("compile tools for", "run
+/// sandbox code in", ...). Refuses with `-32003`, the code the two original
+/// inline gates used.
+///
+/// The user half is security review 2026-10-14, G-3: until then the grant
+/// was read only when an ACTOR was created or cloned, so a user granted
+/// `minimal-node` could register a `System Administrator` agent and compile,
+/// install and run `governance-node` modules. The read fails closed.
+pub(crate) async fn require_world_permitted(
     req_id: &Option<serde_json::Value>,
+    actor_repo: &talos_actor_repository::ActorRepository,
     agent: &auth::AgentIdentity,
     capability_world: &str,
     verb: &str,
 ) -> Result<(), JsonRpcResponse> {
-    if agent_role_permits_world(agent, capability_world) {
+    if !agent_role_permits_world(agent, capability_world) {
+        return Err(mcp_denied(
+            req_id.clone(),
+            -32003,
+            &format!(
+                "Unauthorized: agent role '{}' lacks capability to {} the '{}' world. \
+                 Allowed capabilities: {:?}",
+                agent.role_name, verb, capability_world, agent.allowed_capabilities
+            ),
+        ));
+    }
+    let Some(user_id) = agent.user_id else {
+        return Err(mcp_denied(
+            req_id.clone(),
+            -32003,
+            "Unauthorized: this agent is not bound to a user, so no capability ceiling applies",
+        ));
+    };
+    let ceiling = match actor_repo.user_capability_ceiling(user_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp",
+                %user_id,
+                error = %e,
+                "could not read capability grant — refusing rather than assuming the default"
+            );
+            return Err(mcp_error(
+                req_id.clone(),
+                -32603,
+                "Could not verify your capability ceiling — try again.",
+            ));
+        }
+    };
+    if talos_capability_world::ceiling_permits(&ceiling, capability_world) {
         return Ok(());
     }
     Err(mcp_denied(
         req_id.clone(),
         -32003,
         &format!(
-            "Unauthorized: agent role '{}' lacks capability to {} the '{}' world. \
-             Allowed capabilities: {:?}",
-            agent.role_name, verb, capability_world, agent.allowed_capabilities
+            "Unauthorized: your capability ceiling is '{ceiling}', so you cannot {verb} the \
+             '{capability_world}' world. A platform admin grants a wider ceiling."
         ),
     ))
+}
+
+/// The gate an edit of a stored module's grants passes (security review
+/// 2026-10-14, G-23): the module's stored world must be one the agent's role
+/// and the user's ceiling permit — the gate compiling into that world passes.
+/// Until then an `["minimal"]`-role token could rewrite the grants of any
+/// module its user owned. An absent row is the caller's "not found"; an
+/// unreadable one refuses.
+async fn require_grant_edit_permitted(
+    req_id: &Option<serde_json::Value>,
+    state: &McpState,
+    agent: &auth::AgentIdentity,
+    module_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+) -> Result<(), JsonRpcResponse> {
+    let world = match state
+        .module_repo
+        .get_hot_update_context(module_id, user_id)
+        .await
+    {
+        Ok(Some(ctx)) => ctx.capability_world,
+        Ok(None) => {
+            return Err(mcp_denied(
+                req_id.clone(),
+                -32000,
+                "Module not found or access denied",
+            ))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %module_id, "could not read the module's stored world — refusing");
+            return Err(crate::utils::database_error(req_id.clone()));
+        }
+    };
+    require_world_permitted(
+        req_id,
+        &state.actor_repo,
+        agent,
+        &world,
+        "edit the grants of a module in",
+    )
+    .await
+}
+
+/// The grant arguments of a compile or a sandbox run, as an MCP bearer token
+/// may give them (security review 2026-10-14, A-2 / G-23): no `*` in
+/// `allowed_secrets` or `allowed_hosts` (`-32003`), and both lists within the
+/// registry's size bounds (`-32602`). The repository applies the same `*`
+/// rule to an `update_module_*` write.
+fn refuse_bearer_grant(
+    req_id: &Option<serde_json::Value>,
+    allowed_secrets: &[String],
+    allowed_hosts: &[String],
+) -> Result<(), JsonRpcResponse> {
+    if talos_capability_world::grant_list_has_wildcard(allowed_secrets)
+        || talos_capability_world::grant_list_has_wildcard(allowed_hosts)
+    {
+        return Err(mcp_denied(
+            req_id.clone(),
+            -32003,
+            talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR,
+        ));
+    }
+    talos_registry::validate_allowed_secrets_bounds(allowed_secrets)
+        .and_then(|()| talos_registry::validate_allowed_hosts(allowed_hosts))
+        .map_err(|msg| mcp_error(req_id.clone(), -32602, &msg))
+}
+
+/// The answer to a module grant write that failed: a refused `*` is a
+/// refusal (`-32003`), anything else the caller's generic failure.
+fn grant_write_failure(
+    req_id: Option<serde_json::Value>,
+    e: &anyhow::Error,
+    tool: &str,
+    generic: &str,
+) -> JsonRpcResponse {
+    if e.downcast_ref::<talos_module_repository::WildcardGrantRefused>()
+        .is_some()
+    {
+        return mcp_denied(
+            req_id,
+            -32003,
+            talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR,
+        );
+    }
+    tracing::error!("{tool} failed: {:#}", e);
+    mcp_error(req_id, -32000, generic)
 }
 
 /// What the in-process runtime was told about the bound actor's egress scope.
@@ -1232,10 +1361,16 @@ async fn handle_compile_custom_sandbox(
     };
 
     // RBAC CHECK 1: Ensure agent is allowed to compile/use this capability world.
-    // One shared predicate (`require_agent_role_permits_world`) — the inline
+    // One shared predicate (`require_world_permitted`) — the inline
     // copy that stood here was one of two, and four sibling surfaces had none.
-    if let Err(resp) =
-        require_agent_role_permits_world(&req_id, &agent, capability_world, "compile tools for")
+    if let Err(resp) = require_world_permitted(
+        &req_id,
+        &state.actor_repo,
+        &agent,
+        capability_world,
+        "compile tools for",
+    )
+    .await
     {
         return resp;
     }
@@ -1375,12 +1510,16 @@ async fn handle_compile_custom_sandbox(
     // a no-match allowlist entry.
     let pre_allowed_secrets =
         crate::utils::json_string_array_field_trimmed(args, "allowed_secrets");
+    let pre_allowed_hosts = crate::utils::json_string_array_field_trimmed(args, "allowed_hosts");
+    if let Err(resp) = refuse_bearer_grant(&req_id, &pre_allowed_secrets, &pre_allowed_hosts) {
+        return resp;
+    }
     if pre_allowed_secrets.is_empty() && inner_rust_code.contains("vault://") {
         return mcp_error(
             req_id,
             -32602,
             "Compilation blocked: code references 'vault://' but allowed_secrets is empty (deny-all). \
-             Vault references will fail at runtime. Add allowed_secrets: [\"your/path\"] or [\"*\"].",
+             Vault references will fail at runtime. Add allowed_secrets: [\"your/path\"].",
         );
     }
 
@@ -1838,8 +1977,14 @@ async fn handle_run_sandbox(
     // role-based gate that compile_custom_sandbox enforces. The downstream
     // actor-ceiling check below is optional (skipped when `agent_id` omitted),
     // so it cannot stand in for this primary gate.
-    if let Err(resp) =
-        require_agent_role_permits_world(&req_id, &agent, capability_world, "run sandbox code in")
+    if let Err(resp) = require_world_permitted(
+        &req_id,
+        &state.actor_repo,
+        &agent,
+        capability_world,
+        "run sandbox code in",
+    )
+    .await
     {
         return resp;
     }
@@ -1902,6 +2047,9 @@ async fn handle_run_sandbox(
     // MCP-243: trimmed variants for run_sandbox security allowlists.
     let allowed_hosts = crate::utils::json_string_array_field_trimmed(args, "allowed_hosts");
     let allowed_secrets = crate::utils::json_string_array_field_trimmed(args, "allowed_secrets");
+    if let Err(resp) = refuse_bearer_grant(&req_id, &allowed_secrets, &allowed_hosts) {
+        return resp;
+    }
     // The method axis is the ONE grant on this path that defaults OPEN, and
     // `resolve_sandbox_methods` is where that decision lives so a test can
     // drive it. Absent argument => all five verbs; an explicitly supplied list
@@ -2416,12 +2564,15 @@ async fn handle_compile_template(
     // the world the compiled module will run at. `compile_custom_sandbox`
     // refuses a caller whose role lacks that capability; compiling the same
     // world FROM A TEMPLATE was ungated. Same predicate, same refusal.
-    if let Err(resp) = require_agent_role_permits_world(
+    if let Err(resp) = require_world_permitted(
         &req_id,
+        &state.actor_repo,
         &agent,
         &template.capability_world,
         "compile a template for",
-    ) {
+    )
+    .await
+    {
         return resp;
     }
 
@@ -3408,12 +3559,15 @@ async fn handle_hot_update_module(
             }
         },
     };
-    if let Err(resp) = require_agent_role_permits_world(
+    if let Err(resp) = require_world_permitted(
         &req_id,
+        &state.actor_repo,
         &agent,
         &effective_world,
         "hot-update a module in",
-    ) {
+    )
+    .await
+    {
         return Some(resp);
     }
 
@@ -3565,8 +3719,18 @@ async fn handle_update_module_secrets(
         }
     }
 
+    if let Err(msg) = talos_registry::validate_allowed_secrets_bounds(&allowed_secrets) {
+        return Some(mcp_error(req_id, -32602, &msg));
+    }
+    if let Err(resp) =
+        require_grant_edit_permitted(&req_id, state, &agent, module_id, user_id).await
+    {
+        return Some(resp);
+    }
+
     // The replace and its `admin_event_log` record commit in ONE transaction
-    // inside the repository (package CT); a failed record fails the call.
+    // inside the repository (package CT); a failed record fails the call. A
+    // `*` is refused there for this bearer token (2026-10-14, A-2).
     let change = match state
         .module_repo
         .update_module_allowed_secrets(
@@ -3574,6 +3738,7 @@ async fn handle_update_module_secrets(
             user_id,
             &allowed_secrets,
             &crate::modules::secrets_beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
         )
         .await
     {
@@ -3586,8 +3751,12 @@ async fn handle_update_module_secrets(
             ));
         }
         Err(e) => {
-            tracing::error!("update_module_secrets failed: {:#}", e);
-            return Some(mcp_error(req_id, -32000, "Failed to update module secrets"));
+            return Some(grant_write_failure(
+                req_id,
+                &e,
+                "update_module_secrets",
+                "Failed to update module secrets",
+            ));
         }
     };
 
@@ -3703,7 +3872,17 @@ async fn handle_update_module_hosts(
         }
     }
 
-    // Replace + record in ONE transaction (package CT).
+    if let Err(msg) = talos_registry::validate_allowed_hosts(&allowed_hosts) {
+        return Some(mcp_error(req_id, -32602, &msg));
+    }
+    if let Err(resp) =
+        require_grant_edit_permitted(&req_id, state, &agent, module_id, user_id).await
+    {
+        return Some(resp);
+    }
+
+    // Replace + record in ONE transaction (package CT); a `*` is refused
+    // there for this bearer token (2026-10-14, A-2).
     let change = match state
         .module_repo
         .update_module_allowed_hosts(
@@ -3711,6 +3890,7 @@ async fn handle_update_module_hosts(
             user_id,
             &allowed_hosts,
             &crate::modules::hosts_beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
         )
         .await
     {
@@ -3723,8 +3903,12 @@ async fn handle_update_module_hosts(
             ));
         }
         Err(e) => {
-            tracing::error!("update_module_hosts failed: {:#}", e);
-            return Some(mcp_error(req_id, -32000, "Failed to update module hosts"));
+            return Some(grant_write_failure(
+                req_id,
+                &e,
+                "update_module_hosts",
+                "Failed to update module hosts",
+            ));
         }
     };
 
@@ -3835,6 +4019,12 @@ async fn handle_update_module_methods(
         }
     }
 
+    if let Err(resp) =
+        require_grant_edit_permitted(&req_id, state, &agent, module_id, user_id).await
+    {
+        return Some(resp);
+    }
+
     // Replace + record in ONE transaction (package CT).
     let change = match state
         .module_repo
@@ -3843,6 +4033,7 @@ async fn handle_update_module_methods(
             user_id,
             &allowed_methods,
             &crate::modules::methods_beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
         )
         .await
     {
@@ -4162,8 +4353,14 @@ async fn handle_test_module(
     // surface had no such gate: an `["http"]`-role agent could run a stored
     // `secrets-node` module here. Same predicate, same refusal.
     let stored_world = module.capability_world.to_string();
-    if let Err(resp) =
-        require_agent_role_permits_world(&req_id, &agent, &stored_world, "execute a module in")
+    if let Err(resp) = require_world_permitted(
+        &req_id,
+        &state.actor_repo,
+        &agent,
+        &stored_world,
+        "execute a module in",
+    )
+    .await
     {
         return Some(resp);
     }

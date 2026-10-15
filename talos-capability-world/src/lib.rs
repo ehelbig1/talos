@@ -522,6 +522,73 @@ pub fn withdrawing_grant_widens(world: &str) -> bool {
     !ceiling_permits(world, DEFAULT_USER_CEILING)
 }
 
+/// The capabilities of an MCP agent role that a user's `ceiling` does not
+/// permit (security review 2026-10-14, G-3). A role names worlds (short or
+/// `-node` form); `*` and `admin` stand for every world. An unrecognised name
+/// is returned too, the refusing answer. Empty = the role fits the ceiling.
+#[must_use]
+pub fn role_capabilities_above<'a>(ceiling: &str, capabilities: &'a [String]) -> Vec<&'a str> {
+    capabilities
+        .iter()
+        .map(String::as_str)
+        .filter(|cap| {
+            let world = match *cap {
+                "*" | "admin" => "trusted-node",
+                other => other,
+            };
+            !ceiling_permits(ceiling, world)
+        })
+        .collect()
+}
+
+/// What the caller asking to change a security bound has proved
+/// (security review 2026-10-14, G-4 / G-5 / A-2).
+///
+/// A bound — a user's capability ceiling, an actor's LLM tier, egress scope or
+/// write ceiling, a module's secret or host grant — may be TIGHTENED by
+/// either. It is LOOSENED only by a session that verified a second factor: a
+/// bearer credential (an MCP agent token, an API key) is long-lived and can be
+/// held by a prompt-injected agent, which is why a cross-user grant and every
+/// secret write were already refused over MCP. The writer that holds the row
+/// lock decides, from the value it replaces; a handler names who is asking
+/// and does not classify the change itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeAuthority {
+    /// A browser session whose second factor was verified
+    /// (`require_second_factor` on the GraphQL mutation).
+    SecondFactorSession,
+    /// An MCP agent token or an API key.
+    BearerCredential,
+}
+
+impl ChangeAuthority {
+    /// Whether this caller may loosen a bound.
+    #[must_use]
+    pub fn may_loosen(self) -> bool {
+        matches!(self, Self::SecondFactorSession)
+    }
+}
+
+/// Whether a module grant list (`allowed_secrets` or `allowed_hosts`) is one
+/// a bearer credential may write: it names no `*`, the entry that grants
+/// every stored secret or every host (security review 2026-10-14, A-2 /
+/// G-23). A `*` is written only with [`ChangeAuthority::SecondFactorSession`].
+#[must_use]
+pub fn grant_list_has_wildcard(entries: &[String]) -> bool {
+    entries.iter().any(|e| e.trim() == "*")
+}
+
+/// The sentence a refused wildcard grant answers with.
+pub const WILDCARD_GRANT_NEEDS_SECOND_FACTOR: &str =
+    "A '*' grant (every stored secret, or every host) needs a session verified with two-factor \
+     authentication; an MCP agent token or an API key may only name exact paths and hosts.";
+
+/// The one sentence a refused loosening answers with, on every surface.
+pub const LOOSENING_NEEDS_SECOND_FACTOR: &str =
+    "This change loosens a security bound, which needs a session verified with two-factor \
+     authentication; an MCP agent token or an API key may only tighten it. Make the change \
+     signed in to the dashboard (GraphQL), or ask a platform admin to.";
+
 /// CSV rendering of [`ACTOR_CEILING_WORLDS`].
 pub fn actor_ceiling_worlds_csv() -> String {
     ACTOR_CEILING_WORLDS.join(", ")
@@ -1349,5 +1416,44 @@ mod vault_substitution_route_tests {
             assert!(!world_allows_vault_substitution(w), "world {w:?}");
             assert!(!world_allows_secrets(w), "world {w:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod change_authority_tests {
+    use super::*;
+
+    fn caps(list: &[&str]) -> Vec<String> {
+        list.iter().map(|c| (*c).to_string()).collect()
+    }
+
+    #[test]
+    fn only_a_second_factor_session_may_loosen() {
+        assert!(ChangeAuthority::SecondFactorSession.may_loosen());
+        assert!(!ChangeAuthority::BearerCredential.may_loosen());
+    }
+
+    #[test]
+    fn a_role_is_measured_against_the_users_ceiling() {
+        let admin_role = caps(&["automation", "secrets", "governance", "http", "minimal"]);
+        assert!(role_capabilities_above("automation-node", &admin_role).is_empty());
+        assert_eq!(
+            role_capabilities_above("http-node", &admin_role),
+            vec!["automation", "secrets", "governance"]
+        );
+        assert!(role_capabilities_above("minimal-node", &caps(&["minimal"])).is_empty());
+        assert_eq!(
+            role_capabilities_above("agent-node", &caps(&["*"])),
+            vec!["*"]
+        );
+        assert_eq!(
+            role_capabilities_above("agent-node", &caps(&["admin"])),
+            vec!["admin"]
+        );
+        assert!(role_capabilities_above("trusted-node", &caps(&["*", "admin"])).is_empty());
+        assert_eq!(
+            role_capabilities_above("trusted-node", &caps(&["no-such-world"])),
+            vec!["no-such-world"]
+        );
     }
 }

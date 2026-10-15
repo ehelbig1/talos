@@ -12772,17 +12772,20 @@ async fn handle_create_workflow_from_spec(
     }
 
     // Role gate, per compiled world — the same gate every other compile path
-    // runs (`require_agent_role_permits_world`). Before 2026-09-25 this path
+    // runs (`require_world_permitted`). Before 2026-09-25 this path
     // compiled at whatever world the spec named, for any agent role. Runs over
     // `inline_compile_worlds`, which follows the service's own resolution
     // precedence, so it sees exactly the nodes that will compile.
     for (_node_id, world) in talos_workflow_creation::inline_compile_worlds(&spec_nodes) {
-        if let Err(resp) = crate::sandbox::require_agent_role_permits_world(
+        if let Err(resp) = crate::sandbox::require_world_permitted(
             &req_id,
+            &state.actor_repo,
             &agent,
             world,
             "compile inline modules for",
-        ) {
+        )
+        .await
+        {
             return resp;
         }
     }

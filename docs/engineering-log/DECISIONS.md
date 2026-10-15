@@ -1787,6 +1787,22 @@ tests race, and everything the flow needs past it).
   within ±20 lines. A check cannot ship at 21 and baselines are not re-added,
   so the count stays where it was (84 at the time).
 
+**Who may LOOSEN a per-actor ceiling (2026-10-14, security review G-5,
+operator decision D-1 — the narrow option built).** The four per-actor bounds
+(`max_llm_tier`, `egress_scope`, `max_write_ceiling`, `http_verb_ceiling`) are
+TIGHTENED by the owner from any surface; they are LOOSENED only with
+`ChangeAuthority::SecondFactorSession`, which only the GraphQL
+`setActorCeiling` mutation (behind `require_second_factor`) passes. The MCP
+`set_actor_*` tools may only tighten — including for a platform admin, whose
+MCP token proves no second factor either. The decision is made by
+`ActorRepository::set_actor_ceiling_recorded` under the row lock, against the
+value it replaces (`ActorCeiling::is_loosening`); a cleared egress or verb
+override counts as loosening an explicit `local` / `readonly`. Rejected: a
+platform-admin exemption over MCP (on a one-operator fleet the admin's token IS
+the token the review's attack holds, so it would exempt the only caller), and a
+setting to switch the rule off. Record:
+`packages/2026-10-14-loosening-needs-a-second-factor.md`.
+
 ### The attempt window → [`2026-10-05-attempt-window.md`](docs/engineering-log/2026-10-05-attempt-window.md)
 
 **The class.** One question — how much of a workflow's wall-clock budget may a

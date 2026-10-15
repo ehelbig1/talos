@@ -238,6 +238,23 @@ pub fn mark_response_no_store(ctx: &Context<'_>) {
     ctx.insert_http_header(axum::http::header::CACHE_CONTROL, "no-store");
 }
 
+/// Refuses an unauthenticated request and a browser session still waiting
+/// for its two-factor code. That is ALL it proves: an API key passes (the
+/// router marks every key request `IsTwoFactorVerified`), and so does a
+/// password-only session on an account with no second factor enrolled. It is
+/// not a second-factor gate, whatever its name says; that is
+/// [`require_second_factor`], which refuses API keys (security review
+/// 2026-10-14, G-16 — documented rather than renamed: 58 call sites and the
+/// source pins read the name).
+///
+/// Which operations need the strong gate is decided per resolver and pinned
+/// by `the_privileged_tier_calls_the_second_factor_gate`: key material, the
+/// creation or expansion of privilege, and — since 2026-10-14 — LOOSENING a
+/// security bound (`setActorCeiling`, the widening branch of
+/// `revokeCapabilityCeiling`). Decided to stay on this gate: the revocations,
+/// which narrow and must stay quick in an incident, and `setConcurrencyLimit`,
+/// which bounds one of the caller's own workflows between 1 and 100 and
+/// crosses no tenant and no security bound.
 pub fn require_2fa(ctx: &Context<'_>) -> Result<()> {
     // MCP-616 (2026-05-12): fail closed when `IsTwoFactorVerified` data is
     // missing entirely. Pre-fix: `if let Ok(verified) = ctx.data::<...>` —
@@ -1477,7 +1494,8 @@ mod second_factor_tests {
     /// SOURCE PIN, stated as textual: the privileged tier — operations that
     /// touch key material or create or expand privilege — calls
     /// `require_second_factor`, and the revocations (which REDUCE privilege and
-    /// must stay quick in an incident) keep `require_2fa`. The DB test drives
+    /// must stay quick in an incident) keep `require_2fa`. A capability revoke
+    /// is both, by branch. The DB test drives
     /// the gate through `rotateOrgDek` only; this pins every member.
     #[test]
     fn the_privileged_tier_calls_the_second_factor_gate() {
@@ -1506,7 +1524,7 @@ mod second_factor_tests {
                 .map_or(src.len(), |e| i + 1 + e);
             &src[i..end]
         };
-        const PRIVILEGED: [&str; 15] = [
+        const PRIVILEGED: [&str; 16] = [
             "create_api_key",
             "rotate_api_key",
             "register_mcp_agent",
@@ -1522,6 +1540,8 @@ mod second_factor_tests {
             "update_audit_settings",
             "grant_capability_ceiling",
             "transfer_ownership",
+            // Loosens an actor's ceiling (2026-10-14, G-5).
+            "set_actor_ceiling",
         ];
         for name in PRIVILEGED {
             let b = body(name);
@@ -1534,12 +1554,7 @@ mod second_factor_tests {
                 "{name}: must not keep the weaker gate"
             );
         }
-        const REDUCING: [&str; 4] = [
-            "revoke_api_key",
-            "delete_api_key",
-            "revoke_mcp_agent",
-            "revoke_capability_ceiling",
-        ];
+        const REDUCING: [&str; 3] = ["revoke_api_key", "delete_api_key", "revoke_mcp_agent"];
         for name in REDUCING {
             let b = body(name);
             assert!(
@@ -1547,6 +1562,23 @@ mod second_factor_tests {
                 "{name}: reduces privilege, keeps require_2fa"
             );
         }
+        // A capability revoke usually narrows and stays quick, but withdrawing
+        // a grant below the default WIDENS its holder (2026-10-14, G-4): that
+        // branch asks for the second factor, and every caller needs Admin
+        // scope (A-8).
+        let b = body("revoke_capability_ceiling");
+        assert!(b.contains("require_2fa(ctx)?"));
+        assert!(b.contains("require_second_factor(ctx).await?"));
+        let scope = b
+            .find("require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?")
+            .expect("revoke requires Admin scope");
+        let branch = b
+            .find("if revoker_id != user_id")
+            .expect("cross-user branch");
+        assert!(
+            scope < branch,
+            "Admin scope is required before the self branch"
+        );
     }
 }
 

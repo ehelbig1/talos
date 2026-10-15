@@ -204,6 +204,30 @@ pub fn validate_allowed_hosts(hosts: &[String]) -> std::result::Result<(), Strin
 const MAX_ALLOWED_SECRETS: usize = 50;
 const MAX_SECRET_PATH_LENGTH: usize = 200;
 
+/// The size bounds of an `allowed_secrets` list — at most 50 entries of at
+/// most 200 characters — without [`validate_allowed_secrets`]' character
+/// rule. A module's grant names stored paths, and 12 of the 92 entries held
+/// on the reference deployment (2026-10-14) carry a `.` or `@` (a connection
+/// keyed by an account) or an uppercase letter, which that rule refuses; an
+/// `update_module_secrets` or a compile asks this one (security review
+/// 2026-10-14, G-23).
+pub fn validate_allowed_secrets_bounds(secrets: &[String]) -> std::result::Result<(), String> {
+    if secrets.len() > MAX_ALLOWED_SECRETS {
+        return Err(format!(
+            "allowed_secrets exceeds maximum of {} entries",
+            MAX_ALLOWED_SECRETS
+        ));
+    }
+    if let Some(entry) = secrets.iter().find(|e| e.len() > MAX_SECRET_PATH_LENGTH) {
+        return Err(format!(
+            "Invalid allowed_secrets entry: path exceeds {} chars. Got {} chars.",
+            MAX_SECRET_PATH_LENGTH,
+            entry.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Validate an `allowed_secrets` list.
 ///
 /// MCP-1124 (2026-05-16): sibling sweep of MCP-1123. The OCI catalog

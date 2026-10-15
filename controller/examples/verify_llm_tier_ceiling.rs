@@ -21,6 +21,7 @@ use sqlx::Row as _;
 use uuid::Uuid;
 
 use controller::actor_repository::ActorRepository;
+use talos_capability_world::ChangeAuthority;
 use talos_workflow_job_protocol::{EncryptedSecrets, JobRequest, LlmTier};
 
 #[tokio::main]
@@ -47,10 +48,18 @@ async fn main() -> Result<()> {
 
     // 2. Flip to tier1, read back.
     let updated = repo
-        .set_actor_max_llm_tier(actor_id, user_id, LlmTier::Tier1)
+        .set_actor_max_llm_tier(
+            actor_id,
+            user_id,
+            LlmTier::Tier1,
+            ChangeAuthority::BearerCredential,
+        )
         .await?;
     assert!(
-        updated.is_some(),
+        matches!(
+            updated,
+            controller::actor_repository::CeilingWrite::Changed(_)
+        ),
         "set returned None — actor not found or wrong user"
     );
     let t1 = repo.get_actor_max_llm_tier(actor_id).await?;
@@ -62,8 +71,18 @@ async fn main() -> Result<()> {
     println!("✓ set/get tier1 round-trip");
 
     // 3. Flip back to tier2.
-    repo.set_actor_max_llm_tier(actor_id, user_id, LlmTier::Tier2)
+    let loosened = repo
+        .set_actor_max_llm_tier(
+            actor_id,
+            user_id,
+            LlmTier::Tier2,
+            ChangeAuthority::SecondFactorSession,
+        )
         .await?;
+    assert!(matches!(
+        loosened,
+        controller::actor_repository::CeilingWrite::Changed(_)
+    ));
     let t2 = repo.get_actor_max_llm_tier(actor_id).await?;
     assert!(matches!(t2, Some(LlmTier::Tier2)));
     println!("✓ set/get tier2 round-trip");
@@ -71,10 +90,18 @@ async fn main() -> Result<()> {
     // 4. Wrong user denied.
     let wrong_user = Uuid::new_v4();
     let denied = repo
-        .set_actor_max_llm_tier(actor_id, wrong_user, LlmTier::Tier1)
+        .set_actor_max_llm_tier(
+            actor_id,
+            wrong_user,
+            LlmTier::Tier1,
+            ChangeAuthority::BearerCredential,
+        )
         .await?;
     assert!(
-        denied.is_none(),
+        matches!(
+            denied,
+            controller::actor_repository::CeilingWrite::NoSuchActor
+        ),
         "set should have returned None for wrong user"
     );
     println!("✓ set with wrong user_id denied");

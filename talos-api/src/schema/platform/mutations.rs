@@ -298,8 +298,19 @@ impl PlatformMutations {
     // `minimal-node` or `governance-node` grant lands on the `http-node`
     // default) is refused by `delete_capability_grant` (2026-09-25). Plain
     // `//` so the SDL description, and the checked-in schema, are unchanged.
+    //
+    // 2026-10-14 (security review G-4 / A-8): the Admin scope is required of
+    // every caller, the self-revoke included — before, an API key of any scope
+    // could narrow its owner's own ceiling. A revoke that NARROWS stays on
+    // `require_2fa`, quick in an incident like the other revocations; one that
+    // would WIDEN another user's ceiling (withdrawing their `minimal-node` or
+    // `governance-node`) is the expansion `grantCapabilityCeiling` guards, so
+    // the repository refuses it for a caller that has not proved a second
+    // factor and this resolver then asks `require_second_factor` and tries
+    // once more under that authority. The decision stays under the row lock.
     async fn revoke_capability_ceiling(&self, ctx: &Context<'_>, user_id: Uuid) -> Result<bool> {
         require_2fa(ctx)?;
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let revoker_id = ctx
             .data_opt::<Uuid>()
             .copied()
@@ -315,8 +326,6 @@ impl PlatformMutations {
         // MCP sibling `handle_revoke_capability_ceiling` already uses
         // the canonical helper; this brings GraphQL into parity.
         if revoker_id != user_id {
-            require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
-
             let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
             let is_admin = actor_repo
                 .is_platform_admin(revoker_id)
@@ -335,15 +344,30 @@ impl PlatformMutations {
         }
 
         let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
-        let outcome = actor_repo
-            // Records `capability_grant_revoked` in the same transaction, and
-            // refuses a self-revoke that would widen the caller's ceiling.
-            .delete_capability_grant(user_id, revoker_id, None)
-            .await
-            .map_err(|e| {
-                tracing::error!("revoke_capability_ceiling failed: {}", e);
-                async_graphql::Error::new("Failed to revoke capability ceiling").extend_safe()
-            })?;
+        let revoke = |authority| {
+            let actor_repo = actor_repo.clone();
+            async move {
+                actor_repo
+                    // Records `capability_grant_revoked` in the same
+                    // transaction, and refuses a self-revoke that would widen
+                    // the caller's ceiling.
+                    .delete_capability_grant(user_id, revoker_id, None, authority)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("revoke_capability_ceiling failed: {}", e);
+                        async_graphql::Error::new("Failed to revoke capability ceiling")
+                            .extend_safe()
+                    })
+            }
+        };
+        let mut outcome = revoke(talos_capability_world::ChangeAuthority::BearerCredential).await?;
+        if matches!(
+            outcome,
+            talos_actor_repository::CapabilityGrantRevocation::WideningNeedsSecondFactor { .. }
+        ) {
+            require_second_factor(ctx).await?;
+            outcome = revoke(talos_capability_world::ChangeAuthority::SecondFactorSession).await?;
+        }
 
         match outcome {
             talos_actor_repository::CapabilityGrantRevocation::Revoked { .. } => {}
@@ -363,6 +387,15 @@ impl PlatformMutations {
                 );
                 return Err(async_graphql::Error::new(
                     talos_actor_repository::CapabilityGrantRevocation::self_revoke_refusal(&world),
+                )
+                .extend_safe());
+            }
+            // Not reached: the second attempt above ran with a second factor.
+            talos_actor_repository::CapabilityGrantRevocation::WideningNeedsSecondFactor {
+                ..
+            } => {
+                return Err(async_graphql::Error::new(
+                    talos_capability_world::LOOSENING_NEEDS_SECOND_FACTOR,
                 )
                 .extend_safe());
             }
