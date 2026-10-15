@@ -4,6 +4,8 @@ import { AddExistingNodeDialog } from "./AddExistingNodeDialog";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { server } from "../../vitest.setup";
 import { handlers } from "../mocks/handlers";
+import { http, HttpResponse } from "msw";
+import { useUIStore } from "@/store/uiStore";
 
 describe("AddExistingNodeDialog", () => {
   const mockOnNodeAdded = vi.fn();
@@ -86,5 +88,33 @@ describe("AddExistingNodeDialog", () => {
 
     expect(screen.getByText(/No modules match/i)).toBeInTheDocument();
     expect(screen.queryByText("Existing Module")).not.toBeInTheDocument();
+  });
+
+  it("offers to create a module when there are none to add", async () => {
+    server.use(
+      http.post("*/graphql", async ({ request }) => {
+        const { query } = (await request.json()) as { query: string };
+        if (query.includes("myModules")) {
+          return HttpResponse.json({ data: { myModules: [] } });
+        }
+        return HttpResponse.json({ data: {} });
+      }),
+    );
+    useUIStore.getState().setToolbarModal(null);
+
+    render(
+      <AddExistingNodeDialog
+        onNodeAdded={mockOnNodeAdded}
+        onClose={mockOnClose}
+      />,
+    );
+
+    expect(
+      await screen.findByText(/You have no modules yet/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/No modules match/i)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "New module" }));
+    expect(useUIStore.getState().toolbarModal).toBe("create");
   });
 });

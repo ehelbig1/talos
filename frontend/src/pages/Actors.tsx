@@ -348,23 +348,20 @@ export default function Actors() {
               </p>
             </div>
           ) : actors.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-40 bg-surface-3/20 border border-white/5 border-dashed border-2 rounded-2xl bg-surface-3 border border-white/10 max-w-4xl mx-auto">
-              <div className="w-24 h-24 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center mb-10 relative group">
-                <Bot className="w-12 h-12 text-primary relative z-10 transition-ui" />
+            <div className="flex flex-col items-center justify-center py-14 px-6 bg-surface-3/40 border border-white/10 border-dashed rounded-2xl max-w-3xl mx-auto">
+              <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center mb-5">
+                <Bot className="w-6 h-6 text-primary" />
               </div>
-              <h2 className="text-4xl font-semibold text-white tracking-tight font-outfit mb-6">
+              <h2 className="text-xl font-semibold text-white font-outfit mb-2">
                 No actors yet
               </h2>
-              <p className="text-muted-foreground/70 text-sm max-w-xl leading-relaxed text-center px-12 mb-12">
+              <p className="text-muted-foreground text-sm max-w-md leading-relaxed text-center mb-7">
                 An actor is an identity a workflow runs as. It has a capability
                 ceiling, a budget and its own memory.
               </p>
-              <button
-                onClick={() => setShowCreate(true)}
-                className="flex items-center gap-4 px-10 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-ui border border-white/20"
-              >
-                <Plus className="w-5 h-5" /> Create your first actor
-              </button>
+              <Button onClick={() => setShowCreate(true)}>
+                <Plus className="w-4 h-4" /> Create an actor
+              </Button>
             </div>
           ) : (
             <div className="space-y-20">
