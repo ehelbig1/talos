@@ -211,6 +211,9 @@ pub async fn active_full_tier_connections(
     pool: &Pool<Postgres>,
     user_id: Uuid,
 ) -> Result<Vec<Uuid>> {
+    // In the user's own scope, so the table's row-security policy stands
+    // behind the `user_id` predicate (security review 2026-10-14, D-1).
+    let mut tx = talos_db::begin_user_scoped(pool, user_id).await?;
     let rows: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT provider_key FROM google_cloud_integrations \
          WHERE user_id = $1 AND tier = 'full' AND is_active = TRUE \
@@ -218,9 +221,10 @@ pub async fn active_full_tier_connections(
     )
     .bind(user_id)
     .bind(MAX_CONSENTS_READ)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .context("Failed to look up full-tier GCP consents")?;
+    tx.commit().await?;
     Ok(rows.into_iter().map(|(key,)| key).collect())
 }
 

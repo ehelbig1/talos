@@ -1700,6 +1700,7 @@ enforced by `clippy.toml`.
   101. a token is not minted from Uuid::new_v4()
   102. every push-channel workflow binding asks workflow_is_bindable
   103. is_production() is read only where build posture is decided
+  104. a repository function that takes user_id binds it
 
 ### The actor write ceiling → [`2026-10-05-actor-write-ceiling.md`](docs/engineering-log/2026-10-05-actor-write-ceiling.md)
 
@@ -1824,6 +1825,34 @@ single dispatch attempt occupy — had two implementations, the dispatcher's
   comments explaining the fix. `--count` stayed 86. Two mutations survive, both
   in the loud direction: re-inlining `timeout + 5` at the dispatch site, and
   passing `None` for `budget_secs`.
+
+### Row security: which tenant tables carry a policy → [`packages/2026-10-15-tenancy-backstop.md`](docs/engineering-log/packages/2026-10-15-tenancy-backstop.md)
+
+**The rule (2026-10-15, security review D-1).** A tenant table carries a
+row-security policy when a scoped transaction reads or writes it; a policy on a
+table only the superuser pool reads is a control nothing exercises (the
+20260912130000 reasoning, which stands). `actor_memory`'s tenant is its ACTOR's
+(`EXISTS (SELECT 1 FROM actors …)`, the parent's own policy deciding), not its
+`org_id`: the org-keyed policy read a user-scoped transaction's empty org list
+as "unset" and admitted every tenant's rows. The five user-keyed integration
+tables (`plaid_items`, `google_health_integrations`,
+`microsoft_365_integrations`, `google_calendar_write_integrations`,
+`google_cloud_integrations`) carry `user_id` policies, and their readers that
+know the user run in `begin_user_scoped`.
+
+**Deliberately outside the net, with the reason.**
+* `memory_read_grants`, `workflow_action_tokens` — a capability token is
+  presented before any user is known; the claim/apply statement re-joins the
+  owner itself. The read-grant expiry sweep is a system statement on the pool,
+  so a policy added later cannot silently narrow it.
+* `atlassian_webhook_registrations`, `github_app_installations` — a provider
+  delivery is read before its user is known.
+* `talos_oauth::credentials`' account-email union across the Google tables —
+  a Google grant is per (account, OAuth client), so "is this the account's last
+  connection" is asked across every user, on the pool.
+* The bare-pool `talos_memory::*` readers (MCP tools, the memory RPC, the
+  engine) — app-layer scoping only, as before; moving them is a signature change
+  across ~40 functions and the RPC hot path, not done.
 
 ### Completed extractions and the May-2026 crate decomposition → [`2026-10-05-extraction-history.md`](docs/engineering-log/2026-10-05-extraction-history.md)
 

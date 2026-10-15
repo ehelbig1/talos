@@ -9835,6 +9835,36 @@ fi
 
 echo
 
+bold "▶ check 104: a repository function that takes user_id binds it"
+
+# The defect class "a tenant bind a lint cannot see": a repository method
+# takes the caller's `user_id`, runs SQL, and never binds it, and every test
+# passes because a one-tenant fixture cannot tell a scoped read from an
+# unscoped one (security review 2026-10-14, D-8). Checks 25, 42 and 70 cover
+# GraphQL resolvers, three tables' INSERTs and natural keys; none covered the
+# repository crates. The specification — the scope (`talos-*-repository/src`),
+# what counts as a statement, a bind and "passing it on", what counts as test
+# code — is in `scripts/lint-unbound-user-id.py`'s header.
+# Opt-out: `// allow-unbound-user-id: <reason>` on the fn line or 3 above.
+# Measured on main @ 7ac25242: 320 `pub async fn`s take `user_id: Uuid` and
+# build a statement; 319 bind it and 1 passes it on; 0 hits, 0 false
+# positives. Limit: textual — a bind under another name needs the marker, a
+# "passed on" callee is not proved to bind, and a NEUTERED bind
+# (`OR $n IS NULL`) is bound and therefore not seen.
+CK104_RC=0
+CK104_OUT="$(cd "$ROOT" && python3 scripts/lint-unbound-user-id.py . 2>&1)" || CK104_RC=$?
+if [ "$CK104_RC" -eq 0 ]; then
+    green "✓ every repository function that takes user_id binds it ($(echo "$CK104_OUT" | tail -1))"
+else
+    echo "$CK104_OUT" | sed 's/^/  /'
+    red "✗ a repository function takes user_id and binds it nowhere"
+    yellow "  → bind it in every statement that reads or writes the caller's rows,"
+    yellow "    or mark it // allow-unbound-user-id: <reason>"
+    EXIT_CODE=1
+fi
+
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

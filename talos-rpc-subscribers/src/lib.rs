@@ -448,10 +448,26 @@ mod memory_set_error_tests {
 /// list, and a name in a schema other than `pg_catalog` was not matched; a
 /// bare or `pg_catalog` name of a listed function is the only thing
 /// admitted now.
+/// The controller's re-check of what guest SQL reads: the first relation that
+/// is not an ordinary `public` table, as written (security review 2026-10-14,
+/// D-4). The one rule is `talos_sql_classify::first_relation_not_public`.
+fn controller_side_non_public_relation(stmt: &sqlparser::ast::Statement) -> Option<String> {
+    talos_sql_classify::first_relation_not_public(stmt).map(|(name, _)| name)
+}
+
+/// The `SET LOCAL`s that bound one guest transaction: its statement timeout
+/// is the RPC's own budget, and its sort/hash memory 4 MB.
+fn guest_tx_limits_sql() -> String {
+    format!(
+        "SET LOCAL statement_timeout = '{}s'; SET LOCAL work_mem = '4MB'",
+        talos_memory::database_rpc::QUERY_TIMEOUT_SECS
+    )
+}
+
 fn controller_side_denied_function(stmt: &sqlparser::ast::Statement) -> Option<String> {
     talos_sql_classify::first_function_not_admitted(
         stmt,
-        talos_workflow_job_protocol::is_allowed_sql_function,
+        talos_workflow_job_protocol::is_allowed_guest_sql_function,
     )
 }
 
@@ -906,7 +922,18 @@ async fn run_guest_transaction(
         };
         // The one statement that sets the tenant GUCs (`TenantReadScope`),
         // with no org list: the owner's personal rows.
-        let tenant_sql = talos_tenancy::TenantReadScope::new(owner, Vec::new()).set_local_sql();
+        //
+        // And the guest's own bounds, in the same round trip: the server
+        // abandons a statement when the caller's budget does
+        // (`QUERY_TIMEOUT_SECS`, where the 60 s pool default used to let it
+        // run on after the client had gone), and a sort or hash spills to disk
+        // past 4 MB rather than growing in memory (security review
+        // 2026-10-14, D-3).
+        let tenant_sql = format!(
+            "{}; {}",
+            talos_tenancy::TenantReadScope::new(owner, Vec::new()).set_local_sql(),
+            guest_tx_limits_sql()
+        );
 
         // SET LOCAL ROLE — reverted automatically at COMMIT/ROLLBACK — the
         // tenant GUCs, and a read-back of what the role is, in one round
@@ -2652,6 +2679,33 @@ pub fn spawn_database_rpc_subscriber(
                         RpcSubject::DatabaseQuery,
                         req.actor_id,
                         RpcOutcome::DisallowedFunction,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
+                    );
+                    return;
+                }
+
+                // Controller-side re-check of what the statement reads:
+                // ordinary public tables only (security review 2026-10-14,
+                // D-4). The same rule as the worker's and query_paginated's
+                // (`talos_sql_classify::first_relation_not_public`).
+                if let Some(relation) = controller_side_non_public_relation(&stmts[0]) {
+                    tracing::warn!(
+                        target: "talos_rpc",
+                        event_kind = "database_rpc_non_public_relation",
+                        actor_id = %req.actor_id,
+                        relation = %relation,
+                        "database RPC: rejecting query reading a relation outside the public \
+                         schema — possible worker bypass (worker should already have refused)"
+                    );
+                    send(Err(DatabaseRpcError::InvalidQuery(format!(
+                        "SQL reads `{relation}`, which is not a table of the public schema"
+                    ))))
+                    .await;
+                    record_rpc_metric(
+                        RpcSubject::DatabaseQuery,
+                        req.actor_id,
+                        RpcOutcome::StatementNotPermitted,
                         start.elapsed(),
                         std::time::Duration::ZERO,
                     );

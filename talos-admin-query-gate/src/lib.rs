@@ -35,7 +35,7 @@
 //! The gate's verdicts over the shared SQL corpus are recorded in
 //! `talos-sql-classify/corpus/query_paginated.snapshot` (`tests/sql_corpus.rs`).
 
-use sqlparser::ast::{Ident, Statement};
+use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::ops::ControlFlow;
@@ -270,55 +270,28 @@ fn statement_refusal(statement: &Statement) -> Option<QueryRefusal> {
 }
 
 fn relation_refusal(relation: ReadRelation<'_>) -> Option<QueryRefusal> {
-    let name = match relation {
-        ReadRelation::Named(name) => name,
-        ReadRelation::TableCommand => {
-            return Some(QueryRefusal::Relation {
-                name: "TABLE".to_string(),
-                rule: RelationRule::TableCommand,
-            })
-        }
-    };
     let refuse = |rule| {
         Some(QueryRefusal::Relation {
-            name: name.to_string(),
+            name: match relation {
+                ReadRelation::Named(name) => name.to_string(),
+                ReadRelation::TableCommand => "TABLE".to_string(),
+            },
             rule,
         })
     };
-    let Some(parts) = name
-        .0
-        .iter()
-        .map(|part| part.as_ident())
-        .collect::<Option<Vec<&Ident>>>()
-    else {
-        return refuse(RelationRule::NotPublic);
-    };
-    let table = match parts.as_slice() {
-        [table] => *table,
-        [schema, table] if folded(schema) == "public" => *table,
-        _ => return refuse(RelationRule::NotPublic),
-    };
-    // Compared without regard to case even when quoted: stricter than
-    // Postgres, which would read `"USERS"` as a different table from `users`.
-    let table_name = folded(table).to_ascii_lowercase();
-    if table.quote_style.is_none() && table_name == "only" {
-        return refuse(RelationRule::OnlyKeyword);
-    }
-    if table_name.starts_with("pg_") {
-        return refuse(RelationRule::SystemCatalog);
-    }
-    if BLOCKED_TABLES_LIST.contains(&table_name.as_str()) {
-        return refuse(RelationRule::Blocked);
-    }
-    None
-}
-
-/// An identifier as Postgres reads it: an unquoted one folded to lower case,
-/// a quoted one as written.
-fn folded(ident: &Ident) -> String {
-    match ident.quote_style {
-        None => ident.value.to_ascii_lowercase(),
-        Some(_) => ident.value.clone(),
+    // The schema, catalog and keyword rules have one home, shared with the
+    // module-SQL gates; the withheld tables are this tool's own.
+    match talos_sql_classify::public_table_name(relation) {
+        Ok(table_name) if BLOCKED_TABLES_LIST.contains(&table_name.as_str()) => {
+            refuse(RelationRule::Blocked)
+        }
+        Ok(_) => None,
+        Err(talos_sql_classify::NotPublicTable::NotPublic) => refuse(RelationRule::NotPublic),
+        Err(talos_sql_classify::NotPublicTable::SystemCatalog) => {
+            refuse(RelationRule::SystemCatalog)
+        }
+        Err(talos_sql_classify::NotPublicTable::OnlyKeyword) => refuse(RelationRule::OnlyKeyword),
+        Err(talos_sql_classify::NotPublicTable::TableCommand) => refuse(RelationRule::TableCommand),
     }
 }
 

@@ -2840,6 +2840,34 @@ pub fn is_allowed_sql_function(name: &str) -> bool {
         && ALLOWED_SQL_FUNCTIONS.contains(&function.to_ascii_lowercase().as_str())
 }
 
+/// Functions on [`ALLOWED_SQL_FUNCTIONS`] that module (guest) SQL may NOT
+/// call: each builds a value or a set whose size the caller chooses, and the
+/// server materialises it before any result cap is consulted —
+/// `SELECT repeat('x', 1073741823) FROM generate_series(1, 1000)` asks for a
+/// terabyte (security review 2026-10-14, D-3). The platform-admin
+/// `query_paginated` tool keeps them ([`is_allowed_sql_function`]); a
+/// module's `talos.database.query` asks [`is_allowed_guest_sql_function`].
+/// Sorted, lower case, plain identifiers; every entry is on the allow list
+/// (a test holds it).
+pub const GUEST_EXCLUDED_SQL_FUNCTIONS: &[&str] = &[
+    "generate_series",
+    "generate_subscripts",
+    "lpad",
+    "repeat",
+    "rpad",
+];
+
+/// [`is_allowed_sql_function`] for module (guest) SQL: the same matcher,
+/// less [`GUEST_EXCLUDED_SQL_FUNCTIONS`]. The worker's validator and the
+/// controller's re-check of `talos.database.query` both ask this one.
+pub fn is_allowed_guest_sql_function(name: &str) -> bool {
+    if !is_allowed_sql_function(name) {
+        return false;
+    }
+    let function = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+    !GUEST_EXCLUDED_SQL_FUNCTIONS.contains(&function.as_str())
+}
+
 /// True iff `name` (case-insensitive, schema component already stripped)
 /// appears in [`DISALLOWED_SQL_FUNCTIONS`] OR starts with one of the
 /// [`DISALLOWED_SQL_FUNCTION_PREFIXES`] families. The schema strip is the
@@ -3513,6 +3541,30 @@ mod external_llm_host_normalisation_tests {
 // ============================================================================
 // Wasm-security review 2026-05-22 (MEDIUM-1): SQL function deny-list tests
 // ============================================================================
+#[cfg(test)]
+mod guest_sql_function_tests {
+    use super::*;
+
+    #[test]
+    fn the_guest_list_is_the_admin_list_less_the_size_builders() {
+        for f in GUEST_EXCLUDED_SQL_FUNCTIONS {
+            assert!(is_allowed_sql_function(f), "{f} must be on the allow list");
+            assert!(!is_allowed_guest_sql_function(f), "{f}");
+            let upper = f.to_ascii_uppercase();
+            assert!(!is_allowed_guest_sql_function(&upper), "{upper}");
+            let qualified = format!("pg_catalog.{f}");
+            assert!(!is_allowed_guest_sql_function(&qualified), "{qualified}");
+        }
+        assert!(GUEST_EXCLUDED_SQL_FUNCTIONS.windows(2).all(|w| w[0] < w[1]));
+        for f in ["lower", "count", "pg_catalog.lower", "string_agg"] {
+            assert!(is_allowed_guest_sql_function(f), "{f}");
+        }
+        for f in ["public.lower", "pg_sleep", "\"lower\""] {
+            assert!(!is_allowed_guest_sql_function(f), "{f}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod disallowed_sql_function_tests {
     use super::{is_disallowed_sql_function, DISALLOWED_SQL_FUNCTIONS};

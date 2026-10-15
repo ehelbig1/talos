@@ -364,14 +364,20 @@ impl PlaidConnectService {
     /// [`RemovalAt::HereOnly`].
     pub async fn remove_item(&self, user_id: Uuid, item_id: &str) -> anyhow::Result<()> {
         let path = access_token_path(item_id).map_err(|e| anyhow::anyhow!(e))?;
-        let row_environment: Option<String> = match sqlx::query_scalar::<_, String>(
-            "SELECT environment FROM plaid_items WHERE user_id = $1 AND item_id = $2",
-        )
-        .bind(user_id)
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        {
+        // In the user's own scope (security review 2026-10-14, D-1).
+        let read = async {
+            let mut tx = talos_db::begin_user_scoped(&self.pool, user_id).await?;
+            let env = sqlx::query_scalar::<_, String>(
+                "SELECT environment FROM plaid_items WHERE user_id = $1 AND item_id = $2",
+            )
+            .bind(user_id)
+            .bind(item_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            anyhow::Ok(env)
+        };
+        let row_environment: Option<String> = match read.await {
             Ok(env) => env,
             Err(e) => {
                 tracing::warn!(target: "talos_plaid", %user_id, error = %e, "could not read the connection's environment; asking Plaid to remove it");

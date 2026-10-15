@@ -42,6 +42,7 @@ fn verdict(sql: &str, allowed: &[String], policy: EmptyAllowlistPolicy) -> Strin
         Err(SqlValidationError::AlwaysBlocked(what)) => format!("blocked({what})"),
         Err(SqlValidationError::UnknownStatement) => "unknown".to_string(),
         Err(SqlValidationError::DisallowedFunction(what)) => format!("function({what})"),
+        Err(SqlValidationError::NonPublicRelation(what)) => format!("relation({what})"),
     }
 }
 

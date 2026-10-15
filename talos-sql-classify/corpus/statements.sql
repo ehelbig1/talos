@@ -491,3 +491,14 @@ SELECT * FROM "API_KEYS"
 SELECT lower(name), count(*) FROM public.t WHERE created_at > now() - interval '1 day' GROUP BY 1
 SELECT date_trunc('hour', created_at) AS h, avg(duration_ms) FROM t GROUP BY 1 ORDER BY 1
 SELECT id, payload->>'kind' AS kind, jsonb_array_length(payload->'items') FROM t LIMIT 10
+# 2026-10-14 security review D-3: functions that build a value or a set whose size the caller chooses
+SELECT repeat('x', 1073741823) FROM generate_series(1, 1000)
+SELECT lpad('x', 100000, 'y') AS padded
+SELECT rpad(name, 100000) FROM t
+SELECT * FROM generate_subscripts(ARRAY[1, 2, 3], 1)
+# 2026-10-14 security review D-4: catalog and information_schema reads
+SELECT relname, reltuples FROM pg_catalog.pg_class
+SELECT * FROM information_schema.columns
+SELECT * FROM pg_stat_user_tables
+SELECT * FROM public.pg_roles
+SELECT t.id FROM t JOIN information_schema.tables it ON it.table_name = t.name

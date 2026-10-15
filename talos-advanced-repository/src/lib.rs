@@ -4262,6 +4262,35 @@ impl AdvancedRepository {
     ///
     /// See `docs/engineering-log/packages/2026-10-08-query-paginated-admin-read-role.md`
     /// and `docs/engineering-log/packages/2026-10-09-query-paginated-own-login.md`.
+    /// Record one `query_paginated` run in `admin_event_log`: who ran it, the
+    /// SHA-256 of the statement (never its text, which can carry literals),
+    /// the page and how many rows it returned (security review 2026-10-14,
+    /// D-5). The caller returns no rows when this fails: a cross-tenant read
+    /// that cannot be recorded is not handed out.
+    pub async fn record_admin_query(
+        &self,
+        user_id: Uuid,
+        statement: &str,
+        page: i64,
+        row_count: usize,
+    ) -> anyhow::Result<()> {
+        let statement_sha256 = talos_text_util::sha256_hex(statement);
+        talos_admin_event_log::insert(
+            &self.db_pool,
+            Some(user_id),
+            "admin_query_paginated",
+            "query",
+            None,
+            &format!("query_paginated returned {row_count} row(s)"),
+            Some(&serde_json::json!({
+                "statement_sha256": statement_sha256,
+                "page": page,
+                "row_count": row_count,
+            })),
+        )
+        .await
+    }
+
     pub async fn execute_paginated_select(
         &self,
         validated_base_query: &str,
