@@ -218,8 +218,64 @@ pub(crate) const MAX_SECRET_ACCESSES_PER_EXECUTION: u64 = 100;
 /// typical 4 chars/token), so 64 KiB covers worst-case multi-byte
 /// UTF-8 input that still falls within the model's token window.
 pub(crate) const MAX_EMBEDDING_TEXT_BYTES: usize = 65_536;
-/// Maximum bytes writable to the sandbox per execution (1 GiB).
-pub(crate) const MAX_FS_BYTES_PER_EXECUTION: u64 = 1_073_741_824;
+/// Maximum bytes writable to the sandbox per execution (64 MiB; 1 GiB until
+/// 2026-10-14 — with 100 concurrent jobs that was 100 GiB of a worker's tmp,
+/// security review E-8). The same as the largest file `files::read` returns.
+pub(crate) const MAX_FS_BYTES_PER_EXECUTION: u64 = 64 * 1024 * 1024;
+/// Maximum bytes every live sandbox of this worker process may hold together
+/// (768 MiB): the chart sizes the worker's `/tmp` at 1 GiB, and a write that
+/// would take the process past this is refused like one over the
+/// per-execution cap. Released when an execution's context (and its
+/// tempdir) is dropped.
+pub(crate) const MAX_FS_BYTES_PER_PROCESS: u64 = 768 * 1024 * 1024;
+/// Bytes the live sandboxes of this process hold, against
+/// [`MAX_FS_BYTES_PER_PROCESS`].
+pub(crate) static PROCESS_FS_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reserve `bytes` against the process-wide sandbox budget; `false` (nothing
+/// reserved) when it would go over.
+pub(crate) fn reserve_process_fs_bytes(bytes: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    PROCESS_FS_BYTES
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            process_fs_admits(held, bytes)
+        })
+        .is_ok()
+}
+
+/// The budget's new total when `bytes` more fit beside `held`.
+pub(crate) fn process_fs_admits(held: u64, bytes: u64) -> Option<u64> {
+    let projected = held.saturating_add(bytes);
+    (projected <= MAX_FS_BYTES_PER_PROCESS).then_some(projected)
+}
+
+#[cfg(test)]
+mod process_fs_budget_tests {
+    use super::*;
+
+    /// E-8 (2026-10-14): the process holds at most its budget, a write that
+    /// exactly fills it is admitted, and the per-execution cap sits below it.
+    #[test]
+    fn the_process_budget_admits_up_to_its_limit() {
+        assert_eq!(
+            process_fs_admits(0, MAX_FS_BYTES_PER_PROCESS),
+            Some(MAX_FS_BYTES_PER_PROCESS)
+        );
+        assert_eq!(process_fs_admits(MAX_FS_BYTES_PER_PROCESS, 1), None);
+        assert_eq!(process_fs_admits(u64::MAX, 1), None);
+        assert_eq!(process_fs_admits(10, 5), Some(15));
+        const { assert!(MAX_FS_BYTES_PER_EXECUTION < MAX_FS_BYTES_PER_PROCESS) };
+    }
+}
+
+/// Return `bytes` to the process-wide sandbox budget.
+pub(crate) fn release_process_fs_bytes(bytes: u64) {
+    use std::sync::atomic::Ordering;
+    let _ = PROCESS_FS_BYTES.try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+        Some(held.saturating_sub(bytes))
+    });
+}
 /// Maximum log messages per execution (prevents NATS flooding).
 pub(crate) const MAX_LOG_MESSAGES_PER_EXECUTION: u64 = 10_000;
 /// Maximum Tier-2 secret exposures per user per day (global limit across all executions).

@@ -1439,14 +1439,20 @@ impl ModuleRepository {
         Ok(rows)
     }
 
-    /// Unscoped batch fetch of full module details by id. Backs the GraphQL
-    /// `ModuleLoader` DataLoader, which is only invoked via ComplexObject
-    /// resolvers (e.g. WebhookTrigger.module) where the parent entity has
-    /// already been scoped to the authenticated user; modules may also be
-    /// referenced across users via `workflow_module_refs`, so deliberately
-    /// NO user_id filter here. Do not call from a surface that hasn't
-    /// pre-scoped the ids.
-    pub async fn get_modules_by_ids(&self, ids: &[Uuid]) -> Result<Vec<ModuleDetailsRow>> {
+    /// Batch-fetch full module details by id, for a READER: the modules the
+    /// user owns, those of the orgs they belong to NOW, and catalog rows (no
+    /// owner, no org). Backs the GraphQL `ModuleLoader` (`WebhookTrigger.module`,
+    /// `ModuleExecution.module`). Until 2026-10-14 that loader read by id alone,
+    /// on the strength of its parent being the user's — but a module execution
+    /// is the user's long after the module stops being shared with them, and it
+    /// resolved the module's CURRENT source and config (security review A-10 /
+    /// D-9).
+    pub async fn get_modules_by_ids_for_reader(
+        &self,
+        ids: &[Uuid],
+        user_id: Uuid,
+        org_ids: &[Uuid],
+    ) -> Result<Vec<ModuleDetailsRow>> {
         let rows = sqlx::query_as::<_, ModuleDetailsRow>(
             "SELECT id, name,
                     COALESCE(size_bytes, 0) AS size_bytes,
@@ -1454,9 +1460,12 @@ impl ModuleRepository {
                     COALESCE(compiled_at, created_at) AS compiled_at,
                     config, config_schema, catalog_slug, source_code, capability_world, imported_interfaces, language
              FROM modules
-             WHERE id = ANY($1)",
+             WHERE id = ANY($1)
+               AND (user_id = $2 OR org_id = ANY($3) OR (user_id IS NULL AND org_id IS NULL))",
         )
         .bind(ids)
+        .bind(user_id)
+        .bind(org_ids)
         .fetch_all(&self.db_pool)
         .await?;
         Ok(rows)

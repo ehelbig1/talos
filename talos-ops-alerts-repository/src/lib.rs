@@ -261,6 +261,21 @@ impl OpsAlertRepository {
         Ok(talos_ops_alert_store::resolve_by_dedup_key(&self.db_pool, user_id, dedup_key).await?)
     }
 
+    /// Resolve the active alert under `dedup_key` only when `source`
+    /// raised it — the reporter's resolve signal
+    /// ([`talos_ops_alert_store::resolve_signal`]).
+    pub async fn resolve_signal(
+        &self,
+        user_id: Uuid,
+        source: &str,
+        dedup_key: &str,
+    ) -> Result<bool> {
+        Ok(
+            talos_ops_alert_store::resolve_signal(&self.db_pool, user_id, source, dedup_key)
+                .await?,
+        )
+    }
+
     /// Resolve EVERY active alert whose dedup key starts with `prefix`
     /// — the self-monitoring success signal ([`self_monitor`]): one
     /// green unattended run closes all of that workflow's open

@@ -247,6 +247,44 @@ where
     Ok(res.rows_affected() > 0)
 }
 
+/// Resolve the ACTIVE alert `user_id` holds under `dedup_key` ONLY when it
+/// was raised by `source` (security review 2026-10-14, G-27).
+///
+/// The resolve a reporter signals — a module's `__ops_alert__` recovery
+/// entry, the MCP `report_ops_alert` tool — goes through here, not through
+/// [`resolve_by_dedup_key`]: a dedup key is unique only per user, so a
+/// key-only resolve let any module a user runs close (silence) an alert a
+/// sibling workflow raised. An ingest never changes a row's `source`, so a
+/// reporter can resolve exactly what it raised. `source` is normalised as
+/// [`sanitize`] stores it. Returns whether a row moved.
+pub async fn resolve_signal<'e, E>(
+    executor: E,
+    user_id: Uuid,
+    source: &str,
+    dedup_key: &str,
+) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let source = truncate_chars(source, MAX_SOURCE_CHARS);
+    let dedup_key = truncate_chars(dedup_key, MAX_KEY_CHARS);
+    if source.is_empty() || dedup_key.is_empty() {
+        return Ok(false);
+    }
+    let res = sqlx::query(
+        "UPDATE ops_alerts \
+         SET status = 'resolved', resolved_at = NOW(), resolved_source = 'signal' \
+         WHERE user_id = $1 AND source = $2 AND dedup_key = $3 \
+           AND status IN ('new','acked')",
+    )
+    .bind(user_id)
+    .bind(&source)
+    .bind(&dedup_key)
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// The `(user_id, org_id)` an actor's rows are scoped to, or `None` when no
 /// such actor exists. The one home for this read (package CD):
 /// `ActorRepository::get_actor_tenancy` delegates here.

@@ -1093,7 +1093,12 @@ type MutationRoot {
 	updateMemberRole(orgId: UUID!, targetUserId: UUID!, role: String!): OrgMemberObj!
 	transferOwnership(orgId: UUID!, newOwnerId: UUID!): OrganizationObj!
 	setConcurrencyLimit(workflowId: UUID!, maxConcurrent: Int): Boolean!
-	updateResourceQuotas(input: UpdateResourceQuotasInput!): ResourceQuota!
+	updateResourceQuotas(		input: UpdateResourceQuotasInput!,
+		"""
+		The organization to set quotas for (you must be an Admin of it). Omitted: your personal organization.
+		"""
+		orgId: UUID
+	): ResourceQuota!
 	"""
 	Grant a capability ceiling to a user. Cross-user grants require
 	the designated `users.is_platform_admin` flag (M T6-1) — NOT
@@ -1553,7 +1558,12 @@ type QueryRoot {
 	least one verified chain.
 	"""
 	verifyAuditChain(executionId: UUID!): AuditChainVerification!
-	resourceQuotas: ResourceQuota!
+	resourceQuotas(
+		"""
+		The organization to read quotas for (you must be a member). Omitted: your personal organization.
+		"""
+		orgId: UUID
+	): ResourceQuota!
 	serviceIntegrations: [ServiceIntegration!]!
 	secrets(pagination: PaginationInput): [Secret!]!
 	secret(keyPath: String!): Secret!

@@ -85,8 +85,10 @@ pub fn output_has_envelope(output: &JsonValue) -> bool {
 pub enum EntryAction {
     /// Create-or-bump the rolling alert (the default entry shape).
     Ingest,
-    /// Source-signaled recovery: resolve the alert with this dedup key.
-    Resolve { dedup_key: String },
+    /// Source-signaled recovery: resolve the alert with this dedup key
+    /// that this source raised. `source` is DLP-redacted as an ingest
+    /// stores it, so it matches the row the same entry shape created.
+    Resolve { source: String, dedup_key: String },
     /// `status_event` present but not a recognized value — skip the
     /// entry (fail-safe: a typo must not turn a recovery into a bump).
     SkipUnknownStatusEvent { status_event: String },
@@ -125,11 +127,8 @@ pub fn classify_entry(entry: &JsonValue) -> EntryAction {
     match entry.get("status_event").and_then(JsonValue::as_str) {
         None => EntryAction::Ingest,
         Some("resolved") => EntryAction::Resolve {
-            dedup_key: entry
-                .get("dedup_key")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            source: talos_dlp_provider::redact_str(source),
+            dedup_key: dedup_key.to_string(),
         },
         Some(other) => EntryAction::SkipUnknownStatusEvent {
             status_event: other.to_string(),
@@ -252,8 +251,12 @@ pub async fn apply_entry(
         // A recovery signal must RESOLVE the rolling alert, never ingest
         // it: a plain ingest would bump the row (and reopen an
         // operator-resolved one) — the exact wrong reading.
-        EntryAction::Resolve { dedup_key } => {
-            match repo.resolve_by_dedup_key(user_id, &dedup_key).await {
+        // Only the source that raised an alert may resolve it: a dedup key
+        // is unique per user, not per source, and a key-only resolve let
+        // one module silence another workflow's alert (security review
+        // 2026-10-14, G-27).
+        EntryAction::Resolve { source, dedup_key } => {
+            match repo.resolve_signal(user_id, &source, &dedup_key).await {
                 Ok(true) => Ok(EntryOutcome::Resolved),
                 Ok(false) => Ok(EntryOutcome::NoActiveAlert),
                 Err(e) => Err(EntryRefusal::Resolve(e)),
@@ -466,8 +469,13 @@ mod tests {
             EntryAction::Ingest
         );
         assert_eq!(
-            classify_entry(&json!({"dedup_key": "gcpmon|p|r", "status_event": "resolved"})),
+            classify_entry(&json!({
+                "source": "gcp-monitoring",
+                "dedup_key": "gcpmon|p|r",
+                "status_event": "resolved"
+            })),
             EntryAction::Resolve {
+                source: "gcp-monitoring".into(),
                 dedup_key: "gcpmon|p|r".into()
             }
         );
@@ -480,11 +488,13 @@ mod tests {
                 status_event: "closed".into()
             }
         );
-        // Resolve with a missing dedup_key classifies as Resolve with an
-        // empty key; the repo layer no-ops on empty keys.
+        // Resolve with a missing dedup_key or source classifies as Resolve
+        // with an empty one; the store no-ops on either being empty, so a
+        // resolve that names no source resolves nothing.
         assert_eq!(
             classify_entry(&json!({"status_event": "resolved"})),
             EntryAction::Resolve {
+                source: String::new(),
                 dedup_key: String::new()
             }
         );

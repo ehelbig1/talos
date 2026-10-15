@@ -1684,8 +1684,8 @@ impl CompilationService {
         // (cleanup handled by outer compile_to_wasm_with_config)
         self.validate_wasm(&wasm_bytes)?;
 
-        // 6. Validate size (max 1MB)
-        if wasm_bytes.len() > 1_048_576 {
+        // 6. Validate size (max 1MB — `max_component_bytes(Rust)`)
+        if wasm_bytes.len() > max_component_bytes(ModuleLanguage::Rust) {
             bail!("Compiled WASM exceeds 1MB size limit");
         }
 
@@ -2709,6 +2709,7 @@ impl CompilationService {
         if wasm_bytes.len() < 8 || &wasm_bytes[..4] != b"\0asm" {
             bail!("JS compilation produced invalid WASM binary");
         }
+        check_interpreted_component(&wasm_bytes, ModuleLanguage::JavaScript, world)?;
         Ok(wasm_bytes)
     }
 
@@ -2810,8 +2811,52 @@ impl CompilationService {
         if wasm_bytes.len() < 8 || &wasm_bytes[..4] != b"\0asm" {
             bail!("Python compilation produced invalid WASM binary");
         }
+        check_interpreted_component(&wasm_bytes, ModuleLanguage::Python, world)?;
         Ok(wasm_bytes)
     }
+}
+
+/// The largest compiled component each language may produce (security review
+/// 2026-10-14, G-20). A Rust module is its own code (the 1 MiB the Rust path
+/// has always held); a JavaScript or Python component carries its language's
+/// whole runtime (StarlingMonkey, CPython), so its bound is that runtime plus
+/// headroom. Until then a JS or Python component was read with no size bound.
+#[must_use]
+pub fn max_component_bytes(language: ModuleLanguage) -> usize {
+    match language {
+        ModuleLanguage::Rust | ModuleLanguage::Go => 1_048_576,
+        ModuleLanguage::JavaScript | ModuleLanguage::TypeScript => 32 * 1024 * 1024,
+        ModuleLanguage::Python => 64 * 1024 * 1024,
+    }
+}
+
+/// A JavaScript or Python component as the Rust path holds one: within its
+/// language's size bound ([`max_component_bytes`]), and importing nothing the
+/// requested `world` does not permit (G-20 — until then such a component was
+/// never inspected; the toolchain is told the world, and this checks what it
+/// produced).
+fn check_interpreted_component(
+    wasm_bytes: &[u8],
+    language: ModuleLanguage,
+    world: &str,
+) -> Result<()> {
+    let max = max_component_bytes(language);
+    if wasm_bytes.len() > max {
+        bail!(
+            "Compiled component is {} bytes, over the {max}-byte limit for this language",
+            wasm_bytes.len()
+        );
+    }
+    let detected = talos_wit_inspector::inspect_component(wasm_bytes)
+        .capability_world
+        .to_string();
+    if !talos_capability_world::ceiling_permits(world, &detected) {
+        bail!(
+            "Compiled component imports the '{detected}' world, wider than the requested \
+             '{world}'"
+        );
+    }
+    Ok(())
 }
 
 /// Adapter appended to Python module source that doesn't define its own
@@ -4377,3 +4422,58 @@ mod reconcile_declared_world_tests {
 
 #[cfg(test)]
 mod compile_switch_tests;
+
+#[cfg(test)]
+mod interpreted_component_bound_tests {
+    use super::*;
+
+    /// G-20 (2026-10-14): a JS or Python component has a size bound, wider
+    /// than a Rust module's only by its embedded runtime, and one over it is
+    /// refused before inspection.
+    #[test]
+    fn an_interpreted_component_is_bounded() {
+        assert_eq!(max_component_bytes(ModuleLanguage::Rust), 1_048_576);
+        assert!(
+            max_component_bytes(ModuleLanguage::JavaScript)
+                < max_component_bytes(ModuleLanguage::Python)
+        );
+        let mut over = b"\0asm\x0d\0\x01\0".to_vec();
+        over.resize(max_component_bytes(ModuleLanguage::JavaScript) + 1, 0);
+        let err = check_interpreted_component(&over, ModuleLanguage::JavaScript, "minimal-node")
+            .unwrap_err();
+        assert!(err.to_string().contains("over the"), "{err}");
+    }
+
+    /// A component that imports a wider world than the one requested is
+    /// refused: the interpreted paths are inspected as the Rust path is
+    /// (security review 2026-10-14, G-20).
+    #[test]
+    fn an_interpreted_component_wider_than_its_world_is_refused() {
+        let name = b"talos:core/secrets";
+        let mut c = b"\0asm\x0d\0\x01\0".to_vec();
+        // Type section: one instance type with no declarations.
+        c.extend_from_slice(&[0x07, 0x03, 0x01, 0x42, 0x00]);
+        // Import section: `talos:core/secrets` as an instance of type 0.
+        let body_len = 3 + name.len() + 2;
+        c.extend_from_slice(&[0x0a, u8::try_from(body_len).unwrap(), 0x01, 0x00]);
+        c.push(u8::try_from(name.len()).unwrap());
+        c.extend_from_slice(name);
+        c.extend_from_slice(&[0x05, 0x00]);
+        assert_ne!(
+            talos_wit_inspector::inspect_component(&c)
+                .capability_world
+                .to_string(),
+            "unknown",
+            "the hand-built component must parse for this test to mean anything"
+        );
+        let err = check_interpreted_component(&c, ModuleLanguage::JavaScript, "minimal-node")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("wider than the requested"),
+            "{err}"
+        );
+        assert!(
+            check_interpreted_component(&c, ModuleLanguage::JavaScript, "automation-node").is_ok()
+        );
+    }
+}

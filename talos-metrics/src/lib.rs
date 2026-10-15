@@ -2765,7 +2765,8 @@ impl TalosMetrics {
             prometheus::Opts::new(
                 "talos_wasm_log_orphaned_total",
                 "WASM log lines discarded because they could not be routed to \
-                 any execution row. Labels: kind=no_execution_row|unparseable_id. \
+                 any execution row. Labels: kind=no_execution_row|unparseable_id|\
+                 subject_mismatch (the payload's execution_id is not its subject's). \
                  Non-zero means a dispatch path is minting execution ids without \
                  recording a row — those executions' logs are lost.",
             ),
@@ -2777,7 +2778,7 @@ impl TalosMetrics {
         // ABSENT and `increase(...[15m]) > 0` would have nothing to reference
         // until the first incident. Seeding at 0 also lets a dashboard show
         // "detector present and quiet" rather than "detector missing".
-        for kind in ["no_execution_row", "unparseable_id"] {
+        for kind in ["no_execution_row", "unparseable_id", "subject_mismatch"] {
             wasm_log_orphaned_total
                 .with_label_values(&[kind])
                 .inc_by(0.0);

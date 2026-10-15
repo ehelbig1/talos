@@ -217,6 +217,14 @@ pub fn run(input: String) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-11 (2026-10-14): an address with `user:password@` is refused.
+    #[test]
+    fn a_base_with_userinfo_is_refused() {
+        assert!(base_of("https://user:pw@example.test/").is_err());
+        assert!(base_of("https://user@example.test").is_err());
+        assert!(base_of("https://example.test").is_ok());
+    }
     use serde_json::{json, Value};
     use talos_module_testkit::host;
 

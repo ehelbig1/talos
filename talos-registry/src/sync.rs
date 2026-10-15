@@ -239,6 +239,13 @@ const INDEX_REPO: &str = "_index";
 /// traffic, short enough that operator updates land within minutes.
 const SYNC_INTERVAL: Duration = Duration::from_secs(300);
 
+/// The largest config blob a sync reads (security review 2026-10-14, G-27).
+/// An index config lists every template's name and tag and a template's
+/// config is its `talos.json`; both are kilobytes. Until this cap the blob
+/// was read whole into memory before its digest was compared, so a hostile
+/// publisher could make the controller buffer anything it served.
+pub(crate) const MAX_CONFIG_BLOB_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Deserialize)]
 struct IndexConfig {
     /// List of templates the operator has published. Each entry is fetched
@@ -545,14 +552,73 @@ async fn pull_config_by_digest(
     let image: manifest::OciImageManifest =
         serde_json::from_slice(&raw).context("Parse manifest as an OCI image manifest")?;
     let config_digest = parse_sha256_digest(&image.config.digest)?;
-    let mut config = Vec::new();
-    oci.pull_blob(pinned, &image.config, &mut config)
+    // The descriptor's declared size is refused first, and the bytes read are
+    // capped too, since a registry need not send what the descriptor says.
+    if usize::try_from(image.config.size).map_or(true, |n| n > MAX_CONFIG_BLOB_BYTES) {
+        anyhow::bail!(
+            "config blob declares {} bytes; the most a sync reads is {MAX_CONFIG_BLOB_BYTES}",
+            image.config.size
+        );
+    }
+    let mut sink = CappedSink::new(MAX_CONFIG_BLOB_BYTES);
+    oci.pull_blob(pinned, &image.config, &mut sink)
         .await
         .map_err(anyhow::Error::from)?;
+    let config = sink.into_inner();
     if !content_matches_digest(&config, config_digest) {
         anyhow::bail!("config blob does not hash to its manifest descriptor digest");
     }
     String::from_utf8(config).context("config blob is not UTF-8")
+}
+
+/// An in-memory writer that refuses a write past `cap` bytes.
+pub(crate) struct CappedSink {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl CappedSink {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            cap,
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+impl tokio::io::AsyncWrite for CappedSink {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.buf.len().saturating_add(data.len()) > self.cap {
+            return std::task::Poll::Ready(Err(std::io::Error::other(format!(
+                "blob exceeds {} bytes",
+                self.cap
+            ))));
+        }
+        self.buf.extend_from_slice(data);
+        std::task::Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 /// Pull the index artifact and parse its config blob into the template list.
@@ -1057,6 +1123,28 @@ mod one_catalog_writer_pin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config blob larger than the cap is refused as it is read, whatever
+    /// the descriptor declared (security review 2026-10-14, G-27).
+    #[test]
+    fn a_capped_sink_refuses_the_write_that_would_pass_its_cap() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::AsyncWrite;
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut sink = CappedSink::new(8);
+        assert!(matches!(
+            Pin::new(&mut sink).poll_write(&mut cx, b"12345678"),
+            Poll::Ready(Ok(8))
+        ));
+        assert!(matches!(
+            Pin::new(&mut sink).poll_write(&mut cx, b"9"),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(sink.into_inner(), b"12345678");
+        assert_eq!(MAX_CONFIG_BLOB_BYTES, 4 * 1024 * 1024);
+    }
 
     #[test]
     fn digest_parsing_accepts_only_sha256_hex() {

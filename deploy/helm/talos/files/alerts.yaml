@@ -979,11 +979,13 @@ groups:
       # the detector was a LOG LINE, and every alert in this file is
       # metric-based, so nothing could page on it. This is that alert.
       #
-      # `kind` is a closed set of two values, both emitted by
-      # controller/src/bootstrap/background.rs::handle_wasm_log_message:
+      # `kind` is a closed set of three values, all emitted by
+      # talos-wasm-log-relay::persist_log_message:
       #   no_execution_row — the id parsed but names neither a
       #                      workflow_executions nor a module_executions row.
       #   unparseable_id   — the published line carried no usable execution id.
+      #   subject_mismatch — the line's execution id is not the one its
+      #                      wasm.log.<id> subject names (2026-10-14, B-7).
       # Deliberately unfiltered here so a NEW kind (should one ever be added)
       # cannot slip past the alert by not matching a selector.
       #
@@ -1024,6 +1026,9 @@ groups:
             both.
             kind=unparseable_id: a publisher is emitting malformed
             execution_ids; grep event_kind="wasm_log_unparseable_execution_id".
+            kind=subject_mismatch: a publisher wrote a line naming another
+            execution than its subject — a forged line, or a worker bug; grep
+            event_kind="wasm_log_subject_mismatch".
 
       # ── module_executions start rows that never landed.
       # The upstream CAUSE of the orphan alert above, and independently a

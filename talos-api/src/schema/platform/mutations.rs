@@ -82,6 +82,11 @@ impl PlatformMutations {
         &self,
         ctx: &Context<'_>,
         input: UpdateResourceQuotasInput,
+        #[graphql(
+            desc = "The organization to set quotas for (you must be an Admin of it). \
+                          Omitted: your personal organization."
+        )]
+        org_id: Option<Uuid>,
     ) -> Result<ResourceQuota> {
         require_2fa(ctx)?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
@@ -91,18 +96,19 @@ impl PlatformMutations {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        // Find the organization owned by the user
-        let org_id =
-            talos_organizations::OrganizationService::first_org_id_owned_by(db_pool, user_id)
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "graphql: owned-org lookup failed");
-                    async_graphql::Error::new("Request could not be completed").extend_safe()
-                })?
-                .ok_or_else(|| {
-                    async_graphql::Error::new("No organization found to update quotas for")
-                        .extend_safe()
-                })?;
+        // The org the caller names (Admin of it), or their personal one
+        // (security review 2026-10-14, A-9).
+        let org_id = talos_organizations::OrganizationService::quota_org_for(
+            db_pool,
+            user_id,
+            org_id,
+            talos_organizations::OrgRole::Admin,
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "graphql: quota org refused or unreadable");
+            async_graphql::Error::new("Organization not found or access denied").extend_safe()
+        })?;
 
         let metrics = [
             ("cpu_cores", input.cpu_cores),

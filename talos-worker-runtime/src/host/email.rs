@@ -184,6 +184,16 @@ impl wit_email::Host for TalosContext {
             return Err(wit_email::Error::Sendfailed);
         }
 
+        // Dry run: answer the send here (security review 2026-10-14, G-27).
+        // Every gate above still ran, so a rehearsal refuses what a real run
+        // would refuse.
+        if self.dry_run {
+            tracing::info!("Dry-run: intercepted email send");
+            self.dry_run_ledger
+                .record(crate::dry_run::StubbedSurface::Email);
+            return Ok(());
+        }
+
         // Look up API credentials via SecretProvider first, then env vars.
         //
         // MCP-935 (2026-05-15): filter empty-string env values so a

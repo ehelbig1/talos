@@ -148,9 +148,13 @@ fn usable_base(s: &str) -> Result<String, String> {
         && s.starts_with("https://")
         && s.bytes().all(|b| b.is_ascii_graphic())
         && !s.contains('?')
-        && !s.contains('#');
+        && !s.contains('#')
+        // No `user:password@` in the authority (security review F-11).
+        && !host_of(s).contains('@');
     if !ok {
-        return Err("BASE_URL must be an https:// address with no query".to_string());
+        return Err(
+            "BASE_URL must be an https:// address with no query or credentials".to_string(),
+        );
     }
     Ok(s.trim_end_matches('/').to_string())
 }
@@ -337,6 +341,14 @@ pub fn run(input: String) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-11 (2026-10-14): an address with `user:password@` is refused.
+    #[test]
+    fn a_base_with_userinfo_is_refused() {
+        assert!(usable_base("https://user:pw@example.test/").is_err());
+        assert!(usable_base("https://user@example.test").is_err());
+        assert!(usable_base("https://example.test").is_ok());
+    }
     use serde_json::{json, Value};
     use talos_module_testkit::host;
 

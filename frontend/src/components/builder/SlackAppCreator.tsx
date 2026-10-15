@@ -19,14 +19,20 @@ interface SlackAppCreatorProps {
   onCancel: () => void;
 }
 
+// The app's credentials are stored in the vault by the controller and named
+// here by path; their values never reach the browser.
 interface SlackAppResponse {
   app_id: string;
   client_id: string;
-  client_secret: string;
-  signing_secret: string;
-  verification_token: string;
+  client_secret_path: string | null;
+  signing_secret_path: string | null;
+  verification_token_path: string | null;
   bot_user_id: string;
 }
+
+// A node config field reads a stored secret through a `vault://` reference.
+const vaultRef = (path: string | null): string =>
+  path ? `vault://${path}` : "";
 
 export function SlackAppCreator({
   webhookUrl,
@@ -105,9 +111,9 @@ export function SlackAppCreator({
       onAppCreated({
         appId: data.app_id,
         clientId: data.client_id,
-        clientSecret: data.client_secret,
-        signingSecret: data.signing_secret,
-        verificationToken: data.verification_token,
+        clientSecret: vaultRef(data.client_secret_path),
+        signingSecret: vaultRef(data.signing_secret_path),
+        verificationToken: vaultRef(data.verification_token_path),
         botUserId: data.bot_user_id,
       });
     } catch (err) {

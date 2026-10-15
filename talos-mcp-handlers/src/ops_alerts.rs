@@ -72,7 +72,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "report_ops_alert",
-            "description": "Raise or resolve an ops-alert for YOU (the calling user) — for an operator-side reporter such as a host script or an agent. Raising creates the alert, or bumps it when an alert with the same dedup_key exists (reopening it if it was resolved). Pass status_event: 'resolved' to resolve the active alert with that dedup_key. Same rules as the __ops_alert__ module envelope: the 'talos' source and 'talos/' dedup keys are reserved for the platform and refused; title, resource, external_id and raw are DLP-redacted before they are stored; an oversized raw is dropped. Returns what happened (created / bumped / reopened / resolved / no_active_alert); raw is never echoed.",
+            "description": "Raise or resolve an ops-alert for YOU (the calling user) — for an operator-side reporter such as a host script or an agent. Raising creates the alert, or bumps it when an alert with the same dedup_key exists (reopening it if it was resolved). Pass status_event: 'resolved' to resolve the active alert with that dedup_key that the same source raised; an alert another source raised is not touched. Same rules as the __ops_alert__ module envelope: the 'talos' source and 'talos/' dedup keys are reserved for the platform and refused; title, resource, external_id and raw are DLP-redacted before they are stored; an oversized raw is dropped. Returns what happened (created / bumped / reopened / resolved / no_active_alert); raw is never echoed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -83,7 +83,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "resource": { "type": "string", "description": "What the alert is about (a host, a service, a backup copy)." },
                     "external_id": { "type": "string", "description": "The reporter's own id for this occurrence, if any." },
                     "raw": { "type": "object", "description": "Structured detail stored with the alert (DLP-redacted, dropped above 64 KiB). Never echoed back." },
-                    "status_event": { "type": "string", "enum": ["resolved"], "description": "'resolved' resolves the active alert with this dedup_key instead of raising. Any other value is refused." }
+                    "status_event": { "type": "string", "enum": ["resolved"], "description": "'resolved' resolves the active alert with this dedup_key and source instead of raising. Any other value is refused." }
                 },
                 "required": ["source", "dedup_key"]
             }

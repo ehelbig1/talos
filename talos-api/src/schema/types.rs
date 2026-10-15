@@ -108,7 +108,15 @@ impl WebhookTrigger {
     async fn module(&self, ctx: &Context<'_>) -> Result<Option<WasmModule>> {
         if let Some(id) = self.module_id {
             let loader = ctx.data::<async_graphql::dataloader::DataLoader<ModuleLoader>>()?;
-            Ok(loader.load_one(id).await?)
+            let user_id = ctx.data_opt::<Uuid>().copied().ok_or_else(|| {
+                async_graphql::Error::new("Authentication required").extend_safe()
+            })?;
+            Ok(loader
+                .load_one(ModuleKey {
+                    user_id,
+                    module_id: id,
+                })
+                .await?)
         } else {
             Ok(None)
         }
@@ -566,58 +574,82 @@ pub struct UserAuditSettings {
 
 pub struct ModuleLoader(pub sqlx::Pool<sqlx::Postgres>);
 
-impl async_graphql::dataloader::Loader<Uuid> for ModuleLoader {
+/// A [`ModuleLoader`] key: the module, and the user asking for it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ModuleKey {
+    pub user_id: Uuid,
+    pub module_id: Uuid,
+}
+
+impl async_graphql::dataloader::Loader<ModuleKey> for ModuleLoader {
     type Value = WasmModule;
     type Error = std::sync::Arc<anyhow::Error>;
 
-    /// NOTE: This DataLoader is only invoked via ComplexObject resolvers (e.g.,
-    /// WebhookTrigger.module) where the parent entity has already been scoped to
-    /// the authenticated user. The module IDs passed here are therefore
-    /// pre-validated through user-scoped parent queries. Additionally, modules
-    /// may be referenced across users via the workflow_module_refs junction table,
-    /// so the repository method intentionally has no user_id filter.
+    /// Keyed by the reader (security review 2026-10-14, A-10 / D-9): a module
+    /// resolves only when the user may see it NOW — their own, an org they
+    /// belong to, or the catalog. A parent the user still holds (an old
+    /// execution of a module an org shared) no longer reaches the module's
+    /// current source. Grouped by user, one query per user, as
+    /// [`WorkflowNameLoader`] does.
     async fn load(
         &self,
-        keys: &[Uuid],
-    ) -> std::result::Result<std::collections::HashMap<Uuid, Self::Value>, Self::Error> {
-        // Phase 5.1: unified `modules` table; bare-pool read preserved
-        // (the loader's own pool backs the per-call repository).
+        keys: &[ModuleKey],
+    ) -> std::result::Result<std::collections::HashMap<ModuleKey, Self::Value>, Self::Error> {
         let repo = talos_module_repository::ModuleRepository::new(self.0.clone());
-        // allow-bare-pool-read: batch loader keyed by module ids that every
-        // consumer (`WebhookTrigger.module`, `ModuleExecution.module`) has
-        // already resolved through a user-scoped parent read; modules are
-        // also legitimately referenced across users via
-        // `workflow_module_refs`, so the unscoped twin is the documented
-        // choice here (see the doc comment above), not a missed `_scoped`.
-        let modules = repo
-            .get_modules_by_ids(keys)
-            .await
-            .map_err(std::sync::Arc::new)?;
-
-        let mut map = std::collections::HashMap::new();
-        for m in modules {
-            let wm = WasmModule {
-                id: m.id,
-                name: m.name,
-                size_bytes: m.size_bytes,
-                content_hash: m.content_hash,
-                compiled_at: m.compiled_at.to_rfc3339(),
-                config: m
-                    .config
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "{}".to_string()),
-                config_schema: m.config_schema.map(|c| c.to_string()),
-                catalog_slug: m.catalog_slug,
-                source_code: m.source_code,
-                capability_world: m.capability_world,
-                imported_interfaces: m.imported_interfaces,
-                language: m.language,
-            };
-            map.insert(m.id, wm);
+        let mut by_user: std::collections::HashMap<Uuid, Vec<Uuid>> =
+            std::collections::HashMap::new();
+        for key in keys {
+            by_user.entry(key.user_id).or_default().push(key.module_id);
         }
-
-        Ok(map)
+        let mut out = std::collections::HashMap::new();
+        for (user_id, module_ids) in by_user {
+            let org_ids =
+                talos_organizations::OrganizationService::list_user_org_ids(&self.0, user_id)
+                    .await
+                    .map_err(std::sync::Arc::new)?;
+            let modules = repo
+                .get_modules_by_ids_for_reader(&module_ids, user_id, &org_ids)
+                .await
+                .map_err(std::sync::Arc::new)?;
+            for (id, module) in module_map(modules) {
+                out.insert(
+                    ModuleKey {
+                        user_id,
+                        module_id: id,
+                    },
+                    module,
+                );
+            }
+        }
+        Ok(out)
     }
+}
+
+fn module_map(
+    modules: Vec<talos_module_repository::ModuleDetailsRow>,
+) -> std::collections::HashMap<Uuid, WasmModule> {
+    let mut map = std::collections::HashMap::new();
+    for m in modules {
+        let wm = WasmModule {
+            id: m.id,
+            name: m.name,
+            size_bytes: m.size_bytes,
+            content_hash: m.content_hash,
+            compiled_at: m.compiled_at.to_rfc3339(),
+            config: m
+                .config
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "{}".to_string()),
+            config_schema: m.config_schema.map(|c| c.to_string()),
+            catalog_slug: m.catalog_slug,
+            source_code: m.source_code,
+            capability_world: m.capability_world,
+            imported_interfaces: m.imported_interfaces,
+            language: m.language,
+        };
+        map.insert(m.id, wm);
+    }
+    map
 }
 
 pub struct ModuleExecutionLogLoader(
@@ -1177,7 +1209,16 @@ pub struct ModuleExecution {
 impl ModuleExecution {
     async fn module(&self, ctx: &Context<'_>) -> Result<Option<WasmModule>> {
         let loader = ctx.data::<async_graphql::dataloader::DataLoader<ModuleLoader>>()?;
-        Ok(loader.load_one(self.module_id).await?)
+        let user_id = ctx
+            .data_opt::<Uuid>()
+            .copied()
+            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+        Ok(loader
+            .load_one(ModuleKey {
+                user_id,
+                module_id: self.module_id,
+            })
+            .await?)
     }
 
     async fn logs(&self, ctx: &Context<'_>) -> Result<Vec<ModuleExecutionLog>> {

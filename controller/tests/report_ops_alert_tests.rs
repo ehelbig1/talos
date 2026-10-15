@@ -260,6 +260,34 @@ async fn a_resolve_reaches_only_the_callers_own_alert() {
     assert_eq!(alert_count(&pool, other).await, 0);
 }
 
+/// A dedup key is unique per user, not per source, so a resolve that named
+/// only the key let any module the user runs close an alert a sibling
+/// workflow raised (security review 2026-10-14, G-27). A resolve now reaches
+/// only the alert its own source raised; the `__ops_alert__` envelope goes
+/// through the same `apply_entry`.
+#[tokio::test]
+async fn a_resolve_reaches_only_the_alert_its_own_source_raised() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let user = create_test_user(&ctx.auth_service, "report-ops-source@example.com").await;
+    let state = mcp_state(pool.clone()).await;
+
+    assert_eq!(report(&state, user, raise()).await["result"], "created");
+    assert_eq!(
+        report(
+            &state,
+            user,
+            json!({"source": "another-module", "dedup_key": KEY, "status_event": "resolved"}),
+        )
+        .await["result"],
+        "no_active_alert",
+        "a resolve from another source must not close this alert"
+    );
+    assert_eq!(rows(&pool, KEY).await[0].status, "new");
+    assert_eq!(report(&state, user, resolve()).await["result"], "resolved");
+    assert_eq!(rows(&pool, KEY).await[0].status, "resolved");
+}
+
 #[tokio::test]
 async fn invalid_arguments_write_nothing() {
     let ctx = setup_test_context().await;

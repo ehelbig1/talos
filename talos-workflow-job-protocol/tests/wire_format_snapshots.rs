@@ -71,9 +71,13 @@ fn deterministic_job_request() -> JobRequest {
         workflow_execution_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0002),
         module_uri: "redis:wasm:00000000-0000-0000-0000-000000000003".into(),
         input_payload: json!({"key": "value"}).into(),
+        // An EMPTY nonce since 2026-10-14 (B-10): a non-empty one appends the
+        // `:sn=` segment, so the fixture keeps pinning the bytes every earlier
+        // snapshot pinned; `job_request_non_default_secret_nonce_snapshot`
+        // pins the segment.
         encrypted_secrets: EncryptedSecrets {
             ciphertext: vec![0xAA, 0xBB, 0xCC],
-            nonce: vec![0x01; 12],
+            nonce: Vec::new(),
         },
         timeout_ms: 30_000,
         priority: 100,
@@ -232,6 +236,12 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
         use std::fmt::Write as _;
         let _ = write!(payload, ":fuel={}", req.max_fuel);
     }
+    // The secret envelope's nonce, after `:fuel=`, only when there is one
+    // (2026-10-14, B-10).
+    if !req.encrypted_secrets.nonce.is_empty() {
+        use std::fmt::Write as _;
+        let _ = write!(payload, ":sn={}", hex::encode(&req.encrypted_secrets.nonce));
+    }
     let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key).unwrap();
     mac.update(payload.as_bytes());
     req.signature = mac.finalize().into_bytes().to_vec();
@@ -262,7 +272,7 @@ fn job_request_json_snapshot() {
     // the ALL-DEFAULT bytes. Only the `"max_fuel"` value changed here — the
     // `signature` bytes are IDENTICAL to the previous snapshot, which is the
     // proof that a zero fuel appends nothing to the signed payload.
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[148,43,32,127,38,9,195,99,190,123,65,37,13,194,131,37,142,141,251,4,22,121,109,44,38,100,86,186,141,95,191,50],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":0,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0}"#;
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[148,43,32,127,38,9,195,99,190,123,65,37,13,194,131,37,142,141,251,4,22,121,109,44,38,100,86,186,141,95,191,50],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":0,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0}"#;
     assert_eq!(
         actual, expected,
         "JobRequest wire format drifted — see test docstring for resolution"
@@ -598,7 +608,7 @@ fn job_request_non_default_dispatch_attempt_snapshot() {
     sign_request_with_fixed_nonce(&mut req, &TEST_KEY);
 
     let actual = serde_json::to_string(&req).expect("serialize");
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[51,236,184,92,40,199,215,64,6,179,242,133,80,245,10,251,18,139,219,146,210,207,94,31,66,205,156,78,176,120,25,34],"job_nonce":"0:0000000000000000000000000000000a","expected_wasm_hash":"deadbeef","max_fuel":0,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0,"dispatch_attempt":2}"#;
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[51,236,184,92,40,199,215,64,6,179,242,133,80,245,10,251,18,139,219,146,210,207,94,31,66,205,156,78,176,120,25,34],"job_nonce":"0:0000000000000000000000000000000a","expected_wasm_hash":"deadbeef","max_fuel":0,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0,"dispatch_attempt":2}"#;
     assert_eq!(
         actual, expected,
         "JobRequest wire format drifted for a re-dispatched job — see the module docstring"
@@ -742,7 +752,7 @@ fn job_request_non_default_max_fuel_snapshot() {
     sign_request_with_fixed_nonce(&mut req, &TEST_KEY);
 
     let actual = serde_json::to_string(&req).expect("serialize");
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[142,159,68,155,1,42,13,77,249,250,205,103,112,249,124,169,127,228,133,25,99,153,90,105,87,44,80,34,79,244,131,38],"job_nonce":"0:0000000000000000000000000000000f","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0}"#;
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[142,159,68,155,1,42,13,77,249,250,205,103,112,249,124,169,127,228,133,25,99,153,90,105,87,44,80,34,79,244,131,38],"job_nonce":"0:0000000000000000000000000000000f","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0}"#;
     assert_eq!(
         actual, expected,
         "JobRequest wire format drifted for a fuel-carrying job — see the module docstring"
@@ -900,4 +910,36 @@ fn stripping_or_flipping_the_verb_override_fails_verification() {
     sign_request_with_fixed_nonce(&mut ok, &TEST_KEY);
     ok.verify(&TEST_KEY, u64::MAX)
         .expect("the unmodified message must still verify");
+}
+
+/// B-10 (2026-10-14): the secret envelope's nonce is signed. A job with an
+/// envelope appends `:sn=<hex nonce>` after every other segment; flipping the
+/// nonce fails VERIFICATION, not decryption. A job with no envelope appends
+/// nothing — every snapshot above pins those bytes unchanged.
+#[test]
+fn job_request_non_default_secret_nonce_snapshot() {
+    let mut req = deterministic_job_request();
+    req.encrypted_secrets.nonce = vec![0x01; 12];
+    // Its own job nonce: `verify()` records one in the process-wide replay
+    // cache, which the base snapshot's nonce is already in.
+    req.job_nonce = "0:00000000000000000000000000000031".into();
+    sign_request_with_fixed_nonce(&mut req, &TEST_KEY);
+    req.verify(&TEST_KEY, u64::MAX)
+        .expect("hand-rolled signature must verify against production verify()");
+    let actual_hex = hex::encode(&req.signature);
+    let expected_hex = "578fe511ece584d7522b4494828d4074d4e7d900d94e35f46a94439fdd3adbe2";
+    assert_eq!(actual_hex, expected_hex, "the `:sn=` segment drifted");
+
+    let mut flipped = req.clone();
+    flipped.encrypted_secrets.nonce[0] ^= 0xFF;
+    assert!(
+        flipped.verify(&TEST_KEY, u64::MAX).is_err(),
+        "a flipped nonce fails the signature"
+    );
+    let mut stripped = req.clone();
+    stripped.encrypted_secrets.nonce.clear();
+    assert!(
+        stripped.verify(&TEST_KEY, u64::MAX).is_err(),
+        "a stripped nonce fails the signature"
+    );
 }

@@ -173,3 +173,26 @@ async fn precheck_runs_on_seeded_resume_path_too() {
         .expect_err("must fail at the precheck");
     assert!(matches!(err, WorkflowEngineError::ModuleFetcherMissing));
 }
+
+/// `__trigger__` is the engine's synthetic root. A node the author gave that
+/// id was adopted as the trigger and never ran; the load refuses it
+/// (security review 2026-10-14, G-27).
+#[tokio::test]
+async fn a_node_with_the_trigger_id_is_refused_at_load() {
+    let module = Uuid::new_v4();
+    let graph = WorkflowGraphBuilder::new()
+        .add_module("__trigger__", module, None)
+        .add_module("after", module, None)
+        .edge("__trigger__", "after")
+        .build()
+        .expect("graph builds");
+    let mut engine = minimal_engine();
+    let err = engine
+        .load_graph_from_json(&serde_json::to_string(&graph).unwrap())
+        .await
+        .expect_err("a node with the reserved trigger id must not load");
+    assert!(
+        matches!(&err, WorkflowEngineError::LoadGraph(m) if m.contains("__trigger__")),
+        "{err:?}"
+    );
+}

@@ -334,6 +334,22 @@ impl ParallelWorkflowEngine {
             )));
         }
 
+        // `__trigger__` is the engine's own synthetic root: a node the author
+        // gave that id was adopted as the trigger by
+        // `ensure_trigger_node_wired_to_roots` and never ran (security review
+        // 2026-10-14, G-27). Refused at load, as a graph the author did not
+        // mean.
+        if nodes.iter().any(|n| {
+            n.get("id").and_then(JsonValue::as_str)
+                == Some(talos_workflow_engine_core::reserved_keys::TRIGGER)
+        }) {
+            return Err(crate::WorkflowEngineError::load_graph(format!(
+                "A node may not have the id `{}`: it is reserved for the run's trigger input. \
+                 Rename the node.",
+                talos_workflow_engine_core::reserved_keys::TRIGGER
+            )));
+        }
+
         if let Some(timeout) = graph
             .get("execution_timeout_secs")
             .and_then(JsonValue::as_u64)

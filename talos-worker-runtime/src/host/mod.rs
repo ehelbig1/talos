@@ -93,7 +93,7 @@ mod graphql;
 mod http;
 mod http_stream;
 mod integration_state;
-mod limits;
+pub(crate) mod limits;
 /// Byte-level SSE line reader shared by the two streaming readers.
 mod line_reader;
 mod llm;

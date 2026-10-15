@@ -18,7 +18,9 @@ How to register a GitHub App and wire it into Talos for the connect/install flow
 > and the 1-hour installation-token cache (`InstallationTokenCache`) are
 > implemented + unit tested. (A never-called App webhook signature verifier was
 > deleted 2026-09-26; a receiver should reuse the Phase-A GitHub verifier in
-> `talos_webhooks::signature` against `GithubAppConfig::webhook_secret`.) **Not yet wired:** the GitHub *modules* don't consume installation
+> `talos_webhooks::signature`, and bring back a webhook-secret setting with it
+> — the `GITHUB_APP_WEBHOOK_SECRET` setting had no reader and was removed on
+> 2026-10-14.) **Not yet wired:** the GitHub *modules* don't consume installation
 > tokens yet (B4), there's no App-webhook *receiver* endpoint yet (B5-wiring),
 > and there's no frontend "Connect GitHub" button yet. So today you can validate
 > credentials + the connect flow; outbound module auth and inbound App webhooks
@@ -39,7 +41,7 @@ GitHub → **Settings → Developer settings → GitHub Apps → New GitHub App*
 | **Request user authorization (OAuth) during installation** | ❌ **leave UNCHECKED** — when checked, GitHub sends the post-install redirect to the Callback URL instead of the Setup URL, skipping the step that starts Talos's own (state-bound, PKCE) authorization |
 | **Redirect on update** | ✅ enabled |
 | **Webhook → Active** | ❌ **disabled for now** — the App-webhook receiver isn't built yet (B5-wiring). Enable it later. |
-| **Webhook secret** | set a random string anyway (used once B5-wiring lands; Talos reads it as `GITHUB_APP_WEBHOOK_SECRET`) |
+| **Webhook secret** | leave empty — Talos has no App-webhook receiver and reads no webhook secret |
 | **Repository permissions** | start minimal, e.g. **Contents: Read-only**, **Pull requests: Read-only** |
 | **Where can this be installed?** | "Only on this account" for a test App |
 
@@ -76,7 +78,6 @@ the App is registered correctly and the cryptographic/API core works.
 # bash — $(cat ...) preserves the PEM's newlines
 GITHUB_APP_ID=<app-id> \
 GITHUB_APP_SLUG=<slug> \
-GITHUB_APP_WEBHOOK_SECRET=placeholder \
 GITHUB_APP_PRIVATE_KEY="$(cat ~/Downloads/<your-app>.private-key.pem)" \
 cargo run -p talos-github --features client --example app_smoke -- <INSTALLATION_ID>
 ```
@@ -112,7 +113,6 @@ claim an installation it cannot verify. Setting some but not all fails the boot.
 | `GITHUB_APP_ID` | no | JWT `iss`; presence enables the feature |
 | `GITHUB_APP_SLUG` | no | builds the install-redirect URL |
 | `GITHUB_APP_PRIVATE_KEY` | **yes** | RS256 signing key (PEM, PKCS#1 or PKCS#8) |
-| `GITHUB_APP_WEBHOOK_SECRET` | **yes** | App webhook HMAC secret (used by B5-wiring) |
 | `GITHUB_APP_CLIENT_ID` | no | user authorization (connect flow) |
 | `GITHUB_APP_CLIENT_SECRET` | **yes** | user-authorization code exchange |
 | `GITHUB_APP_REDIRECT_URI` | no | the App's Callback URL, e.g. `https://<host>/api/github/authorized` |
@@ -125,7 +125,6 @@ real newlines inside the quotes:
 ```dotenv
 GITHUB_APP_ID=123456
 GITHUB_APP_SLUG=talos-test-you
-GITHUB_APP_WEBHOOK_SECRET=<the-webhook-secret>
 GITHUB_APP_CLIENT_ID=Iv1.<client-id>
 GITHUB_APP_CLIENT_SECRET=<client-secret>
 GITHUB_APP_REDIRECT_URI=http://localhost:8000/api/github/authorized

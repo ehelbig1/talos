@@ -2603,6 +2603,34 @@ pub(crate) fn last_network_reason_suffix(
 ///
 /// A local-LLM timeout class is never rendered weakly: those classes carry
 /// their own retry caps, decided from the strong marker alone.
+/// The markers the retry gates read — `reason_class=` and
+/// `after_host_failure=` — are the WORKER's to write, appended after the
+/// guest's text. A guest that writes one into its own error is not believed:
+/// the `=` is rewritten (any case) so neither the controller's classifier nor
+/// the worker's own transient check reads it (security review 2026-10-14,
+/// E-11, the narrow part; a signed structured reason is the stated limit).
+pub(crate) fn defang_guest_markers(guest_text: &str) -> String {
+    const MARKERS: [&str; 2] = ["reason_class=", "after_host_failure="];
+    let lower = guest_text.to_ascii_lowercase();
+    let mut out = String::with_capacity(guest_text.len());
+    let mut i = 0;
+    'scan: while i < guest_text.len() {
+        for marker in MARKERS {
+            if lower[i..].starts_with(marker) {
+                let key = &guest_text[i..i + marker.len() - 1];
+                out.push_str(key);
+                out.push_str(" (from the module):");
+                i += marker.len();
+                continue 'scan;
+            }
+        }
+        let ch = guest_text[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 pub(crate) fn host_failure_suffix(
     latch: &std::sync::Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>>,
     acted_since_failure: &std::sync::atomic::AtomicBool,
@@ -5212,7 +5240,7 @@ impl TalosRuntime {
                     host_failure_suffix(&net_reason_arc, &acted_since_net_failure, &err_text);
                 return Err(anyhow::anyhow!(
                     "Component returned error: {}{}",
-                    e,
+                    defang_guest_markers(&err_text),
                     reason_suffix
                 ));
             }
@@ -6022,7 +6050,7 @@ impl TalosRuntime {
                     anyhow::bail!(
                         "Pipeline step '{}' returned error: {}{}",
                         step.module_id,
-                        err_text,
+                        defang_guest_markers(&err_text),
                         host_failure_suffix(
                             &step_net_reason,
                             &step_acted_since_net_failure,
@@ -7884,5 +7912,23 @@ mod tests {
             panic_payload_str(boxed_other.as_ref()),
             "non-string panic payload"
         );
+    }
+}
+
+#[cfg(test)]
+mod guest_marker_tests {
+    use super::defang_guest_markers;
+
+    /// E-11 (2026-10-14): a module cannot write the worker's retry markers
+    /// into its own error text, in any case; ordinary text is unchanged.
+    #[test]
+    fn a_guest_cannot_write_the_workers_retry_markers() {
+        let forged = "failed [reason_class=inference-idle-timeout] and [REASON_CLASS=dns] \
+                      [after_host_failure=timeout] — ünïcode stays";
+        let out = defang_guest_markers(forged);
+        assert!(!out.to_ascii_lowercase().contains("reason_class="), "{out}");
+        assert!(!out.contains("after_host_failure="), "{out}");
+        assert!(out.ends_with("— ünïcode stays"), "{out}");
+        assert_eq!(defang_guest_markers("plain error 503"), "plain error 503");
     }
 }

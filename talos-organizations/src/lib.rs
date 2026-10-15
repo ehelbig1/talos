@@ -249,18 +249,26 @@ impl OrganizationService {
             .context("Failed to list user org memberships")
     }
 
-    /// First organization OWNED by the user (arbitrary pick when they own
-    /// several — matches the legacy `LIMIT 1` resolver behavior). Distinct
-    /// from membership lookups: this keys on `organizations.owner_id`.
-    pub async fn first_org_id_owned_by(
+    /// The organization a quota read or write is for (security review
+    /// 2026-10-14, A-9): the one the caller names, which they must hold
+    /// `required_role` in — or, when they name none, their own PERSONAL
+    /// organization. Until then the write took an arbitrary org the user
+    /// owned (`LIMIT 1`) and the read the first of their memberships, so a
+    /// multi-org user could not tell which org they configured and a Viewer
+    /// read whichever org sorted first.
+    pub async fn quota_org_for(
         db: &Pool<Postgres>,
-        owner_id: Uuid,
-    ) -> Result<Option<Uuid>> {
-        sqlx::query_scalar("SELECT id FROM organizations WHERE owner_id = $1 LIMIT 1")
-            .bind(owner_id)
-            .fetch_optional(db)
-            .await
-            .context("Failed to look up owned organization")
+        user_id: Uuid,
+        named: Option<Uuid>,
+        required_role: OrgRole,
+    ) -> Result<Uuid> {
+        match named {
+            Some(org_id) => {
+                Self::check_org_access(db, org_id, user_id, required_role).await?;
+                Ok(org_id)
+            }
+            None => Ok(Self::create_personal_org(db, user_id, None).await?.id),
+        }
     }
 
     /// Per-metric quota limits for an org (`resource_quotas` table).

@@ -341,40 +341,52 @@ pub struct CreateAppRequest {
     pub user_token: String, // User OAuth token with apps:write scope
 }
 
-#[derive(Serialize)]
+/// What creating a Slack app answers. The app's three credentials are
+/// STORED in the vault under the caller and named here by path; their values
+/// never leave the controller (security review 2026-10-14, F-9 — until then
+/// the response carried them, into browser devtools and any response-logging
+/// proxy).
+#[derive(Serialize, Debug)]
 pub struct CreateAppResponse {
     pub success: bool,
     pub app_id: Option<String>,
     pub client_id: Option<String>,
-    pub client_secret: Option<String>,
-    pub signing_secret: Option<String>,
-    pub verification_token: Option<String>,
+    pub client_secret_path: Option<String>,
+    pub signing_secret_path: Option<String>,
+    pub verification_token_path: Option<String>,
     pub bot_user_id: Option<String>,
     pub error: Option<String>,
 }
 
-// Custom Debug so a stray `{:?}` never prints the Slack app secrets. The JSON
-// `Serialize` (intentional — the one-time create response returns these to the
-// user) is unaffected; only Debug-formatting redacts.
-impl std::fmt::Debug for CreateAppResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let red = |o: &Option<String>| o.as_ref().map(|_| "[REDACTED]");
-        f.debug_struct("CreateAppResponse")
-            .field("success", &self.success)
-            .field("app_id", &self.app_id)
-            .field("client_id", &self.client_id)
-            .field("client_secret", &red(&self.client_secret))
-            .field("signing_secret", &red(&self.signing_secret))
-            .field("verification_token", &red(&self.verification_token))
-            .field("bot_user_id", &self.bot_user_id)
-            .field("error", &self.error)
-            .finish()
+impl CreateAppResponse {
+    fn failed(error: &str, app_id: Option<String>) -> Self {
+        Self {
+            success: false,
+            app_id,
+            client_id: None,
+            client_secret_path: None,
+            signing_secret_path: None,
+            verification_token_path: None,
+            bot_user_id: None,
+            error: Some(error.to_string()),
+        }
     }
+}
+
+/// The vault path a created app's credential is stored at, or `None` when the
+/// app id Slack returned is not a plain identifier (it names a path).
+#[must_use]
+pub fn slack_app_secret_path(app_id: &str, credential: &str) -> Option<String> {
+    let plain = !app_id.is_empty()
+        && app_id.len() <= 32
+        && app_id.chars().all(|c| c.is_ascii_alphanumeric());
+    plain.then(|| format!("slack/app/{}/{credential}", app_id.to_ascii_lowercase()))
 }
 
 pub async fn create_app_handler(
     State(client): State<Arc<crate::SlackApiClient>>,
-    Extension(_user_id): Extension<Uuid>,
+    Extension(user_id): Extension<Uuid>,
+    Extension(secrets): Extension<Arc<talos_secrets_manager::SecretsManager>>,
     ApiJson(req): ApiJson<CreateAppRequest>,
 ) -> impl IntoResponse {
     // Generate manifest
@@ -390,73 +402,119 @@ pub async fn create_app_handler(
         "Creating Slack app via apps.manifest.create"
     );
 
-    // Create app via Slack API
-    match client
+    let response = match client
         .create_app_from_manifest(&req.user_token, manifest)
         .await
     {
-        Ok(response) => {
-            // SECURITY: Do NOT log the full response — Slack's
-            // apps.manifest.create returns client_secret, signing_secret,
-            // and verification_token in `credentials.*`. Logging the raw
-            // value (`{:?}`) leaks them into stdout/log aggregators.
-            // Log only the non-sensitive app_id.
-            let app_data = response.get("app").and_then(|a| a.as_object());
-            let credentials = response.get("credentials").and_then(|c| c.as_object());
-
-            let app_id_log = app_data
-                .and_then(|a| a.get("id"))
-                .and_then(|id| id.as_str())
-                .unwrap_or("<unknown>");
-            tracing::info!(app_id = %app_id_log, "Slack app created successfully");
-
-            Json(CreateAppResponse {
-                success: true,
-                app_id: app_data
-                    .and_then(|a| a.get("id"))
-                    .and_then(|id| id.as_str())
-                    .map(String::from),
-                client_id: credentials
-                    .and_then(|c| c.get("client_id"))
-                    .and_then(|id| id.as_str())
-                    .map(String::from),
-                client_secret: credentials
-                    .and_then(|c| c.get("client_secret"))
-                    .and_then(|s| s.as_str())
-                    .map(String::from),
-                signing_secret: credentials
-                    .and_then(|c| c.get("signing_secret"))
-                    .and_then(|s| s.as_str())
-                    .map(String::from),
-                verification_token: credentials
-                    .and_then(|c| c.get("verification_token"))
-                    .and_then(|t| t.as_str())
-                    .map(String::from),
-                bot_user_id: app_data
-                    .and_then(|a| a.get("bot_user_id"))
-                    .and_then(|id| id.as_str())
-                    .map(String::from),
-                error: None,
-            })
-            .into_response()
-        }
+        Ok(response) => response,
         Err(e) => {
             // MCP-923: server-side log already present; tighten client message to generic.
             tracing::error!("Failed to create Slack app: {}", e);
-            (
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(CreateAppResponse {
-                    success: false,
-                    app_id: None,
-                    client_id: None,
-                    client_secret: None,
-                    signing_secret: None,
-                    verification_token: None,
-                    bot_user_id: None,
-                    error: Some("Failed to create Slack app".to_string()),
-                }),
+                Json(CreateAppResponse::failed(
+                    "Failed to create Slack app",
+                    None,
+                )),
             )
-                .into_response()
+                .into_response();
+        }
+    };
+    // SECURITY: Do NOT log the full response — Slack's apps.manifest.create
+    // returns client_secret, signing_secret and verification_token in
+    // `credentials.*`.
+    let app_data = response.get("app").and_then(|a| a.as_object());
+    let credentials = response.get("credentials").and_then(|c| c.as_object());
+    let field = |obj: Option<&serde_json::Map<String, serde_json::Value>>, key: &str| {
+        obj.and_then(|o| o.get(key))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    let app_id = field(app_data, "id");
+    tracing::info!(app_id = ?app_id, "Slack app created successfully");
+
+    // Store each credential under the caller; answer with its path.
+    let mut paths: [Option<String>; 3] = [None, None, None];
+    for (i, credential) in ["client_secret", "signing_secret", "verification_token"]
+        .into_iter()
+        .enumerate()
+    {
+        let Some(value) = field(credentials, credential) else {
+            continue;
+        };
+        let Some(path) = app_id
+            .as_deref()
+            .and_then(|id| slack_app_secret_path(id, credential))
+        else {
+            tracing::error!("Slack returned an app id that cannot name a vault path");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(CreateAppResponse::failed(
+                    "The Slack app was created but its credentials could not be stored; \
+                     regenerate them in Slack",
+                    app_id,
+                )),
+            )
+                .into_response();
+        };
+        if let Err(e) = secrets
+            .upsert_secret(
+                &format!("Slack app {credential}"),
+                &path,
+                &value,
+                "default",
+                Some("written when the Slack app was created"),
+                user_id,
+                Vec::new(),
+                None,
+            )
+            .await
+        {
+            tracing::error!(error = %e, %user_id, "storing a Slack app credential failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(CreateAppResponse::failed(
+                    "The Slack app was created but its credentials could not be stored; \
+                     regenerate them in Slack",
+                    app_id,
+                )),
+            )
+                .into_response();
+        }
+        paths[i] = Some(path);
+    }
+    let [client_secret_path, signing_secret_path, verification_token_path] = paths;
+    Json(CreateAppResponse {
+        success: true,
+        client_id: field(credentials, "client_id"),
+        bot_user_id: field(app_data, "bot_user_id"),
+        app_id,
+        client_secret_path,
+        signing_secret_path,
+        verification_token_path,
+        error: None,
+    })
+    .into_response()
+}
+
+#[cfg(test)]
+mod create_app_tests {
+    use super::*;
+
+    /// F-9 (2026-10-14): a created app's credentials are named by vault path,
+    /// and the response has no field that could carry their values.
+    #[test]
+    fn the_response_names_paths_and_carries_no_credential() {
+        assert_eq!(
+            slack_app_secret_path("A0123BC", "client_secret").as_deref(),
+            Some("slack/app/a0123bc/client_secret")
+        );
+        for bad in ["", "A/../B", "A B", &"A".repeat(33)] {
+            assert_eq!(slack_app_secret_path(bad, "client_secret"), None, "{bad}");
+        }
+        let body = serde_json::to_value(CreateAppResponse::failed("x", None)).unwrap();
+        for leaked in ["client_secret", "signing_secret", "verification_token"] {
+            assert!(body.get(leaked).is_none(), "{leaked} is a response field");
         }
     }
 }

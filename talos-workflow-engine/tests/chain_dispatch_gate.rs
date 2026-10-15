@@ -441,3 +441,37 @@ async fn the_synthetic_trigger_absorbs_the_chain_it_is_wired_into() {
         "the point of this test is that the trigger is INSIDE the only detected chain"
     );
 }
+
+/// B-8 (security review 2026-10-14): even on the one entry point that batches
+/// chains, a DRY RUN and an ACTOR-BOUND run dispatch every node on its own —
+/// the pipeline wire type carries neither `dry_run` nor `actor_id`, so a
+/// chained rehearsal step would send for real. The control above, on the same
+/// graph, proves the chain forms when neither is set.
+// disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — test fixture: an engine with an arbitrary actor, no ceilings in play
+#[allow(clippy::disallowed_methods)]
+#[tokio::test]
+async fn a_dry_run_or_an_actor_bound_run_is_never_chained() {
+    for which in ["dry_run", "actor"] {
+        let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let mut engine = linear_three_node_engine(ids).await;
+        match which {
+            "dry_run" => engine.set_dry_run(true),
+            _ => engine.set_actor_id(Uuid::new_v4()),
+        }
+        let dispatcher = Arc::new(RouteRecordingDispatcher::default());
+        engine
+            .run_with_transport(dispatcher.clone(), None, Uuid::new_v4())
+            .await
+            .expect("run succeeds");
+        assert!(
+            dispatcher.chain_calls().is_empty(),
+            "{which}: no chain may be dispatched; got {:?}",
+            dispatcher.chain_calls()
+        );
+        assert_eq!(
+            dispatcher.single_nodes().len(),
+            3,
+            "{which}: each node alone"
+        );
+    }
+}
