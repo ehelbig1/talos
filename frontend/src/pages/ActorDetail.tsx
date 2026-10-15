@@ -24,6 +24,7 @@ import { BudgetPanel } from "./actor-detail/BudgetPanel";
 import { PoliciesPanel } from "./actor-detail/PoliciesPanel";
 import { LogPanel } from "./actor-detail/LogPanel";
 import { HandoffsPanel } from "./actor-detail/HandoffsPanel";
+import { Button, PageHeader } from "@/components/ui";
 
 export default function ActorDetail() {
   const { id } = useParams<{ id: string }>();
@@ -131,72 +132,52 @@ export default function ActorDetail() {
     <div className="flex flex-col h-full bg-background overflow-hidden relative">
       <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/5 via-background to-background opacity-50" />
 
-      {/* Premium Header */}
-      <header className="flex items-center gap-6 px-8 py-8 shrink-0 relative z-30">
-        <button
-          onClick={() => navigate("/actors")}
-          className="w-12 h-12 rounded-2xl bg-surface-3/50 border border-white/5 flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-surface-3 transition-premium"
-        >
-          <ChevronLeft className="w-6 h-6" />
-        </button>
-
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-4 flex-wrap">
-            <h1 className="text-3xl font-semibold text-white tracking-tight drop-shadow-sm">
+      <div className="w-full max-w-7xl mx-auto px-6 md:px-8 pt-6 shrink-0 relative z-30">
+        <PageHeader
+          backTo={{ to: "/actors", label: "Actors" }}
+          title={
+            <span className="inline-flex items-center gap-3 flex-wrap">
               {actor.name}
-            </h1>
-            <span
-              className={cn(
-                "px-3 py-1 rounded-full border border-white/5 text-xs font-semibold flex items-center gap-2",
-                colors.badge,
-              )}
-            >
               <span
                 className={cn(
-                  "w-1.5 h-1.5 rounded-full",
-                  colors.dot,
-                  actor.status === "active" && "animate-status-pulse",
+                  "px-2.5 py-0.5 rounded-full border border-white/5 text-xs font-semibold inline-flex items-center gap-2 align-middle",
+                  colors.badge,
                 )}
-              />
-              {actor.status}
+              >
+                <span
+                  className={cn(
+                    "w-1.5 h-1.5 rounded-full",
+                    colors.dot,
+                    actor.status === "active" && "animate-status-pulse",
+                  )}
+                />
+                {actor.status}
+              </span>
             </span>
-          </div>
-          {actor.description ? (
-            <p className="text-muted-foreground font-medium mt-1 text-sm">
-              {actor.description}
-            </p>
-          ) : (
-            <p className="text-muted-foreground/60 text-xs font-semibold mt-1 italic">
-              No description
-            </p>
-          )}
-        </div>
-
-        {!isTerminated && (
-          <div className="flex items-center gap-3 shrink-0">
-            <button
-              onClick={() =>
-                toggleMut.mutate(
-                  actor.status === "active" ? "suspended" : "active",
-                )
-              }
-              disabled={toggleMut.isPending}
-              className={cn(
-                "px-6 py-2.5 text-sm font-semibold rounded-xl transition-premium active:scale-95 border",
-                actor.status === "active"
-                  ? "bg-warning/5 text-warning/80 border-warning/20 hover:bg-warning/10"
-                  : "bg-success/5 text-success/80 border-success/20 hover:bg-success/10",
-              )}
-            >
-              {toggleMut.isPending
-                ? "..."
-                : actor.status === "active"
-                  ? "Suspend actor"
-                  : "Activate actor"}
-            </button>
-          </div>
-        )}
-      </header>
+          }
+          description={actor.description || "No description"}
+          actions={
+            !isTerminated && (
+              <Button
+                variant="outline"
+                onClick={() =>
+                  toggleMut.mutate(
+                    actor.status === "active" ? "suspended" : "active",
+                  )
+                }
+                disabled={toggleMut.isPending}
+              >
+                {toggleMut.isPending
+                  ? "Saving…"
+                  : actor.status === "active"
+                    ? "Suspend actor"
+                    : "Activate actor"}
+              </Button>
+            )
+          }
+          className="mb-4"
+        />
+      </div>
 
       {/* Tabs Sticky Bar */}
       <TabBar

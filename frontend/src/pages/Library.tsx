@@ -1,6 +1,5 @@
 import React, { Suspense, lazy, useState, useEffect } from "react";
-import { cn } from "@/lib/utils";
-import { Box, BookOpen } from "lucide-react";
+import { Button, PageHeader } from "@/components/ui";
 
 const Modules = lazy(() => import("./Modules"));
 const Catalog = lazy(() => import("./Catalog"));
@@ -60,82 +59,44 @@ export default function Library() {
       </div>
 
       {/* Header Area */}
-      <div className="px-10 pt-16 pb-10 shrink-0 relative z-10">
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-10 mb-12">
-          <div className="space-y-4">
-            <div className="flex items-center gap-5">
-              <div className="w-16 h-16 rounded-2xl bg-surface-3/40 border border-white/10 flex items-center justify-center shadow-2xl glass">
-                <Box className="w-8 h-8 text-primary" />
-              </div>
-              <div>
-                <h1 className="text-5xl font-semibold text-white tracking-tight font-outfit leading-none">
-                  Library
-                </h1>
-              </div>
+      <div className="w-full max-w-7xl mx-auto px-6 md:px-8 pt-8 md:pt-10 shrink-0 relative z-10">
+        <PageHeader
+          title="Library"
+          description="Templates you can install, and the modules you have created."
+          actions={
+            <div
+              role="tablist"
+              aria-label="Library sections"
+              className="flex items-center gap-1 p-1 bg-surface-3/40 border border-white/5 rounded-xl"
+            >
+              <Button
+                role="tab"
+                aria-selected={tab === "templates"}
+                variant={tab === "templates" ? "premium" : "ghost"}
+                size="sm"
+                onClick={() => setTab("templates")}
+              >
+                Templates
+              </Button>
+              <Button
+                role="tab"
+                aria-selected={tab === "installed"}
+                variant={tab === "installed" ? "premium" : "ghost"}
+                size="sm"
+                onClick={() => setTab("installed")}
+              >
+                Your modules
+              </Button>
             </div>
-            <p className="text-sm text-muted-foreground/70 max-w-xl leading-relaxed">
-              Browse templates in the Catalog, or manage the modules you have
-              created.
-            </p>
-          </div>
-
-          {/* Tab bar */}
-          <div className="flex items-center gap-3 p-2 bg-surface-3/40 backdrop-blur-3xl rounded-3xl border border-white/5 w-fit glass shadow-2xl gpu">
-            <button
-              onClick={() => setTab("installed")}
-              className={cn(
-                "flex items-center gap-4 px-10 py-4 text-sm font-semibold rounded-2xl transition-premium active:scale-95 relative group whitespace-nowrap",
-                tab === "installed"
-                  ? "bg-primary text-white shadow-2xl border border-white/20"
-                  : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
-              )}
-            >
-              <div
-                className={cn(
-                  "absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-premium rounded-2xl",
-                  tab === "installed" && "hidden",
-                )}
-              />
-              <Box
-                className={cn(
-                  "w-4 h-4 relative z-10 transition-transform",
-                  tab === "installed" ? "text-white" : "text-primary/70",
-                )}
-              />
-              <span className="relative z-10">Your modules</span>
-            </button>
-            <button
-              onClick={() => setTab("templates")}
-              className={cn(
-                "flex items-center gap-4 px-10 py-4 text-sm font-semibold rounded-2xl transition-premium active:scale-95 relative group whitespace-nowrap",
-                tab === "templates"
-                  ? "bg-primary text-white shadow-2xl border border-white/20"
-                  : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
-              )}
-            >
-              <div
-                className={cn(
-                  "absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-premium rounded-2xl",
-                  tab === "templates" && "hidden",
-                )}
-              />
-              <BookOpen
-                className={cn(
-                  "w-4 h-4 relative z-10 transition-transform",
-                  tab === "templates" ? "text-white" : "text-primary/70",
-                )}
-              />
-              <span className="relative z-10">Templates</span>
-            </button>
-          </div>
-        </div>
+          }
+          className="mb-0"
+        />
       </div>
-
       {/* Tab content */}
       <div className="flex-1 overflow-hidden relative z-10">
         <Suspense fallback={<TabLoading />}>
           <div className="h-full overflow-auto custom-scrollbar gpu optimize-blur">
-            <div className="max-w-[1600px] mx-auto pb-32">
+            <div className="max-w-7xl mx-auto px-6 md:px-8 pb-24">
               {tab === "installed" ? <Modules /> : <Catalog />}
             </div>
           </div>

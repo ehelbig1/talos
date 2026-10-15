@@ -23,7 +23,6 @@ import { ConditionEdge } from "@/components/ConditionEdge";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useShallow } from "zustand/react/shallow";
 import { useUIStore } from "@/store/uiStore";
-import { WorkflowToolbar } from "@/components/WorkflowToolbar";
 const Inspector = React.lazy(() => import("@/components/Inspector"));
 const Terminal = React.lazy(() => import("@/components/Terminal"));
 import { KeyboardShortcutsHelp } from "@/components/KeyboardShortcutsHelp";
@@ -151,8 +150,6 @@ function Workspace() {
           style={{ animationDuration: "18s" }}
         />
       </div>
-
-      <WorkflowToolbar />
 
       <div className="flex flex-1 overflow-hidden relative z-10">
         <div className="flex-1 relative">

@@ -19,6 +19,7 @@ import { cn } from "@/lib/utils";
 import { ExecutionWaterfall } from "./ExecutionWaterfall";
 import { TimelineEvent } from "./execution/TimelineEvent";
 import { ExecutionHeader } from "./execution/ExecutionHeader";
+import { WorkflowToolbar } from "./WorkflowToolbar";
 import { useActiveExecutionSync } from "@/hooks/useActiveExecutionSync";
 
 interface Workflow {
@@ -230,7 +231,7 @@ export default function ExecutionPanel() {
         onCancel={() => setConfirmPending(null)}
       />
 
-      {/* Header / Workflow Selector */}
+      {/* The editor's one header row */}
       <ExecutionHeader
         workflowId={workflowId}
         workflows={workflows}
@@ -246,7 +247,9 @@ export default function ExecutionPanel() {
         showTimeline={showTimeline}
         onToggleTimeline={() => setShowTimeline(!showTimeline)}
         eventCount={events.length}
-      />
+      >
+        <WorkflowToolbar />
+      </ExecutionHeader>
 
       {/* Main Content Area — Only visible when telemetry is toggled */}
       {showTimeline && (

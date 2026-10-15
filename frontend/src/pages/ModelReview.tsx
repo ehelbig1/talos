@@ -20,6 +20,7 @@ import {
   useResolveMlDisagreementMutation,
 } from "@/generated/graphql";
 import { LIFECYCLE_STYLE, lifecycleLabel } from "@/lib/mlLifecycle";
+import { PageContainer, PageHeader } from "@/components/ui";
 
 function pct(v: number | null | undefined): string {
   return v == null ? "—" : `${(v * 100).toFixed(1)}%`;
@@ -265,267 +266,257 @@ export default function ModelReview() {
       : null;
 
   return (
-    <div className="flex flex-col h-full bg-background overflow-hidden">
-      {/* Header */}
-      <header className="px-10 pt-16 pb-8 shrink-0">
-        <div className="flex items-center gap-5">
-          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center">
-            <BrainCircuit className="w-7 h-7 text-primary" />
-          </div>
-          <div>
-            <h1 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
-              Model Review
-            </h1>
-            <p className="text-xs text-muted-foreground/70 font-bold mt-2">
-              Review and correct what your classifiers predicted.
-            </p>
-          </div>
-        </div>
-      </header>
+    <div className="h-full overflow-auto custom-scrollbar bg-background">
+      <PageContainer>
+        <PageHeader
+          title="Model review"
+          description="Review and correct what your classifiers predicted."
+        />
 
-      <div className="flex-1 overflow-auto custom-scrollbar px-10 pb-16">
-        {/* Model picker row */}
-        {modelsLoading ? (
-          <div className="flex gap-4">
-            {[1, 2].map((i) => (
-              <div
-                key={i}
-                className="h-28 w-72 bg-white/[0.02] border border-white/5 rounded-2xl animate-pulse"
-              />
-            ))}
-          </div>
-        ) : models.length === 0 ? (
-          <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-3xl">
-            <BrainCircuit className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto" />
-            <p className="text-sm text-muted-foreground/50 font-semibold">
-              No models yet
-            </p>
-            <p className="text-xs text-muted-foreground/60 font-bold mt-2">
-              Distilled classifiers appear here as they start learning.
-            </p>
-          </div>
-        ) : (
-          <div className="flex flex-wrap gap-4">
-            {models.map((m) => {
-              const isActive = m.name === activeName;
-              return (
-                <button
-                  key={m.id}
-                  type="button"
-                  onClick={() => setPicked(m.name)}
-                  className={cn(
-                    "text-left w-72 rounded-2xl p-6 border transition-premium relative overflow-hidden group",
-                    isActive
-                      ? "bg-primary/[0.06] border-primary/30 shadow-xl"
-                      : "bg-white/[0.02] border-white/5 hover:bg-white/[0.04] hover:border-white/10",
-                  )}
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <span className="text-sm font-semibold text-white truncate font-outfit">
-                      {m.name}
-                    </span>
-                    {m.pendingDisagreements > 0 && (
-                      <span className="shrink-0 bg-warning text-black text-xs font-semibold rounded-full px-2.5 py-1 min-w-[1.6rem] text-center">
-                        {m.pendingDisagreements}
-                      </span>
+        <div>
+          {/* Model picker row */}
+          {modelsLoading ? (
+            <div className="flex gap-4">
+              {[1, 2].map((i) => (
+                <div
+                  key={i}
+                  className="h-28 w-72 bg-white/[0.02] border border-white/5 rounded-2xl animate-pulse"
+                />
+              ))}
+            </div>
+          ) : models.length === 0 ? (
+            <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-3xl">
+              <BrainCircuit className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto" />
+              <p className="text-sm text-muted-foreground/50 font-semibold">
+                No models yet
+              </p>
+              <p className="text-xs text-muted-foreground/60 font-bold mt-2">
+                Distilled classifiers appear here as they start learning.
+              </p>
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-4">
+              {models.map((m) => {
+                const isActive = m.name === activeName;
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => setPicked(m.name)}
+                    className={cn(
+                      "text-left w-72 rounded-2xl p-6 border transition-premium relative overflow-hidden group",
+                      isActive
+                        ? "bg-primary/[0.06] border-primary/30 shadow-xl"
+                        : "bg-white/[0.02] border-white/5 hover:bg-white/[0.04] hover:border-white/10",
                     )}
-                  </div>
-                  <div className="flex items-center gap-2 mt-4">
-                    <span
-                      className={cn(
-                        "text-2xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-lg border",
-                        LIFECYCLE_STYLE[m.lifecycleState] ??
-                          LIFECYCLE_STYLE.llm_only,
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="text-sm font-semibold text-white truncate font-outfit">
+                        {m.name}
+                      </span>
+                      {m.pendingDisagreements > 0 && (
+                        <span className="shrink-0 bg-warning text-black text-xs font-semibold rounded-full px-2.5 py-1 min-w-[1.6rem] text-center">
+                          {m.pendingDisagreements}
+                        </span>
                       )}
-                    >
-                      {lifecycleLabel(m.lifecycleState)}
-                    </span>
-                    <span className="text-2xs text-muted-foreground/70 font-bold uppercase tracking-wider">
-                      acc {pct(m.promotedAccuracy)}
-                    </span>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Selected model status + disagreement queue */}
-        {activeName && (
-          <div className="mt-10">
-            {/* Status strip */}
-            {feed && (
-              <div className="flex flex-wrap items-center gap-x-8 gap-y-3 mb-8 px-6 py-5 bg-white/[0.02] border border-white/5 rounded-2xl">
-                <Stat
-                  label="Lifecycle"
-                  value={lifecycleLabel(feed.lifecycleState)}
-                />
-                <Stat
-                  label="Shadow agreement"
-                  value={pct(feed.shadowAgreement)}
-                  hint={`${feed.shadowObservations} obs · era ${feed.shadowEpoch}`}
-                />
-                <Stat label="Pending review" value={String(pending.length)} />
-                <div className="ml-auto flex items-center gap-2 text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
-                  <Sparkles className="w-3.5 h-3.5 text-primary/70" />
-                  Corrections train the model toward promotion
-                </div>
-              </div>
-            )}
-
-            {/* Teacher ceiling — the LLM teacher's accuracy on gold rows,
-                the distilled model's accuracy ceiling. */}
-            {feed && (
-              <div className="mb-8">
-                <TeacherCeilingCard audit={feed.teacherAudit} />
-              </div>
-            )}
-
-            {feedLoading ? (
-              <div className="space-y-4">
-                {[1, 2, 3].map((i) => (
-                  <div
-                    key={i}
-                    className="h-40 bg-white/[0.02] border border-white/5 rounded-2xl animate-pulse"
-                  />
-                ))}
-              </div>
-            ) : feedError ? (
-              // A failed queue load must NEVER masquerade as "all caught
-              // up" — with pending items still counted in the model list,
-              // that silently hides work (found live 2026-07-14: a
-              // schema/query version skew errored the feed while the
-              // badge showed 10 pending).
-              <div className="text-center py-24 bg-white/[0.01] border border-dashed border-destructive/20 rounded-3xl">
-                <p className="text-sm text-destructive/80 font-semibold">
-                  Could not load the review queue
-                </p>
-                <p className="text-xs text-muted-foreground/70 font-bold mt-2">
-                  The pending count in the model list is still accurate.
-                </p>
-                <button
-                  onClick={() => refetchFeed()}
-                  className="mt-6 px-5 py-2 text-xs font-semibold text-foreground/80 bg-white/[0.04] border border-white/10 rounded-full hover:bg-white/[0.08] transition-premium"
-                >
-                  Retry
-                </button>
-              </div>
-            ) : pending.length === 0 ? (
-              <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-3xl group">
-                <CheckCircle2 className="w-16 h-16 text-success/25 mb-6 mx-auto group-hover:text-success/50 transition-premium" />
-                <p className="text-sm text-muted-foreground font-semibold">
-                  All caught up
-                </p>
-                <p className="text-xs text-muted-foreground/60 font-bold mt-2">
-                  No disagreements waiting on your review.
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-4">
-                {pending.map((d) => {
-                  const rowBusy = busyId === d.id;
-                  return (
-                    <div
-                      key={d.id}
-                      className={cn(
-                        "bg-white/[0.02] border border-white/5 rounded-2xl p-6 transition-premium relative overflow-hidden",
-                        rowBusy && "opacity-50 pointer-events-none",
-                      )}
-                    >
-                      {/* Candidate labels */}
-                      <div className="flex flex-wrap items-center gap-3 mb-4">
-                        <span
-                          className={cn(
-                            "text-2xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-lg border",
-                            d.kind === "divergence"
-                              ? "text-warning bg-warning/5 border-warning/20"
-                              : "text-muted-foreground/60 bg-white/5 border-white/10",
-                          )}
-                        >
-                          {d.kind === "divergence"
-                            ? "Model disagreed"
-                            : "Model abstained"}
-                        </span>
-                        <span className="flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60">
-                          <Cpu className="w-3.5 h-3.5 text-warning/70" />
-                          model:{" "}
-                          <span className="font-semibold text-white/80">
-                            {d.fastLabel ?? "—"}
-                          </span>
-                          {d.fastConfidence != null && (
-                            <span className="text-muted-foreground/70">
-                              ({pct(d.fastConfidence)})
-                            </span>
-                          )}
-                        </span>
-                        <span className="flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60">
-                          <Bot className="w-3.5 h-3.5 text-primary/70" />
-                          llm:{" "}
-                          <span className="font-semibold text-white/80">
-                            {d.llmLabel}
-                          </span>
-                        </span>
-                        <span className="ml-auto text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
-                          {new Date(d.createdAt).toLocaleString()}
-                        </span>
-                      </div>
-
-                      {/* Email-derived features */}
-                      <pre className="text-[12px] leading-relaxed text-muted-foreground/80 whitespace-pre-wrap font-sans bg-black/20 border border-white/5 rounded-2xl p-4 mb-5 max-h-40 overflow-auto custom-scrollbar">
-                        {d.featuresText}
-                      </pre>
-
-                      {/* Correct-label actions + dismiss */}
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider mr-1">
-                          Correct label
-                        </span>
-                        {labelOptions.map((label) => {
-                          const suggested = label === d.llmLabel;
-                          return (
-                            <Button
-                              key={label}
-                              size="sm"
-                              onClick={() =>
-                                resolve.mutate({
-                                  disagreementId: d.id,
-                                  correctLabel: label,
-                                })
-                              }
-                              className={cn(
-                                "h-9 rounded-xl font-semibold text-xs border transition-premium",
-                                suggested
-                                  ? "bg-primary/10 hover:bg-primary text-primary hover:text-black border-primary/30"
-                                  : "bg-white/[0.03] hover:bg-white/10 text-white/80 border-white/10",
-                              )}
-                            >
-                              {suggested && (
-                                <ShieldCheck className="w-3.5 h-3.5 mr-1.5" />
-                              )}
-                              {label}
-                            </Button>
-                          );
-                        })}
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() =>
-                            resolve.mutate({ disagreementId: d.id })
-                          }
-                          className="h-9 rounded-xl font-semibold text-xs text-muted-foreground/50 hover:text-destructive hover:bg-destructive/10 border border-transparent hover:border-destructive/20 ml-auto"
-                        >
-                          <X className="w-3.5 h-3.5 mr-1.5" />
-                          Dismiss
-                        </Button>
-                      </div>
                     </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+                    <div className="flex items-center gap-2 mt-4">
+                      <span
+                        className={cn(
+                          "text-2xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-lg border",
+                          LIFECYCLE_STYLE[m.lifecycleState] ??
+                            LIFECYCLE_STYLE.llm_only,
+                        )}
+                      >
+                        {lifecycleLabel(m.lifecycleState)}
+                      </span>
+                      <span className="text-2xs text-muted-foreground/70 font-bold uppercase tracking-wider">
+                        acc {pct(m.promotedAccuracy)}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Selected model status + disagreement queue */}
+          {activeName && (
+            <div className="mt-10">
+              {/* Status strip */}
+              {feed && (
+                <div className="flex flex-wrap items-center gap-x-8 gap-y-3 mb-8 px-6 py-5 bg-white/[0.02] border border-white/5 rounded-2xl">
+                  <Stat
+                    label="Lifecycle"
+                    value={lifecycleLabel(feed.lifecycleState)}
+                  />
+                  <Stat
+                    label="Shadow agreement"
+                    value={pct(feed.shadowAgreement)}
+                    hint={`${feed.shadowObservations} obs · era ${feed.shadowEpoch}`}
+                  />
+                  <Stat label="Pending review" value={String(pending.length)} />
+                  <div className="ml-auto flex items-center gap-2 text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                    <Sparkles className="w-3.5 h-3.5 text-primary/70" />
+                    Corrections train the model toward promotion
+                  </div>
+                </div>
+              )}
+
+              {/* Teacher ceiling — the LLM teacher's accuracy on gold rows,
+                the distilled model's accuracy ceiling. */}
+              {feed && (
+                <div className="mb-8">
+                  <TeacherCeilingCard audit={feed.teacherAudit} />
+                </div>
+              )}
+
+              {feedLoading ? (
+                <div className="space-y-4">
+                  {[1, 2, 3].map((i) => (
+                    <div
+                      key={i}
+                      className="h-40 bg-white/[0.02] border border-white/5 rounded-2xl animate-pulse"
+                    />
+                  ))}
+                </div>
+              ) : feedError ? (
+                // A failed queue load must NEVER masquerade as "all caught
+                // up" — with pending items still counted in the model list,
+                // that silently hides work (found live 2026-07-14: a
+                // schema/query version skew errored the feed while the
+                // badge showed 10 pending).
+                <div className="text-center py-24 bg-white/[0.01] border border-dashed border-destructive/20 rounded-3xl">
+                  <p className="text-sm text-destructive/80 font-semibold">
+                    Could not load the review queue
+                  </p>
+                  <p className="text-xs text-muted-foreground/70 font-bold mt-2">
+                    The pending count in the model list is still accurate.
+                  </p>
+                  <button
+                    onClick={() => refetchFeed()}
+                    className="mt-6 px-5 py-2 text-xs font-semibold text-foreground/80 bg-white/[0.04] border border-white/10 rounded-full hover:bg-white/[0.08] transition-premium"
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : pending.length === 0 ? (
+                <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-3xl group">
+                  <CheckCircle2 className="w-16 h-16 text-success/25 mb-6 mx-auto group-hover:text-success/50 transition-premium" />
+                  <p className="text-sm text-muted-foreground font-semibold">
+                    All caught up
+                  </p>
+                  <p className="text-xs text-muted-foreground/60 font-bold mt-2">
+                    No disagreements waiting on your review.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {pending.map((d) => {
+                    const rowBusy = busyId === d.id;
+                    return (
+                      <div
+                        key={d.id}
+                        className={cn(
+                          "bg-white/[0.02] border border-white/5 rounded-2xl p-6 transition-premium relative overflow-hidden",
+                          rowBusy && "opacity-50 pointer-events-none",
+                        )}
+                      >
+                        {/* Candidate labels */}
+                        <div className="flex flex-wrap items-center gap-3 mb-4">
+                          <span
+                            className={cn(
+                              "text-2xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-lg border",
+                              d.kind === "divergence"
+                                ? "text-warning bg-warning/5 border-warning/20"
+                                : "text-muted-foreground/60 bg-white/5 border-white/10",
+                            )}
+                          >
+                            {d.kind === "divergence"
+                              ? "Model disagreed"
+                              : "Model abstained"}
+                          </span>
+                          <span className="flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60">
+                            <Cpu className="w-3.5 h-3.5 text-warning/70" />
+                            model:{" "}
+                            <span className="font-semibold text-white/80">
+                              {d.fastLabel ?? "—"}
+                            </span>
+                            {d.fastConfidence != null && (
+                              <span className="text-muted-foreground/70">
+                                ({pct(d.fastConfidence)})
+                              </span>
+                            )}
+                          </span>
+                          <span className="flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60">
+                            <Bot className="w-3.5 h-3.5 text-primary/70" />
+                            llm:{" "}
+                            <span className="font-semibold text-white/80">
+                              {d.llmLabel}
+                            </span>
+                          </span>
+                          <span className="ml-auto text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                            {new Date(d.createdAt).toLocaleString()}
+                          </span>
+                        </div>
+
+                        {/* Email-derived features */}
+                        <pre className="text-[12px] leading-relaxed text-muted-foreground/80 whitespace-pre-wrap font-sans bg-black/20 border border-white/5 rounded-2xl p-4 mb-5 max-h-40 overflow-auto custom-scrollbar">
+                          {d.featuresText}
+                        </pre>
+
+                        {/* Correct-label actions + dismiss */}
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider mr-1">
+                            Correct label
+                          </span>
+                          {labelOptions.map((label) => {
+                            const suggested = label === d.llmLabel;
+                            return (
+                              <Button
+                                key={label}
+                                size="sm"
+                                onClick={() =>
+                                  resolve.mutate({
+                                    disagreementId: d.id,
+                                    correctLabel: label,
+                                  })
+                                }
+                                className={cn(
+                                  "h-9 rounded-xl font-semibold text-xs border transition-premium",
+                                  suggested
+                                    ? "bg-primary/10 hover:bg-primary text-primary hover:text-black border-primary/30"
+                                    : "bg-white/[0.03] hover:bg-white/10 text-white/80 border-white/10",
+                                )}
+                              >
+                                {suggested && (
+                                  <ShieldCheck className="w-3.5 h-3.5 mr-1.5" />
+                                )}
+                                {label}
+                              </Button>
+                            );
+                          })}
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() =>
+                              resolve.mutate({ disagreementId: d.id })
+                            }
+                            className="h-9 rounded-xl font-semibold text-xs text-muted-foreground/50 hover:text-destructive hover:bg-destructive/10 border border-transparent hover:border-destructive/20 ml-auto"
+                          >
+                            <X className="w-3.5 h-3.5 mr-1.5" />
+                            Dismiss
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </PageContainer>
     </div>
   );
 }
