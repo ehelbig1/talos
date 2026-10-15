@@ -132,6 +132,19 @@ pub(crate) struct WasiHttpAdmitted {
     pub(crate) host: String,
     pub(crate) host_for_limit: String,
     pub(crate) mutates: bool,
+    /// The destination the gate judged, as `host:port` ([`destination_key`]).
+    /// The send refuses any other (E2-1).
+    pub(crate) send_key: String,
+}
+
+/// `host:port` of a URL (WHATWG-normalised host, the scheme's port when none
+/// is written): how the gate and the send both name a destination.
+pub(crate) fn destination_key(url: &url::Url) -> Option<String> {
+    Some(format!(
+        "{}:{}",
+        url.host_str()?.to_ascii_lowercase(),
+        url.port_or_known_default()?
+    ))
 }
 
 fn refuse(policy: &'static str, target: impl Into<String>) -> WasiHttpRefusal {
@@ -204,6 +217,10 @@ pub(crate) fn wasi_http_admission(
                 ..refuse("invalid-authority", "")
             }
         })?;
+    let send_key = destination_key(&url).ok_or_else(|| WasiHttpRefusal {
+        code: wt::ErrorCode::HttpRequestUriInvalid,
+        ..refuse("invalid-authority", "")
+    })?;
     // Scheme, allowlist, IP literal, `allowed_hosts`, egress posture: the
     // same function `talos:core/http::fetch` / `fetch_all` call.
     let url_policy = super::egress_admission::UrlPolicy {
@@ -260,6 +277,7 @@ pub(crate) fn wasi_http_admission(
         host,
         host_for_limit,
         mutates,
+        send_key,
     })
 }
 
@@ -400,6 +418,9 @@ pub(crate) fn gated_handle(
             .push(dry_run_response(&target.method, &admitted.host))?);
     }
 
+    // The send may go only where the gate judged (E2-1, 2026-10-15): the
+    // hooks refuse a request whose built URI names another host:port.
+    ctx.wasi_http_hooks.admit(admitted.send_key.clone());
     let mut view = <TalosContext as WasiHttpView>::http(ctx);
     outgoing_handler::Host::handle(&mut view, request, options)
 }
@@ -468,11 +489,46 @@ type IoFuture = Box<dyn Future<Output = wasmtime_wasi_http::Result<()>> + Send>;
 /// `TcpStream::connect` on a name it resolves itself.
 pub(crate) struct HardenedWasiHttpHooks {
     client: reqwest::Client,
+    /// Every destination ([`destination_key`]) the gate admitted in this
+    /// execution. Bounded by the per-execution call budget, which is charged
+    /// before a destination is added.
+    admitted: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl HardenedWasiHttpHooks {
     pub(crate) fn new(client: reqwest::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            admitted: std::sync::Arc::default(),
+        }
+    }
+
+    /// Record a destination the gate admitted.
+    pub(crate) fn admit(&self, send_key: String) {
+        self.admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(send_key);
+    }
+
+    /// Whether the request's URI names a destination the gate admitted.
+    /// Talos's own comparison (security review 2026-10-15, E2-1): the gate
+    /// judges the guest's `authority`, and upstream builds the URI it sends
+    /// from scheme + authority + path — RUSTSEC-2026-0350 was that builder
+    /// sending to another host. A repeat of that bug class is refused here
+    /// rather than trusted.
+    fn sends_where_admitted(&self, uri: &http::Uri) -> bool {
+        let Some(key) = url::Url::parse(&uri.to_string())
+            .ok()
+            .as_ref()
+            .and_then(destination_key)
+        else {
+            return false;
+        };
+        self.admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
     }
 }
 
@@ -489,7 +545,16 @@ impl WasiHttpHooks for HardenedWasiHttpHooks {
             + Send,
     > {
         let client = self.client.clone();
+        let admitted = self.sends_where_admitted(request.uri());
         Box::new(async move {
+            if !admitted {
+                tracing::warn!(
+                    target: "talos_security",
+                    "wasi:http request refused: the URI to be sent names a host or port the \
+                     gate did not admit"
+                );
+                return Err(wasmtime_wasi_http::Error::HttpRequestDenied);
+            }
             let response = send_via_hardened_client(client, request, options).await?;
             // reqwest drives its own connection, so there is no separate I/O
             // task for the caller to await.
@@ -1052,6 +1117,68 @@ mod tests {
         );
     }
 
+    /// E2-1 (2026-10-15): the send goes only where the gate judged. A request
+    /// whose URI names a host:port the gate did not admit — what an upstream
+    /// URI-builder bug (RUSTSEC-2026-0350) produced — is refused before any
+    /// connection: the listener it names is never reached, even under the
+    /// opt-in that lets this context reach loopback. CONTROL: once that
+    /// destination is admitted, the same request reaches it.
+    #[tokio::test]
+    async fn a_request_sent_to_another_destination_than_the_admitted_one_is_refused() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _read = sock.read(&mut buf).await;
+                let _written = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        let opted = trusted_ctx(&["localhost"], &["GET"]).with_dev_egress(
+            crate::context::DevEgressOptIns {
+                private_host_targets: true,
+                insecure_http: true,
+            },
+        );
+        let mut hooks = HardenedWasiHttpHooks::new(opted.http_client.clone());
+        hooks.admit("api.example.test:443".to_string());
+        let refused = Pin::from(hooks.send_request(
+            get_localhost(port),
+            options(),
+            Box::new(std::future::ready(Ok(()))),
+        ))
+        .await;
+        assert!(
+            matches!(refused, Err(wasmtime_wasi_http::Error::HttpRequestDenied)),
+            "a destination the gate did not admit is refused: {:?}",
+            refused.map(|(r, _)| r.status())
+        );
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing connected"
+        );
+
+        hooks.admit(format!("localhost:{port}"));
+        let reached = Pin::from(hooks.send_request(
+            get_localhost(port),
+            options(),
+            Box::new(std::future::ready(Ok(()))),
+        ))
+        .await
+        .map(|(r, _)| r.status());
+        assert!(
+            matches!(reached, Ok(status) if status == 200),
+            "{reached:?}"
+        );
+    }
+
     /// The gate reads the insecure-HTTP opt-in from ITS context: a plaintext
     /// request is refused as `insecure-scheme` unless this context opted in,
     /// whatever any other context in the process was built with. CONTROL: the
@@ -1156,6 +1283,7 @@ mod tests {
         let ctx = trusted_ctx(&["localhost"], &["GET"])
             .with_dev_egress(crate::context::DevEgressOptIns::default());
         let mut hooks = HardenedWasiHttpHooks::new(ctx.http_client.clone());
+        hooks.admit(format!("localhost:{port}"));
         let refused = Pin::from(hooks.send_request(
             get_localhost(port),
             options(),
@@ -1177,6 +1305,7 @@ mod tests {
             },
         );
         let mut hooks = HardenedWasiHttpHooks::new(opted.http_client.clone());
+        hooks.admit(format!("localhost:{port}"));
         let reached = Pin::from(hooks.send_request(
             get_localhost(port),
             options(),

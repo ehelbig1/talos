@@ -141,8 +141,16 @@ pub fn inspect_component(wasm_bytes: &[u8]) -> ComponentInspection {
         let mut interfaces: Vec<String> = imported.into_iter().collect();
         interfaces.sort();
 
+        // The import section is ground truth. The world sentinel — a string
+        // the SDK macro embeds as a data-segment static, scanned for over the
+        // whole binary — may RAISE the world to one that covers what the
+        // imports need (a source that declared more than survived DCE), never
+        // lower it below them (security review 2026-10-15, E2-7: a binary
+        // importing `secrets` with the minimal sentinel embedded inspected as
+        // `Minimal`, and the world recorded and the ceilings asked were read
+        // off an author-steerable string).
         if let Some(world) = detect_world_from_type_section(wasm_bytes) {
-            capability_world = world;
+            capability_world = sentinel_never_narrows(capability_world, world);
         }
 
         return ComponentInspection {
@@ -235,6 +243,20 @@ pub fn link_world(
 // ============================================================================
 // Private helpers
 // ============================================================================
+
+/// The world of a component that has imports, given the world its imports
+/// need (`classified`) and the world its sentinel names: the sentinel when it
+/// covers the imports, the imports' world otherwise.
+fn sentinel_never_narrows(
+    classified: CapabilityWorld,
+    sentinel: CapabilityWorld,
+) -> CapabilityWorld {
+    if classified.is_subset_of(&sentinel) {
+        sentinel
+    } else {
+        classified
+    }
+}
 
 /// Detect the capability world from the component type section when no interface
 /// imports survive dead-code elimination.
@@ -945,6 +967,37 @@ mod tests {
         let blob =
             b"world minimal-node {} world http-node {} world database-node {} world agent-node {}";
         assert_eq!(detect_world_from_type_section(&blob[..]), None);
+    }
+
+    #[test]
+    fn a_sentinel_never_narrows_the_world_the_imports_need() {
+        use CapabilityWorld as W;
+        // Narrower than the imports: the imports win.
+        assert_eq!(sentinel_never_narrows(W::Secrets, W::Minimal), W::Secrets);
+        assert_eq!(sentinel_never_narrows(W::Http, W::Minimal), W::Http);
+        // Covering the imports: the declared (wider) world stands.
+        assert_eq!(sentinel_never_narrows(W::Http, W::Trusted), W::Trusted);
+        assert_eq!(sentinel_never_narrows(W::Secrets, W::Secrets), W::Secrets);
+    }
+
+    /// E2-7 (2026-10-15), on a real component: it imports
+    /// `talos:core/secrets` and carries the MINIMAL sentinel in a data
+    /// segment. It inspects as `Secrets`, never `Minimal`.
+    #[test]
+    fn a_secrets_importing_component_with_the_minimal_sentinel_inspects_as_secrets() {
+        let bytes = wat::parse_str(
+            r#"(component
+                 (import "talos:core/secrets" (instance))
+                 (core module
+                   (memory 1)
+                   (data (i32.const 0) "__talos_world_minimal-node__")))"#,
+        )
+        .expect("component");
+        let inspection = inspect_component(&bytes);
+        assert!(inspection
+            .imported_interfaces
+            .contains(&"talos:core/secrets".to_string()));
+        assert_eq!(inspection.capability_world, CapabilityWorld::Secrets);
     }
 
     #[test]

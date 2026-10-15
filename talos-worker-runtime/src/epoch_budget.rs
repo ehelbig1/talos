@@ -139,6 +139,90 @@ pub const CANCEL_PREEMPT_MESSAGE: &str =
     "WASM execution aborted mid-computation: the execution was cancelled by an operator \
      (talos:cancel-preempt) [reason_class=cancelled]";
 
+/// The message a guest is stopped with when its sandbox directory — the WASI
+/// preopen of a `filesystem` / `automation` world — grows past the
+/// per-execution file-system cap, or the worker's sandbox budget (security
+/// review 2026-10-15, E2-2). Writes through `wasi:filesystem` bypass the
+/// `talos:core/files` counters, so the directory itself is measured.
+pub const FS_PREOPEN_OVER_CAP_MESSAGE: &str =
+    "WASM execution stopped: the sandbox file system grew past its write quota \
+     (talos:fs-cap) — the per-execution limit or the worker's sandbox budget";
+
+/// How often, in epoch callbacks (ticks of guest execution), a preopen
+/// sandbox is measured: every half second.
+pub(crate) const FS_PREOPEN_CHECK_EVERY_TICKS: u32 = 5;
+
+/// Most directory entries one measurement visits. A sandbox holding more is
+/// treated as over its quota: a guest cannot make the check itself expensive.
+pub(crate) const FS_PREOPEN_MAX_ENTRIES: usize = 50_000;
+
+/// The apparent size of everything under `dir`, stopping early: `None` when it
+/// passes `stop_above` bytes or [`FS_PREOPEN_MAX_ENTRIES`] entries, or cannot be
+/// read. Symlinks are not followed (a WASI guest cannot create one that leaves
+/// the preopen, and following none keeps the walk inside it regardless).
+pub(crate) fn sandbox_bytes(dir: &std::path::Path, stop_above: u64) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut entries = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).ok()? {
+            let entry = entry.ok()?;
+            entries += 1;
+            if entries > FS_PREOPEN_MAX_ENTRIES {
+                return None;
+            }
+            let meta = entry.path().symlink_metadata().ok()?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(meta.len());
+                if total > stop_above {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(total)
+}
+
+/// One preopen sandbox's share of the worker's process-wide sandbox budget:
+/// what its directory holds beyond the bytes `talos:core/files` already
+/// reserved. Returned to the budget when the store (and this guard, owned by
+/// its epoch callback) is dropped.
+struct PreopenReservation {
+    reserved: u64,
+    ticks: u32,
+}
+
+impl Drop for PreopenReservation {
+    fn drop(&mut self) {
+        crate::host::limits::release_process_fs_bytes(self.reserved);
+    }
+}
+
+/// The preopen check, one measurement: `Err` with
+/// [`FS_PREOPEN_OVER_CAP_MESSAGE`] when the sandbox is over the per-execution
+/// cap, unreadable or too large to walk, or its growth does not fit the
+/// process budget.
+fn check_preopen(
+    reservation: &mut PreopenReservation,
+    sandbox: &std::path::Path,
+    host_written: u64,
+) -> Result<(), ()> {
+    use crate::host::limits::{reserve_process_fs_bytes, MAX_FS_BYTES_PER_EXECUTION};
+    let size = sandbox_bytes(sandbox, MAX_FS_BYTES_PER_EXECUTION).ok_or(())?;
+    // Bytes written through `talos:core/files` are already reserved by that
+    // host function; the rest arrived through the preopen.
+    let wanted = size.saturating_sub(host_written);
+    if wanted > reservation.reserved {
+        if !reserve_process_fs_bytes(wanted - reservation.reserved) {
+            return Err(());
+        }
+        reservation.reserved = wanted;
+    }
+    Ok(())
+}
+
 /// What the epoch-deadline callback decided. Split from the callback itself so
 /// the policy is unit-testable without a wasm runtime, an engine, or a clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,8 +348,32 @@ pub(crate) fn arm_epoch_deadline(store: &mut Store<TalosContext>, timeout: Durat
 
     let (first_slice, mut budget) = EpochBudget::new(total);
     store.set_epoch_deadline(first_slice);
+    // E2-2 (2026-10-15): a world with a WASI preopen writes through
+    // `wasi:filesystem`, outside `talos:core/files`' counters; its sandbox is
+    // measured here, every `FS_PREOPEN_CHECK_EVERY_TICKS` ticks of guest
+    // execution, against the same per-execution cap and process budget.
+    let mut preopen = crate::context::capability_world_has_fs_preopen(
+        &store.data().capability_world,
+    )
+    .then_some(PreopenReservation {
+        reserved: 0,
+        ticks: 0,
+    });
 
-    store.epoch_deadline_callback(move |_ctx| {
+    store.epoch_deadline_callback(move |ctx| {
+        if let Some(reservation) = preopen.as_mut() {
+            reservation.ticks = reservation.ticks.wrapping_add(1);
+            if reservation.ticks % FS_PREOPEN_CHECK_EVERY_TICKS == 0 {
+                let data = ctx.data();
+                let host_written = data.fs_bytes_written.load(Ordering::Relaxed);
+                if check_preopen(reservation, data.sandbox_dir(), host_written).is_err() {
+                    if let Some(m) = &data.metrics {
+                        m.record_rate_limit_exceeded("fs");
+                    }
+                    return Err(wasmtime::Error::msg(FS_PREOPEN_OVER_CAP_MESSAGE));
+                }
+            }
+        }
         // Hot path: one relaxed atomic load, one Instant compare, one
         // subtraction. No allocation, no lock, no logging.
         let decision = budget.decide(
@@ -339,6 +447,39 @@ fn update_for_continue(ticks: u64) -> UpdateDeadline {
 /// `wasmtime::Error` (what `call_async` returns in wasmtime 47) and
 /// `anyhow::Error` (what the surrounding runtime code uses). One recogniser so
 /// the two cannot drift.
+pub(crate) fn is_fs_cap_error<E>(err: &E) -> bool
+where
+    E: std::fmt::Display + std::fmt::Debug + ?Sized,
+{
+    format!("{err}").contains(FS_CAP_MARKER) || format!("{err:?}").contains(FS_CAP_MARKER)
+}
+
+/// Stable marker in [`FS_PREOPEN_OVER_CAP_MESSAGE`], recognised by the trap
+/// arm as the cancel marker is (same reasoning: an unrecognised trap is
+/// collapsed to an opaque message).
+pub(crate) const FS_CAP_MARKER: &str = "talos:fs-cap";
+
+/// [`is_cancel_preempt_error`]'s twin for the preopen quota stop (E2-2).
+#[allow(dead_code)]
+const _FS_CAP_MARKER_IS_IN_THE_MESSAGE: () =
+    assert!(const_contains(FS_PREOPEN_OVER_CAP_MESSAGE, FS_CAP_MARKER));
+
+const fn const_contains(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    let mut i = 0;
+    while i + n.len() <= h.len() {
+        let mut j = 0;
+        while j < n.len() && h[i + j] == n[j] {
+            j += 1;
+        }
+        if j == n.len() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 pub(crate) fn is_cancel_preempt_error<E>(err: &E) -> bool
 where
     E: std::fmt::Display + std::fmt::Debug + ?Sized,
@@ -350,6 +491,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E2-2 (2026-10-15): the sandbox is measured by apparent size, and a
+    /// sandbox past the per-execution cap is refused — a 65 MiB sparse file
+    /// (no disk used) stands in for a guest's `wasi:filesystem` write.
+    #[test]
+    fn a_preopen_sandbox_past_the_cap_is_refused() {
+        use crate::host::limits::MAX_FS_BYTES_PER_EXECUTION;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/a"), vec![0u8; 1024]).unwrap();
+        assert_eq!(
+            sandbox_bytes(dir.path(), MAX_FS_BYTES_PER_EXECUTION),
+            Some(1024)
+        );
+        let mut reservation = PreopenReservation {
+            reserved: 0,
+            ticks: 0,
+        };
+        assert!(check_preopen(&mut reservation, dir.path(), 0).is_ok());
+        assert_eq!(
+            reservation.reserved, 1024,
+            "the preopen's bytes are reserved"
+        );
+        // Bytes the host function already reserved are not reserved twice.
+        let mut host = PreopenReservation {
+            reserved: 0,
+            ticks: 0,
+        };
+        assert!(check_preopen(&mut host, dir.path(), 1024).is_ok());
+        assert_eq!(host.reserved, 0);
+
+        let big = std::fs::File::create(dir.path().join("big")).unwrap();
+        big.set_len(MAX_FS_BYTES_PER_EXECUTION + 1).unwrap();
+        assert_eq!(sandbox_bytes(dir.path(), MAX_FS_BYTES_PER_EXECUTION), None);
+        let mut past = PreopenReservation {
+            reserved: 0,
+            ticks: 0,
+        };
+        assert!(check_preopen(&mut past, dir.path(), 0).is_err());
+    }
 
     /// RFC 0014 P2: the wall-clock bound stands still while the job waits for
     /// the local-inference slot, and only then.

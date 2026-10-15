@@ -125,3 +125,12 @@ import of the world's interface is read as the narrower world).
 - Inspection now runs on every hinted job too: one `wasmparser` pass over the
   binary's sections, the same pass the hint-less and chain paths already
   made per job.
+
+## Correction, 2026-10-15 (security review round 2, E2-4)
+
+"`JobRequest.capability_world` is not HMAC-bound" above is false, in the safe
+direction: it has been bound since 2026-05-23 (H-3) — `signing_payload` carries
+`lp(capability_world_str)` — so it cannot be stripped or changed on the wire.
+What remains of the stated limit is the uninspectable binary. A hint the worker
+does not recognise is now refused rather than read as "no hint"
+(`2026-10-15-worker-residue.md`, E2-3).

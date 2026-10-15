@@ -3415,7 +3415,9 @@ impl TalosRuntime {
         if let (Some(redis), Some(seal)) = (&self.redis_client, &self.result_cache_seal) {
             if let Ok(mut conn) = talos_redis::multiplexed(redis).await {
                 use redis::AsyncCommands;
-                if let Some(result_str) = crate::result_cache_seal::seal(seal, cache_key, result) {
+                if let Some(result_str) =
+                    crate::result_cache_seal::seal(seal, cache_key, result, ttl_secs)
+                {
                     let _ = conn
                         .set_ex::<_, _, ()>(cache_key, result_str, ttl_secs)
                         .await;
@@ -5147,6 +5149,14 @@ impl TalosRuntime {
                         crate::epoch_budget::CANCEL_PREEMPT_MESSAGE
                     ));
                 }
+                // The preopen sandbox's write quota (E2-2): raised only by this
+                // process's epoch callback, for a filesystem world.
+                if crate::epoch_budget::is_fs_cap_error(&e) {
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        crate::epoch_budget::FS_PREOPEN_OVER_CAP_MESSAGE
+                    ));
+                }
                 if let Some(oom_msg) = oom_msg {
                     return Err(anyhow::anyhow!("{}", oom_msg));
                 }
@@ -5547,6 +5557,14 @@ impl TalosRuntime {
                     return Err(anyhow::anyhow!(
                         "{}",
                         crate::epoch_budget::CANCEL_PREEMPT_MESSAGE
+                    ));
+                }
+                // The preopen sandbox's write quota (E2-2): raised only by this
+                // process's epoch callback, for a filesystem world.
+                if crate::epoch_budget::is_fs_cap_error(&e) {
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        crate::epoch_budget::FS_PREOPEN_OVER_CAP_MESSAGE
                     ));
                 }
                 if let Some(oom_msg) = oom_msg {
@@ -6062,6 +6080,14 @@ impl TalosRuntime {
                         return Err(anyhow::anyhow!(
                             "{}",
                             crate::epoch_budget::CANCEL_PREEMPT_MESSAGE
+                        ));
+                    }
+                    // The preopen sandbox's write quota (E2-2): raised only by this
+                    // process's epoch callback, for a filesystem world.
+                    if crate::epoch_budget::is_fs_cap_error(&e) {
+                        return Err(anyhow::anyhow!(
+                            "{}",
+                            crate::epoch_budget::FS_PREOPEN_OVER_CAP_MESSAGE
                         ));
                     }
                     if let Some(oom_msg) = oom_msg {
@@ -6765,6 +6791,14 @@ impl TalosRuntime {
                     return Err(anyhow::anyhow!(
                         "{}",
                         crate::epoch_budget::CANCEL_PREEMPT_MESSAGE
+                    ));
+                }
+                // The preopen sandbox's write quota (E2-2): raised only by this
+                // process's epoch callback, for a filesystem world.
+                if crate::epoch_budget::is_fs_cap_error(&e) {
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        crate::epoch_budget::FS_PREOPEN_OVER_CAP_MESSAGE
                     ));
                 }
                 if let Some(oom_msg) = oom_msg {

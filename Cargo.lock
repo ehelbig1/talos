@@ -10217,6 +10217,7 @@ dependencies = [
  "serde",
  "talos-capability-world",
  "wasmparser 0.224.1",
+ "wat",
 ]
 
 [[package]]
