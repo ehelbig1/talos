@@ -1696,6 +1696,10 @@ enforced by `clippy.toml`.
   97. a documented env var with NO default must be TRANSPORTED
   98. a module-grant secret read names the user it reads for
   99. a job built with no capability-world hint says why
+  100. bytes for a key, nonce or token come from talos_random, not rand (clippy)
+  101. a token is not minted from Uuid::new_v4()
+  102. every push-channel workflow binding asks workflow_is_bindable
+  103. is_production() is read only where build posture is decided
 
 ### The actor write ceiling → [`2026-10-05-actor-write-ceiling.md`](docs/engineering-log/2026-10-05-actor-write-ceiling.md)
 

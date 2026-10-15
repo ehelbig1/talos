@@ -183,7 +183,7 @@ impl SecretsResolver for ControllerSecretsResolver {
         &self,
         module_id: Uuid,
         user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError> {
+    ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
         self.sm
             .get_module_secrets_for(module_id, user_id)
             .await
@@ -194,7 +194,7 @@ impl SecretsResolver for ControllerSecretsResolver {
         &self,
         paths: &[String],
         user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError> {
+    ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
         // Mint-on-dispatch schemes are partitioned OUT of the vault lookup:
         // they have nothing stored to fetch. Everything else resolves through
         // SecretsManager exactly as before.
@@ -242,7 +242,7 @@ impl SecretsResolver for ControllerSecretsResolver {
                             // Key by the full `github_app:<owner>` path: that's
                             // what the module reads via get_secret(...).
                             Ok(Some(token)) => {
-                                out.insert(path.clone(), token);
+                                out.insert(path.clone(), zeroize::Zeroizing::new(token));
                             }
                             Ok(None) => tracing::warn!(
                                 %owner,
@@ -295,7 +295,7 @@ impl SecretsResolver for ControllerSecretsResolver {
                             // module reads via get_secret(...), and what its
                             // `gcp/impersonated/*` allowed_secrets grant covers.
                             Ok(Some(token)) => {
-                                out.insert(path.clone(), token);
+                                out.insert(path.clone(), zeroize::Zeroizing::new(token));
                             }
                             Ok(None) => tracing::warn!(
                                 named_connection = target.connection.is_some(),
@@ -442,6 +442,15 @@ pub fn standalone_run_paths(granted: &[String], wanted: &[String]) -> Vec<String
         .collect()
 }
 
+/// A resolved map handed to the in-process runtime, whose secret provider
+/// holds plain `String`s: the ONE place a standalone run's values leave the
+/// zeroizing [`talos_workflow_engine_core::SecretMap`] (security review
+/// 2026-10-14, C-10). A dispatch never does this — its map is sealed.
+#[must_use]
+pub fn into_runtime_secrets(map: talos_workflow_engine_core::SecretMap) -> HashMap<String, String> {
+    map.into_iter().map(|(k, v)| (k, v.to_string())).collect()
+}
+
 /// Resolve the secrets of a module run outside a workflow, the way a
 /// dispatch resolves them: stored paths from the vault, mint paths minted.
 ///
@@ -464,7 +473,7 @@ pub async fn resolve_for_standalone_run(
     granted: &[String],
     wanted: &[String],
     user_id: Option<Uuid>,
-) -> Result<HashMap<String, String>, BoxError> {
+) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
     let paths = standalone_run_paths(granted, wanted);
     if paths.is_empty() {
         return Ok(HashMap::new());

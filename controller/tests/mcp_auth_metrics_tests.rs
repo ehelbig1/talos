@@ -372,3 +372,76 @@ async fn the_caller_is_told_why_without_learning_which_tokens_exist() {
     let (status, _, _) = call_raw(&app, ip, Some(&format!("bearer {honest}"))).await;
     assert_eq!(status, StatusCode::OK, "the scheme is case-insensitive");
 }
+
+/// A `?token=` is read on `GET /mcp/sse` and nowhere else (2026-10-14).
+///
+/// The production nesting: the middleware runs inside `nest("/mcp", …)`, as
+/// `mcp_router` mounts it. A VALID agent token in the query admits the SSE
+/// stream (what a browser `EventSource` opens) and is not read on any other
+/// method or path, which answer as if no credential were sent; the same
+/// token in the header is admitted everywhere.
+#[tokio::test]
+async fn a_query_token_is_read_only_on_the_event_stream() {
+    let _counters = COUNTERS.lock().await;
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let user_id = create_test_user(
+        &ctx.auth_service,
+        &format!("mcp-query-{}@example.test", Uuid::new_v4()),
+    )
+    .await;
+    let token = format!("talos_mcp_{}", Uuid::new_v4().simple());
+    seed_agent(&pool, &token, &token, Some(user_id)).await;
+
+    let app = Router::new().nest(
+        "/mcp",
+        Router::new()
+            .route(
+                "/",
+                post(|| async { StatusCode::OK }).get(|| async { StatusCode::OK }),
+            )
+            .route("/sse", axum::routing::get(|| async { StatusCode::OK }))
+            .route("/message", post(|| async { StatusCode::OK }))
+            .route_layer(middleware::from_fn_with_state(
+                pool.clone(),
+                mcp_auth_middleware,
+            )),
+    );
+    let send = |method: &str, uri: String, bearer: bool| {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        if bearer {
+            req.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("header value"),
+            );
+        }
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "203.0.113.141".parse().expect("ip"),
+            40_000,
+        )));
+        let app = app.clone();
+        async move { app.oneshot(req).await.expect("response").status() }
+    };
+
+    assert_eq!(
+        send("GET", format!("/mcp/sse?token={token}"), false).await,
+        StatusCode::OK,
+        "the event stream reads its token from the query"
+    );
+    for (method, path) in [("POST", "/mcp"), ("POST", "/mcp/message"), ("GET", "/mcp")] {
+        assert_eq!(
+            send(method, format!("{path}?token={token}"), false).await,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}: a query token must not be read"
+        );
+        assert_eq!(
+            send(method, path.to_string(), true).await,
+            StatusCode::OK,
+            "{method} {path}: the header token is"
+        );
+    }
+}

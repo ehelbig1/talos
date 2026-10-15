@@ -114,7 +114,7 @@ EXIT_CODE=0
 TREE_PRUNE_FIND=( \( -name .claude -o -name .git \) -prune -o )
 TREE_PRUNE_GREP=( --exclude-dir=.claude --exclude-dir=.git )
 
-# ── clippy `disallowed-methods` rules (checks 29, 53, 63, 78) ─────────
+# ── clippy `disallowed-methods` rules (checks 29, 53, 63, 78, 100) ────
 # Four "never call X outside Y" rules are enforced by CLIPPY, which resolves
 # the call by type — an alias, a re-export or a UFCS call cannot hide one
 # from it, and each could hide from the grep these checks used to run. The
@@ -9599,6 +9599,238 @@ else
     yellow "  → send the module row's world (the one every gate checked),"
     yellow "    or mark it // no-world-hint: <reason>"
     EXIT_CODE=1
+fi
+
+echo
+
+bold "▶ check 100: bytes for a key, nonce or token come from talos_random, not rand"
+
+# CLAUDE.md (2026-10-08): bytes for a key, nonce, salt or bearer token come
+# from `talos_random::fill` / `talos_random::bytes`, never the `rand` crate
+# directly. Nothing enforced it, and the four replay-nonce sites (JobRequest /
+# JobResult signing, the agent envelope, a test helper) were rewritten for
+# rand 0.10 AFTER the rule and kept `rand::rng()` (security review 2026-10-14,
+# C-5). Enforced by CLIPPY (`clippy.toml` `rand::rng` / `rand::random`, which
+# resolves the call by type: an alias or a re-export cannot hide one); this
+# check verifies the config and where each sanctioned allow sits
+# (`scripts/lint-clippy-disallowed.py`, rule 100: tests, and the one marked
+# retry-jitter use in `talos-worker-runtime/src/runtime.rs`).
+# Measured: 5 calls on main @ 4f32b26b (the four nonce sites + the jitter);
+# 1 after (the jitter, sanctioned). Limit: `rand::Rng` methods on an
+# explicitly constructed generator are not covered; none exist outside
+# `talos-random`.
+if ! clippy_disallowed_rule 100; then
+    yellow "  → use talos_random::bytes::<N>() / talos_random::fill(&mut buf);"
+    yellow "    a non-secret use carries // disallowed-method: <path> — <reason> + #[allow(clippy::disallowed_methods)]"
+fi
+
+echo
+
+bold "▶ check 101: a token is not minted from Uuid::new_v4()"
+
+# CLAUDE.md (2026-10-08): bytes for a key, nonce, salt or bearer token come
+# from `talos_random::fill` / `talos_random::bytes`. A UUIDv4 carries 122
+# random bits, but it is not the sanctioned source, and the `rand`-crate grep
+# that guards the rule cannot see it. Until 2026-10-14 the MCP
+# `create_webhook` minted the webhook's bearer `verification_token` as
+# `Uuid::new_v4().to_string()` (security review 2026-10-14, G-25); both
+# create paths now call `talos_webhook_repository::mint_verification_token`.
+#
+# Refuses a binding whose NAME contains `token` (case-insensitive, not ending
+# in `_id`/`_ids` — the id of a token row is not a token) when its VALUE is a
+# UUID: `let <name> = [uuid::]Uuid::new_v4()…`, the same inside `format!(…)`,
+# or a struct field `<name>: [uuid::]Uuid::new_v4()…`. Test code is skipped
+# by path (`/tests/`, `*_tests.rs`, `tests.rs`); comment lines are skipped.
+# Opt-out: `// allow-uuid-token: <reason>` on the line or one of the 3 above.
+# Measured: on main @ a8ede4a9, 1 hit outside test paths (the G-25 defect,
+# talos-mcp-handlers/src/webhooks.rs) and 6 in test paths (skipped: four
+# OAuth `state_token`s, one `tok-<uuid>` header, one `token_id`); 0 after;
+# 0 false positives. Limit: textual and one line — a UUID bound to another
+# name first and then renamed to a token is not seen, nor is a token
+# assembled across lines.
+CK101_HITS=0
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"; rest="${hit#*:}"; lineno="${rest%%:*}"; text="${rest#*:}"
+    case "$file" in */tests/*|*_tests.rs|*/tests.rs) continue ;; esac
+    case "$(printf '%s' "$text" | sed -E 's/^[[:space:]]+//')" in //*) continue ;; esac
+    start=$((lineno > 3 ? lineno - 3 : 1))
+    if sed -n "${start},${lineno}p" "$file" | grep -q 'allow-uuid-token:'; then
+        continue
+    fi
+    printf '  %s\n' "$hit"
+    CK101_HITS=$((CK101_HITS + 1))
+done < <(cd "$ROOT" && grep -rEin --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" \
+            '(let[[:space:]]+(mut[[:space:]]+)?[a-z0-9_]*token[a-z0-9_]*[[:space:]]*(:[^=]*)?=[[:space:]]*(format!\([^;]*)?|[a-z0-9_]*token[a-z0-9_]*[[:space:]]*:[[:space:]]*)(uuid::)?Uuid::new_v4\(\)' . 2>/dev/null \
+        | grep -viE '(let[[:space:]]+(mut[[:space:]]+)?|[[:space:]])[a-z0-9_]*token[a-z0-9_]*_ids?[[:space:]]*[:=]' || true)
+if [ "$CK101_HITS" -gt 0 ]; then
+    red "✗ $CK101_HITS token(s) minted from Uuid::new_v4()"
+    yellow "  → mint from talos_random::bytes / talos_random::fill (a webhook token: talos_webhook_repository::mint_verification_token)"
+    yellow "  → or mark it // allow-uuid-token: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ no token minted from Uuid::new_v4()"
+fi
+
+echo
+
+bold "▶ check 102: every push-channel workflow binding asks workflow_is_bindable"
+
+# A push channel's workflow binding names what a push on it starts. Until
+# 2026-10-14 only Gmail asked whether the workflow could be bound; Google
+# Calendar, Google Cloud and Jira each read `get_workflow(user)` themselves
+# and bound an archived or disabled workflow, which the trigger then refused
+# at every push (security review 2026-10-14, F-7). The one question is now
+# `talos_integration_helpers::watch_binding::workflow_is_bindable`: ownership
+# AND the trigger's own dispatch gate.
+#
+# For every definition of `fn bind_channel_workflow` / `fn
+# bind_registration_workflow` (free functions, closed by the next line that is
+# a bare `}` at column 0), the body must call `workflow_is_bindable(` and must
+# not call `get_workflow(` itself. Opt-out: `// allow-unchecked-workflow-binding:
+# <reason>` inside the body. Measured: on main @ a8ede4a9, 4 definitions, 3
+# hits (gcal, gcp, atlassian; gmail asked a private copy); 0 after; 0 false
+# positives. Limit: a create path that names a workflow (gmail's
+# `create_watch`) is not a bind function by name and is not checked here —
+# it calls the same function, pinned by its DB test.
+CK102_HITS=0
+CK102_DEFS=0
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    while IFS= read -r verdict; do
+        [ -z "$verdict" ] && continue
+        CK102_DEFS=$((CK102_DEFS + 1))
+        case "$verdict" in
+            OK:*) ;;
+            *) printf '  %s:%s\n' "$file" "${verdict#*:}"; CK102_HITS=$((CK102_HITS + 1)) ;;
+        esac
+    done < <(awk '
+        /^(pub(\([a-z]+\))? )?async fn bind_(channel|registration)_workflow[^A-Za-z0-9_]/ { inb=1; start=NR; body=""; next }
+        inb { body = body "\n" $0 }
+        inb && /^}/ {
+            inb=0
+            if (body ~ /allow-unchecked-workflow-binding:/) { print "OK:" start; next }
+            if (body ~ /workflow_is_bindable\(/ && body !~ /get_workflow\(/) { print "OK:" start }
+            else if (body !~ /workflow_is_bindable\(/) { print "MISSING:" start ": does not call workflow_is_bindable" }
+            else { print "HANDROLLED:" start ": reads get_workflow itself" }
+        }' "$ROOT/$file")
+done < <(cd "$ROOT" && grep -rlE --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" \
+            'async fn bind_(channel|registration)_workflow' . 2>/dev/null | sed 's|^\./||' || true)
+if [ "$CK102_DEFS" -eq 0 ]; then
+    red "✗ check 102 matched no bind_channel_workflow definition — the scan is broken, not the code"
+    EXIT_CODE=1
+elif [ "$CK102_HITS" -gt 0 ]; then
+    red "✗ $CK102_HITS push-channel workflow binding(s) skip workflow_is_bindable"
+    yellow "  → call talos_integration_helpers::watch_binding::workflow_is_bindable (ownership + the trigger's dispatch gate)"
+    yellow "  → or mark it // allow-unchecked-workflow-binding: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ every push-channel workflow binding asks workflow_is_bindable ($CK102_DEFS definitions)"
+fi
+
+echo
+
+bold "▶ check 103: is_production() is read only where build posture is decided"
+
+# Two predicates name the deployment: `talos_config::is_production()`
+# (`RUST_ENV == "production"`) and
+# `talos_auth_types::browser_hardening_required()` (every RUST_ENV but the
+# development spellings). `docker-compose.prod.yml` faces real users under
+# RUST_ENV=staging, deliberately (its plaintext backends cannot pass the
+# production TLS gates). Until 2026-10-14 the /mcp/local mount, the WebSocket
+# Origin requirement, the CSP, HSTS's default, every request-rate limiter, the
+# auth limiters' fail-closed policy, GraphQL introspection and error scrubbing,
+# the GraphQL playground, the OAuth connect cookie's `Secure`, the
+# ALLOWED_ORIGIN rule set, the unauthenticated catalog publish and the 2FA and
+# API-key fail-closed gates all keyed on `is_production()` and relaxed there
+# (security review 2026-10-14, A-5/A-6).
+#
+# The rule: `is_production()` decides BUILD / INFRASTRUCTURE posture only —
+# TLS to the backends, the KEK, required keys, Sigstore, the compilation
+# sandbox, the worker, the audit sink, RLS and DB-sandbox posture, the
+# signed-RPC replay policy. Anything a browser or a tenant meets uses
+# `browser_hardening_required()`. This check lists the files where an
+# `is_production()` / `is_development()` call or qualified reference may
+# appear; a file not on the list fails, so a new call site must be classified
+# (add the file here with its reason) instead of being copied in. A listed
+# file that no longer reads it fails too, so the list only shrinks.
+# Scope: every *.rs outside target/; comment lines skipped.
+# Measured on main @ 176a8b56 (before the change): 84 matching lines in 36
+# files. Run there with this list, the check flags 19 lines in 11 files —
+# every one a site the change moved (0 false positives). The change moved 24
+# call sites and deleted one re-export; the other 6 sit in files that keep a
+# build-posture read (services.rs, main.rs, talos-api-keys, talos-config), so
+# a FILE list cannot see them — the resolution of this check is the file.
+# After: 59 lines in the 25 listed files, 0 hits.
+# Limit: textual and per file — `use talos_config::is_production as p;` then
+# `p()` is seen at the `use`, not at the call, and a new read inside a listed
+# file passes.
+CK103_ALLOWED=(
+    # The definition's own crate (is_development, the origin parser's arg).
+    talos-config/src/lib.rs
+    # Boot posture gates: RLS, DB sandbox, dispatch scheme, backend TLS,
+    # env-KEK, worker key, admin-query login, non-dumpable process.
+    controller/src/bootstrap/services.rs
+    controller/src/bootstrap/admin_query_login.rs
+    controller/src/cli.rs
+    controller/src/main.rs
+    talos-advanced-repository/src/lib.rs
+    talos-config-validator/src/lib.rs
+    talos-db/src/lib.rs
+    talos-engine/src/nats_run.rs
+    talos-rpc-subscribers/src/lib.rs
+    talos-secrets-manager/src/vault_kek_provider.rs
+    talos-replay-guard/src/lib.rs
+    # The API-key bcrypt cost floor (operator config, not a request path).
+    talos-api-keys/src/lib.rs
+    # Audit sink, DLP endpoint TLS, the posture report.
+    talos-audit-event/src/lib.rs
+    talos-dlp-provider/src/lib.rs
+    talos-security-audit/src/lib.rs
+    # Supply chain: Sigstore policy, registry TLS downgrade, compilation.
+    talos-registry/src/sync.rs
+    talos-compilation/src/advisory_db.rs
+    talos-compilation/src/container.rs
+    talos-compilation/src/lib.rs
+    # The worker process (no browser surface). host/limits.rs (dev egress
+    # opt-ins) and host/secrets.rs (tier-2 expose cap) face tenants and are
+    # a recorded follow-up (package 2026-10-14-browser-hardening-predicate).
+    talos-worker-runtime/src/host/limits.rs
+    talos-worker-runtime/src/host/secrets.rs
+    talos-worker-runtime/src/module_fetcher.rs
+    talos-worker-runtime/src/runtime.rs
+    worker/src/main.rs
+)
+CK103_HITS=0
+CK103_SEEN=" "
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"; file="${file#./}"; rest="${hit#*:}"; text="${rest#*:}"
+    case "$(printf '%s' "$text" | sed -E 's/^[[:space:]]+//')" in //*) continue ;; esac
+    case "$text" in *"fn is_production()"*|*"fn is_development()"*) continue ;; esac
+    CK103_SEEN="${CK103_SEEN}${file} "
+    allowed=0
+    for f in "${CK103_ALLOWED[@]}"; do [ "$f" = "$file" ] && allowed=1 && break; done
+    if [ "$allowed" -eq 0 ]; then
+        printf '  %s\n' "$hit"
+        CK103_HITS=$((CK103_HITS + 1))
+    fi
+done < <(cd "$ROOT" && grep -rEn --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" \
+            '(^|[^A-Za-z0-9_])is_(production|development)[[:space:]]*\(|::is_(production|development)([^A-Za-z0-9_]|$)' . 2>/dev/null || true)
+CK103_STALE=0
+for f in "${CK103_ALLOWED[@]}"; do
+    case "$CK103_SEEN" in *" $f "*) ;; *)
+        printf '  %s is listed but no longer reads is_production() — remove it from check 103\n' "$f"
+        CK103_STALE=$((CK103_STALE + 1)) ;;
+    esac
+done
+if [ "$CK103_HITS" -gt 0 ] || [ "$CK103_STALE" -gt 0 ]; then
+    red "✗ $CK103_HITS unclassified is_production() read(s), $CK103_STALE stale list entr(y/ies)"
+    yellow "  → a control a browser or tenant meets: talos_auth_types::browser_hardening_required()"
+    yellow "  → build/infrastructure posture: keep is_production() and add the file to CK103_ALLOWED with its reason"
+    EXIT_CODE=1
+else
+    green "✓ is_production() is read only in the ${#CK103_ALLOWED[@]} files that decide build posture"
 fi
 
 echo

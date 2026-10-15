@@ -300,3 +300,44 @@ async fn a_disconnect_that_cannot_delete_a_token_reports_it() {
     .unwrap();
     assert!(!active, "the credential row is retired all the same");
 }
+
+/// C-9 (2026-10-14): `oauth_state_tokens` has row security. A session scoped
+/// to one user sees that user's pending consents only — not another user's,
+/// not a login row (which has no user) — while an unscoped session, the one
+/// every OAuth flow statement runs on, still sees all of them.
+#[tokio::test]
+async fn a_scoped_session_sees_only_its_own_pending_oauth_states() {
+    let w = world().await;
+    let a = seed_user(&w.pool).await;
+    let b = seed_user(&w.pool).await;
+    assert_role_is_enforced(&w.pool, a).await;
+    for (user, token) in [
+        (Some(a), "state-a"),
+        (Some(b), "state-b"),
+        (None, "state-login"),
+    ] {
+        sqlx::query(
+            "INSERT INTO oauth_state_tokens (state_token, provider, expires_at, user_id) \
+             VALUES ($1, 'test', now() + interval '10 minutes', $2)",
+        )
+        .bind(format!("{token}-{}", Uuid::new_v4().simple()))
+        .bind(user)
+        .execute(&w.pool)
+        .await
+        .expect("seed state");
+    }
+    let mut tx = talos_db::begin_user_scoped(&w.pool, a).await.expect("tx");
+    let seen: Vec<Option<Uuid>> =
+        sqlx::query_scalar("SELECT user_id FROM oauth_state_tokens WHERE provider = 'test'")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("scoped read");
+    assert_eq!(seen, vec![Some(a)]);
+    drop(tx);
+    let all: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM oauth_state_tokens WHERE provider = 'test'")
+            .fetch_one(&w.pool)
+            .await
+            .expect("unscoped read");
+    assert_eq!(all, 3);
+}

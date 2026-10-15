@@ -8,7 +8,8 @@ pub struct WebhookTrigger {
     pub name: String,
     pub module_id: Option<Uuid>,
     pub workflow_id: Option<Uuid>,
-    pub verification_token: Option<String>,
+    /// Hex SHA-256 of the static verification token (F-3); never the token.
+    pub verification_token_hash: Option<String>,
     /// Encrypted signing secret (nonce || ciphertext). Decrypted on demand via SecretsManager.
     /// The legacy plaintext `signing_secret` column has been removed.
     pub signing_secret_enc: Option<Vec<u8>>,
@@ -52,8 +53,8 @@ impl std::fmt::Debug for WebhookTrigger {
             .field("module_id", &self.module_id)
             .field("workflow_id", &self.workflow_id)
             .field(
-                "verification_token",
-                &self.verification_token.as_ref().map(|_| "[REDACTED]"),
+                "verification_token_hash",
+                &self.verification_token_hash.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
                 "signing_secret_enc",
@@ -90,6 +91,31 @@ pub(crate) fn webhook_must_fail_closed_on_hmac(
     hmac_secret_resolved: bool,
 ) -> bool {
     hmac_configured && !hmac_secret_resolved
+}
+
+/// Does a delivered `X-Verification-Token` match the trigger's stored hash?
+///
+/// The row holds only `verification_token_hash` (security review 2026-10-14,
+/// F-3), so the delivered token is hashed with the SAME function the create
+/// stored with (`talos_webhook_repository::verification_token_hash`) and the
+/// two hex digests are compared in constant time — the
+/// `approval_token_matches` shape. An empty stored hash or an empty delivered
+/// token never authenticates: `ct_eq(&[], &[])` is 1, the MCP-629 bypass
+/// class, and the SHA-256 of an empty header is a real digest that a row
+/// written with an empty token would match.
+///
+/// Pure, so the authentication decision is tested without a database.
+pub(crate) fn verification_token_matches(stored_hash: &str, provided: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    if stored_hash.is_empty() || provided.is_empty() {
+        return false;
+    }
+    let provided_hash = talos_webhook_repository::verification_token_hash(provided);
+    stored_hash
+        .as_bytes()
+        .ct_eq(provided_hash.as_bytes())
+        .unwrap_u8()
+        == 1
 }
 
 /// RFC 0007: does a verified delivery match the trigger's `event_filter`?
@@ -415,6 +441,56 @@ mod timestamp_skew_tests {
                 "ts={ts} produced skew={skew}, which would PASS the freshness gate"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod verification_token_hash_tests {
+    use super::verification_token_matches;
+    use talos_webhook_repository::{mint_verification_token, verification_token_hash};
+
+    /// F-3: the row holds the hash; the right token, hashed, matches it.
+    #[test]
+    fn the_hash_path_accepts_the_right_token() {
+        let token = mint_verification_token();
+        let stored = verification_token_hash(&token);
+        assert!(verification_token_matches(&stored, &token));
+    }
+
+    /// A wrong token, the stored hash itself presented as the token, and a
+    /// token that differs in one character are all refused.
+    #[test]
+    fn the_hash_path_refuses_a_wrong_token() {
+        let token = mint_verification_token();
+        let stored = verification_token_hash(&token);
+        assert!(!verification_token_matches(
+            &stored,
+            &mint_verification_token()
+        ));
+        assert!(
+            !verification_token_matches(&stored, &stored),
+            "the stored digest is not itself a credential"
+        );
+        let mut near = token.clone();
+        near.pop();
+        near.push(if token.ends_with('0') { '1' } else { '0' });
+        assert!(!verification_token_matches(&stored, &near));
+    }
+
+    /// The empty guard survives the move to hashes (MCP-629): an empty
+    /// header never authenticates, not even against a row written with an
+    /// empty token, and an empty stored hash authenticates nothing.
+    #[test]
+    fn the_hash_path_refuses_an_empty_token() {
+        let stored_for_empty = verification_token_hash("");
+        assert!(!verification_token_matches(&stored_for_empty, ""));
+        let token = mint_verification_token();
+        assert!(!verification_token_matches(
+            &verification_token_hash(&token),
+            ""
+        ));
+        assert!(!verification_token_matches("", &token));
+        assert!(!verification_token_matches("", ""));
     }
 }
 

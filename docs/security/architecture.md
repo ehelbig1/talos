@@ -278,8 +278,10 @@ Login, 2FA verification and token refresh are GraphQL mutations (`login`,
 
 A 12-hex-character backup code is accepted in place of a TOTP code (bcrypt-verified
 against the stored backup codes on a blocking thread, and spent by one conditional
-`UPDATE`, so a code verifies once). In production, `verifyTwoFactor` refuses to run
-when no Redis client is configured (`talos-totp-2fa/src/lib.rs`).
+`UPDATE`, so a code verifies once). Wherever browser hardening is required (every
+`RUST_ENV` but the development spellings; only `production` until 2026-10-14),
+`verifyTwoFactor` refuses to run when no Redis client is configured
+(`talos-totp-2fa/src/lib.rs`).
 
 ### 3.2 JWT Validation
 
@@ -288,10 +290,30 @@ when no Redis client is configured (`talos-totp-2fa/src/lib.rs`).
 | Algorithm | Pinned to the configured `JWT_ALGORITHM` — `HS256` (default), `RS256` or `ES256`; a token signed with any other algorithm is rejected. During a key/algorithm migration the previous key pair's algorithm is also accepted | `talos-auth/src/lib.rs::verify_token` |
 | Issuer claim | Required, and must match `"talos"`; a token with no `iss` is refused | `Claims.iss` field, validated in `verify_token` |
 | Critical header extensions | A header with `crit` is refused: the verifier understands none (RFC 7515 §4.1.11). The Google push-token verifier applies the same rule | `refuse_critical_extensions` in `talos-auth/src/lib.rs`; `talos-integration-helpers/src/google_jwt.rs::verify_signed` |
-| Audience claim | If present, must be `"talos"`; tokens with no `aud` are accepted unless `JWT_REQUIRE_AUD=true` | `talos-auth/src/lib.rs::verify_token` |
+| Audience claim | Required, and must be `"talos"`; a token with no `aud` is refused (since 2026-10-14; `JWT_REQUIRE_AUD` no longer exists) | `talos-auth/src/lib.rs::verify_token` |
 | Expiration | 15-minute TTL | `Claims.exp` checked by jsonwebtoken crate |
 | 2FA status | `is_2fa_verified` claim: the session is not waiting for its 2FA code. It is `true` for an account with no second factor enrolled, so `require_2fa` refuses only a half-finished 2FA login | `require_2fa` on ordinary mutations (`talos-api/src/schema/mod.rs`) |
 | Verified second factor | `second_factor_verified` claim, also stored on the session row and carried across refresh. Set only when a TOTP or backup code was verified (a 2FA login, or the session that enrolled); absent on older tokens, which read as `false` | `require_second_factor` on the privileged operations: master-key and DEK rotation, the re-encryption sweeps, API-key creation and rotation, MCP agent registration, capability grants, audit settings and ownership transfer. It refuses API keys, requires the verified flag, and re-reads that 2FA is still enrolled (`talos-api/src/schema/mod.rs`) |
+
+#### The access-token revocation window (accepted, 2026-10-14)
+
+An access token is not revocable before it expires. Every revocation path —
+"sign out everywhere" (`revoke_all_sessions`), revoking pre-2FA sessions, a
+password change, disabling 2FA, and refresh-token reuse detection — deletes
+`refresh_tokens` rows; `verify_token` consults no denylist and the token
+carries no `jti`. So a party already holding an access token keeps the session
+it represents for **at most 15 minutes** (its `exp`) after any of those events,
+and cannot refresh it. The WebSocket lane closes a socket at the token's own
+expiry, so it is bounded the same way.
+
+This is accepted as the platform's posture (operator decision D-7, recorded in
+`docs/engineering-log/packages/2026-10-14-browser-hardening-predicate.md`). The
+alternative, not built: a `jti` on every access token and a Redis
+`user_id → not_before` entry written by each revocation path and read by
+`verify_token` (one `GET` per authenticated request; fail open to the 15-minute
+window when Redis is unreachable). Revisit if the access-token TTL is raised,
+or if a revocation must take effect at once (an incident response that cannot
+wait 15 minutes).
 
 ### 3.3 API Key Authentication
 
@@ -301,8 +323,10 @@ when no Redis client is configured (`talos-totp-2fa/src/lib.rs`).
 
   Validation (talos-api-keys/src/lib.rs::validate_key):
   1. Constant-time check of the literal "talos_sk_" prefix (subtle::ConstantTimeEq)
-  2. Rate limit: 60 validations/min per 8-hex key prefix (Redis when configured,
-     plus an in-process counter)
+  2. Rate limit: 60 FAILED validations/min per (8-hex key prefix, caller
+     address) — a caller who spends it locks out only itself, not the key's
+     owner (2026-10-14); a correct key is never limited. Redis when
+     configured, plus an in-process counter
   3. Candidate lookup by the 8-hex `key_prefix` column (active keys only)
   4. Expiry check, then bcrypt verification of the full key against each candidate
   5. last_used_at / usage_count updated (atomic re-check that the key is still active)

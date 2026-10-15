@@ -1422,7 +1422,7 @@ mod oauth_repair_tests {
             &self,
             _node_id: Uuid,
             _user_id: Option<Uuid>,
-        ) -> Result<HashMap<String, String>, BoxError> {
+        ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
             Ok(HashMap::new())
         }
 
@@ -1430,11 +1430,16 @@ mod oauth_repair_tests {
             &self,
             paths: &[String],
             _user_id: Option<Uuid>,
-        ) -> Result<HashMap<String, String>, BoxError> {
+        ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
             self.log.lock().expect("log mutex").push("resolve");
             Ok(paths
                 .iter()
-                .map(|p| (p.clone(), "token-bytes".to_string()))
+                .map(|p| {
+                    (
+                        p.clone(),
+                        zeroize::Zeroizing::new("token-bytes".to_string()),
+                    )
+                })
                 .collect())
         }
 

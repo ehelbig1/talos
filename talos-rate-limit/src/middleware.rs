@@ -18,7 +18,11 @@ use std::time::Duration;
 
 /// Cached environment flags to avoid re-parsing on every request.
 struct RateLimitEnvConfig {
-    is_production: bool,
+    /// `talos_auth_types::browser_hardening_required()` — every `RUST_ENV`
+    /// but the development spellings. Until 2026-10-14 this was
+    /// `is_production()`, so `RUST_ENV=staging` (`docker-compose.prod.yml`,
+    /// which faces real users) ran with per-IP limiting OFF.
+    hardening_required: bool,
     enforce_in_dev: bool,
 }
 
@@ -26,7 +30,7 @@ static RATE_LIMIT_ENV: OnceLock<RateLimitEnvConfig> = OnceLock::new();
 
 fn rate_limit_env() -> &'static RateLimitEnvConfig {
     RATE_LIMIT_ENV.get_or_init(|| {
-        let is_production = crate::is_production();
+        let hardening_required = talos_auth_types::browser_hardening_required();
         // MCP-1073 (2026-05-16): canonical bool-env helper. Pre-fix
         // `== "true"` case-sensitive exact-match — `=1` / `=yes` etc.
         // got the FALSE branch. OnceLock-cached so the env read is
@@ -34,10 +38,31 @@ fn rate_limit_env() -> &'static RateLimitEnvConfig {
         // with the workspace-wide pattern.
         let enforce_in_dev = talos_config::bool_env_or_default("ENFORCE_RATE_LIMITS_IN_DEV", false);
         RateLimitEnvConfig {
-            is_production,
+            hardening_required,
             enforce_in_dev,
         }
     })
+}
+
+/// The fallback policy [`DistributedRateLimiter::auto`] uses when Redis is
+/// unreachable: `FailClosed` wherever browser hardening is required (every
+/// `RUST_ENV` but the development spellings), `FailOpen` (the in-memory
+/// limiter) in development. These limiters guard login, signup, token refresh
+/// and 2FA; until 2026-10-14 the choice followed `is_production()`.
+pub fn auto_fallback_policy() -> RateLimitFallbackPolicy {
+    if talos_auth_types::browser_hardening_required() {
+        RateLimitFallbackPolicy::FailClosed
+    } else {
+        RateLimitFallbackPolicy::FailOpen
+    }
+}
+
+/// Whether the per-IP middleware, the global limiter and the governor are
+/// applied: wherever browser hardening is required, or when
+/// `ENFORCE_RATE_LIMITS_IN_DEV` is set. Read once per process.
+pub fn ip_rate_limits_enforced() -> bool {
+    let env = rate_limit_env();
+    env.hardening_required || env.enforce_in_dev
 }
 
 /// Helper to read a rate‑limit configuration value from the environment.
@@ -166,6 +191,37 @@ impl IpWhitelist {
     }
 }
 
+/// Does the configuration say a proxy is in front while trusting none?
+///
+/// `cidrs_set` is whether `TRUSTED_PROXY_CIDRS` named anything;
+/// `allowed_origin` is the raw `ALLOWED_ORIGIN` (comma-separated). True when no
+/// CIDR is trusted and at least one allowed origin's host is not loopback
+/// (`localhost`, `127.0.0.1`, `[::1]`): a browser served from another name
+/// reaches the controller through something, and that something's address
+/// becomes every client's (A-3, 2026-10-14). Pure, so the warning has a test.
+pub fn proxy_trust_looks_missing(cidrs_set: bool, allowed_origin: &str) -> bool {
+    if cidrs_set {
+        return false;
+    }
+    allowed_origin
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .any(|origin| {
+            let rest = origin.split_once("://").map_or(origin, |(_, r)| r);
+            let authority = rest.split('/').next().unwrap_or("");
+            let host = if let Some(v6) = authority.strip_prefix('[') {
+                v6.split(']').next().unwrap_or("")
+            } else {
+                authority.split(':').next().unwrap_or("")
+            };
+            !matches!(
+                host.to_ascii_lowercase().as_str(),
+                "localhost" | "127.0.0.1" | "::1"
+            )
+        })
+}
+
 /// Trusted proxy configuration.
 #[derive(Clone)]
 pub struct TrustedProxies(IpWhitelist);
@@ -176,9 +232,22 @@ impl TrustedProxies {
         let cidrs = std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default();
         let loopback = "127.0.0.1,::1";
         let cidrs = if cidrs.is_empty() {
-            tracing::info!(
-                "TRUSTED_PROXY_CIDRS not set — X-Forwarded-For will only be trusted from loopback"
-            );
+            let allowed_origin = std::env::var("ALLOWED_ORIGIN").unwrap_or_default();
+            if proxy_trust_looks_missing(false, &allowed_origin) {
+                // A browser origin that is not this machine means a proxy is
+                // in front, and with no trusted CIDR the proxy's address is
+                // every client's: one rate-limit bucket for everyone (A-3).
+                tracing::warn!(
+                    "TRUSTED_PROXY_CIDRS not set while ALLOWED_ORIGIN names a non-loopback \
+                     origin — a reverse proxy is almost certainly in front, and every client \
+                     will be rate-limited as the proxy's address. Set TRUSTED_PROXY_CIDRS to \
+                     the proxy's network."
+                );
+            } else {
+                tracing::info!(
+                    "TRUSTED_PROXY_CIDRS not set — X-Forwarded-For will only be trusted from loopback"
+                );
+            }
             loopback.to_string()
         } else {
             format!("{},{}", cidrs, loopback)
@@ -464,8 +533,7 @@ pub async fn rate_limit_middleware(
     let bucket = rate_limit_key(ip_addr).to_string();
 
     // Disable rate limiting completely in development unless explicitly enforced
-    let env = rate_limit_env();
-    if !env.is_production && !env.enforce_in_dev {
+    if !ip_rate_limits_enforced() {
         let response = next.run(request).await;
         return Ok(response);
     }
@@ -715,18 +783,13 @@ impl DistributedRateLimiter {
     }
 
     /// Create a distributed rate limiter that auto-detects the fallback policy
-    /// based on the environment: `FailClosed` in production, `FailOpen` in development.
+    /// from the environment: [`auto_fallback_policy`].
     pub fn auto(
         redis_client: Option<Arc<redis::Client>>,
         config: RateLimitConfig,
         prefix: &str,
     ) -> Self {
-        let policy = if crate::is_production() {
-            RateLimitFallbackPolicy::FailClosed
-        } else {
-            RateLimitFallbackPolicy::FailOpen
-        };
-        Self::with_policy(redis_client, config, prefix, policy)
+        Self::with_policy(redis_client, config, prefix, auto_fallback_policy())
     }
 
     pub async fn check(&self, identifier: &str) -> bool {
@@ -870,6 +933,30 @@ impl DistributedRateLimiter {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    /// A-3 (2026-10-14): the boot WARN fires when a browser origin other than
+    /// this machine is allowed and no proxy CIDR is trusted — the shape of
+    /// `docker-compose.prod.yml` before it declared `TRUSTED_PROXY_CIDRS`.
+    #[test]
+    fn a_public_origin_with_no_trusted_proxy_is_named() {
+        assert!(proxy_trust_looks_missing(false, "https://app.example.com"));
+        assert!(proxy_trust_looks_missing(
+            false,
+            "http://localhost:3000, https://app.example.com:8443"
+        ));
+        assert!(proxy_trust_looks_missing(false, "https://10.0.0.5"));
+        // Configured: no warning, whatever the origin.
+        assert!(!proxy_trust_looks_missing(true, "https://app.example.com"));
+        // Only this machine: no proxy implied.
+        for local in [
+            "",
+            "http://localhost:3000",
+            "http://127.0.0.1:3002,http://LOCALHOST",
+            "http://[::1]:3000",
+        ] {
+            assert!(!proxy_trust_looks_missing(false, local), "{local:?}");
+        }
+    }
 
     fn trusted(cidrs: &str) -> TrustedProxies {
         TrustedProxies(IpWhitelist::from_string(cidrs).expect("valid cidrs"))

@@ -11,10 +11,10 @@ dist/
 .turbo/
 .next/
 
-# Env files never belong in images.
-.env
-.env.local
-.env.*.local
+# Env files never belong in images — every one of them, `.env.production`
+# included: Vite bakes a `VITE_*` value from it into `dist/` (H-7, 2026-10-14).
+# Same pattern as the root .dockerignore.
+.env*
 
 # Build artifacts + IDE noise.
 *.log

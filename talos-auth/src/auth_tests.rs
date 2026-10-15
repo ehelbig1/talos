@@ -456,12 +456,15 @@ async fn test_jwt_wrong_audience_rejected() {
     assert!(result.is_err(), "Tokens with wrong aud must be rejected");
 }
 
+/// A token with no `aud` is refused (2026-10-14). It was accepted here, for a
+/// migration window that closed long ago (every token issued since 2026-05
+/// carries `aud`, and an access token lives 15 minutes).
 #[tokio::test]
-async fn test_jwt_missing_audience_accepted_for_migration() {
+async fn test_jwt_missing_audience_is_refused() {
     let service = test_service();
     let user = test_user();
 
-    // Manually craft a token without the audience claim (legacy token)
+    // Manually craft a token without the audience claim
     let now = Utc::now();
     let claims = Claims {
         sub: user.id.to_string(),
@@ -482,10 +485,7 @@ async fn test_jwt_missing_audience_accepted_for_migration() {
     .unwrap();
 
     let result = service.verify_token(&token);
-    assert!(
-        result.is_ok(),
-        "Legacy tokens without aud must still be accepted during migration window"
-    );
+    assert!(result.is_err(), "a token without aud must be refused");
 }
 
 /// MCP-1147 (2026-05-16): refresh rate-limiter max-entries cap.
@@ -1180,9 +1180,9 @@ async fn the_session_verifier_accepts_and_refuses_what_it_is_recorded_to() {
             REFUSED,
         ),
         (
-            "no aud (legacy tokens; JWT_REQUIRE_AUD refuses it)",
+            "no aud (refused since 2026-10-14; no switch admits it)",
             own(without("aud")),
-            ACCEPTED,
+            REFUSED,
         ),
         (
             "nbf in the future (not issued, not checked)",

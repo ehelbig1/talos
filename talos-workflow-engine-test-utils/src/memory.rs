@@ -360,11 +360,15 @@ impl SecretsResolver for InMemorySecretsResolver {
         &self,
         node_id: Uuid,
         _user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError> {
+    ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
         Ok(self
             .module_secrets
             .get(&node_id)
-            .map(|e| e.clone())
+            .map(|e| {
+                e.iter()
+                    .map(|(k, v)| (k.clone(), zeroize::Zeroizing::new(v.clone())))
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -372,11 +376,11 @@ impl SecretsResolver for InMemorySecretsResolver {
         &self,
         paths: &[String],
         _user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError> {
+    ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
         let mut out = HashMap::with_capacity(paths.len());
         for path in paths {
             if let Some(v) = self.vault.get(path) {
-                out.insert(path.clone(), v.clone());
+                out.insert(path.clone(), zeroize::Zeroizing::new(v.clone()));
             }
         }
         Ok(out)
@@ -595,13 +599,13 @@ mod tests {
             .with_llm_key(user, "anthropic", "secret-c");
 
         let m = r.resolve_module_secrets(node, Some(user)).await.unwrap();
-        assert_eq!(m.get("API_KEY"), Some(&"secret-a".to_string()));
+        assert_eq!(m.get("API_KEY").map(|v| v.as_str()), Some("secret-a"));
 
         let v = r
             .resolve_by_paths(&["stripe/key".into(), "missing".into()], Some(user))
             .await
             .unwrap();
-        assert_eq!(v.get("stripe/key"), Some(&"secret-b".to_string()));
+        assert_eq!(v.get("stripe/key").map(|v| v.as_str()), Some("secret-b"));
         assert_eq!(v.get("missing"), None);
 
         let l = r.resolve_llm_keys(Some(user)).await.unwrap();

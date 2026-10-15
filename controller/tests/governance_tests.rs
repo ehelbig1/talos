@@ -104,7 +104,7 @@ async fn test_webhook_dlq_flow() {
 
     // 2. Seed a webhook trigger
     let trigger_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO webhook_triggers (id, user_id, name, module_id, verification_token, enabled) VALUES ($1, $2, $3, $4, $5, $6)")
+    sqlx::query("INSERT INTO webhook_triggers (id, user_id, name, module_id, verification_token_hash, enabled) VALUES ($1, $2, $3, $4, $5, $6)")
         .bind(trigger_id)
         .bind(user_id)
         .bind("Test Trigger")

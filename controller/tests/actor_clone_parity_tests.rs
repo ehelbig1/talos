@@ -2,7 +2,7 @@
 //!
 //! The GraphQL `cloneActor` mutation (the web UI's) had drifted from the MCP
 //! `clone_actor` tool: no user capability-ceiling gate, no per-user actor
-//! limit, and the source's secret grants, budget policy and approval policies
+//! limit, and the source's ceilings, budget policy and approval policies
 //! silently dropped. Both now call `talos_actor_lifecycle_service::clone_actor`;
 //! these tests drive that function against a real clone of the migrated schema
 //! and read every outcome back from the tables. The GraphQL resolver itself has
@@ -45,9 +45,9 @@ async fn seed_user(pool: &Pool<Postgres>, grant: Option<&str>) -> Uuid {
 async fn seed_source(pool: &Pool<Postgres>, user: Uuid, world: &str, status: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO actors (id, user_id, name, max_capability_world, status, secret_grants, \
+        "INSERT INTO actors (id, user_id, name, max_capability_world, status, \
                              max_llm_tier, egress_scope, max_write_ceiling) \
-         VALUES ($1, $2, $3, $4, $5, ARRAY['oauth/gmail'], 'tier1', 'public', 'readonly')",
+         VALUES ($1, $2, $3, $4, $5, 'tier1', 'public', 'readonly')",
     )
     .bind(id)
     .bind(user)
@@ -96,7 +96,7 @@ async fn actor_count(pool: &Pool<Postgres>, user: Uuid) -> i64 {
 
 /// A dashboard clone carries everything the MCP clone always carried.
 #[tokio::test]
-async fn a_clone_carries_grants_ceilings_budget_and_approval_policies() {
+async fn a_clone_carries_ceilings_budget_and_approval_policies() {
     let (pool, _db) = common::isolated_db_pool().await;
     let user = seed_user(&pool, Some("automation-node")).await;
     let source = seed_source(&pool, user, "agent-node", "active").await;
@@ -108,20 +108,17 @@ async fn a_clone_carries_grants_ceilings_budget_and_approval_policies() {
     assert!(out.name.starts_with("Copy of source-"), "{}", out.name);
     assert_eq!(out.budget_copied, Some(true));
     assert_eq!(out.approval_policies_copied, Some(1));
-    assert_eq!(out.secret_grants_copied, 1);
     assert!(out.readings.complete());
 
-    let (world, grants, tier, egress, ceiling): (String, Vec<String>, String, Option<String>, String) =
-        sqlx::query_as(
-            "SELECT max_capability_world, secret_grants, max_llm_tier, egress_scope, max_write_ceiling \
+    let (world, tier, egress, ceiling): (String, String, Option<String>, String) = sqlx::query_as(
+        "SELECT max_capability_world, max_llm_tier, egress_scope, max_write_ceiling \
              FROM actors WHERE id = $1",
-        )
-        .bind(out.new_actor_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    )
+    .bind(out.new_actor_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(world, "agent-node");
-    assert_eq!(grants, vec!["oauth/gmail".to_string()]);
     assert_eq!(
         (tier.as_str(), egress.as_deref(), ceiling.as_str()),
         ("tier1", Some("public"), "readonly")
@@ -329,7 +326,7 @@ fn both_surfaces_call_the_shared_clone() {
         "{body}"
     );
     assert!(
-        !body.contains("insert_actor_with_grants_and_limit_check"),
+        !body.contains("insert_cloned_actor_with_limit_check"),
         "{body}"
     );
     assert!(!body.contains("ceiling_permits"), "{body}");

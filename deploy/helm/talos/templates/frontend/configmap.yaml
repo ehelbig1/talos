@@ -88,6 +88,8 @@ data:
         # /graphql — GraphQL HTTP. POST only in production (GET is 405); the
         # CSRF cookie is seeded by `= /auth/csrf` below, not here.
         location /graphql {
+            # The controller's own cap for this location (csrf::GRAPHQL_MAX_BODY_BYTES (5 MiB)).
+            client_max_body_size 5m;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
@@ -110,6 +112,8 @@ data:
         # proxy_set_header. Long timeouts let subscriptions stay open
         # across idle periods.
         location /ws {
+            # The controller's own cap for this location (same router layer as /graphql).
+            client_max_body_size 5m;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
@@ -126,6 +130,8 @@ data:
         # /api/* — REST endpoints (OAuth callbacks, webhooks, etc.) routed
         # to the controller alongside GraphQL. Same handling as /graphql.
         location /api/ {
+            # The controller's own cap for this location (largest under /api/: axum's 2 MiB default).
+            client_max_body_size 2m;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -146,6 +152,8 @@ data:
         # landed on a controller 404 instead of the SPA's OAuthCallback view.
         # Mirrors frontend/vite.config.ts's dev proxy list exactly.
         location /auth/oauth/ {
+            # The controller's own cap for this location (axum's 2 MiB default).
+            client_max_body_size 2m;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -159,6 +167,8 @@ data:
         # single endpoint, and an exact `=` location cannot be widened by a
         # later sibling into swallowing the SPA's /auth/callback again.
         location = /auth/csrf {
+            # The controller's own cap for this location (axum's 2 MiB default).
+            client_max_body_size 2m;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -173,6 +183,8 @@ data:
         # the controller, not here. Same long-lived/streaming flags as
         # /graphql in case a sender ships a large body.
         location /webhooks/ {
+            # The controller's own cap for this location (the webhook router's 1 MiB).
+            client_max_body_size 1m;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -186,6 +198,8 @@ data:
         # the controller; must reach it from the frontend host too, not
         # fall through to the SPA shell.
         location /corrections/ {
+            # The controller's own cap for this location (DefaultBodyLimit 4096).
+            client_max_body_size 4k;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -202,6 +216,8 @@ data:
         # never saw the multi-line `.route(` that registers it, so every
         # approval-gate email link fell through to the SPA shell.
         location /approvals/ {
+            # The controller's own cap for this location (DefaultBodyLimit 4096).
+            client_max_body_size 4k;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -215,6 +231,8 @@ data:
         # executions. Token-authenticated on the controller; must reach it
         # from the frontend host too, not fall through to the SPA shell.
         location /approval-actions/ {
+            # The controller's own cap for this location (DefaultBodyLimit 4096).
+            client_max_body_size 4k;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -229,6 +247,8 @@ data:
         # location writes no access-log line.
         location /action-links/ {
             access_log off;
+            # The controller's own cap for this location (DefaultBodyLimit 4096).
+            client_max_body_size 4k;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -241,6 +261,8 @@ data:
         # memory. The token is in the Authorization header, never the path, so
         # the default log line records nothing usable.
         location /memory-grants/ {
+            # The controller's own cap for this location (axum's 2 MiB default).
+            client_max_body_size 2m;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -260,6 +282,8 @@ data:
             # Path-only log line: the MCP bearer token may travel as
             # `?token=` (see `log_format talos_no_query` at the top).
             access_log /var/log/nginx/access.log talos_no_query;
+            # The controller's own cap for this location (axum's 2 MiB default).
+            client_max_body_size 2m;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -276,6 +300,8 @@ data:
         # NOT the CSRF seed — that is `= /auth/csrf` above; /health sits in a
         # router branch with no CSRF middleware and sets no cookie.
         location /health {
+            # The controller's own cap for this location (axum's 2 MiB default).
+            client_max_body_size 2m;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;

@@ -299,6 +299,8 @@ lint: ## Fast gate: rustfmt + WIT drift + structural lints (no clippy) + offline
 	@python3 scripts/check-sqlx-cli-pin.py
 	@printf '▶ every write of a workflow graph is behind the action-link targets rule\n'
 	@python3 scripts/check-graph-writers.py
+	@printf '▶ deployment artefacts keep their reviewed posture\n'
+	@python3 scripts/check-deploy-posture.py
 # NOTE: no `cargo fmt --all -- --check` here. It ran TWICE per `make lint` —
 # once from this target and again as structural check 35 — which is pure
 # duplicated wall-clock for identical coverage. Check 35 is the copy that was
@@ -374,22 +376,29 @@ test-scripts: ## Every scripts/tests/*.sh and every scripts/*.py --self-test (fo
 
 # Same split for the frontend: eslint + prettier are seconds, vitest is the
 # slow half and runs in CI's frontend job on every frontend change.
-lint-frontend: ## Frontend fast gate — eslint + prettier (skips if frontend/node_modules absent; under CI that is a failure)
+# Without frontend/node_modules the gate cannot run. It prints SKIPPED and
+# exits 0 for a person at a terminal, and exits 3 — a skip, distinct from a
+# lint failure (1) — under CI or when the caller sets TALOS_SKIP_IS_FAILURE=1,
+# which the pre-push hook does: a push of frontend files that ran no frontend
+# gate is not a green push (H-6, 2026-10-14).
+lint-frontend: ## Frontend fast gate — eslint + prettier (SKIPPED without frontend/node_modules; a failure under CI or from pre-push)
 	@if [ -d frontend/node_modules ]; then \
 	    printf '▶ frontend: eslint + prettier (vitest: make lint-frontend-full)\n'; \
 	    cd frontend && npm run lint; \
-	elif [ -n "$${CI:-}" ]; then \
-	    printf '\033[1;31m✗ frontend/node_modules absent under CI — a gate that skips is not a gate (run npm ci first)\033[0m\n'; exit 1; \
+	elif [ -n "$${CI:-}" ] || [ "$${TALOS_SKIP_IS_FAILURE:-0}" = "1" ]; then \
+	    printf '\033[1;31m✗ SKIPPED: frontend/node_modules absent — the frontend gate did not run (run: cd frontend && npm ci)\033[0m\n'; exit 3; \
 	else \
-	    printf '\033[1;33m⊘ frontend/node_modules absent — skipping frontend gate (run: cd frontend && npm ci)\033[0m\n'; \
+	    printf '\033[1;33m⊘ SKIPPED: frontend/node_modules absent — the frontend gate did not run (run: cd frontend && npm ci)\033[0m\n'; \
 	fi
 
-lint-frontend-full: ## Frontend full gate — eslint + prettier + vitest
+lint-frontend-full: ## Frontend full gate — eslint + prettier + vitest (SKIPPED without frontend/node_modules; a failure under CI or from pre-push)
 	@if [ -d frontend/node_modules ]; then \
 	    printf '▶ frontend: eslint + prettier + vitest\n'; \
 	    cd frontend && npm run lint && npm run test; \
+	elif [ -n "$${CI:-}" ] || [ "$${TALOS_SKIP_IS_FAILURE:-0}" = "1" ]; then \
+	    printf '\033[1;31m✗ SKIPPED: frontend/node_modules absent — the frontend gate did not run (run: cd frontend && npm ci)\033[0m\n'; exit 3; \
 	else \
-	    printf '\033[1;33m⊘ frontend/node_modules absent — skipping frontend gate (run: cd frontend && npm ci)\033[0m\n'; \
+	    printf '\033[1;33m⊘ SKIPPED: frontend/node_modules absent — the frontend gate did not run (run: cd frontend && npm ci)\033[0m\n'; \
 	fi
 
 check-frontend-codegen: ## The committed GraphQL codegen output is what the schema generates

@@ -489,12 +489,15 @@ impl SlackIntegrationService {
             .await
             .context("Failed to fetch Slack bot token from vault")?;
 
-        secrets.get(&vault_path).cloned().ok_or_else(|| {
-            anyhow!(
-                "Slack bot token not found at '{}'. Reconnect the Slack integration.",
-                vault_path
-            )
-        })
+        secrets
+            .get(&vault_path)
+            .map(|v| v.to_string())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Slack bot token not found at '{}'. Reconnect the Slack integration.",
+                    vault_path
+                )
+            })
     }
 
     /// Get all integrations for a user

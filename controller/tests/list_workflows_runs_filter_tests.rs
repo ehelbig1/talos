@@ -68,7 +68,7 @@ async fn schedule(pool: &Pool<Postgres>, user: Uuid, workflow_id: Uuid, enabled:
 
 async fn webhook(pool: &Pool<Postgres>, user: Uuid, workflow_id: Uuid, enabled: bool) {
     sqlx::query(
-        "INSERT INTO webhook_triggers (id, name, verification_token, enabled, user_id, workflow_id) \
+        "INSERT INTO webhook_triggers (id, name, verification_token_hash, enabled, user_id, workflow_id) \
          VALUES ($1, 'runs filter test', $2, $3, $4, $5)",
     )
     .bind(Uuid::new_v4())

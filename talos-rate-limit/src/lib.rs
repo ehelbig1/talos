@@ -27,9 +27,12 @@ pub mod user_throttle;
 
 pub use governor_key::TrustedProxyClientIpKeyExtractor;
 pub use middleware::*;
-pub use user_throttle::{PerUserThrottle, ThrottleExceeded};
+pub use user_throttle::{
+    heavy_operations, PerUserThrottle, ThrottleExceeded, HEAVY_MUTATION_DEFAULT_PER_MIN,
+    HEAVY_MUTATION_ENV,
+};
 
-// `is_production` now lives in `talos-config`; re-exported here as
-// `pub(crate)` so the `crate::is_production()` callsites in middleware.rs
-// continue to resolve unchanged.
-pub(crate) use talos_config::is_production;
+// Whether a limiter is on, and whether the auth limiter fails closed, follow
+// `talos_auth_types::browser_hardening_required()` (2026-10-14) — see
+// `ip_rate_limits_enforced` and `auto_fallback_policy`. This crate no longer
+// reads `is_production()`.

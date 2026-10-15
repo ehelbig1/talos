@@ -71,7 +71,7 @@ use crate::rate_limiter::RateLimiter;
 use crate::signature::{self, WebhookAuthOutcome};
 use crate::types::{
     build_module_dispatch_payload, build_webhook_trigger_payload, event_filter_matches,
-    webhook_must_fail_closed_on_hmac, WebhookTrigger,
+    verification_token_matches, webhook_must_fail_closed_on_hmac, WebhookTrigger,
 };
 use crate::{CircuitBreaker, CircuitBreakerFailureType};
 
@@ -658,7 +658,8 @@ impl WebhookRouter {
         // 4. Verify request authenticity.
         //
         //    Priority: HMAC signing_secret (strongest) → verification_token (static fallback).
-        //    If neither is configured the webhook is open (no authentication).
+        //    If neither is configured the delivery is REFUSED (F-3, 2026-10-14: both
+        //    create paths store a token hash, so "neither" is a failed backfill).
         //
         //    The signing secret is stored encrypted (AES-256-GCM via SecretsManager).
         //    It is decrypted in-memory here and never written to any log.
@@ -852,34 +853,34 @@ impl WebhookRouter {
             )
             .await;
             return Ok((StatusCode::UNAUTHORIZED, "Invalid signature").into_response());
-        } else if let Some(expected_token) = &trigger.verification_token {
+        } else if let Some(expected_hash) = &trigger.verification_token_hash {
             // Static token fallback — used when the caller cannot compute HMAC
             // (e.g. simple webhook forwarders).  The caller must supply the token
-            // in the X-Verification-Token header.  Comparison is constant-time to
-            // prevent timing side-channels.
-            use subtle::ConstantTimeEq;
+            // in the X-Verification-Token header. The row holds only the
+            // token's SHA-256 (F-3, 2026-10-14); `verification_token_matches`
+            // hashes the delivered token and compares the digests in constant
+            // time.
             let provided = headers
                 .get("x-verification-token")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             // MCP-629 (2026-05-12): empty-string ct_eq bypass class. The
-            // storage path always sets `verification_token` to a fresh
-            // `Uuid::new_v4()` (36 chars), so an empty stored token is
-            // impossible via the documented surface. But defense-in-depth
-            // requires the verify path to reject empty values: pre-fix,
-            // a stored `expected_token = ""` combined with a request
-            // missing the X-Verification-Token header (so
-            // `provided = ""`) would have produced
-            // `ct_eq(&[], &[]) == 1` and authenticated. Same auth-bypass
-            // class as MCP-590/591/592/628 — auth gates must reject
-            // empty values before constant-time compare.
-            if expected_token.is_empty() || provided.is_empty() {
+            // storage path always stores the hash of a freshly minted token,
+            // so an empty stored value is impossible via the documented
+            // surface. But defense-in-depth requires the verify path to reject
+            // empty values: pre-fix, a stored `expected_token = ""` combined
+            // with a request missing the X-Verification-Token header (so
+            // `provided = ""`) would have produced `ct_eq(&[], &[]) == 1` and
+            // authenticated. Same auth-bypass class as MCP-590/591/592/628 —
+            // auth gates must reject empty values before constant-time
+            // compare. `verification_token_matches` refuses them too.
+            if expected_hash.is_empty() || provided.is_empty() {
                 tracing::warn!(
                     trigger_id = %trigger_id,
-                    expected_empty = expected_token.is_empty(),
+                    expected_empty = expected_hash.is_empty(),
                     provided_empty = provided.is_empty(),
-                    "Verification token rejected: empty value (storage path enforces UUID; \
-                     either header missing or stored token bypassed validation)"
+                    "Verification token rejected: empty value (storage path stores a token hash; \
+                     either header missing or stored hash bypassed validation)"
                 );
                 if let Some(ip) = source_ip {
                     self.circuit_breaker.record_failure_with_type(
@@ -890,12 +891,7 @@ impl WebhookRouter {
                 }
                 return Ok((StatusCode::UNAUTHORIZED, "Invalid verification token").into_response());
             }
-            if expected_token
-                .as_bytes()
-                .ct_eq(provided.as_bytes())
-                .unwrap_u8()
-                != 1
-            {
+            if !verification_token_matches(expected_hash, provided) {
                 tracing::warn!(
                     trigger_id = %trigger_id,
                     "Verification token check failed"
@@ -924,9 +920,24 @@ impl WebhookRouter {
             }
             WebhookAuthOutcome::StaticToken
         } else {
-            // Neither a signing secret nor a verification token: the webhook
-            // is open (documented at the top of step 4).
-            WebhookAuthOutcome::Open
+            // Neither a signing secret nor a verification-token hash. Both
+            // create paths always store a hash, so this is a row whose hash
+            // backfill failed (migration 20261014220000 leaves it NULL and
+            // says so). An unreadable rule refuses: this is NOT an open
+            // webhook. Until 2026-10-14 this arm returned `Open`, unreachable
+            // while the plaintext column was NOT NULL.
+            tracing::warn!(
+                trigger_id = %trigger_id,
+                "Webhook has neither a signing secret nor a verification-token hash; refusing"
+            );
+            if let Some(ip) = source_ip {
+                self.circuit_breaker.record_failure_with_type(
+                    ip,
+                    trigger_id,
+                    CircuitBreakerFailureType::InvalidVerificationToken,
+                );
+            }
+            return Ok((StatusCode::UNAUTHORIZED, "Invalid verification token").into_response());
         };
 
         // 4b. RFC 0007 event filter. Evaluated AFTER all signature / verification-
@@ -2882,7 +2893,7 @@ impl WebhookRouter {
         sqlx::query_as::<_, WebhookTrigger>(
             r#"
             SELECT id, user_id, name, module_id, workflow_id,
-                   verification_token,
+                   verification_token_hash,
                    signing_secret_enc, signing_key_id, signing_secret_format,
                    allowed_ips, enabled, auto_respond, queue_events, max_requests_per_minute,
                    COALESCE(sync_response, false) as sync_response,

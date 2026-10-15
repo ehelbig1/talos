@@ -95,7 +95,15 @@ fn check_publish_authorized(
     let configured = std::env::var(PUBLISH_TOKEN_ENV)
         .ok()
         .filter(|v| !v.is_empty());
-    match (configured.as_deref(), talos_config::is_production()) {
+    // Open without a token ONLY in development. This route writes catalog rows
+    // every user can install, and it is reachable through the frontend's
+    // `/api/` proxy; until 2026-10-14 the second arm was `is_production()`, so
+    // a `RUST_ENV=staging` deployment (docker-compose.prod.yml) accepted an
+    // unauthenticated publish from anyone who could reach it.
+    match (
+        configured.as_deref(),
+        talos_auth_types::browser_hardening_required(),
+    ) {
         (Some(expected), _) => {
             // Token configured — require a matching bearer in every request,
             // dev and prod alike.
@@ -370,5 +378,34 @@ mod tests {
         // configured" branch and return 503.
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// With no token configured the endpoint is open in DEVELOPMENT only
+    /// (2026-10-14). `RUST_ENV=staging` — `docker-compose.prod.yml`, whose
+    /// frontend proxies `/api/` — refuses, as production does; until then it
+    /// accepted an unauthenticated publish of a catalog row every user can
+    /// install.
+    #[test]
+    fn no_token_is_open_only_in_development() {
+        let _g = env_var_lock();
+        let prev_env = std::env::var("RUST_ENV").ok();
+        std::env::remove_var(PUBLISH_TOKEN_ENV);
+        std::env::set_var("RUST_ENV", "staging");
+        let staging = check_publish_authorized(&HeaderMap::new());
+        std::env::set_var("RUST_ENV", "development");
+        let development = check_publish_authorized(&HeaderMap::new());
+        match prev_env {
+            Some(v) => std::env::set_var("RUST_ENV", v),
+            None => std::env::remove_var("RUST_ENV"),
+        }
+        assert_eq!(
+            staging.map_err(|e| e.0),
+            Err(StatusCode::SERVICE_UNAVAILABLE),
+            "RUST_ENV=staging must not accept an unauthenticated publish"
+        );
+        assert!(
+            development.is_ok(),
+            "development stays open for local iteration"
+        );
     }
 }

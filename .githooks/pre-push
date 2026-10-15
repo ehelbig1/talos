@@ -155,7 +155,9 @@ fi
 
 if [ "$run_frontend" -eq 1 ]; then
     echo "pre-push: running 'make $frontend_target'…"
-    if ! make -C "$repo_root" "$frontend_target"; then
+    # A frontend gate that could not run (no node_modules) is a failure here,
+    # not a skip: this push carries frontend files (H-6, 2026-10-14).
+    if ! TALOS_SKIP_IS_FAILURE=1 make -C "$repo_root" "$frontend_target"; then
         echo
         echo "✗ pre-push: 'make $frontend_target' failed — push blocked."
         echo "  Fix the reported issues, or for an emergency push bypass with:"

@@ -49,6 +49,13 @@ pub enum PushWatchLookup {
     Absent,
     /// `Err(_)` — the lookup did not answer.
     Unreadable,
+    /// The watch is there, but the push was signed for a sender it does not
+    /// name (GCP: a service account other than the watch's). Answered exactly
+    /// as [`Self::Absent`]: a different answer would tell anyone who can mint
+    /// a Google token for their own service account which watch tokens exist
+    /// (security review 2026-10-14, F-5). The refusal is counted on
+    /// `talos_google_push_refusals_total` instead.
+    WrongSender,
 }
 
 impl PushWatchLookup {
@@ -61,7 +68,7 @@ impl PushWatchLookup {
     #[must_use]
     pub const fn status(self) -> StatusCode {
         match self {
-            Self::Absent => StatusCode::OK,
+            Self::Absent | Self::WrongSender => StatusCode::OK,
             Self::Unreadable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -95,6 +102,18 @@ mod tests {
             PushWatchLookup::Unreadable.status(),
             "acking an unreadable lookup discards the delivery permanently"
         );
+    }
+
+    /// F-5: a watch that exists but names another sender is answered exactly
+    /// as one that does not exist. The handler returns a bare status (no
+    /// body), so an equal status is an equal response.
+    #[test]
+    fn a_wrong_sender_is_answered_as_an_absent_watch() {
+        assert_eq!(
+            PushWatchLookup::WrongSender.status(),
+            PushWatchLookup::Absent.status()
+        );
+        assert!(!PushWatchLookup::WrongSender.defers());
     }
 
     #[test]
@@ -223,6 +242,32 @@ mod call_site_pins {
             include_str!("../../talos-google-cloud/src/handlers.rs"),
             "find_by_push_token(",
             "PushIntegration::Gcp",
+        );
+    }
+
+    /// F-5: the GCP handler's service-account refusal answers through the
+    /// shared decision, not with its own 401, and writes its audit row
+    /// through the once-a-day writer.
+    #[test]
+    fn the_gcp_push_handler_answers_a_wrong_sender_as_an_absent_watch() {
+        let stripped =
+            strip_line_comments(include_str!("../../talos-google-cloud/src/handlers.rs"));
+        let arm = arms_after(&stripped, "require_service_account(");
+        assert!(
+            arm.contains("PushWatchLookup::WrongSender"),
+            "the service-account refusal must answer through the shared decision"
+        );
+        assert!(
+            !arm[..arm.find("PushWatchLookup::WrongSender").unwrap()].contains("UNAUTHORIZED"),
+            "a 401 for a known watch is the existence oracle F-5 removes"
+        );
+        let writer = stripped
+            .find("async fn audit_push_rejected")
+            .map(|i| &stripped[i..(i + 1200).min(stripped.len())])
+            .expect("audit_push_rejected");
+        assert!(
+            writer.contains("insert_channel_audit_once_per_day"),
+            "a refusal an outsider can provoke writes at most one row a day per channel"
         );
     }
 

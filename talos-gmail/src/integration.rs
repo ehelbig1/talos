@@ -155,13 +155,16 @@ impl GmailIntegrationService {
             .await
             .context("Failed to fetch Gmail access token from vault")?;
 
-        secrets.get(&access_token_path).cloned().ok_or_else(|| {
-            anyhow!(
-                "Gmail access token not found at vault path '{}'. \
+        secrets
+            .get(&access_token_path)
+            .map(|v| v.to_string())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Gmail access token not found at vault path '{}'. \
                  Reconnect the Gmail integration.",
-                access_token_path
-            )
-        })
+                    access_token_path
+                )
+            })
     }
 
     /// Check if Gmail OAuth is configured

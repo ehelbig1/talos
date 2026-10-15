@@ -15,6 +15,12 @@
 //!
 //! `common` harness (a template clone per test), so the migrated-database
 //! job runs it.
+//!
+//! One test here sets `RUST_ENV` (to `staging`, then back): it drives the
+//! mount decision `talos_mcp_handlers::mount_routes` makes, which reads the
+//! variable. It never sets `production`, which other constructors in this
+//! binary read at build time; `staging` changes only
+//! `browser_hardening_required()`, which nothing else here consults.
 
 mod common;
 #[path = "common/mcp.rs"]
@@ -211,4 +217,45 @@ async fn a_request_that_names_no_host_is_not_served() {
     let (app, _db) = local_app().await;
     let (status, _) = answer(&app, initialize(&[])).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The route is MOUNTED only where no browser hardening is required
+/// (2026-10-14). Under `RUST_ENV=staging` — what `docker-compose.prod.yml`
+/// runs, facing real users — the loopback caller that the gate above serves
+/// in development finds no route at all: the gate cannot tell a process on
+/// the compose network that sends `Host: localhost` from this machine.
+#[tokio::test]
+async fn the_route_is_not_mounted_outside_development() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, name) \
+         VALUES (gen_random_uuid(), 'local-mount@example.com', 'x', 'local')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed user");
+    let state = mcp_state(pool.clone()).await;
+    let mounted = |state: controller::mcp::McpState| {
+        Router::new().nest("/mcp", controller::mcp::mount_routes(state, pool.clone()))
+    };
+    let before = std::env::var("RUST_ENV").ok();
+
+    std::env::set_var("RUST_ENV", "development");
+    let development = mounted(state.clone());
+    std::env::set_var("RUST_ENV", "staging");
+    let staging = mounted(state);
+    match &before {
+        Some(v) => std::env::set_var("RUST_ENV", v),
+        None => std::env::remove_var("RUST_ENV"),
+    }
+
+    let (status, _) = answer(&development, initialize(&[("host", "localhost:8000")])).await;
+    assert_eq!(status, StatusCode::OK, "development mounts the local route");
+    let (status, body) = answer(&staging, initialize(&[("host", "localhost:8000")])).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "RUST_ENV=staging must not mount /mcp/local"
+    );
+    assert!(body.is_empty(), "the refusal says nothing");
 }

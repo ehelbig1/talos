@@ -645,7 +645,7 @@ async fn enforce_cache_limits_keeps_rows_and_exempts_referenced_modules() {
     insert_workflow_referencing(&db, user_id, in_graph, "active").await;
     // 3. webhook binding, disabled — a paused hook is still a binding.
     sqlx::query(
-        "INSERT INTO webhook_triggers (id, name, verification_token, module_id, user_id, enabled) \
+        "INSERT INTO webhook_triggers (id, name, verification_token_hash, module_id, user_id, enabled) \
          VALUES ($1, 'hook', 'tok', $2, $3, false)",
     )
     .bind(Uuid::new_v4())

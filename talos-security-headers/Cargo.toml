@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 axum = { workspace = true, features = ["json"] }
+talos-auth-types = { path = "../talos-auth-types" }
 talos-config = { path = "../talos-config" }
 tracing.workspace = true
 

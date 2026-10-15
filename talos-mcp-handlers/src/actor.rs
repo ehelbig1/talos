@@ -274,23 +274,6 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "required": ["actor_id", "status"]
             }
         }),
-        // ── Phase 1.2: Secret namespacing ──────────────────────────────────
-        serde_json::json!({
-            "name": "grant_secret_access",
-            "description": "Grant an actor explicit access to a secret key_path outside its \
-                default actor/{id}/* namespace. Logged to the actor action log.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "actor_id": { "type": "string" },
-                    "key_path": {
-                        "type": "string",
-                        "description": "Secret key_path to grant (e.g. 'shared/stripe_api_key')"
-                    }
-                },
-                "required": ["actor_id", "key_path"]
-            }
-        }),
         // ── Phase 2.1: Budget policies ─────────────────────────────────────
         serde_json::json!({
             "name": "set_actor_budget",
@@ -1051,7 +1034,6 @@ pub async fn dispatch(
         "suspend_actor" => handle_suspend_actor(req_id, args, state, user_id).await,
         "terminate_actor" => handle_terminate_actor(req_id, args, state, user_id).await,
         "update_actor_status" => handle_update_actor_status(req_id, args, state, user_id).await,
-        "grant_secret_access" => handle_grant_secret_access(req_id, args, state, user_id).await,
         "set_actor_budget" => handle_set_actor_budget(req_id, args, state, user_id).await,
         "create_memory_read_grant" => {
             handle_create_memory_read_grant(req_id, args, state, user_id).await
@@ -1771,7 +1753,6 @@ async fn handle_create_actor(
                     format!("Define this actor's persona (recommended): actor_remember(actor_id: '{}', key: 'persona', value: {{\"role\": \"...\", \"expertise\": \"...\", \"tone\": \"...\"}}, memory_type: 'semantic') — semantic memories persist permanently and are injected as __actor_context__ when trigger_workflow is called with inject_memory_context: true", actor_id),
                     format!("Set a budget policy with set_actor_budget(actor_id: '{}')", actor_id),
                     format!("Create a workflow: create_workflow(actor_id: '{}', name: '...', workflow_type: 'agent')", actor_id),
-                    "Use grant_secret_access to allow access to secrets outside the actor's namespace",
                     "To run the same workflow as multiple actors and compare outputs: trigger_workflow_as_actors(workflow_id: '...', actor_ids: ['<id1>', '<id2>'], inject_memory_context: true)"
                 ]
             });
@@ -2067,7 +2048,6 @@ async fn handle_get_actor_summary(
             "description":         summary.description,
             "status":              summary.status,
             "max_capability_world": summary.max_capability_world,
-            "secret_grants":       summary.secret_grants,
             "created_at":          summary.created_at,
             "workflows":           { "active": summary.workflow_count },
             "executions": {
@@ -2580,84 +2560,6 @@ async fn handle_update_actor_status(
         Err(e) => {
             tracing::error!("update_actor_status: {}", e);
             mcp_error(req_id, -32000, "Failed to update actor status")
-        }
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Phase 1.2 — Secret namespacing
-// ────────────────────────────────────────────────────────────────────────────
-
-async fn handle_grant_secret_access(
-    req_id: Option<serde_json::Value>,
-    args: &Value,
-    state: &McpState,
-    user_id: Uuid,
-) -> JsonRpcResponse {
-    let actor_id = match resolve_actor_via_repo(&req_id, args, &state.actor_repo, user_id).await {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-
-    // MCP-394 (2026-05-11): untrimmed-storage class. Pre-fix
-    // `Some(k) if !k.is_empty() => k` passed the raw string to
-    // grant_secret_access. Operator paste of `key_path: " anthropic/api_key "`
-    // (whitespace padding — common from runbook copy-paste) persisted
-    // WITH the padding to actor_secret_grants. The worker's
-    // `check_secret_allowlist` uses job_protocol::vault_path_permitted
-    // which does exact-match against `vault://anthropic/api_key` (no
-    // trim), so the grant SILENTLY DOES NOT MATCH at runtime. The
-    // operator confirms grant_secret_access succeeded, the audit log
-    // shows the grant, but the actor's first vault:// header
-    // substitution returns "NotFound" with no signal that a
-    // configured grant was on the wrong side of a trim mismatch.
-    // Same MCP-364 / MCP-365 / MCP-372 / MCP-388 family applied to a
-    // secret-access surface (silently-broken authz config is worse
-    // than rejected config). Trim before emptiness check, length-cap
-    // the TRIMMED value, persist trimmed.
-    let key_path = match args.get("key_path").and_then(|v| v.as_str()) {
-        Some(k) if k.trim().is_empty() => {
-            return mcp_error(
-                req_id,
-                -32602,
-                "key_path must be non-empty and non-whitespace",
-            )
-        }
-        Some(k) if k.trim().len() > 500 => {
-            return mcp_error(req_id, -32602, "key_path must be ≤ 500 characters")
-        }
-        Some(k) => k.trim(),
-        None => return mcp_error(req_id, -32602, "Missing or empty key_path"),
-    };
-
-    // Prevent duplicate grants using PostgreSQL array dedup
-    match state
-        .actor_repo
-        .grant_secret_access(actor_id, user_id, key_path)
-        .await
-    {
-        Ok(_) => {
-            spawn_log_action(
-                state.db_pool.clone(),
-                actor_id,
-                "secret_access_granted",
-                None,
-                None,
-                format!("Secret access granted: {}", key_path),
-                Some(serde_json::json!({ "key_path": key_path })),
-            );
-            mcp_text(
-                req_id,
-                &format!(
-                    "Actor {} granted access to secret '{}'. \
-                     The actor's default namespace is actor/{}/*, this adds cross-namespace access.",
-                    actor_id, key_path, actor_id
-                ),
-            )
-        }
-        Err(e) => {
-            tracing::error!("grant_secret_access: {}", e);
-            mcp_error(req_id, -32000, "Failed to grant secret access")
         }
     }
 }
@@ -5794,7 +5696,6 @@ async fn handle_clone_actor(
             "cloned_from": source_actor_id.to_string(),
             "budget_copied": outcome.budget_copied,
             "approval_policies_copied": outcome.approval_policies_copied,
-            "secret_grants_copied": outcome.secret_grants_copied,
             "memories_copied": outcome.memories_copied,
             "memory_note": "Semantic and episodic memories were copied. Working and scratchpad memories were excluded (ephemeral, run-specific).",
             "next_steps": [

@@ -112,7 +112,7 @@ impl SecretsResolver for RecordingResolver {
         &self,
         _node_id: Uuid,
         _user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError> {
+    ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
         Ok(HashMap::new())
     }
 
@@ -120,13 +120,13 @@ impl SecretsResolver for RecordingResolver {
         &self,
         paths: &[String],
         _user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError> {
+    ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
         if !paths.is_empty() {
             self.asked.lock().unwrap().push(paths.to_vec());
         }
         Ok(paths
             .iter()
-            .map(|p| (p.clone(), format!("value-of-{p}")))
+            .map(|p| (p.clone(), zeroize::Zeroizing::new(format!("value-of-{p}"))))
             .collect())
     }
 }

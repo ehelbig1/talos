@@ -939,16 +939,11 @@ pub(crate) async fn build_platform_services(
     }
     // Wire in the unified credential service for dual-write token storage.
     google_calendar_service.with_credentials_service(oauth_credential_service.clone());
-    // Wire in the worker shared HMAC key for webhook-token signing. If
-    // the key isn't set, watch-channel creation will fail closed —
-    // safer than issuing channels Google will send to but we can't
-    // verify on arrival. Empty / short keys are rejected up-front.
-    if let Some(ref key) = worker_shared_key {
-        if let Err(e) = google_calendar_service.with_worker_shared_key(key.as_bytes().to_vec()) {
-            tracing::error!(error = %e, "gcal webhook HMAC key rejected; aborting");
-            return Err(e);
-        }
-    }
+    // The Google Calendar service no longer holds the worker shared key: a
+    // channel's token is random and only its hash is stored (security review
+    // 2026-10-14, F-6). The webhook handler still receives the key as an
+    // Extension, to verify a channel created before that change until the
+    // dual-verify window ends (`webhook_token::LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX`).
 
     // ---------- Push-channel inventories (operator surfaces) ----------
     //
@@ -1275,10 +1270,9 @@ pub(crate) async fn build_platform_services(
     ));
     tracing::info!(
         "Auth rate limiter initialized (policy: {})",
-        if config::is_production() {
-            "fail-closed"
-        } else {
-            "fail-open"
+        match rate_limit::auto_fallback_policy() {
+            rate_limit::RateLimitFallbackPolicy::FailClosed => "fail-closed",
+            rate_limit::RateLimitFallbackPolicy::FailOpen => "fail-open",
         }
     );
 
@@ -2093,10 +2087,14 @@ pub(crate) fn build_schema_and_services(
     .limit_depth(15) // Maximum query nesting depth
     .limit_complexity(5000); // Maximum query complexity score
 
-    // Disable GraphQL introspection in production to prevent schema enumeration.
-    if config::is_production() {
+    // Disable GraphQL introspection wherever browser hardening is required
+    // (every RUST_ENV but the development spellings) to prevent schema
+    // enumeration. Until 2026-10-14 only under `production`; `__schema` and
+    // `__type` are pre-2FA root fields, so a staging deployment answered them
+    // to a password-only session.
+    if talos_auth_types::browser_hardening_required() {
         schema_builder = schema_builder.disable_introspection();
-        tracing::info!("GraphQL introspection disabled (production mode)");
+        tracing::info!("GraphQL introspection disabled (browser hardening required)");
     }
 
     let schema_builder = schema_builder

@@ -1091,24 +1091,15 @@ pub async fn bind_registration_workflow(
     workflow_id: Option<Uuid>,
 ) -> Result<(), BindWorkflowRefusal> {
     if let Some(workflow_id) = workflow_id {
-        let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
-        match repo.get_workflow(workflow_id, user_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                tracing::warn!(
-                    target: "talos_audit",
-                    event_kind = "jira_push_workflow_binding_refused",
-                    %user_id,
-                    %workflow_id,
-                    "refusing to bind a Jira push channel to a workflow this user does not own"
-                );
-                return Err(BindWorkflowRefusal::WorkflowNotBindable);
-            }
-            Err(e) => {
-                tracing::error!(%user_id, %workflow_id, error = %e, "Jira push binding: workflow read failed");
-                return Err(BindWorkflowRefusal::Unreadable);
-            }
-        }
+        use talos_integration_helpers::watch_binding::{
+            workflow_is_bindable, WorkflowBindingRefusal,
+        };
+        workflow_is_bindable(pool, user_id, workflow_id, INTEGRATION_NAME)
+            .await
+            .map_err(|r| match r {
+                WorkflowBindingRefusal::NotBindable => BindWorkflowRefusal::WorkflowNotBindable,
+                WorkflowBindingRefusal::Unreadable => BindWorkflowRefusal::Unreadable,
+            })?;
     }
 
     let bound: Option<(String, i64)> = sqlx::query_as(
@@ -1329,6 +1320,17 @@ impl PushChannelProvisioner for JiraPushProvisioner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The inventory's refusal (which this integration returns, and which the
+    /// MCP tool words) says what every integration's does. The inventory crate
+    /// cannot name the helpers' constant, so the copy is pinned here.
+    #[test]
+    fn the_inventory_says_the_shared_workflow_refusal() {
+        assert_eq!(
+            BindWorkflowRefusal::WorkflowNotBindable.user_facing_message(),
+            talos_integration_helpers::watch_binding::WORKFLOW_NOT_BINDABLE_MESSAGE
+        );
+    }
 
     #[test]
     fn the_webhook_url_is_the_one_path_on_an_https_public_address() {

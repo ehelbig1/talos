@@ -163,7 +163,7 @@ fn parse_claim_based_enabled(raw: Option<String>) -> bool {
 #[derive(Clone)]
 pub(crate) struct DispatchSecrets {
     pub encrypted: talos_workflow_job_protocol::EncryptedSecrets,
-    pub plaintext: Option<std::collections::HashMap<String, String>>,
+    pub plaintext: Option<talos_workflow_engine_core::SecretMap>,
     pub secret_paths: Vec<String>,
 }
 
@@ -257,7 +257,7 @@ pub(crate) async fn resolve_secrets_map_for(
     vault_paths: &[String],
     extra_paths: &[String],
     max_llm_tier: talos_workflow_engine_core::LlmTier,
-) -> std::collections::HashMap<String, String> {
+) -> talos_workflow_engine_core::SecretMap {
     // 1. Module-grant secrets, as seen by the user this job runs for: a
     // module id is shared by every user who dispatches it, so the grant
     // read is scoped to the user's own and system secrets.
@@ -333,7 +333,10 @@ pub(crate) async fn resolve_secrets_map_for(
     // by tier check" — much narrower exploit surface.
     if !matches!(max_llm_tier, talos_workflow_engine_core::LlmTier::Tier1) {
         match resolver.resolve_llm_keys(user_id).await {
-            Ok(keys) => secrets_map.extend(keys),
+            Ok(keys) => secrets_map.extend(
+                keys.into_iter()
+                    .map(|(k, v)| (k, zeroize::Zeroizing::new(v))),
+            ),
             Err(e) => tracing::debug!(
                 error = %e,
                 "Failed to pre-fetch LLM vault keys — worker will fall back to env vars"
@@ -402,8 +405,8 @@ pub(crate) fn filter_tier1_paths(
 /// tier-1 job "never has an Anthropic/OpenAI/Gemini key on the wire" was
 /// reachable around through the dev-test surface. Same class MCP-692 fixed for
 /// the tier GATE and left open for the key PREFETCH four lines above it.
-pub fn retain_wire_safe_secrets(
-    secrets: &mut std::collections::HashMap<String, String>,
+pub fn retain_wire_safe_secrets<V>(
+    secrets: &mut std::collections::HashMap<String, V>,
     max_llm_tier: talos_workflow_engine_core::LlmTier,
 ) {
     secrets.retain(|path, _| {

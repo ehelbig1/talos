@@ -24,7 +24,6 @@
 
 use http::header::{COOKIE, SET_COOKIE};
 use http::{HeaderMap, HeaderValue};
-use uuid::Uuid;
 
 use crate::{constant_time_eq, hash_oauth_session_binding};
 
@@ -59,10 +58,11 @@ impl BrowserBinding {
         }
     }
 
-    /// A new binding: ~244 bits from two v4 UUIDs, hex — the login flow's shape.
+    /// A new binding: 256 bits from `talos_random`, hex — the login flow's
+    /// shape (64 lowercase hex characters, as before; C-9).
     pub fn fresh() -> Self {
         Self {
-            nonce: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
+            nonce: hex::encode(talos_random::bytes::<32>()),
         }
     }
 
@@ -72,12 +72,16 @@ impl BrowserBinding {
     }
 
     /// The `Set-Cookie` value the connect response must carry. `Secure` follows
-    /// `is_production()`, exactly as the login binding cookie does.
+    /// `browser_hardening_required()`, exactly as the login binding cookie
+    /// does (it followed `is_production()` until 2026-10-14, so a staging
+    /// deployment behind TLS set this cookie without `Secure`).
     pub fn set_cookie_header(&self) -> HeaderValue {
         // The nonce is hex and the attributes are literals, so this cannot fail;
         // a failure would mean the nonce shape changed, which the unit tests pin.
-        HeaderValue::from_str(&self.set_cookie_string(talos_config::is_production()))
-            .expect("connect-binding cookie is ASCII by construction")
+        HeaderValue::from_str(
+            &self.set_cookie_string(talos_auth_types::browser_hardening_required()),
+        )
+        .expect("connect-binding cookie is ASCII by construction")
     }
 
     /// `(SET_COOKIE, value)` — a ready-to-use axum response-header pair.

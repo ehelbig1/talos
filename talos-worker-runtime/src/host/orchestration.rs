@@ -77,12 +77,11 @@ fn build_signed_agent_envelope(
     payload: &serde_json::Value,
     correlation_id: &Option<String>,
 ) -> Result<Vec<u8>, &'static str> {
-    use rand::RngExt;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "system time before epoch")?
         .as_millis();
-    let rand_bytes: [u8; 16] = rand::rng().random();
+    let rand_bytes: [u8; 16] = talos_random::bytes::<16>();
     let nonce = format!("{}:{}", ts, hex::encode(rand_bytes));
 
     // Canonical envelope WITHOUT signature (which is added last). This is

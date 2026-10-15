@@ -139,11 +139,11 @@ async fn a_standalone_run_mints_for_its_caller_only_and_only_under_a_grant() {
         .await
         .expect("resolve");
     assert_eq!(
-        resolved.get(&named).map(String::as_str),
+        resolved.get(&named).map(|v| v.as_str()),
         Some("minted:runner@example-project.iam.gserviceaccount.com")
     );
     assert_eq!(
-        resolved.get(&github).map(String::as_str),
+        resolved.get(&github).map(|v| v.as_str()),
         Some("minted:example-org")
     );
     let mut seen = take_asked();
@@ -225,7 +225,7 @@ async fn a_standalone_run_mints_for_its_caller_only_and_only_under_a_grant() {
             .await
             .expect("resolve");
     assert_eq!(
-        resolved.get(&named).map(String::as_str),
+        resolved.get(&named).map(|v| v.as_str()),
         Some("minted:runner@example-project.iam.gserviceaccount.com")
     );
     assert!(!resolved.contains_key(&github));

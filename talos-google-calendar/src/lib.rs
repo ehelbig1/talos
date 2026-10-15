@@ -143,11 +143,6 @@ pub struct GoogleCalendarService {
     /// secrets-backed `integration_credentials` table (set via
     /// `with_credentials_service`).
     credentials_service: OnceLock<Arc<talos_oauth::OAuthCredentialService>>,
-    /// Worker shared HMAC key, used to sign + verify Google Calendar
-    /// webhook tokens. Set via `with_worker_shared_key` at startup.
-    /// Without it, `create_watch_channel` fails closed — signed tokens
-    /// are required for every channel we register with Google.
-    pub(crate) shared_key: OnceLock<Vec<u8>>,
     /// Per-`(user_id, integration_id, calendar_id)` serialization lock
     /// for `create_watch_channel`. Without it, two concurrent calls
     /// for the same calendar both see "no existing channel" and both
@@ -199,7 +194,6 @@ impl GoogleCalendarService {
             connect_redirect_uri,
             webhook_channel_limits: Arc::new(DashMap::new()),
             credentials_service: OnceLock::new(),
-            shared_key: OnceLock::new(),
             create_channel_locks: talos_integration_helpers::state_store::CreateLockMap::new(),
             renew_channel_locks: talos_integration_helpers::state_store::CreateLockMap::new(),
             api_base_url: OnceLock::new(),
@@ -228,26 +222,6 @@ impl GoogleCalendarService {
     /// Subsequent calls are silently ignored (OnceLock semantics).
     pub fn with_credentials_service(&self, svc: Arc<talos_oauth::OAuthCredentialService>) {
         let _ = self.credentials_service.set(svc);
-    }
-
-    /// Wire in the worker shared HMAC key used for webhook-token
-    /// signing + verification. Call once at startup, before any
-    /// watch channels are created.
-    ///
-    /// Rejects empty keys: HMAC-SHA256 accepts any key length including
-    /// zero, but an empty key means the MAC is computed from publicly
-    /// known data only — trivially forgeable by anyone who can read
-    /// the sign/verify code. Returns `Err` at startup instead of
-    /// silently accepting a keyless deployment.
-    pub fn with_worker_shared_key(&self, key: Vec<u8>) -> Result<()> {
-        if key.len() < 16 {
-            anyhow::bail!(
-                "WORKER_SHARED_KEY must be at least 16 bytes (got {}); aborting startup",
-                key.len()
-            );
-        }
-        let _ = self.shared_key.set(key);
-        Ok(())
     }
 
     /// Evict idle entries from the `create_channel_locks` DashMap.
@@ -422,13 +396,16 @@ impl GoogleCalendarService {
             .await
             .context("Failed to fetch Calendar access token from vault")?;
 
-        secrets.get(&access_token_path).cloned().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Calendar access token not found at vault path '{}'. \
+        secrets
+            .get(&access_token_path)
+            .map(|v| v.to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Calendar access token not found at vault path '{}'. \
                  Reconnect the Google Calendar integration.",
-                access_token_path
-            )
-        })
+                    access_token_path
+                )
+            })
     }
 
     /// List user's integrations

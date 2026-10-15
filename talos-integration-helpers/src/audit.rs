@@ -46,6 +46,49 @@ pub async fn insert_channel_audit(
     .map(|_| ())
 }
 
+/// Insert one audit row unless the same user already has a row of this
+/// `event_type` for this channel (`metadata.channel_uuid`) from the last 24
+/// hours. `Ok(true)` when the row was written.
+///
+/// For a refusal an outsider can provoke at will: one row a day per channel
+/// is what the owner's `recent_failure` view (a 25-hour look-back) needs, and
+/// every refusal past it is a metric, not a row. One statement, so the cap
+/// costs no extra round trip; two refusals racing on the first write of a
+/// day may both land, which bounds the row count at a small multiple of one.
+pub async fn insert_channel_audit_once_per_day(
+    pool: &sqlx::PgPool,
+    ev: ChannelAuditEvent<'_>,
+    channel_uuid: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let channel_uuid = channel_uuid.to_string();
+    let mut metadata = ev.metadata;
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert("channel_uuid".into(), JsonValue::from(channel_uuid.clone()));
+    }
+    let written = sqlx::query(
+        "INSERT INTO google_calendar_audit_log \
+         (integration_id, user_id, event_type, calendar_id, success, error_message, metadata) \
+         SELECT $1, $2, $3, $4, $5, $6, $7 \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM google_calendar_audit_log \
+             WHERE user_id = $2 AND event_type = $3 \
+               AND metadata->>'channel_uuid' = $8 \
+               AND created_at > now() - interval '24 hours')",
+    )
+    .bind(ev.integration_id)
+    .bind(ev.user_id)
+    .bind(ev.event_type)
+    .bind(ev.target)
+    .bind(ev.success)
+    .bind(ev.error_message)
+    .bind(metadata)
+    .bind(channel_uuid)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(written == 1)
+}
+
 /// The canonical persistence-boundary scrub for upstream API error
 /// text (MCP-980 + MCP-1181): truncate at 1 KiB FIRST (so a verbose
 /// Google error envelope can't amplify regex-pass cost or blow past

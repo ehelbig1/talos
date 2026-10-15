@@ -411,8 +411,12 @@ async fn main() -> anyhow::Result<()> {
     // in talos-csrf used the same case-sensitive predicate so they agreed by
     // chance. Both sites now share the canonical resolver — any future
     // bypass-consuming site that uses `bool_env_or_default` can't diverge.
-    if config::is_production() && talos_config::dev_csrf_bypass_enabled() {
-        panic!("CRITICAL SECURITY ERROR: ALLOW_DEV_UNSAFE_CSRF_BYPASS cannot be enabled in production mode!");
+    // Refused wherever browser hardening is required — the request-time gate
+    // in talos-csrf already ignores the bypass there; this makes the
+    // misconfiguration loud at boot instead of silent (2026-10-14: was
+    // `is_production()`).
+    if talos_auth_types::browser_hardening_required() && talos_config::dev_csrf_bypass_enabled() {
+        panic!("CRITICAL SECURITY ERROR: ALLOW_DEV_UNSAFE_CSRF_BYPASS cannot be enabled outside development (RUST_ENV)!");
     }
 
     // Initialise the logger + tracing subscriber (OTLP bridge when configured).

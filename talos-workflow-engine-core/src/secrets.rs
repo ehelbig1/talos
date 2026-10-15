@@ -107,6 +107,12 @@ impl ForcedRefresh {
     }
 }
 
+/// A resolved secret map: path → plaintext value, each value wiped from
+/// memory when it is dropped (security review 2026-10-14, C-10). The map
+/// travels from `SecretsManager` through the resolver and the dispatch
+/// pipeline to the envelope encrypt without a plain `String` copy.
+pub type SecretMap = HashMap<String, zeroize::Zeroizing<String>>;
+
 /// Resolves the secrets needed to dispatch a workflow node.
 ///
 /// # Method breakdown
@@ -148,7 +154,7 @@ pub trait SecretsResolver: Send + Sync {
         &self,
         module_id: Uuid,
         user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError>;
+    ) -> Result<SecretMap, BoxError>;
 
     /// Resolve a batch of vault paths for a given user. `user_id` is
     /// `None` for system-scoped or actor-scoped lookups; impls may
@@ -157,7 +163,7 @@ pub trait SecretsResolver: Send + Sync {
         &self,
         paths: &[String],
         user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError>;
+    ) -> Result<SecretMap, BoxError>;
 
     /// Return the canonical set of LLM-provider API keys for `user_id`.
     ///

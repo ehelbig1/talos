@@ -52,15 +52,24 @@ try_ngrok() {
         return 1
     fi
 
-    # Configure auth token if provided (required for ngrok v3 free tier)
+    # Auth token (required for ngrok v3 free tier). Written into a config file
+    # only this user can read, and handed to ngrok as `--config <file>` — never
+    # as an argument, where any local user reads it from `ps` (H-9,
+    # 2026-10-14; `ngrok config add-authtoken "$TOKEN"` put it in argv).
+    # `printf` is a shell builtin, so writing the file spawns no process.
+    local config_args=()
     if [[ -n "${NGROK_AUTHTOKEN-}" ]]; then
-        ngrok config add-authtoken "$NGROK_AUTHTOKEN" > /dev/null
+        NGROK_CONFIG_FILE="$(umask 077 && mktemp "${TMPDIR:-/tmp}/talos-ngrok.XXXXXX")"
+        trap 'rm -f "${NGROK_CONFIG_FILE:-}"' EXIT
+        printf 'version: "2"\nauthtoken: %s\n' "$NGROK_AUTHTOKEN" > "$NGROK_CONFIG_FILE"
+        config_args=(--config "$NGROK_CONFIG_FILE")
     else
         echo "ℹ️  NGROK_AUTHTOKEN not set — trying ngrok without auth token (may fail on ngrok v3)."
     fi
 
     rm -f /tmp/ngrok.log
     ngrok http 8000 \
+        ${config_args[@]+"${config_args[@]}"} \
         --log=stdout \
         --log-format=json \
         --region=us \

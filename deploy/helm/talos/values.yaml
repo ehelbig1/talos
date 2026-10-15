@@ -117,6 +117,10 @@ controller:
     className: "nginx"
     annotations:
       cert-manager.io/cluster-issuer: "letsencrypt-prod"
+      # nginx-ingress only (className "nginx"); Traefik ignores it, and
+      # deploy/k3s/install.sh nulls these three for its Traefik ingress.
+      # Under any class the controller's per-route DefaultBodyLimit is the
+      # real cap (largest: /graphql, 5 MiB).
       nginx.ingress.kubernetes.io/proxy-body-size: "16m"
       # GraphQL subscriptions use WebSockets.
       nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
@@ -353,16 +357,6 @@ controller:
     # Rollback is instant and data-safe: set "false" and restart —
     # enforcement is per-transaction, no migration to undo.
     TALOS_RLS_SET_ROLE: "true"
-    # JWT audience-claim enforcement (MCP-857): fail closed on tokens
-    # missing `aud=talos` (defense vs. cross-audience JWT replay — see
-    # talos-auth/src/lib.rs `verify_token`). Default ON as of 2026-07-06:
-    # the issuer has stamped `aud` since 2026-05, so any aud-less token
-    # aged out of circulation one access-token TTL (15 min) after that
-    # deploy. If upgrading from a pre-2026-05 build, upgrade first with
-    # this set to "false", wait one TTL while watching the
-    # `jwt_legacy_aud_less_verify` telemetry event hit zero, then re-set
-    # to "true". Rollback is instant: set "false" and restart.
-    JWT_REQUIRE_AUD: "true"
     # ── RFC 0010 worker-trust (P1 Ed25519 + P3 envelope sealing) ─────
     # deploy/k3s/install.sh APPLIES THIS FOR YOU (2026-09-11): a fresh
     # install gets the full posture; an existing cluster advances one phase
@@ -1556,9 +1550,11 @@ security:
     # `main-publish.yml` workflow_dispatch path (or `release.yml` tags)
     # are signed by the WORKFLOW identity, not any human operator — so
     # this pin stays stable across operator changes (no per-person
-    # widening). To pin to the exact publish workflows instead of the
-    # any-workflow-in-repo default below:
-    #   "^https://github\\.com/OWNER/talos/\\.github/workflows/(main-publish\\.yml|release\\.yml)@refs/(heads/main|tags/v.+)$"
+    # widening). The default below names the two publish workflows exactly
+    # (H-5, 2026-10-14; until then it admitted ANY workflow in the repo on
+    # main or a v* tag, safe only while no other workflow held
+    # `id-token: write` — scripts/check-deploy-posture.py now refuses one that
+    # does without a `# signing-identity:` marker saying why).
     # NOTE: if you drop the ref suffix, keep the trailing `@` after the
     # workflow filename — `...main-publish\\.yml@` — without it a fork
     # workflow named `main-publish.yml-evil.yml` also matches (see
@@ -1572,7 +1568,7 @@ security:
     # email-form certIdentityRegex (e.g. "^(alice|bob)@example\\.com$")
     # AND the matching oidcIssuer — per human operator. Prefer the CI
     # path; keep this only as a documented break-glass.
-    certIdentityRegex: "^https://github\\.com/OWNER/talos/\\.github/workflows/.+@refs/(heads/main|tags/v.+)$"
+    certIdentityRegex: "^https://github\\.com/OWNER/talos/\\.github/workflows/(main-publish\\.yml|release\\.yml)@refs/(heads/main|tags/v.+)$"
     oidcIssuer: "https://token.actions.githubusercontent.com"
 
 # ----------------------------------------------------------------------------

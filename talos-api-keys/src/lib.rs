@@ -80,6 +80,16 @@ const _: () = assert!(
 /// Failed validations a key prefix may spend per [`FAILURE_WINDOW`] before
 /// the legacy bcrypt path refuses it.
 const FAILURE_LIMIT: usize = 60;
+
+/// The failed-validation budget a validation draws from: the key's visible
+/// prefix AND the caller's (bucketed) address. One caller who fails 60 times
+/// a minute on a prefix exhausts only its own budget; the key's owner, from
+/// another address, is unaffected. The bound on bcrypt work is per caller
+/// address, so a caller with many addresses buys more of it — the prefix-only
+/// key traded that for an availability hole (A-12, 2026-10-14).
+pub fn failure_budget_key(prefix: &str, client: &str) -> String {
+    format!("{prefix}|{client}")
+}
 const FAILURE_WINDOW: StdDuration = StdDuration::from_secs(60);
 /// Bound on the in-memory limiter map.
 const RATE_LIMITER_MAX_ENTRIES: usize = 10_000;
@@ -357,7 +367,18 @@ impl ApiKeyService {
     /// capped at 60/min, and anyone who knew the visible prefix could spend
     /// that budget), and the budget still guards the legacy bcrypt path. A key
     /// whose owner is deactivated no longer validates.
-    pub async fn validate_key(&self, api_key: &str) -> Result<(Uuid, Vec<ApiKeyScope>)> {
+    ///
+    /// `client` is the caller's address as the rate limiter buckets it
+    /// (`talos_rate_limit::rate_limit_key` of the trusted-proxy-resolved IP).
+    /// The failure budget is per `(prefix, client)` since 2026-10-14
+    /// ([`failure_budget_key`]): keyed on the prefix alone, anyone who knew a
+    /// legacy key's visible 8-character prefix could spend its budget and
+    /// lock the real key out for the rest of the window.
+    pub async fn validate_key(
+        &self,
+        api_key: &str,
+        client: &str,
+    ) -> Result<(Uuid, Vec<ApiKeyScope>)> {
         // Constant-time format check against the known key prefix to prevent
         // timing-based enumeration of valid vs. invalid key formats.
         use subtle::ConstantTimeEq;
@@ -422,8 +443,9 @@ impl ApiKeyService {
 
         // Legacy rows (no digest yet): bcrypt, behind the failure budget.
         let legacy: Vec<_> = live.iter().filter(|k| k.3.is_none()).collect();
+        let budget = failure_budget_key(&prefix, client);
         if matched.is_none() && !legacy.is_empty() {
-            if self.failures_exceeded(&prefix).await {
+            if self.failures_exceeded(&budget).await {
                 tracing::warn!("API key rate limit exceeded for prefix {}", prefix);
                 talos_metrics::record_api_key_validation(
                     talos_metrics::ApiKeyValidation::RateLimited,
@@ -486,7 +508,7 @@ impl ApiKeyService {
         }
 
         let Some((key_id, user_id, stored_scopes)) = matched else {
-            self.charge_failure(&prefix).await;
+            self.charge_failure(&budget).await;
             tracing::warn!("API key validation failed: no matching active key");
             talos_metrics::record_api_key_validation(if expired_seen {
                 talos_metrics::ApiKeyValidation::Expired
@@ -535,7 +557,9 @@ impl ApiKeyService {
                 }
             }
         }
-        if has_unknown_scope && talos_config::is_production() {
+        // Fail closed wherever browser hardening is required (every RUST_ENV but
+        // the development spellings; only `production` until 2026-10-14).
+        if has_unknown_scope && talos_auth_types::browser_hardening_required() {
             tracing::error!(
                 key_id = %key_id,
                 "Rejecting API key with invalid scopes in production (fail-closed)"
@@ -548,12 +572,12 @@ impl ApiKeyService {
         Ok((user_id, scopes))
     }
 
-    /// Has `prefix` spent its failed-validation budget in the current window?
-    /// Redis first (fleet-wide); the in-memory map when Redis is absent or
-    /// fails.
-    async fn failures_exceeded(&self, prefix: &str) -> bool {
+    /// Has `budget` ([`failure_budget_key`]) spent its failed-validation
+    /// allowance in the current window? Redis first (fleet-wide); the
+    /// in-memory map when Redis is absent or fails.
+    async fn failures_exceeded(&self, budget: &str) -> bool {
         if let Some(redis) = &self.redis_client {
-            match Self::redis_failures(prefix, redis, false).await {
+            match Self::redis_failures(budget, redis, false).await {
                 Ok(n) => return n >= FAILURE_LIMIT as i64,
                 Err(e) => tracing::warn!(
                     "Redis rate limit check failed, falling back to in-memory: {}",
@@ -562,15 +586,15 @@ impl ApiKeyService {
             }
         }
         let map = self.rate_limiter.lock().await;
-        map.get(prefix).is_some_and(|(count, start)| {
+        map.get(budget).is_some_and(|(count, start)| {
             start.elapsed() <= FAILURE_WINDOW && *count >= FAILURE_LIMIT
         })
     }
 
-    /// Count one failed validation against `prefix`.
-    async fn charge_failure(&self, prefix: &str) {
+    /// Count one failed validation against `budget` ([`failure_budget_key`]).
+    async fn charge_failure(&self, budget: &str) {
         if let Some(redis) = &self.redis_client {
-            match Self::redis_failures(prefix, redis, true).await {
+            match Self::redis_failures(budget, redis, true).await {
                 Ok(_) => return,
                 Err(e) => tracing::warn!(
                     "Redis rate limit charge failed, falling back to in-memory: {}",
@@ -584,8 +608,8 @@ impl ApiKeyService {
             let now = Instant::now();
             map.retain(|_, (_, start)| now.duration_since(*start) <= FAILURE_WINDOW);
             // L-18: still at capacity — evict the OLDEST entry rather than
-            // refusing to track a new prefix.
-            if map.len() >= RATE_LIMITER_MAX_ENTRIES && !map.contains_key(prefix) {
+            // refusing to track a new budget.
+            if map.len() >= RATE_LIMITER_MAX_ENTRIES && !map.contains_key(budget) {
                 if let Some(oldest_key) = map
                     .iter()
                     .min_by_key(|(_, (_, start))| *start)
@@ -596,12 +620,12 @@ impl ApiKeyService {
                         target: "talos_api_keys",
                         event_kind = "rate_limiter_evicted_oldest",
                         evicted = %oldest_key,
-                        "API key rate limiter at cap; evicted oldest prefix to admit new"
+                        "API key rate limiter at cap; evicted oldest budget to admit new"
                     );
                 }
             }
         }
-        let entry = map.entry(prefix.to_string()).or_insert((0, Instant::now()));
+        let entry = map.entry(budget.to_string()).or_insert((0, Instant::now()));
         if entry.1.elapsed() > FAILURE_WINDOW {
             *entry = (0, Instant::now());
         }
@@ -1044,6 +1068,28 @@ mod tests {
         svc.charge_failure("aaaaaaaa").await;
         assert!(svc.failures_exceeded("aaaaaaaa").await);
         assert!(!svc.failures_exceeded("bbbbbbbb").await);
+    }
+
+    /// The budget is per `(prefix, client)`: a caller who spends it on a
+    /// prefix locks out only itself, not the same prefix from another address
+    /// (2026-10-14).
+    #[tokio::test]
+    async fn one_callers_failures_do_not_lock_out_another() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .expect("lazy pool");
+        let svc = ApiKeyService::new(pool, None);
+        let attacker = failure_budget_key("cccccccc", "203.0.113.9");
+        let owner = failure_budget_key("cccccccc", "198.51.100.4");
+        for _ in 0..FAILURE_LIMIT {
+            svc.charge_failure(&attacker).await;
+        }
+        assert!(svc.failures_exceeded(&attacker).await);
+        assert!(
+            !svc.failures_exceeded(&owner).await,
+            "the same prefix from another address keeps its budget"
+        );
+        assert_ne!(attacker, owner);
     }
 
     #[test]

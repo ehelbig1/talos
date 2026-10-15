@@ -1652,14 +1652,13 @@ pub(crate) async fn rest_auth_middleware(
 /// caller for lack of a CSRF cookie. Safe methods pass through unchanged
 /// (`csrf_protection` would only seed a cookie there).
 ///
-/// Every frontend REST mutation caller already sends `X-CSRF-Token`
+/// Every frontend REST mutation caller sends `X-CSRF-Token`
 /// (`lib/authedFetch.ts`, `settings/watch-channels/api.ts`, and the two local
 /// `authedFetch` copies in `GmailWatchChannels.tsx` /
-/// `GoogleCalendarSelector.tsx`) — EXCEPT `builder/SlackBrowser.tsx`, whose
-/// bare `fetch` POSTs to `/api/slack/channels` and `/api/slack/users`. Those
-/// two routes are therefore split into their own sub-router WITHOUT this gate
-/// (see `slack_browse_routes`) until the frontend sends the header; the
-/// exemption is recorded there, not hidden here.
+/// `GoogleCalendarSelector.tsx`). There is no exempt route: the two Slack
+/// listing POSTs (`/api/slack/channels`, `/api/slack/users`) were briefly
+/// split out ungated for `builder/SlackBrowser.tsx`, which was deleted on
+/// 2026-09-10, and they sit behind this gate with `slack_api_routes`.
 pub(crate) async fn rest_cookie_csrf_gate(
     cookies: tower_cookies::Cookies,
     request: Request<axum::body::Body>,
@@ -1705,8 +1704,8 @@ pub(crate) async fn graphql_handler(
     // peer IP unchanged — so this is regression-free outside a proxy topology.
     static TRUSTED_PROXIES: std::sync::LazyLock<rate_limit::TrustedProxies> =
         std::sync::LazyLock::new(rate_limit::TrustedProxies::from_env);
-    let ip_address =
-        Some(rate_limit::extract_client_ip(addr.ip(), &headers, &TRUSTED_PROXIES).to_string());
+    let client_ip = rate_limit::extract_client_ip(addr.ip(), &headers, &TRUSTED_PROXIES);
+    let ip_address = Some(client_ip.to_string());
 
     // Extract user agent
     let user_agent = headers
@@ -1759,7 +1758,10 @@ pub(crate) async fn graphql_handler(
     if let Some(api_key) = headers.get("X-API-Key").and_then(|h| h.to_str().ok()) {
         // Get API key service from schema data
         if let Some(api_key_service) = schema.0.data::<std::sync::Arc<api_keys::ApiKeyService>>() {
-            if let Ok((user_id, scopes)) = api_key_service.validate_key(api_key).await {
+            // The failure budget is per (key prefix, caller address), bucketed
+            // as the rate limiter buckets it (A-12, 2026-10-14).
+            let client = rate_limit::rate_limit_key(client_ip).to_string();
+            if let Ok((user_id, scopes)) = api_key_service.validate_key(api_key, &client).await {
                 // Inject user_id into GraphQL context
                 req = req.data(user_id);
                 // Inject scopes so resolvers can enforce fine-grained authorization.
@@ -1848,7 +1850,10 @@ pub(crate) async fn graphql_handler(
     // Errors that match neither layer get replaced with the generic
     // "Internal server error" string. The full original error is logged
     // server-side via `tracing::error!` for debugging.
-    if !config::is_development() {
+    // Scrubbed wherever browser hardening is required (every RUST_ENV but the
+    // development spellings); until 2026-10-14 only under `production`, so a
+    // `staging` deployment returned raw resolver errors to its users.
+    if talos_auth_types::browser_hardening_required() {
         for error in &mut response.errors {
             tracing::error!("GraphQL Error: {:?}", error);
 
@@ -4071,8 +4076,14 @@ pub(crate) fn build_router(
         // trust X-Forwarded-For headers. Shared across all rate-limited routes.
         .layer(Extension(trusted_proxies));
 
-    // Conditionally add global rate limiting (only in production)
-    let app = if config::is_production() {
+    // Global rate limiting wherever the per-IP limiter is on
+    // (`rate_limit::ip_rate_limits_enforced`: browser hardening required —
+    // every RUST_ENV but the development spellings — or
+    // ENFORCE_RATE_LIMITS_IN_DEV). Until 2026-10-14 this followed
+    // `is_production()`, so `RUST_ENV=staging` (docker-compose.prod.yml)
+    // served real users with no request-rate limit at all.
+    let limits_enforced = rate_limit::ip_rate_limits_enforced();
+    let app = if limits_enforced {
         app.layer(from_fn(rate_limit::global_rate_limit_middleware))
             .layer(Extension(global_limiter))
     } else {
@@ -4080,11 +4091,11 @@ pub(crate) fn build_router(
         app
     };
 
-    // Apply tower_governor IP rate limiting only in production.
+    // tower_governor IP rate limiting, on the same predicate.
     // In development the burst of simultaneous GraphQL queries on page load
     // (AuthenticatedApp, Dashboard, WorkflowStatsPanel, etc.) routinely exceeds
     // the 20-token burst cap and produces spurious 429s.
-    let app = if config::is_production() {
+    let app = if limits_enforced {
         app.layer(governor_layer)
     } else {
         tracing::info!("tower_governor IP rate limiter DISABLED in development mode");

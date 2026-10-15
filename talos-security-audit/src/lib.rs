@@ -263,6 +263,10 @@ const CHECK_WEIGHTS: &[(&str, u32, CheckKind)] = &[
     // by `Status::Fail` in production, which lands in `status_counts.fail` and
     // `recommendation_for` by name. Security review 2026-10-14, B-2.
     ("fleet_identity", 0, CheckKind::Control),
+    // Zero weight for the same reason (security review 2026-10-14, C-12):
+    // the finding is a posture the operator chooses, carried by `Warn` and
+    // `recommendation_for`.
+    ("kek_posture", 0, CheckKind::Control),
 ];
 
 /// One rendered check.
@@ -418,6 +422,61 @@ pub fn check_fleet_identity(
     };
     Check {
         name: "fleet_identity",
+        status,
+        detail,
+        verification: Verification::Parsed,
+        points: 0,
+        parts: None,
+    }
+}
+
+/// Which key-encryption keys can unwrap this deployment's DEKs (security
+/// review 2026-10-14, C-12). Under `KEK_PROVIDER=vault` the env KEK
+/// (`TALOS_MASTER_KEY`) stays a live unwrap path — so a leaked Secret still
+/// opens every DEK the env key ever wrapped — until `KEK_DISABLE_LEGACY=true`.
+/// Turning it off is the operator's call once `dekMigrationStatus` reports no
+/// DEK left under the env key; this check reports which posture is running.
+/// Pure: the caller reads the three settings.
+#[must_use]
+pub fn check_kek_posture(
+    is_prod: bool,
+    provider: &str,
+    disable_legacy: bool,
+    allow_env_kek: bool,
+) -> Check {
+    let (status, detail) = match provider {
+        "vault" if disable_legacy => (
+            Status::Pass,
+            "KEK_PROVIDER=vault, KEK_DISABLE_LEGACY=true: one KEK, held by Vault".to_string(),
+        ),
+        "vault" => (
+            Status::Warn,
+            "two KEKs live: KEK_PROVIDER=vault, and the env KEK (TALOS_MASTER_KEY) still \
+             unwraps DEKs because KEK_DISABLE_LEGACY is not set — a leaked Secret opens every \
+             DEK the env key wrapped. Set KEK_DISABLE_LEGACY=true once dekMigrationStatus \
+             reports none left under it"
+                .to_string(),
+        ),
+        "env" if is_prod && allow_env_kek => (
+            Status::Warn,
+            "KEK_PROVIDER=env in production (acknowledged via TALOS_ALLOW_ENV_KEK): the root \
+             key lives in a Secret and in process memory"
+                .to_string(),
+        ),
+        "env" if is_prod => (
+            Status::Fail,
+            "KEK_PROVIDER=env in production without TALOS_ALLOW_ENV_KEK (the boot gate \
+             refuses this; reported for a process that skipped it)"
+                .to_string(),
+        ),
+        "env" => (
+            Status::Info,
+            "KEK_PROVIDER=env (development): the root key lives in the environment".to_string(),
+        ),
+        other => (Status::Fail, format!("unknown KEK_PROVIDER '{other}'")),
+    };
+    Check {
+        name: "kek_posture",
         status,
         detail,
         verification: Verification::Parsed,
@@ -2204,6 +2263,14 @@ pub async fn run_security_audit(
 
     let checks = vec![
         check_production_mode(is_prod),
+        check_kek_posture(
+            is_prod,
+            &std::env::var("KEK_PROVIDER")
+                .unwrap_or_else(|_| "env".to_string())
+                .to_lowercase(),
+            talos_config::bool_env_or_default("KEK_DISABLE_LEGACY", false),
+            talos_config::bool_env_or_default("TALOS_ALLOW_ENV_KEK", false),
+        ),
         check_fleet_identity(
             is_prod,
             talos_config::bool_env_or_default("TALOS_RESULT_REQUIRE_ED25519", false),

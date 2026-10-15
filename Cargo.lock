@@ -7933,7 +7933,6 @@ dependencies = [
  "talos-push-channel-inventory",
  "talos-replay-guard",
  "talos-task-supervision",
- "talos-workflow-repository",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -8118,6 +8117,7 @@ dependencies = [
 name = "talos-config"
 version = "0.1.0"
 dependencies = [
+ "talos-auth-types",
  "tracing",
 ]
 
@@ -8575,7 +8575,6 @@ dependencies = [
  "talos-trace-nats",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
- "talos-workflow-repository",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -8617,16 +8616,17 @@ dependencies = [
  "talos-oauth",
  "talos-public-url",
  "talos-push-channel-inventory",
+ "talos-random",
  "talos-redis",
  "talos-registry",
  "talos-secrets-manager",
  "talos-task-supervision",
+ "talos-text-util",
  "talos-trace-nats",
  "talos-worker-fleet",
  "talos-worker-runtime",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
- "talos-workflow-repository",
  "tokio",
  "tracing",
  "uuid",
@@ -8697,7 +8697,6 @@ dependencies = [
  "talos-trace-nats",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
- "talos-workflow-repository",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -8892,10 +8891,12 @@ dependencies = [
  "talos-task-supervision",
  "talos-text-util",
  "talos-workflow-job-protocol",
+ "talos-workflow-repository",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -9043,6 +9044,7 @@ dependencies = [
  "talos-analytics-repository",
  "talos-api-keys",
  "talos-audit-ledger",
+ "talos-auth-types",
  "talos-capability-world",
  "talos-child-run-ledger",
  "talos-compilation",
@@ -9386,11 +9388,12 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "subtle",
- "talos-config",
+ "talos-auth-types",
  "talos-dlp-provider",
  "talos-http-body",
  "talos-http-utils",
  "talos-metrics",
+ "talos-random",
  "talos-redis",
  "talos-secrets-manager",
  "talos-text-util",
@@ -9400,6 +9403,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -9560,6 +9564,7 @@ dependencies = [
  "ipnetwork",
  "redis",
  "serde_json",
+ "talos-auth-types",
  "talos-config",
  "talos-metrics",
  "talos-redis",
@@ -9597,6 +9602,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "subtle",
+ "talos-auth-types",
  "talos-capability-world",
  "talos-compilation",
  "talos-config",
@@ -9859,6 +9865,7 @@ name = "talos-security-headers"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "talos-auth-types",
  "talos-config",
  "tokio",
  "tower",
@@ -10036,6 +10043,7 @@ dependencies = [
  "sqlx",
  "subtle",
  "talos-admin-event-log",
+ "talos-auth-types",
  "talos-config",
  "talos-metrics",
  "talos-random",
@@ -10115,9 +10123,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
  "serde_json",
  "sqlx",
+ "talos-random",
  "talos-secrets-manager",
+ "talos-text-util",
  "uuid",
 ]
 
@@ -10165,6 +10176,7 @@ dependencies = [
  "talos-secrets-manager",
  "talos-task-supervision",
  "talos-text-util",
+ "talos-webhook-repository",
  "talos-worker-fleet",
  "talos-workflow-authorization",
  "talos-workflow-engine",
@@ -10362,6 +10374,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -10373,6 +10386,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -10407,6 +10421,7 @@ dependencies = [
  "talos-workflow-engine-core",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -10420,7 +10435,6 @@ dependencies = [
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
- "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -10539,6 +10553,7 @@ dependencies = [
  "serde_json",
  "talos-api",
  "talos-auth",
+ "talos-auth-types",
  "talos-config",
  "talos-metrics",
  "tokio",

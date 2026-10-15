@@ -287,7 +287,10 @@ async fn a_create_binds_only_the_callers_own_workflow() {
             ),
             "{refused:?}"
         );
-        assert_eq!(refused.user_facing_message(), "No such workflow.");
+        assert_eq!(
+            refused.user_facing_message(),
+            talos_integration_helpers::watch_binding::WORKFLOW_NOT_BINDABLE_MESSAGE
+        );
         assert_eq!(refused.status_code(), axum::http::StatusCode::NOT_FOUND);
     }
     assert_eq!(w.google.watches.load(Ordering::SeqCst), 0);
@@ -312,6 +315,50 @@ async fn a_create_binds_only_the_callers_own_workflow() {
         CreateWatchError::WorkflowBinding(BindWorkflowRefusal::WorkflowNotBindable)
     ));
     assert_eq!(stored_binding(&w, alice).await, Some(alices));
+}
+
+/// The owner's own workflow, archived or disabled, is refused by the bind and
+/// by a create alike: the trigger would refuse every push it started, so the
+/// binding would never fire (security review 2026-10-14, F-7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archived_workflow_cannot_be_bound() {
+    let w = world().await;
+    let (alice, alice_mail) = user_with_mailbox(&w).await;
+    let watch = w
+        .svc
+        .create_watch(alice, alice_mail, None, None, None)
+        .await
+        .expect("watch");
+    let archived = common::create_test_workflow(&w.pool, alice, "archived").await;
+    let disabled = common::create_test_workflow(&w.pool, alice, "disabled").await;
+    sqlx::query("UPDATE workflows SET status = 'archived' WHERE id = $1")
+        .bind(archived)
+        .execute(&w.pool)
+        .await
+        .expect("archive");
+    sqlx::query("UPDATE workflows SET is_enabled = false WHERE id = $1")
+        .bind(disabled)
+        .execute(&w.pool)
+        .await
+        .expect("disable");
+
+    for not_startable in [archived, disabled] {
+        assert_eq!(
+            bind_channel_workflow(&w.pool, alice, watch.id, Some(not_startable))
+                .await
+                .unwrap_err(),
+            BindWorkflowRefusal::WorkflowNotBindable
+        );
+        assert!(matches!(
+            w.svc
+                .create_watch(alice, alice_mail, None, Some(not_startable), None)
+                .await
+                .unwrap_err(),
+            CreateWatchError::WorkflowBinding(BindWorkflowRefusal::WorkflowNotBindable)
+        ));
+    }
+    assert_eq!(stored_binding(&w, alice).await, None);
+    assert!(audit(&w, alice, "workflow_bound").await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

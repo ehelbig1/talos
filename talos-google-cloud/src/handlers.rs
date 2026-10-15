@@ -812,9 +812,10 @@ pub struct PubsubHandlerState {
 ///      No match ⇒ 200 ack (+ warn) — never a 404 (no existence
 ///      oracle); lookup error ⇒ 200.
 ///   4. Enforce the PER-WATCH service-account email
-///      (`claims.require_service_account(row.expected_sa_email)`) — 401
-///      on mismatch (warn logs the channel_uuid only, never the token
-///      or email).
+///      (`claims.require_service_account(row.expected_sa_email)`) — on
+///      mismatch, the SAME 200 an unknown token gets (no existence oracle;
+///      counted, at most one audit row a day per channel; warn logs the
+///      channel_uuid only, never the token or email).
 ///   5. Decode the Pub/Sub envelope + base64 inner payload into the
 ///      Cloud Monitoring incident. Malformed ⇒ 200 (a sender bug isn't
 ///      fixed by retrying).
@@ -822,8 +823,9 @@ pub struct PubsubHandlerState {
 ///      task, and return 200 immediately (Pub/Sub retries non-2xx up to
 ///      7 days; Redis dedup covers replays).
 ///
-/// Only AUTH failures (steps 1/2/4) return non-2xx. Everything else
-/// acks 200 so Pub/Sub doesn't retry a dead message forever.
+/// Only a missing or unverifiable Google token (steps 1/2) returns 401.
+/// Everything else acks 200 so Pub/Sub doesn't retry a dead message
+/// forever.
 pub async fn pubsub_push_handler(
     Path(watch_token): Path<String>,
     State(state): State<Arc<PubsubHandlerState>>,
@@ -884,16 +886,21 @@ pub async fn pubsub_push_handler(
 
     // 4. Enforce the PER-WATCH service account. Log channel_uuid only —
     //    never the token or the email (PII / secret).
+    //
+    //    Answered exactly as an absent watch (200, no body): any GCP project
+    //    owner can mint a Google token with our audience, and a 401 here told
+    //    them which watch tokens exist (security review 2026-10-14, F-5). The
+    //    refusal is counted on the closed-label refusal metric; the owner's
+    //    `recent_failure` view gets at most one row a day per channel.
     if let Err(e) = claims.require_service_account(&row.expected_sa_email) {
         record_push_refusal(PushIntegration::Gcp, e.refusal_reason());
         tracing::warn!(
             channel_uuid = %row.id,
             error = %e,
-            "gcp pubsub: service-account mismatch"
+            "gcp pubsub: service-account mismatch; answered as an absent watch"
         );
-        // Surface to the owner's UI via recent_failure enrichment.
         audit_push_rejected(&state.watch_service.pool, user_id, &row, &e.to_string()).await;
-        return StatusCode::UNAUTHORIZED;
+        return PushWatchLookup::WrongSender.status();
     }
     // Authentication is complete (signature, claims, per-watch service
     // account): count the accepted push, so a stream that goes quiet is
@@ -1014,8 +1021,10 @@ fn decode_pubsub_payload(data: &str) -> Result<serde_json::Value, &'static str> 
 }
 
 /// Best-effort `gcp_channel_push_rejected` audit row (surfaced by the
-/// watch summary's `recent_failure`). Error is truncate-then-DLP-
-/// scrubbed before persisting.
+/// watch summary's `recent_failure`), at most one a day per channel: the
+/// refusal is one anyone holding a Google token can provoke, so past the
+/// first row it is the refusal metric, not a row. Error is
+/// truncate-then-DLP-scrubbed before persisting.
 async fn audit_push_rejected(
     pool: &sqlx::PgPool,
     user_id: Uuid,
@@ -1023,7 +1032,7 @@ async fn audit_push_rejected(
     err: &str,
 ) {
     let scrubbed = talos_integration_helpers::audit::truncate_and_redact_error(err);
-    if let Err(e) = talos_integration_helpers::audit::insert_channel_audit(
+    if let Err(e) = talos_integration_helpers::audit::insert_channel_audit_once_per_day(
         pool,
         talos_integration_helpers::audit::ChannelAuditEvent {
             integration_id: Some(row.integration_id),
@@ -1032,8 +1041,9 @@ async fn audit_push_rejected(
             target: Some(&row.expected_sa_email),
             success: false,
             error_message: Some(&scrubbed),
-            metadata: serde_json::json!({ "channel_uuid": row.id.to_string() }),
+            metadata: serde_json::json!({}),
         },
+        row.id,
     )
     .await
     {
