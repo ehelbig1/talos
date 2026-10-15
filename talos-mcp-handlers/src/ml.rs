@@ -221,13 +221,7 @@ pub async fn dispatch(
     if !tool_name.starts_with("ml_") {
         return None;
     }
-    let Some(user_id) = agent.user_id else {
-        return Some(mcp_denied(
-            req_id,
-            -32000,
-            "ML lifecycle tools require a user-bound agent identity",
-        ));
-    };
+    let user_id = agent.user_id;
     match tool_name {
         "ml_create_dataset" => Some(handle_create_dataset(req_id, args, state, user_id).await),
         "ml_append_examples" => Some(handle_append_examples(req_id, args, state, user_id).await),

@@ -489,7 +489,7 @@ pub async fn dispatch(
         "update_module_methods" => handle_update_module_methods(req_id, args, state, agent).await,
         "test_module" => handle_test_module(req_id, args, state, agent).await,
         "replay_module_regression" => {
-            let uid = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+            let uid = agent.user_id;
             if let Err(resp) = check_expensive_op_rate_limit(&req_id, uid) {
                 return Some(resp);
             }
@@ -497,7 +497,7 @@ pub async fn dispatch(
         }
         "get_rust_scaffold" => Some(handle_get_rust_scaffold(req_id, args)),
         "generate_typed_scaffold" => {
-            let uid = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+            let uid = agent.user_id;
             if let Err(resp) = check_expensive_op_rate_limit(&req_id, uid) {
                 return Some(resp);
             }
@@ -672,13 +672,7 @@ pub(crate) async fn require_world_permitted(
             ),
         ));
     }
-    let Some(user_id) = agent.user_id else {
-        return Err(mcp_denied(
-            req_id.clone(),
-            -32003,
-            "Unauthorized: this agent is not bound to a user, so no capability ceiling applies",
-        ));
-    };
+    let user_id = agent.user_id;
     let ceiling = match actor_repo.user_capability_ceiling(user_id).await {
         Ok(c) => c,
         Err(e) => {
@@ -1164,16 +1158,7 @@ async fn handle_generate_typed_scaffold(
         // callers cannot sample from module_executions because the query
         // path enforces user_id scoping. Return 401-equivalent instead of
         // silently skipping the capture.
-        let uid = match agent.user_id {
-            Some(u) => u,
-            None => {
-                return mcp_error(
-                    req_id,
-                    -32001,
-                    "source_module_id capture requires an authenticated user context",
-                );
-            }
-        };
+        let uid = agent.user_id;
         // MCP-191 (2026-05-08): pre-check module ownership/existence.
         // Pre-fix the handler skipped straight to capture_scrubbed_samples,
         // which queries module_executions scoped by user_id — a non-
@@ -1533,7 +1518,7 @@ async fn handle_compile_custom_sandbox(
     };
     let existing_template = state
         .module_repo
-        .find_compiled_sandbox_template(agent.user_id, &rust_code, cw_short)
+        .find_compiled_sandbox_template(Some(agent.user_id), &rust_code, cw_short)
         .await
         .ok()
         .flatten();
@@ -1595,7 +1580,7 @@ async fn handle_compile_custom_sandbox(
         // because the source hasn't changed, but we need a distinct DB record.
     }
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let job_id = uuid::Uuid::new_v4();
     let compilation = state
         .compiler
@@ -1663,7 +1648,7 @@ async fn handle_compile_custom_sandbox(
             if !user_name.is_empty() {
                 let collision = state
                     .module_repo
-                    .sandbox_template_name_exists(&template_name, agent.user_id)
+                    .sandbox_template_name_exists(&template_name, Some(agent.user_id))
                     .await
                     .unwrap_or(false);
                 if collision {
@@ -1724,7 +1709,7 @@ async fn handle_compile_custom_sandbox(
                 .mirror_sandbox_compile_to_modules(
                     module_id,
                     module_id, // legacy_template_id alias = modules.id (harmless self-reference)
-                    agent.user_id,
+                    Some(agent.user_id),
                     &template_name,
                     "sandbox",
                     cw_short,
@@ -2089,7 +2074,7 @@ async fn handle_run_sandbox(
     let lint_outcome = state
         .compiler
         .lint_code(
-            agent.user_id,
+            Some(agent.user_id),
             "run_sandbox_lint",
             &rust_code,
             &lint_world,
@@ -2129,7 +2114,7 @@ async fn handle_run_sandbox(
         }
     }
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let job_id = uuid::Uuid::new_v4();
     // Step 1b: Compile (with timeout)
     // allow-depless-compile: run_sandbox builds CALLER-SUPPLIED inline Rust.
@@ -2241,7 +2226,7 @@ async fn handle_run_sandbox(
             state.secrets_manager.clone(),
             &declared_secrets,
             &allowed_secrets,
-            agent.user_id,
+            Some(agent.user_id),
         )
         .await
         .map(talos_oauth::resolver::into_runtime_secrets)
@@ -2277,7 +2262,7 @@ async fn handle_run_sandbox(
             Err(resp) => return resp,
         };
     if let Some(aid) = actor_id_opt {
-        let caller_user = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+        let caller_user = agent.user_id;
         let owned = state
             .actor_repo
             .find_actor_for_user(aid, caller_user)
@@ -2299,7 +2284,7 @@ async fn handle_run_sandbox(
     // of the previous hardcoded Uuid::nil) also fixes a latent issue where
     // run_sandbox calls had no tenant identity — they now record the caller's
     // user for fuel/cost accounting and the RPC layer's per-tenant nonce cache.
-    let caller_user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let caller_user_id = agent.user_id;
     let effective_actor_id = actor_id_opt.unwrap_or(caller_user_id);
 
     // MCP-692 (2026-05-13): inherit the actor's max_llm_tier ceiling.
@@ -2335,7 +2320,7 @@ async fn handle_run_sandbox(
     if !matches!(llm_tier, talos_workflow_job_protocol::LlmTier::Tier1) {
         if let Ok(llm_keys) = state
             .secrets_manager
-            .get_llm_vault_keys(agent.user_id)
+            .get_llm_vault_keys(Some(agent.user_id))
             .await
         {
             // The cache returns Zeroizing<String>; the destination is a plain
@@ -2548,9 +2533,9 @@ async fn handle_compile_template(
     // resolve only for their owner. Agents without a user scope
     // (`agent.user_id == None`) fall back to nil UUID which still
     // matches catalog rows, mirroring the
-    // `agent.user_id.unwrap_or_else(Uuid::nil)` pattern used
+    // `agent.user_id` pattern used
     // throughout sandbox.rs for sandbox-template lookups.
-    let user_id_for_lookup = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id_for_lookup = agent.user_id;
     let template = match state
         .registry
         .get_template_for_user(template_id, user_id_for_lookup)
@@ -2644,7 +2629,7 @@ async fn handle_compile_template(
         None => serde_json::json!({}),
     };
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // Early guard: when the caller explicitly named the module, reject duplicate
     // names before spending 30-60s on compilation. Template-default names are
@@ -3473,7 +3458,7 @@ async fn handle_hot_update_module(
 ) -> Option<JsonRpcResponse> {
     use talos_hot_update_service::{HotUpdateError, HotUpdateInput};
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id: uuid::Uuid = match args
         .get("module_id")
         .and_then(|v| v.as_str())
@@ -3657,7 +3642,7 @@ async fn handle_update_module_secrets(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id: uuid::Uuid = match args
         .get("module_id")
         .and_then(|v| v.as_str())
@@ -3805,7 +3790,7 @@ async fn handle_update_module_hosts(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id: uuid::Uuid = match args
         .get("module_id")
         .and_then(|v| v.as_str())
@@ -3960,7 +3945,7 @@ async fn handle_update_module_methods(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id: uuid::Uuid = match args
         .get("module_id")
         .and_then(|v| v.as_str())
@@ -4092,7 +4077,7 @@ async fn handle_test_module(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id: uuid::Uuid = match args
         .get("module_id")
         .and_then(|v| v.as_str())
@@ -4821,16 +4806,7 @@ async fn handle_replay_module_regression(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = match agent.user_id {
-        Some(u) => u,
-        None => {
-            return Some(mcp_error(
-                req_id,
-                -32001,
-                "replay_module_regression requires an authenticated user context",
-            ))
-        }
-    };
+    let user_id = agent.user_id;
 
     // Caller-supplied ignore-fields list is layered on top of the
     // engine-metadata defaults inside the service. Owned `Vec<String>`
@@ -6182,7 +6158,7 @@ mod agent_role_permits_world_tests {
             name: "t".into(),
             role_name: "r".into(),
             allowed_capabilities: caps.iter().map(|s| s.to_string()).collect(),
-            user_id: None,
+            user_id: uuid::Uuid::new_v4(),
         }
     }
 
@@ -6665,7 +6641,7 @@ mod rehearsal_tool_tests {
         assert_eq!(source.matches(&test_module).count(), 1, "{test_module}");
         let run_sandbox = [
             "            &declared_",
-            "secrets,\n            &allowed_secrets,\n            agent.user_id,",
+            "secrets,\n            &allowed_secrets,\n            Some(agent.user_id),",
         ]
         .concat();
         assert_eq!(

@@ -11,7 +11,7 @@ fn mock_agent(capabilities: Vec<&str>) -> Arc<crate::auth::AgentIdentity> {
         name: "Test Agent".to_string(),
         role_name: "test-role".to_string(),
         allowed_capabilities: capabilities.into_iter().map(|s| s.to_string()).collect(),
-        user_id: None,
+        user_id: Uuid::new_v4(),
     })
 }
 

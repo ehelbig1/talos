@@ -66,7 +66,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     match name {
         "list_alerts" => Some(handle_list_alerts(req_id, args, state, user_id).await),
         "acknowledge_alert" => Some(handle_acknowledge_alert(req_id, args, state, user_id).await),

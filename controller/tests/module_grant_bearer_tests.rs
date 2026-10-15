@@ -32,7 +32,7 @@ fn agent_with(user: Uuid, caps: &[&str]) -> Arc<AgentIdentity> {
         name: "grant-probe".to_string(),
         role_name: "probe".to_string(),
         allowed_capabilities: caps.iter().map(|c| (*c).to_string()).collect(),
-        user_id: Some(user),
+        user_id: user,
     })
 }
 

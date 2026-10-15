@@ -189,7 +189,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     match name {
         "create_schedule" => Some(handle_create_schedule(req_id, args, state, user_id).await),
         "update_schedule" => Some(handle_update_schedule(req_id, args, state, user_id).await),

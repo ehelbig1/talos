@@ -1029,7 +1029,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(Uuid::nil);
+    let user_id = agent.user_id;
     Some(match name {
         "create_actor" => handle_create_actor(req_id, args, state, user_id).await,
         "scaffold_actor" => handle_scaffold_actor(req_id, args, state, user_id).await,
