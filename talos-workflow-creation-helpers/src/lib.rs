@@ -233,6 +233,12 @@ pub fn validate_node_ids(nodes: &[Value]) -> Result<(), String> {
                     nid.chars().take(20).collect::<String>()
                 ));
             }
+            if nid.starts_with("__") {
+                return Err(format!(
+                    "node id '{nid}' begins with `__`, which names the engine's own records; \
+                     rename the node"
+                ));
+            }
             if !nid
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))

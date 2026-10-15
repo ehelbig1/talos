@@ -110,6 +110,8 @@ pub async fn write_workflow_graph_if_unchanged(
     // its own.
     // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
     crate::graph_caps::refuse_over_cap_graph(graph_json)?;
+    // A node naming this workflow as its own child (G2-2).
+    crate::graph_caps::refuse_self_reference(graph_json, workflow_id)?;
     crate::action_link_targets::refuse_unowned_targets_on_pool(
         pool,
         user_id,

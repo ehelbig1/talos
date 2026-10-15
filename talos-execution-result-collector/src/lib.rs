@@ -82,7 +82,12 @@ pub fn collect_success_output(
         "__trigger_input__".to_string(),
         trigger_input_for_storage.clone(),
     );
-    if !ctx.node_timings.is_empty() {
+    // Engine-authored keys are set-or-REMOVED (security review 2026-10-15,
+    // G2-5): a node whose label is one of them must not stand in for the
+    // record when the engine has none.
+    if ctx.node_timings.is_empty() {
+        output.remove("__node_timings__");
+    } else {
         output.insert(
             "__node_timings__".to_string(),
             serde_json::to_value(&ctx.node_timings).unwrap_or_default(),
@@ -107,7 +112,11 @@ pub use talos_workflow_engine::child_run_outputs::CHILD_RUNS_KEY;
 /// The record is DLP-redacted here, so a caller that has already redacted
 /// the rest of the output can attach it afterwards.
 pub fn attach_child_runs(output: &mut Map<String, Value>, child_runs: Option<Value>) {
+    // Set-or-REMOVE (G2-5, 2026-10-15): with no record from the engine, a
+    // node output stored under the key (a node labelled `__child_runs__`) is
+    // dropped, never kept as the record.
     let Some(child_runs) = child_runs else {
+        output.remove(CHILD_RUNS_KEY);
         return;
     };
     let size = |v: &Value| serde_json::to_vec(v).map_or(usize::MAX, |b| b.len());
@@ -598,6 +607,20 @@ mod tests {
             err,
             ChildRunPathError::NoRecord { omitted: Some(_) }
         ));
+    }
+
+    #[test]
+    fn a_node_output_under_the_record_key_is_never_kept_as_the_record() {
+        // G2-5 (2026-10-15): a node labelled `__child_runs__` whose output
+        // landed under the key, in a run that started no child, is removed —
+        // set-or-REMOVE, as every engine-authored key is.
+        let mut output = Map::new();
+        output.insert(
+            CHILD_RUNS_KEY.to_string(),
+            serde_json::json!({ "forged": "record" }),
+        );
+        attach_child_runs(&mut output, None);
+        assert!(!output.contains_key(CHILD_RUNS_KEY));
     }
 
     #[test]

@@ -2959,6 +2959,37 @@ pub fn validate_prepared_with_children(
             });
         }
 
+        // ── An expression_dispatch node that declares no `targets` ────────
+        // (security review 2026-10-14, G-7; warned since 2026-10-15). With no
+        // declared set the node may start ANY of the owner's workflows — the
+        // legacy reading the engine keeps. A warning, never a refusal: the
+        // decision recorded is to warn first.
+        if let Some(nodes) = graph.get("nodes").and_then(|v| v.as_array()) {
+            for node in nodes {
+                if !talos_workflow_engine_core::dispatch_targets::is_expression_dispatch_node(node)
+                {
+                    continue;
+                }
+                let declared = node.get("data").and_then(|d| {
+                    d.get(talos_workflow_engine_core::dispatch_targets::DISPATCH_TARGETS_KEY)
+                });
+                if talos_workflow_engine_core::dispatch_targets::parse_dispatch_targets(declared)
+                    .is_some()
+                {
+                    continue;
+                }
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Warning,
+                    message: "This expression_dispatch node declares no `targets`, so it may \
+                              start any of your workflows its expression names. Declare the \
+                              workflows it may start (`targets`: a list of workflow ids)."
+                        .to_string(),
+                    node_id: node.get("id").and_then(|v| v.as_str()).map(str::to_string),
+                    category: "dispatch-targets-undeclared".into(),
+                });
+            }
+        }
+
         // Durability advisory (crash-recovery audit): collected inside the
         // template block below, surfaced as a Warning after it.
         let mut side_effecting_node_ids: Vec<String> = Vec::new();
@@ -5509,6 +5540,37 @@ mod edge_condition_tests {
             has_actor: true,
             history: Err("not read in this test".to_string()),
         }
+    }
+
+    /// G-7 (2026-10-15): an expression_dispatch node with no `targets` is a
+    /// warning (it may start any of the owner's workflows); one that
+    /// declares them is not.
+    #[test]
+    fn an_expression_dispatch_without_targets_is_warned_about() {
+        let undeclared = serde_json::json!({
+            "nodes": [{ "id": "route", "kind": "dispatch", "data": { "expression": "\"x\"" } }],
+            "edges": [],
+        });
+        let declared = serde_json::json!({
+            "nodes": [{ "id": "route", "kind": "dispatch",
+                "data": { "expression": "\"x\"", "targets": [Uuid::new_v4().to_string()] } }],
+            "edges": [],
+        });
+        let count = |g: &serde_json::Value| {
+            validate_prepared(prepared(g))
+                .issues
+                .iter()
+                .filter(|i| i.category == "dispatch-targets-undeclared")
+                .count()
+        };
+        assert_eq!(count(&undeclared), 1);
+        assert_eq!(count(&declared), 0);
+        let r = validate_prepared(prepared(&undeclared));
+        assert!(r
+            .issues
+            .iter()
+            .filter(|i| i.category == "dispatch-targets-undeclared")
+            .all(|i| i.severity == ValidationSeverity::Warning));
     }
 
     /// The observed edge: the source node is `hold` and the condition was

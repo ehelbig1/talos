@@ -15,13 +15,22 @@ front of the statements that write the column:
   called it, and `duplicate_workflow` / `promote_workflow` did not
   (`docs/engineering-log/packages/2026-10-15-every-graph-writer-passes-the-same-gates.md`).
 
-This check keeps a new writer from skipping either:
+* A node naming the workflow being written as its own child (`A → A`) —
+  `talos_workflow_repository::graph_caps` (`refuse_self_reference`), asked in
+  front of a statement that REWRITES a row (UPDATE, MERGE); an INSERT writes a
+  new id no node can name. Until 2026-10-15 only the `add_*_node` tools refused
+  it (security review round 2, G2-2).
+
+This check keeps a new writer from skipping any of them:
 
     check-graph-writers.py [ROOT]     exit 1 and name each statement
     check-graph-writers.py --self-test
 
 A statement is an `INSERT INTO workflows` whose column list names
-`graph_json`, or an `UPDATE workflows` that sets `graph_json`. The function
+`graph_json`, or an `UPDATE workflows` / `MERGE INTO workflows` that sets
+`graph_json` — in any case, `public.`-qualified or quoted, `UPDATE ONLY`
+included (since 2026-10-15, G2-3: each of those spellings passed with no
+finding). The function
 it sits in must call `refuse_unowned_targets…` AND `refuse_over_cap_graph`
 BEFORE the statement. A Rust string continuation (a backslash, then a line break)
 between `workflows` and its column list is whitespace to Postgres and to
@@ -53,8 +62,23 @@ GUARDS = (
 MARKER = re.compile(r"//\s*graph-write-unchecked:\s*\S")
 SKIP_DIRS = {"target", ".git", "node_modules", ".sqlx", "graphify-out", ".claude"}
 
-_INSERT = re.compile(r"INSERT\s+INTO\s+workflows\b(?!_)(?:\s|\\)*\(([^)]*)\)", re.S)
-_UPDATE = re.compile(r"UPDATE\s+workflows\b(?!_)(.*?)(?:\bWHERE\b|\bRETURNING\b|;|\"\s*[,)]\s*\n)", re.S)
+# The table, as Postgres reads it: any case, optionally schema-qualified,
+# optionally quoted — `"workflows"`, or `\"workflows\"` inside a Rust string
+# literal (security review 2026-10-15, G2-3 — the lowercase,
+# `public.`, quoted, `UPDATE ONLY` and `MERGE` spellings each passed with zero
+# findings).
+_TABLE = r'(?:public\.)?(?:\\?"workflows\\?"|workflows\b)(?!_)'
+_INSERT = re.compile(r"INSERT\s+INTO\s+" + _TABLE + r"(?:\s|\\)*\(([^)]*)\)", re.S | re.I)
+_UPDATE = re.compile(
+    r"UPDATE\s+(?:ONLY\s+)?" + _TABLE + r"(.*?)(?:\bWHERE\b|\bRETURNING\b|;|\"\s*[,)]\s*\n)",
+    re.S | re.I,
+)
+_MERGE = re.compile(r"MERGE\s+INTO\s+" + _TABLE + r"(.*?)(?:;|\"\s*[,)]\s*\n)", re.S | re.I)
+# An UPDATE (or MERGE) rewrites an existing row, whose id a node can name: it
+# is also held to the self-reference rule (G2-2). An INSERT writes a new id.
+UPDATE_GUARDS = (
+    ("refuse_self_reference", "talos_workflow_repository::graph_caps"),
+)
 _FN = re.compile(r"^[ \t]*(?:pub(?:\([a-z: ]+\))?\s+)?(?:async\s+)?fn\s+(\w+)", re.M)
 
 
@@ -63,13 +87,19 @@ def _is_test_path(rel: str) -> bool:
     return "tests" in parts[:-1] or parts[-1].endswith("_tests.rs")
 
 
-def _statements(text: str) -> list[int]:
-    """Offsets of each statement that writes `workflows.graph_json`."""
-    found = [m.start() for m in _INSERT.finditer(text) if "graph_json" in m.group(1)]
+def _statements(text: str) -> list[tuple[int, bool]]:
+    """`(offset, rewrites_a_row)` of each statement that writes
+    `workflows.graph_json`."""
+    found = [
+        (m.start(), False)
+        for m in _INSERT.finditer(text)
+        if re.search(r"\bgraph_json\b", m.group(1), re.I)
+    ]
     found += [
-        m.start()
-        for m in _UPDATE.finditer(text)
-        if re.search(r"\bgraph_json\s*=", m.group(1))
+        (m.start(), True)
+        for pat in (_UPDATE, _MERGE)
+        for m in pat.finditer(text)
+        if re.search(r"\bgraph_json\s*=", m.group(1), re.I)
     ]
     return sorted(found)
 
@@ -77,7 +107,7 @@ def _statements(text: str) -> list[int]:
 def problems_in(rel: str, text: str) -> list[str]:
     out: list[str] = []
     fns = [(m.start(), m.group(1)) for m in _FN.finditer(text)]
-    for at in _statements(text):
+    for at, rewrites in _statements(text):
         line = text.count("\n", 0, at) + 1
         above = "\n".join(text[:at].split("\n")[-9:])
         if MARKER.search(above):
@@ -87,7 +117,7 @@ def problems_in(rel: str, text: str) -> list[str]:
             out.append(f"{rel}:{line}: writes workflows.graph_json outside any function")
             continue
         start, name = enclosing[-1]
-        for guard, home in GUARDS:
+        for guard, home in GUARDS + (UPDATE_GUARDS if rewrites else ()):
             if guard not in text[start:at]:
                 out.append(
                     f"{rel}:{line}: `{name}` writes workflows.graph_json without first calling "
@@ -182,17 +212,41 @@ def _self_test() -> int:
         sqlx::query("INSERT INTO workflow_versions (workflow_id, graph_json) VALUES ($1, $2)");
     }
     '''
+    good_update = '''
+    pub async fn save(&self, id: Uuid, graph_json: &str) -> Result<()> {
+        crate::graph_caps::refuse_over_cap_graph(graph_json)?;
+        crate::graph_caps::refuse_self_reference(graph_json, id)?;
+        refuse_unowned_targets_on_pool(pool, u, Some(id), graph_json).await?;
+        sqlx::query("UPDATE workflows SET graph_json = $1 WHERE id = $2");
+    }
+    '''
+    update_no_self_reference = good_update.replace(
+        "crate::graph_caps::refuse_self_reference(graph_json, id)?;", ""
+    )
+    spellings = {
+        "lowercase": 'sqlx::query("update workflows set graph_json = $1 where id = $2");',
+        "schema-qualified": 'sqlx::query("UPDATE public.workflows SET graph_json = $1 WHERE id = $2");',
+        "quoted": 'sqlx::query("UPDATE \\"workflows\\" SET graph_json = $1 WHERE id = $2");',
+        "only": 'sqlx::query("UPDATE ONLY workflows SET graph_json = $1 WHERE id = $2");',
+        "merge": 'sqlx::query("MERGE INTO workflows w USING s ON w.id = s.id WHEN MATCHED THEN UPDATE SET graph_json = s.g;");',
+        "insert lowercase": 'sqlx::query("insert into public.workflows (id, graph_json) values ($1, $2)");',
+    }
     cases = [
         ("good", good, 0),
+        ("good update", good_update, 0),
         # Each missing guard is its own problem.
-        ("no guard", no_guard, 2),
-        ("only the targets rule", only_targets, 1),
+        ("no guard", no_guard, 3),
+        ("only the targets rule", only_targets, 2),
         ("a continuation before the column list, caps missing", continuation, 1),
-        ("guard after the statement", guard_after, 2),
+        ("guard after the statement", guard_after, 3),
         ("guard in the function before", guard_in_the_function_before, 2),
+        ("an update without the self-reference rule", update_no_self_reference, 1),
         ("marked", marked, 0),
         ("not a graph write", not_a_graph_write, 0),
     ]
+    for name, stmt in spellings.items():
+        want = 2 if name.startswith("insert") else 3
+        cases.append((f"spelling: {name}", f"async fn w(&self) {{\n    {stmt}\n}}\n", want))
     failures = 0
     for name, text, want in cases:
         got = problems_in("x.rs", text)
@@ -214,7 +268,7 @@ def _self_test() -> int:
             with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
                 fh.write(text)
         got = problems(root)
-        if len(got) != 2 or not all(
+        if len(got) != 3 or not all(
             g.startswith(os.path.join("crate", "src", "lib.rs") + ":") for g in got
         ):
             failures += 1
