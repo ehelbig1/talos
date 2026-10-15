@@ -551,7 +551,8 @@ enum McpAuthRefusal {
     RateLimited,
     /// No usable credential: no `Authorization: Bearer <token>` header (see
     /// [`UnusableCredential`] for what the request carried instead) and no
-    /// `?token=` query parameter.
+    /// `?token=` query parameter on the one request that may carry it
+    /// ([`query_token_permitted`]).
     MissingToken(UnusableCredential),
     /// No active `mcp_agents` row carries this token's SHA-256 lookup hash —
     /// a guessed, mistyped or REVOKED token (`is_active = false` rows are
@@ -795,6 +796,17 @@ fn mcp_client_ip(addr: SocketAddr, req: &Request<axum::body::Body>) -> String {
     talos_rate_limit::extract_client_ip(addr.ip(), req.headers(), &TRUSTED_PROXIES).to_string()
 }
 
+/// May this request carry its agent token in `?token=`? Only `GET /mcp/sse`
+/// (2026-10-14): the SSE stream is what a browser `EventSource` opens, and it
+/// cannot set a header. `POST /mcp`, `POST /mcp/message` and the streamable
+/// `GET /mcp` all have header-capable clients. The middleware runs inside the
+/// `/mcp` nest, which strips the prefix, so the path it sees is `/sse`; the
+/// unnested spelling is accepted too so the rule does not depend on where the
+/// router is mounted.
+pub(crate) fn query_token_permitted(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::GET && matches!(path, "/sse" | "/mcp/sse")
+}
+
 /// Every step of MCP authentication — limiter, token extraction, cache,
 /// lookup, bcrypt, the user-scope gate, the admit-side bookkeeping — admitting
 /// an [`AgentIdentity`] or naming why not. It writes nothing to the request
@@ -808,6 +820,7 @@ fn mcp_client_ip(addr: SocketAddr, req: &Request<axum::body::Body>) -> String {
 async fn authenticate_mcp_request(
     db_pool: &PgPool,
     ip: &str,
+    method: &axum::http::Method,
     headers: &axum::http::HeaderMap,
     uri: &axum::http::Uri,
 ) -> Result<AgentIdentity, McpAuthRefusal> {
@@ -817,22 +830,28 @@ async fn authenticate_mcp_request(
 
     // 1. Extract Bearer Token from multiple sources:
     //    a) Authorization: Bearer <token> header (standard)
-    //    b) ?token=<token> query parameter (for clients that can't set headers)
+    //    b) ?token=<token> query parameter — ONLY on `GET /mcp/sse`
     let auth_header = bearer_from_header(headers);
 
-    // Query-param token: supported for clients that cannot set HTTP headers
-    // (e.g. SSE clients, browser EventSource).  The token value is extracted
-    // here and NEVER written to any log — the raw URI (which would contain the
-    // plaintext token) must not appear in access logs or tracing spans.
-    let query_token = uri.query().and_then(|q| {
-        q.split('&').find_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            match (parts.next(), parts.next()) {
-                (Some("token"), Some(v)) => Some(v.to_string()),
-                _ => None,
-            }
+    // Query-param token: supported for the one client that cannot set HTTP
+    // headers, a browser `EventSource` opening the SSE stream. Anywhere else a
+    // `?token=` is not read at all — the request is answered as if it carried
+    // no credential — because a token in a URL lands in every intermediary
+    // that logs request lines, in browser history and in `Referer`, and the
+    // agent token is long-lived. The value is NEVER written to any log.
+    let query_token = if query_token_permitted(method, uri.path()) {
+        uri.query().and_then(|q| {
+            q.split('&').find_map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                match (parts.next(), parts.next()) {
+                    (Some("token"), Some(v)) => Some(v.to_string()),
+                    _ => None,
+                }
+            })
         })
-    });
+    } else {
+        None
+    };
 
     // The header wins when it carries a token; a malformed or absent header
     // falls back to `?token=` as before, and is the reason only when there
@@ -1053,7 +1072,7 @@ pub async fn mcp_auth_middleware(
     next: Next,
 ) -> Result<Response, StatusCode> {
     let ip = mcp_client_ip(addr, &req);
-    match authenticate_mcp_request(&db_pool, &ip, req.headers(), req.uri()).await {
+    match authenticate_mcp_request(&db_pool, &ip, req.method(), req.headers(), req.uri()).await {
         Ok(agent) => {
             talos_metrics::record_mcp_auth(McpAuthOutcome::Ok);
             // 5. Inject AgentIdentity into Request extensions
@@ -1129,10 +1148,15 @@ mod mcp_auth_refusal_tests {
         let _g = LIMITER_TEST_LOCK.lock().await;
         let pool = never_connecting_pool();
         let no_token = request(None);
-        let refusal =
-            authenticate_mcp_request(&pool, "203.0.113.11", no_token.headers(), no_token.uri())
-                .await
-                .expect_err("no token must be refused");
+        let refusal = authenticate_mcp_request(
+            &pool,
+            "203.0.113.11",
+            no_token.method(),
+            no_token.headers(),
+            no_token.uri(),
+        )
+        .await
+        .expect_err("no token must be refused");
         assert!(
             matches!(
                 refusal,
@@ -1151,9 +1175,9 @@ mod mcp_auth_refusal_tests {
     }
 
     /// A header that is not `Bearer <token>` is refused before any database
-    /// read and named as malformed; with a `?token=` beside it the query
-    /// token is still used, as before (here it reaches the lookup, which this
-    /// pool cannot answer).
+    /// read and named as malformed; with a `?token=` beside it on the event
+    /// stream the query token is still used, as before (here it reaches the
+    /// lookup, which this pool cannot answer).
     #[tokio::test]
     async fn a_malformed_header_is_named_and_the_query_token_still_counts() {
         let _g = LIMITER_TEST_LOCK.lock().await;
@@ -1165,9 +1189,15 @@ mod mcp_auth_refusal_tests {
             ("Bearer    ", UnusableCredential::EmptyBearer),
         ] {
             let req = request(Some(header));
-            let refusal = authenticate_mcp_request(&pool, "203.0.113.14", req.headers(), req.uri())
-                .await
-                .expect_err("malformed");
+            let refusal = authenticate_mcp_request(
+                &pool,
+                "203.0.113.14",
+                req.method(),
+                req.headers(),
+                req.uri(),
+            )
+            .await
+            .expect_err("malformed");
             assert!(
                 matches!(refusal, McpAuthRefusal::MissingToken(w) if w == why),
                 "{header:?}: {refusal:?}"
@@ -1182,14 +1212,15 @@ mod mcp_auth_refusal_tests {
             assert_eq!(body["error"]["data"]["reason"], "malformed_authorization");
         }
         let with_query = Request::builder()
-            .method("POST")
-            .uri("/mcp?token=talos_mcp_from_query")
+            .method("GET")
+            .uri("/sse?token=talos_mcp_from_query")
             .header(axum::http::header::AUTHORIZATION, "talos_mcp_no_scheme")
             .body(axum::body::Body::empty())
             .expect("request");
         let refusal = authenticate_mcp_request(
             &pool,
             "203.0.113.14",
+            with_query.method(),
             with_query.headers(),
             with_query.uri(),
         )
@@ -1216,14 +1247,20 @@ mod mcp_auth_refusal_tests {
         let api_key = "talos_sk_0123abcd0123456789abcdef0123456789abcdef";
         let by_header = request(Some(&format!("Bearer {api_key}")));
         let by_query = Request::builder()
-            .method("POST")
-            .uri(format!("/mcp?token={api_key}"))
+            .method("GET")
+            .uri(format!("/sse?token={api_key}"))
             .body(axum::body::Body::empty())
             .expect("request");
         for req in [by_header, by_query] {
-            let refusal = authenticate_mcp_request(&pool, "203.0.113.15", req.headers(), req.uri())
-                .await
-                .expect_err("an API key");
+            let refusal = authenticate_mcp_request(
+                &pool,
+                "203.0.113.15",
+                req.method(),
+                req.headers(),
+                req.uri(),
+            )
+            .await
+            .expect_err("an API key");
             assert!(
                 matches!(
                     refusal,
@@ -1245,6 +1282,71 @@ mod mcp_auth_refusal_tests {
         MCP_AUTH_RATE_LIMITER
             .get_or_init(DashMap::new)
             .remove("203.0.113.15");
+    }
+
+    /// A `?token=` is read only on `GET /sse` (2026-10-14): on any other method
+    /// or path the request is answered as carrying no credential, before any
+    /// database read (this pool cannot connect, so a lookup would be an
+    /// `Error`, not `MissingToken`).
+    #[tokio::test]
+    async fn a_query_token_off_the_event_stream_is_not_read() {
+        let _g = LIMITER_TEST_LOCK.lock().await;
+        let pool = never_connecting_pool();
+        for (method, uri) in [
+            ("POST", "/?token=talos_mcp_from_query"),
+            ("POST", "/message?token=talos_mcp_from_query"),
+            ("GET", "/?token=talos_mcp_from_query"),
+            ("POST", "/sse?token=talos_mcp_from_query"),
+            ("POST", "/mcp?token=talos_mcp_from_query"),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let refusal = authenticate_mcp_request(
+                &pool,
+                "203.0.113.16",
+                req.method(),
+                req.headers(),
+                req.uri(),
+            )
+            .await
+            .expect_err("no credential was read");
+            assert!(
+                matches!(
+                    refusal,
+                    McpAuthRefusal::MissingToken(UnusableCredential::Absent)
+                ),
+                "{method} {uri}: {refusal:?}"
+            );
+            let (status, _, body) =
+                reply_parts(refusal.into_reply().expect("a 401 with a body")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body["error"]["data"]["reason"], "missing_credentials");
+        }
+        MCP_AUTH_RATE_LIMITER
+            .get_or_init(DashMap::new)
+            .remove("203.0.113.16");
+    }
+
+    #[test]
+    fn only_the_event_stream_get_may_carry_its_token_in_the_query() {
+        use axum::http::Method;
+        assert!(query_token_permitted(&Method::GET, "/sse"));
+        assert!(query_token_permitted(&Method::GET, "/mcp/sse"));
+        for (method, path) in [
+            (Method::POST, "/sse"),
+            (Method::HEAD, "/sse"),
+            (Method::GET, "/"),
+            (Method::POST, "/"),
+            (Method::POST, "/message"),
+            (Method::GET, "/mcp"),
+            (Method::GET, "/sse/"),
+            (Method::GET, "/local"),
+        ] {
+            assert!(!query_token_permitted(&method, path), "{method} {path}");
+        }
     }
 
     #[test]
@@ -1318,9 +1420,15 @@ mod mcp_auth_refusal_tests {
         let _g = LIMITER_TEST_LOCK.lock().await;
         let pool = never_connecting_pool();
         let guess = request(Some("Bearer not-a-real-token"));
-        let refusal = authenticate_mcp_request(&pool, "203.0.113.12", guess.headers(), guess.uri())
-            .await
-            .expect_err("the lookup cannot succeed");
+        let refusal = authenticate_mcp_request(
+            &pool,
+            "203.0.113.12",
+            guess.method(),
+            guess.headers(),
+            guess.uri(),
+        )
+        .await
+        .expect_err("the lookup cannot succeed");
         assert!(
             matches!(
                 refusal,
@@ -1343,19 +1451,29 @@ mod mcp_auth_refusal_tests {
         let pool = never_connecting_pool();
         let no_token = request(None);
         for i in 0..mcp_auth_max_requests() {
-            let refusal =
-                authenticate_mcp_request(&pool, "203.0.113.13", no_token.headers(), no_token.uri())
-                    .await
-                    .expect_err("no token");
+            let refusal = authenticate_mcp_request(
+                &pool,
+                "203.0.113.13",
+                no_token.method(),
+                no_token.headers(),
+                no_token.uri(),
+            )
+            .await
+            .expect_err("no token");
             assert!(
                 matches!(refusal, McpAuthRefusal::MissingToken(_)),
                 "request {i}: {refusal:?}"
             );
         }
-        let refusal =
-            authenticate_mcp_request(&pool, "203.0.113.13", no_token.headers(), no_token.uri())
-                .await
-                .expect_err("over the cap");
+        let refusal = authenticate_mcp_request(
+            &pool,
+            "203.0.113.13",
+            no_token.method(),
+            no_token.headers(),
+            no_token.uri(),
+        )
+        .await
+        .expect_err("over the cap");
         assert!(
             matches!(refusal, McpAuthRefusal::RateLimited),
             "{refusal:?}"

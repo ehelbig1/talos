@@ -43,6 +43,29 @@ const SWEEP_EVERY_CHECKS: u64 = 4096;
 /// Default bound on distinct users tracked at once before a sweep is forced.
 pub const DEFAULT_MAX_TRACKED_USERS: usize = 10_000;
 
+/// Env var for the heavy-operation bucket's ceiling. Default 10 per user per
+/// minute (`env_rate_limit`: `0`/unset/unparseable → default).
+pub const HEAVY_MUTATION_ENV: &str = "GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN";
+pub const HEAVY_MUTATION_DEFAULT_PER_MIN: u32 = 10;
+
+static HEAVY_OPERATIONS: std::sync::LazyLock<PerUserThrottle> = std::sync::LazyLock::new(|| {
+    PerUserThrottle::per_minute(crate::env_rate_limit(
+        HEAVY_MUTATION_ENV,
+        HEAVY_MUTATION_DEFAULT_PER_MIN,
+    ))
+});
+
+/// The ONE per-user bucket for operations that cost seconds of someone
+/// else's resource each — an LLM round trip, a synchronous WASM run, an
+/// outbound relay. The GraphQL `HeavyMutation` class draws from it
+/// (`talos_api::schema::throttle`), and so does the MCP `call_a2a_agent` tool
+/// (2026-10-14): one user's allowance is shared across both surfaces, not
+/// doubled by switching between them. Per controller replica, like every
+/// `PerUserThrottle`.
+pub fn heavy_operations() -> &'static PerUserThrottle {
+    &HEAVY_OPERATIONS
+}
+
 /// Outcome of a refused check — how long until one token is available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThrottleExceeded {

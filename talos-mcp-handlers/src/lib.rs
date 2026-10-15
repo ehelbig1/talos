@@ -473,6 +473,22 @@ pub fn create_router(
         push_channels,
     };
 
+    mount_routes(state, db_pool)
+}
+
+/// The `/mcp` route set for `state`: the authenticated routes, plus the
+/// tokenless `/local` route ONLY where no browser hardening is required.
+///
+/// `/local` serves every tool as the first user with no token. Until
+/// 2026-10-14 it was mounted on `!is_production()`, so a deployment that
+/// runs `RUST_ENV=staging` — `docker-compose.prod.yml`, which faces real
+/// users — served it, and the `local_caller` gate was its only condition. A
+/// process on the compose network that opens a connection to the controller
+/// and sends `Host: localhost` passes that gate. The predicate is now
+/// [`talos_auth_types::browser_hardening_required`]: only the development
+/// spellings of `RUST_ENV` mount the route. A function of its own so a test
+/// can drive the mount decision as it is served.
+pub fn mount_routes(state: McpState, db_pool: sqlx::PgPool) -> Router {
     // Authenticated routes (Bearer token required)
     let authenticated = Router::new()
         .route("/sse", get(sse_handler))
@@ -487,28 +503,19 @@ pub fn create_router(
             auth::mcp_auth_middleware,
         ));
 
-    // Local development route — NO auth required.
-    // SECURITY: Only available when RUST_ENV != "production", and only to a
-    // caller on this machine (`local_caller`).
-    // Uses a default admin agent identity for local development.
-    let is_production = talos_config::is_production();
-
-    if is_production {
-        tracing::info!("MCP local endpoint DISABLED (production mode)");
+    if talos_auth_types::browser_hardening_required() {
+        tracing::info!("MCP local endpoint DISABLED (RUST_ENV is not a development spelling)");
         authenticated.with_state(state)
     } else {
-        tracing::info!(
-            "MCP local endpoint ENABLED (optimized build) at /mcp/local (development mode)"
-        );
-        let local_route = local_router(state.clone(), db_pool.clone());
-
+        tracing::info!("MCP local endpoint ENABLED at /mcp/local (development mode)");
+        let local_route = local_router(state.clone(), db_pool);
         authenticated.merge(local_route).with_state(state)
     }
 }
 
 /// The tokenless local-development MCP route (`/local` under `/mcp`).
 ///
-/// Mounted by [`create_router`] only outside production, and answered only
+/// Mounted by [`mount_routes`] only in development, and answered only
 /// for a caller on this machine ([`local_caller`]): the build mode says
 /// nothing about who can reach the port. A function of its own so a test can
 /// drive the route as it is served.

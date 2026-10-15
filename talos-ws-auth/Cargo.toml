@@ -13,6 +13,7 @@ futures.workspace = true
 serde_json.workspace = true
 talos-api = { path = "../talos-api" }
 talos-auth = { path = "../talos-auth" }
+talos-auth-types = { path = "../talos-auth-types" }
 talos-config = { path = "../talos-config" }
 talos-metrics = { path = "../talos-metrics" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }

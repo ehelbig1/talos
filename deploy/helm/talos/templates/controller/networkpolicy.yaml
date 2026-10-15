@@ -160,6 +160,11 @@ spec:
           port: 11434
     {{- end }}
     # External egress (Postgres, Redis, OAuth providers, LLM providers)
+    # The `except` list is the worker's, entry for entry
+    # (scripts/check-deploy-posture.py holds them equal): the controller holds
+    # the Postgres, Neo4j and Vault credentials, so SSRF space the worker may
+    # not reach — RFC 6598 included, where a tailnet or cloud-internal service
+    # lives — is not reachable from here either (H-2, 2026-10-14).
     - to:
         {{- range .Values.networkPolicy.externalEgressCIDRs }}
         - ipBlock:
@@ -169,6 +174,7 @@ spec:
               - 10.0.0.0/8
               - 172.16.0.0/12
               - 192.168.0.0/16
+              - 100.64.0.0/10    # RFC 6598 shared/CGNAT space (Tailscale, carrier NAT)
         {{- end }}
       ports:
         - protocol: TCP

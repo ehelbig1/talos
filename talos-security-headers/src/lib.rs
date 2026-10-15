@@ -52,7 +52,9 @@ pub async fn add_security_headers(
 
     // HTTP Strict Transport Security (HSTS)
     // Forces HTTPS connections for 1 year
-    // Auto-enabled in production, can be explicitly enabled/disabled via ENABLE_HSTS env var
+    // Auto-enabled wherever browser hardening is required (every RUST_ENV but
+    // the development spellings — `is_production()` until 2026-10-14), and
+    // explicitly enabled/disabled via the ENABLE_HSTS env var
     //
     // MCP-1072 (2026-05-15): routed through `bool_env_or_default` so
     // canonical truthy/falsy tokens override the production default
@@ -63,8 +65,10 @@ pub async fn add_security_headers(
     // enabled/disabled" promise. Also fixed: `=1` / `=yes` / `=on`
     // / `=TRUE` (capital) now enable HSTS in dev (the canonical
     // truthy set). Sibling drift class to MCP-1060/1064/1065/1066.
-    let enable_hsts =
-        talos_config::bool_env_or_default("ENABLE_HSTS", talos_config::is_production());
+    let enable_hsts = talos_config::bool_env_or_default(
+        "ENABLE_HSTS",
+        talos_auth_types::browser_hardening_required(),
+    );
 
     if enable_hsts {
         headers.insert(
@@ -208,8 +212,9 @@ fn csp_and_reporting_headers() -> &'static (HeaderValue, Option<HeaderValue>) {
                     ok
                 });
 
-            let csp_value: &'static str = if talos_config::is_production() {
-                // STRICT CSP for production - NO unsafe-inline, unsafe-eval, or data: URIs.
+            let csp_value: &'static str = if talos_auth_types::browser_hardening_required() {
+                // STRICT CSP wherever browser hardening is required (staging too,
+                // since 2026-10-14) - NO unsafe-inline, unsafe-eval, or data: URIs.
                 "default-src 'self'; \
                  script-src 'self'; \
                  style-src 'self'; \

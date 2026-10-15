@@ -9730,6 +9730,111 @@ fi
 
 echo
 
+bold "▶ check 103: is_production() is read only where build posture is decided"
+
+# Two predicates name the deployment: `talos_config::is_production()`
+# (`RUST_ENV == "production"`) and
+# `talos_auth_types::browser_hardening_required()` (every RUST_ENV but the
+# development spellings). `docker-compose.prod.yml` faces real users under
+# RUST_ENV=staging, deliberately (its plaintext backends cannot pass the
+# production TLS gates). Until 2026-10-14 the /mcp/local mount, the WebSocket
+# Origin requirement, the CSP, HSTS's default, every request-rate limiter, the
+# auth limiters' fail-closed policy, GraphQL introspection and error scrubbing,
+# the GraphQL playground, the OAuth connect cookie's `Secure`, the
+# ALLOWED_ORIGIN rule set, the unauthenticated catalog publish and the 2FA and
+# API-key fail-closed gates all keyed on `is_production()` and relaxed there
+# (security review 2026-10-14, A-5/A-6).
+#
+# The rule: `is_production()` decides BUILD / INFRASTRUCTURE posture only —
+# TLS to the backends, the KEK, required keys, Sigstore, the compilation
+# sandbox, the worker, the audit sink, RLS and DB-sandbox posture, the
+# signed-RPC replay policy. Anything a browser or a tenant meets uses
+# `browser_hardening_required()`. This check lists the files where an
+# `is_production()` / `is_development()` call or qualified reference may
+# appear; a file not on the list fails, so a new call site must be classified
+# (add the file here with its reason) instead of being copied in. A listed
+# file that no longer reads it fails too, so the list only shrinks.
+# Scope: every *.rs outside target/; comment lines skipped.
+# Measured on main @ 176a8b56 (before the change): 84 matching lines in 36
+# files. Run there with this list, the check flags 19 lines in 11 files —
+# every one a site the change moved (0 false positives). The change moved 24
+# call sites and deleted one re-export; the other 6 sit in files that keep a
+# build-posture read (services.rs, main.rs, talos-api-keys, talos-config), so
+# a FILE list cannot see them — the resolution of this check is the file.
+# After: 59 lines in the 25 listed files, 0 hits.
+# Limit: textual and per file — `use talos_config::is_production as p;` then
+# `p()` is seen at the `use`, not at the call, and a new read inside a listed
+# file passes.
+CK103_ALLOWED=(
+    # The definition's own crate (is_development, the origin parser's arg).
+    talos-config/src/lib.rs
+    # Boot posture gates: RLS, DB sandbox, dispatch scheme, backend TLS,
+    # env-KEK, worker key, admin-query login, non-dumpable process.
+    controller/src/bootstrap/services.rs
+    controller/src/bootstrap/admin_query_login.rs
+    controller/src/cli.rs
+    controller/src/main.rs
+    talos-advanced-repository/src/lib.rs
+    talos-config-validator/src/lib.rs
+    talos-db/src/lib.rs
+    talos-engine/src/nats_run.rs
+    talos-rpc-subscribers/src/lib.rs
+    talos-secrets-manager/src/vault_kek_provider.rs
+    talos-replay-guard/src/lib.rs
+    # The API-key bcrypt cost floor (operator config, not a request path).
+    talos-api-keys/src/lib.rs
+    # Audit sink, DLP endpoint TLS, the posture report.
+    talos-audit-event/src/lib.rs
+    talos-dlp-provider/src/lib.rs
+    talos-security-audit/src/lib.rs
+    # Supply chain: Sigstore policy, registry TLS downgrade, compilation.
+    talos-registry/src/sync.rs
+    talos-compilation/src/advisory_db.rs
+    talos-compilation/src/container.rs
+    talos-compilation/src/lib.rs
+    # The worker process (no browser surface). host/limits.rs (dev egress
+    # opt-ins) and host/secrets.rs (tier-2 expose cap) face tenants and are
+    # a recorded follow-up (package 2026-10-14-browser-hardening-predicate).
+    talos-worker-runtime/src/host/limits.rs
+    talos-worker-runtime/src/host/secrets.rs
+    talos-worker-runtime/src/module_fetcher.rs
+    talos-worker-runtime/src/runtime.rs
+    worker/src/main.rs
+)
+CK103_HITS=0
+CK103_SEEN=" "
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"; file="${file#./}"; rest="${hit#*:}"; text="${rest#*:}"
+    case "$(printf '%s' "$text" | sed -E 's/^[[:space:]]+//')" in //*) continue ;; esac
+    case "$text" in *"fn is_production()"*|*"fn is_development()"*) continue ;; esac
+    CK103_SEEN="${CK103_SEEN}${file} "
+    allowed=0
+    for f in "${CK103_ALLOWED[@]}"; do [ "$f" = "$file" ] && allowed=1 && break; done
+    if [ "$allowed" -eq 0 ]; then
+        printf '  %s\n' "$hit"
+        CK103_HITS=$((CK103_HITS + 1))
+    fi
+done < <(cd "$ROOT" && grep -rEn --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" \
+            '(^|[^A-Za-z0-9_])is_(production|development)[[:space:]]*\(|::is_(production|development)([^A-Za-z0-9_]|$)' . 2>/dev/null || true)
+CK103_STALE=0
+for f in "${CK103_ALLOWED[@]}"; do
+    case "$CK103_SEEN" in *" $f "*) ;; *)
+        printf '  %s is listed but no longer reads is_production() — remove it from check 103\n' "$f"
+        CK103_STALE=$((CK103_STALE + 1)) ;;
+    esac
+done
+if [ "$CK103_HITS" -gt 0 ] || [ "$CK103_STALE" -gt 0 ]; then
+    red "✗ $CK103_HITS unclassified is_production() read(s), $CK103_STALE stale list entr(y/ies)"
+    yellow "  → a control a browser or tenant meets: talos_auth_types::browser_hardening_required()"
+    yellow "  → build/infrastructure posture: keep is_production() and add the file to CK103_ALLOWED with its reason"
+    EXIT_CODE=1
+else
+    green "✓ is_production() is read only in the ${#CK103_ALLOWED[@]} files that decide build posture"
+fi
+
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

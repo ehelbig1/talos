@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+talos-auth-types = { path = "../talos-auth-types" }
 tracing.workspace = true
 
 [lints]

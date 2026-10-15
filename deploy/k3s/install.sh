@@ -652,7 +652,7 @@ security:
       - "ghcr.io/${TALOS_GHCR_OWNER}/talos-*"
     githubOrg: "${TALOS_GHCR_OWNER}"
     githubRepo: "${TALOS_GHCR_REPO}"
-    certIdentityRegex: "^https://github\\\\.com/${TALOS_GHCR_OWNER}/${TALOS_GHCR_REPO}/\\\\.github/workflows/.+@refs/(heads/main|tags/v.+)\$"
+    certIdentityRegex: "^https://github\\\\.com/${TALOS_GHCR_OWNER}/${TALOS_GHCR_REPO}/\\\\.github/workflows/(main-publish\\\\.yml|release\\\\.yml)@refs/(heads/main|tags/v.+)\$"
     oidcIssuer: "https://token.actions.githubusercontent.com"
 EOF
 )
@@ -739,6 +739,13 @@ ${WT_CONTROLLER_ENV_BLOCK}
     annotations:
       cert-manager.io/cluster-issuer: "letsencrypt-prod"
       traefik.ingress.kubernetes.io/router.entrypoints: "websecure"
+      # The chart's defaults are nginx-ingress annotations, which Traefik
+      # ignores: null removes them so the rendered Ingress does not advertise
+      # a 16m body limit nothing enforces. Under Traefik the controller's own
+      # per-route DefaultBodyLimit is the cap (H-3, 2026-10-14).
+      nginx.ingress.kubernetes.io/proxy-body-size: null
+      nginx.ingress.kubernetes.io/proxy-read-timeout: null
+      nginx.ingress.kubernetes.io/proxy-send-timeout: null
     hosts:
       - host: "${TALOS_API_HOST}"
         paths:

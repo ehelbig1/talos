@@ -1270,10 +1270,9 @@ pub(crate) async fn build_platform_services(
     ));
     tracing::info!(
         "Auth rate limiter initialized (policy: {})",
-        if config::is_production() {
-            "fail-closed"
-        } else {
-            "fail-open"
+        match rate_limit::auto_fallback_policy() {
+            rate_limit::RateLimitFallbackPolicy::FailClosed => "fail-closed",
+            rate_limit::RateLimitFallbackPolicy::FailOpen => "fail-open",
         }
     );
 
@@ -2088,10 +2087,14 @@ pub(crate) fn build_schema_and_services(
     .limit_depth(15) // Maximum query nesting depth
     .limit_complexity(5000); // Maximum query complexity score
 
-    // Disable GraphQL introspection in production to prevent schema enumeration.
-    if config::is_production() {
+    // Disable GraphQL introspection wherever browser hardening is required
+    // (every RUST_ENV but the development spellings) to prevent schema
+    // enumeration. Until 2026-10-14 only under `production`; `__schema` and
+    // `__type` are pre-2FA root fields, so a staging deployment answered them
+    // to a password-only session.
+    if talos_auth_types::browser_hardening_required() {
         schema_builder = schema_builder.disable_introspection();
-        tracing::info!("GraphQL introspection disabled (production mode)");
+        tracing::info!("GraphQL introspection disabled (browser hardening required)");
     }
 
     let schema_builder = schema_builder

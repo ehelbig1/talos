@@ -164,12 +164,18 @@ Render env entries sourced from a Secret key. Pass list of (secretName, [keys]).
 {{- end -}}
 
 {{/*
-Secret-content checksum for the `checksum/<secret>-data` pod annotation
-pattern. Hashes ONLY the secret's `.data` (the actual values), not
-managed metadata — those change on every helm operation and would
-cause spurious rolls. When the secret doesn't exist yet (first
-install, or `helm template` with no cluster), returns a fixed
-placeholder so the annotation is stable across first-render attempts.
+Secret-revision checksum for the `checksum/<secret>-data` pod annotation
+pattern. Hashes the Secret's identity and revision — `metadata.uid` and
+`metadata.resourceVersion` — NOT its `.data` (H-4, 2026-10-14). Pod
+annotations are readable by anyone who can `get pods`, a far wider set than
+`get secrets`; a hash of `.data` was a stable fingerprint of the whole
+credential set, comparable across namespaces and clusters that share one.
+The revision changes whenever the Secret is written (a rotation, a
+delete-and-recreate) and means nothing outside this cluster. A write that
+changes no value (a label edit) also rolls the pods; that is the price.
+When the secret doesn't exist yet (first install, or `helm template` with
+no cluster), returns a fixed placeholder so the annotation is stable across
+first-render attempts.
 
 Usage:
     annotations:
@@ -192,8 +198,8 @@ rolls the pod automatically.
 {{- $ns   := .ns   -}}
 {{- $name := .name -}}
 {{- $secret := lookup "v1" "Secret" $ns $name -}}
-{{- if and $secret $secret.data -}}
-{{ $secret.data | toYaml | sha256sum }}
+{{- if and $secret $secret.metadata -}}
+{{ printf "%s/%s" $secret.metadata.uid $secret.metadata.resourceVersion | sha256sum }}
 {{- else -}}
 no-secret-yet
 {{- end -}}

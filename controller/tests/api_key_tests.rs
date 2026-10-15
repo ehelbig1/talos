@@ -27,7 +27,7 @@ async fn test_api_key_lifecycle() {
     // 2. Validate API key
     let (validated_user_id, scopes) = ctx
         .api_key_service
-        .validate_key(&full_key)
+        .validate_key(&full_key, "203.0.113.1")
         .await
         .expect("Failed to validate API key");
 
@@ -49,7 +49,10 @@ async fn test_api_key_lifecycle() {
         .expect("Failed to revoke key");
 
     // 5. Validation should fail now
-    let validation_result = ctx.api_key_service.validate_key(&full_key).await;
+    let validation_result = ctx
+        .api_key_service
+        .validate_key(&full_key, "203.0.113.1")
+        .await;
     assert!(validation_result.is_err(), "Revoked key should be invalid");
 
     // 6. Delete API key
@@ -74,10 +77,16 @@ async fn test_api_key_rate_limiting() {
 
     // Trigger rate limit (default is 60/min)
     for _ in 0..60 {
-        ctx.api_key_service.validate_key(&full_key).await.unwrap();
+        ctx.api_key_service
+            .validate_key(&full_key, "203.0.113.1")
+            .await
+            .unwrap();
     }
 
-    let result = ctx.api_key_service.validate_key(&full_key).await;
+    let result = ctx
+        .api_key_service
+        .validate_key(&full_key, "203.0.113.1")
+        .await;
     assert!(result.is_err());
     assert!(result
         .unwrap_err()
@@ -98,7 +107,11 @@ async fn test_api_key_scopes() {
         .await
         .unwrap();
 
-    let (_, validated_scopes) = ctx.api_key_service.validate_key(&full_key).await.unwrap();
+    let (_, validated_scopes) = ctx
+        .api_key_service
+        .validate_key(&full_key, "203.0.113.1")
+        .await
+        .unwrap();
     assert_eq!(validated_scopes.len(), 2);
     assert!(validated_scopes.contains(&ApiKeyScope::WorkflowsWrite));
     assert!(validated_scopes.contains(&ApiKeyScope::SecretsRead));
@@ -151,7 +164,7 @@ async fn validate_key_verdicts_move_the_seeded_counters() {
 
     let valid0 = verdict(ApiKeyValidation::Valid);
     ctx.api_key_service
-        .validate_key(&full_key)
+        .validate_key(&full_key, "203.0.113.1")
         .await
         .expect("valid key validates");
     assert_eq!(
@@ -161,10 +174,14 @@ async fn validate_key_verdicts_move_the_seeded_counters() {
     );
 
     let invalid0 = verdict(ApiKeyValidation::Invalid);
-    assert!(ctx.api_key_service.validate_key("nope").await.is_err());
     assert!(ctx
         .api_key_service
-        .validate_key("talos_sk_zzzzzzzzdoesnotexist000000")
+        .validate_key("nope", "203.0.113.1")
+        .await
+        .is_err());
+    assert!(ctx
+        .api_key_service
+        .validate_key("talos_sk_zzzzzzzzdoesnotexist000000", "203.0.113.1")
         .await
         .is_err());
     assert_eq!(
@@ -187,7 +204,7 @@ async fn validate_key_verdicts_move_the_seeded_counters() {
         .expect("create expired key");
     assert!(ctx
         .api_key_service
-        .validate_key(&expired_key)
+        .validate_key(&expired_key, "203.0.113.1")
         .await
         .is_err());
     assert_eq!(

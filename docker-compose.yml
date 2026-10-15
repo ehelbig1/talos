@@ -830,10 +830,6 @@ services:
       # Default ON (2026-07-06) so dev matches the production posture; set
       # TALOS_RLS_SET_ROLE=false in .env only to bisect an RLS-related failure.
       TALOS_RLS_SET_ROLE: ${TALOS_RLS_SET_ROLE:-true}
-      # JWT audience-claim enforcement (MCP-857): reject tokens missing
-      # `aud=talos`. Default ON — the issuer has stamped `aud` since 2026-05;
-      # a stale pre-aud session cookie just prompts a fresh login.
-      JWT_REQUIRE_AUD: ${JWT_REQUIRE_AUD:-true}
       # RFC 0010 worker-trust boundary (P1 Ed25519 dispatch signing + P3
       # per-execution envelope sealing). Generate the keypairs with:
       #   docker compose exec controller /app/controller \

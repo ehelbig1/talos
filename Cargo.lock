@@ -8117,6 +8117,7 @@ dependencies = [
 name = "talos-config"
 version = "0.1.0"
 dependencies = [
+ "talos-auth-types",
  "tracing",
 ]
 
@@ -9043,6 +9044,7 @@ dependencies = [
  "talos-analytics-repository",
  "talos-api-keys",
  "talos-audit-ledger",
+ "talos-auth-types",
  "talos-capability-world",
  "talos-child-run-ledger",
  "talos-compilation",
@@ -9386,7 +9388,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "subtle",
- "talos-config",
+ "talos-auth-types",
  "talos-dlp-provider",
  "talos-http-body",
  "talos-http-utils",
@@ -9562,6 +9564,7 @@ dependencies = [
  "ipnetwork",
  "redis",
  "serde_json",
+ "talos-auth-types",
  "talos-config",
  "talos-metrics",
  "talos-redis",
@@ -9599,6 +9602,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "subtle",
+ "talos-auth-types",
  "talos-capability-world",
  "talos-compilation",
  "talos-config",
@@ -9861,6 +9865,7 @@ name = "talos-security-headers"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "talos-auth-types",
  "talos-config",
  "tokio",
  "tower",
@@ -10038,6 +10043,7 @@ dependencies = [
  "sqlx",
  "subtle",
  "talos-admin-event-log",
+ "talos-auth-types",
  "talos-config",
  "talos-metrics",
  "talos-random",
@@ -10547,6 +10553,7 @@ dependencies = [
  "serde_json",
  "talos-api",
  "talos-auth",
+ "talos-auth-types",
  "talos-config",
  "talos-metrics",
  "tokio",
