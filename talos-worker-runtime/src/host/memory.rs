@@ -533,42 +533,48 @@ impl wit_agent_memory::Host for TalosContext {
 /// best-effort (the in-process HashMap remains the primary store).
 pub(crate) fn spawn_state_write_through(
     nats: Option<std::sync::Arc<async_nats::Client>>,
-    execution_id: Option<&str>,
+    workflow_execution_id: Option<&str>,
+    job_id: Option<&str>,
     actor_id: Option<uuid::Uuid>,
     key: &str,
     value: Option<&str>,
 ) {
-    use talos_memory::state_rpc::{StateWriteRequest, SUBJECT_STATE_WRITE};
-    let (Some(nats), Some(exec_id_str), Some(actor_id)) = (nats, execution_id, actor_id) else {
+    use talos_memory::state_rpc::{StateWriteNotSent, StateWriteRequest, SUBJECT_STATE_WRITE};
+    let (Some(nats), Some(workflow_execution_id), Some(job_id), Some(actor_id)) =
+        (nats, workflow_execution_id, job_id, actor_id)
+    else {
         return;
     };
-    let Ok(exec_id) = uuid::Uuid::parse_str(exec_id_str) else {
-        return;
-    };
-    let key = key.to_string();
-    let (value, is_delete) = match value {
-        Some(v) => (v.to_string(), false),
-        None => (String::new(), true),
-    };
-    tokio::spawn(async move {
-        // MCP-734 (2026-05-13): sibling of MCP-733. The fire-and-forget
-        // state-write path discarded ALL error signals (sign failure,
-        // serialize failure, NATS publish failure). User-facing
-        // contract is best-effort, but operator contract requires
-        // visibility into systemic failures. Log at WARN with
-        // execution_id + actor_id so SIEM / dashboards can alert on
-        // sustained failures (NATS outage, HMAC key not initialised,
-        // etc.).
-        let Some(req) = StateWriteRequest::new_signed(exec_id, actor_id, key, value, is_delete)
-        else {
+    // The request names the job's RUN (security review 2026-10-15, B2-1);
+    // a module-bound dispatch has none and keeps its state in memory.
+    let req = match StateWriteRequest::for_dispatch(
+        workflow_execution_id,
+        job_id,
+        actor_id,
+        key,
+        value,
+    ) {
+        Ok(req) => req,
+        Err(StateWriteNotSent::NoRun) => return,
+        Err(StateWriteNotSent::Unsigned) => {
+            // MCP-734 (2026-05-13): the fire-and-forget path must not
+            // discard its error signals; operators alert on these.
             tracing::warn!(
                 target: "talos_rpc",
-                execution_id = %exec_id,
                 actor_id = %actor_id,
-                "state-write-through: HMAC key unavailable — drop (worker bootstrap incomplete or rotation in flight)"
+                "state-write-through: HMAC key unavailable or write malformed — drop (worker bootstrap incomplete or rotation in flight)"
             );
             return;
-        };
+        }
+    };
+    let exec_id = req.execution_id;
+    tokio::spawn(async move {
+        // MCP-734 (2026-05-13): sibling of MCP-733. The fire-and-forget
+        // state-write path discarded ALL error signals (serialize failure,
+        // NATS publish failure). User-facing contract is best-effort, but
+        // operator contract requires visibility into systemic failures.
+        // Log at WARN with execution_id + actor_id so SIEM / dashboards
+        // can alert on sustained failures.
         let payload = match serde_json::to_vec(&req) {
             Ok(p) => p,
             Err(e) => {

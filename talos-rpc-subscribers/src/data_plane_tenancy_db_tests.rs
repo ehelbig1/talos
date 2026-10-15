@@ -1,10 +1,13 @@
 //! A durable state write names a live run, and guest SQL carries its tenant
 //! (security review 2026-10-14, B-3 and B-4/D-2), against the MIGRATED
-//! database (CI: `scripts/test-integration.sh`, kind `lib-migrated`), as a
-//! superuser. Skipped without `TALOS_TEST_DATABASE_URL`.
+//! database (CI: `scripts/test-integration.sh`, kind `lib-migrated` — named
+//! there since 2026-10-15, D2-2; before that the unit job ran it with no URL
+//! and it returned green over zero assertions), as a superuser. Skipped
+//! without `TALOS_TEST_DATABASE_URL`.
 use crate::{
-    execute_guest_query_within, execution_state_delete, execution_state_write, guest_reply,
-    test_actor, GuestRoleSetting, StateWriteVerdict, GUEST_QUERY_FAILED,
+    apply_state_write, execute_guest_query_within, execution_state_delete, execution_state_write,
+    guest_reply, test_actor, GuestRoleSetting, StateWriteVerdict, GUEST_CONNECTION_FAILED,
+    GUEST_QUERY_FAILED,
 };
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -108,6 +111,126 @@ async fn a_state_write_for_an_execution_that_is_not_live_writes_nothing() {
         StateWriteVerdict::Written
     );
     assert_eq!(state_rows(&pool, live).await, 0);
+}
+
+/// A node's own `module_executions` row under `run`: the id a worker's
+/// execution context holds as the job id.
+async fn node_job(pool: &PgPool, run: Uuid) -> Uuid {
+    let (user, actor): (Uuid, Uuid) =
+        sqlx::query_as("SELECT user_id, actor_id FROM workflow_executions WHERE id = $1")
+            .bind(run)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let module = Uuid::new_v4();
+    sqlx::query("INSERT INTO modules (id, name, kind, user_id) VALUES ($1, $2, 'sandbox', $3)")
+        .bind(module)
+        .bind(format!("state-node-{module}"))
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("seed module");
+    let job = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO module_executions \
+         (id, module_id, user_id, actor_id, status, trigger_type, workflow_execution_id) \
+         VALUES ($1, $2, $3, $4, 'running', 'webhook', $5)",
+    )
+    .bind(job)
+    .bind(module)
+    .bind(user)
+    .bind(actor)
+    .bind(run)
+    .execute(pool)
+    .await
+    .expect("seed module execution");
+    job
+}
+
+/// The request is built exactly as the worker's `state::set` builds it, from
+/// the two ids its execution context holds — the job's
+/// `workflow_execution_id` and its `job_id` — and applied by the
+/// subscriber's own function (security review 2026-10-15, B2-1: the worker
+/// sent the job id, which names no run, and every honest write was refused).
+#[tokio::test]
+async fn a_state_write_built_as_the_worker_builds_it_lands_for_a_live_run() {
+    use talos_memory::state_rpc::{StateWriteNotSent, StateWriteRequest};
+    let Some(url) = database_url() else { return };
+    let pool = pool(&url).await;
+    talos_memory::rpc_auth::register_hmac_key(std::sync::Arc::new(vec![7u8; 32]));
+    // The request a node of `run` sends, built from its context's two ids.
+    let built = |run: Uuid, job: Uuid, actor: Uuid, value: Option<&str>| {
+        StateWriteRequest::for_dispatch(
+            &run.to_string(),
+            &job.to_string(),
+            actor,
+            "talos://m:k",
+            value,
+        )
+        .expect("a workflow node's write is sent")
+    };
+    let actor_of = |run: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>("SELECT actor_id FROM workflow_executions WHERE id = $1")
+                .bind(run)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    let run = execution(&pool, "running").await;
+    let job = node_job(&pool, run).await;
+    let actor = actor_of(run).await;
+    let set = built(run, job, actor, Some("v"));
+    set.verify().expect("the worker's request verifies");
+    assert_eq!(
+        apply_state_write(&pool, &set).await.unwrap(),
+        StateWriteVerdict::Written
+    );
+    assert_eq!(state_rows(&pool, run).await, 1);
+    assert_eq!(
+        state_rows(&pool, job).await,
+        0,
+        "keyed on the run, not the job"
+    );
+
+    // The same request from a node of a run that has ended.
+    let ended = execution(&pool, "completed").await;
+    let ended_job = node_job(&pool, ended).await;
+    let ended_actor = actor_of(ended).await;
+    assert_eq!(
+        apply_state_write(&pool, &built(ended, ended_job, ended_actor, Some("w")))
+            .await
+            .unwrap(),
+        StateWriteVerdict::NotLive
+    );
+    assert_eq!(
+        apply_state_write(&pool, &built(ended, ended_job, ended_actor, None))
+            .await
+            .unwrap(),
+        StateWriteVerdict::NotLive
+    );
+    assert_eq!(
+        state_rows(&pool, ended).await,
+        0,
+        "an ended run gains nothing"
+    );
+
+    // A module-bound dispatch names itself in both ids: it has no run and
+    // sends nothing, so it never reaches the refusal counter.
+    assert_eq!(
+        StateWriteRequest::for_dispatch(
+            &job.to_string(),
+            &job.to_string(),
+            actor,
+            "talos://m:k",
+            Some("v"),
+        )
+        .unwrap_err(),
+        StateWriteNotSent::NoRun
+    );
 }
 
 #[tokio::test]
@@ -266,6 +389,38 @@ async fn a_guest_query_error_reaches_the_guest_as_one_sentence() {
     }
     match guest_reply(raw, actor) {
         Err(DatabaseRpcError::QueryError(said)) => assert_eq!(said, GUEST_QUERY_FAILED),
+        other => panic!("expected the generic reply, got {other:?}"),
+    }
+
+    // A guest role that does not exist: Postgres' refusal names the role,
+    // and none of it reaches the guest (security review 2026-10-15, B2-5).
+    let missing_role = format!(
+        "no_such_guest_{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    );
+    let raw = execute_guest_query_within(
+        &pool,
+        "SELECT 1 AS one",
+        &[],
+        true,
+        GuestRoleSetting::Role(&missing_role),
+        actor,
+        Duration::from_secs(10),
+    )
+    .await;
+    match &raw {
+        Err(DatabaseRpcError::ConnectionFailed(detail)) => {
+            assert!(
+                detail.contains(&missing_role),
+                "the detail names the role: {detail}"
+            );
+        }
+        other => panic!("expected a connection failure, got {other:?}"),
+    }
+    match guest_reply(raw, actor) {
+        Err(DatabaseRpcError::ConnectionFailed(said)) => {
+            assert_eq!(said, GUEST_CONNECTION_FAILED);
+        }
         other => panic!("expected the generic reply, got {other:?}"),
     }
 }

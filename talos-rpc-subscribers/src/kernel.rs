@@ -206,6 +206,30 @@ pub(crate) fn spawn_admitted<Fut>(
     });
 }
 
+/// One inbound message through admission (security review 2026-10-14, B-6):
+/// with a slot, the handler is CALLED — which is where the message is parsed,
+/// verified and looked up — and its future spawned holding the slot; without
+/// one, the handler is never called and the message is dropped unread.
+/// `true` when the message was admitted. The subscriber loop's one step.
+pub(crate) async fn intake<M, H, Fut>(
+    admission: &Arc<tokio::sync::Semaphore>,
+    subject: &'static str,
+    wait: std::time::Duration,
+    in_flight: &mut tokio::task::JoinSet<()>,
+    msg: M,
+    handler: H,
+) -> bool
+where
+    H: FnOnce(M) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let Some(slot) = admit(admission, subject, wait).await else {
+        return false;
+    };
+    spawn_admitted(in_flight, slot, handler(msg));
+    true
+}
+
 /// Per-op permit-guard timeout (docs/platform-primitive-checklist.md
 /// §3). Bounds how long a single handler may hold a semaphore permit
 /// while its DB/service future is stalled — without it, a Postgres or
@@ -284,7 +308,7 @@ pub(crate) fn spawn_rpc_subscriber<H, Fut>(
     spec: RpcSubscriberSpec,
     handler: H,
 ) where
-    H: Fn(async_nats::Message, Arc<tokio::sync::Semaphore>) -> Fut + Send + 'static,
+    H: Fn(async_nats::Message, Arc<tokio::sync::Semaphore>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     spawn_supervised(spec.task, async move {
@@ -343,9 +367,15 @@ pub(crate) fn spawn_rpc_subscriber<H, Fut>(
                         None => break,
                     },
                 };
-                if let Some(slot) = admit(&admission, spec.subject, ADMISSION_WAIT).await {
-                    spawn_admitted(&mut in_flight, slot, handler(msg, sem.clone()));
-                }
+                intake(
+                    &admission,
+                    spec.subject,
+                    ADMISSION_WAIT,
+                    &mut in_flight,
+                    msg,
+                    |m| handler(m, sem.clone()),
+                )
+                .await;
             }
             // Inner loop exited.
             if shutdown_requested {
@@ -556,6 +586,58 @@ mod intake_tests {
         )
         .await;
         assert!(slot.is_none());
+    }
+
+    /// The handler — which parses the message — is not called without a
+    /// slot, and is called exactly once with one (B-6; restored 2026-10-15,
+    /// B2-7: the 2026-10-14 record named this test after the follow-up that
+    /// added the wait had replaced it, so the property was held only by the
+    /// loop's shape).
+    #[tokio::test]
+    async fn a_message_is_not_parsed_without_an_admission_slot() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut in_flight = tokio::task::JoinSet::new();
+        let none = Arc::new(tokio::sync::Semaphore::new(0));
+        let c = calls.clone();
+        let admitted = intake(
+            &none,
+            "talos.memory.op",
+            std::time::Duration::from_millis(20),
+            &mut in_flight,
+            b"unparsed".to_vec(),
+            move |_msg| {
+                c.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
+        )
+        .await;
+        assert!(!admitted);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no slot: the handler never ran"
+        );
+        assert!(in_flight.is_empty());
+
+        let one = Arc::new(tokio::sync::Semaphore::new(1));
+        let c = calls.clone();
+        assert!(
+            intake(
+                &one,
+                "talos.memory.op",
+                std::time::Duration::ZERO,
+                &mut in_flight,
+                b"parsed".to_vec(),
+                move |_msg| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    async {}
+                },
+            )
+            .await
+        );
+        while in_flight.join_next().await.is_some() {}
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(one.available_permits(), 1, "the slot is returned");
     }
 
     /// A taken slot is held for the handler's whole life and returned after.

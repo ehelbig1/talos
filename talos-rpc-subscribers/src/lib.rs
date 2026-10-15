@@ -2900,6 +2900,37 @@ mod guest_fence_tests {
         );
         assert!(guest_fence(GuestRoleSetting::Invalid, false).is_err());
     }
+
+    /// A fence or connection fault reaches the guest as one sentence; the
+    /// role name and Postgres' text stay in the subscriber's log
+    /// (security review 2026-10-15, B2-5).
+    #[test]
+    fn a_fence_failure_reaches_the_guest_as_one_sentence() {
+        use talos_memory::database_rpc::DatabaseRpcError;
+        let actor = uuid::Uuid::new_v4();
+        for setting in [GuestRoleSetting::Invalid, GuestRoleSetting::Unset] {
+            let raw = guest_fence(setting, true).map(|_| unreachable_result());
+            match guest_reply(raw, actor) {
+                Err(DatabaseRpcError::ConnectionFailed(said)) => {
+                    assert_eq!(said, GUEST_CONNECTION_FAILED);
+                }
+                other => panic!("expected the generic reply, got {other:?}"),
+            }
+        }
+        let raw = Err(DatabaseRpcError::ConnectionFailed(
+            "SET LOCAL ROLE failed: role \"talos_guest\" does not exist".to_string(),
+        ));
+        match guest_reply(raw, actor) {
+            Err(DatabaseRpcError::ConnectionFailed(said)) => {
+                assert_eq!(said, GUEST_CONNECTION_FAILED);
+            }
+            other => panic!("expected the generic reply, got {other:?}"),
+        }
+    }
+
+    fn unreachable_result() -> talos_memory::database_rpc::DatabaseResult {
+        unreachable!("the fence refuses before a query runs")
+    }
 }
 
 /// A user and an actor of theirs, for tests of the guest-SQL path: the path
@@ -2929,7 +2960,8 @@ pub(crate) async fn test_actor(pool: &sqlx::PgPool) -> uuid::Uuid {
 }
 
 /// What the guest is told about its query. A database failure becomes
-/// [`GUEST_QUERY_FAILED`], never Postgres' own text, which names relations,
+/// [`GUEST_QUERY_FAILED`] and a connection or fence failure
+/// [`GUEST_CONNECTION_FAILED`], never Postgres' own text, which names relations,
 /// columns, constraints and roles and can quote a constraint's offending
 /// value; the SQLSTATE class is logged here (never the text — guest SQL can
 /// carry PII in literals). Security review 2026-10-14, B-4.
@@ -2953,9 +2985,28 @@ pub(crate) fn guest_reply(
             );
             DatabaseRpcError::QueryError(GUEST_QUERY_FAILED.to_string())
         }
+        // A connection, fence or role fault: operator configuration or an
+        // infrastructure blip, never the guest's SQL. Its text names the
+        // guest role and quotes Postgres, so it stays here (security review
+        // 2026-10-15, B2-5/D2-3). It carries no guest literal, so the detail
+        // is logged.
+        DatabaseRpcError::ConnectionFailed(detail) => {
+            tracing::warn!(
+                target: "talos_rpc",
+                event_kind = "database_rpc_guest_connection_failed",
+                %actor_id,
+                %detail,
+                "database RPC: guest query could not be run"
+            );
+            DatabaseRpcError::ConnectionFailed(GUEST_CONNECTION_FAILED.to_string())
+        }
         other => other,
     })
 }
+
+/// The one sentence a guest is given when its query could not be run at all
+/// (no connection, no usable guest role). Security review 2026-10-15, B2-5.
+pub const GUEST_CONNECTION_FAILED: &str = "database unavailable";
 
 /// The one sentence a guest is given when its SQL fails at the database
 /// (security review 2026-10-14, B-4). Postgres' own text is a schema oracle
@@ -3071,6 +3122,21 @@ pub async fn execution_state_delete(
     } else {
         StateWriteVerdict::NotLive
     })
+}
+
+/// What a verified [`talos_memory::state_rpc::StateWriteRequest`] does: the
+/// write or the delete, for the run it names. The subscriber's one call, and
+/// the one a test drives with a request built as the worker builds it
+/// (`StateWriteRequest::for_dispatch`).
+pub(crate) async fn apply_state_write(
+    pool: &sqlx::PgPool,
+    req: &talos_memory::state_rpc::StateWriteRequest,
+) -> sqlx::Result<StateWriteVerdict> {
+    if req.is_delete {
+        execution_state_delete(pool, req.execution_id, &req.key).await
+    } else {
+        execution_state_write(pool, req.execution_id, &req.key, &req.value).await
+    }
 }
 
 pub fn spawn_state_write_subscriber(
@@ -3266,12 +3332,7 @@ pub fn spawn_state_write_subscriber(
             // "timeout" so operators can alert on it, same as the
             // MCP-733 query_error visibility rule.
             let db_work = async {
-                let written = if req.is_delete {
-                    execution_state_delete(&pool, req.execution_id, &req.key).await
-                } else {
-                    execution_state_write(&pool, req.execution_id, &req.key, &req.value).await
-                };
-                match written {
+                match apply_state_write(&pool, &req).await {
                     Ok(StateWriteVerdict::Written) => RpcOutcome::Ok,
                     Ok(StateWriteVerdict::NotLive) => {
                         tracing::warn!(

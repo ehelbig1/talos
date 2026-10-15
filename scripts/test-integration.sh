@@ -63,6 +63,13 @@ WORK+=(
     # MIGRATED database (the only lib item that needs one — hence its own kind).
     "lib-migrated|talos-rpc-subscribers|--lib guest_session::db_tests|guest SQL session cleanup + advisory/LO privileges [migrated]"
     "lib-migrated|talos-rpc-subscribers|--lib guest_role_db_tests|guest SQL role: fenced, refused when unusable [migrated]"
+    # Named 2026-10-15 (security review D2-2): until then the unit job ran
+    # these with no service and they returned green over zero assertions.
+    # `scripts/ci_test_targets.py check` now refuses a library test that reads
+    # a TALOS_TEST_* service variable and is named by no filter here.
+    "lib-migrated|talos-rpc-subscribers|--lib data_plane_tenancy_db_tests|durable state names a live run; guest SQL tenancy [migrated]"
+    "lib|talos-replay-guard|--lib|cross-replica nonce single-use [redis]"
+    "lib|talos-workflow-engine-nats|--lib call_site_converts_a_real_503_into_an_error|no-responders call site [nats]"
 )
 for cat in ctrl ctrl-serial tc; do
     while IFS=$'\t' read -r crate bin; do

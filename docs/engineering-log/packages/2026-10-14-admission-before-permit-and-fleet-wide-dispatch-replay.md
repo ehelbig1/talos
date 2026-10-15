@@ -128,3 +128,15 @@ only with a slot in hand (`admit` then `spawn_admitted`).
 - `kernel_two_replica_tests` pass three runs in a row against a broker.
 - Stated limit: while the loop waits it does not observe shutdown; the wait is
   2 s against a 10 s drain deadline.
+
+## Correction, 2026-10-15 (security review round 2, B2-7)
+
+The mutation table above names
+`intake_tests::a_message_is_not_parsed_without_an_admission_slot`; the
+follow-up that added the wait replaced it, so from then until 2026-10-15 the
+"not parsed without a slot" property was held only by the loop's shape. The
+loop's step is now one function, `kernel::intake`, and the named test is
+restored against it (the handler is not called without a slot, is called once
+with one, and the slot is returned). Mutation: the handler called before
+`admit` → that test FAIL; restored → PASS. See
+`2026-10-15-state-write-names-the-run.md`.
