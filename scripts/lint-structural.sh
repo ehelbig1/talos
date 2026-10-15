@@ -3623,56 +3623,37 @@ bold "▶ check 47: append-only audit tables must not gain CASCADE/SET NULL FKs"
 # (#264); auth_audit_log / admin_event_log -> users SET NULL made users
 # undeletable (#266). Audit rows must hold the parent id as a plain (nullable)
 # historical reference. This freezes it: a CREATE/ALTER of an append-only audit
-# table that adds `ON DELETE CASCADE|SET NULL` fails. Pre-fix history is
-# grandfathered by timestamp — those bad FKs are dropped by 20260625140000 /
-# 20260625150000, and the four tables package CG made immutable had theirs
-# dropped by 20260917130000 (they were written as ordinary tables before that
-# migration, so their CREATE statements still carry the text); only migrations
-# newer than the last fix are scanned. Adding a
-# NEW append-only audit table? Append its name to AUDIT_TABLES below.
+# table that adds `ON DELETE CASCADE|SET NULL` fails. The pre-fix FKs were
+# dropped by 20260625140000 / 20260625150000, and the four tables package CG
+# made immutable had theirs dropped by 20260917130000 (they were written as
+# ordinary tables before that migration, so their CREATE statements still
+# carry the text). Until 2026-10-15 that history was grandfathered by a
+# timestamp cutoff; it is now out of scope because each of those FKs predates
+# its table's trigger (below). Adding a NEW append-only audit table? Nothing
+# to edit.
 
-AUDIT_FK_VIOLATIONS=0
-# `audit_events` left this list 2026-09-11: dropped (migration 20260911160000) —
-# it had held zero rows since creation and nothing wrote it; the execution
-# audit ledger is the S3 WORM chain, not a table.
-# Package CG (2026-09-17) widened immutability to four more audit-shaped
-# tables and DROPPED their CASCADE/SET NULL FKs in the same migration — an
-# enforced delete action into a table that refuses DELETE makes the PARENT
-# undeletable, which is what this check exists to stop. They join the list so a
-# future migration cannot re-add one.
-AUDIT_TABLES='admin_event_log auth_audit_log secret_audit_log schema_audit_log oauth_audit_log gmail_integration_audit_log slack_integration_audit_log'
-AUDIT_FK_CUTOFF=20260917130000
-for mig in "$ROOT"/migrations/*.sql; do
-    [ -f "$mig" ] || continue
-    ts=$(basename "$mig" | grep -oE '^[0-9]{14}' || true)
-    [ -n "$ts" ] || ts=0
-    # Grandfather everything at/before the last audit-FK fix migration.
-    if [ "$ts" -le "$AUDIT_FK_CUTOFF" ] 2>/dev/null; then
-        continue
-    fi
-    for tbl in $AUDIT_TABLES; do
-        hit=$(awk -v t="$tbl" '
-            BEGIN { inblk = 0 }
-            (/CREATE TABLE/ || /ALTER TABLE/) && index($0, t) { inblk = 1 }
-            inblk && (/ON DELETE CASCADE/ || /ON DELETE SET NULL/) { print NR ": " $0 }
-            inblk && /;/ { inblk = 0 }
-        ' "$mig" 2>/dev/null || true)
-        if [ -n "$hit" ]; then
-            while IFS= read -r h; do
-                printf '  %s:%s  [%s]\n' "$(basename "$mig")" "$h" "$tbl"
-                AUDIT_FK_VIOLATIONS=$((AUDIT_FK_VIOLATIONS + 1))
-            done <<< "$hit"
-        fi
-    done
-done
-
-if [ "$AUDIT_FK_VIOLATIONS" -gt 0 ]; then
-    red "✗ $AUDIT_FK_VIOLATIONS append-only audit-table FK(s) with ON DELETE CASCADE/SET NULL"
+# 2026-10-15: the scan moved into scripts/lint-audit-table-writes.py (`--leg
+# fks`), which check 105 shares. The hand-kept AUDIT_TABLES list and the
+# 20260917130000 cutoff it replaced are DERIVED there: the migrations are read in
+# apply order, and a table is guarded from the statement that gives it a
+# prevent_audit_modification trigger until a DROP TRIGGER / DROP TABLE removes
+# it, so a new append-only table is covered without editing this script and a
+# pre-trigger FK (all eight historical ones, re-found by the scan with timing
+# ignored) is out of scope by construction. The awk scan matched only when
+# `ALTER TABLE` and the table name shared a line, and by substring (a
+# `secret_audit_log_archive` would have counted); the script reads whole
+# statements with comments dropped. Also caught now: `ON UPDATE CASCADE|SET
+# NULL|SET DEFAULT` and `ON DELETE SET DEFAULT`, each an UPDATE of the child
+# row. Measured 2026-10-15: 0 findings over 381 migrations, as before.
+# No opt-out marker.
+if fk_out=$(python3 scripts/lint-audit-table-writes.py --leg fks 2>&1); then
+    green "✓ no append-only audit table gains a CASCADE/SET NULL FK (${fk_out##*$'\n'})"
+else
+    printf '%s\n' "$fk_out"
+    red "✗ an append-only audit table gains an FK with an enforced ON DELETE/ON UPDATE action"
     yellow "  → an append-only audit row must reference its parent WITHOUT an enforced delete action,"
     yellow "    or the parent becomes undeletable (immutability trigger blocks the cascade) — #264/#266."
     EXIT_CODE=1
-else
-    green "✓ no append-only audit table gains a CASCADE/SET NULL FK"
 fi
 echo
 
@@ -9860,6 +9841,64 @@ else
     red "✗ a repository function takes user_id and binds it nowhere"
     yellow "  → bind it in every statement that reads or writes the caller's rows,"
     yellow "    or mark it // allow-unbound-user-id: <reason>"
+    EXIT_CODE=1
+fi
+
+echo
+
+bold "▶ check 105: a migration does not UPDATE, DELETE or TRUNCATE an append-only audit table"
+
+# Rule: a statement in migrations/*.sql (migrations/.baseline/ is not read)
+# that would modify a row of a table prevent_audit_modification() guards, at
+# the point the statement runs, fails: UPDATE t, DELETE FROM t, TRUNCATE … t,
+# MERGE INTO t, INSERT INTO t … ON CONFLICT … DO UPDATE.
+#
+# Why: a ROW trigger does not fire on zero rows and a test database holds no
+# audit rows, so such a migration passes every test and CI, then fails at
+# migrate on a deployment with history and stops the rollout.
+# 20261014191000 (#1301) backfilled secret_audit_log.key_hash with an UPDATE
+# and stopped the reference deployment's migrate on 35,900 rows; #1314
+# replaced it with 20261015120000, no backfill
+# (docs/engineering-log/packages/2026-10-15-audit-key-hash-no-backfill.md).
+#
+# Scope: the guarded tables are DERIVED, the same derivation check 47 uses —
+# migrations in apply order, a table guarded for the events its
+# prevent_audit_modification trigger names from the statement that creates
+# it (20260408000001 for auth_audit_log, secret_audit_log, admin_event_log
+# and the since-dropped audit_events; 20260917130000 for schema_audit_log,
+# oauth_audit_log, gmail_integration_audit_log, slack_integration_audit_log)
+# until a DROP TRIGGER / DROP TABLE. Statement-aware: comments are dropped,
+# a DO $$ … $$ body is read as code, COMMENT ON text is prose.
+#
+# Opt-out: none. Rewriting audit history is what the append-only policy
+# forbids; disabling the trigger around a backfill was considered and rejected
+# in #1314. An already-APPLIED migration that predates the rule is named in the
+# script's ALLOWED map with its reason — one today,
+# 20260529130000_org_id_columns.sql (`UPDATE secret_audit_log x SET org_id`),
+# applied 2026-05-29. An ALLOWED entry that stops matching is a finding.
+#
+# Measured precision, 2026-10-15, 381 migrations: 1 write found, the allowed
+# one; 0 false positives. A line grep for UPDATE|DELETE|TRUNCATE beside a
+# guarded table name after 20260408000001 finds 15 lines: that one, 11 trigger
+# definitions and 3 comments. Against main before #1314 the check also finds
+# 20261014191000:17, the incident.
+#
+# Stated limits: dynamic SQL is not resolved (EXECUTE format('UPDATE %I …', t));
+# a write reached through a function a migration calls is not followed;
+# execution_approval_decision_is_final (a decision row is final once made) is
+# a different trigger and out of scope. The self-test (29 cases, run by
+# `make test-scripts`) pins each, the limits included.
+if ! python3 scripts/lint-audit-table-writes.py --self-test >/dev/null; then
+    red "✗ check 105 self-test failed (python3 scripts/lint-audit-table-writes.py --self-test)"
+    EXIT_CODE=1
+fi
+if aw_out=$(python3 scripts/lint-audit-table-writes.py --leg writes 2>&1); then
+    green "✓ no migration rewrites an append-only audit table (${aw_out##*$'\n'})"
+else
+    printf '%s\n' "$aw_out"
+    red "✗ a migration modifies rows of an append-only audit table (check 105)"
+    yellow "  → the immutability trigger refuses it on any database that holds audit rows; CI's do not."
+    yellow "    Add the column without a backfill; rows written before it stay NULL."
     EXIT_CODE=1
 fi
 
