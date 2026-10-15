@@ -14,6 +14,7 @@ import { AuthForm } from "@/components/auth/AuthForm";
 import { OAuthCallback } from "@/components/auth/OAuthCallback";
 import { useTokenRefresh } from "@/hooks/useTokenRefresh";
 import { useGetApprovalsQuery } from "@/generated/graphql";
+import { NavAlertBadge } from "@/components/NavAlertBadge";
 import {
   Zap,
   Loader2,
@@ -168,7 +169,8 @@ function AuthenticatedApp() {
             ))}
           </div>
 
-          <div className="ml-auto flex items-center gap-4">
+          <div className="ml-auto flex items-center gap-3 md:gap-4">
+            <NavAlertBadge />
             <div className="hidden lg:block h-6 w-px bg-white/10" />
 
             <div
@@ -183,9 +185,11 @@ function AuthenticatedApp() {
               </span>
             </div>
 
+            {/* Below md the nav has no room for this; Settings → Account has
+                the same button, and the alert badge keeps its place. */}
             <button
               onClick={logout}
-              className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-white hover:bg-white/5 rounded-lg transition-ui"
+              className="hidden md:inline-flex px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-white hover:bg-white/5 rounded-lg transition-ui"
             >
               Sign out
             </button>
