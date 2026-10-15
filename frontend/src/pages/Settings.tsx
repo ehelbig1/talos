@@ -15,14 +15,9 @@ import {
   Building,
   CheckSquare,
   Calendar,
-  Layout,
   FileSearch,
   Inbox,
   BarChart,
-  Fingerprint,
-  KeyRound,
-  Globe,
-  Search,
   Layers,
   type LucideIcon,
   Activity,
@@ -101,9 +96,8 @@ const prefetchMap: Record<string, () => Promise<unknown>> = {
   dlq: dlqImport,
   quotas: quotasImport,
   organizations: organizationsImport,
-  "two-factor": twoFactorImport,
-  password: passwordImport,
-  oauth: oauthImport,
+  account: () =>
+    Promise.all([passwordImport(), twoFactorImport(), oauthImport()]),
   schedules: schedulesImport,
   security: securityImport,
   webhooks: webhooksImport,
@@ -125,33 +119,26 @@ interface SidebarCategory {
   items: SidebarItem[];
 }
 
+/* Six groups, one line each where one will do. Account is ONE section: the
+   profile, password, two-factor and connected sign-ins stack on one page (the
+   old #password, #two-factor and #oauth hashes still land on their card). */
 const SIDEBAR_CATEGORIES: SidebarCategory[] = [
   {
     label: "Account",
-    items: [
-      { value: "account", label: "Profile", icon: UserIcon },
-      { value: "password", label: "Password", icon: KeyRound },
-      { value: "two-factor", label: "Two-factor auth", icon: Fingerprint },
-      { value: "oauth", label: "Connected sign-ins", icon: Globe },
-    ],
+    items: [{ value: "account", label: "Account and sign-in", icon: UserIcon }],
   },
   {
-    label: "Workflow",
+    label: "Workflows",
     items: [
       { value: "schedules", label: "Schedules", icon: Calendar },
-      {
-        value: "templates",
-        label: "Templates",
-        icon: Layout,
-        to: "/library#templates",
-      },
+      { value: "webhooks", label: "Webhooks", icon: Webhook },
+      { value: "approvals", label: "Approvals", icon: CheckSquare },
     ],
   },
   {
-    label: "Integrations",
+    label: "Connections",
     items: [
       { value: "integrations", label: "Integrations", icon: Plug },
-      { value: "webhooks", label: "Webhooks", icon: Webhook },
       { value: "mcp-server", label: "MCP server", icon: Server },
     ],
   },
@@ -162,6 +149,15 @@ const SIDEBAR_CATEGORIES: SidebarCategory[] = [
       { value: "api-keys", label: "API keys", icon: Key },
       { value: "capability-ceiling", label: "Capabilities", icon: Layers },
       { value: "security", label: "Access and encryption", icon: Shield },
+    ],
+  },
+  {
+    label: "Organization",
+    items: [
+      { value: "organizations", label: "Organizations", icon: Building },
+      { value: "quotas", label: "Quotas", icon: BarChart },
+      { value: "audit", label: "Audit log and tracing", icon: FileSearch },
+      { value: "dlq", label: "Failed deliveries", icon: Inbox },
     ],
   },
   {
@@ -182,17 +178,24 @@ const SIDEBAR_CATEGORIES: SidebarCategory[] = [
       },
     ],
   },
-  {
-    label: "Admin",
-    items: [
-      { value: "organizations", label: "Organizations", icon: Building },
-      { value: "approvals", label: "Approvals", icon: CheckSquare },
-      { value: "audit", label: "Audit log and tracing", icon: FileSearch },
-      { value: "dlq", label: "Failed deliveries", icon: Inbox },
-      { value: "quotas", label: "Quotas", icon: BarChart },
-    ],
-  },
 ];
+
+/** Hashes that used to name a section of their own; each is a card on Account. */
+const SECTION_ALIASES: Record<string, string> = {
+  password: "account",
+  "two-factor": "account",
+  oauth: "account",
+};
+
+/** Which section a hash opens, and which card on it to scroll to. */
+function resolveHash(
+  hash: string,
+): { section: string; anchor?: string } | null {
+  if (SECTION_ALIASES[hash])
+    return { section: SECTION_ALIASES[hash], anchor: hash };
+  if (SECTION_ITEMS.some((i) => i.value === hash)) return { section: hash };
+  return null;
+}
 
 const ALL_ITEMS: SidebarItem[] = SIDEBAR_CATEGORIES.flatMap((c) => c.items);
 /** The sections this page renders itself (a hash may name one of these). */
@@ -200,7 +203,7 @@ const SECTION_ITEMS: SidebarItem[] = ALL_ITEMS.filter((i) => !i.to);
 
 const sidebarItemClass = (isActive: boolean) =>
   cn(
-    "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-ui",
+    "w-full flex items-center gap-3 px-3 py-1 rounded-lg text-sm font-medium transition-ui",
     isActive
       ? "bg-primary/10 text-primary"
       : "text-muted-foreground hover:text-foreground hover:bg-white/5",
@@ -219,43 +222,15 @@ function SettingsSidebar({
   onSelect,
   onPrefetch,
 }: SettingsSidebarProps) {
-  const [search, setSearch] = useState("");
-
-  const filteredCategories = search.trim()
-    ? [
-        {
-          label: "Results",
-          items: ALL_ITEMS.filter((item) =>
-            item.label.toLowerCase().includes(search.toLowerCase()),
-          ),
-        },
-      ]
-    : SIDEBAR_CATEGORIES;
-
   return (
-    <aside className="hidden sm:flex w-64 shrink-0 flex-col border-r border-white/5 bg-surface-2/40 overflow-y-auto custom-scrollbar">
-      {/* Search */}
-      <div className="p-4 sticky top-0 bg-surface-2/80 z-10">
-        <div className="relative group">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/60 group-focus-within:text-primary transition-ui" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Find a setting…"
-            className="w-full bg-surface-4/60 border border-white/10 rounded-xl pl-10 pr-4 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-ui"
-          />
-        </div>
-      </div>
-
-      {/* Category groups */}
-      <nav className="flex-1 py-4 px-3 space-y-6">
-        {filteredCategories.map((category) => (
+    <aside className="hidden sm:flex w-60 shrink-0 flex-col border-r border-white/5 bg-surface-2/40 overflow-y-auto custom-scrollbar">
+      <nav className="flex-1 py-3 px-3 space-y-3" aria-label="Settings">
+        {SIDEBAR_CATEGORIES.map((category) => (
           <div key={category.label}>
-            <p className="px-3 mb-2 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+            <p className="px-3 mb-0.5 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
               {category.label}
             </p>
-            <ul className="space-y-1">
+            <ul className="space-y-0.5">
               {category.items.map((item) => {
                 const Icon = item.icon;
                 const isActive = active === item.value;
@@ -281,6 +256,7 @@ function SettingsSidebar({
                         onClick={() => onSelect(item.value)}
                         onMouseEnter={() => onPrefetch(item.value)}
                         onFocus={() => onPrefetch(item.value)}
+                        aria-current={isActive ? "page" : undefined}
                         className={sidebarItemClass(isActive)}
                       >
                         {content}
@@ -292,15 +268,6 @@ function SettingsSidebar({
             </ul>
           </div>
         ))}
-
-        {filteredCategories[0]?.items.length === 0 && (
-          <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
-            <Search className="w-8 h-8 text-muted-foreground/30 mb-3" />
-            <p className="text-sm text-muted-foreground">
-              No settings match “{search}”
-            </p>
-          </div>
-        )}
       </nav>
     </aside>
   );
@@ -310,7 +277,10 @@ function SettingsSidebar({
 
 function PanelLoading() {
   return (
-    <div className="flex flex-col items-center justify-center py-24 gap-4">
+    <div
+      className="flex flex-col items-center justify-center py-24 gap-4"
+      data-panel-loading
+    >
       <div className="w-12 h-12 rounded-2xl bg-surface-4/60 border border-white/5 flex items-center justify-center relative overflow-hidden">
         <div className="absolute inset-0 bg-primary/10" />
         <div className="w-6 h-6 border-2 border-primary/20 border-t-primary rounded-full animate-spin relative z-10" />
@@ -326,10 +296,13 @@ export default function Settings() {
   const { user, logout } = useAuth();
 
   // Initialize from URL hash, fall back to "integrations".
-  const [active, setActive] = useState<string>(() => {
-    const hash = window.location.hash.slice(1);
-    return SECTION_ITEMS.some((i) => i.value === hash) ? hash : "integrations";
-  });
+  const [active, setActive] = useState<string>(
+    () => resolveHash(window.location.hash.slice(1))?.section ?? "integrations",
+  );
+  // A card on the Account page the hash asked for (#password, #two-factor, #oauth).
+  const [anchor, setAnchor] = useState<string | null>(
+    () => resolveHash(window.location.hash.slice(1))?.anchor ?? null,
+  );
 
   // Keep URL hash in sync when active section changes.
   useEffect(() => {
@@ -339,12 +312,32 @@ export default function Settings() {
   // Handle browser back/forward navigation.
   useEffect(() => {
     const onHashChange = () => {
-      const hash = window.location.hash.slice(1);
-      if (ALL_ITEMS.some((i) => i.value === hash)) setActive(hash);
+      const target = resolveHash(window.location.hash.slice(1));
+      if (!target) return;
+      setActive(target.section);
+      if (target.anchor) setAnchor(target.anchor);
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
+
+  // Scroll to the requested card once every lazy card above it has rendered
+  // (the section wrappers exist at once; their content arrives in chunks, and
+  // a scroll taken before the cards above have their height lands short).
+  useEffect(() => {
+    if (!anchor) return;
+    let tries = 0;
+    const timer = window.setInterval(() => {
+      const el = document.getElementById(anchor);
+      const settled = el && !document.querySelector("[data-panel-loading]");
+      if (settled || ++tries > 40) {
+        el?.scrollIntoView({ block: "start" });
+        window.clearInterval(timer);
+        setAnchor(null);
+      }
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [anchor]);
 
   const handlePrefetch = useCallback((tab: string) => {
     prefetchMap[tab]?.();
@@ -393,7 +386,7 @@ export default function Settings() {
       </div>
 
       {/* Two-column layout */}
-      <div className="flex flex-1 overflow-hidden relative z-10">
+      <div className="flex flex-1 min-h-0 overflow-hidden relative z-10">
         <SettingsSidebar
           active={active}
           onSelect={setActive}
@@ -494,90 +487,55 @@ export default function Settings() {
                 </Suspense>
               </ErrorBoundary>
             )}
-            {active === "password" && (
-              <ErrorBoundary>
-                <Suspense fallback={<PanelLoading />}>
-                  <PasswordSettings />
-                </Suspense>
-              </ErrorBoundary>
-            )}
-            {active === "two-factor" && (
-              <ErrorBoundary>
-                <Suspense fallback={<PanelLoading />}>
-                  <TwoFactorSettings
-                    enabled={user?.twoFactorEnabled || false}
-                  />
-                </Suspense>
-              </ErrorBoundary>
-            )}
-            {active === "oauth" && (
-              <ErrorBoundary>
-                <Suspense fallback={<PanelLoading />}>
-                  <OAuthManager />
-                </Suspense>
-              </ErrorBoundary>
-            )}
             {active === "account" && (
-              <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
-                <div className="relative z-10 space-y-10">
+              <div className="space-y-8">
+                <section
+                  id="profile"
+                  className="bg-surface-3/40 border border-white/5 rounded-2xl p-10"
+                >
                   <div className="flex items-center gap-6">
-                    <div className="w-20 h-20 bg-surface-4/60 border border-white/10 rounded-2xl flex items-center justify-center relative group/avatar">
-                      <UserIcon className="w-10 h-10 text-primary relative z-10" />
+                    <div className="w-16 h-16 bg-surface-4/60 border border-white/10 rounded-2xl flex items-center justify-center shrink-0">
+                      <UserIcon className="w-8 h-8 text-primary" />
                     </div>
-                    <div>
-                      <h2 className="text-2xl font-semibold text-white tracking-tight">
-                        Profile
-                      </h2>
-                      <p className="text-sm text-muted-foreground mt-1">
-                        The account you are signed in with.
+                    <div className="min-w-0">
+                      <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground mb-1.5 block">
+                        Signed in as
+                      </span>
+                      <p className="text-lg md:text-xl font-semibold text-white tracking-tight truncate">
+                        {user?.email || user?.name}
                       </p>
                     </div>
-                  </div>
-
-                  <div className="grid gap-6">
-                    <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 group/field hover:bg-surface-4/60 transition-ui">
-                      <div className="min-w-0">
-                        <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground mb-1.5 block">
-                          Signed in as
-                        </span>
-                        <p className="text-lg md:text-xl font-semibold text-white tracking-tight truncate">
-                          {user?.email || user?.name}
-                        </p>
-                      </div>
-                      <div className="shrink-0 px-4 py-2 bg-success/10 border border-success/20 rounded-full w-fit">
-                        <span className="text-xs font-medium text-success">
-                          Active session
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="bg-warning/5 border border-warning/10 rounded-2xl p-8 flex items-start gap-6 relative overflow-hidden">
-                      <div className="p-4 bg-warning/10 rounded-2xl text-warning relative z-10 border border-warning/20">
-                        <LockIcon className="w-6 h-6" />
-                      </div>
-                      <div className="relative z-10 flex-1">
-                        <h4 className="text-base font-semibold text-warning tracking-tight">
-                          Password and two-factor sign-in
-                        </h4>
-                        <p className="text-sm text-warning/70 leading-relaxed mt-1.5">
-                          Change your password under Password, and turn on an
-                          authenticator app under Two-factor auth. Accounts that
-                          sign in with Google or Okta manage both with that
-                          provider.
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="pt-8 border-t border-white/5 flex justify-end">
                     <button
                       onClick={logout}
-                      className="px-4 h-10 text-sm font-medium border border-destructive/20 text-destructive hover:text-white hover:bg-destructive transition-ui rounded-xl"
+                      className="ml-auto shrink-0 px-4 h-10 text-sm font-medium border border-destructive/20 text-destructive hover:text-white hover:bg-destructive transition-ui rounded-xl"
                     >
                       Sign out
                     </button>
                   </div>
-                </div>
+                </section>
+                <section id="password" className="scroll-mt-6">
+                  <ErrorBoundary>
+                    <Suspense fallback={<PanelLoading />}>
+                      <PasswordSettings />
+                    </Suspense>
+                  </ErrorBoundary>
+                </section>
+                <section id="two-factor" className="scroll-mt-6">
+                  <ErrorBoundary>
+                    <Suspense fallback={<PanelLoading />}>
+                      <TwoFactorSettings
+                        enabled={user?.twoFactorEnabled || false}
+                      />
+                    </Suspense>
+                  </ErrorBoundary>
+                </section>
+                <section id="oauth" className="scroll-mt-6">
+                  <ErrorBoundary>
+                    <Suspense fallback={<PanelLoading />}>
+                      <OAuthManager />
+                    </Suspense>
+                  </ErrorBoundary>
+                </section>
               </div>
             )}
           </div>
