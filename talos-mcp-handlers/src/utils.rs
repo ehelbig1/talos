@@ -4502,8 +4502,9 @@ mod blocked_vault_report_tests {
     fn a_permitted_reference_is_silent() {
         let cfg = json!({ "AUTH_HEADER": "Bearer vault://gmail/token" });
         assert!(describe_blocked_vault_refs("n", "M", &cfg, &s(&["gmail"])).is_none());
-        assert!(describe_blocked_vault_refs("n", "M", &cfg, &s(&["*"])).is_none());
         assert!(describe_blocked_vault_refs("n", "M", &cfg, &s(&["gmail/*"])).is_none());
+        // D2-D: a `*` grant permits nothing, so its reference is reported.
+        assert!(describe_blocked_vault_refs("n", "M", &cfg, &s(&["*"])).is_some());
         // A config with no vault references at all.
         assert!(describe_blocked_vault_refs("n", "M", &json!({"URL": "https://x"}), &[]).is_none());
     }

@@ -2522,14 +2522,14 @@ async fn handle_install_from_marketplace(
         return resp;
     }
     // The installer's own secret grant to another publisher's code: exact
-    // paths only — no `*` from a bearer token on any listing, no `/*` prefix
-    // on a third-party one — and within the per-user module quota the catalog
-    // install applies (security review 2026-10-14, G-24).
+    // paths only — no `*` on any listing, from anyone (D2-D, 2026-10-15), no
+    // `/*` prefix on a third-party one — and within the per-user module quota
+    // the catalog install applies (security review 2026-10-14, G-24).
     if talos_capability_world::grant_list_has_wildcard(&installer_secrets) {
         return mcp_denied(
             req_id,
             -32003,
-            talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR,
+            talos_capability_world::SECRET_WILDCARD_RETIRED,
         );
     }
     if listing.publisher_id != talos_advanced_repository::SYSTEM_PUBLISHER_ID

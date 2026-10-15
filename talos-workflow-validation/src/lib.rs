@@ -7658,9 +7658,14 @@ mod vault_config_finding_tests {
         assert!(matches!(findings[0], VaultConfigFinding::Blocked { .. }));
     }
 
+    /// D2-D (2026-10-15): a `*` grant grants nothing, so the validator reports
+    /// the reference as blocked, by the one matcher and no caller-side case —
+    /// until then `*` cleared every reference.
     #[test]
-    fn wildcard_grant_permits_without_a_caller_side_special_case() {
-        assert!(vault_config_findings(&live_gmail_config(), &s(&["*"])).is_empty());
+    fn a_star_grant_permits_nothing_without_a_caller_side_special_case() {
+        let findings = vault_config_findings(&live_gmail_config(), &s(&["*"]));
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(findings[0], VaultConfigFinding::Blocked { .. }));
     }
 
     /// The live `Send HTML Email (Gmail)` grant is a glob; the live

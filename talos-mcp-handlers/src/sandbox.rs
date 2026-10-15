@@ -774,14 +774,8 @@ fn grant_write_failure(
     tool: &str,
     generic: &str,
 ) -> JsonRpcResponse {
-    if e.downcast_ref::<talos_module_repository::WildcardGrantRefused>()
-        .is_some()
-    {
-        return mcp_denied(
-            req_id,
-            -32003,
-            talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR,
-        );
+    if let Some(refused) = e.downcast_ref::<talos_module_repository::WildcardGrantRefused>() {
+        return mcp_denied(req_id, -32003, refused.0);
     }
     tracing::error!("{tool} failed: {:#}", e);
     mcp_error(req_id, -32000, generic)

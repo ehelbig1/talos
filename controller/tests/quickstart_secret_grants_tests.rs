@@ -95,14 +95,15 @@ fn key_paths(entries: &Value) -> Vec<String> {
         .collect()
 }
 
-const GRANTS: [&str; 7] = [
+// No `*`: a module cannot hold one since 2026-10-15 (D2-D,
+// `modules_no_star_secret_grant`).
+const GRANTS: [&str; 6] = [
     "svc/token",   // exact, stored by the owner
     "oauth/gmail", // prefix; the owner holds a token under it
     "notes/*",     // glob; the owner holds a path under it
     "shared",      // prefix; only an ownerless secret is under it
     "chat/*",      // glob; only ANOTHER user holds a path under it
     "bank/secret", // exact; nobody holds it
-    "*",           // everything: never listed, never missing
 ];
 
 #[tokio::test]

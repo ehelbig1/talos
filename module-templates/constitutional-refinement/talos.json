@@ -9,7 +9,7 @@
   "allowed_methods": [
     "POST"
   ],
-  "allowed_secrets": ["*"],
+  "allowed_secrets": [],
   "config_schema": {
     "type": "object",
     "required": ["CONSTITUTION", "API_KEY_SECRET"],
@@ -20,7 +20,7 @@
       },
       "API_KEY_SECRET": {
         "type": "string",
-        "description": "Vault path to the LLM provider API key (e.g. 'talos/openai_key' or 'talos/anthropic_key'). The key is injected by the host and never crosses into guest memory."
+        "description": "Vault path to the LLM provider API key (e.g. 'talos/openai_key' or 'talos/anthropic_key'). The key is injected by the host and never crosses into guest memory. Grant this exact path to the installed module (update_module_secrets): the template grants nothing, because a '*' grant is not accepted."
       },
       "PROVIDER": {
         "type": "string",

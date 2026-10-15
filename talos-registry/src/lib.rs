@@ -259,8 +259,11 @@ pub fn validate_allowed_secrets(secrets: &[String]) -> std::result::Result<(), S
         ));
     }
     for entry in secrets {
-        if entry == "*" {
-            continue;
+        // A `*` grant (every stored secret) is refused here as it is at every
+        // other writer (operator decision D2-D, 2026-10-15): a catalog
+        // manifest, a registry upload and a reconcile cannot declare it.
+        if entry.trim() == "*" {
+            return Err(talos_capability_world::SECRET_WILDCARD_RETIRED.to_string());
         }
         if entry.is_empty() {
             return Err("allowed_secrets entry must not be empty".to_string());
@@ -1795,7 +1798,8 @@ pub struct InheritedGrants {
     pub allowed_hosts: Vec<String>,
     /// HTTP method allowlist. Empty DENIES every verb (since 2026-09-24).
     pub allowed_methods: Vec<String>,
-    /// Vault path allowlist. Empty DENIES every secret; `["*"]` is the wildcard.
+    /// Vault path allowlist. Empty DENIES every secret; `*` grants nothing
+    /// (D2-D, 2026-10-15 — it is refused at every write).
     pub allowed_secrets: Vec<String>,
     /// Operations this module may not perform without an approval gate.
     pub requires_approval_for: Vec<String>,
@@ -2364,7 +2368,8 @@ pub struct WasmModule {
     /// a module row from a template dropped this field while carrying
     /// `allowed_hosts`; see [`InheritedGrants`]). Non-empty = only those verbs.
     pub allowed_methods: Vec<String>,
-    /// Secret allowlist. Empty = deny all. `["*"]` = allow all. Otherwise explicit names.
+    /// Secret allowlist. Empty = deny all. `*` grants nothing (D2-D). Otherwise
+    /// exact paths, prefixes and `<prefix>/*` globs.
     pub allowed_secrets: Vec<String>,
     /// Operation types that require human approval before execution.
     pub requires_approval_for: Vec<String>,
@@ -2664,7 +2669,7 @@ mod validate_allowed_secrets_tests {
 
     #[test]
     fn accepts_wildcard() {
-        assert!(validate_allowed_secrets(&["*".into()]).is_ok());
+        assert!(validate_allowed_secrets(&["*".into()]).is_err(), "D2-D");
     }
 
     #[test]

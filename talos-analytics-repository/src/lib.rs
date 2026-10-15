@@ -1870,9 +1870,11 @@ mod orphan_secret_tests {
         ));
     }
 
+    /// D2-D (2026-10-15): a `*` grant grants nothing, so a secret it alone
+    /// would have "claimed" is reported as unused — which it is.
     #[test]
-    fn wildcard_matches_everything() {
-        assert!(secret_path_in_any_grant(&s(&["*"]), "anything/at/all"));
+    fn a_star_grant_claims_nothing() {
+        assert!(!secret_path_in_any_grant(&s(&["*"]), "anything/at/all"));
     }
 
     #[test]

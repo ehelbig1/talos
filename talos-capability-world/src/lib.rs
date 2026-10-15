@@ -572,7 +572,9 @@ impl ChangeAuthority {
 /// Whether a module grant list (`allowed_secrets` or `allowed_hosts`) is one
 /// a bearer credential may write: it names no `*`, the entry that grants
 /// every stored secret or every host (security review 2026-10-14, A-2 /
-/// G-23). A `*` is written only with [`ChangeAuthority::SecondFactorSession`].
+/// G-23). A `*` HOST grant is written only with
+/// [`ChangeAuthority::SecondFactorSession`]; a `*` SECRET grant by nobody
+/// (D2-D, [`SECRET_WILDCARD_RETIRED`]).
 #[must_use]
 pub fn grant_list_has_wildcard(entries: &[String]) -> bool {
     entries.iter().any(|e| e.trim() == "*")
@@ -608,6 +610,12 @@ pub fn refuse_wildcard_grant(
     allowed_secrets: &[String],
     allowed_hosts: &[String],
 ) -> Result<(), &'static str> {
+    // A bare `*` secret grant is refused for EVERY authority (operator
+    // decision D2-D, 2026-10-15): it delivered every secret the user can read,
+    // every OAuth access token included, into each dispatch's envelope.
+    if allowed_secrets.iter().any(|e| e.trim() == "*") {
+        return Err(SECRET_WILDCARD_RETIRED);
+    }
     if authority.may_loosen()
         || !(secret_grant_list_has_wildcard(allowed_secrets)
             || grant_list_has_wildcard(allowed_hosts))
@@ -617,11 +625,17 @@ pub fn refuse_wildcard_grant(
     Err(WILDCARD_GRANT_NEEDS_SECOND_FACTOR)
 }
 
+/// The sentence a `*` secret grant answers with, whoever writes it.
+pub const SECRET_WILDCARD_RETIRED: &str =
+    "A '*' secret grant (every stored secret) is not accepted from anyone: name the exact \
+     paths the module reads, or a '<prefix>/*' grant from a session verified with \
+     two-factor authentication.";
+
 /// The sentence a refused wildcard grant answers with.
 pub const WILDCARD_GRANT_NEEDS_SECOND_FACTOR: &str =
-    "A '*' grant (every stored secret, or every host) or a '<prefix>/*' secret grant needs a \
-     session verified with two-factor authentication; an MCP agent token or an API key may \
-     only name exact paths and hosts.";
+    "A '*' host grant (every host) or a '<prefix>/*' secret grant needs a session verified \
+     with two-factor authentication; an MCP agent token or an API key may only name exact \
+     paths and hosts.";
 
 /// The one sentence a refused loosening answers with, on every surface.
 pub const LOOSENING_NEEDS_SECOND_FACTOR: &str =
@@ -1510,11 +1524,34 @@ mod wildcard_grant_tests {
     /// writer — no `*` secret or host, no `<prefix>/*` secret glob; exact
     /// paths, bare namespaces and named hosts pass; a second-factor session
     /// may write any of them.
+    /// D2-D: a bare `*` secret grant is refused for every authority, a
+    /// second-factor session included; `<prefix>/*` stays a session's to grant.
+    #[test]
+    fn a_star_secret_grant_is_refused_for_every_authority() {
+        let v = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        for authority in [
+            ChangeAuthority::SecondFactorSession,
+            ChangeAuthority::BearerCredential,
+        ] {
+            for secrets in [v(&["*"]), v(&[" * "]), v(&["svc/a", "*"])] {
+                assert_eq!(
+                    refuse_wildcard_grant(authority, &secrets, &[]),
+                    Err(SECRET_WILDCARD_RETIRED),
+                    "{authority:?} {secrets:?}"
+                );
+            }
+        }
+        assert_eq!(
+            refuse_wildcard_grant(ChangeAuthority::SecondFactorSession, &v(&["svc/*"]), &[]),
+            Ok(())
+        );
+    }
+
     #[test]
     fn a_bearer_writes_no_wildcard_grant() {
         let bearer = ChangeAuthority::BearerCredential;
         let session = ChangeAuthority::SecondFactorSession;
-        for secrets in [v(&["*"]), v(&["svc/*"]), v(&["a/b", " svc/* "])] {
+        for secrets in [v(&["svc/*"]), v(&["a/b", " svc/* "])] {
             assert_eq!(
                 refuse_wildcard_grant(bearer, &secrets, &[]),
                 Err(WILDCARD_GRANT_NEEDS_SECOND_FACTOR),

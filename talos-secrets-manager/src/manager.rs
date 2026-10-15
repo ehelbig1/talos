@@ -2876,8 +2876,10 @@ impl SecretsManager {
         }
     }
 
-    /// Fetch secrets by their key_paths (from a module's allowed_secrets list).
-    /// Supports wildcard "*" to fetch all secrets visible to `owner_user_id`.
+    /// Fetch secrets by their key_paths (from a module's allowed_secrets list):
+    /// exact `key_path` equality. A `*` entry matches no row (operator
+    /// decision D2-D, 2026-10-15) — until then it fetched every secret visible
+    /// to `owner_user_id`, every OAuth access token included.
     ///
     /// SECURITY: `owner_user_id` MUST be provided when the caller is acting on
     /// behalf of a specific user. Without it, only secrets with no owner
@@ -2894,8 +2896,6 @@ impl SecretsManager {
         owner_user_id: Option<Uuid>,
         audit: PathReadAudit,
     ) -> Result<std::collections::HashMap<String, Zeroizing<String>>> {
-        let is_wildcard = allowed_paths.iter().any(|p| p == "*");
-
         // N T2-N1: include `id` (for AAD) and `encryption_format_version`
         // (for v0/v1 dispatch) on every variant of the path-keyed
         // bulk read.
@@ -2908,29 +2908,7 @@ impl SecretsManager {
             Option<chrono::DateTime<chrono::Utc>>,
             Option<Uuid>,
         );
-        let records: Vec<PathRecord> = if is_wildcard {
-            if let Some(uid) = owner_user_id {
-                sqlx::query_as(concat!(
-                    "SELECT id, key_path, encrypted_value, encryption_key_id, \
-                            encryption_format_version, expires_at, org_id \
-                     FROM secrets \
-                     WHERE ",
-                    may_dispatch_read_secret!("$1")
-                ))
-                .bind(uid)
-                .fetch_all(&self.db_pool)
-                .await?
-            } else {
-                // No user context — restrict to global/system secrets only.
-                sqlx::query_as(
-                    "SELECT id, key_path, encrypted_value, encryption_key_id, \
-                            encryption_format_version, expires_at, org_id \
-                     FROM secrets WHERE owner_user_id IS NULL",
-                )
-                .fetch_all(&self.db_pool)
-                .await?
-            }
-        } else if let Some(uid) = owner_user_id {
+        let records: Vec<PathRecord> = if let Some(uid) = owner_user_id {
             sqlx::query_as(concat!(
                 "SELECT id, key_path, encrypted_value, encryption_key_id, \
                         encryption_format_version, expires_at, org_id \
