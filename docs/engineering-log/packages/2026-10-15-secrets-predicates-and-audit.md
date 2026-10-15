@@ -61,7 +61,7 @@ surface needs it today.
   audit trail is kept as long as the obligations it serves require.
   `security_audit` gains `secret_audit_log_extent` (info): the planner's row
   estimate — not a `count(*)` over a table that only grows — and the oldest
-  row's age. Migration `20261015140000` adds `(secret_id, timestamp DESC)`.
+  row's age. Migration `20261015140000` adds `(secret_id, timestamp DESC)`; `20261015140100` drops `(secret_id)`, its leading prefix (`index_hygiene_tests`).
 - **C2-4:** `resolve_llm_keys` returns `SecretMap`; the impl hands on the
   cache's `Zeroizing` values unchanged; the re-wrap in `secrets_pipeline` is
   gone. The type is the test.
