@@ -34,7 +34,7 @@ export function SetupPanel({
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
       {/* Workflow selector */}
-      <div className="bg-surface-1/40 border border-white/5 rounded-3xl p-10 space-y-6 glass-dark shadow-2xl relative overflow-hidden">
+      <div className="bg-surface-1/40 border border-white/5 rounded-2xl p-10 space-y-6 bg-surface-3 border border-white/10 relative overflow-hidden">
         <div className="absolute top-0 right-0 p-8 opacity-5">
           <Clock size={120} />
         </div>
@@ -53,11 +53,10 @@ export function SetupPanel({
           </p>
         ) : (
           <div className="relative group">
-            <div className="absolute -inset-px bg-gradient-to-r from-primary/20 to-transparent rounded-2xl opacity-0 group-hover:opacity-100 transition-premium" />
             <select
               value={selectedWorkflowId}
               onChange={(e) => onSelectWorkflow(e.target.value)}
-              className="w-full bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-4 text-sm font-bold text-white focus:outline-none focus:ring-2 focus:ring-primary/40 transition-premium appearance-none cursor-pointer relative z-10 shadow-inner"
+              className="w-full bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-4 text-sm font-bold text-white focus:outline-none focus:ring-2 focus:ring-primary/40 transition-premium appearance-none cursor-pointer relative z-10"
             >
               <option value="" className="bg-surface-4">
                 Select a workflow…
@@ -76,7 +75,7 @@ export function SetupPanel({
       </div>
 
       {/* Actor selector */}
-      <div className="bg-surface-1/40 border border-white/5 rounded-3xl p-10 space-y-6 glass-dark shadow-2xl relative overflow-hidden">
+      <div className="bg-surface-1/40 border border-white/5 rounded-2xl p-10 space-y-6 bg-surface-3 border border-white/10 relative overflow-hidden">
         <div className="absolute top-0 right-0 p-8 opacity-5">
           <Bot size={120} />
         </div>
@@ -112,7 +111,7 @@ export function SetupPanel({
                   className={cn(
                     "flex items-center gap-4 p-4 rounded-2xl cursor-pointer transition-premium group relative overflow-hidden",
                     selected
-                      ? "bg-primary/5 border-primary/20 shadow-xl"
+                      ? "bg-primary/5 border-primary/20"
                       : "bg-surface-3/40 border border-white/5 hover:border-white/20",
                   )}
                 >

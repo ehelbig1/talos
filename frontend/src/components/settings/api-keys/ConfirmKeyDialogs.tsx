@@ -22,11 +22,11 @@ export function RevokeKeyDialog({
   return (
     <Dialog open={true} onClose={onCancel}>
       <div
-        className="bg-surface-3/90 border border-amber-500/20 shadow-2xl rounded-2xl overflow-hidden w-[400px] animate-in zoom-in-95 duration-200"
+        className="bg-surface-3/90 border border-amber-500/20 rounded-2xl overflow-hidden w-[400px] animate-in zoom-in-95 duration-200"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
-          <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center text-amber-500 mx-auto shadow-inner">
+          <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center text-amber-500 mx-auto">
             <Shield size={32} />
           </div>
           <div>
@@ -52,7 +52,7 @@ export function RevokeKeyDialog({
           <Button
             onClick={onConfirm}
             disabled={isPending}
-            className="flex-1 bg-amber-600 hover:bg-amber-500 text-white shadow-xl shadow-amber-900/20 font-bold h-12 rounded-xl transition-premium"
+            className="flex-1 bg-amber-600 hover:bg-amber-500 text-white shadow-amber-900/20 font-bold h-12 rounded-xl transition-premium"
           >
             {isPending ? "Revoking..." : "Revoke Key"}
           </Button>
@@ -74,11 +74,11 @@ export function RotateKeyDialog({
   return (
     <Dialog open={true} onClose={onCancel}>
       <div
-        className="bg-surface-3/90 border border-indigo-500/20 shadow-2xl rounded-2xl overflow-hidden w-[460px] animate-in zoom-in-95 duration-200"
+        className="bg-surface-3/90 border border-indigo-500/20 rounded-2xl overflow-hidden w-[460px] animate-in zoom-in-95 duration-200"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
-          <div className="w-16 h-16 bg-indigo-500/10 border border-indigo-500/20 rounded-2xl flex items-center justify-center text-indigo-400 mx-auto shadow-inner">
+          <div className="w-16 h-16 bg-indigo-500/10 border border-indigo-500/20 rounded-2xl flex items-center justify-center text-indigo-400 mx-auto">
             <RefreshCw size={32} />
           </div>
           <div>
@@ -113,7 +113,7 @@ export function RotateKeyDialog({
           <Button
             onClick={onConfirm}
             disabled={isPending}
-            className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white shadow-xl shadow-indigo-900/20 font-bold h-12 rounded-xl transition-premium"
+            className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-900/20 font-bold h-12 rounded-xl transition-premium"
           >
             {isPending ? (
               <div className="flex items-center gap-2">
@@ -142,11 +142,11 @@ export function DeleteKeyDialog({
   return (
     <Dialog open={true} onClose={onCancel}>
       <div
-        className="bg-surface-3/90 border border-red-500/20 shadow-2xl rounded-2xl overflow-hidden w-[400px] animate-in zoom-in-95 duration-200"
+        className="bg-surface-3/90 border border-red-500/20 rounded-2xl overflow-hidden w-[400px] animate-in zoom-in-95 duration-200"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
-          <div className="w-16 h-16 bg-red-500/10 border border-red-500/20 rounded-2xl flex items-center justify-center text-red-500 mx-auto shadow-inner">
+          <div className="w-16 h-16 bg-red-500/10 border border-red-500/20 rounded-2xl flex items-center justify-center text-red-500 mx-auto">
             <Trash2 size={32} />
           </div>
           <div>
@@ -172,7 +172,7 @@ export function DeleteKeyDialog({
           <Button
             onClick={onConfirm}
             disabled={isPending}
-            className="flex-1 bg-red-600 hover:bg-red-500 text-white shadow-xl shadow-red-900/20 font-bold h-12 rounded-xl transition-premium"
+            className="flex-1 bg-red-600 hover:bg-red-500 text-white shadow-red-900/20 font-bold h-12 rounded-xl transition-premium"
           >
             {isPending ? "Deleting..." : "Delete Key"}
           </Button>

@@ -32,7 +32,7 @@ export function ServiceIntegrationSection({
       <CollapsibleTrigger asChild>
         <button
           type="button"
-          className="w-full p-4 bg-surface-3 hover:bg-surface-4 border border-white/5 rounded-2xl cursor-pointer text-xs font-semibold text-white flex items-center justify-between transition-premium shadow-xl group-hover/collapsible:border-primary/20"
+          className="w-full p-4 bg-surface-3 hover:bg-surface-4 border border-white/5 rounded-2xl cursor-pointer text-xs font-semibold text-white flex items-center justify-between transition-premium group-hover/collapsible:border-primary/20"
         >
           <div className="flex items-center gap-3">
             <div className="p-1.5 rounded-lg bg-primary/10 text-primary">

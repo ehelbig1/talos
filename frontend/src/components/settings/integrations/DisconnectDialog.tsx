@@ -27,8 +27,7 @@ export function DisconnectDialog({
   return (
     <Dialog open={open} onClose={onClose} title="Disconnect account">
       <div className="space-y-8 p-2">
-        <div className="flex items-start gap-6 p-8 bg-destructive/5 border border-destructive/20 rounded-2xl shadow-2xl relative overflow-hidden">
-          <div className="absolute inset-0 bg-gradient-to-br from-destructive/10 to-transparent opacity-50" />
+        <div className="flex items-start gap-6 p-8 bg-destructive/5 border border-destructive/20 rounded-2xl relative overflow-hidden">
           <div className="w-14 h-14 bg-destructive/10 rounded-2xl flex items-center justify-center text-destructive shrink-0 border border-destructive/20 relative z-10">
             <AlertTriangle size={28} />
           </div>
@@ -58,7 +57,7 @@ export function DisconnectDialog({
           <button
             onClick={onConfirm}
             disabled={disconnecting}
-            className="px-10 py-4 text-sm font-semibold bg-destructive text-white rounded-2xl shadow-2xl transition-premium active:scale-95 hover:bg-destructive/90"
+            className="px-10 py-4 text-sm font-semibold bg-destructive text-white rounded-2xl transition-premium active:scale-95 hover:bg-destructive/90"
           >
             {disconnecting ? (
               <div className="flex items-center gap-3">

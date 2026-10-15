@@ -69,7 +69,7 @@ export function CreateKeyDialog({
   return (
     <Dialog open={true} onClose={onClose}>
       <div
-        className="bg-surface-3/90 border border-white/5 shadow-[0_0_50px_rgba(0,0,0,0.5)] rounded-2xl overflow-hidden w-[520px] animate-in zoom-in-95 duration-200"
+        className="bg-surface-3/90 border border-white/5 rounded-2xl overflow-hidden w-[520px] animate-in zoom-in-95 duration-200"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-8 py-6 border-b border-white/5 flex items-center justify-between bg-white/[0.02]">
@@ -110,7 +110,7 @@ export function CreateKeyDialog({
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   onNameChange(e.target.value)
                 }
-                className="pl-12 bg-surface-4/60 border-white/5 focus:border-indigo-500 focus:ring-indigo-500/10 transition-premium h-12 text-sm font-medium rounded-xl shadow-inner"
+                className="pl-12 bg-surface-4/60 border-white/5 focus:border-indigo-500 focus:ring-indigo-500/10 transition-premium h-12 text-sm font-medium rounded-xl"
               />
             </div>
           </div>
@@ -130,7 +130,7 @@ export function CreateKeyDialog({
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   onExpiresInChange(e.target.value)
                 }
-                className="pl-12 bg-surface-4/60 border-white/5 focus:border-indigo-500 focus:ring-indigo-500/10 transition-premium h-12 text-sm font-medium rounded-xl shadow-inner"
+                className="pl-12 bg-surface-4/60 border-white/5 focus:border-indigo-500 focus:ring-indigo-500/10 transition-premium h-12 text-sm font-medium rounded-xl"
               />
             </div>
           </div>
@@ -147,7 +147,7 @@ export function CreateKeyDialog({
                   className={cn(
                     "flex flex-col items-start p-4 rounded-xl border transition-premium text-left group/scope",
                     selectedScopes.includes(s.value)
-                      ? "bg-indigo-500/10 border-indigo-500/40 text-indigo-100 shadow-[0_4px_12px_rgba(99,102,241,0.1)]"
+                      ? "bg-indigo-500/10 border-indigo-500/40 text-indigo-100"
                       : "bg-surface-4/60 border-white/5 text-muted-foreground hover:border-white/10 hover:bg-white/[0.02]",
                   )}
                 >
@@ -166,7 +166,7 @@ export function CreateKeyDialog({
                       className={cn(
                         "w-4 h-4 rounded-full border transition-premium flex items-center justify-center",
                         selectedScopes.includes(s.value)
-                          ? "bg-indigo-500 border-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.4)]"
+                          ? "bg-indigo-500 border-indigo-500"
                           : "bg-surface-3/60 border-white/5",
                       )}
                     >
@@ -202,7 +202,7 @@ export function CreateKeyDialog({
           <Button
             onClick={onCreate}
             disabled={isPending || !name || selectedScopes.length === 0}
-            className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20 px-8 h-11 rounded-xl font-bold transition-premium"
+            className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/20 px-8 h-11 rounded-xl font-bold transition-premium"
           >
             {isPending ? (
               <div className="flex items-center gap-2">

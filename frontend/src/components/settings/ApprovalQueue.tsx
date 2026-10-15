@@ -73,7 +73,7 @@ export function ApprovalQueue() {
 
   if (isLoading) {
     return (
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl animate-pulse">
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
         <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
         <div className="space-y-4">
           {[1, 2].map((i) => (
@@ -91,9 +91,7 @@ export function ApprovalQueue() {
   const decided = approvals.filter((a) => a.status !== "pending");
 
   return (
-    <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl relative overflow-hidden">
-      <div className="absolute inset-0 bg-gradient-to-br from-warning/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between mb-10 relative z-10">
         <div className="flex items-center gap-5">
@@ -127,7 +125,7 @@ export function ApprovalQueue() {
           className={cn(
             "flex-1 flex items-center justify-center gap-3 py-4 rounded-xl text-sm font-semibold transition-premium",
             activeTab === "pending"
-              ? "bg-warning/10 text-warning border border-warning/20 shadow-lg"
+              ? "bg-warning/10 text-warning border border-warning/20"
               : "text-muted-foreground/70 hover:text-white",
           )}
         >
@@ -145,7 +143,7 @@ export function ApprovalQueue() {
           className={cn(
             "flex-1 flex items-center justify-center gap-3 py-4 rounded-xl text-sm font-semibold transition-premium",
             activeTab === "decided"
-              ? "bg-primary/10 text-primary border border-primary/20 shadow-lg"
+              ? "bg-primary/10 text-primary border border-primary/20"
               : "text-muted-foreground/70 hover:text-white",
           )}
         >
@@ -157,8 +155,7 @@ export function ApprovalQueue() {
       {activeTab === "pending" ? (
         <div className="space-y-4 relative z-10">
           {pending.length === 0 ? (
-            <div className="text-center py-20 bg-white/[0.01] border border-dashed border-white/5 rounded-3xl relative group overflow-hidden">
-              <div className="absolute inset-0 bg-success/5 opacity-0 group-hover:opacity-100 transition-premium blur-3xl pointer-events-none" />
+            <div className="text-center py-20 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
               <CheckCircle2 className="w-16 h-16 text-success/20 mb-6 mx-auto group-hover:text-success/40 transition-premium" />
               <p className="text-sm text-muted-foreground font-semibold">
                 All Systems Authorized
@@ -173,8 +170,6 @@ export function ApprovalQueue() {
                 key={approval.id}
                 className="bg-white/[0.02] border border-white/5 rounded-2xl p-6 hover:bg-white/[0.04] hover:border-white/10 transition-premium group relative overflow-hidden"
               >
-                <div className="absolute inset-0 bg-gradient-to-r from-warning/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
                 <div className="flex items-center justify-between mb-5 relative z-10">
                   <div className="flex items-center gap-4">
                     <div className="w-2.5 h-2.5 rounded-full bg-warning animate-status-pulse" />
@@ -202,7 +197,7 @@ export function ApprovalQueue() {
 
                 <div className="grid grid-cols-2 gap-4 relative z-10">
                   <Button
-                    className="h-14 rounded-2xl font-semibold text-sm shadow-xl bg-success/10 hover:bg-success text-success hover:text-black border border-success/20 transition-premium"
+                    className="h-14 rounded-2xl font-semibold text-sm bg-success/10 hover:bg-success text-success hover:text-black border border-success/20 transition-premium"
                     onClick={() => handleDecision(approval.id, "approved")}
                   >
                     <Check className="w-4 h-4 mr-3" />
@@ -224,7 +219,7 @@ export function ApprovalQueue() {
       ) : (
         <div className="space-y-4 relative z-10">
           {decided.length === 0 ? (
-            <div className="text-center py-20 bg-white/[0.01] border border-dashed border-white/5 rounded-3xl">
+            <div className="text-center py-20 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl">
               <History className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto" />
               <p className="text-sm text-muted-foreground/70 font-semibold">
                 Archive Empty

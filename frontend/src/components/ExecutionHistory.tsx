@@ -179,7 +179,7 @@ const ExecutionItem = React.memo(
     return (
       <div
         className={cn(
-          "group border border-white/5 bg-surface-1/40 rounded-2xl overflow-hidden backdrop-blur-3xl transition-premium shadow-xl",
+          "group border border-white/5 bg-surface-1/40 rounded-2xl overflow-hidden transition-premium",
           isExpanded
             ? "border-primary/20 ring-1 ring-primary/10 bg-surface-2/60"
             : "hover:bg-surface-2/40 hover:border-white/10",
@@ -198,8 +198,7 @@ const ExecutionItem = React.memo(
             )}
           />
 
-          <div className="shrink-0 flex items-center justify-center w-10 h-10 rounded-2xl bg-surface-4 border border-white/5 transition-premium shadow-lg relative">
-            <div className="absolute inset-0 bg-primary/5 rounded-full blur-xl opacity-0 group-hover:opacity-50 transition-premium" />
+          <div className="shrink-0 flex items-center justify-center w-10 h-10 rounded-2xl bg-surface-4 border border-white/5 transition-premium relative">
             <StatusIcon status={exec.status} />
           </div>
 
@@ -237,11 +236,10 @@ const ExecutionItem = React.memo(
             isExpanded ? "max-h-[800px] opacity-100" : "max-h-0 opacity-0",
           )}
         >
-          <div className="p-8 border-t border-white/5 bg-surface-3/40 backdrop-blur-3xl space-y-8">
+          <div className="p-8 border-t border-white/5 bg-surface-3/40 space-y-8">
             {exec.errorMessage && (
               <div className="relative group/error">
-                <div className="absolute -inset-1 bg-destructive/10 rounded-2xl blur opacity-0 group-hover/error:opacity-100 transition-premium" />
-                <div className="relative p-5 bg-destructive/5 rounded-2xl border border-destructive/20 text-xs font-bold text-destructive shadow-inner leading-relaxed animate-in fade-in slide-in-from-top-2">
+                <div className="relative p-5 bg-destructive/5 rounded-2xl border border-destructive/20 text-xs font-bold text-destructive leading-relaxed animate-in fade-in slide-in-from-top-2">
                   <div className="flex items-center gap-3 mb-2">
                     <XCircle className="w-4 h-4" />
                     <span className="font-semibold uppercase tracking-wider text-2xs">
@@ -264,7 +262,7 @@ const ExecutionItem = React.memo(
                 {outputText ? (
                   <pre
                     tabIndex={0}
-                    className="p-6 bg-surface-4/60 rounded-2xl border border-white/5 overflow-x-auto whitespace-pre-wrap max-h-64 text-xs font-mono text-white/80 focus:outline-none focus:ring-2 focus:ring-primary/20 shadow-inner custom-scrollbar relative z-10 leading-relaxed selection:bg-primary/30"
+                    className="p-6 bg-surface-4/60 rounded-2xl border border-white/5 overflow-x-auto whitespace-pre-wrap max-h-64 text-xs font-mono text-white/80 focus:outline-none focus:ring-2 focus:ring-primary/20 custom-scrollbar relative z-10 leading-relaxed selection:bg-primary/30"
                   >
                     {outputText}
                   </pre>
@@ -286,7 +284,7 @@ const ExecutionItem = React.memo(
               </h5>
               <div
                 tabIndex={0}
-                className="p-6 bg-surface-4/60 rounded-2xl border border-white/5 font-mono space-y-2 max-h-64 overflow-y-auto focus:outline-none focus:ring-2 focus:ring-primary/20 shadow-inner custom-scrollbar relative z-10 animate-in fade-in slide-in-from-bottom-2"
+                className="p-6 bg-surface-4/60 rounded-2xl border border-white/5 font-mono space-y-2 max-h-64 overflow-y-auto focus:outline-none focus:ring-2 focus:ring-primary/20 custom-scrollbar relative z-10 animate-in fade-in slide-in-from-bottom-2"
               >
                 {loadingLogs ? (
                   <div className="flex items-center gap-4 text-muted-foreground/50 py-4">
@@ -374,7 +372,7 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
         <div className="flex items-center gap-5">
           <div
             className={cn(
-              "w-12 h-12 rounded-2xl flex items-center justify-center bg-surface-3 border border-white/5 shadow-2xl transition-premium",
+              "w-12 h-12 rounded-2xl flex items-center justify-center bg-surface-3 border border-white/5 transition-premium",
               hasRunning && "border-primary/40 animate-status-pulse",
             )}
           >
@@ -402,7 +400,7 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
           onClick={() => refetch()}
           disabled={isFetching}
           variant="ghost"
-          className="h-11 px-5 text-sm font-semibold text-muted-foreground/70 hover:text-white bg-surface-3 border border-white/5 rounded-xl transition-premium active:scale-95 shadow-xl disabled:opacity-50"
+          className="h-11 px-5 text-sm font-semibold text-muted-foreground/70 hover:text-white bg-surface-3 border border-white/5 rounded-xl transition-premium active:scale-95 disabled:opacity-50"
         >
           <RefreshCw
             className={cn("w-4 h-4 mr-2.5", isFetching && "animate-spin")}
@@ -417,7 +415,7 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
           <p className="text-xs font-semibold">Loading…</p>
         </div>
       ) : history.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-32 bg-surface-2/20 border border-white/5 border-dashed rounded-3xl animate-in zoom-in-95 duration-1000">
+        <div className="flex flex-col items-center justify-center py-32 bg-surface-2/20 border border-white/5 border-dashed rounded-2xl animate-in zoom-in-95 duration-1000">
           <HistoryIcon className="w-16 h-16 text-muted-foreground/5 mb-6" />
           <p className="text-xs font-semibold text-muted-foreground/50">
             Zero Execution Cycles Logged

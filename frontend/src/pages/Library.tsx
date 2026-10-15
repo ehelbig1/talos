@@ -47,16 +47,7 @@ export default function Library() {
   return (
     <div className="flex flex-col h-full overflow-hidden bg-background relative selection:bg-primary/30">
       {/* Dynamic Background Glows */}
-      <div className="absolute inset-0 pointer-events-none overflow-hidden select-none z-0">
-        <div
-          className="absolute top-[-20%] left-[-10%] w-[60%] h-[60%] bg-primary/5 blur-[120px] rounded-full mix-blend-screen"
-          style={{ animationDuration: "15s" }}
-        />
-        <div
-          className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-surface-2/20 blur-[100px] rounded-full mix-blend-screen"
-          style={{ animationDuration: "20s" }}
-        />
-      </div>
+      <div className="absolute inset-0 pointer-events-none overflow-hidden select-none z-0"></div>
 
       {/* Header Area */}
       <div className="w-full max-w-7xl mx-auto px-6 md:px-8 pt-8 md:pt-10 shrink-0 relative z-10">
@@ -95,7 +86,7 @@ export default function Library() {
       {/* Tab content */}
       <div className="flex-1 overflow-hidden relative z-10">
         <Suspense fallback={<TabLoading />}>
-          <div className="h-full overflow-auto custom-scrollbar gpu optimize-blur">
+          <div className="h-full overflow-auto custom-scrollbar">
             <div className="max-w-7xl mx-auto px-6 md:px-8 pb-24">
               {tab === "installed" ? <Modules /> : <Catalog />}
             </div>

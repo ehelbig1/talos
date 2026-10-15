@@ -69,7 +69,7 @@ export function RoleChangeDialog({
           </Button>
           <Button
             variant="premium"
-            className="flex-1 h-14 rounded-xl shadow-2xl"
+            className="flex-1 h-14 rounded-xl"
             disabled={isPending}
             onClick={onConfirm}
           >

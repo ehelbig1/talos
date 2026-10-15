@@ -170,7 +170,7 @@ export function StatCard({
   accent?: string;
 }) {
   return (
-    <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-6 glass transition-premium hover:border-white/10">
+    <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-6 transition-premium hover:border-white/10">
       <div
         className={cn(
           "text-3xl font-semibold tabular-nums tracking-tight",
@@ -255,7 +255,7 @@ export function TabBar({
   ];
 
   return (
-    <div className="flex items-center gap-2 p-1.5 bg-surface-3/40 border-b border-white/5 shrink-0 flex-wrap glass sticky top-0 z-20 px-8">
+    <div className="flex items-center gap-2 p-1.5 bg-surface-3/40 border-b border-white/5 shrink-0 flex-wrap sticky top-0 z-20 px-8">
       {tabs.map((t) => (
         <button
           key={t.id}
@@ -263,7 +263,7 @@ export function TabBar({
           className={cn(
             "px-5 py-2 rounded-xl text-xs font-semibold transition-premium flex items-center gap-2",
             active === t.id
-              ? "bg-primary text-primary-foreground shadow-lg"
+              ? "bg-primary text-primary-foreground"
               : "text-muted-foreground hover:text-foreground hover:bg-white/5",
           )}
         >

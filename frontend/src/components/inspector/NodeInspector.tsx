@@ -155,14 +155,11 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
   };
 
   return (
-    <div className="flex flex-col h-full bg-surface-2/80 backdrop-blur-3xl relative border-l border-white/5 shadow-[-20px_0_50px_rgba(0,0,0,0.4)] animate-in slide-in-from-right duration-500">
-      <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-20 pointer-events-none" />
-
+    <div className="flex flex-col h-full bg-surface-2/80 relative border-l border-white/5 animate-in slide-in-from-right duration-500">
       {/* Header */}
       <div className="flex items-center justify-between px-8 py-6 border-b border-white/5 bg-white/[0.02] relative z-10">
         <div className="flex items-center gap-5">
           <div className="w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center relative group overflow-hidden">
-            <div className="absolute inset-0 bg-primary/20 opacity-0 group-hover:opacity-100 transition-premium blur-xl" />
             <Puzzle className="w-6 h-6 text-primary relative z-10" />
           </div>
           <div>
@@ -182,7 +179,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
         <button
           type="button"
           onClick={onClose}
-          className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-premium active:scale-95 shadow-xl"
+          className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-premium active:scale-95"
         >
           <X className="h-5 w-5" />
         </button>
@@ -233,7 +230,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
               <label className="text-xs font-semibold text-muted-foreground/60 ml-1">
                 Node Parameters
               </label>
-              <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 glass-dark shadow-2xl">
+              <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 bg-surface-3 border border-white/10">
                 {isSmartClassifierModule(
                   node.data.moduleName,
                   node.data.configSchema,
@@ -300,7 +297,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                       />
                     </FormField>
 
-                    <div className="flex items-center justify-between p-6 rounded-2xl bg-black/40 border border-white/5 shadow-xl">
+                    <div className="flex items-center justify-between p-6 rounded-2xl bg-black/40 border border-white/5">
                       <div className="space-y-1">
                         <label className="text-xs font-semibold text-white">
                           Continue on error
@@ -324,7 +321,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                       >
                         <div
                           className={cn(
-                            "w-4 h-4 rounded-full transition-premium shadow-lg",
+                            "w-4 h-4 rounded-full transition-premium",
                             node.data.continueOnError
                               ? "bg-primary translate-x-6"
                               : "bg-white/20 translate-x-0",
@@ -402,8 +399,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
         >
           <div className="space-y-10 animate-in fade-in slide-in-from-bottom-2 duration-500">
             {/* Status Panel */}
-            <div className="p-6 rounded-2xl bg-surface-3/40 border border-white/5 shadow-2xl glass-dark relative overflow-hidden group">
-              <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
+            <div className="p-6 rounded-2xl bg-surface-3/40 border border-white/5 bg-surface-3 border border-white/10 relative overflow-hidden group">
               <div className="flex items-center justify-between relative z-10">
                 <div className="flex items-center gap-5">
                   <div
@@ -441,8 +437,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
             </div>
 
             {nodeStatus?.error && (
-              <div className="p-8 rounded-2xl bg-destructive/5 border border-destructive/10 space-y-5 shadow-2xl relative overflow-hidden group">
-                <div className="absolute inset-0 bg-gradient-to-br from-destructive/10 via-transparent to-transparent opacity-50" />
+              <div className="p-8 rounded-2xl bg-destructive/5 border border-destructive/10 space-y-5 relative overflow-hidden group">
                 <div className="flex items-center gap-4 text-destructive relative z-10">
                   <div className="w-10 h-10 rounded-2xl bg-destructive/10 border border-destructive/20 flex items-center justify-center">
                     <AlertCircle className="w-5 h-5" />
@@ -455,7 +450,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                   </p>
                 </div>
                 {fixSuggestion && (
-                  <div className="p-5 bg-warning/5 border border-warning/10 rounded-2xl text-warning relative z-10 flex gap-4 shadow-xl">
+                  <div className="p-5 bg-warning/5 border border-warning/10 rounded-2xl text-warning relative z-10 flex gap-4">
                     <Zap className="w-5 h-5 shrink-0 text-warning animate-pulse" />
                     <div className="space-y-1">
                       <span className="text-2xs font-semibold uppercase tracking-wider opacity-40 block">
@@ -493,14 +488,13 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                         // Clipboard API unavailable
                       }
                     }}
-                    className="w-10 h-10 flex items-center justify-center hover:bg-white/10 rounded-xl border border-white/5 text-muted-foreground/70 hover:text-white transition-premium shadow-xl"
+                    className="w-10 h-10 flex items-center justify-center hover:bg-white/10 rounded-xl border border-white/5 text-muted-foreground/70 hover:text-white transition-premium"
                     title="Copy Payload"
                   >
                     <Copy className="w-4 h-4" />
                   </button>
                 </div>
-                <div className="p-6 bg-black/40 border border-white/5 rounded-2xl shadow-inner relative overflow-hidden group">
-                  <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-20 pointer-events-none" />
+                <div className="p-6 bg-black/40 border border-white/5 rounded-2xl relative overflow-hidden group">
                   <pre className="text-xs text-foreground/70 font-mono overflow-auto max-h-[400px] selection:bg-primary/30 relative z-10 leading-relaxed custom-scrollbar p-2">
                     {JSON.stringify(nodeResult, null, 2)}
                   </pre>
@@ -520,8 +514,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                     Timeline
                   </label>
                 </div>
-                <div className="space-y-4 bg-white/[0.01] p-6 rounded-2xl border border-white/5 shadow-2xl relative overflow-hidden">
-                  <div className="absolute inset-0 bg-gradient-to-tr from-white/[0.01] to-transparent opacity-50 pointer-events-none" />
+                <div className="space-y-4 bg-white/[0.01] p-6 rounded-2xl border border-white/5 relative overflow-hidden">
                   {nodeEvents.map((ev: TimedEvent, idx: number) => (
                     <div
                       key={`${ev.nodeId ?? "global"}-${ev.elapsedMs}-${idx}`}
@@ -551,7 +544,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                           </span>
                         </div>
                         {ev.retryAttempt != null && ev.retryAttempt > 0 && (
-                          <span className="inline-block text-2xs px-3 py-1 rounded-full bg-warning/5 text-warning border border-warning/10 uppercase font-semibold tracking-wider shadow-lg">
+                          <span className="inline-block text-2xs px-3 py-1 rounded-full bg-warning/5 text-warning border border-warning/10 uppercase font-semibold tracking-wider">
                             Retry {ev.retryAttempt}
                           </span>
                         )}

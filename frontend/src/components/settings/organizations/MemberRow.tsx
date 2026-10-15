@@ -25,7 +25,7 @@ export function MemberRow({
   return (
     <div className="flex items-center justify-between p-4 bg-white/[0.02] hover:bg-white/[0.04] border border-white/5 hover:border-white/10 rounded-2xl transition-premium group">
       <div className="flex items-center gap-4">
-        <div className="w-10 h-10 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-white shadow-inner transition-premium">
+        <div className="w-10 h-10 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-white transition-premium">
           {member.userId.charAt(0).toUpperCase()}
         </div>
         <div>

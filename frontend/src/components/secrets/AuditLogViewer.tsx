@@ -71,9 +71,8 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
   return (
     <Dialog open={open} onClose={onClose} title="Security Audit Log">
       <div className="space-y-6">
-        <div className="flex items-center gap-5 p-5 bg-card/60 backdrop-blur-xl rounded-2xl border border-border/80 shadow-inner relative overflow-hidden group">
-          <div className="absolute top-0 right-0 w-32 h-32 bg-primary/5 blur-3xl -mr-16 -mt-16 pointer-events-none group-hover:bg-primary/10 transition-premium" />
-          <div className="w-12 h-12 bg-primary/10 border border-primary/20 rounded-xl flex items-center justify-center shadow-inner transition-transform relative z-10">
+        <div className="flex items-center gap-5 p-5 bg-card/60 rounded-2xl border border-border/80 relative overflow-hidden group">
+          <div className="w-12 h-12 bg-primary/10 border border-primary/20 rounded-xl flex items-center justify-center transition-transform relative z-10">
             <Shield className="w-6 h-6 text-primary" />
           </div>
           <div className="relative z-10">

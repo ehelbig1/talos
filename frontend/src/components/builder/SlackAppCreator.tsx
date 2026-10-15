@@ -129,7 +129,7 @@ export function SlackAppCreator({
 
   return (
     <Dialog open={true} onClose={onCancel} title="Create Slack App">
-      <div className="bg-surface-3/60 rounded-xl max-w-2xl w-11/12 max-h-[90vh] overflow-auto p-8 shadow-xl">
+      <div className="bg-surface-3/60 rounded-xl max-w-2xl w-11/12 max-h-[90vh] overflow-auto p-8">
         {/* Header */}
         <div className="mb-8 text-center">
           <div className="text-4xl mb-4">🚀</div>

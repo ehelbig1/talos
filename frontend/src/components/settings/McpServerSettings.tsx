@@ -135,9 +135,9 @@ export default function McpServerSettings() {
   };
 
   const inputBase =
-    "w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner";
+    "w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium";
   const selectBase =
-    "w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner appearance-none cursor-pointer";
+    "w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer";
 
   return (
     <div className="space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-1000 max-w-7xl mx-auto">
@@ -151,9 +151,7 @@ export default function McpServerSettings() {
         onCancel={() => setRevokeConfirmId(null)}
       />
 
-      <div className="bg-surface-3/30 border border-white/5 rounded-3xl p-10 shadow-2xl backdrop-blur-3xl relative overflow-hidden group/header">
-        <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-50 pointer-events-none transition-premium group-hover/header:opacity-100" />
-
+      <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-10 relative overflow-hidden group/header">
         <div className="flex flex-col md:flex-row items-center justify-between gap-8 relative z-10">
           <div className="flex items-center gap-6">
             <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary transition-premium">
@@ -194,9 +192,7 @@ export default function McpServerSettings() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Left Column: Form & Endpoints */}
         <div className="lg:col-span-1 space-y-8">
-          <div className="bg-surface-3/30 border border-white/5 rounded-3xl p-8 shadow-2xl backdrop-blur-xl relative overflow-hidden group">
-            <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-50" />
-
+          <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-8 relative overflow-hidden group">
             <div className="flex items-center gap-3 mb-8 relative z-10">
               <Shield className="w-4 h-4 text-primary" />
               <h4 className="text-xs font-semibold text-white/70">New agent</h4>
@@ -247,7 +243,7 @@ export default function McpServerSettings() {
                 onClick={handleCreatePlugin}
                 disabled={creating || !pluginName.trim()}
                 variant="premium"
-                className="w-full h-14 rounded-2xl shadow-2xl"
+                className="w-full h-14 rounded-2xl"
               >
                 {creating ? (
                   <div className="flex items-center gap-3">
@@ -264,7 +260,6 @@ export default function McpServerSettings() {
 
               {createdAgent && (
                 <div className="mt-6 p-6 bg-primary/5 border border-primary/20 rounded-2xl space-y-4 animate-in zoom-in-95 duration-500 relative overflow-hidden group/token">
-                  <div className="absolute inset-0 bg-gradient-to-br from-primary/10 to-transparent opacity-50" />
                   <div className="flex items-center gap-3 text-primary relative z-10">
                     <Check className="w-4 h-4" />
                     <span className="text-2xs font-semibold uppercase tracking-wider">
@@ -288,14 +283,14 @@ export default function McpServerSettings() {
             </div>
           </div>
 
-          <div className="bg-surface-3/30 border border-white/5 rounded-3xl p-8 shadow-2xl backdrop-blur-xl relative overflow-hidden">
+          <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-8 relative overflow-hidden">
             <div className="flex items-center gap-3 mb-8">
               <Server className="w-4 h-4 text-primary" />
               <h4 className="text-xs font-semibold text-white/70">Endpoints</h4>
             </div>
 
             <div className="space-y-4">
-              <div className="p-5 bg-black/40 border border-white/5 rounded-2xl space-y-3 shadow-inner group">
+              <div className="p-5 bg-black/40 border border-white/5 rounded-2xl space-y-3 group">
                 <div className="flex items-center justify-between">
                   <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60">
                     Local development
@@ -318,7 +313,7 @@ export default function McpServerSettings() {
                 </button>
               </div>
 
-              <div className="p-5 bg-black/40 border border-white/5 rounded-2xl space-y-3 shadow-inner group">
+              <div className="p-5 bg-black/40 border border-white/5 rounded-2xl space-y-3 group">
                 <div className="flex items-center justify-between">
                   <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60">
                     Production
@@ -347,10 +342,10 @@ export default function McpServerSettings() {
         {/* Right Column: Agents & Instructions */}
         <div className="lg:col-span-2 space-y-8">
           {/* Active Agents */}
-          <div className="bg-surface-3/30 border border-white/5 rounded-3xl p-10 shadow-2xl backdrop-blur-xl relative overflow-hidden min-h-[400px]">
+          <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-10 relative overflow-hidden min-h-[400px]">
             <div className="flex items-center justify-between mb-10">
               <div className="flex items-center gap-4">
-                <div className="w-12 h-12 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary shadow-inner">
+                <div className="w-12 h-12 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary">
                   <Bot size={24} />
                 </div>
                 <div>
@@ -383,7 +378,7 @@ export default function McpServerSettings() {
                   </p>
                 </div>
               ) : agents.length === 0 ? (
-                <div className="col-span-full py-24 flex flex-col items-center justify-center border border-dashed border-white/5 rounded-3xl bg-white/[0.01] group">
+                <div className="col-span-full py-24 flex flex-col items-center justify-center border border-dashed border-white/5 rounded-2xl bg-white/[0.01] group">
                   <Bot className="w-16 h-16 text-muted-foreground/30 mb-6 transition-premium group-hover:text-primary/10" />
                   <p className="text-xs text-muted-foreground/60 font-semibold">
                     No agents yet
@@ -393,10 +388,8 @@ export default function McpServerSettings() {
                 agents.map((agent) => (
                   <div
                     key={agent.id}
-                    className="group bg-white/[0.02] border border-white/5 rounded-2xl p-6 transition-premium hover:bg-white/[0.04] hover:border-white/10 hover:shadow-2xl relative overflow-hidden"
+                    className="group bg-white/[0.02] border border-white/5 rounded-2xl p-6 transition-premium hover:bg-white/[0.04] hover:border-white/10 relative overflow-hidden"
                   >
-                    <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
                     <div className="flex items-start justify-between relative z-10 mb-6">
                       <div className="flex items-center gap-4">
                         <div className="w-10 h-10 bg-surface-4/40 border border-white/5 rounded-xl flex items-center justify-center text-muted-foreground/70 group-hover:text-primary transition-premium">
@@ -485,10 +478,8 @@ export default function McpServerSettings() {
             ].map((inst, idx) => (
               <div
                 key={idx}
-                className="bg-surface-3/30 border border-white/5 rounded-3xl p-8 shadow-2xl backdrop-blur-xl relative overflow-hidden group/guide"
+                className="bg-surface-3/30 border border-white/5 rounded-2xl p-8 relative overflow-hidden group/guide"
               >
-                <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-50" />
-
                 <div className="flex items-center justify-between mb-6 relative z-10">
                   <div className="space-y-1">
                     <h5 className="text-xs font-semibold text-white">
@@ -523,8 +514,7 @@ export default function McpServerSettings() {
         </div>
       </div>
 
-      <div className="bg-surface-3/20 border border-white/5 rounded-3xl p-10 glass-dark relative overflow-hidden group/info">
-        <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30" />
+      <div className="bg-surface-3/20 border border-white/5 rounded-2xl p-10 bg-surface-3 border border-white/10 relative overflow-hidden group/info">
         <div className="flex flex-col md:flex-row items-center gap-10 relative z-10">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-6 flex-1">
             {[

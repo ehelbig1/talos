@@ -65,7 +65,7 @@ function StatCard({
 }: StatCardProps) {
   const Icon = icon as React.ReactElement<{ size?: number }>;
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 glass transition-premium hover-elevation relative overflow-hidden group">
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 transition-premium hover-elevation relative overflow-hidden group">
       <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
         {React.cloneElement(Icon, { size: 48 })}
       </div>
@@ -220,7 +220,7 @@ function ActorBreakdown() {
   ];
 
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 glass h-full">
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-8 h-full">
       <SectionHeader
         icon={<Bot size={16} />}
         title="Actors by status"
@@ -324,7 +324,7 @@ function UpcomingSchedules() {
   const enabledCount = schedules.filter((s) => s.isEnabled).length;
 
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 glass h-full">
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-8 h-full">
       <SectionHeader
         icon={<Calendar size={16} />}
         title="Upcoming schedules"
@@ -418,9 +418,7 @@ function WorkflowHealth() {
   );
 
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 glass relative overflow-hidden group">
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30" />
-
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-8 relative overflow-hidden group">
       <div className="relative z-10">
         <div className="flex items-center justify-between mb-8">
           <SectionHeader

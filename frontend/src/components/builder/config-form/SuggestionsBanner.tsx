@@ -31,7 +31,7 @@ export function SuggestionsBanner({
       className={cn(
         "relative group/suggestions p-6 rounded-2xl border transition-premium overflow-hidden",
         showSuggestions
-          ? "bg-primary/5 border-primary/20 shadow-2xl"
+          ? "bg-primary/5 border-primary/20"
           : "bg-primary/5 border-primary/10 hover:border-primary/30",
       )}
     >
@@ -89,7 +89,7 @@ export function SuggestionsBanner({
           <div className="flex items-center gap-3 pt-4 border-t border-white/5">
             <button
               onClick={onApply}
-              className="px-6 h-9 bg-primary hover:bg-primary/90 text-white text-2xs font-semibold rounded-xl transition-premium shadow-lg"
+              className="px-6 h-9 bg-primary hover:bg-primary/90 text-white text-2xs font-semibold rounded-xl transition-premium"
             >
               Apply Optimization
             </button>

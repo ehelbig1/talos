@@ -233,9 +233,9 @@ function SettingsSidebar({
     : SIDEBAR_CATEGORIES;
 
   return (
-    <aside className="hidden sm:flex w-64 shrink-0 flex-col border-r border-white/5 bg-surface-2/40 backdrop-blur-xl overflow-y-auto custom-scrollbar">
+    <aside className="hidden sm:flex w-64 shrink-0 flex-col border-r border-white/5 bg-surface-2/40 overflow-y-auto custom-scrollbar">
       {/* Search */}
-      <div className="p-4 sticky top-0 bg-surface-2/80 backdrop-blur-xl z-10">
+      <div className="p-4 sticky top-0 bg-surface-2/80 z-10">
         <div className="relative group">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/60 group-focus-within:text-primary transition-premium" />
           <input
@@ -356,7 +356,7 @@ export default function Settings() {
       <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/5 via-background to-background opacity-50" />
 
       {/* Page header */}
-      <header className="shrink-0 px-8 py-6 border-b border-white/5 bg-surface-1/60 backdrop-blur-xl relative z-20">
+      <header className="shrink-0 px-8 py-6 border-b border-white/5 bg-surface-1/60 relative z-20">
         <PageHeader
           title="Settings"
           description="Your account, integrations and security."
@@ -366,9 +366,7 @@ export default function Settings() {
 
       {/* Mobile nav — horizontal scrollable pills, shown only below sm breakpoint */}
       <div className="sm:hidden relative shrink-0 z-20">
-        <div className="absolute left-0 inset-y-0 w-8 bg-gradient-to-r from-background to-transparent z-10 pointer-events-none" />
-        <div className="absolute right-0 inset-y-0 w-8 bg-gradient-to-l from-background to-transparent z-10 pointer-events-none" />
-        <div className="flex gap-2 overflow-x-auto px-8 py-4 border-b border-white/5 bg-surface-2/40 backdrop-blur-xl custom-scrollbar">
+        <div className="flex gap-2 overflow-x-auto px-8 py-4 border-b border-white/5 bg-surface-2/40 custom-scrollbar">
           {ALL_ITEMS.map((item) => {
             const isActive = !item.to && active === item.value;
             const pill = cn(
@@ -520,12 +518,10 @@ export default function Settings() {
               </ErrorBoundary>
             )}
             {active === "account" && (
-              <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-10 glass relative overflow-hidden group">
-                <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
-
+              <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
                 <div className="relative z-10 space-y-10">
                   <div className="flex items-center gap-6">
-                    <div className="w-20 h-20 bg-surface-4/60 border border-white/10 rounded-2xl flex items-center justify-center shadow-2xl relative group/avatar">
+                    <div className="w-20 h-20 bg-surface-4/60 border border-white/10 rounded-2xl flex items-center justify-center relative group/avatar">
                       <div className="absolute inset-0 bg-primary/10 rounded-2xl scale-0 transition-transform duration-500" />
                       <UserIcon className="w-10 h-10 text-primary relative z-10" />
                     </div>
@@ -557,7 +553,6 @@ export default function Settings() {
                     </div>
 
                     <div className="bg-warning/5 border border-warning/10 rounded-2xl p-8 flex items-start gap-6 relative overflow-hidden">
-                      <div className="absolute inset-0 bg-gradient-to-br from-warning/10 to-transparent opacity-50" />
                       <div className="p-4 bg-warning/10 rounded-2xl text-warning relative z-10 border border-warning/20">
                         <LockIcon className="w-6 h-6" />
                       </div>

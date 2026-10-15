@@ -105,10 +105,10 @@ export function CompilationStatus() {
         <div
           key={job.jobId}
           className={cn(
-            "p-6 rounded-2xl border shadow-2xl glass-dark flex flex-col gap-4 relative overflow-hidden transition-premium",
+            "p-6 rounded-2xl border bg-surface-3 flex flex-col gap-4 relative overflow-hidden transition-premium",
             job.status === "failed"
               ? "border-destructive/20 bg-destructive/5"
-              : "border-white/5 bg-surface-2/40 shadow-black/40",
+              : "border-white/5",
           )}
         >
           {/* Animated Background Gradient for Active Jobs */}

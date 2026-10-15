@@ -23,7 +23,7 @@ export function renderField(
   isValid?: boolean,
 ) {
   const baseClassName = cn(
-    "w-full px-4 h-12 bg-surface-2 border border-white/5 rounded-xl text-sm font-semibold text-white placeholder-white/10 outline-none transition-premium shadow-inner",
+    "w-full px-4 h-12 bg-surface-2 border border-white/5 rounded-xl text-sm font-semibold text-white placeholder-white/10 outline-none transition-premium",
     isValid === false &&
       "border-destructive/40 ring-1 ring-destructive/20 bg-destructive/5 text-destructive",
     isValid === true &&
@@ -172,7 +172,7 @@ export function renderField(
                     className={cn(
                       "p-4 rounded-2xl border text-left transition-premium group/preset relative overflow-hidden",
                       isSelected
-                        ? "bg-primary/10 border-primary shadow-xl"
+                        ? "bg-primary/10 border-primary"
                         : "bg-surface-2 border-white/5 hover:border-white/20 hover:bg-surface-3",
                     )}
                   >

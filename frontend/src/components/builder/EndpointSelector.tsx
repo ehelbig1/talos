@@ -153,8 +153,7 @@ export function EndpointSelector({
 
   if (!selectedEndpoint) {
     return (
-      <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-8 space-y-6 shadow-2xl animate-in zoom-in-95 duration-500 relative overflow-hidden">
-        <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50 pointer-events-none" />
+      <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-8 space-y-6 animate-in zoom-in-95 duration-500 relative overflow-hidden">
         <div className="flex items-center gap-3 relative z-10 mb-2">
           <div className="p-1.5 rounded-lg bg-primary/10 text-primary">
             <Target className="h-4 w-4" />
@@ -168,7 +167,7 @@ export function EndpointSelector({
             <button
               key={`${endpoint.method}-${endpoint.path}`}
               onClick={() => handleSelectEndpoint(endpoint)}
-              className="p-5 bg-surface-3/60 hover:bg-surface-4 border border-white/5 hover:border-primary/40 rounded-2xl text-left transition-premium group shadow-lg active:scale-[0.98]"
+              className="p-5 bg-surface-3/60 hover:bg-surface-4 border border-white/5 hover:border-primary/40 rounded-2xl text-left transition-premium group active:scale-[0.98]"
             >
               <div className="flex items-center gap-4 mb-3">
                 <span
@@ -209,16 +208,14 @@ export function EndpointSelector({
     pathParameters.length + queryParameters.length + headerParameters.length;
 
   return (
-    <div className="bg-surface-2/60 border border-primary/20 rounded-3xl p-8 space-y-10 shadow-2xl animate-in zoom-in-95 duration-500 relative overflow-hidden">
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50 pointer-events-none" />
-
+    <div className="bg-surface-2/60 border border-primary/20 rounded-2xl p-8 space-y-10 animate-in zoom-in-95 duration-500 relative overflow-hidden">
       <div className="relative z-10">
         <div className="flex justify-between items-start mb-6">
           <div className="space-y-4">
             <div className="flex items-center gap-4">
               <span
                 className={cn(
-                  "px-3 py-1.5 rounded-xl text-xs font-semibold border shadow-lg",
+                  "px-3 py-1.5 rounded-xl text-xs font-semibold border",
                   getMethodStyles(selectedEndpoint.method),
                 )}
               >
@@ -413,14 +410,13 @@ export function EndpointSelector({
                       placeholder={String(
                         prop.example || prop.default || `Enter ${key}...`,
                       ).toUpperCase()}
-                      className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium shadow-inner"
+                      className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium"
                     />
                   </div>
                 ))}
               </div>
             ) : (
               <div className="relative group">
-                <div className="absolute -inset-1 bg-primary/10 rounded-3xl blur opacity-50 group-focus-within:opacity-100 transition-premium" />
                 <textarea
                   value={JSON.stringify(bodyData, null, 2)}
                   onChange={(e) => {
@@ -432,7 +428,7 @@ export function EndpointSelector({
                   }}
                   placeholder='{ "PAYLOAD": "METADATA" }'
                   rows={10}
-                  className="relative w-full p-6 bg-surface-4 border border-white/5 rounded-2xl text-xs font-mono text-primary placeholder-primary/20 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium outline-none shadow-2xl custom-scrollbar"
+                  className="relative w-full p-6 bg-surface-4 border border-white/5 rounded-2xl text-xs font-mono text-primary placeholder-primary/20 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium outline-none custom-scrollbar"
                 />
               </div>
             )}
@@ -444,7 +440,7 @@ export function EndpointSelector({
       <div className="relative z-10 flex gap-4 pt-10 border-t border-white/5">
         <Button
           onClick={handleApplyConfiguration}
-          className="flex-1 h-14 bg-primary hover:bg-primary/90 text-white text-sm font-semibold rounded-2xl transition-premium shadow-2xl active:scale-95 flex items-center justify-center gap-3"
+          className="flex-1 h-14 bg-primary hover:bg-primary/90 text-white text-sm font-semibold rounded-2xl transition-premium active:scale-95 flex items-center justify-center gap-3"
         >
           <Zap className="h-4 w-4" /> Finalize Configuration
         </Button>
@@ -514,7 +510,7 @@ function ParameterInput({
             `IDENTIFIER VALUE...`,
         ).toUpperCase()}
         required={parameter.required}
-        className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium shadow-inner"
+        className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium"
       />
     </div>
   );
@@ -522,13 +518,11 @@ function ParameterInput({
 
 function getMethodStyles(method: string): string {
   const styles: Record<string, string> = {
-    GET: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20 shadow-[0_0_15px_rgba(16,185,129,0.1)]",
-    POST: "bg-primary/10 text-primary border-primary/20 shadow-[0_0_15px_rgba(99,102,241,0.1)]",
-    PUT: "bg-amber-500/10 text-amber-400 border-amber-500/20 shadow-[0_0_15px_rgba(245,158,11,0.1)]",
-    PATCH:
-      "bg-fuchsia-500/10 text-fuchsia-400 border-fuchsia-500/20 shadow-[0_0_15px_rgba(168,85,247,0.1)]",
-    DELETE:
-      "bg-destructive/10 text-destructive border-destructive/20 shadow-[0_0_15px_rgba(239,68,68,0.1)]",
+    GET: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+    POST: "bg-primary/10 text-primary border-primary/20",
+    PUT: "bg-amber-500/10 text-amber-400 border-amber-500/20",
+    PATCH: "bg-fuchsia-500/10 text-fuchsia-400 border-fuchsia-500/20",
+    DELETE: "bg-destructive/10 text-destructive border-destructive/20",
   };
   return styles[method] || "bg-white/5 text-muted-foreground border-white/10";
 }

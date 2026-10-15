@@ -149,7 +149,7 @@ export function ResourceQuotas() {
 
   if (isLoading) {
     return (
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl animate-pulse">
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
         <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {[1, 2, 3, 4].map((i) => (
@@ -164,9 +164,7 @@ export function ResourceQuotas() {
   }
 
   return (
-    <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl relative overflow-hidden group">
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
       <div className="flex items-center justify-between mb-10 relative z-10">
         <div className="flex items-center gap-5">
           <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-premium">
@@ -198,7 +196,7 @@ export function ResourceQuotas() {
               <button
                 onClick={handleSave}
                 disabled={isUpdating}
-                className="flex items-center gap-3 px-8 py-3 bg-primary hover:bg-primary/90 text-black rounded-2xl text-sm font-semibold transition-premium shadow-xl disabled:opacity-50"
+                className="flex items-center gap-3 px-8 py-3 bg-primary hover:bg-primary/90 text-black rounded-2xl text-sm font-semibold transition-premium disabled:opacity-50"
               >
                 <Save className="w-4 h-4" />
                 {isUpdating ? "Saving…" : "Save limits"}
@@ -230,11 +228,9 @@ export function ResourceQuotas() {
                   : "border-white/5 hover:border-white/10",
               )}
             >
-              <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-0 group-hover/item:opacity-100 transition-premium pointer-events-none" />
-
               <div className="flex items-center justify-between mb-8 relative z-10">
                 <div className="flex items-center gap-5">
-                  <div className="w-12 h-12 bg-white/5 border border-white/10 rounded-xl flex items-center justify-center transition-premium shadow-inner">
+                  <div className="w-12 h-12 bg-white/5 border border-white/10 rounded-xl flex items-center justify-center transition-premium">
                     <Icon
                       className={cn(
                         "w-6 h-6",
@@ -277,7 +273,7 @@ export function ResourceQuotas() {
                           [item.key]: e.target.value,
                         }))
                       }
-                      className="w-full h-14 px-6 bg-black/60 border border-white/5 rounded-2xl text-xl font-semibold text-white focus:outline-none focus:ring-4 focus:ring-primary/10 transition-premium font-mono shadow-inner pr-24"
+                      className="w-full h-14 px-6 bg-black/60 border border-white/5 rounded-2xl text-xl font-semibold text-white focus:outline-none focus:ring-4 focus:ring-primary/10 transition-premium font-mono pr-24"
                       min="0"
                     />
                     <div className="absolute right-6 top-1/2 -translate-y-1/2 text-xs font-semibold text-muted-foreground/70 pointer-events-none">

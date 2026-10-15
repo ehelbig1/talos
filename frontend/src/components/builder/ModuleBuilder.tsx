@@ -199,7 +199,7 @@ export function ModuleBuilder({
             <p className="text-xs font-semibold">Loading template…</p>
           </div>
         ) : templateError ? (
-          <div className="p-8 bg-destructive/10 border border-destructive/20 rounded-3xl text-destructive animate-in shake duration-500 shadow-2xl glass-dark">
+          <div className="p-8 bg-destructive/10 border border-destructive/20 rounded-2xl text-destructive animate-in shake duration-500 bg-surface-3 border border-white/10">
             <div className="flex items-start gap-4">
               <Shield className="w-6 h-6 shrink-0" />
               <div className="space-y-1">
@@ -230,7 +230,6 @@ export function ModuleBuilder({
           <div className="space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
             {/* Template Identity */}
             <div className="flex items-center gap-6 pb-8 border-b border-white/5 relative">
-              <div className="absolute -inset-x-8 -top-8 h-32 bg-gradient-to-b from-primary/5 to-transparent pointer-events-none" />
               <Button
                 variant="ghost"
                 size="icon"
@@ -241,10 +240,9 @@ export function ModuleBuilder({
                 <ArrowLeft className="h-4 w-4 text-muted-foreground/70" />
               </Button>
               <div className="flex items-center gap-4 relative z-10">
-                <div className="flex items-center justify-center w-16 h-16 bg-surface-3/60 border border-white/10 rounded-2xl shadow-2xl relative">
-                  <div className="absolute -inset-2 bg-primary/10 rounded-full blur-xl opacity-50" />
+                <div className="flex items-center justify-center w-16 h-16 bg-surface-3/60 border border-white/10 rounded-2xl relative">
                   {selectedTemplate.icon ? (
-                    <span className="text-4xl filter drop-shadow-[0_0_8px_rgba(0,0,0,0.5)] relative z-10">
+                    <span className="text-4xl relative z-10">
                       {selectedTemplate.icon}
                     </span>
                   ) : (
@@ -272,13 +270,12 @@ export function ModuleBuilder({
                   </label>
                 </div>
                 <div className="relative group">
-                  <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
                   <DarkInput
                     type="text"
                     value={moduleName}
                     onChange={(e) => setModuleName(e.target.value)}
                     placeholder="e.g. data-extractor"
-                    className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10 shadow-inner"
+                    className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10"
                   />
                 </div>
               </div>
@@ -296,8 +293,7 @@ export function ModuleBuilder({
                 )}
 
               {selectedTemplate.configSchema && (
-                <div className="bg-surface-2/40 border border-white/5 rounded-3xl p-10 space-y-6 shadow-2xl relative overflow-hidden glass-dark">
-                  <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50 pointer-events-none" />
+                <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-10 space-y-6 relative overflow-hidden bg-surface-3 border border-white/10">
                   <div className="flex items-center gap-3 relative z-10 mb-6">
                     <Database className="w-4 h-4 text-primary" />
                     <h3 className="text-xs font-semibold text-white">
@@ -320,8 +316,7 @@ export function ModuleBuilder({
 
               {isWebhookTemplate && (
                 <div className="relative group/webhook">
-                  <div className="absolute -inset-0.5 bg-indigo-500/10 rounded-3xl blur opacity-50 pointer-events-none" />
-                  <div className="relative p-10 bg-surface-2/40 border border-white/5 rounded-3xl space-y-10 shadow-2xl glass-dark">
+                  <div className="relative p-10 bg-surface-2/40 border border-white/5 rounded-2xl space-y-10 bg-surface-3 border border-white/10">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-3">
                         <Webhook className="h-5 w-5 text-indigo-400" />
@@ -352,7 +347,7 @@ export function ModuleBuilder({
                             }
                             min="1"
                             max="1000"
-                            className="h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-sm font-semibold rounded-2xl shadow-inner"
+                            className="h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-sm font-semibold rounded-2xl"
                           />
                           <span className="absolute right-5 top-1/2 -translate-y-1/2 text-2xs font-semibold text-muted-foreground/50 uppercase tracking-tighter">
                             RPM
@@ -374,7 +369,7 @@ export function ModuleBuilder({
                             value={ipInput}
                             onChange={(e) => setIpInput(e.target.value)}
                             placeholder="0.0.0.0"
-                            className="flex-1 h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-sm font-semibold rounded-2xl shadow-inner"
+                            className="flex-1 h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-sm font-semibold rounded-2xl"
                             onKeyDown={(e) => {
                               if (e.key === "Enter" && ipInput.trim()) {
                                 setWebhookSettings({
@@ -402,7 +397,7 @@ export function ModuleBuilder({
                                 setIpInput("");
                               }
                             }}
-                            className="h-14 px-6 bg-indigo-500 hover:bg-indigo-400 text-white border-none rounded-2xl active:scale-95 transition-premium shadow-xl"
+                            className="h-14 px-6 bg-indigo-500 hover:bg-indigo-400 text-white border-none rounded-2xl active:scale-95 transition-premium"
                           >
                             Add
                           </Button>
@@ -412,7 +407,7 @@ export function ModuleBuilder({
                             {webhookSettings.allowedIps.map((ip, index) => (
                               <span
                                 key={ip}
-                                className="px-4 py-2 bg-surface-3/80 border border-white/10 rounded-xl text-2xs font-semibold uppercase tracking-wider flex items-center gap-3 text-indigo-400 shadow-xl animate-in zoom-in-95 duration-200"
+                                className="px-4 py-2 bg-surface-3/80 border border-white/10 rounded-xl text-2xs font-semibold uppercase tracking-wider flex items-center gap-3 text-indigo-400 animate-in zoom-in-95 duration-200"
                               >
                                 {ip}
                                 <button
@@ -463,7 +458,7 @@ export function ModuleBuilder({
                 disabled={!moduleName || createModuleMutation.isPending}
                 className={cn(
                   "h-14 px-12 text-sm font-semibold transition-premium active:scale-[0.98] rounded-2xl",
-                  "bg-primary hover:bg-primary/90 text-white border-none shadow-2xl",
+                  "bg-primary hover:bg-primary/90 text-white border-none",
                   (!moduleName || createModuleMutation.isPending) &&
                     "opacity-50 grayscale cursor-not-allowed",
                 )}
@@ -480,7 +475,7 @@ export function ModuleBuilder({
             </div>
 
             {createModuleMutation.isError && (
-              <div className="p-6 bg-destructive/10 border border-destructive/20 rounded-3xl text-destructive text-xs font-semibold text-center shadow-2xl animate-in shake duration-500 glass-dark">
+              <div className="p-6 bg-destructive/10 border border-destructive/20 rounded-2xl text-destructive text-xs font-semibold text-center animate-in shake duration-500 bg-surface-3 border border-white/10">
                 Critical Deployment Failure:{" "}
                 {sanitizeErrorMessage(
                   createModuleMutation.error instanceof Error
@@ -543,8 +538,7 @@ function WebhookSuccessView({
   return (
     <div className="space-y-10 animate-in fade-in slide-in-from-bottom-8 duration-1000">
       <div className="text-center relative">
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-48 h-48 bg-success/10 rounded-full blur-[80px]" />
-        <div className="inline-flex items-center justify-center w-24 h-24 rounded-3xl bg-success/10 border border-success/20 mb-10 relative z-10">
+        <div className="inline-flex items-center justify-center w-24 h-24 rounded-2xl bg-success/10 border border-success/20 mb-10 relative z-10">
           <CheckCircle className="h-12 w-12 text-success" />
         </div>
         <h2 className="text-4xl font-semibold text-white tracking-tight font-outfit leading-none mb-4 relative z-10">
@@ -555,8 +549,7 @@ function WebhookSuccessView({
         </p>
       </div>
 
-      <div className="bg-surface-2/40 border border-white/5 rounded-3xl p-10 space-y-8 shadow-2xl relative overflow-hidden glass-dark">
-        <div className="absolute inset-0 bg-gradient-to-br from-success/5 via-transparent to-transparent opacity-50 pointer-events-none" />
+      <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-10 space-y-8 relative overflow-hidden bg-surface-3 border border-white/10">
         <CopyField
           label="Ingress Endpoint URL"
           value={webhookUrl}
@@ -566,7 +559,7 @@ function WebhookSuccessView({
       </div>
 
       {isSlackWebhook ? (
-        <div className="bg-surface-2/40 border border-white/5 rounded-3xl p-12 relative overflow-hidden shadow-2xl glass-dark">
+        <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-12 relative overflow-hidden bg-surface-3 border border-white/10">
           <div className="flex items-center gap-4 mb-10">
             <Webhook className="w-6 h-6 text-indigo-400" />
             <h3 className="text-xs font-semibold text-white">
@@ -588,7 +581,7 @@ function WebhookSuccessView({
               },
             ].map((step, idx) => (
               <li key={idx} className="flex gap-6 items-start group">
-                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-premium shadow-lg">
+                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-premium">
                   {idx + 1}
                 </span>
                 <p className="text-sm font-bold text-muted-foreground/60 leading-relaxed pt-1 group-hover:text-white transition-premium">
@@ -609,9 +602,9 @@ function WebhookSuccessView({
           </ol>
         </div>
       ) : (
-        <div className="bg-surface-2/40 border border-white/5 rounded-3xl p-12 relative overflow-hidden shadow-2xl glass-dark">
+        <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-12 relative overflow-hidden bg-surface-3 border border-white/10">
           <div className="flex items-center gap-4 mb-10">
-            <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20 shadow-lg">
+            <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20">
               <Zap className="w-6 h-6 text-primary" />
             </div>
             <h3 className="text-xs font-semibold text-white">
@@ -626,7 +619,7 @@ function WebhookSuccessView({
               "Send a test request to confirm it arrives",
             ].map((step, idx) => (
               <li key={idx} className="flex gap-6 items-start group">
-                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-premium shadow-lg">
+                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-premium">
                   {idx + 1}
                 </span>
                 <p className="text-sm font-bold text-muted-foreground/60 leading-relaxed pt-1 group-hover:text-white transition-premium">
@@ -638,8 +631,8 @@ function WebhookSuccessView({
         </div>
       )}
 
-      <div className="p-8 bg-warning/5 border border-warning/20 rounded-3xl flex items-start gap-5 glass-light">
-        <div className="shrink-0 p-3 rounded-2xl bg-warning/10 border border-warning/20 shadow-lg">
+      <div className="p-8 bg-warning/5 border border-warning/20 rounded-2xl flex items-start gap-5 bg-white/[0.03] border border-white/5">
+        <div className="shrink-0 p-3 rounded-2xl bg-warning/10 border border-warning/20">
           <Shield className="w-5 h-5 text-warning" />
         </div>
         <p className="text-xs text-warning leading-relaxed">
@@ -651,7 +644,7 @@ function WebhookSuccessView({
       <Button
         type="button"
         onClick={onClose}
-        className="w-full h-16 bg-success hover:bg-success/90 text-white text-sm font-semibold rounded-2xl transition-premium shadow-2xl active:scale-[0.98]"
+        className="w-full h-16 bg-success hover:bg-success/90 text-white text-sm font-semibold rounded-2xl transition-premium active:scale-[0.98]"
       >
         Acknowledge Deployment
       </Button>

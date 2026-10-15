@@ -163,7 +163,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
           aria-label={`${displayName} node. Status: ${status}. ${configCount} configured fields.`}
           className={cn(
             "relative border-l-[4px] outline-none transition-premium duration-500",
-            "bg-surface-3/40 backdrop-blur-2xl border-y border-r border-white/5 px-5 py-4 min-w-[220px] shadow-2xl glass",
+            "bg-surface-3/40 backdrop-blur-2xl border-y border-r border-white/5 px-5 py-4 min-w-[220px]",
             dragging && "transition-none",
             "group active:scale-[0.98] hover:-translate-y-2 hover:bg-surface-3/60",
             systemStyle ? "rounded-2xl" : "rounded-2xl",

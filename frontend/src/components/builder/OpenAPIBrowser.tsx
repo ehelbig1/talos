@@ -80,7 +80,7 @@ export function OpenAPIBrowser({
           className={cn(
             "h-10 px-6 text-sm font-semibold rounded-xl transition-premium active:scale-95",
             baseUrl
-              ? "bg-primary hover:bg-primary/90 text-white shadow-lg"
+              ? "bg-primary hover:bg-primary/90 text-white"
               : "bg-surface-3 text-muted-foreground/70 grayscale",
           )}
         >
@@ -119,9 +119,7 @@ export function OpenAPIBrowser({
   }
 
   return (
-    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-3xl space-y-8 shadow-2xl animate-in zoom-in-95 duration-500">
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50 pointer-events-none" />
-
+    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-2xl space-y-8 animate-in zoom-in-95 duration-500">
       <div className="flex items-center justify-between relative z-10">
         <div className="flex items-center gap-3">
           <div className="p-2 rounded-xl bg-primary/10 border border-primary/20">

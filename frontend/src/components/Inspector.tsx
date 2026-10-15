@@ -138,10 +138,8 @@ function Inspector() {
         <Tabs
           value={activeTab}
           onValueChange={handleTabChange}
-          className="flex flex-col h-full bg-surface-1/60 backdrop-blur-3xl relative"
+          className="flex flex-col h-full bg-surface-1/60 relative"
         >
-          <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-
           <TabsList className="w-full justify-start rounded-none border-b border-white/5 bg-surface-2/40 px-4 gap-2 shrink-0 relative z-10">
             <TabsTrigger
               value="inspector"
@@ -172,8 +170,7 @@ function Inspector() {
           </TabsContent>
         </Tabs>
       ) : (
-        <div className="flex flex-col h-full bg-surface-1/60 backdrop-blur-3xl relative">
-          <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
+        <div className="flex flex-col h-full bg-surface-1/60 relative">
           {/* min-h-0 so the inspector's inner scroll area (overflow-auto) is
               bounded and scrolls instead of overflowing the sidebar. */}
           <div className="flex-1 min-h-0 relative z-10">{content}</div>

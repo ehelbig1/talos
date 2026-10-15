@@ -90,8 +90,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
                 Expression
               </label>
             </div>
-            <div className="bg-surface-4/60 p-6 rounded-2xl border border-white/5 font-mono text-xs text-primary/80 break-all leading-relaxed shadow-inner glass-light relative overflow-hidden">
-              <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
+            <div className="bg-surface-4/60 p-6 rounded-2xl border border-white/5 font-mono text-xs text-primary/80 break-all leading-relaxed bg-white/[0.03] border border-white/5 relative overflow-hidden">
               <div className="relative z-10">
                 {script || (
                   <span className="text-muted-foreground/50 italic font-semibold">
@@ -111,12 +110,11 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
                 </label>
               </div>
               <div className="relative group">
-                <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
                 <Textarea
                   value={mockContext}
                   onChange={(e) => setMockContext(e.target.value)}
                   rows={6}
-                  className="font-mono text-sm bg-surface-4/60 border-white/5 focus:ring-primary/20 focus:border-primary/40 rounded-2xl p-6 text-white shadow-inner resize-none relative z-10"
+                  className="font-mono text-sm bg-surface-4/60 border-white/5 focus:ring-primary/20 focus:border-primary/40 rounded-2xl p-6 text-white resize-none relative z-10"
                   placeholder='{ "items": [1, 2, 3] }'
                 />
               </div>
@@ -126,7 +124,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
               onClick={handleTest}
               disabled={loading || !script}
               variant="premium"
-              className="w-full h-16 rounded-2xl shadow-2xl"
+              className="w-full h-16 rounded-2xl"
             >
               {loading ? (
                 <div className="flex items-center gap-4">
@@ -145,20 +143,12 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
           {result && (
             <div
               className={cn(
-                "p-8 rounded-3xl border text-xs font-mono overflow-hidden animate-in slide-in-from-top-4 duration-500 shadow-2xl relative glass",
+                "p-8 rounded-2xl border text-xs font-mono overflow-hidden animate-in slide-in-from-top-4 duration-500 relative",
                 result.success
                   ? "bg-success/5 border-success/20 text-success"
                   : "bg-destructive/5 border-destructive/20 text-destructive",
               )}
             >
-              <div
-                className={cn(
-                  "absolute inset-0 bg-gradient-to-br opacity-10",
-                  result.success
-                    ? "from-success via-transparent"
-                    : "from-destructive via-transparent",
-                )}
-              />
               {result.success ? (
                 <div className="relative z-10">
                   <div className="flex items-center gap-3 mb-6">
@@ -169,7 +159,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
                       Execution Successful
                     </div>
                   </div>
-                  <pre className="whitespace-pre-wrap leading-relaxed font-bold bg-black/20 p-6 rounded-2xl shadow-inner border border-white/5">
+                  <pre className="whitespace-pre-wrap leading-relaxed font-bold bg-black/20 p-6 rounded-2xl border border-white/5">
                     {result.output}
                   </pre>
                 </div>
@@ -183,7 +173,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
                       Critical Evaluation Failure
                     </div>
                   </div>
-                  <div className="whitespace-pre-wrap leading-relaxed font-bold bg-black/20 p-6 rounded-2xl shadow-inner border border-white/5">
+                  <div className="whitespace-pre-wrap leading-relaxed font-bold bg-black/20 p-6 rounded-2xl border border-white/5">
                     {sanitizeErrorMessage(result.error ?? "")}
                   </div>
                 </div>
@@ -196,7 +186,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
           <Button
             variant="ghost"
             onClick={handleClose}
-            className="h-14 px-12 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95 shadow-xl"
+            className="h-14 px-12 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
           >
             Close Diagnostics
           </Button>

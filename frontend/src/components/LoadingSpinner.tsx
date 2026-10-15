@@ -20,7 +20,6 @@ export const LoadingSpinner: React.FC<LoadingSpinnerProps> = ({
     {...props}
   >
     <div className="relative">
-      <div className="absolute inset-0 bg-primary/20 rounded-full blur-xl animate-status-pulse" />
       <svg
         className="animate-spin h-10 w-10 text-primary relative z-10 icon-glow"
         xmlns="http://www.w3.org/2000/svg"

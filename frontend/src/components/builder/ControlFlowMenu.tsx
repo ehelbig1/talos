@@ -161,11 +161,10 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
 
       {isOpen && (
         <div
-          className="absolute top-full left-0 mt-2 z-50 glass-dark rounded-2xl py-2 min-w-[240px] overflow-hidden animate-in fade-in slide-in-from-top-2 duration-300 origin-top-left"
+          className="absolute top-full left-0 mt-2 z-50 bg-surface-3 border border-white/10 rounded-2xl py-2 min-w-[240px] overflow-hidden animate-in fade-in slide-in-from-top-2 duration-300 origin-top-left"
           role="menu"
           aria-label="Control flow nodes"
         >
-          <div className="absolute inset-0 bg-gradient-to-br from-cyan-500/10 via-transparent to-transparent opacity-30 pointer-events-none" />
           <div className="relative z-10 px-3 py-1.5 mb-1.5 border-b border-white/5">
             <span className="text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider">
               Logic Primitives

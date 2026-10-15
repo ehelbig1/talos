@@ -83,11 +83,9 @@ function AddScheduleDialog({
   return (
     <Dialog open={open} onClose={onClose}>
       <div
-        className="bg-surface-3/95 backdrop-blur-3xl border border-white/10 shadow-[0_0_80px_rgba(0,0,0,0.6)] rounded-3xl overflow-hidden w-[560px] animate-in zoom-in-95 fade-in duration-300 relative"
+        className="bg-surface-3/95 border border-white/10 rounded-2xl overflow-hidden w-[560px] animate-in zoom-in-95 fade-in duration-300 relative"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="absolute inset-0 bg-gradient-to-br from-amber-500/10 via-transparent to-transparent opacity-50 pointer-events-none" />
-
         {/* Header */}
         <div className="px-10 py-8 border-b border-white/5 flex items-center justify-between bg-white/[0.02] relative z-10">
           <div className="flex items-center gap-4">
@@ -124,7 +122,7 @@ function AddScheduleDialog({
               <select
                 value={workflowId}
                 onChange={(e) => setWorkflowId(e.target.value)}
-                className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white focus:outline-none focus:border-amber-500/40 focus:ring-4 focus:ring-amber-500/10 transition-premium shadow-inner appearance-none cursor-pointer"
+                className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white focus:outline-none focus:border-amber-500/40 focus:ring-4 focus:ring-amber-500/10 transition-premium appearance-none cursor-pointer"
               >
                 <option value="" disabled className="bg-surface-3">
                   Select a workflow…
@@ -164,7 +162,7 @@ function AddScheduleDialog({
                   className={cn(
                     "px-4 py-2 rounded-xl border text-2xs font-semibold transition-premium active:scale-95",
                     cron === ex.value
-                      ? "bg-amber-500/10 border-amber-500/30 text-amber-400 shadow-lg shadow-amber-500/5"
+                      ? "bg-amber-500/10 border-amber-500/30 text-amber-400 shadow-amber-500/5"
                       : "bg-white/5 border-white/5 text-muted-foreground/70 hover:border-white/10 hover:text-white",
                   )}
                 >
@@ -207,7 +205,7 @@ function AddScheduleDialog({
             onClick={handleSubmit}
             disabled={createMutation.isPending || !isValid}
             variant="premium"
-            className="px-10 h-14 shadow-2xl"
+            className="px-10 h-14"
           >
             {createMutation.isPending ? "Creating…" : "Create schedule"}
           </Button>
@@ -359,14 +357,12 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
             : "border-white/5 opacity-60 hover:opacity-100",
         )}
       >
-        <div className="absolute inset-0 bg-gradient-to-r from-amber-500/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
         <div className="flex items-start justify-between gap-6 relative z-10">
           {/* Left: workflow name + cron */}
           <div className="flex items-start gap-6 min-w-0">
             <div
               className={cn(
-                "w-14 h-14 rounded-2xl flex items-center justify-center border shrink-0 shadow-2xl transition-premium",
+                "w-14 h-14 rounded-2xl flex items-center justify-center border shrink-0 transition-premium",
                 schedule.isEnabled
                   ? "bg-amber-500/10 border-amber-500/20 text-amber-500"
                   : "bg-white/5 border-white/5 text-muted-foreground/60",
@@ -410,7 +406,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
               onClick={handleToggle}
               disabled={toggleMutation.isPending}
               className={cn(
-                "w-11 h-11 flex items-center justify-center rounded-2xl border transition-premium active:scale-90 shadow-xl",
+                "w-11 h-11 flex items-center justify-center rounded-2xl border transition-premium active:scale-90",
                 schedule.isEnabled
                   ? "bg-amber-500/10 border-amber-500/20 text-amber-400 hover:bg-amber-500/20"
                   : "bg-white/5 border-white/5 text-muted-foreground/60 hover:text-white hover:bg-white/10",
@@ -429,7 +425,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
               type="button"
               onClick={() => setEditing((v) => !v)}
               className={cn(
-                "w-11 h-11 flex items-center justify-center rounded-2xl border transition-premium active:scale-90 shadow-xl",
+                "w-11 h-11 flex items-center justify-center rounded-2xl border transition-premium active:scale-90",
                 editing
                   ? "bg-white/10 border-white/20 text-white"
                   : "bg-white/5 border-white/5 text-muted-foreground/70 hover:text-white hover:bg-white/10",
@@ -441,7 +437,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
             <button
               type="button"
               onClick={() => setConfirmDelete(true)}
-              className="w-11 h-11 flex items-center justify-center rounded-2xl border bg-white/5 border-white/5 text-muted-foreground/60 hover:text-destructive hover:border-destructive/30 hover:bg-destructive/10 transition-premium active:scale-90 shadow-xl"
+              className="w-11 h-11 flex items-center justify-center rounded-2xl border bg-white/5 border-white/5 text-muted-foreground/60 hover:text-destructive hover:border-destructive/30 hover:bg-destructive/10 transition-premium active:scale-90"
             >
               <Trash2 size={16} />
             </button>
@@ -525,7 +521,6 @@ export default function SchedulesManager() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-6">
           <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center text-amber-500 relative">
-            <div className="absolute inset-0 bg-amber-500/5 rounded-full blur-xl animate-pulse" />
             <Clock size={32} className="relative z-10" />
           </div>
           <div>
@@ -543,7 +538,7 @@ export default function SchedulesManager() {
         <Button
           onClick={() => setShowAdd(true)}
           variant="premium"
-          className="h-14 px-8 shadow-2xl"
+          className="h-14 px-8"
         >
           <Plus className="w-5 h-5 mr-2" />
           New schedule
@@ -553,14 +548,14 @@ export default function SchedulesManager() {
       {/* Content */}
       {schedulesLoading ? (
         <div className="flex flex-col items-center justify-center py-32 gap-6">
-          <div className="w-16 h-16 border-4 border-amber-500/10 border-t-amber-500 rounded-full animate-spin shadow-2xl" />
+          <div className="w-16 h-16 border-4 border-amber-500/10 border-t-amber-500 rounded-full animate-spin" />
           <p className="text-xs text-muted-foreground/70 font-semibold animate-status-pulse">
             Synchronizing Time-Stream...
           </p>
         </div>
       ) : schedules.length === 0 ? (
-        <div className="bg-surface-3/20 backdrop-blur-3xl border border-white/5 rounded-3xl p-24 glass-dark text-center flex flex-col items-center">
-          <div className="w-24 h-24 rounded-3xl bg-white/[0.02] border border-white/5 flex items-center justify-center text-muted-foreground/30 mb-8 shadow-2xl">
+        <div className="bg-surface-3/20 border border-white/5 rounded-2xl p-24 bg-surface-3 border border-white/10 text-center flex flex-col items-center">
+          <div className="w-24 h-24 rounded-2xl bg-white/[0.02] border border-white/5 flex items-center justify-center text-muted-foreground/30 mb-8">
             <Calendar size={48} />
           </div>
           <h3 className="text-2xl font-semibold text-white tracking-tight mb-4">
@@ -596,8 +591,6 @@ export default function SchedulesManager() {
       {/* Summary strip */}
       {schedules.length > 0 && (
         <div className="flex items-center gap-10 px-10 py-6 bg-surface-3/40 border border-white/5 rounded-2xl relative overflow-hidden group">
-          <div className="absolute inset-0 bg-gradient-to-r from-amber-500/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-
           <div className="flex items-center gap-3 relative z-10">
             <div className="w-2 h-2 rounded-full bg-amber-500" />
             <span className="text-xs text-muted-foreground/70 font-semibold">

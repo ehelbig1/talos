@@ -69,14 +69,12 @@ export function ServiceCard({
   return (
     <div
       data-provider-id={providerId}
-      className="bg-surface-3/30 border border-white/5 rounded-2xl p-6 transition-premium hover:border-white/10 hover:shadow-2xl group relative overflow-hidden flex flex-col h-full"
+      className="bg-surface-3/30 border border-white/5 rounded-2xl p-6 transition-premium hover:border-white/10 group relative overflow-hidden flex flex-col h-full"
     >
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
       <div className="flex items-start justify-between mb-8 relative z-10">
         <div className="flex items-center gap-5">
           <div
-            className="w-14 h-14 rounded-2xl flex items-center justify-center text-white shadow-2xl transition-premium group-hover:rotate-3"
+            className="w-14 h-14 rounded-2xl flex items-center justify-center text-white transition-premium group-hover:rotate-3"
             style={{
               background: `linear-gradient(135deg, ${color}, ${color}dd)`,
               boxShadow: `0 10px 25px -5px ${color}44`,
@@ -138,7 +136,7 @@ export function ServiceCard({
           serviceIntegrations.map((i) => (
             <div
               key={i.id}
-              className="bg-black/20 border border-white/5 rounded-2xl px-5 py-4 flex items-center justify-between group/item hover:bg-black/40 transition-premium shadow-inner"
+              className="bg-black/20 border border-white/5 rounded-2xl px-5 py-4 flex items-center justify-between group/item hover:bg-black/40 transition-premium"
             >
               <div className="flex flex-col">
                 <span className="text-xs font-semibold text-white/80 tracking-tight">

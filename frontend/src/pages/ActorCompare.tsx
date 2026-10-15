@@ -64,8 +64,6 @@ export default function ActorCompare() {
   return (
     <div className="min-h-screen bg-background text-white relative overflow-hidden font-inter">
       {/* Ambient background glows */}
-      <div className="absolute top-[-10%] right-[-10%] w-[50%] h-[50%] bg-primary/5 rounded-full blur-[120px]" />
-      <div className="absolute bottom-[-5%] left-[-5%] w-[40%] h-[40%] bg-violet-500/5 rounded-full blur-[100px]" />
 
       <div className="max-w-7xl mx-auto px-8 py-10 space-y-12 relative z-10">
         <PageHeader
@@ -133,7 +131,6 @@ export default function ActorCompare() {
         {lanes.length === 0 && (
           <div className="flex flex-col items-center justify-center py-20 gap-8 text-center animate-in fade-in duration-1000">
             <div className="relative">
-              <div className="absolute -inset-10 bg-primary/5 rounded-full blur-3xl animate-pulse" />
               <GitCompare className="w-24 h-24 text-white/5 relative z-10" />
             </div>
             <div className="space-y-3 relative z-10">

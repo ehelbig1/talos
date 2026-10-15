@@ -160,12 +160,12 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
     return (
       <Dialog open={true} onClose={onClose} title="Create module from template">
         <div className="space-y-8">
-          <div className="relative overflow-hidden p-6 bg-primary/5 border border-white/5 rounded-3xl shadow-inner glass-light">
+          <div className="relative overflow-hidden p-6 bg-primary/5 border border-white/5 rounded-2xl bg-white/[0.03] border border-white/5">
             <div className="absolute top-0 right-0 p-4 opacity-10">
               <Sparkles className="w-12 h-12 text-primary" />
             </div>
             <div className="flex items-start gap-4 relative z-10">
-              <div className="shrink-0 w-10 h-10 rounded-xl bg-primary/20 border border-primary/30 flex items-center justify-center shadow-lg">
+              <div className="shrink-0 w-10 h-10 rounded-xl bg-primary/20 border border-primary/30 flex items-center justify-center">
                 <Package className="w-5 h-5 text-primary" />
               </div>
               <div className="space-y-1">
@@ -183,7 +183,6 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
           {/* Search and Filter Bar */}
           <div className="flex items-center gap-4">
             <div className="relative flex-1 group">
-              <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
               <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/70 group-focus-within:text-primary transition-premium" />
               <DarkInput
                 type="text"
@@ -192,7 +191,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   setSearchQuery(e.target.value)
                 }
-                className="pl-11 h-12 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10 shadow-inner"
+                className="pl-11 h-12 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10"
               />
             </div>
             <div className="relative group">
@@ -202,7 +201,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                 onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
                   setSelectedCategory(e.target.value)
                 }
-                className="pl-10 pr-10 h-12 w-48 bg-surface-2/40 border-white/5 text-sm font-semibold rounded-2xl appearance-none relative z-10 shadow-inner"
+                className="pl-10 pr-10 h-12 w-48 bg-surface-2/40 border-white/5 text-sm font-semibold rounded-2xl appearance-none relative z-10"
               >
                 {categories.map((cat) => (
                   <option key={cat} value={cat}>
@@ -221,7 +220,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                 <p className="text-xs font-semibold">Loading…</p>
               </div>
             ) : filteredTemplates.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-20 px-8 text-center border-2 border-dashed border-white/5 rounded-3xl bg-surface-1/20 grayscale opacity-20">
+              <div className="flex flex-col items-center justify-center py-20 px-8 text-center border-2 border-dashed border-white/5 rounded-2xl bg-surface-1/20 grayscale opacity-20">
                 <Search className="w-12 h-12 text-muted-foreground/70 mb-4" />
                 <p className="text-xs font-semibold text-muted-foreground">
                   No templates match your search
@@ -233,18 +232,15 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                   <button
                     key={template.id}
                     onClick={() => setSelectedTemplateId(template.id)}
-                    className="group relative bg-surface-2/40 border border-white/5 hover:border-primary/40 hover:bg-surface-2/60 rounded-2xl p-6 text-left transition-premium hover:scale-[1.02] shadow-lg active:scale-95 overflow-hidden"
+                    className="group relative bg-surface-2/40 border border-white/5 hover:border-primary/40 hover:bg-surface-2/60 rounded-2xl p-6 text-left transition-premium hover:scale-[1.02] active:scale-95 overflow-hidden"
                   >
-                    <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-                    <div className="absolute top-6 right-6 p-2 rounded-xl bg-surface-4/60 border border-white/5 opacity-0 group-hover:opacity-100 transition-premium shadow-xl">
+                    <div className="absolute top-6 right-6 p-2 rounded-xl bg-surface-4/60 border border-white/5 opacity-0 group-hover:opacity-100 transition-premium">
                       <Sparkles className="w-4 h-4 text-primary" />
                     </div>
                     <div className="flex items-start gap-4 mb-5">
-                      <div className="flex items-center justify-center w-14 h-14 bg-surface-3 border border-white/10 rounded-2xl group-hover:border-primary/20 transition-premium shadow-2xl">
+                      <div className="flex items-center justify-center w-14 h-14 bg-surface-3 border border-white/10 rounded-2xl group-hover:border-primary/20 transition-premium">
                         {template.icon ? (
-                          <span className="text-3xl filter drop-shadow-[0_0_8px_rgba(0,0,0,0.5)]">
-                            {template.icon}
-                          </span>
+                          <span className="text-3xl">{template.icon}</span>
                         ) : (
                           <Package className="w-6 h-6 text-primary" />
                         )}
@@ -306,7 +302,6 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
       <div className="space-y-8">
         {/* Header with back button */}
         <div className="flex items-center gap-6 pb-6 border-b border-white/5 relative">
-          <div className="absolute -inset-x-8 -top-8 h-32 bg-gradient-to-b from-primary/5 to-transparent pointer-events-none" />
           <Button
             variant="ghost"
             size="icon"
@@ -318,10 +313,9 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
           </Button>
           <div className="flex-1 min-w-0 relative z-10">
             <div className="flex items-center gap-4">
-              <div className="flex items-center justify-center w-14 h-14 bg-surface-3/60 border border-white/10 rounded-2xl shadow-2xl relative">
-                <div className="absolute -inset-2 bg-primary/10 rounded-full blur-xl opacity-50" />
+              <div className="flex items-center justify-center w-14 h-14 bg-surface-3/60 border border-white/10 rounded-2xl relative">
                 {selectedTemplate?.icon ? (
-                  <span className="text-4xl relative z-10 filter drop-shadow-[0_0_8px_rgba(0,0,0,0.5)]">
+                  <span className="text-4xl relative z-10">
                     {selectedTemplate.icon}
                   </span>
                 ) : (
@@ -353,7 +347,6 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
               </Label>
             </div>
             <div className="relative group">
-              <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
               <DarkInput
                 id="module-name"
                 value={moduleName}
@@ -361,7 +354,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                   setModuleName(e.target.value)
                 }
                 placeholder="e.g. notify-dispatcher"
-                className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10 shadow-inner"
+                className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10"
               />
             </div>
             <p className="px-2 text-2xs text-muted-foreground/70 leading-relaxed">
@@ -372,8 +365,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
 
           {/* Configuration Form */}
           {selectedTemplate && (
-            <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-8 space-y-6 shadow-2xl relative overflow-hidden glass-dark">
-              <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50 pointer-events-none" />
+            <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-8 space-y-6 relative overflow-hidden bg-surface-3 border border-white/10">
               <div className="flex items-center justify-between relative z-10">
                 <div className="flex items-center gap-3">
                   <Database className="w-4 h-4 text-primary" />
@@ -424,7 +416,6 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
             className={cn(
               "h-12 px-10 text-sm font-semibold transition-premium active:scale-[0.98] rounded-2xl",
               "bg-primary hover:bg-primary/90 text-white border-none",
-              "shadow-2xl",
               (creating || !moduleName) &&
                 "opacity-50 grayscale cursor-not-allowed",
             )}

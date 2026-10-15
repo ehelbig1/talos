@@ -74,7 +74,7 @@ export default function AuditSettings() {
 
   if (isLoading)
     return (
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl animate-pulse">
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
         <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
         <div className="space-y-6">
           <div className="h-32 bg-white/[0.02] border border-white/5 rounded-2xl" />
@@ -111,9 +111,7 @@ export default function AuditSettings() {
         </div>
       </div>
 
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl relative overflow-hidden group">
-        <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
         <div className="relative z-10">
           <p className="text-sm text-muted-foreground/70 leading-relaxed mb-10 max-w-2xl">
             Stream signed run logs to your existing SIEM over OpenTelemetry.
@@ -125,7 +123,7 @@ export default function AuditSettings() {
               <div className="flex items-center gap-6">
                 <div
                   className={cn(
-                    "w-14 h-14 rounded-2xl flex items-center justify-center transition-premium shadow-2xl",
+                    "w-14 h-14 rounded-2xl flex items-center justify-center transition-premium",
                     enabled
                       ? "bg-success/10 border border-success/20 text-success"
                       : "bg-white/5 border border-white/10 text-muted-foreground/50",
@@ -156,7 +154,7 @@ export default function AuditSettings() {
               >
                 <span
                   className={cn(
-                    "inline-block h-6 w-6 transform rounded-full bg-white transition-transform shadow-lg",
+                    "inline-block h-6 w-6 transform rounded-full bg-white transition-transform",
                     enabled ? "translate-x-7" : "translate-x-1",
                   )}
                 />
@@ -175,7 +173,7 @@ export default function AuditSettings() {
                       value={endpoint}
                       onChange={(e) => setEndpoint(e.target.value)}
                       placeholder="https://otel-collector.internal:4317"
-                      className="h-14 bg-black/40 border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/50 focus:ring-primary/20 transition-premium shadow-inner"
+                      className="h-14 bg-black/40 border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/50 focus:ring-primary/20 transition-premium"
                     />
                   </div>
 
@@ -188,7 +186,7 @@ export default function AuditSettings() {
                       <select
                         value={protocol}
                         onChange={(e) => setProtocol(e.target.value)}
-                        className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white focus:outline-none focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer hover:bg-black/60 shadow-inner"
+                        className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white focus:outline-none focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer hover:bg-black/60"
                       >
                         {/* MCP-866 (2026-05-14): only gRPC is wired through
                             talos-audit-ledger today. HTTP/Protobuf was offered
@@ -213,7 +211,7 @@ export default function AuditSettings() {
                     value={headers}
                     onChange={(e) => setHeaders(e.target.value)}
                     placeholder='{ "Authorization": "Bearer ...", "x-team-id": "..." }'
-                    className="bg-black/40 border-white/5 text-white placeholder:text-muted-foreground/50 rounded-2xl min-h-[120px] font-mono text-xs resize-none focus:ring-primary/20 transition-premium border-dashed shadow-inner p-6"
+                    className="bg-black/40 border-white/5 text-white placeholder:text-muted-foreground/50 rounded-2xl min-h-[120px] font-mono text-xs resize-none focus:ring-primary/20 transition-premium border-dashed p-6"
                   />
                   <div className="flex items-center gap-3 px-1 mt-2">
                     <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
@@ -231,7 +229,7 @@ export default function AuditSettings() {
               onClick={handleSave}
               disabled={saving}
               variant="premium"
-              className="h-16 px-12 rounded-2xl shadow-2xl"
+              className="h-16 px-12 rounded-2xl"
             >
               {saving ? (
                 <div className="flex items-center gap-3">
@@ -255,8 +253,8 @@ export default function AuditSettings() {
       </div>
 
       {/* Info Box */}
-      <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 flex items-start gap-6 hover:border-white/10 transition-premium group">
-        <div className="w-14 h-14 bg-primary/5 border border-primary/10 rounded-2xl flex items-center justify-center shrink-0 group-hover:bg-primary/10 transition-premium shadow-inner">
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-8 flex items-start gap-6 hover:border-white/10 transition-premium group">
+        <div className="w-14 h-14 bg-primary/5 border border-primary/10 rounded-2xl flex items-center justify-center shrink-0 group-hover:bg-primary/10 transition-premium">
           <Database className="w-7 h-7 text-primary" />
         </div>
         <div className="space-y-2">

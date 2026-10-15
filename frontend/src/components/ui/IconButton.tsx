@@ -3,7 +3,7 @@ import { cn } from "@/lib/utils";
 
 /**
  * Common, themed icon button with consistent hover and focus states.
- * Uses glassmorphic surface tokens for consistent theming.
+ * Uses the shared surface tokens for consistent theming.
  */
 export const IconButton: React.FC<{
   onClick?: (e: React.MouseEvent) => void;

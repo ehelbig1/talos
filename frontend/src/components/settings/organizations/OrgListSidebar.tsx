@@ -46,7 +46,7 @@ export function OrgListSidebar({
             >
               <div
                 className={cn(
-                  "w-12 h-12 rounded-xl flex items-center justify-center text-xl font-semibold font-outfit shadow-2xl transition-premium",
+                  "w-12 h-12 rounded-xl flex items-center justify-center text-xl font-semibold font-outfit transition-premium",
                   selectedOrgId === org.id
                     ? "bg-primary text-white"
                     : "bg-white/5 text-muted-foreground/60",

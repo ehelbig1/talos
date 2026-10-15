@@ -170,7 +170,7 @@ function NodeTraceCard({
               </p>
               <pre
                 className={cn(
-                  "text-xs font-mono border rounded-2xl p-5 overflow-x-auto max-h-48 whitespace-pre-wrap shadow-inner leading-relaxed",
+                  "text-xs font-mono border rounded-2xl p-5 overflow-x-auto max-h-48 whitespace-pre-wrap leading-relaxed",
                   trace.status === "failed"
                     ? "text-destructive/80 bg-destructive/10 border-destructive/20 font-bold"
                     : "text-foreground/60 bg-surface-4/60 border-white/5",
@@ -185,7 +185,7 @@ function NodeTraceCard({
               <p className="text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider ml-1">
                 Egress Result
               </p>
-              <pre className="text-xs font-mono text-primary/60 bg-primary/5 border border-primary/10 rounded-2xl p-5 overflow-x-auto max-h-64 whitespace-pre-wrap shadow-inner leading-relaxed">
+              <pre className="text-xs font-mono text-primary/60 bg-primary/5 border border-primary/10 rounded-2xl p-5 overflow-x-auto max-h-64 whitespace-pre-wrap leading-relaxed">
                 {trace.output}
               </pre>
             </div>
@@ -388,7 +388,7 @@ export function TestWorkflowModal({
         </div>
 
         {/* Mock inputs */}
-        <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-8 space-y-6 shadow-inner glass-light">
+        <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-8 space-y-6 bg-white/[0.03] border border-white/5">
           <div className="flex items-center justify-between">
             <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
               Synthetic Trigger Ingress (JSON)
@@ -405,7 +405,7 @@ export function TestWorkflowModal({
             rows={4}
             spellCheck={false}
             className={cn(
-              "w-full bg-surface-3/40 border focus:outline-none focus:ring-1 rounded-2xl px-6 py-5 text-sm font-mono text-foreground placeholder:text-muted-foreground/50 resize-none transition-premium shadow-inner",
+              "w-full bg-surface-3/40 border focus:outline-none focus:ring-1 rounded-2xl px-6 py-5 text-sm font-mono text-foreground placeholder:text-muted-foreground/50 resize-none transition-premium",
               jsonError
                 ? "border-destructive/40 focus:border-destructive focus:ring-destructive/20"
                 : "border-white/5 focus:border-primary/40 focus:ring-primary/20",
@@ -422,7 +422,7 @@ export function TestWorkflowModal({
             <Button
               onClick={handleRun}
               disabled={!!jsonError || testMutation.isPending || isRunning}
-              className="bg-primary hover:bg-primary/90 text-white font-semibold px-10 h-14 rounded-2xl shadow-2xl transition-premium flex items-center gap-3 text-sm border border-white/10 shrink-0"
+              className="bg-primary hover:bg-primary/90 text-white font-semibold px-10 h-14 rounded-2xl transition-premium flex items-center gap-3 text-sm border border-white/10 shrink-0"
             >
               {testMutation.isPending || isRunning ? (
                 <>
@@ -440,10 +440,10 @@ export function TestWorkflowModal({
         </div>
 
         {/* Results */}
-        <div className="max-h-[460px] overflow-y-auto custom-scrollbar border border-white/5 rounded-2xl bg-surface-4/20 shadow-inner">
+        <div className="max-h-[460px] overflow-y-auto custom-scrollbar border border-white/5 rounded-2xl bg-surface-4/20">
           {phase === "idle" && !testMutation.isPending && (
             <div className="flex flex-col items-center justify-center py-24 text-center px-6 opacity-20">
-              <div className="w-16 h-16 rounded-2xl bg-surface-3 border border-white/5 flex items-center justify-center mb-6 shadow-2xl">
+              <div className="w-16 h-16 rounded-2xl bg-surface-3 border border-white/5 flex items-center justify-center mb-6">
                 <Terminal size={32} className="text-muted-foreground" />
               </div>
               <p className="text-xs font-semibold text-muted-foreground">
@@ -458,7 +458,7 @@ export function TestWorkflowModal({
               <div className="flex items-center gap-4 flex-wrap">
                 <div
                   className={cn(
-                    "flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-semibold shadow-lg",
+                    "flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-semibold",
                     phase === "completed"
                       ? "bg-success/10 text-success border-success/20"
                       : phase === "failed"
@@ -480,7 +480,7 @@ export function TestWorkflowModal({
                   {isTerminal ? phase : "running"}
                 </div>
                 {elapsedMs != null && (
-                  <div className="flex items-center gap-2 px-4 py-2 rounded-xl border border-white/5 bg-white/[0.02] text-xs text-muted-foreground font-semibold shadow-lg">
+                  <div className="flex items-center gap-2 px-4 py-2 rounded-xl border border-white/5 bg-white/[0.02] text-xs text-muted-foreground font-semibold">
                     <Clock className="w-3.5 h-3.5 opacity-40" />
                     {elapsedMs}ms
                   </div>
@@ -504,7 +504,7 @@ export function TestWorkflowModal({
                         </span>
                       )}
                     </div>
-                    <div className="h-1 w-full bg-white/5 rounded-full overflow-hidden flex shadow-inner">
+                    <div className="h-1 w-full bg-white/5 rounded-full overflow-hidden flex">
                       <div
                         className="bg-success h-full transition-premium"
                         style={{ width: `${(succeeded / traceTotal) * 100}%` }}
@@ -520,7 +520,7 @@ export function TestWorkflowModal({
 
               {/* Global error */}
               {runError && (
-                <div className="bg-destructive/5 border border-destructive/20 rounded-2xl p-6 flex items-start gap-4 shadow-2xl glass-light">
+                <div className="bg-destructive/5 border border-destructive/20 rounded-2xl p-6 flex items-start gap-4 bg-white/[0.03] border border-white/5">
                   <Activity className="w-5 h-5 text-destructive shrink-0 mt-0.5" />
                   <div className="space-y-2">
                     <p className="text-xs font-semibold text-destructive">

@@ -196,15 +196,13 @@ export default function OAuthManager() {
           return (
             <div
               key={provider.id}
-              className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 p-8 rounded-3xl group hover:border-white/10 hover:bg-surface-3/60 transition-premium relative overflow-hidden shadow-2xl"
+              className="bg-surface-3/40 border border-white/5 p-8 rounded-2xl group hover:border-white/10 hover:bg-surface-3/60 transition-premium relative overflow-hidden"
             >
-              <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-8 relative z-10">
                 <div className="flex items-start gap-6">
                   <div
                     className={cn(
-                      "w-16 h-16 rounded-2xl flex items-center justify-center border shadow-2xl shrink-0 transition-premium group-hover:rotate-3",
+                      "w-16 h-16 rounded-2xl flex items-center justify-center border shrink-0 transition-premium group-hover:rotate-3",
                       provider.bg,
                       provider.border,
                       linkedAccount
@@ -264,7 +262,7 @@ export default function OAuthManager() {
                   {linkedAccount ? (
                     <Button
                       variant="outline"
-                      className="h-12 px-6 border-white/10 text-muted-foreground/60 hover:text-destructive hover:bg-destructive/10 hover:border-destructive/30 text-sm font-semibold rounded-xl transition-premium active:scale-95 shadow-xl"
+                      className="h-12 px-6 border-white/10 text-muted-foreground/60 hover:text-destructive hover:bg-destructive/10 hover:border-destructive/30 text-sm font-semibold rounded-xl transition-premium active:scale-95"
                       onClick={() => handleUnlink(provider.id)}
                       disabled={unlinkMutation.isPending}
                     >
@@ -294,7 +292,7 @@ export default function OAuthManager() {
                   {linkedAccount && (
                     <button
                       type="button"
-                      className="h-12 w-12 flex items-center justify-center text-muted-foreground/50 hover:text-primary hover:bg-primary/10 rounded-xl transition-premium border border-white/5 hover:border-primary/20 shadow-xl"
+                      className="h-12 w-12 flex items-center justify-center text-muted-foreground/50 hover:text-primary hover:bg-primary/10 rounded-xl transition-premium border border-white/5 hover:border-primary/20"
                       title="Access provider dashboard"
                     >
                       <ExternalLink className="w-5 h-5" />
@@ -307,9 +305,8 @@ export default function OAuthManager() {
         })}
       </div>
 
-      <div className="bg-primary/5 border border-white/5 rounded-3xl p-8 flex items-start gap-8 hover:border-white/10 transition-premium group relative overflow-hidden">
-        <div className="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 transition-premium blur-3xl pointer-events-none" />
-        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center shrink-0 transition-premium shadow-inner relative z-10">
+      <div className="bg-primary/5 border border-white/5 rounded-2xl p-8 flex items-start gap-8 hover:border-white/10 transition-premium group relative overflow-hidden">
+        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center shrink-0 transition-premium relative z-10">
           <Shield className="w-8 h-8 text-primary" />
         </div>
         <div className="space-y-2 relative z-10">

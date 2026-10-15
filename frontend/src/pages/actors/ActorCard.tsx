@@ -81,7 +81,7 @@ export function ActorCard({
   return (
     <div
       className={cn(
-        "group relative flex flex-col gap-6 p-7 rounded-3xl bg-surface-3/40 border border-white/10 backdrop-blur-3xl transition-premium hover:border-primary/20 hover:scale-[1.02] active:scale-[0.98] shadow-2xl overflow-hidden glass gpu",
+        "group relative flex flex-col gap-6 p-7 rounded-2xl bg-surface-3/40 border border-white/10 transition-premium hover:border-primary/20 hover:scale-[1.02] active:scale-[0.98] overflow-hidden",
         compareMode && selectedForCompare && "ring-2 ring-primary",
         isTerminated && "opacity-60 grayscale-[0.5]",
       )}
@@ -106,7 +106,7 @@ export function ActorCard({
             e.stopPropagation();
             onToggleCompare();
           }}
-          className="absolute top-6 right-6 z-10 p-2.5 rounded-2xl bg-surface-4/80 border border-white/10 text-primary transition-premium active:scale-90 shadow-2xl backdrop-blur-md"
+          className="absolute top-6 right-6 z-10 p-2.5 rounded-2xl bg-surface-4/80 border border-white/10 text-primary transition-premium active:scale-90"
         >
           {selectedForCompare ? (
             <CheckSquare className="w-6 h-6" />
@@ -117,7 +117,6 @@ export function ActorCard({
       )}
 
       {/* Decorative Glow */}
-      <div className="absolute -top-16 -right-16 w-32 h-32 bg-primary/5 blur-[50px] group-hover:bg-primary/10 transition-premium" />
 
       {/* Header */}
       <div className="flex items-start justify-between gap-5 relative z-10">
@@ -152,8 +151,7 @@ export function ActorCard({
             className={cn(
               "w-2 h-2 rounded-full",
               colors.dot,
-              actor.status === "active" &&
-                "animate-status-pulse shadow-[0_0_8px_currentColor]",
+              actor.status === "active" && "animate-status-pulse",
             )}
           />
           {actor.status}
@@ -187,7 +185,7 @@ export function ActorCard({
         ].map((s) => (
           <div
             key={s.label}
-            className="bg-surface-4/40 border border-white/5 rounded-2xl p-4 text-center transition-premium hover:bg-surface-4/60 hover:border-white/20 glass-light group/m shadow-sm"
+            className="bg-surface-4/40 border border-white/5 rounded-2xl p-4 text-center transition-premium hover:bg-surface-4/60 hover:border-white/20 bg-white/[0.03] border border-white/5 group/m shadow-sm"
           >
             <div className="flex items-center justify-center gap-2 mb-2 opacity-30 group-hover/m:opacity-100 transition-premium">
               <s.icon className={cn("w-3 h-3 transition-colors", s.accent)} />
@@ -217,7 +215,7 @@ export function ActorCard({
                   e.stopPropagation();
                   onQuickRun();
                 }}
-                className="w-10 h-10 flex items-center justify-center rounded-xl bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 hover:border-primary/40 transition-premium shadow-xl active:scale-90"
+                className="w-10 h-10 flex items-center justify-center rounded-xl bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 hover:border-primary/40 transition-premium active:scale-90"
                 title="Execute Manual Cycle"
               >
                 <Play className="w-4.5 h-4.5" fill="currentColor" />
@@ -232,7 +230,7 @@ export function ActorCard({
                 onClone();
               }}
               disabled={isCloning}
-              className="w-10 h-10 flex items-center justify-center rounded-xl bg-surface-4/60 text-muted-foreground/70 border border-white/5 hover:text-white hover:bg-surface-4 hover:border-white/20 transition-premium active:scale-95 disabled:opacity-30 shadow-xl glass-light"
+              className="w-10 h-10 flex items-center justify-center rounded-xl bg-surface-4/60 text-muted-foreground/70 border border-white/5 hover:text-white hover:bg-surface-4 hover:border-white/20 transition-premium active:scale-95 disabled:opacity-30 bg-white/[0.03] border border-white/5"
               title="Duplicate actor"
             >
               <Copy className="w-4 h-4" />
@@ -245,7 +243,7 @@ export function ActorCard({
               }}
               disabled={isToggling}
               className={cn(
-                "h-10 px-5 rounded-xl text-sm font-semibold border transition-premium active:scale-95 disabled:opacity-30 shadow-xl",
+                "h-10 px-5 rounded-xl text-sm font-semibold border transition-premium active:scale-95 disabled:opacity-30",
                 actor.status === "active"
                   ? "bg-warning/5 text-warning/80 border-warning/20 hover:bg-warning/10 hover:border-warning/40"
                   : "bg-success/5 text-success/80 border-success/20 hover:bg-success/10 hover:border-success/40",

@@ -28,7 +28,6 @@ export function CapabilityBadge({
         visuals.color,
       )}
     >
-      <div className="absolute inset-0 bg-gradient-to-r from-primary/10 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium" />
       <visuals.icon className="w-3.5 h-3.5 relative z-10" />
       <span className="relative z-10">{visuals.label}</span>
       {importedInterfaces && importedInterfaces.length > 0 && (
@@ -61,9 +60,7 @@ export function LlmConfigSection({
     "w-full px-4 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
 
   return (
-    <div className="p-6 bg-surface-3/40 border border-white/5 rounded-3xl space-y-6 shadow-2xl relative overflow-hidden group">
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-20 pointer-events-none" />
-
+    <div className="p-6 bg-surface-3/40 border border-white/5 rounded-2xl space-y-6 relative overflow-hidden group">
       <div className="flex items-center justify-between relative z-10">
         <h4 className="text-xs font-semibold text-white flex items-center gap-3 font-outfit">
           <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20 transition-premium">
@@ -192,7 +189,6 @@ export function LlmConfigSection({
             System prompt
           </label>
           <div className="relative group/directive">
-            <div className="absolute -inset-0.5 bg-primary/10 rounded-2xl blur opacity-0 group-hover/directive:opacity-100 transition-premium" />
             <textarea
               rows={4}
               className="relative w-full px-5 py-4 text-xs font-medium bg-black/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:outline-none transition-premium resize-none font-sans leading-relaxed selection:bg-primary/30 placeholder:text-muted-foreground/50"
@@ -279,7 +275,6 @@ export function RetryPolicySection({
           Condition Logic (Rhai)
         </label>
         <div className="relative group/logic">
-          <div className="absolute -inset-1 bg-primary/5 rounded-3xl blur opacity-20 group-hover/logic:opacity-40 transition-premium" />
           <textarea
             placeholder="ctx.last_error.code == 503"
             className="relative w-full px-6 py-5 bg-black/40 border border-white/5 font-mono text-xs min-h-[140px] transition-premium rounded-2xl selection:bg-primary/30 leading-relaxed focus:outline-none focus:border-primary/40"
@@ -317,7 +312,7 @@ export function RetryPolicySection({
                   },
                 });
               }}
-              className="text-2xs font-semibold px-4 py-2 bg-white/5 hover:bg-primary/10 border border-white/5 rounded-xl text-muted-foreground/70 hover:text-primary transition-premium shadow-lg active:scale-95"
+              className="text-2xs font-semibold px-4 py-2 bg-white/5 hover:bg-primary/10 border border-white/5 rounded-xl text-muted-foreground/70 hover:text-primary transition-premium active:scale-95"
             >
               {snippet.label}
             </button>
@@ -372,9 +367,8 @@ export function SystemInternalsSection({
         <button
           type="button"
           onClick={onDelete}
-          className="w-full py-4 rounded-2xl border border-destructive/20 bg-destructive/5 text-destructive text-sm font-semibold hover:bg-destructive/10 hover:border-destructive/40 transition-premium shadow-2xl active:scale-[0.98] group overflow-hidden relative"
+          className="w-full py-4 rounded-2xl border border-destructive/20 bg-destructive/5 text-destructive text-sm font-semibold hover:bg-destructive/10 hover:border-destructive/40 transition-premium active:scale-[0.98] group overflow-hidden relative"
         >
-          <div className="absolute inset-0 bg-gradient-to-r from-destructive/10 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium" />
           <span className="relative z-10">Delete node</span>
         </button>
       </div>
