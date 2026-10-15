@@ -2680,14 +2680,15 @@ impl ModuleRepository {
     ///
     /// # Why an app-layer predicate and not a tenant-scoped transaction
     ///
-    /// RLS cannot express this boundary. `modules_tenant_isolation` keys on
-    /// `org_id` and permits unconditionally when `app.current_org_ids` is
-    /// unset, catalog rows are `org_id IS NULL` (permitted by a dedicated
-    /// arm), and the application role carries `rolbypassrls`. Even a correct
-    /// `begin_org_scoped` transaction would let one member read another
-    /// member's private module. This is a USER boundary; RLS enforces an ORG
-    /// one. Same conclusion `ml_registry_tenancy_tests` records for the
-    /// serving path.
+    /// RLS does not express this boundary on the path this runs on: the
+    /// statement runs on the bare pool, where row security is bypassed. Since
+    /// 2026-10-15 `modules_tenant_isolation` is user-keyed (the caller's own
+    /// rows, the caller's orgs' rows, and catalog rows with neither key —
+    /// `20261015130000`), but an org arm would still show one member another
+    /// member's org-shared module, and this resolver must answer "the
+    /// caller's own module, else the catalog's" — a USER boundary with an
+    /// order, which the predicate below states. Same conclusion
+    /// `ml_registry_tenancy_tests` records for the serving path.
     ///
     /// # Why the ORDER BY
     ///

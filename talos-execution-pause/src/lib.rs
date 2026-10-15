@@ -115,6 +115,7 @@ pub async fn set_execution_paused<'e, E: PgExecutor<'e>>(
 /// replaced; a pause of an already-paused deployment is still recorded — it
 /// is an operator's act on deployment-wide state — with `changed: false`.
 /// Returns the state that was replaced.
+// allow-unbound-user-id: deployment-wide setting; `user_id` is the operator recorded in admin_event_log, not a tenant filter
 pub async fn set_execution_paused_recorded(
     pool: &sqlx::PgPool,
     paused: bool,

@@ -9818,7 +9818,7 @@ fi
 
 echo
 
-bold "▶ check 104: a repository function that takes user_id binds it"
+bold "▶ check 104: a data-access function that takes user_id binds it"
 
 # The defect class "a tenant bind a lint cannot see": a repository method
 # takes the caller's `user_id`, runs SQL, and never binds it, and every test
@@ -9834,10 +9834,21 @@ bold "▶ check 104: a repository function that takes user_id binds it"
 # positives. Limit: textual — a bind under another name needs the marker, a
 # "passed on" callee is not proved to bind, and a NEUTERED bind
 # (`OR $n IS NULL`) is bound and therefore not seen.
+# Tightened 2026-10-15 (security review round 2, D2-5): the scope is every
+# crate whose manifest depends on `sqlx` (468 files, was 34); a bind must name
+# THE PARAMETER (`.bind(user_id)`, `.bind(&user_id)`, `.bind(Some(user_id))`,
+# or a `query!`-family macro argument) — `.bind(ctx.user_id)` no longer
+# passes; and "passing it on" counts only into a named scoping helper
+# (`begin_user_scoped`, `begin_tenant_read_scoped`, `TenantReadScope::new`,
+# `OrgScope::new`, …) or into another function held to this rule — not into
+# any call. Measured on main @ 7e267e5f: 2 hits, both deployment-wide
+# operator acts that record their actor (marked with that reason); 0 false
+# positives once the macro rule was added (8 before it). `--self-test` runs in
+# `make test-scripts`.
 CK104_RC=0
 CK104_OUT="$(cd "$ROOT" && python3 scripts/lint-unbound-user-id.py . 2>&1)" || CK104_RC=$?
 if [ "$CK104_RC" -eq 0 ]; then
-    green "✓ every repository function that takes user_id binds it ($(echo "$CK104_OUT" | tail -1))"
+    green "✓ every data-access function that takes user_id binds it ($(echo "$CK104_OUT" | tail -1))"
 else
     echo "$CK104_OUT" | sed 's/^/  /'
     red "✗ a repository function takes user_id and binds it nowhere"

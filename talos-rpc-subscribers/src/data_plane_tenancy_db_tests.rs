@@ -424,3 +424,115 @@ async fn a_guest_query_error_reaches_the_guest_as_one_sentence() {
         other => panic!("expected the generic reply, got {other:?}"),
     }
 }
+
+/// Every row-security policy in `public` keys its reads on
+/// `app.current_user_id` (security review 2026-10-15, D2-1). The guest
+/// transaction sets the actor's owner there and an EMPTY org list; a policy
+/// keyed only on the org list read that empty list as "unset" and admitted
+/// every tenant's rows — `modules` and `webhook_triggers` did, so a
+/// `GRANT SELECT ON modules TO talos_guest` showed every tenant's source and
+/// grants. Asked of every policy, not only those on tables granted to
+/// `talos_guest` today (none are, by default): a grant is one statement an
+/// operator makes later.
+#[tokio::test]
+async fn every_row_security_policy_is_keyed_on_the_user() {
+    let Some(url) = database_url() else { return };
+    let pool = pool(&url).await;
+    let unkeyed: Vec<(String, String)> = sqlx::query_as(
+        "SELECT tablename::text, policyname::text FROM pg_policies \
+         WHERE schemaname = 'public' \
+           AND coalesce(qual, '') NOT LIKE '%app.current_user_id%' \
+         ORDER BY 1, 2",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("pg_policies");
+    assert!(
+        unkeyed.is_empty(),
+        "policies whose reads are not keyed on app.current_user_id: {unkeyed:?}"
+    );
+}
+
+/// D2-1 driven through the guest path: two users each own a module, the
+/// operator grants `modules` to the guest role, and each actor's query sees
+/// its owner's module and the catalog's (decision D2-A: catalog rows are
+/// public by design), never the other tenant's.
+#[tokio::test]
+async fn guest_sql_sees_only_its_owners_modules() {
+    let Some(url) = database_url() else { return };
+    let pool = pool(&url).await;
+    let a = test_actor(&pool).await;
+    let b = test_actor(&pool).await;
+    let tag = Uuid::new_v4().simple().to_string();
+    for actor in [a, b] {
+        sqlx::query(
+            "INSERT INTO modules (id, name, kind, user_id, source_code) \
+             SELECT $1, $2, 'sandbox', user_id, 'fn secret() {}' FROM actors WHERE id = $3",
+        )
+        .bind(Uuid::new_v4())
+        .bind(format!("guest-mod-{tag}-{actor}"))
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .expect("seed module");
+    }
+    sqlx::query("INSERT INTO modules (id, name, kind) VALUES ($1, $2, 'catalog')")
+        .bind(Uuid::new_v4())
+        .bind(format!("guest-mod-{tag}-catalog"))
+        .execute(&pool)
+        .await
+        .expect("seed catalog module");
+    sqlx::raw_sql("GRANT SELECT ON modules TO talos_guest")
+        .execute(&pool)
+        .await
+        .expect("grant");
+    let names_as = |actor: Uuid| {
+        let pool = pool.clone();
+        let sql = format!("SELECT name FROM modules WHERE name LIKE 'guest-mod-{tag}-%'");
+        async move {
+            let res = execute_guest_query_within(
+                &pool,
+                &sql,
+                &[],
+                true,
+                GuestRoleSetting::Role("talos_guest"),
+                actor,
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("guest read");
+            let rows: serde_json::Value = serde_json::from_str(&res.rows_json).unwrap();
+            let mut names = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        }
+    };
+    let expected = |own: Uuid| {
+        let mut v = vec![
+            format!("guest-mod-{tag}-{own}"),
+            format!("guest-mod-{tag}-catalog"),
+        ];
+        v.sort();
+        v
+    };
+    let seen_a = names_as(a).await;
+    let seen_b = names_as(b).await;
+    let _ = sqlx::raw_sql("REVOKE SELECT ON modules FROM talos_guest")
+        .execute(&pool)
+        .await;
+    assert_eq!(
+        seen_a,
+        expected(a),
+        "A's owner sees its own module and the catalog's, not B's"
+    );
+    assert_eq!(
+        seen_b,
+        expected(b),
+        "B's owner sees its own module and the catalog's, not A's"
+    );
+}
