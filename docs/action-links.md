@@ -20,7 +20,10 @@ it again says it has already been done.
 Mail scanners and link previewers open links. If opening a link acted, a
 scanner could mark your tasks done. So opening shows the page and only the
 button acts. A push notification with an action button can submit directly,
-which is the one-tap form; email cannot.
+which is the one-tap form; email cannot. A one-tap client posts from its own origin, so an
+action link's reply is readable from any origin and carries no credentials: the
+token in the address is the only key, and the reply says only done, already
+used or invalid, with the link's label.
 
 ## Wiring it into a workflow
 
