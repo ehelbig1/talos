@@ -2975,6 +2975,24 @@ async fn handle_update_node_config(
         }
     }
 
+    // A budget above the per-node ceiling is stored as written and clamped at
+    // dispatch: say so now, not at the first fuel-exhausted run.
+    if action == "update_config" || action == "merge_config" {
+        if let Some(note) =
+            node_fuel_above_ceiling(&graph, args.get("node_id").and_then(|v| v.as_str()))
+        {
+            msg.push_str(&format!("\n\nWarning: {note}"));
+            let fields = serde_json::json!({ "max_fuel_note": note, "max_fuel_applied": talos_workflow_validation::NODE_FUEL_CEILING });
+            match (
+                machine_block.as_mut().and_then(|mb| mb.as_object_mut()),
+                fields,
+            ) {
+                (Some(obj), serde_json::Value::Object(f)) => obj.extend(f),
+                (_, f) => machine_block = Some(f),
+            }
+        }
+    }
+
     // update_retry (2026-07): a retry_condition that parsed but failed the
     // dry-run eval is persisted, with the caveat surfaced in the message
     // AND as a machine-parsable "warning" field (additive — same envelope
@@ -3028,6 +3046,34 @@ async fn handle_update_node_config(
             machine_block,
         ),
     )
+}
+
+/// The warning for a node whose stored `max_fuel` is above the per-node ceiling
+/// (`talos_workflow_validation::fuel_above_ceiling`); `None` when it is within it,
+/// absent, or the node is not in the graph.
+fn node_fuel_above_ceiling(graph: &serde_json::Value, node_id: Option<&str>) -> Option<String> {
+    let node_id = node_id?;
+    let node = graph["nodes"]
+        .as_array()?
+        .iter()
+        .find(|n| n.get("id").and_then(|v| v.as_str()) == Some(node_id))?;
+    talos_workflow_validation::fuel_above_ceiling(node.get("data")?.get("max_fuel")?.as_u64()?)
+}
+
+#[cfg(test)]
+mod node_fuel_above_ceiling_tests {
+    use super::node_fuel_above_ceiling;
+    use serde_json::json;
+
+    #[test]
+    fn a_stored_budget_above_the_ceiling_is_named_and_others_are_not() {
+        let graph = json!({"nodes": [{"id": "check", "data": {"max_fuel": 250_000_000u64}}, {"id": "fits", "data": {"max_fuel": 50_000_000u64}}, {"id": "none", "data": {}}]});
+        assert!(node_fuel_above_ceiling(&graph, Some("check"))
+            .is_some_and(|n| n.starts_with("max_fuel 250000000 is above the 50000000")));
+        for id in [Some("fits"), Some("none"), Some("absent"), None] {
+            assert_eq!(node_fuel_above_ceiling(&graph, id), None, "{id:?}");
+        }
+    }
 }
 
 /// The JSON block every `update_node_config` reply carries:

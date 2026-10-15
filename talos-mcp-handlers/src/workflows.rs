@@ -2938,6 +2938,8 @@ async fn handle_add_node_to_workflow(
             // clamp on top of it at dispatch, so the ceiling a worker enforces
             // can be higher or lower. See `configured_max_fuel`.
             "configured_max_fuel": configured_max_fuel,
+            // Above the per-node ceiling the budget is clamped at dispatch; null within it.
+            "max_fuel_note": configured_max_fuel.and_then(|f| u64::try_from(f).ok()).and_then(talos_workflow_validation::fuel_above_ceiling),
             "configured_max_fuel_note": "the budget as AUTHORED. The engine resolves \
                  max(this, adaptive-fuel learned floor) clamped to the engine-wide \
                  max_fuel_per_node, so the ceiling actually enforced can differ in either \

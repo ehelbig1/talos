@@ -308,7 +308,12 @@ its configured maximum output alone puts the requirement near 4M before the
    runs weekly, it does not. The number you set is the number it lives with.
 6. Run `validate_workflow`. A `fuel-sizing` warning means the budget cannot
    cover the node's own configured maximum — fix that before looking at
-   anything else.
+   anything else. A `fuel-above-ceiling` warning means the budget is
+   above the 50,000,000 every node is capped at: it is clamped at dispatch,
+   so raising it further changes nothing, and a node that needs more must be
+   made cheaper or split. `update_node_config` and `add_node_to_workflow` say
+   the same when the value is written (`max_fuel_note`), and a fuel-exhausted
+   failure at the ceiling no longer calls the limit configurable.
 7. After it has run, check `get_fuel_usage_report` →
    `high_utilisation_nodes`. Step 6 is a floor and cannot tell you whether the
    number holds against real inputs.
