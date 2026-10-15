@@ -91,7 +91,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(Uuid::nil);
+    let user_id = agent.user_id;
     match name {
         "graph_query" => Some(handle_graph_query(req_id, args, state, user_id).await),
         "graph_stats" => Some(handle_graph_stats(req_id, args, state, user_id).await),

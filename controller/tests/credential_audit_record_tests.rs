@@ -248,9 +248,14 @@ async fn capability_grants_are_recorded_on_every_surface() {
     // Nothing to revoke: no change, no record.
     let repo = talos_actor_repository::ActorRepository::new(ctx.db_pool.clone());
     assert_eq!(
-        repo.delete_capability_grant(target, admin, None)
-            .await
-            .unwrap(),
+        repo.delete_capability_grant(
+            target,
+            admin,
+            None,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
+        .await
+        .unwrap(),
         talos_actor_repository::CapabilityGrantRevocation::NoGrant
     );
     assert_eq!(
@@ -278,7 +283,12 @@ async fn a_grant_that_cannot_be_recorded_does_not_happen() {
         .await
         .is_err());
     assert!(repo
-        .delete_capability_grant(target, admin, None)
+        .delete_capability_grant(
+            target,
+            admin,
+            None,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
         .await
         .is_err());
     let world: Option<String> = sqlx::query_scalar(

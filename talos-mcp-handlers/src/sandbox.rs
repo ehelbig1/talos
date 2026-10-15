@@ -489,7 +489,7 @@ pub async fn dispatch(
         "update_module_methods" => handle_update_module_methods(req_id, args, state, agent).await,
         "test_module" => handle_test_module(req_id, args, state, agent).await,
         "replay_module_regression" => {
-            let uid = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+            let uid = agent.user_id;
             if let Err(resp) = check_expensive_op_rate_limit(&req_id, uid) {
                 return Some(resp);
             }
@@ -497,7 +497,7 @@ pub async fn dispatch(
         }
         "get_rust_scaffold" => Some(handle_get_rust_scaffold(req_id, args)),
         "generate_typed_scaffold" => {
-            let uid = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+            let uid = agent.user_id;
             if let Err(resp) = check_expensive_op_rate_limit(&req_id, uid) {
                 return Some(resp);
             }
@@ -642,27 +642,150 @@ pub(crate) fn checked_world_hint(world: &str) -> talos_worker_runtime::Capabilit
         .unwrap_or(talos_worker_runtime::CapabilityWorld::Unknown)
 }
 
-/// [`agent_role_permits_world`] as a refusal. `verb` names the operation for
-/// the message ("compile tools for", "run sandbox code in", ...). Refuses with
-/// `-32003`, the code the two original inline gates used.
-pub(crate) fn require_agent_role_permits_world(
+/// The two gates every surface that compiles, installs or runs a module at a
+/// world passes: the agent's ROLE permits the world
+/// ([`agent_role_permits_world`]), and so does the USER's own capability
+/// ceiling (`user_capability_grants`, the bound a platform admin sets).
+/// `verb` names the operation for the message ("compile tools for", "run
+/// sandbox code in", ...). Refuses with `-32003`, the code the two original
+/// inline gates used.
+///
+/// The user half is security review 2026-10-14, G-3: until then the grant
+/// was read only when an ACTOR was created or cloned, so a user granted
+/// `minimal-node` could register a `System Administrator` agent and compile,
+/// install and run `governance-node` modules. The read fails closed.
+pub(crate) async fn require_world_permitted(
     req_id: &Option<serde_json::Value>,
+    actor_repo: &talos_actor_repository::ActorRepository,
     agent: &auth::AgentIdentity,
     capability_world: &str,
     verb: &str,
 ) -> Result<(), JsonRpcResponse> {
-    if agent_role_permits_world(agent, capability_world) {
+    if !agent_role_permits_world(agent, capability_world) {
+        return Err(mcp_denied(
+            req_id.clone(),
+            -32003,
+            &format!(
+                "Unauthorized: agent role '{}' lacks capability to {} the '{}' world. \
+                 Allowed capabilities: {:?}",
+                agent.role_name, verb, capability_world, agent.allowed_capabilities
+            ),
+        ));
+    }
+    let user_id = agent.user_id;
+    let ceiling = match actor_repo.user_capability_ceiling(user_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp",
+                %user_id,
+                error = %e,
+                "could not read capability grant — refusing rather than assuming the default"
+            );
+            return Err(mcp_error(
+                req_id.clone(),
+                -32603,
+                "Could not verify your capability ceiling — try again.",
+            ));
+        }
+    };
+    if talos_capability_world::ceiling_permits(&ceiling, capability_world) {
         return Ok(());
     }
     Err(mcp_denied(
         req_id.clone(),
         -32003,
         &format!(
-            "Unauthorized: agent role '{}' lacks capability to {} the '{}' world. \
-             Allowed capabilities: {:?}",
-            agent.role_name, verb, capability_world, agent.allowed_capabilities
+            "Unauthorized: your capability ceiling is '{ceiling}', so you cannot {verb} the \
+             '{capability_world}' world. A platform admin grants a wider ceiling."
         ),
     ))
+}
+
+/// The gate an edit of a stored module's grants passes (security review
+/// 2026-10-14, G-23): the module's stored world must be one the agent's role
+/// and the user's ceiling permit — the gate compiling into that world passes.
+/// Until then an `["minimal"]`-role token could rewrite the grants of any
+/// module its user owned. An absent row is the caller's "not found"; an
+/// unreadable one refuses.
+async fn require_grant_edit_permitted(
+    req_id: &Option<serde_json::Value>,
+    state: &McpState,
+    agent: &auth::AgentIdentity,
+    module_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+) -> Result<(), JsonRpcResponse> {
+    let world = match state
+        .module_repo
+        .get_hot_update_context(module_id, user_id)
+        .await
+    {
+        Ok(Some(ctx)) => ctx.capability_world,
+        Ok(None) => {
+            return Err(mcp_denied(
+                req_id.clone(),
+                -32000,
+                "Module not found or access denied",
+            ))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %module_id, "could not read the module's stored world — refusing");
+            return Err(crate::utils::database_error(req_id.clone()));
+        }
+    };
+    require_world_permitted(
+        req_id,
+        &state.actor_repo,
+        agent,
+        &world,
+        "edit the grants of a module in",
+    )
+    .await
+}
+
+/// The grant arguments of a compile or a sandbox run, as an MCP bearer token
+/// may give them (security review 2026-10-14, A-2 / G-23): no `*` in
+/// `allowed_secrets` or `allowed_hosts` (`-32003`), and both lists within the
+/// registry's size bounds (`-32602`). The repository applies the same `*`
+/// rule to an `update_module_*` write.
+fn refuse_bearer_grant(
+    req_id: &Option<serde_json::Value>,
+    allowed_secrets: &[String],
+    allowed_hosts: &[String],
+) -> Result<(), JsonRpcResponse> {
+    if talos_capability_world::grant_list_has_wildcard(allowed_secrets)
+        || talos_capability_world::grant_list_has_wildcard(allowed_hosts)
+    {
+        return Err(mcp_denied(
+            req_id.clone(),
+            -32003,
+            talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR,
+        ));
+    }
+    talos_registry::validate_allowed_secrets_bounds(allowed_secrets)
+        .and_then(|()| talos_registry::validate_allowed_hosts(allowed_hosts))
+        .map_err(|msg| mcp_error(req_id.clone(), -32602, &msg))
+}
+
+/// The answer to a module grant write that failed: a refused `*` is a
+/// refusal (`-32003`), anything else the caller's generic failure.
+fn grant_write_failure(
+    req_id: Option<serde_json::Value>,
+    e: &anyhow::Error,
+    tool: &str,
+    generic: &str,
+) -> JsonRpcResponse {
+    if e.downcast_ref::<talos_module_repository::WildcardGrantRefused>()
+        .is_some()
+    {
+        return mcp_denied(
+            req_id,
+            -32003,
+            talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR,
+        );
+    }
+    tracing::error!("{tool} failed: {:#}", e);
+    mcp_error(req_id, -32000, generic)
 }
 
 /// What the in-process runtime was told about the bound actor's egress scope.
@@ -1035,16 +1158,7 @@ async fn handle_generate_typed_scaffold(
         // callers cannot sample from module_executions because the query
         // path enforces user_id scoping. Return 401-equivalent instead of
         // silently skipping the capture.
-        let uid = match agent.user_id {
-            Some(u) => u,
-            None => {
-                return mcp_error(
-                    req_id,
-                    -32001,
-                    "source_module_id capture requires an authenticated user context",
-                );
-            }
-        };
+        let uid = agent.user_id;
         // MCP-191 (2026-05-08): pre-check module ownership/existence.
         // Pre-fix the handler skipped straight to capture_scrubbed_samples,
         // which queries module_executions scoped by user_id — a non-
@@ -1232,10 +1346,16 @@ async fn handle_compile_custom_sandbox(
     };
 
     // RBAC CHECK 1: Ensure agent is allowed to compile/use this capability world.
-    // One shared predicate (`require_agent_role_permits_world`) — the inline
+    // One shared predicate (`require_world_permitted`) — the inline
     // copy that stood here was one of two, and four sibling surfaces had none.
-    if let Err(resp) =
-        require_agent_role_permits_world(&req_id, &agent, capability_world, "compile tools for")
+    if let Err(resp) = require_world_permitted(
+        &req_id,
+        &state.actor_repo,
+        &agent,
+        capability_world,
+        "compile tools for",
+    )
+    .await
     {
         return resp;
     }
@@ -1375,12 +1495,16 @@ async fn handle_compile_custom_sandbox(
     // a no-match allowlist entry.
     let pre_allowed_secrets =
         crate::utils::json_string_array_field_trimmed(args, "allowed_secrets");
+    let pre_allowed_hosts = crate::utils::json_string_array_field_trimmed(args, "allowed_hosts");
+    if let Err(resp) = refuse_bearer_grant(&req_id, &pre_allowed_secrets, &pre_allowed_hosts) {
+        return resp;
+    }
     if pre_allowed_secrets.is_empty() && inner_rust_code.contains("vault://") {
         return mcp_error(
             req_id,
             -32602,
             "Compilation blocked: code references 'vault://' but allowed_secrets is empty (deny-all). \
-             Vault references will fail at runtime. Add allowed_secrets: [\"your/path\"] or [\"*\"].",
+             Vault references will fail at runtime. Add allowed_secrets: [\"your/path\"].",
         );
     }
 
@@ -1394,7 +1518,7 @@ async fn handle_compile_custom_sandbox(
     };
     let existing_template = state
         .module_repo
-        .find_compiled_sandbox_template(agent.user_id, &rust_code, cw_short)
+        .find_compiled_sandbox_template(Some(agent.user_id), &rust_code, cw_short)
         .await
         .ok()
         .flatten();
@@ -1456,7 +1580,7 @@ async fn handle_compile_custom_sandbox(
         // because the source hasn't changed, but we need a distinct DB record.
     }
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let job_id = uuid::Uuid::new_v4();
     let compilation = state
         .compiler
@@ -1524,7 +1648,7 @@ async fn handle_compile_custom_sandbox(
             if !user_name.is_empty() {
                 let collision = state
                     .module_repo
-                    .sandbox_template_name_exists(&template_name, agent.user_id)
+                    .sandbox_template_name_exists(&template_name, Some(agent.user_id))
                     .await
                     .unwrap_or(false);
                 if collision {
@@ -1585,7 +1709,7 @@ async fn handle_compile_custom_sandbox(
                 .mirror_sandbox_compile_to_modules(
                     module_id,
                     module_id, // legacy_template_id alias = modules.id (harmless self-reference)
-                    agent.user_id,
+                    Some(agent.user_id),
                     &template_name,
                     "sandbox",
                     cw_short,
@@ -1838,8 +1962,14 @@ async fn handle_run_sandbox(
     // role-based gate that compile_custom_sandbox enforces. The downstream
     // actor-ceiling check below is optional (skipped when `agent_id` omitted),
     // so it cannot stand in for this primary gate.
-    if let Err(resp) =
-        require_agent_role_permits_world(&req_id, &agent, capability_world, "run sandbox code in")
+    if let Err(resp) = require_world_permitted(
+        &req_id,
+        &state.actor_repo,
+        &agent,
+        capability_world,
+        "run sandbox code in",
+    )
+    .await
     {
         return resp;
     }
@@ -1902,6 +2032,9 @@ async fn handle_run_sandbox(
     // MCP-243: trimmed variants for run_sandbox security allowlists.
     let allowed_hosts = crate::utils::json_string_array_field_trimmed(args, "allowed_hosts");
     let allowed_secrets = crate::utils::json_string_array_field_trimmed(args, "allowed_secrets");
+    if let Err(resp) = refuse_bearer_grant(&req_id, &allowed_secrets, &allowed_hosts) {
+        return resp;
+    }
     // The method axis is the ONE grant on this path that defaults OPEN, and
     // `resolve_sandbox_methods` is where that decision lives so a test can
     // drive it. Absent argument => all five verbs; an explicitly supplied list
@@ -1941,7 +2074,7 @@ async fn handle_run_sandbox(
     let lint_outcome = state
         .compiler
         .lint_code(
-            agent.user_id,
+            Some(agent.user_id),
             "run_sandbox_lint",
             &rust_code,
             &lint_world,
@@ -1981,7 +2114,7 @@ async fn handle_run_sandbox(
         }
     }
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let job_id = uuid::Uuid::new_v4();
     // Step 1b: Compile (with timeout)
     // allow-depless-compile: run_sandbox builds CALLER-SUPPLIED inline Rust.
@@ -2093,7 +2226,7 @@ async fn handle_run_sandbox(
             state.secrets_manager.clone(),
             &declared_secrets,
             &allowed_secrets,
-            agent.user_id,
+            Some(agent.user_id),
         )
         .await
         .map(talos_oauth::resolver::into_runtime_secrets)
@@ -2129,7 +2262,7 @@ async fn handle_run_sandbox(
             Err(resp) => return resp,
         };
     if let Some(aid) = actor_id_opt {
-        let caller_user = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+        let caller_user = agent.user_id;
         let owned = state
             .actor_repo
             .find_actor_for_user(aid, caller_user)
@@ -2151,7 +2284,7 @@ async fn handle_run_sandbox(
     // of the previous hardcoded Uuid::nil) also fixes a latent issue where
     // run_sandbox calls had no tenant identity — they now record the caller's
     // user for fuel/cost accounting and the RPC layer's per-tenant nonce cache.
-    let caller_user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let caller_user_id = agent.user_id;
     let effective_actor_id = actor_id_opt.unwrap_or(caller_user_id);
 
     // MCP-692 (2026-05-13): inherit the actor's max_llm_tier ceiling.
@@ -2187,7 +2320,7 @@ async fn handle_run_sandbox(
     if !matches!(llm_tier, talos_workflow_job_protocol::LlmTier::Tier1) {
         if let Ok(llm_keys) = state
             .secrets_manager
-            .get_llm_vault_keys(agent.user_id)
+            .get_llm_vault_keys(Some(agent.user_id))
             .await
         {
             // The cache returns Zeroizing<String>; the destination is a plain
@@ -2400,9 +2533,9 @@ async fn handle_compile_template(
     // resolve only for their owner. Agents without a user scope
     // (`agent.user_id == None`) fall back to nil UUID which still
     // matches catalog rows, mirroring the
-    // `agent.user_id.unwrap_or_else(Uuid::nil)` pattern used
+    // `agent.user_id` pattern used
     // throughout sandbox.rs for sandbox-template lookups.
-    let user_id_for_lookup = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id_for_lookup = agent.user_id;
     let template = match state
         .registry
         .get_template_for_user(template_id, user_id_for_lookup)
@@ -2416,12 +2549,15 @@ async fn handle_compile_template(
     // the world the compiled module will run at. `compile_custom_sandbox`
     // refuses a caller whose role lacks that capability; compiling the same
     // world FROM A TEMPLATE was ungated. Same predicate, same refusal.
-    if let Err(resp) = require_agent_role_permits_world(
+    if let Err(resp) = require_world_permitted(
         &req_id,
+        &state.actor_repo,
         &agent,
         &template.capability_world,
         "compile a template for",
-    ) {
+    )
+    .await
+    {
         return resp;
     }
 
@@ -2493,7 +2629,7 @@ async fn handle_compile_template(
         None => serde_json::json!({}),
     };
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // Early guard: when the caller explicitly named the module, reject duplicate
     // names before spending 30-60s on compilation. Template-default names are
@@ -3322,7 +3458,7 @@ async fn handle_hot_update_module(
 ) -> Option<JsonRpcResponse> {
     use talos_hot_update_service::{HotUpdateError, HotUpdateInput};
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id: uuid::Uuid = match args
         .get("module_id")
         .and_then(|v| v.as_str())
@@ -3408,12 +3544,15 @@ async fn handle_hot_update_module(
             }
         },
     };
-    if let Err(resp) = require_agent_role_permits_world(
+    if let Err(resp) = require_world_permitted(
         &req_id,
+        &state.actor_repo,
         &agent,
         &effective_world,
         "hot-update a module in",
-    ) {
+    )
+    .await
+    {
         return Some(resp);
     }
 
@@ -3518,7 +3657,7 @@ async fn handle_update_module_secrets(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id: uuid::Uuid = match args
         .get("module_id")
         .and_then(|v| v.as_str())
@@ -3580,8 +3719,18 @@ async fn handle_update_module_secrets(
         }
     }
 
+    if let Err(msg) = talos_registry::validate_allowed_secrets_bounds(&allowed_secrets) {
+        return Some(mcp_error(req_id, -32602, &msg));
+    }
+    if let Err(resp) =
+        require_grant_edit_permitted(&req_id, state, &agent, module_id, user_id).await
+    {
+        return Some(resp);
+    }
+
     // The replace and its `admin_event_log` record commit in ONE transaction
-    // inside the repository (package CT); a failed record fails the call.
+    // inside the repository (package CT); a failed record fails the call. A
+    // `*` is refused there for this bearer token (2026-10-14, A-2).
     let change = match state
         .module_repo
         .update_module_allowed_secrets(
@@ -3589,6 +3738,7 @@ async fn handle_update_module_secrets(
             user_id,
             &allowed_secrets,
             &crate::modules::secrets_beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
         )
         .await
     {
@@ -3601,8 +3751,12 @@ async fn handle_update_module_secrets(
             ));
         }
         Err(e) => {
-            tracing::error!("update_module_secrets failed: {:#}", e);
-            return Some(mcp_error(req_id, -32000, "Failed to update module secrets"));
+            return Some(grant_write_failure(
+                req_id,
+                &e,
+                "update_module_secrets",
+                "Failed to update module secrets",
+            ));
         }
     };
 
@@ -3651,7 +3805,7 @@ async fn handle_update_module_hosts(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id: uuid::Uuid = match args
         .get("module_id")
         .and_then(|v| v.as_str())
@@ -3718,7 +3872,17 @@ async fn handle_update_module_hosts(
         }
     }
 
-    // Replace + record in ONE transaction (package CT).
+    if let Err(msg) = talos_registry::validate_allowed_hosts(&allowed_hosts) {
+        return Some(mcp_error(req_id, -32602, &msg));
+    }
+    if let Err(resp) =
+        require_grant_edit_permitted(&req_id, state, &agent, module_id, user_id).await
+    {
+        return Some(resp);
+    }
+
+    // Replace + record in ONE transaction (package CT); a `*` is refused
+    // there for this bearer token (2026-10-14, A-2).
     let change = match state
         .module_repo
         .update_module_allowed_hosts(
@@ -3726,6 +3890,7 @@ async fn handle_update_module_hosts(
             user_id,
             &allowed_hosts,
             &crate::modules::hosts_beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
         )
         .await
     {
@@ -3738,8 +3903,12 @@ async fn handle_update_module_hosts(
             ));
         }
         Err(e) => {
-            tracing::error!("update_module_hosts failed: {:#}", e);
-            return Some(mcp_error(req_id, -32000, "Failed to update module hosts"));
+            return Some(grant_write_failure(
+                req_id,
+                &e,
+                "update_module_hosts",
+                "Failed to update module hosts",
+            ));
         }
     };
 
@@ -3791,7 +3960,7 @@ async fn handle_update_module_methods(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id: uuid::Uuid = match args
         .get("module_id")
         .and_then(|v| v.as_str())
@@ -3850,6 +4019,12 @@ async fn handle_update_module_methods(
         }
     }
 
+    if let Err(resp) =
+        require_grant_edit_permitted(&req_id, state, &agent, module_id, user_id).await
+    {
+        return Some(resp);
+    }
+
     // Replace + record in ONE transaction (package CT).
     let change = match state
         .module_repo
@@ -3858,6 +4033,7 @@ async fn handle_update_module_methods(
             user_id,
             &allowed_methods,
             &crate::modules::methods_beyond,
+            talos_capability_world::ChangeAuthority::BearerCredential,
         )
         .await
     {
@@ -3916,7 +4092,7 @@ async fn handle_test_module(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id: uuid::Uuid = match args
         .get("module_id")
         .and_then(|v| v.as_str())
@@ -4177,8 +4353,14 @@ async fn handle_test_module(
     // surface had no such gate: an `["http"]`-role agent could run a stored
     // `secrets-node` module here. Same predicate, same refusal.
     let stored_world = module.capability_world.to_string();
-    if let Err(resp) =
-        require_agent_role_permits_world(&req_id, &agent, &stored_world, "execute a module in")
+    if let Err(resp) = require_world_permitted(
+        &req_id,
+        &state.actor_repo,
+        &agent,
+        &stored_world,
+        "execute a module in",
+    )
+    .await
     {
         return Some(resp);
     }
@@ -4639,16 +4821,7 @@ async fn handle_replay_module_regression(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = match agent.user_id {
-        Some(u) => u,
-        None => {
-            return Some(mcp_error(
-                req_id,
-                -32001,
-                "replay_module_regression requires an authenticated user context",
-            ))
-        }
-    };
+    let user_id = agent.user_id;
 
     // Caller-supplied ignore-fields list is layered on top of the
     // engine-metadata defaults inside the service. Owned `Vec<String>`
@@ -6000,7 +6173,7 @@ mod agent_role_permits_world_tests {
             name: "t".into(),
             role_name: "r".into(),
             allowed_capabilities: caps.iter().map(|s| s.to_string()).collect(),
-            user_id: None,
+            user_id: uuid::Uuid::new_v4(),
         }
     }
 
@@ -6483,7 +6656,7 @@ mod rehearsal_tool_tests {
         assert_eq!(source.matches(&test_module).count(), 1, "{test_module}");
         let run_sandbox = [
             "            &declared_",
-            "secrets,\n            &allowed_secrets,\n            agent.user_id,",
+            "secrets,\n            &allowed_secrets,\n            Some(agent.user_id),",
         ]
         .concat();
         assert_eq!(

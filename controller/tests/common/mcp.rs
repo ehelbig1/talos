@@ -181,7 +181,7 @@ pub fn agent(user_id: Uuid) -> Arc<AgentIdentity> {
         name: "package-23-probe".to_string(),
         role_name: "admin".to_string(),
         allowed_capabilities: vec!["*".to_string()],
-        user_id: Some(user_id),
+        user_id,
     })
 }
 

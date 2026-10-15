@@ -79,7 +79,7 @@ pub async fn dispatch(
     // tenant. Per-tenant agent admin no longer carries authority over
     // shared infra; route through user_id so the handler can verify
     // `is_platform_admin` against the `users` table.
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     match tool_name {
         "ollama_list_models" => Some(handle_list_models(req_id, state).await),
         "ollama_pull_model" => Some(handle_pull_model(req_id, args, state, user_id).await),
@@ -444,10 +444,8 @@ async fn handle_local_complete(
         }
     };
 
-    // R2 token ledger: attribute usage to the requesting user (nil uuid
-    // from a non-user agent context records unscoped — the task-local
-    // still carries it, but the ledger insert treats it as a real user id
-    // only when non-nil).
+    // R2 token ledger: attribute usage to the requesting user. An agent
+    // identity always carries one (D-7), so there is no unscoped branch.
     let started = std::time::Instant::now();
     let call = client.complete_with_options(
         &model,
@@ -456,11 +454,7 @@ async fn handle_local_complete(
         max_tokens,
         apply_options,
     );
-    let completion = if user_id.is_nil() {
-        call.await
-    } else {
-        talos_llm::usage::scoped_user(user_id, call).await
-    };
+    let completion = talos_llm::usage::scoped_user(user_id, call).await;
     match completion {
         Ok(reply) => {
             let report = local_complete_report(&model, &reply, started.elapsed());

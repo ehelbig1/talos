@@ -11,7 +11,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     match name {
         "describe_capability_world" => Some(handle_describe_capability_world(req_id, args).await),
         "test_condition" => Some(handle_test_condition(req_id, args).await),

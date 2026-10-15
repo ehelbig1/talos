@@ -12,6 +12,7 @@ chrono.workspace = true
 serde_json.workspace = true
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-admin-event-log = { path = "../talos-admin-event-log" }
+talos-capability-world = { path = "../talos-capability-world" }
 talos-db = { path = "../talos-db" }
 talos-module-payload-encryption = { path = "../talos-module-payload-encryption" }
 # `PushBoundModules`: a bulk module delete must exclude modules a push channel
@@ -21,6 +22,7 @@ talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 # Catalog drift report: counts only workflows that are not retired (check 87).
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

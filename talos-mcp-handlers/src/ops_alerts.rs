@@ -108,16 +108,15 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     match name {
         "list_ops_alerts" => Some(handle_list(req_id, args, state, user_id).await),
         "set_ops_alert_status" => Some(handle_set_status(req_id, args, state, user_id).await),
         "correct_ops_alert_severity" => Some(handle_correct(req_id, args, state, user_id).await),
         "get_ops_alerts_digest" => Some(handle_digest(req_id, state, user_id).await),
         "cleanup_ops_alerts" => Some(handle_cleanup(req_id, args, state, user_id).await),
-        // A WRITE attributed to the caller: the bare `agent.user_id`, never
-        // the nil default above (a nil user is not "no tenant").
-        "report_ops_alert" => Some(handle_report(req_id, args, state, agent.user_id).await),
+        // A WRITE attributed to the caller.
+        "report_ops_alert" => Some(handle_report(req_id, args, state, user_id).await),
         _ => None,
     }
 }
@@ -449,14 +448,8 @@ async fn handle_report(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
-    user_id: Option<Uuid>,
+    user_id: Uuid,
 ) -> JsonRpcResponse {
-    // Every route that reaches here resolves a user (the authenticated
-    // middleware refuses an unbound agent; `/mcp/local` resolves its dev
-    // user). Refused rather than attributed to a nil user if that changes.
-    let Some(user_id) = user_id else {
-        return mcp_denied(req_id, -32001, "Unauthorized: agent is not bound to a user");
-    };
     let parsed = match parse_report_args(args) {
         Ok(p) => p,
         Err(msg) => return mcp_error(req_id, -32602, &msg),

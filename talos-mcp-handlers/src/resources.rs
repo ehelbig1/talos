@@ -7,18 +7,7 @@ pub async fn handle_resources_list(
     agent: std::sync::Arc<super::auth::AgentIdentity>,
 ) -> JsonRpcResponse {
     // SECURITY: Scope resource listing to the agent's user_id to prevent cross-user data access.
-    let user_id = match agent.user_id {
-        Some(uid) => uid,
-        None => {
-            return JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: req.id,
-                result: Some(serde_json::json!({ "resources": [] })),
-                error: None,
-                error_kind: None,
-            };
-        }
-    };
+    let user_id = agent.user_id;
 
     // Fetch recent 10 executions scoped to the agent's user
     let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
@@ -100,15 +89,11 @@ pub async fn handle_resources_read(
         // doesn't need encryption but the consistent reference keeps the
         // function simple.
         let exec_repo = execution_repo.clone();
-        if let Some(uid) = user_id {
-            let owns = exec_repo
-                .module_execution_owned_by(exec_id, uid)
-                .await
-                .unwrap_or(false);
-            if !owns {
-                return resource_not_found_error(req.id, uri);
-            }
-        } else {
+        let owns = exec_repo
+            .module_execution_owned_by(exec_id, user_id)
+            .await
+            .unwrap_or(false);
+        if !owns {
             return resource_not_found_error(req.id, uri);
         }
 
@@ -151,10 +136,9 @@ pub async fn handle_resources_read(
         // every encrypted module execution. The shared repo from McpState
         // has SecretsManager wired so decryption is transparent.
         let exec_repo = execution_repo.clone();
-        let record_opt = match user_id {
-            Some(uid) => exec_repo.get_module_execution_for_user(exec_id, uid).await,
-            None => Ok(None),
-        };
+        let record_opt = exec_repo
+            .get_module_execution_for_user(exec_id, user_id)
+            .await;
         let record_opt = match record_opt {
             Ok(r) => r,
             _ => return resource_not_found_error(req.id, uri),

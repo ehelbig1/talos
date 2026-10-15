@@ -593,7 +593,7 @@ pub fn local_router(state: McpState, db_pool: sqlx::PgPool) -> Router<McpState> 
                     name: "local-dev".to_string(),
                     role_name: "System Administrator".to_string(),
                     allowed_capabilities: vec!["*".to_string()],
-                    user_id: Some(dev_user_id),
+                    user_id: dev_user_id,
                 });
 
                 let response = match payload.method.as_str() {
@@ -816,10 +816,7 @@ async fn message_handler(
     //   Layer 2 — per-user: prevents bypass via multiple agents (N agents × per-agent
     //             limit = N× effective rate without this check).
     let agent_allowed = AGENT_RATE_LIMITER.check_and_increment(&agent.agent_id.to_string());
-    let user_allowed = agent
-        .user_id
-        .map(|uid| USER_RATE_LIMITER.check_and_increment(&uid.to_string()))
-        .unwrap_or(true); // Agents without a user_id are system agents — exempt.
+    let user_allowed = USER_RATE_LIMITER.check_and_increment(&agent.user_id.to_string());
     if !agent_allowed || !user_allowed {
         let limit_type = if !agent_allowed { "agent" } else { "user" };
         tracing::warn!(
@@ -905,10 +902,7 @@ async fn streamable_http_handler(
 ) -> impl IntoResponse {
     // Rate limit — same two-layer check as message_handler
     let agent_allowed = AGENT_RATE_LIMITER.check_and_increment(&agent.agent_id.to_string());
-    let user_allowed = agent
-        .user_id
-        .map(|uid| USER_RATE_LIMITER.check_and_increment(&uid.to_string()))
-        .unwrap_or(true);
+    let user_allowed = USER_RATE_LIMITER.check_and_increment(&agent.user_id.to_string());
     if !agent_allowed || !user_allowed {
         let response = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),

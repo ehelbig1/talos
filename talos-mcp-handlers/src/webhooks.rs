@@ -107,7 +107,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     match name {
         "create_webhook" => Some(handle_create_webhook(req_id, args, state, user_id).await),
         "list_webhooks" => Some(handle_list_webhooks(req_id, args, state, user_id).await),

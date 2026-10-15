@@ -15,8 +15,22 @@ use crate::schema::{require_2fa, require_scope, require_second_factor};
 #[derive(Default)]
 pub struct ActorsMutations;
 
+/// Which per-actor security ceiling `setActorCeiling` sets.
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ActorCeilingKind {
+    LlmTier,
+    EgressScope,
+    WriteCeiling,
+    HttpVerbCeiling,
+}
+
 #[async_graphql::Object]
 impl ActorsMutations {
+    /// Register an MCP agent and return its token, shown once. The role's
+    /// capabilities scope the capability WORLDS the agent may compile,
+    /// install and run at — and only within the caller's own capability
+    /// ceiling. They are not a read/write boundary: every MCP tool is
+    /// available to the agent for its user's own data.
     async fn register_mcp_agent(
         &self,
         ctx: &Context<'_>,
@@ -72,8 +86,8 @@ impl ActorsMutations {
         // distinguishable from a missing-row hit on the operator
         // side. User-facing message stays generic.
         let system_repo = talos_system_repo::SystemRepository::new(db_pool.clone());
-        let role_id = system_repo
-            .find_role_id_by_name(&role_name)
+        let role = system_repo
+            .find_role_by_name(&role_name)
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -84,7 +98,7 @@ impl ActorsMutations {
                 async_graphql::Error::new("Database error").extend_safe()
             })?;
 
-        let role_id = role_id.ok_or_else(|| {
+        let (role_id, role_capabilities) = role.ok_or_else(|| {
             // MCP-1048: .extend_safe() + bounded_preview on role_name.
             // Pre-fix the lowercase "not found" missed the case-sensitive
             // scrubber whitelist (MCP-964 sibling) and role_name was
@@ -94,6 +108,37 @@ impl ActorsMutations {
                 talos_text_util::bounded_preview(&role_name, 64)
             )).extend_safe()
         })?;
+
+        // The agent compiles and runs at the worlds its role names, so the
+        // role must fit the caller's own capability ceiling — a user granted
+        // `minimal-node` registered a `System Administrator` agent and
+        // compiled governance-node modules (security review 2026-10-14, G-3).
+        // A platform admin may issue any role. Both reads fail closed.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let is_admin = actor_repo.is_platform_admin(*user_id).await.map_err(|e| {
+            tracing::error!(error = %e, "register_mcp_agent: admin check failed");
+            async_graphql::Error::new("Database error").extend_safe()
+        })?;
+        if !is_admin {
+            let ceiling = actor_repo
+                .user_capability_ceiling(*user_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "register_mcp_agent: ceiling read failed");
+                    async_graphql::Error::new("Database error").extend_safe()
+                })?;
+            let above =
+                talos_capability_world::role_capabilities_above(&ceiling, &role_capabilities);
+            if !above.is_empty() {
+                return Err(async_graphql::Error::new(format!(
+                    "Role '{}' grants {} beyond your capability ceiling ('{ceiling}'). Choose a \
+                     narrower role, or ask a platform admin for a wider ceiling.",
+                    talos_text_util::bounded_preview(&role_name, 64),
+                    above.join(", ")
+                ))
+                .extend_safe());
+            }
+        }
 
         // Generate a secure random token via OS entropy
         let mut token_bytes = [0u8; 32];
@@ -1022,6 +1067,94 @@ impl ActorsMutations {
         super::helpers::fetch_actor_summary_post_mutation(db_pool, outcome.new_actor_id, user_id)
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())
+    }
+
+    /// Set one of an actor's per-actor security ceilings — the LLM tier
+    /// (`tier1`/`tier2`), the egress scope (`local`/`public`, null = the
+    /// tier-derived default), the write ceiling (`readonly`/`write`) or the
+    /// HTTP-verb override (`readonly`/`write`, null = inherit). The MCP tools
+    /// `set_actor_*` may only TIGHTEN these; loosening one needs this
+    /// mutation, from a session with a verified second factor (security
+    /// review 2026-10-14, G-5).
+    async fn set_actor_ceiling(
+        &self,
+        ctx: &Context<'_>,
+        actor_id: Uuid,
+        ceiling: ActorCeilingKind,
+        #[graphql(desc = "The new value; null clears egress_scope or http_verb_ceiling.")]
+        value: Option<String>,
+    ) -> Result<bool> {
+        require_second_factor(ctx).await?;
+        let user_id = ctx
+            .data_opt::<Uuid>()
+            .copied()
+            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+        let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
+        let repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let authority = talos_capability_world::ChangeAuthority::SecondFactorSession;
+        let invalid = |what: &str| async_graphql::Error::new(what.to_string()).extend_safe();
+        use talos_workflow_job_protocol::{EgressScope, LlmTier, WriteCeiling};
+        let write = match (ceiling, value.as_deref()) {
+            (ActorCeilingKind::LlmTier, Some("tier1")) => {
+                repo.set_actor_max_llm_tier(actor_id, user_id, LlmTier::Tier1, authority)
+                    .await
+            }
+            (ActorCeilingKind::LlmTier, Some("tier2")) => {
+                repo.set_actor_max_llm_tier(actor_id, user_id, LlmTier::Tier2, authority)
+                    .await
+            }
+            (ActorCeilingKind::LlmTier, _) => return Err(invalid("value must be tier1 or tier2")),
+            (ActorCeilingKind::EgressScope, v) => {
+                let scope = match v {
+                    None => None,
+                    Some("local") => Some(EgressScope::Local),
+                    Some("public") => Some(EgressScope::Public),
+                    Some(_) => return Err(invalid("value must be local, public or null")),
+                };
+                repo.set_actor_egress_scope(actor_id, user_id, scope, authority)
+                    .await
+            }
+            (ActorCeilingKind::WriteCeiling, Some("readonly")) => {
+                repo.set_actor_max_write_ceiling(
+                    actor_id,
+                    user_id,
+                    WriteCeiling::ReadOnly,
+                    authority,
+                )
+                .await
+            }
+            (ActorCeilingKind::WriteCeiling, Some("write")) => {
+                repo.set_actor_max_write_ceiling(actor_id, user_id, WriteCeiling::Write, authority)
+                    .await
+            }
+            (ActorCeilingKind::WriteCeiling, _) => {
+                return Err(invalid("value must be readonly or write"))
+            }
+            (ActorCeilingKind::HttpVerbCeiling, v) => {
+                let verb = match v {
+                    None => None,
+                    Some("readonly") => Some(WriteCeiling::ReadOnly),
+                    Some("write") => Some(WriteCeiling::Write),
+                    Some(_) => return Err(invalid("value must be readonly, write or null")),
+                };
+                repo.set_actor_http_verb_ceiling(actor_id, user_id, verb, authority)
+                    .await
+            }
+        };
+        match write.map_err(|e| {
+            tracing::error!(error = %e, %actor_id, "graphql: set_actor_ceiling failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })? {
+            talos_actor_repository::CeilingWrite::Changed(_) => Ok(true),
+            talos_actor_repository::CeilingWrite::NoSuchActor => {
+                Err(async_graphql::Error::new("Actor not found").extend_safe())
+            }
+            // Not reached: this mutation proved a second factor above.
+            talos_actor_repository::CeilingWrite::LooseningRefused { .. } => Err(
+                async_graphql::Error::new(talos_capability_world::LOOSENING_NEEDS_SECOND_FACTOR)
+                    .extend_safe(),
+            ),
+        }
     }
 
     async fn revoke_mcp_agent(&self, ctx: &Context<'_>, id: Uuid) -> Result<bool> {

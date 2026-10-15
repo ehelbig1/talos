@@ -148,6 +148,16 @@ impl SystemRepository {
     }
 
     /// Resolve an `agent_roles` row id by exact name.
+    /// A role's id and the capabilities it grants an agent, by name.
+    pub async fn find_role_by_name(&self, role_name: &str) -> Result<Option<(Uuid, Vec<String>)>> {
+        let row: Option<(Uuid, Vec<String>)> =
+            sqlx::query_as("SELECT id, allowed_capabilities FROM agent_roles WHERE name = $1")
+                .bind(role_name)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        Ok(row)
+    }
+
     pub async fn find_role_id_by_name(&self, role_name: &str) -> Result<Option<Uuid>> {
         let role_id: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM agent_roles WHERE name = $1")

@@ -103,7 +103,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     match name {
         "publish_version" => Some(handle_publish_version(req_id, args, state, user_id).await),
         "list_versions" => Some(handle_list_versions(req_id, args, state, user_id).await),

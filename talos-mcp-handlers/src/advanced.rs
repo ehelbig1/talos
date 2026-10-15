@@ -643,7 +643,7 @@ pub async fn dispatch(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-323/324/325/326/327: the deployment-wide admin handlers
     // (`query_paginated`, `set_archive_policy`, `publish_built_in_templates`,
     // plus cross-file siblings) now do their own
@@ -1132,12 +1132,13 @@ mod unreturnable_column_tests {
 /// The two gates a scratch session's `capability_world` must pass, at create
 /// AND at run (2026-09-10): a compilable WIT world (the `is_compilable_world`
 /// + `reject_non_compilable_world` pair `compile_custom_sandbox` applies), and
-/// the agent's ROLE permitting that world (`require_agent_role_permits_world`,
-/// the shared predicate). The actor-ceiling check `compile_custom_sandbox`
+/// the agent's ROLE and the user's own ceiling permitting that world
+/// (`require_world_permitted`, the shared gate). The actor-ceiling check `compile_custom_sandbox`
 /// also runs is keyed on an `agent_id` argument scratch sessions do not take —
 /// no actor is bound, so there is no actor ceiling to consult.
-fn validate_scratch_world(
+async fn validate_scratch_world(
     req_id: &Option<serde_json::Value>,
+    state: &McpState,
     agent: &auth::AgentIdentity,
     world: &str,
 ) -> Result<(), JsonRpcResponse> {
@@ -1156,12 +1157,14 @@ fn validate_scratch_world(
             ),
         ));
     }
-    crate::sandbox::require_agent_role_permits_world(
+    crate::sandbox::require_world_permitted(
         req_id,
+        &state.actor_repo,
         agent,
         world,
         "run scratch-session code in",
     )
+    .await
 }
 
 async fn handle_create_scratch_session(
@@ -1170,7 +1173,7 @@ async fn handle_create_scratch_session(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-169 (2026-05-08): reject whitespace-only session names.
     // Pre-fix `!n.is_empty()` accepted "                " and persisted
     // it in upsert_scratch_session, polluting list_scratch_sessions.
@@ -1251,7 +1254,7 @@ async fn handle_create_scratch_session(
     // compilable WIT world, and one the agent's ROLE permits. Pre-fix any
     // string was accepted and later run at Tier-2 with a permissive write
     // ceiling. The run path re-checks (a stored row may predate this gate).
-    if let Err(resp) = validate_scratch_world(&req_id, &agent, world) {
+    if let Err(resp) = validate_scratch_world(&req_id, state, &agent, world).await {
         return resp;
     }
 
@@ -1280,7 +1283,7 @@ async fn handle_run_scratch_session(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-169 (2026-05-08): reject whitespace-only session names.
     // Pre-fix `!n.is_empty()` accepted "                " and persisted
     // it in upsert_scratch_session, polluting list_scratch_sessions.
@@ -1405,7 +1408,7 @@ async fn handle_run_scratch_session(
     // 2026-09-10: the STORED world is about to be compiled and executed in
     // this process. Re-apply the create-time gates here — the row may predate
     // them, and the gate that matters is the one at the run.
-    if let Err(resp) = validate_scratch_world(&req_id, &agent, &world) {
+    if let Err(resp) = validate_scratch_world(&req_id, state, &agent, &world).await {
         return resp;
     }
 
@@ -2227,6 +2230,21 @@ async fn handle_publish_to_marketplace(
             "Module has no source code and cannot be published to the marketplace",
         );
     }
+    // The host list is frozen onto the listing and copied to every installer,
+    // so it passes the registry's host rules here, once (security review
+    // 2026-10-14, G-24); a `*` is the installer's to decide, never the
+    // publisher's to hand out.
+    if talos_capability_world::grant_list_has_wildcard(&snapshot.allowed_hosts) {
+        return mcp_denied(
+            req_id,
+            -32003,
+            "A module whose allowed_hosts include '*' cannot be published: every installer \
+             would inherit unrestricted egress. Name the hosts it calls.",
+        );
+    }
+    if let Err(msg) = talos_registry::validate_allowed_hosts(&snapshot.allowed_hosts) {
+        return mcp_error(req_id, -32602, &msg);
+    }
     // The listed world is the one the BYTES import, not the row's label.
     let capability_world = marketplace_world(&snapshot.wasm_bytes, &snapshot.capability_world);
 
@@ -2389,7 +2407,7 @@ async fn handle_install_from_marketplace(
     state: &McpState,
     agent: &auth::AgentIdentity,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let listing_id = match crate::utils::require_uuid(args, "listing_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -2441,12 +2459,41 @@ async fn handle_install_from_marketplace(
             "Marketplace listing's bytes are not a recognised Talos component — refusing to install",
         );
     }
-    if let Err(resp) = crate::sandbox::require_agent_role_permits_world(
+    if let Err(resp) = crate::sandbox::require_world_permitted(
         &req_id,
+        &state.actor_repo,
         agent,
         &world,
         "install a marketplace module for",
-    ) {
+    )
+    .await
+    {
+        return resp;
+    }
+    // The installer's own secret grant to another publisher's code: exact
+    // paths only — no `*` from a bearer token on any listing, no `/*` prefix
+    // on a third-party one — and within the per-user module quota the catalog
+    // install applies (security review 2026-10-14, G-24).
+    if talos_capability_world::grant_list_has_wildcard(&installer_secrets) {
+        return mcp_denied(
+            req_id,
+            -32003,
+            talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR,
+        );
+    }
+    if listing.publisher_id != talos_advanced_repository::SYSTEM_PUBLISHER_ID
+        && installer_secrets.iter().any(|e| e.ends_with("/*"))
+    {
+        return mcp_denied(
+            req_id,
+            -32003,
+            "A module from another publisher is granted exact secret paths only, not a '/*' \
+             prefix.",
+        );
+    }
+    if let Some(resp) =
+        crate::modules::refuse_over_module_quota(req_id.clone(), state, user_id).await
+    {
         return resp;
     }
     let grants = src.grants_for_installer(installer_secrets);
@@ -2758,15 +2805,6 @@ async fn handle_star_module(
         Ok(id) => id,
         Err(resp) => return resp,
     };
-
-    // Reject nil user_id — agents without a bound user cannot own a star.
-    if user_id == uuid::Uuid::nil() {
-        return mcp_error(
-            req_id,
-            -32600,
-            "Agent must have a bound user_id to star modules",
-        );
-    }
 
     // Verify the listing exists and is public before touching the stars table.
     let listing_exists = state.advanced_repo.check_listing_exists(listing_id).await;

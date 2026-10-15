@@ -61,8 +61,13 @@ pub struct AgentIdentity {
     pub name: String,
     pub role_name: String,
     pub allowed_capabilities: Vec<String>,
-    /// Optional user ID for scoping agent operations to a specific user.
-    pub user_id: Option<Uuid>,
+    /// The user every operation of this agent is scoped to. Never absent: an
+    /// agent row with no user (`mcp_agents.user_id` is nullable — a deleted
+    /// user's agents keep their rows) is refused before an identity is built,
+    /// so no handler can act as a nil tenant (security review 2026-10-14,
+    /// D-7 / A-21). Until then this was `Option<Uuid>` and handlers spelled
+    /// its absence `unwrap_or_else(Uuid::nil)`.
+    pub user_id: Uuid,
 }
 
 impl AgentIdentity {
@@ -485,11 +490,12 @@ fn check_mcp_auth_rate_limit(ip: &str) -> Result<(), ()> {
     }
 }
 
-/// Refuse an authenticated agent whose `mcp_agents.user_id` is NULL
-/// (2026-09-10).
+/// The refusal of an authenticated agent whose `mcp_agents.user_id` is NULL
+/// (2026-09-10). Since 2026-10-15 (D-7) it is returned where the identity
+/// would be built, so an [`AgentIdentity`] without a user cannot exist.
 ///
-/// `user_id` is nullable and ~45 handler sites spell the absence
-/// `agent.user_id.unwrap_or_else(Uuid::nil)`. Downstream, the nil UUID is
+/// `user_id` is nullable, and until then ~45 handler sites spelled its
+/// absence `agent.user_id`. Downstream, the nil UUID is
 /// not "no tenant": it is a tenant that owns nothing and matches the shared
 /// catalog (`user_id IS NULL OR user_id = $1`), that every per-user gate
 /// (`is_platform_admin`, ownership predicates, budgets) answers `false`/empty
@@ -501,21 +507,18 @@ fn check_mcp_auth_rate_limit(ip: &str) -> Result<(), ()> {
 /// reaches this function. The reply is the uniform denial (no hint whether
 /// the token, the agent or its scope was the problem); the agent id goes to
 /// the log where an operator can act on it.
-fn refuse_unscoped_agent(agent: &AgentIdentity) -> Result<(), Response> {
-    if agent.user_id.is_some() {
-        return Ok(());
-    }
+fn unscoped_agent_refusal(agent_id: Uuid, agent_name: &str, role_name: &str) -> Response {
     tracing::warn!(
         target: "talos_audit",
         event_kind = "mcp_agent_unscoped_refused",
-        agent_id = %agent.agent_id,
-        agent_name = %agent.name,
-        role = %agent.role_name,
+        agent_id = %agent_id,
+        agent_name = %agent_name,
+        role = %role_name,
         "MCP agent has no user_id (mcp_agents.user_id IS NULL); refusing the authenticated \
          request. Bind the agent to a user before it can call tools."
     );
     let body = talos_mcp::mcp_denied(None, -32001, "Unauthorized: agent is not bound to a user");
-    Err((
+    (
         StatusCode::FORBIDDEN,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_else(|_| {
@@ -523,7 +526,7 @@ fn refuse_unscoped_agent(agent: &AgentIdentity) -> Result<(), Response> {
                 .to_string()
         }),
     )
-        .into_response())
+        .into_response()
 }
 
 /// Why one `/mcp` request was refused before it reached a handler.
@@ -893,7 +896,8 @@ async fn authenticate_mcp_request(
             // which is well within product expectations and matches the
             // equivalent JWT `last_seen_at` patterns elsewhere in the
             // codebase.
-            refuse_unscoped_agent(&agent).map_err(McpAuthRefusal::UnscopedAgent)?;
+            // A cached identity always has a user: one without is never
+            // built, so never cached (D-7).
             return Ok(agent);
         }
     }
@@ -953,12 +957,21 @@ async fn authenticate_mcp_request(
         return Err(McpAuthRefusal::InvalidToken);
     }
 
+    // 4a. An agent with NO user scope is refused here, before an identity
+    // exists: `AgentIdentity.user_id` is not optional (D-7).
+    let Some(user_id) = r.user_id else {
+        return Err(McpAuthRefusal::UnscopedAgent(unscoped_agent_refusal(
+            r.id,
+            &r.name,
+            &r.role_name,
+        )));
+    };
     let identity = AgentIdentity {
         agent_id: r.id,
         name: r.name,
         role_name: r.role_name,
         allowed_capabilities: r.allowed_capabilities,
-        user_id: r.user_id,
+        user_id,
     };
     // Validate capabilities at auth time — unknown strings are logged as
     // warnings so operators catch typos before they cause silent access denials.
@@ -1016,9 +1029,6 @@ async fn authenticate_mcp_request(
 
     let agent = identity;
 
-    // 4a. An agent with NO user scope is refused on the authenticated path.
-    refuse_unscoped_agent(&agent).map_err(McpAuthRefusal::UnscopedAgent)?;
-
     // 4b. Lazy user-row upsert — ensures FK-constrained writes succeed.
     //
     // On fresh deployments the mcp_agents.user_id UUID may not yet have a
@@ -1030,7 +1040,8 @@ async fn authenticate_mcp_request(
     //
     // This MUST be awaited (not spawned) so the row exists before the handler
     // attempts any FK-constrained INSERT.
-    if let Some(uid) = agent.user_id {
+    {
+        let uid = agent.user_id;
         // Build a deterministic, globally-unique synthetic email.
         // Using the full UUID guarantees no collision with other MCP users.
         let synthetic_email = format!("mcp-{}@system.internal", uid);
@@ -1642,7 +1653,7 @@ mod bcrypt_cache_invalidation_tests {
             name: "test-agent".to_string(),
             role_name: "developer".to_string(),
             allowed_capabilities: vec!["minimal".to_string()],
-            user_id: None,
+            user_id: Uuid::new_v4(),
         }
     }
 

@@ -12,7 +12,7 @@
 //!   provenance (correlation of memory relevance with judge outcome). Read-only.
 
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_denied, mcp_error, mcp_text};
+use super::utils::{mcp_error, mcp_text};
 use super::McpState;
 use serde_json::Value;
 use std::sync::Arc;
@@ -60,13 +60,7 @@ pub async fn dispatch(
     if tool_name != "run_memory_ab_eval" && tool_name != "memory_grounding_report" {
         return None;
     }
-    let Some(user_id) = agent.user_id else {
-        return Some(mcp_denied(
-            req_id,
-            -32000,
-            "memory evaluation tools require a user-bound agent identity",
-        ));
-    };
+    let user_id = agent.user_id;
     match tool_name {
         "run_memory_ab_eval" => Some(handle_run_ab_eval(req_id, args, state, user_id).await),
         "memory_grounding_report" => {

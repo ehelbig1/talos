@@ -211,6 +211,22 @@ fn catalog_install_record(
     ("module_reinstalled_from_catalog", summary, details)
 }
 
+/// The refusal of a module grant write that would put `*` in
+/// `allowed_secrets` or `allowed_hosts` for a bearer credential
+/// ([`talos_capability_world::grant_list_has_wildcard`]). Returned as the
+/// error of the `update_module_allowed_*` writers; nothing was written. A
+/// surface downcasts it to answer with its own refusal code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WildcardGrantRefused;
+
+impl std::fmt::Display for WildcardGrantRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR)
+    }
+}
+
+impl std::error::Error for WildcardGrantRefused {}
+
 /// What a recorded module-permission change replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModulePermissionChange {
@@ -4293,10 +4309,12 @@ impl ModuleRepository {
         user_id: Uuid,
         allowed_secrets: &[String],
         beyond: BeyondGrant<'_>,
+        authority: talos_capability_world::ChangeAuthority,
     ) -> Result<Option<ModulePermissionChange>> {
         self.set_module_permission_recorded(
             module_id,
             user_id,
+            authority,
             ModulePermission::Secrets,
             allowed_secrets,
             beyond,
@@ -4313,10 +4331,12 @@ impl ModuleRepository {
         user_id: Uuid,
         allowed_hosts: &[String],
         beyond: BeyondGrant<'_>,
+        authority: talos_capability_world::ChangeAuthority,
     ) -> Result<Option<ModulePermissionChange>> {
         self.set_module_permission_recorded(
             module_id,
             user_id,
+            authority,
             ModulePermission::Hosts,
             allowed_hosts,
             beyond,
@@ -4332,10 +4352,12 @@ impl ModuleRepository {
         user_id: Uuid,
         allowed_methods: &[String],
         beyond: BeyondGrant<'_>,
+        authority: talos_capability_world::ChangeAuthority,
     ) -> Result<Option<ModulePermissionChange>> {
         self.set_module_permission_recorded(
             module_id,
             user_id,
+            authority,
             ModulePermission::Methods,
             allowed_methods,
             beyond,
@@ -4350,14 +4372,28 @@ impl ModuleRepository {
     /// detached task after the update had committed and could not say what
     /// was replaced — these are REPLACE-style writes, so a flip-use-revert of
     /// a grant left no durable trace whenever that task failed.
+    ///
+    /// A `*` in `allowed_secrets` or `allowed_hosts` is written only for an
+    /// `authority` that may loosen; for a bearer credential the answer is the
+    /// error [`WildcardGrantRefused`] and nothing is read or written. Every
+    /// write that ADDS an entry is logged `module_grant_widened` on
+    /// `talos_audit`, naming the entries added — paths and hosts, never a
+    /// value (security review 2026-10-14, A-2 / G-23).
     async fn set_module_permission_recorded(
         &self,
         module_id: Uuid,
         user_id: Uuid,
+        authority: talos_capability_world::ChangeAuthority,
         which: ModulePermission,
         new: &[String],
         beyond: BeyondGrant<'_>,
     ) -> Result<Option<ModulePermissionChange>> {
+        if !authority.may_loosen()
+            && matches!(which, ModulePermission::Secrets | ModulePermission::Hosts)
+            && talos_capability_world::grant_list_has_wildcard(new)
+        {
+            return Err(WildcardGrantRefused.into());
+        }
         let mut tx = self.db_pool.begin().await?;
         let locked: Option<(Vec<String>, Vec<String>)> = sqlx::query_as(which.lock_sql())
             .bind(module_id)
@@ -4397,6 +4433,19 @@ impl ModuleRepository {
         )
         .await?;
         tx.commit().await?;
+        let added: Vec<&String> = new.iter().filter(|e| !previous.contains(e)).collect();
+        if !added.is_empty() {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "module_grant_widened",
+                %user_id,
+                %module_id,
+                column,
+                added = ?added,
+                authority = ?authority,
+                "a module grant was widened"
+            );
+        }
         Ok(Some(ModulePermissionChange {
             previous,
             owner_added,

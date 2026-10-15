@@ -478,7 +478,7 @@ async fn handle_list_templates(
     // sees the shared catalog alone.
     let templates = match state
         .registry
-        .list_template_metadata_for_user(agent.user_id.unwrap_or_else(uuid::Uuid::nil), None)
+        .list_template_metadata_for_user(agent.user_id, None)
         .await
     {
         Ok(t) => t,
@@ -576,7 +576,7 @@ async fn handle_list_modules(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // Optional substring filter — escaped (backslash first) so `%`/`_` in
     // caller input match literally, then wrapped for ILIKE.
     let name_like = args
@@ -671,7 +671,7 @@ async fn handle_delete_module(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let mod_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -786,7 +786,7 @@ async fn handle_cleanup_modules(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-177 (2026-05-08): bring cleanup_modules' safety in line with
     // cleanup_workflows. Pre-fix:
     //  - empty-string prefix `""` reached the SQL repo and deleted ALL
@@ -932,7 +932,7 @@ async fn handle_get_module_info(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // module_id (UUID) or module_name (case-insensitive exact) — previously
     // id-only, which forced a full list_modules pull to look up one module.
     let module_id = if args.get("module_id").is_some() {
@@ -1415,7 +1415,7 @@ async fn handle_test_secret_access(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -1777,7 +1777,7 @@ async fn handle_cleanup_module_versions(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-175 / MCP-213 (2026-05-08): trim BEFORE the SQL LIKE pattern
     // is built. The pre-MCP-175 fix only used trim() in the emptiness
     // check; the un-trimmed value still flowed into the SQL pattern,
@@ -2138,7 +2138,7 @@ async fn handle_list_module_usage(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -2214,7 +2214,7 @@ async fn handle_find_unreferenced_modules(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // Mirror N-J pattern (workflows.rs handle_list_workflows): a missing
     // arg defaults; a present-but-invalid arg fails fast with -32602.
     // Pre-fix, `days: 0` silently clamped to 1 and the response carried
@@ -2303,7 +2303,7 @@ async fn handle_batch_delete_modules(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-250 (2026-05-08): dedup module_ids upfront. MCP-249 family.
     let module_ids: Vec<uuid::Uuid> = match args.get("module_ids").and_then(|v| v.as_array()) {
         Some(arr) => {
@@ -2553,7 +2553,7 @@ async fn handle_rename_module(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -2626,7 +2626,7 @@ async fn handle_get_module_history(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -2766,7 +2766,7 @@ async fn handle_get_module_source(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
@@ -2811,7 +2811,7 @@ async fn handle_get_module_dependents(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
@@ -2928,7 +2928,7 @@ async fn handle_get_module_compatibility(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
@@ -3050,7 +3050,7 @@ async fn handle_set_module_rate_limit(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -3129,7 +3129,7 @@ async fn handle_get_module_rate_limit(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -3193,7 +3193,7 @@ async fn handle_share_module_with_org(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -3244,7 +3244,7 @@ async fn handle_list_org_modules(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     let org_id = match crate::utils::require_uuid(args, "org_id", req_id.clone()) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -4415,7 +4415,7 @@ async fn handle_list_module_catalog(
     // step, and there is no partial answer to give.
     let visible = match state
         .module_repo
-        .list_visible_module_ids(agent.user_id.unwrap_or_else(uuid::Uuid::nil))
+        .list_visible_module_ids(agent.user_id)
         .await
     {
         Ok(v) => v,
@@ -5015,6 +5015,49 @@ pub(crate) fn registry_catalog_items(
     items
 }
 
+/// The per-user installed-module quota, shared by the catalog and the
+/// marketplace install (the marketplace counted nothing until 2026-10-14,
+/// G-24). `Some` is the refusal.
+pub(crate) async fn refuse_over_module_quota(
+    req_id: Option<serde_json::Value>,
+    state: &McpState,
+    user_id: uuid::Uuid,
+) -> Option<JsonRpcResponse> {
+    // Enforce per-user installed module limit to prevent storage exhaustion.
+    // MCP-368 (2026-05-11): pre-fix `.unwrap_or(0)` silently bypassed
+    // the cap on any DB error — count = 0 < 500, the install proceeded
+    // past the gate. Fail-CLOSED on quota errors. Same MCP-366/367
+    // family applied to the install_module_from_catalog quota.
+    const MAX_INSTALLED_MODULES_PER_USER: i64 = 500;
+    let module_count = match state.module_repo.count_user_modules(user_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "count_user_modules (module quota) failed; refusing install to avoid silent cap bypass"
+            );
+            return Some(mcp_error(
+                req_id,
+                -32000,
+                "Module quota check failed (database error). Refusing install to avoid silent cap bypass; retry after the database recovers.",
+            ));
+        }
+    };
+    if module_count >= MAX_INSTALLED_MODULES_PER_USER {
+        return Some(mcp_error(
+            req_id,
+            -32602,
+            &format!(
+                "Installed module limit reached ({} / {}). Delete unused modules with \
+                 delete_module before installing new ones.",
+                module_count, MAX_INSTALLED_MODULES_PER_USER
+            ),
+        ));
+    }
+    None
+}
+
 async fn handle_install_module_from_catalog(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -5041,39 +5084,10 @@ async fn handle_install_module_from_catalog(
         Err(reason) => return mcp_error(req_id, -32602, &reason),
     };
 
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
-    // Enforce per-user installed module limit to prevent storage exhaustion.
-    // MCP-368 (2026-05-11): pre-fix `.unwrap_or(0)` silently bypassed
-    // the cap on any DB error — count = 0 < 500, the install proceeded
-    // past the gate. Fail-CLOSED on quota errors. Same MCP-366/367
-    // family applied to the install_module_from_catalog quota.
-    const MAX_INSTALLED_MODULES_PER_USER: i64 = 500;
-    let module_count = match state.module_repo.count_user_modules(user_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(
-                user_id = %user_id,
-                error = %e,
-                "count_user_modules (module quota) failed; refusing install to avoid silent cap bypass"
-            );
-            return mcp_error(
-                req_id,
-                -32000,
-                "Module quota check failed (database error). Refusing install to avoid silent cap bypass; retry after the database recovers.",
-            );
-        }
-    };
-    if module_count >= MAX_INSTALLED_MODULES_PER_USER {
-        return mcp_error(
-            req_id,
-            -32602,
-            &format!(
-                "Installed module limit reached ({} / {}). Delete unused modules with \
-                 delete_module before installing new ones.",
-                module_count, MAX_INSTALLED_MODULES_PER_USER
-            ),
-        );
+    if let Some(resp) = refuse_over_module_quota(req_id.clone(), state, user_id).await {
+        return resp;
     }
 
     // What the key names. A shared catalog row that names a registry
@@ -5195,12 +5209,15 @@ async fn handle_install_module_from_catalog(
     // refuses a role lacking that capability; this surface refused nothing, so
     // an `["http"]`-role agent could install and then run an automation-node
     // module. One shared predicate, same refusal.
-    if let Err(resp) = crate::sandbox::require_agent_role_permits_world(
+    if let Err(resp) = crate::sandbox::require_world_permitted(
         &req_id,
+        &state.actor_repo,
         &agent,
         capability_world,
         "install a catalog module for",
-    ) {
+    )
+    .await
+    {
         return resp;
     }
 
@@ -5559,7 +5576,7 @@ async fn handle_install_module_from_catalog(
     let install_result = match state
         .module_repo
         .install_catalog_copy(
-            agent.user_id,
+            Some(agent.user_id),
             &display_name,
             cw_short,
             artifact,
@@ -5618,19 +5635,16 @@ async fn handle_install_module_from_catalog(
         Err(resp) => return resp,
     };
     let (pinned, pin_warning) = if pin_module {
-        if let Some(uid) = agent.user_id {
-            match state.module_repo.pin_user_module(uid, &display_name).await {
-                Ok(_) => (true, None),
-                Err(e) => {
-                    tracing::warn!(module_name = %display_name, "Failed to pin module: {:#}", e);
-                    (false, Some("Pin failed — user_module_pins table may not exist yet. Run migrations to enable module pinning."))
-                }
+        match state
+            .module_repo
+            .pin_user_module(agent.user_id, &display_name)
+            .await
+        {
+            Ok(_) => (true, None),
+            Err(e) => {
+                tracing::warn!(module_name = %display_name, "Failed to pin module: {:#}", e);
+                (false, Some("Pin failed — user_module_pins table may not exist yet. Run migrations to enable module pinning."))
             }
-        } else {
-            (
-                false,
-                Some("Cannot pin: agent is not linked to a user account"),
-            )
         }
     } else {
         (false, None)
@@ -5752,10 +5766,7 @@ async fn handle_restore_pinned_modules(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = match agent.user_id {
-        Some(uid) => uid,
-        None => return mcp_denied(req_id, -32000, "User identity required"),
-    };
+    let user_id = agent.user_id;
 
     // Fetch pinned modules and whether WASM is currently present
     let rows = match state.module_repo.list_user_pinned_modules(user_id).await {
@@ -5925,7 +5936,7 @@ async fn handle_find_module_alternatives(
     // Pre-fix this handler took no `agent` at all — which is why the four
     // repository calls could not have been scoped even if someone had
     // noticed: the tenant was not in the room.
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
     // MCP-354 (2026-05-11): pre-fix `s.chars().take(N).collect()`
     // silently truncated operator-provided search keys — a 300-char
     // `module_name` was queried as the first 200 chars, and the
@@ -6616,7 +6627,7 @@ async fn handle_get_catalog_status(
     state: &McpState,
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let user_id = agent.user_id;
 
     // Mode: OCI sync owns the DB catalog when TALOS_REGISTRY_URL is set
     // (empty string treated as unset — the MCP-598 footgun).

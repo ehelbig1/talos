@@ -224,13 +224,26 @@ fn every_ceiling_reader_calls_the_one_home() {
     assert!(!repo.contains("pub async fn read_user_grant_world("));
     assert!(!repo.contains("get_user_max_capability_world"));
     // Exact call counts, not presence: `talos-api/src/schema/actors/mutations.rs`
-    // holds TWO gates (createActor, updateActor), so a presence check stays
-    // green when one of them is reverted.
+    // holds THREE gates (createActor, updateActor, and registerMcpAgent's
+    // role-against-ceiling check, security review 2026-10-14 G-3), so a
+    // presence check stays green when one of them is reverted.
     for (path, src, expected) in [
         (
             "talos-api actors",
             include_str!("../../talos-api/src/schema/actors/mutations.rs"),
-            2,
+            3,
+        ),
+        // G-3: the module surfaces' one gate (role AND user ceiling) and the
+        // template install.
+        (
+            "talos-mcp-handlers sandbox (require_world_permitted)",
+            include_str!("../../talos-mcp-handlers/src/sandbox.rs"),
+            1,
+        ),
+        (
+            "talos-api modules (createModuleFromTemplate)",
+            include_str!("../../talos-api/src/schema/modules/mutations.rs"),
+            1,
         ),
         (
             "talos-api platform mutations",

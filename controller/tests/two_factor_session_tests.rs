@@ -495,9 +495,14 @@ async fn the_capability_bootstrap_runs_once() {
         "http-node"
     );
     assert!(matches!(
-        repo.delete_capability_grant(first, other, None)
-            .await
-            .unwrap(),
+        repo.delete_capability_grant(
+            first,
+            other,
+            None,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
+        .await
+        .unwrap(),
         CapabilityGrantRevocation::Revoked { .. }
     ));
 
@@ -662,8 +667,18 @@ async fn a_user_cannot_widen_their_own_ceiling_by_revoking_it() {
         "governance-node"
     );
 
-    // Control: an admin may remove the restricted grant.
-    let resp = ctx.schema.execute(revoke(admin, user)).await;
+    // Control: an admin may remove the restricted grant — with a second
+    // factor, since removing it widens the user (2026-10-14, G-4;
+    // `ceiling_loosening_tests` covers the refusals).
+    sqlx::query("UPDATE users SET totp_enabled = true WHERE id = $1")
+        .bind(admin)
+        .execute(&ctx.db_pool)
+        .await
+        .unwrap();
+    let resp = ctx
+        .schema
+        .execute(revoke(admin, user).data(SecondFactorVerified(true)))
+        .await;
     assert!(resp.errors.is_empty(), "{:?}", resp.errors);
     assert_eq!(
         repo.user_capability_ceiling(user).await.unwrap(),
