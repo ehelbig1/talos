@@ -187,7 +187,7 @@ export default function ActorDetail() {
 
       {/* Content Area */}
       <div className="flex-1 overflow-auto custom-scrollbar relative z-10">
-        <div className="max-w-7xl mx-auto px-8 py-8">
+        <div className="max-w-7xl mx-auto px-6 md:px-8 py-8">
           {activeTab === "summary" && (
             <SummaryPanel
               actor={actor}

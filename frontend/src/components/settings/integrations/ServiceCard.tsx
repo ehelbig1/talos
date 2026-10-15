@@ -71,8 +71,8 @@ export function ServiceCard({
       data-provider-id={providerId}
       className="bg-surface-3/30 border border-white/5 rounded-2xl p-6 transition-ui hover:border-white/10 group relative overflow-hidden flex flex-col h-full"
     >
-      <div className="flex items-start justify-between mb-8 relative z-10">
-        <div className="flex items-center gap-5">
+      <div className="flex items-start justify-between gap-3 mb-8 relative z-10">
+        <div className="flex items-center gap-5 min-w-0">
           <div
             className="w-14 h-14 rounded-2xl flex items-center justify-center text-white transition-ui"
             style={{
@@ -100,7 +100,7 @@ export function ServiceCard({
             <Plus size={18} />
           </button>
         ) : (
-          <span className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider px-3 py-1.5 border border-white/5 rounded-xl">
+          <span className="shrink-0 whitespace-nowrap text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider px-3 py-1.5 border border-white/5 rounded-xl">
             Coming soon
           </span>
         )}

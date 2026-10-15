@@ -195,7 +195,7 @@ export function ActorCard({
       </div>
 
       {/* Controller Actions */}
-      <div className="mt-auto pt-6 border-t border-white/5 flex items-center justify-between gap-4 relative z-10">
+      <div className="mt-auto pt-6 border-t border-white/5 flex flex-wrap items-center justify-between gap-3 relative z-10">
         <span className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
           Created{" "}
           <span className="text-white/50">{relativeTime(actor.createdAt)}</span>
