@@ -479,29 +479,13 @@ export default function Catalog() {
           onClose={() => setInstallTemplate(null)}
         />
       )}
-      <div className="px-10 pb-20 animate-in fade-in slide-in-from-bottom-4 duration-700">
-        {/* Header / Toolbar */}
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-8 mb-12">
-          <div className="flex items-center gap-6">
-            <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center relative">
-              <div className="absolute inset-0 bg-primary/5 rounded-full blur-xl animate-pulse" />
-              <Layers className="w-6 h-6 text-primary relative z-10" />
-            </div>
-            <div>
-              <h1 className="text-3xl font-semibold text-white tracking-tight font-outfit leading-none mb-1.5">
-                Templates
-              </h1>
-              <div className="flex items-center gap-3">
-                <span className="text-xs font-semibold text-primary/60">
-                  {isLoading
-                    ? "Loading…"
-                    : `${templates.length} template${templates.length !== 1 ? "s" : ""}`}
-                </span>
-                <div className="w-1.5 h-1.5 rounded-full bg-primary animate-status-pulse" />
-              </div>
-            </div>
-          </div>
-
+      <div className="pb-20">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
+          <p className="text-sm text-muted-foreground">
+            {isLoading
+              ? "Loading…"
+              : `${templates.length} template${templates.length !== 1 ? "s" : ""}`}
+          </p>
           {/* Search */}
           <div className="relative group/search flex-1 md:flex-none">
             <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within/search:opacity-100 transition-premium pointer-events-none" />

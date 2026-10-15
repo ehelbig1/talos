@@ -46,6 +46,7 @@ export { InfoTip } from "./InfoTip";
 export { Modal } from "./Modal";
 export { ModalHeader } from "./ModalHeader";
 export { NoteBox } from "./NoteBox";
+export { PageContainer } from "./PageContainer";
 export { PageHeader } from "./PageHeader";
 export { Section } from "./Section";
 export { SectionHeader } from "./SectionHeader";

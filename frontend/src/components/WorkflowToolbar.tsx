@@ -39,15 +39,43 @@ import { userFacingErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
 
 // Sub-components
-import { ToolbarGroup } from "./toolbar/ToolbarGroup";
 import { WorkflowStatus } from "./toolbar/WorkflowStatus";
-import { ResourceStats } from "./toolbar/ResourceStats";
 
 const CreateModuleDialog = lazy(() => import("./CreateModuleDialog"));
 const AddExistingNodeDialog = lazy(() => import("./AddExistingNodeDialog"));
 const TestWorkflowModal = lazy(() =>
   import("./TestWorkflowModal").then((m) => ({ default: m.TestWorkflowModal })),
 );
+
+/** A toolbar action: icon always, label from 2xl up, name for assistive tech always. */
+function ToolbarButton({
+  label,
+  icon: Icon,
+  iconClassName,
+  variant = "outline",
+  ...rest
+}: {
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+  iconClassName?: string;
+  variant?: "outline" | "premium";
+} & Pick<React.ComponentProps<typeof Button>, "onClick" | "disabled">) {
+  return (
+    <Button
+      variant={variant}
+      size="sm"
+      aria-label={label}
+      title={label}
+      className="h-8 px-2.5 2xl:px-3 rounded-lg"
+      {...rest}
+    >
+      <Icon className={cn("w-3.5 h-3.5", iconClassName)} />
+      <span className="hidden 2xl:inline">{label}</span>
+    </Button>
+  );
+}
+
+const Divider = () => <div className="w-px h-6 bg-white/10 mx-1" aria-hidden />;
 
 type ToolbarModalState =
   | { kind: "none" }
@@ -60,8 +88,19 @@ type ToolbarModalState =
   | { kind: "publish"; desc: string };
 
 export const WorkflowToolbar = memo(function WorkflowToolbar() {
-  const [modal, setModal] = useState<ToolbarModalState>({ kind: "none" });
-  const closeModal = useCallback(() => setModal({ kind: "none" }), []);
+  const [localModal, setModal] = useState<ToolbarModalState>({
+    kind: "none",
+  });
+  // A request from elsewhere (the empty canvas) is read from the store and
+  // cleared on close, so no effect has to copy it into local state.
+  const toolbarModalRequest = useUIStore((s) => s.toolbarModal);
+  const modal: ToolbarModalState = toolbarModalRequest
+    ? { kind: toolbarModalRequest }
+    : localModal;
+  const closeModal = useCallback(() => {
+    setModal({ kind: "none" });
+    useUIStore.getState().setToolbarModal(null);
+  }, []);
 
   const nameInputRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
@@ -90,11 +129,10 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
   );
 
   // UI Store
-  const { showInspector, setShowInspector, toolbarModalRequest } = useUIStore(
+  const { showInspector, setShowInspector } = useUIStore(
     useShallow((s) => ({
       showInspector: s.showInspector,
       setShowInspector: s.setShowInspector,
-      toolbarModalRequest: s.toolbarModal,
     })),
   );
 
@@ -102,17 +140,6 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
   const runStatus = usePersistedExecutionStore((s: PersistedSlice) =>
     workflowId ? s.workflowStatuses[workflowId] : undefined,
   );
-
-  // External triggers for modals (from Workspace empty state)
-  useEffect(() => {
-    if (toolbarModalRequest === "addExisting") {
-      setModal({ kind: "addExisting" });
-      useUIStore.getState().setToolbarModal(null);
-    } else if (toolbarModalRequest === "create") {
-      setModal({ kind: "create" });
-      useUIStore.getState().setToolbarModal(null);
-    }
-  }, [toolbarModalRequest]);
 
   // Mutations
   const publishVersionMutation = usePublishWorkflowVersionMutation({
@@ -237,16 +264,14 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
 
   return (
     <div
-      className="bg-surface-1/60 backdrop-blur-xl border-b border-white/5 px-6 py-3 flex items-center gap-8 shrink-0 sticky top-0 z-40 shadow-2xl relative group"
+      className="flex items-center gap-2 flex-wrap"
       role="toolbar"
-      aria-label="Workflow Construction Tools"
+      aria-label="Workflow tools"
     >
-      <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-50" />
-
       {/* Dialogs */}
       <ConfirmDialog
         open={modal.kind === "confirmClear"}
-        title="New Workflow"
+        title="New workflow?"
         message="Clear the current workflow? Unsaved changes will be lost."
         confirmLabel="Clear"
         destructive
@@ -259,8 +284,8 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
 
       <ConfirmDialog
         open={modal.kind === "confirmDelete"}
-        title="Delete Workflow"
-        message={`Permanently delete "${workflowName}"? This cannot be undone.`}
+        title="Delete workflow?"
+        message={`“${workflowName}” and its run history will be deleted. This cannot be undone.`}
         confirmLabel="Delete"
         destructive
         onConfirm={() => {
@@ -292,7 +317,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
                 if (e.key === "Enter") handleNameDialogConfirm();
                 if (e.key === "Escape") closeModal();
               }}
-              placeholder="Workflow Identifier..."
+              placeholder="Workflow name"
               className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10 shadow-inner"
             />
           </div>
@@ -302,7 +327,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
               onClick={closeModal}
               className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
             >
-              Abort
+              Cancel
             </Button>
             <Button
               variant="premium"
@@ -382,118 +407,80 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
         </div>
       </Dialog>
 
-      {/* Build tools */}
-      <ToolbarGroup label="Add">
-        <Button variant="outline" size="sm" onClick={handleNew}>
-          <PlusCircle className="w-3.5 h-3.5 mr-2" />
-          New
-        </Button>
+      <WorkflowStatus isDirty={isDirty} runStatus={runStatus} />
 
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setModal({ kind: "addExisting" })}
-        >
-          <FolderPlus className="w-3.5 h-3.5 mr-2" />
-          From library
-        </Button>
+      <ToolbarButton label="New" icon={PlusCircle} onClick={handleNew} />
+      <ToolbarButton
+        label="Add from library"
+        icon={FolderPlus}
+        onClick={() => setModal({ kind: "addExisting" })}
+      />
+      <ToolbarButton
+        label="New module"
+        icon={Zap}
+        onClick={() => setModal({ kind: "create" })}
+      />
+      <ControlFlowMenu onClose={closeModal} />
 
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setModal({ kind: "create" })}
-        >
-          <Zap className="w-3.5 h-3.5 mr-2" />
-          New module
-        </Button>
+      <Divider />
 
-        <div className="pt-0.5">
-          <ControlFlowMenu onClose={closeModal} />
-        </div>
-      </ToolbarGroup>
-
-      <div className="w-[1px] h-8 bg-white/5 mx-2" />
-
-      {/* Deployment tools */}
-      <ToolbarGroup label="Workflow">
-        <Button
-          variant={isSaving || nodeCount === 0 ? "outline" : "premium"}
-          size="sm"
-          onClick={handleSaveWithName}
-          disabled={isSaving || nodeCount === 0}
-        >
-          {isSaving ? (
-            <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
-          ) : (
-            <Save className="w-3.5 h-3.5 mr-2" />
-          )}
-          {isSaving ? "Saving…" : "Save"}
-        </Button>
-
-        {workflowId && !isDirty && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setModal({ kind: "publish", desc: "" })}
-          >
-            <Tag className="w-3.5 h-3.5 mr-2" />
-            Publish version
-          </Button>
-        )}
-
-        {workflowId && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setModal({ kind: "test" })}
-          >
-            <Play className="w-3.5 h-3.5 mr-2" />
-            Test
-          </Button>
-        )}
-
-        {workflowId && (
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setModal({ kind: "confirmDelete" })}
-            className="text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10"
-            aria-label="Delete workflow"
-          >
-            <Trash2 className="w-4 h-4" />
-          </Button>
-        )}
-      </ToolbarGroup>
-
-      {/* Global state & Telemetry */}
-      <div className="ml-auto flex items-center gap-6">
-        <WorkflowStatus
-          name={workflowName}
-          isDirty={isDirty}
-          runStatus={runStatus}
+      <ToolbarButton
+        label={isSaving ? "Saving…" : "Save"}
+        icon={isSaving ? Loader2 : Save}
+        iconClassName={isSaving ? "animate-spin" : undefined}
+        variant={isDirty && nodeCount > 0 && !isSaving ? "premium" : "outline"}
+        onClick={handleSaveWithName}
+        disabled={isSaving || nodeCount === 0}
+      />
+      {workflowId && !isDirty && (
+        <ToolbarButton
+          label="Publish version"
+          icon={Tag}
+          onClick={() => setModal({ kind: "publish", desc: "" })}
         />
+      )}
+      {workflowId && (
+        <ToolbarButton
+          label="Test"
+          icon={Play}
+          onClick={() => setModal({ kind: "test" })}
+        />
+      )}
+      {workflowId && (
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => setModal({ kind: "confirmDelete" })}
+          className="h-8 w-8 rounded-lg text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10"
+          aria-label="Delete workflow"
+          title="Delete workflow"
+        >
+          <Trash2 className="w-4 h-4" />
+        </Button>
+      )}
 
-        <div className="w-[1px] h-10 bg-white/5" />
+      <Divider />
 
-        <div className="flex items-center gap-3">
-          <Button
-            variant={showInspector ? "secondary" : "ghost"}
-            size="sm"
-            onClick={() => setShowInspector(!showInspector)}
-            className={cn(
-              "px-4",
-              showInspector
-                ? "bg-white/5 text-white border-white/10"
-                : "text-muted-foreground/70 hover:text-white",
-            )}
-          >
-            <Settings2 className="w-4 h-4 mr-2" />
-            <span className="hidden sm:inline">Inspector</span>
-          </Button>
-
-          <ResourceStats nodeCount={nodeCount} edgeCount={edgeCount} />
-        </div>
-      </div>
+      <Button
+        variant={showInspector ? "secondary" : "ghost"}
+        size="icon"
+        onClick={() => setShowInspector(!showInspector)}
+        aria-label="Inspector"
+        title="Inspector"
+        aria-pressed={showInspector}
+        className={cn(
+          "h-8 w-8 rounded-lg",
+          showInspector
+            ? "bg-white/5 text-white border border-white/10"
+            : "text-muted-foreground/70 hover:text-white",
+        )}
+      >
+        <Settings2 className="w-4 h-4" />
+      </Button>
+      <span className="hidden 2xl:inline text-xs text-muted-foreground tabular-nums whitespace-nowrap pl-1">
+        {nodeCount} node{nodeCount === 1 ? "" : "s"} · {edgeCount} edge
+        {edgeCount === 1 ? "" : "s"}
+      </span>
 
       {/* Dialog Rendering */}
       {modal.kind === "create" && (

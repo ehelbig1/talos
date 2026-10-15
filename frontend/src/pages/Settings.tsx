@@ -2,6 +2,7 @@ import React, { Suspense, lazy, useCallback, useState, useEffect } from "react";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { useAuth } from "@/contexts/AuthContext";
 import { cn } from "@/lib/utils";
+import { PageHeader } from "@/components/ui";
 import {
   Lock as LockIcon,
   User as UserIcon,
@@ -319,19 +320,11 @@ export default function Settings() {
 
       {/* Page header */}
       <header className="shrink-0 px-8 py-6 border-b border-white/5 bg-surface-1/60 backdrop-blur-xl relative z-20">
-        <div className="flex items-center gap-4">
-          <div className="w-12 h-12 rounded-2xl bg-surface-4/60 border border-white/5 flex items-center justify-center shadow-lg">
-            <Shield className="w-6 h-6 text-primary" />
-          </div>
-          <div>
-            <h1 className="text-2xl md:text-3xl font-bold text-white tracking-tight">
-              Settings
-            </h1>
-            <p className="text-sm text-muted-foreground mt-1">
-              Your account, integrations and security.
-            </p>
-          </div>
-        </div>
+        <PageHeader
+          title="Settings"
+          description="Your account, integrations and security."
+          className="mb-0"
+        />
       </header>
 
       {/* Mobile nav — horizontal scrollable pills, shown only below sm breakpoint */}

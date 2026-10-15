@@ -7,7 +7,6 @@ import { relativeTime } from "@/lib/formatTime";
 import { getCapabilityConfig } from "@/lib/capabilityConfig";
 import {
   Box,
-  Code2,
   Search,
   Cpu,
   Globe,
@@ -68,6 +67,7 @@ function parseConfigFields(config: string): string[] {
 // ---------------------------------------------------------------------------
 
 import type { MyModulesQuery } from "@/generated/graphql";
+import { Button } from "@/components/ui";
 type Module = MyModulesQuery["myModules"][number];
 
 function ModuleCard({
@@ -304,43 +304,27 @@ export default function Modules() {
   }, [modules, worldFilter, search]);
 
   return (
-    <div className="px-10 pb-20 animate-in fade-in slide-in-from-bottom-4 duration-700">
-      {/* Header / Toolbar */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-8 mb-12">
-        <div className="flex items-center gap-6">
-          <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center relative">
-            <div className="absolute inset-0 bg-primary/5 rounded-full blur-xl animate-pulse" />
-            <Code2 className="w-6 h-6 text-primary relative z-10" />
-          </div>
-          <div>
-            <h1 className="text-3xl font-semibold text-white tracking-tight font-outfit leading-none mb-1.5">
-              Active Library
-            </h1>
-            <div className="flex items-center gap-3">
-              <span className="text-xs font-semibold text-primary/60">
-                {isLoading
-                  ? "Loading…"
-                  : `${modules.length} module${modules.length !== 1 ? "s" : ""}`}
-              </span>
-              <div className="w-1.5 h-1.5 rounded-full bg-success animate-status-pulse" />
-            </div>
-          </div>
-        </div>
+    <div className="pb-20">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
+        <p className="text-sm text-muted-foreground">
+          {isLoading
+            ? "Loading…"
+            : `${modules.length} module${modules.length !== 1 ? "s" : ""}`}
+        </p>
 
-        <div className="flex items-center gap-4">
-          <button
+        <div className="flex items-center gap-3">
+          <Button
+            variant="outline"
+            size="icon"
             onClick={() => refetch()}
             disabled={isFetching}
-            className="h-14 w-14 bg-surface-3/40 border border-white/5 text-muted-foreground hover:text-white rounded-2xl transition-premium disabled:opacity-40 active:scale-90 shadow-2xl flex items-center justify-center glass group"
-            title="Force Synchronize"
+            aria-label="Refresh modules"
+            title="Refresh modules"
           >
             <RefreshCw
-              className={cn(
-                "w-5 h-5 group-hover:rotate-180 transition-transform duration-700",
-                isFetching && "animate-spin",
-              )}
+              className={cn("w-4 h-4", isFetching && "animate-spin")}
             />
-          </button>
+          </Button>
 
           {/* Search */}
           <div className="relative group/search flex-1 md:flex-none">

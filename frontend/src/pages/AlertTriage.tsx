@@ -1,12 +1,7 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import {
-  AlertTriangle,
-  CheckCircle2,
-  RotateCcw,
-  ShieldCheck,
-} from "lucide-react";
+import { CheckCircle2, RotateCcw, ShieldCheck } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,6 +11,7 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import { relativeTime } from "@/lib/formatTime";
 import { ASSIGNABLE_SEVERITIES, severityStyle } from "@/lib/alertSeverity";
+import { PageContainer, PageHeader } from "@/components/ui";
 import {
   useOpsAlertsQuery,
   useOpsAlertsDigestQuery,
@@ -116,226 +112,216 @@ export default function AlertTriage() {
     ack.isPending && ack.variables ? ack.variables.alertId : null;
 
   return (
-    <div className="flex flex-col h-full bg-background overflow-hidden">
-      {/* Header */}
-      <header className="px-10 pt-16 pb-8 shrink-0">
-        <div className="flex items-center gap-5">
-          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center">
-            <AlertTriangle className="w-7 h-7 text-primary" />
-          </div>
-          <div>
-            <h1 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
-              Alerts
-            </h1>
-            <p className="text-xs text-muted-foreground/70 font-bold mt-2">
-              Ops alert triage · correct, acknowledge, resolve
-            </p>
-          </div>
-        </div>
-      </header>
+    <div className="h-full overflow-auto custom-scrollbar bg-background">
+      <PageContainer>
+        <PageHeader
+          title="Alerts"
+          description="Correct, acknowledge and resolve alerts raised by your workflows."
+        />
 
-      <div className="flex-1 overflow-auto custom-scrollbar px-10 pb-16">
-        {/* Digest chips */}
-        {digestLoading ? (
-          <div className="flex gap-3 mb-8">
-            {[1, 2, 3].map((i) => (
-              <div
-                key={i}
-                className="h-8 w-28 bg-white/[0.02] border border-white/5 rounded-lg animate-pulse"
-              />
-            ))}
-          </div>
-        ) : digest ? (
-          <div className="flex flex-wrap items-center gap-3 mb-8">
-            {digest.activeBySeverity.map((sc) => (
-              <span
-                key={sc.severity}
-                className={cn(
-                  "px-3 py-1.5 rounded-lg text-xs font-bold border",
-                  severityStyle(sc.severity),
-                )}
-              >
-                {sc.count} {sc.severity}
-              </span>
-            ))}
-            <span className="px-3 py-1.5 rounded-lg text-xs font-bold border text-primary bg-primary/5 border-primary/20">
-              {digest.newLast24H} new in 24h
-            </span>
-            {digest.reopenedActive > 0 && (
-              <span className="px-3 py-1.5 rounded-lg text-xs font-bold border text-destructive bg-destructive/10 border-destructive/30">
-                {digest.reopenedActive} reopened
-              </span>
-            )}
-          </div>
-        ) : null}
-
-        {/* Filter row */}
-        <div className="inline-flex h-10 items-center justify-center rounded-xl bg-white/5 p-1 text-muted-foreground border border-white/5 mb-8">
-          {(["active", "acked", "resolved"] as StatusFilter[]).map((f) => (
-            <button
-              key={f}
-              type="button"
-              onClick={() => setFilter(f)}
-              className={cn(
-                "inline-flex items-center justify-center whitespace-nowrap rounded-lg px-4 py-1.5 text-xs font-semibold transition-premium",
-                filter === f
-                  ? "bg-white/10 text-foreground shadow-sm border border-white/10"
-                  : "text-muted-foreground/60 hover:text-foreground",
-              )}
-            >
-              {f}
-            </button>
-          ))}
-        </div>
-
-        {/* Alert list */}
-        {alertsLoading ? (
-          <div className="space-y-4">
-            {[1, 2, 3].map((i) => (
-              <div
-                key={i}
-                className="h-32 bg-white/[0.02] border border-white/5 rounded-2xl animate-pulse"
-              />
-            ))}
-          </div>
-        ) : alertsError ? (
-          <>
-            <ErrorBanner message="Could not load alerts" />
-            <div className="flex justify-center">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => refetchAlerts()}
-              >
-                Retry
-              </Button>
+        <div>
+          {/* Digest chips */}
+          {digestLoading ? (
+            <div className="flex gap-3 mb-8">
+              {[1, 2, 3].map((i) => (
+                <div
+                  key={i}
+                  className="h-8 w-28 bg-white/[0.02] border border-white/5 rounded-lg animate-pulse"
+                />
+              ))}
             </div>
-          </>
-        ) : alerts.length === 0 ? (
-          <EmptyState
-            icon={CheckCircle2}
-            title="No active alerts — all quiet"
-            description="Nothing is waiting on triage right now."
-          />
-        ) : (
-          <div className="space-y-4">
-            {alerts.map((a) => {
-              const rowBusy = correctBusyId === a.id || ackBusyId === a.id;
-              return (
-                <Card
-                  key={a.id}
+          ) : digest ? (
+            <div className="flex flex-wrap items-center gap-3 mb-8">
+              {digest.activeBySeverity.map((sc) => (
+                <span
+                  key={sc.severity}
                   className={cn(
-                    "rounded-2xl p-6 relative overflow-hidden",
-                    rowBusy && "opacity-50 pointer-events-none",
+                    "px-3 py-1.5 rounded-lg text-xs font-bold border",
+                    severityStyle(sc.severity),
                   )}
                 >
-                  {/* Top row: title + badges */}
-                  <div className="flex flex-wrap items-start gap-3 mb-4">
-                    <span className="text-sm font-semibold text-white truncate max-w-xl font-outfit">
-                      {a.title}
-                    </span>
-                    <Badge className="text-2xs">{a.source}</Badge>
-                    {a.occurrenceCount > 1 && (
-                      <span className="text-xs font-bold text-muted-foreground/60">
-                        ×{a.occurrenceCount}
-                      </span>
-                    )}
-                    {asIsoString(a.reopenedAt) && (
-                      <span className="px-2.5 py-0.5 rounded-lg text-2xs font-bold uppercase tracking-wider inline-flex items-center border text-destructive bg-destructive/10 border-destructive/30">
-                        <RotateCcw className="w-3 h-3 mr-1" />
-                        reopened
-                      </span>
-                    )}
-                    {a.correctedSeverity && (
-                      <span className="px-2.5 py-0.5 rounded-lg text-2xs font-bold uppercase tracking-wider inline-flex items-center border text-primary bg-primary/5 border-primary/20">
-                        <ShieldCheck className="w-3 h-3 mr-1" />
-                        corrected
-                      </span>
-                    )}
-                    <span className="ml-auto text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider shrink-0">
-                      {relativeTime(asIsoString(a.lastSeen))}
-                    </span>
-                  </div>
+                  {sc.count} {sc.severity}
+                </span>
+              ))}
+              <span className="px-3 py-1.5 rounded-lg text-xs font-bold border text-primary bg-primary/5 border-primary/20">
+                {digest.newLast24H} new in 24h
+              </span>
+              {digest.reopenedActive > 0 && (
+                <span className="px-3 py-1.5 rounded-lg text-xs font-bold border text-destructive bg-destructive/10 border-destructive/30">
+                  {digest.reopenedActive} reopened
+                </span>
+              )}
+            </div>
+          ) : null}
 
-                  {a.resource && (
-                    <p className="text-xs text-muted-foreground/50 font-medium mb-4 truncate">
-                      {a.resource}
-                    </p>
-                  )}
-
-                  {/* Severity chips */}
-                  <div className="flex flex-wrap items-center gap-2 mb-4">
-                    <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider mr-1">
-                      Severity
-                    </span>
-                    {ASSIGNABLE_SEVERITIES.map((sev) => {
-                      const isCurrent = sev === a.severity;
-                      return (
-                        <button
-                          key={sev}
-                          type="button"
-                          disabled={isCurrent || correct.isPending}
-                          onClick={() =>
-                            correct.mutate({ alertId: a.id, severity: sev })
-                          }
-                          className={cn(
-                            "h-8 px-3 rounded-lg text-2xs font-semibold uppercase tracking-wider border transition-premium disabled:cursor-default",
-                            isCurrent
-                              ? severityStyle(sev)
-                              : "bg-transparent text-muted-foreground/50 border-white/10 hover:bg-white/5 hover:text-foreground",
-                          )}
-                        >
-                          {sev}
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                  {/* Row actions */}
-                  <div className="flex items-center gap-2">
-                    {a.status === "new" && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={ack.isPending}
-                        onClick={() => ack.mutate({ alertId: a.id })}
-                      >
-                        Ack
-                      </Button>
-                    )}
-                    {a.status !== "resolved" && (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="text-muted-foreground/50 hover:text-destructive hover:bg-destructive/10"
-                        onClick={() => setPendingResolve(a)}
-                      >
-                        Resolve
-                      </Button>
-                    )}
-                  </div>
-                </Card>
-              );
-            })}
+          {/* Filter row */}
+          <div className="inline-flex h-10 items-center justify-center rounded-xl bg-white/5 p-1 text-muted-foreground border border-white/5 mb-8">
+            {(["active", "acked", "resolved"] as StatusFilter[]).map((f) => (
+              <button
+                key={f}
+                type="button"
+                onClick={() => setFilter(f)}
+                className={cn(
+                  "inline-flex items-center justify-center whitespace-nowrap rounded-lg px-4 py-1.5 text-xs font-semibold transition-premium",
+                  filter === f
+                    ? "bg-white/10 text-foreground shadow-sm border border-white/10"
+                    : "text-muted-foreground/60 hover:text-foreground",
+                )}
+              >
+                {f}
+              </button>
+            ))}
           </div>
-        )}
-      </div>
 
-      <ConfirmDialog
-        open={pendingResolve != null}
-        title="Resolve alert"
-        message={
-          pendingResolve
-            ? `Resolve "${pendingResolve.title}"? This suppresses it from the active digest until it re-fires.`
-            : ""
-        }
-        confirmLabel="Resolve"
-        isLoading={resolve.isPending}
-        onConfirm={() => {
-          if (pendingResolve) resolve.mutate({ alertId: pendingResolve.id });
-        }}
-        onCancel={() => setPendingResolve(null)}
-      />
+          {/* Alert list */}
+          {alertsLoading ? (
+            <div className="space-y-4">
+              {[1, 2, 3].map((i) => (
+                <div
+                  key={i}
+                  className="h-32 bg-white/[0.02] border border-white/5 rounded-2xl animate-pulse"
+                />
+              ))}
+            </div>
+          ) : alertsError ? (
+            <>
+              <ErrorBanner message="Could not load alerts" />
+              <div className="flex justify-center">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => refetchAlerts()}
+                >
+                  Retry
+                </Button>
+              </div>
+            </>
+          ) : alerts.length === 0 ? (
+            <EmptyState
+              icon={CheckCircle2}
+              title="No active alerts — all quiet"
+              description="Nothing is waiting on triage right now."
+            />
+          ) : (
+            <div className="space-y-4">
+              {alerts.map((a) => {
+                const rowBusy = correctBusyId === a.id || ackBusyId === a.id;
+                return (
+                  <Card
+                    key={a.id}
+                    className={cn(
+                      "rounded-2xl p-6 relative overflow-hidden",
+                      rowBusy && "opacity-50 pointer-events-none",
+                    )}
+                  >
+                    {/* Top row: title + badges */}
+                    <div className="flex flex-wrap items-start gap-3 mb-4">
+                      <span className="text-sm font-semibold text-white truncate max-w-xl font-outfit">
+                        {a.title}
+                      </span>
+                      <Badge className="text-2xs">{a.source}</Badge>
+                      {a.occurrenceCount > 1 && (
+                        <span className="text-xs font-bold text-muted-foreground/60">
+                          ×{a.occurrenceCount}
+                        </span>
+                      )}
+                      {asIsoString(a.reopenedAt) && (
+                        <span className="px-2.5 py-0.5 rounded-lg text-2xs font-bold uppercase tracking-wider inline-flex items-center border text-destructive bg-destructive/10 border-destructive/30">
+                          <RotateCcw className="w-3 h-3 mr-1" />
+                          reopened
+                        </span>
+                      )}
+                      {a.correctedSeverity && (
+                        <span className="px-2.5 py-0.5 rounded-lg text-2xs font-bold uppercase tracking-wider inline-flex items-center border text-primary bg-primary/5 border-primary/20">
+                          <ShieldCheck className="w-3 h-3 mr-1" />
+                          corrected
+                        </span>
+                      )}
+                      <span className="ml-auto text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider shrink-0">
+                        {relativeTime(asIsoString(a.lastSeen))}
+                      </span>
+                    </div>
+
+                    {a.resource && (
+                      <p className="text-xs text-muted-foreground/50 font-medium mb-4 truncate">
+                        {a.resource}
+                      </p>
+                    )}
+
+                    {/* Severity chips */}
+                    <div className="flex flex-wrap items-center gap-2 mb-4">
+                      <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider mr-1">
+                        Severity
+                      </span>
+                      {ASSIGNABLE_SEVERITIES.map((sev) => {
+                        const isCurrent = sev === a.severity;
+                        return (
+                          <button
+                            key={sev}
+                            type="button"
+                            disabled={isCurrent || correct.isPending}
+                            onClick={() =>
+                              correct.mutate({ alertId: a.id, severity: sev })
+                            }
+                            className={cn(
+                              "h-8 px-3 rounded-lg text-2xs font-semibold uppercase tracking-wider border transition-premium disabled:cursor-default",
+                              isCurrent
+                                ? severityStyle(sev)
+                                : "bg-transparent text-muted-foreground/50 border-white/10 hover:bg-white/5 hover:text-foreground",
+                            )}
+                          >
+                            {sev}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Row actions */}
+                    <div className="flex items-center gap-2">
+                      {a.status === "new" && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={ack.isPending}
+                          onClick={() => ack.mutate({ alertId: a.id })}
+                        >
+                          Ack
+                        </Button>
+                      )}
+                      {a.status !== "resolved" && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="text-muted-foreground/50 hover:text-destructive hover:bg-destructive/10"
+                          onClick={() => setPendingResolve(a)}
+                        >
+                          Resolve
+                        </Button>
+                      )}
+                    </div>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <ConfirmDialog
+          open={pendingResolve != null}
+          title="Resolve alert"
+          message={
+            pendingResolve
+              ? `Resolve "${pendingResolve.title}"? This suppresses it from the active digest until it re-fires.`
+              : ""
+          }
+          confirmLabel="Resolve"
+          isLoading={resolve.isPending}
+          onConfirm={() => {
+            if (pendingResolve) resolve.mutate({ alertId: pendingResolve.id });
+          }}
+          onCancel={() => setPendingResolve(null)}
+        />
+      </PageContainer>
     </div>
   );
 }

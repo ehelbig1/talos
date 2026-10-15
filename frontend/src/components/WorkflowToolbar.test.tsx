@@ -14,15 +14,13 @@ describe("WorkflowToolbar Component", () => {
     vi.clearAllMocks();
   });
 
-  it("renders workflow name and node counts", () => {
+  it("renders node and edge counts", () => {
     useWorkflowStore.getState().setWorkflowMeta("wf-1", "Test Workflow");
     useWorkflowStore.getState().addNode("mod-1", "Node 1", { x: 0, y: 0 });
 
     render(<WorkflowToolbar />);
 
-    expect(screen.getByText("Test Workflow")).toBeInTheDocument();
-    expect(screen.getByText("1")).toBeInTheDocument(); // node count
-    expect(screen.getByText(/nodes/i)).toBeInTheDocument();
+    expect(screen.getByText(/1 node · 0 edges/i)).toBeInTheDocument();
   });
 
   it("shows unsaved indicator when dirty", () => {
@@ -62,7 +60,7 @@ describe("WorkflowToolbar Component", () => {
     // Should show the name-assignment dialog
     expect(screen.getAllByText(/rename workflow/i).length).toBeGreaterThan(0);
 
-    const input = screen.getByPlaceholderText(/workflow identifier/i);
+    const input = screen.getByPlaceholderText(/workflow name/i);
     fireEvent.change(input, { target: { value: "My New Workflow" } });
 
     const confirmBtn = screen.getByRole("button", { name: /save name/i });

@@ -20,6 +20,7 @@ import {
   type ActorTemplate,
 } from "./actors/CreateActorPanel";
 import { Bot, Search, X, Plus, GitCompare, ChevronDown } from "lucide-react";
+import { Button, PageHeader } from "@/components/ui";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -176,81 +177,48 @@ export default function Actors() {
       <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_bottom_right,_var(--tw-gradient-stops))] from-surface-2/20 via-transparent to-transparent opacity-30" />
 
       {/* Header Area */}
-      <header className="px-10 pt-16 pb-10 shrink-0 relative z-10">
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-10 mb-12">
-          <div className="space-y-4">
-            <div className="flex items-center gap-6">
-              <div className="w-16 h-16 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center relative">
-                <div className="absolute inset-0 bg-primary/5 rounded-full blur-2xl animate-pulse" />
-                <Bot className="w-8 h-8 text-primary relative z-10" />
-              </div>
-              <div>
-                <h1 className="text-5xl font-semibold text-white tracking-tight font-outfit leading-none mb-2">
-                  Actors
-                </h1>
-              </div>
-            </div>
-            <p className="text-sm text-muted-foreground/70 max-w-xl leading-relaxed">
-              <span className="text-white/60">{actors.length}</span> actor
-              {actors.length !== 1 ? "s" : ""}. Each actor runs workflows under
-              its own capability ceiling and keeps its own memory.
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-4">
-            {compareMode && (
-              <button
-                onClick={() => {
-                  if (compareSet.size >= 2) {
+      <header className="w-full max-w-7xl mx-auto px-6 md:px-8 pt-8 md:pt-10 shrink-0 relative z-10">
+        <PageHeader
+          title="Actors"
+          description={`${actors.length} actor${actors.length !== 1 ? "s" : ""}. Each actor runs workflows under its own capability ceiling and keeps its own memory.`}
+          actions={
+            <>
+              {compareMode && (
+                <Button
+                  variant={compareSet.size >= 2 ? "premium" : "outline"}
+                  disabled={compareSet.size < 2}
+                  onClick={() => {
                     navigate(
                       `/actors/compare?actors=${[...compareSet].join(",")}`,
                     );
-                  }
-                  setCompareMode(false);
+                    setCompareMode(false);
+                    setCompareSet(new Set());
+                  }}
+                >
+                  <GitCompare className="w-4 h-4" />
+                  {compareSet.size >= 2
+                    ? `Compare (${compareSet.size})`
+                    : "Select two or more"}
+                </Button>
+              )}
+              <Button
+                variant="outline"
+                aria-pressed={compareMode}
+                onClick={() => {
+                  setCompareMode((v) => !v);
                   setCompareSet(new Set());
                 }}
-                className={cn(
-                  "flex items-center gap-4 px-8 py-4 text-sm font-semibold rounded-2xl transition-premium shadow-2xl active:scale-95 border glass",
-                  compareSet.size >= 2
-                    ? "bg-primary text-white border-white/20"
-                    : "bg-surface-3/40 text-muted-foreground/60 border-white/5 cursor-default",
-                )}
               >
-                <GitCompare className="w-5 h-5" />
-                {compareSet.size >= 2
-                  ? `Compare (${compareSet.size})`
-                  : "Select actors"}
-              </button>
-            )}
-
-            <button
-              onClick={() => {
-                setCompareMode((v) => !v);
-                setCompareSet(new Set());
-              }}
-              className={cn(
-                "flex items-center gap-4 px-8 py-4 text-sm font-semibold rounded-2xl border transition-premium glass shadow-xl active:scale-95",
-                compareMode
-                  ? "bg-primary/10 text-primary border-primary/30"
-                  : "bg-surface-3/40 text-muted-foreground/70 border-white/5 hover:text-white hover:bg-white/5 hover:border-white/10",
-              )}
-            >
-              <GitCompare className="w-5 h-5 transition-transform group-hover:rotate-12" />
-              {compareMode ? "Cancel" : "Compare actors"}
-            </button>
-
-            <button
-              onClick={() => setShowCreate(true)}
-              className="flex items-center gap-4 px-10 py-4 text-sm font-semibold text-white bg-primary rounded-2xl transition-premium active:scale-95 border border-white/20"
-            >
-              <div className="p-1 rounded-lg bg-white/20">
-                <Plus className="w-5 h-5" />
-              </div>
-              New actor
-            </button>
-          </div>
-        </div>
-
+                <GitCompare className="w-4 h-4" />
+                {compareMode ? "Cancel" : "Compare actors"}
+              </Button>
+              <Button onClick={() => setShowCreate(true)}>
+                <Plus className="w-4 h-4" />
+                New actor
+              </Button>
+            </>
+          }
+        />
         {/* Operational Telemetry Header */}
         {actors.length > 0 && (
           <div className="grid grid-cols-2 md:grid-cols-5 gap-6 p-6 bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl shadow-2xl glass gpu mb-10">
@@ -353,8 +321,8 @@ export default function Actors() {
       </header>
 
       {/* Content Area */}
-      <div className="flex-1 overflow-auto custom-scrollbar px-10 pt-2 pb-32 relative z-0 gpu optimize-blur">
-        <div className="max-w-[1600px] mx-auto">
+      <div className="flex-1 overflow-auto custom-scrollbar px-6 md:px-8 pt-2 pb-24 relative z-0">
+        <div className="max-w-7xl mx-auto">
           {isLoading ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-10">
               {[0, 1, 2, 3, 4, 5].map((i) => (

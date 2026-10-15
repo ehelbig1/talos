@@ -6,6 +6,7 @@ import {
   type ActorMemoryGroup,
 } from "@/lib/graphqlApi";
 import { cn } from "@/lib/utils";
+import { Button, PageContainer, PageHeader } from "@/components/ui";
 import {
   Sparkles,
   Clock,
@@ -346,40 +347,29 @@ export default function Briefings() {
 
   return (
     <div className="h-full overflow-y-auto thin-scrollbar">
-      <div className="max-w-6xl mx-auto px-8 py-10 space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
-        {/* Header */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex items-center gap-5">
-            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary">
-              <Sparkles className="w-7 h-7" />
-            </div>
-            <div>
-              <h1 className="text-3xl md:text-4xl font-semibold text-white tracking-tight">
-                Briefings
-              </h1>
-              <p className="text-sm text-muted-foreground/60 font-medium mt-1">
-                The latest result from each of your workflows, in one place.
-                {lastUpdated && (
-                  <span className="text-muted-foreground/70">
-                    {" "}
-                    Updated {timeAgo(lastUpdated)}.
-                  </span>
-                )}
-              </p>
-            </div>
-          </div>
-          <button
-            onClick={() => refetch()}
-            disabled={isRefetching}
-            className="self-start flex items-center gap-2 px-4 py-2.5 rounded-2xl border border-white/5 bg-white/5 hover:bg-primary/10 hover:border-primary/20 hover:text-primary text-muted-foreground text-xs font-semibold transition-premium active:scale-95 disabled:opacity-50"
-          >
-            <RefreshCw
-              className={cn("w-3.5 h-3.5", isRefetching && "animate-spin")}
-            />
-            Refresh
-          </button>
-        </div>
-
+      <PageContainer className="space-y-8">
+        <PageHeader
+          title="Briefings"
+          description={
+            <>
+              The latest result from each of your workflows, in one place.
+              {lastUpdated && <> Updated {timeAgo(lastUpdated)}.</>}
+            </>
+          }
+          actions={
+            <Button
+              variant="outline"
+              onClick={() => refetch()}
+              disabled={isRefetching}
+            >
+              <RefreshCw
+                className={cn("w-4 h-4", isRefetching && "animate-spin")}
+              />
+              Refresh
+            </Button>
+          }
+          className="mb-0"
+        />
         {!isLoading && !isError && unreadable.length > 0 && (
           <div
             role="alert"
@@ -436,7 +426,7 @@ export default function Briefings() {
             ))}
           </div>
         )}
-      </div>
+      </PageContainer>
     </div>
   );
 }

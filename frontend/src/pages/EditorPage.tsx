@@ -78,7 +78,7 @@ function EditorPage() {
               <div className="flex flex-col items-center gap-3">
                 <div className="w-8 h-8 border-2 border-violet-500/20 border-t-violet-500 rounded-full animate-spin" />
                 <span className="text-sm font-medium animate-pulse">
-                  Initializing Talos Engine...
+                  Loading editor…
                 </span>
               </div>
             </div>
@@ -87,7 +87,7 @@ function EditorPage() {
           <UnsavedChangesGuard />
           {moduleId && <ModulePreloader moduleId={moduleId} />}
 
-          {/* Execution Monitoring Top Bar / Header */}
+          {/* Header row: workflow, tools, run */}
           <div className="shrink-0 border-b border-white/5 bg-background relative z-40">
             <ExecutionPanel />
           </div>

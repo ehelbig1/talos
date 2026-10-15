@@ -4,18 +4,13 @@ import { useQuery } from "@tanstack/react-query";
 import { listActors, type ActorSummary } from "@/lib/graphqlApi";
 import { useListWorkflowNamesQuery } from "@/generated/graphql";
 import { cn } from "@/lib/utils";
-import {
-  ChevronLeft,
-  Play,
-  RefreshCw,
-  Loader2,
-  GitCompare,
-} from "lucide-react";
+import { Play, RefreshCw, Loader2, GitCompare } from "lucide-react";
 import type { WorkflowOption } from "./actor-compare/types";
 import { CompareLane } from "./actor-compare/CompareLane";
 import { useCompareRun } from "./actor-compare/useCompareRun";
 import { SetupPanel } from "./actor-compare/SetupPanel";
 import { RunTicker } from "./actor-compare/RunTicker";
+import { Button, PageHeader } from "@/components/ui";
 
 // ── ActorCompare page ─────────────────────────────────────────────────────────
 
@@ -73,55 +68,30 @@ export default function ActorCompare() {
       <div className="absolute bottom-[-5%] left-[-5%] w-[40%] h-[40%] bg-violet-500/5 rounded-full blur-[100px]" />
 
       <div className="max-w-7xl mx-auto px-8 py-10 space-y-12 relative z-10">
-        {/* Page header */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-6">
-            <button
-              onClick={() => navigate("/actors")}
-              className="p-3 rounded-2xl bg-white/5 border border-white/10 text-muted-foreground/60 hover:text-white hover:bg-white/10 transition-premium shadow-xl"
-            >
-              <ChevronLeft className="w-5 h-5" />
-            </button>
-            <div className="flex items-center gap-5">
-              <div className="p-3.5 rounded-2xl bg-primary/10 border border-primary/20">
-                <GitCompare className="w-7 h-7 text-primary" />
-              </div>
-              <div>
-                <h1 className="text-2xl font-semibold tracking-tight font-outfit">
-                  Compare actors
-                </h1>
-                <p className="text-xs text-muted-foreground/70 font-semibold mt-1">
-                  Run one workflow as several actors side by side
-                </p>
-              </div>
-            </div>
-          </div>
-
-          {/* Global Actions */}
-          <div className="flex items-center gap-4">
-            {lanes.length > 0 && allDone && (
-              <button
-                onClick={handleReset}
-                className="flex items-center gap-3 px-6 py-3 rounded-2xl bg-surface-2/40 border border-white/5 text-sm font-semibold text-muted-foreground/60 hover:text-white hover:bg-surface-2/60 transition-premium shadow-2xl active:scale-95"
-              >
-                <RefreshCw className="w-4 h-4" />
-                New Analysis
-              </button>
-            )}
-            <button
-              onClick={handleRun}
-              disabled={!canRun}
-              className="flex items-center gap-3 px-8 py-3.5 rounded-2xl bg-primary hover:bg-primary/90 disabled:opacity-40 disabled:grayscale disabled:cursor-not-allowed text-white text-sm font-semibold transition-premium active:scale-95"
-            >
-              {running ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Play className="w-4 h-4" />
+        <PageHeader
+          backTo={{ to: "/actors", label: "Actors" }}
+          title="Compare actors"
+          description="Run one workflow as several actors side by side."
+          actions={
+            <>
+              {lanes.length > 0 && allDone && (
+                <Button variant="outline" onClick={handleReset}>
+                  <RefreshCw className="w-4 h-4" />
+                  Start over
+                </Button>
               )}
-              {running ? "Running…" : "Run comparison"}
-            </button>
-          </div>
-        </div>
+              <Button onClick={handleRun} disabled={!canRun}>
+                {running ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Play className="w-4 h-4" />
+                )}
+                {running ? "Running…" : "Run comparison"}
+              </Button>
+            </>
+          }
+          className="mb-0"
+        />
 
         {/* Setup panel (hidden after run starts) */}
         {lanes.length === 0 && (
