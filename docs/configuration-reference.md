@@ -101,7 +101,6 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `JWT_PUBLIC_KEY_PREVIOUS` (+`_FILE`) | none (optional) | controller | Previous JWT public key for rotation overlap | 🔒 |
 | `JWT_ALGORITHM` | `HS256` | controller | JWT algorithm selection | |
 | `JWT_ALGORITHM_PREVIOUS` | none (optional) | controller | Previous algorithm during rotation (`talos-auth`) | |
-| `JWT_REQUIRE_AUD` | `false` | controller | Enforce the JWT `aud` claim per request | 🔒 (posture) |
 | `BCRYPT_COST` | `12` | controller | Bcrypt cost factor for password hashing | 🔒 (tuning) |
 | `API_KEY_BCRYPT_COST` | built-in default | talos-api-keys | Bcrypt cost for API-key hashing | 🔒 (tuning) |
 | `TOTP_ISSUER` | `Talos` | controller | TOTP issuer label shown in authenticator apps | |

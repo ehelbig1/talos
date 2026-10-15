@@ -24,14 +24,17 @@
 # tls/), or state that this compose file is not a production-TLS deployment.
 # The second is the smaller change and the true one. What "staging" gives up
 # relative to "production" is exactly the `talos_config::is_production()`
-# gates: the plaintext-URL refusals above, the env-KEK guard (check 45), the
-# explicit-Sigstore-policy demand on the worker, the PROMETHEUS_SCRAPE_TOKEN
-# / REGISTRY_PUBLISH_TOKEN fail-closed 403s, and production-only CSP/cookie
-# strictness. It also MOUNTS the development MCP route `/mcp/local`, which
-# has no token; that route answers only a caller on the controller's own
-# machine, so a request through the nginx below (which sets X-Forwarded-For)
-# gets 404 — use `/mcp` with an agent token. Rate limits, HSTS, CSRF and the
-# reverse-proxy posture do NOT depend on RUST_ENV and stay on. If you need RUST_ENV=production, put TLS
+# gates, which are BUILD/INFRASTRUCTURE posture: the plaintext-URL refusals
+# above, the env-KEK guard (check 45), the explicit-Sigstore-policy demand on
+# the worker, and the worker's dev egress opt-in refusals. Everything that
+# faces a browser or a tenant follows `browser_hardening_required()` instead,
+# which is true for "staging" (2026-10-14): Secure
+# cookies, the strict CSP, HSTS by default, the WebSocket Origin requirement,
+# GraphQL error scrubbing and no introspection, no GraphQL playground, the
+# per-IP / global / governor rate limiters and fail-closed auth limiters, the
+# REGISTRY_PUBLISH_TOKEN / PROMETHEUS_SCRAPE_TOKEN refusals — and the
+# tokenless development MCP route `/mcp/local` is NOT mounted (use `/mcp`
+# with an agent token). If you need RUST_ENV=production, put TLS
 # on all three backends first (or deploy the Helm chart, which does), then
 # change the three URLs to `postgres://…?sslmode=require`, `rediss://` and
 # `tls://` and flip this value — it will refuse to boot until you have.
@@ -190,6 +193,14 @@ services:
       FRONTEND_URL: ${FRONTEND_URL}
 
       # ✅ PRODUCTION RATE LIMITS (stricter than development)
+      # The client is the address the proxies in front of the controller
+      # report: X-Forwarded-For is walked right to left over these trusted
+      # CIDRs. The frontend nginx (and a TLS proxy run on this network, or the
+      # host reaching it through the published port's gateway) sits in
+      # `talos-network`, so its subnet is trusted. Without this, nginx's
+      # address is every client's — one 5/min login bucket for the whole
+      # deployment (A-3). Keep it equal to the network's `ipam` subnet below.
+      TRUSTED_PROXY_CIDRS: ${TALOS_COMPOSE_SUBNET:-172.29.0.0/24}
       API_RATE_LIMIT: "60"          # GraphQL API: 60 req/min per IP (1/sec)
       WEBHOOK_RATE_LIMIT: "30"      # Webhooks: 30 req/min per IP (0.5/sec)
       GLOBAL_RATE_LIMIT: "5000"     # Global: 5000 req/min total
@@ -346,3 +357,10 @@ volumes:
 networks:
   talos-network:
     driver: bridge
+    # A fixed subnet so the controller can trust its proxies by CIDR
+    # (TRUSTED_PROXY_CIDRS above). Override TALOS_COMPOSE_SUBNET in
+    # .env.production if it collides with a network on this host; both
+    # places read the same variable.
+    ipam:
+      config:
+        - subnet: ${TALOS_COMPOSE_SUBNET:-172.29.0.0/24}

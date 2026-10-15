@@ -2188,63 +2188,26 @@ impl AuthService {
             v.set_required_spec_claims(&["exp", "sub", "iss"]);
             // Validate issuer to prevent tokens issued by other systems from being accepted.
             v.set_issuer(&["talos"]);
-            // NOTE: We do NOT call `v.set_audience` here because that would
-            // *require* the `aud` claim, rejecting tokens minted before this
-            // change. Instead we validate `aud` post-decode below: tokens with
-            // `aud != "talos"` are rejected; tokens without `aud` (legacy) are
-            // allowed through until they naturally expire and get re-issued.
-            // Disable the library's built-in aud validation so it doesn't
-            // reject tokens that carry the claim when no expected audience
-            // is configured in the Validation struct.
+            // `aud` is checked after decode by `check_audience` below (the
+            // library's own check is off so the two cannot disagree).
             v.validate_aud = false;
             v
         };
 
-        // Post-decode audience check. Rejects cross-service replay when `aud`
-        // is present but wrong; legacy tokens (no `aud` claim) are accepted
-        // unless `JWT_REQUIRE_AUD=true` is set, in which case the migration
-        // window has ended and aud-less tokens fail closed.
+        // Post-decode audience check: `aud` must be present and be "talos".
         //
-        // M-6: pre-fix the back-compat path was permanent — there was no
-        // mechanism for operators to flip strict mode once aud-less tokens
-        // had aged out of circulation, so the audience-validation invariant
-        // had no end date. Now operators that have run with the new
-        // version for one access-token TTL (default 15 min) can set
-        // `JWT_REQUIRE_AUD=true` to fail closed. Every aud-less verify
-        // also emits a structured event so dashboards can graph the
-        // count → flip strict mode when it reaches zero.
-        //
-        // MCP-1060 (2026-05-15): cached via `LazyLock` so the env-var
-        // read happens ONCE per process — `verify_token` runs on every
-        // authenticated request, and the previous `env::var` call took
-        // the process-wide environ lock + allocated a String each
-        // invocation. The flag is a deploy-time toggle by design
-        // (operators flip it once aud-less tokens have aged out), so
-        // read-once semantics match the intent. Operators changing the
-        // flag must restart the process for it to take effect — same
-        // contract as every other env-var-driven config.
-        static REQUIRE_AUD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            talos_config::bool_env_or_default("JWT_REQUIRE_AUD", false)
-        });
-        let require_aud = *REQUIRE_AUD;
+        // 2026-10-14: a token with NO `aud` is refused. Until then it was
+        // accepted unless `JWT_REQUIRE_AUD=true` (default false) — a migration
+        // window for tokens minted before `aud` existed. Every token this
+        // service has issued since carries `aud: "talos"`, and an access token
+        // lives 15 minutes, so nothing legitimate is aud-less; the only token
+        // the window still admitted was one signed by ANOTHER service sharing
+        // `JWT_SECRET`. The variable and its reader are gone.
         let check_audience = |claims: &Claims| -> Result<()> {
             match &claims.aud {
-                Some(aud) if aud != "talos" => Err(anyhow!("Invalid audience claim")),
-                Some(_) => Ok(()),
-                None => {
-                    if require_aud {
-                        Err(anyhow!("Missing audience claim (JWT_REQUIRE_AUD=true)"))
-                    } else {
-                        // Telemetry counter so operators see when legacy
-                        // aud-less tokens disappear and can flip strict mode.
-                        tracing::warn!(
-                            target: "talos_auth",
-                            event_kind = "jwt_legacy_aud_less_verify",
-                            "Verified token with no aud claim (legacy back-compat)"
-                        );
-                        Ok(())
-                    }
-                }
+                Some(aud) if aud == "talos" => Ok(()),
+                Some(_) => Err(anyhow!("Invalid audience claim")),
+                None => Err(anyhow!("Missing audience claim")),
             }
         };
 

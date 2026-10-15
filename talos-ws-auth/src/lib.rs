@@ -18,6 +18,7 @@ use talos_metrics::{WsActiveSession, WsHandshakeOutcome, WsOperationOutcome, WsS
 /// decides whether an ABSENT Origin is refused (browsers always send one on a
 /// WS upgrade; non-browser dev clients may not). `allowed` is the deployment's
 /// allow-list (`talos_config::is_allowed_origin` in production code).
+/// The served verdict is [`origin_verdict`], which supplies both.
 pub fn classify_origin(
     origin: Option<&HeaderValue>,
     production: bool,
@@ -32,6 +33,22 @@ pub fn classify_origin(
         None if production => Err(WsHandshakeOutcome::OriginMissing),
         None => Ok(()),
     }
+}
+
+/// The Origin verdict the WebSocket handshake applies: [`classify_origin`]
+/// with an absent Origin refused wherever browser hardening is required
+/// (`talos_auth_types::browser_hardening_required`, every `RUST_ENV` but the
+/// development spellings) and the deployment's allow-list.
+///
+/// Until 2026-10-14 the flag was `is_production()`, so a `RUST_ENV=staging`
+/// deployment (`docker-compose.prod.yml`) accepted a cookie-authenticated
+/// upgrade that carried no Origin at all.
+pub fn origin_verdict(origin: Option<&HeaderValue>) -> Result<(), WsHandshakeOutcome> {
+    classify_origin(
+        origin,
+        talos_auth_types::browser_hardening_required(),
+        config::is_allowed_origin,
+    )
 }
 
 /// An authenticated socket's identity, plus how long the access token has
@@ -159,11 +176,7 @@ pub async fn handle_websocket_auth(
     origin: Option<HeaderValue>,
 ) {
     // Validate Origin header to prevent Cross-Site WebSocket Hijacking (CSWH).
-    if let Err(outcome) = classify_origin(
-        origin.as_ref(),
-        config::is_production(),
-        config::is_allowed_origin,
-    ) {
+    if let Err(outcome) = origin_verdict(origin.as_ref()) {
         // The Origin string is what an operator triaging CSWH needs; it is
         // caller-supplied and bounded by the report site.
         let shown = origin.as_ref().and_then(|v| v.to_str().ok());

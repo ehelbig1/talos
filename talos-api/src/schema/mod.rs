@@ -165,9 +165,13 @@ pub fn scrub_response_errors_with(response: &mut async_graphql::Response, is_dev
     }
 }
 
-/// [`scrub_response_errors_with`] under the process's own environment.
+/// [`scrub_response_errors_with`] under the process's own environment: errors
+/// are scrubbed wherever browser hardening is required (every `RUST_ENV` but
+/// the development spellings). Until 2026-10-14 the flag was
+/// `is_development()` — true for `staging` — so a staging deployment returned
+/// raw resolver errors to its users.
 pub fn scrub_response_errors(response: &mut async_graphql::Response) {
-    scrub_response_errors_with(response, talos_config::is_development());
+    scrub_response_errors_with(response, !talos_auth_types::browser_hardening_required());
 }
 
 /// Is the operation this request selects a `subscription`? (2026-09-10.)

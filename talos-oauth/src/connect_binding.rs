@@ -72,12 +72,16 @@ impl BrowserBinding {
     }
 
     /// The `Set-Cookie` value the connect response must carry. `Secure` follows
-    /// `is_production()`, exactly as the login binding cookie does.
+    /// `browser_hardening_required()`, exactly as the login binding cookie
+    /// does (it followed `is_production()` until 2026-10-14, so a staging
+    /// deployment behind TLS set this cookie without `Secure`).
     pub fn set_cookie_header(&self) -> HeaderValue {
         // The nonce is hex and the attributes are literals, so this cannot fail;
         // a failure would mean the nonce shape changed, which the unit tests pin.
-        HeaderValue::from_str(&self.set_cookie_string(talos_config::is_production()))
-            .expect("connect-binding cookie is ASCII by construction")
+        HeaderValue::from_str(
+            &self.set_cookie_string(talos_auth_types::browser_hardening_required()),
+        )
+        .expect("connect-binding cookie is ASCII by construction")
     }
 
     /// `(SET_COOKIE, value)` — a ready-to-use axum response-header pair.

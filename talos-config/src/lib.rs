@@ -976,9 +976,14 @@ pub fn parse_allowed_origins(raw: &str, production: bool) -> Result<Vec<String>,
 /// `Ok(origins)` additionally guarantees that touching [`get_allowed_origins`]
 /// is panic-free, so an auditor can safely read the enforced list afterwards.
 pub fn check_allowed_origins() -> Result<Vec<String>, String> {
-    let production = is_production();
+    // The browser-facing rule set (explicit list, no `*` / `null`, a scheme on
+    // every entry) applies wherever browser hardening is required — every
+    // `RUST_ENV` but the development spellings. Until 2026-10-14 it applied
+    // under `production` alone, so a `staging` deployment accepted `null` (the
+    // Origin a sandboxed iframe sends) as a credentialed CORS origin.
+    let production = talos_auth_types::browser_hardening_required();
     let default = if production {
-        "" // ALLOWED_ORIGIN must be explicitly set in production
+        "" // ALLOWED_ORIGIN must be explicitly set outside development
     } else {
         DEV_DEFAULT_ALLOWED_ORIGINS
     };
@@ -998,7 +1003,7 @@ static ALLOWED_ORIGINS: LazyLock<Vec<String>> = LazyLock::new(|| {
     // SECURITY: Credentials are sent to all allowed origins. Each origin
     // added expands the attack surface — a compromised origin can steal
     // session cookies. Log when multiple origins are configured.
-    if is_production() && origins.len() > 1 {
+    if talos_auth_types::browser_hardening_required() && origins.len() > 1 {
         eprintln!(
             "SECURITY WARNING: {} CORS origins configured with credentials. \
              Each origin can receive session cookies. Verify all are trusted: {:?}",

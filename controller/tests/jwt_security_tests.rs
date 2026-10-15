@@ -243,6 +243,58 @@ async fn valid_token_verifies_successfully() {
 }
 
 // ---------------------------------------------------------------------------
+// Audience: required, with no switch that admits a token without it
+// ---------------------------------------------------------------------------
+
+/// A token signed with this service's own secret but carrying no `aud` is
+/// refused, whatever the environment (2026-10-14). Until then it was accepted
+/// unless `JWT_REQUIRE_AUD=true`, and that variable defaulted to `false`; the
+/// only such token still in circulation would be one minted by another
+/// service sharing `JWT_SECRET`. A wrong `aud` is refused too, and the same
+/// claims with `aud: "talos"` verify — the control.
+#[tokio::test]
+async fn a_token_without_an_audience_is_refused() {
+    let secret = "secret-for-audience-test!!!!!!!!";
+    let service = make_auth_service(secret);
+    let now = Utc::now();
+    let claims = |aud: Option<&str>| Claims {
+        sub: Uuid::new_v4().to_string(),
+        email: "aud-test@example.com".to_string(),
+        exp: (now + Duration::minutes(10)).timestamp() as usize,
+        iat: now.timestamp() as usize,
+        is_2fa_verified: true,
+        second_factor_verified: true,
+        iss: "talos".to_string(),
+        aud: aud.map(str::to_string),
+        org: String::new(),
+    };
+    let sign = |c: &Claims| {
+        encode(
+            &Header::default(),
+            c,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encoding should succeed")
+    };
+
+    // No environment is consulted: `JWT_REQUIRE_AUD` has no reader.
+    let err = service
+        .verify_token(&sign(&claims(None)))
+        .expect_err("a token with no aud must be refused");
+    assert!(
+        err.to_string().to_lowercase().contains("audience"),
+        "refused for its audience: {err}"
+    );
+    assert!(
+        service.verify_token(&sign(&claims(Some("other")))).is_err(),
+        "a wrong aud is refused"
+    );
+    service
+        .verify_token(&sign(&claims(Some("talos"))))
+        .expect("the same claims with aud=talos verify");
+}
+
+// ---------------------------------------------------------------------------
 // Very long token strings
 // ---------------------------------------------------------------------------
 

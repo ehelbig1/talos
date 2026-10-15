@@ -12,7 +12,7 @@
 //!
 //! | env var                                   | default | gates                                                        |
 //! |-------------------------------------------|---------|--------------------------------------------------------------|
-//! | `GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN` | 10      | `createWorkflowFromDescription`, `generateCode`, `testModule`, `testWorkflow`, `createModuleFromTemplate` |
+//! | `GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN` | 10      | `createWorkflowFromDescription`, `generateCode`, `testModule`, `testWorkflow`, `createModuleFromTemplate`, and the MCP tool `call_a2a_agent` (one bucket, `talos_rate_limit::heavy_operations`) |
 //! | `GRAPHQL_RHAI_PER_USER_PER_MIN`           | 60      | `analyzeRhai`, `testRhaiExpression`                          |
 //!
 //! Both are PER CONTROLLER REPLICA (in-memory; see `PerUserThrottle`'s
@@ -35,18 +35,12 @@ use uuid::Uuid;
 use super::SafeErrorExtensions;
 
 /// Env var for the LLM / compile class ceiling. Default 10 per user per minute.
-pub const HEAVY_MUTATION_ENV: &str = "GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN";
-pub const HEAVY_MUTATION_DEFAULT_PER_MIN: u32 = 10;
+/// The bucket itself lives in `talos-rate-limit` so the MCP surface draws from
+/// the same one.
+pub use talos_rate_limit::{HEAVY_MUTATION_DEFAULT_PER_MIN, HEAVY_MUTATION_ENV};
 /// Env var for the Rhai evaluation class ceiling. Default 60 per user per minute.
 pub const RHAI_ENV: &str = "GRAPHQL_RHAI_PER_USER_PER_MIN";
 pub const RHAI_DEFAULT_PER_MIN: u32 = 60;
-
-static HEAVY_MUTATION: LazyLock<PerUserThrottle> = LazyLock::new(|| {
-    PerUserThrottle::per_minute(talos_rate_limit::env_rate_limit(
-        HEAVY_MUTATION_ENV,
-        HEAVY_MUTATION_DEFAULT_PER_MIN,
-    ))
-});
 
 static RHAI: LazyLock<PerUserThrottle> = LazyLock::new(|| {
     PerUserThrottle::per_minute(talos_rate_limit::env_rate_limit(
@@ -67,7 +61,7 @@ pub enum ThrottleClass {
 impl ThrottleClass {
     fn throttle(self) -> &'static PerUserThrottle {
         match self {
-            ThrottleClass::HeavyMutation => &HEAVY_MUTATION,
+            ThrottleClass::HeavyMutation => talos_rate_limit::heavy_operations(),
             ThrottleClass::RhaiEval => &RHAI,
         }
     }

@@ -42,6 +42,9 @@
 #   TALOS_PUBLISH_SIGN=0           disable signing without passing --no-sign every time
 #   TALOS_PUBLISH_ALLOW_DIRTY=1    same as --allow-dirty
 #   TALOS_PUBLISH_SKIP_CI_CHECK=1  same as --skip-ci-check
+#   TALOS_PUBLISH_REQUIRE_AUDIT=1  a RustSec advisory aborts the publish (default
+#                                  ON with --skip-ci-check, OFF otherwise; set 0
+#                                  to override)
 #
 # Verification (operator-side, after sign step):
 #   cosign verify \
@@ -111,7 +114,7 @@ while [[ $# -gt 0 ]]; do
         --update-env) UPDATE_ENV_FILE="$2"; shift 2 ;;
         --platform)  PLATFORM="$2"; shift 2 ;;
         --help|-h)
-            sed -n '2,44p' "$0"
+            sed -n '2,47p' "$0"
             exit 0 ;;
         *)
             echo "✗ unknown flag: $1" >&2
@@ -207,8 +210,19 @@ fi
 # it HERE catches a vulnerable dep — or a freshly-published advisory against an
 # existing one (e.g. RUSTSEC-2026-0149 in wasmtime, fixed 2026-06-01) — at the
 # ship boundary. WARN-only by default to honour the operator-responsibility
-# model (the dirty-tree check above warns rather than blocks). Set
-# TALOS_PUBLISH_REQUIRE_AUDIT=1 to make a vulnerability abort the publish.
+# model (the dirty-tree check above warns rather than blocks) — BECAUSE the CI
+# gate (a green quality.yml for HEAD, which runs `make audit`) has already
+# vouched for the tree. With --skip-ci-check nothing has, so the audit is
+# REQUIRED (H-6, 2026-10-14): a vulnerability, or a missing cargo-audit, aborts
+# the publish. TALOS_PUBLISH_REQUIRE_AUDIT=1/0 overrides either way.
+if [ -z "${TALOS_PUBLISH_REQUIRE_AUDIT:-}" ]; then
+    if [ "$REQUIRE_CI" = "1" ]; then
+        TALOS_PUBLISH_REQUIRE_AUDIT=0
+    else
+        TALOS_PUBLISH_REQUIRE_AUDIT=1
+        log "--skip-ci-check: the RustSec audit is REQUIRED for this publish (TALOS_PUBLISH_REQUIRE_AUDIT=0 to override)"
+    fi
+fi
 if command -v cargo-audit >/dev/null 2>&1; then
     if cargo audit >/dev/null 2>&1; then
         ok "cargo audit: no RustSec advisories"
@@ -220,6 +234,9 @@ Run \`cargo audit\` for details; fix or downgrade before publishing."
         warn "  Run \`cargo audit\` for the advisory + fixed-version range, or set"
         warn "  TALOS_PUBLISH_REQUIRE_AUDIT=1 to make this abort the publish."
     fi
+elif [ "${TALOS_PUBLISH_REQUIRE_AUDIT:-0}" = "1" ]; then
+    die "cargo-audit not installed and the audit is required (TALOS_PUBLISH_REQUIRE_AUDIT=1). \
+Install: cargo install cargo-audit --locked"
 else
     warn "cargo-audit not installed — skipping the RustSec advisory pre-flight."
     warn "  Install: cargo install cargo-audit --locked (or run \`make audit\`)."

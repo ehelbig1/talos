@@ -37,10 +37,11 @@ pub const GRAPHQL_SDL_PATH: &str = "frontend/schema.graphql";
 
 /// GraphQL Playground HTML source handler
 /// Serves the GraphQL Playground IDE for interactive API exploration
-/// Disabled in production (RUST_ENV=production)
+/// Disabled wherever browser hardening is required (every `RUST_ENV` but the
+/// development spellings; only `production` until 2026-10-14).
 pub async fn graphql_playground_handler() -> Result<Response, AppError> {
-    // Security: Only serve playground in non-production environments
-    let is_production = talos_config::is_production();
+    // Security: Only serve playground in development
+    let is_production = talos_auth_types::browser_hardening_required();
 
     if is_production {
         return Response::builder()
@@ -170,7 +171,7 @@ pub struct ApiKeyScopeDoc {
 
 /// Generate complete API documentation
 pub fn generate_api_documentation() -> ApiDocumentation {
-    let is_production = talos_config::is_production();
+    let is_production = talos_auth_types::browser_hardening_required();
 
     // MCP-653: empty-env class. `BASE_URL: ""` previously produced an
     // empty string used to compose every generated endpoint URL in
@@ -385,7 +386,9 @@ pub async fn api_docs_json_handler() -> Result<Json<ApiDocumentation>, AppError>
 
 /// HTML API documentation handler (simple documentation page)
 pub async fn api_docs_html_handler() -> Html<String> {
-    Html(render_docs_html(talos_config::is_production()))
+    Html(render_docs_html(
+        talos_auth_types::browser_hardening_required(),
+    ))
 }
 
 /// The documentation page, as a pure function of the environment so every

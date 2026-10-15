@@ -41,6 +41,7 @@ permissions:
   contents: read
   actions: read     # gh run list over this repo's workflow runs (publish gate)
   packages: write   # ghcr.io push
+  # signing-identity: signs OCI TEMPLATE artifacts, verified by the worker against its own regexp (template-publish\.yml@refs/heads/main); the image admission regexp names only main-publish.yml and release.yml, so this identity cannot admit an image
   id-token: write   # Sigstore keyless signing (identity = this workflow @ refs/heads/main)
 
 env:

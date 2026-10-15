@@ -295,7 +295,7 @@ pub async fn dispatch(
             Some(handle_get_secret_access_log(req_id, args, state, user_id).await)
         }
         "get_agent_card" => Some(handle_get_agent_card(req_id, args, state, user_id).await),
-        "call_a2a_agent" => Some(handle_call_a2a_agent(req_id, args, state).await),
+        "call_a2a_agent" => Some(handle_call_a2a_agent(req_id, args, state, user_id).await),
         "get_sql_statement_report" => {
             Some(handle_get_sql_statement_report(req_id, args, state, user_id).await)
         }
@@ -1768,10 +1768,68 @@ async fn handle_get_agent_card(
 // across platform.rs, workflows.rs, advanced.rs, and any future outbound HTTP handlers.
 use super::utils::check_outbound_url_no_ssrf;
 
+/// Why an outbound A2A request failed, as a KIND only — never the transport
+/// error's text, which names the URL and connect/TLS detail of the
+/// controller's own egress (A-14, 2026-10-14).
+fn a2a_failure_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_redirect() {
+        "redirect"
+    } else if e.is_body() || e.is_decode() {
+        "body"
+    } else if e.is_request() {
+        "request"
+    } else {
+        "other"
+    }
+}
+
+/// What the caller is told when the request failed: the kind, nothing else.
+fn a2a_failure_message(kind: &str) -> String {
+    format!("A2A request failed ({kind}) — verify the endpoint_url is reachable")
+}
+
+/// Admit one outbound A2A call for `user_id` from the shared heavy-operation
+/// bucket (`talos_rate_limit::heavy_operations`, the GraphQL `HeavyMutation`
+/// class's bucket), or name the refusal. A refusal is counted on the bucket's
+/// series and logged; the caller gets the ceiling and the wait.
+fn admit_a2a_call(user_id: Uuid) -> Result<(), String> {
+    match talos_rate_limit::heavy_operations().check(user_id) {
+        Ok(()) => Ok(()),
+        Err(exceeded) => {
+            talos_metrics::record_rate_limit_hit(
+                talos_metrics::RateLimitKind::GraphqlHeavyMutation,
+            );
+            tracing::warn!(
+                target: "talos_rate_limit",
+                event_kind = "mcp_a2a_throttle_refused",
+                %user_id,
+                per_minute = exceeded.per_minute,
+                retry_after_secs = exceeded.retry_after_secs,
+                "call_a2a_agent refused by the per-user heavy-operation throttle"
+            );
+            Err(format!(
+                "Rate limited: at most {} heavy operations per minute per user; retry in {} s",
+                exceeded.per_minute, exceeded.retry_after_secs
+            ))
+        }
+    }
+}
+
+/// `call_a2a_agent`: POST a task to a caller-named A2A endpoint.
+///
+/// 2026-10-14 (A-14): the call is made for a USER — admitted from that user's
+/// heavy-operation allowance, and recorded on `talos_audit` with the user and
+/// the endpoint's HOST (not its path or query, and never the message) — and a
+/// failed request reports its kind only.
 async fn handle_call_a2a_agent(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     _state: &McpState,
+    user_id: Uuid,
 ) -> JsonRpcResponse {
     let endpoint_url = match args.get("endpoint_url").and_then(|v| v.as_str()) {
         Some(u) if !u.is_empty() => u.to_string(),
@@ -1815,6 +1873,18 @@ async fn handle_call_a2a_agent(
             Ok(v) => v,
             Err(resp) => return resp,
         };
+
+    // Every argument is valid: the call now costs the user one unit of the
+    // shared heavy-operation allowance, before any network work.
+    if let Err(refusal) = admit_a2a_call(user_id) {
+        return mcp_error(req_id, -32029, &refusal);
+    }
+    // The audit line names the host only: the path and query of a
+    // caller-supplied URL can carry anything.
+    let endpoint_host = reqwest::Url::parse(&endpoint_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
 
     // Build A2A task request per Google A2A spec.
     let task_id = Uuid::new_v4().to_string();
@@ -1871,18 +1941,32 @@ async fn handle_call_a2a_agent(
     {
         Ok(r) => r,
         Err(e) => {
-            return mcp_error(
-                req_id,
-                -32000,
-                &format!(
-                    "A2A request failed: {} — verify the endpoint_url is reachable",
-                    e
-                ),
-            )
+            let kind = a2a_failure_kind(&e);
+            // The transport detail stays server-side.
+            tracing::warn!(error = %e, kind, "call_a2a_agent: request failed");
+            tracing::info!(
+                target: "talos_audit",
+                event_kind = "a2a_call",
+                %user_id,
+                host = %endpoint_host,
+                outcome = "failed",
+                kind,
+                "call_a2a_agent POST"
+            );
+            return mcp_error(req_id, -32000, &a2a_failure_message(kind));
         }
     };
 
     let status = resp.status().as_u16();
+    tracing::info!(
+        target: "talos_audit",
+        event_kind = "a2a_call",
+        %user_id,
+        host = %endpoint_host,
+        outcome = "answered",
+        http_status = status,
+        "call_a2a_agent POST"
+    );
     // Bounded read, NOT unbounded `resp.json()`: `endpoint_url` is
     // caller-supplied, so a malicious / misconfigured A2A endpoint returning
     // a multi-GB body would otherwise OOM the controller (talos-http-body).
@@ -2375,6 +2459,62 @@ mod write_ceiling_read_tests {
         assert_eq!(j["enforced_by"], "unknown");
         assert!(j["note"].as_str().unwrap().contains("database problem"));
         assert!(j["registered_rows"].is_null(), "nothing was counted");
+    }
+}
+
+/// `call_a2a_agent` is made for a user (A-14, 2026-10-14): admitted from the
+/// shared heavy-operation bucket, and a failed request reports its kind only.
+#[cfg(test)]
+mod a2a_call_tests {
+    use super::{a2a_failure_kind, a2a_failure_message, admit_a2a_call};
+    use uuid::Uuid;
+
+    #[test]
+    fn a_user_past_the_heavy_operation_ceiling_is_refused_and_another_is_not() {
+        let limit = talos_rate_limit::heavy_operations().per_minute_limit();
+        let user = Uuid::new_v4();
+        for i in 0..limit {
+            admit_a2a_call(user).unwrap_or_else(|e| panic!("call {i} of {limit}: {e}"));
+        }
+        let refused = admit_a2a_call(user).expect_err("past the ceiling");
+        assert!(refused.starts_with("Rate limited:"), "{refused}");
+        admit_a2a_call(Uuid::new_v4()).expect("another user has their own allowance");
+    }
+
+    /// The bucket is the GraphQL `HeavyMutation` class's: spending it here is
+    /// spending it there.
+    #[test]
+    fn the_bucket_is_the_one_graphql_draws_from() {
+        let user = Uuid::new_v4();
+        let limit = talos_rate_limit::heavy_operations().per_minute_limit();
+        for _ in 0..limit {
+            talos_rate_limit::heavy_operations()
+                .check(user)
+                .expect("the shared bucket admits up to its limit");
+        }
+        assert!(admit_a2a_call(user).is_err());
+    }
+
+    /// A refused connection is named `connect`, and nothing of the transport
+    /// error (the URL, the OS error) reaches the caller's text.
+    #[tokio::test]
+    async fn a_failed_request_is_reported_as_a_kind() {
+        // The client the handler builds.
+        let client = talos_http_utils::outbound::build_outbound_webhook_client_with_timeout(
+            "talos-a2a/1.0",
+            std::time::Duration::from_secs(5),
+        )
+        .expect("client");
+        let err = client
+            .post("http://127.0.0.1:1/a2a-secret-path?k=v")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        let kind = a2a_failure_kind(&err);
+        assert_eq!(kind, "connect");
+        let caller_text = a2a_failure_message(kind);
+        assert!(!caller_text.contains("127.0.0.1"));
+        assert!(!caller_text.contains("a2a-secret-path"));
     }
 }
 

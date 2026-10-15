@@ -86,7 +86,7 @@ impl TotpService {
             // refuse to verify (verify_2fa_login fails closed). In
             // dev the WARN suffices — TOTP works fine single-pod
             // without Redis for local testing.
-            if talos_config::is_production() {
+            if talos_auth_types::browser_hardening_required() {
                 tracing::error!(
                     "TOTP service constructed without Redis in PRODUCTION. \
                      verify_2fa_login WILL FAIL CLOSED on every attempt — \
@@ -211,7 +211,7 @@ impl TotpService {
                     // unavailable we cannot guarantee brute-force protection across cluster
                     // nodes, so we reject the attempt rather than silently degrade.
                     // In development, fall back to in-memory to avoid disruption.
-                    if talos_config::is_production() {
+                    if talos_auth_types::browser_hardening_required() {
                         tracing::error!(
                             user_id = %user_id,
                             "Redis 2FA rate limit unavailable in production — rejecting attempt: {}",
@@ -902,7 +902,7 @@ impl TotpService {
         // cache `Err(e)` path inside this function (lines ~656-668).
         // Operators in dev / single-pod tests can still verify
         // without Redis; production must have it.
-        if talos_config::is_production() && self.redis_client.is_none() {
+        if talos_auth_types::browser_hardening_required() && self.redis_client.is_none() {
             tracing::error!(
                 user_id = %user_id,
                 "TOTP verification rejected in production: Redis is required \
@@ -1353,7 +1353,9 @@ mod tests {
     }
 
     /// `RUST_ENV` is process-global and these tests move it, so every test
-    /// whose behaviour depends on `is_production()` takes this lock.
+    /// whose behaviour depends on `browser_hardening_required()` (which every
+    /// 2FA fail-closed gate here follows since 2026-10-14; `is_production()`
+    /// before) takes this lock.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct ProdEnv(Option<String>);
