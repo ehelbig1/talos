@@ -9338,6 +9338,7 @@ dependencies = [
  "talos-module-payload-encryption",
  "talos-push-channel-inventory",
  "talos-secrets-manager",
+ "talos-tenancy",
  "talos-workflow-liveness",
  "tokio",
  "tracing",

@@ -814,8 +814,9 @@ impl SecretsManager {
             .collect();
         // get_secrets_by_paths returns Zeroizing values (C-10), so the cache
         // and the returned map hold the same protection with no plain copy.
-        let zeroizing_keys: std::collections::HashMap<String, Zeroizing<String>> =
-            self.get_secrets_by_paths(&paths, user_id).await?;
+        let zeroizing_keys: std::collections::HashMap<String, Zeroizing<String>> = self
+            .get_secrets_by_paths(&paths, user_id, PathReadAudit::NotRecorded)
+            .await?;
 
         // MCP-771 (2026-05-13): `LLM_KEYS_CACHE_TTL_SECS=0` previously
         // parsed cleanly and produced expires_at == now → every
@@ -1533,14 +1534,12 @@ impl SecretsManager {
         let mut wanted: Vec<Uuid> = allowed_modules.to_vec();
         wanted.sort_unstable();
         wanted.dedup();
-        let reachable: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM modules m \
-             WHERE m.id = ANY($1) \
-               AND (m.user_id = $2 \
-                    OR (m.user_id IS NULL AND m.org_id IS NULL) \
-                    OR m.org_id IN (SELECT om.org_id FROM organization_members om \
-                                    WHERE om.user_id = $2))",
-        )
+        // The one module-visibility rule (`talos_tenancy::module_visible_to!`,
+        // shared with `ModuleRepository`'s reader; C2-6).
+        let reachable: i64 = sqlx::query_scalar(concat!(
+            "SELECT COUNT(*) FROM modules m WHERE m.id = ANY($1) AND ",
+            talos_tenancy::module_visible_to!("m.", "$2"),
+        ))
         .bind(&wanted)
         .bind(user_id)
         .fetch_one(&self.db_pool)
@@ -2838,6 +2837,22 @@ impl SecretsManager {
         user_id: Option<Uuid>,
         module_id: Option<Uuid>,
     ) {
+        self.record_reads(secret_ids, user_id, module_id, PathReadAudit::Dispatch)
+            .await;
+    }
+
+    /// The access counter and one audit row per read secret, labelled by who
+    /// read it ([`PathReadAudit`]); nothing for `NotRecorded`.
+    async fn record_reads(
+        &self,
+        secret_ids: &[Uuid],
+        user_id: Option<Uuid>,
+        module_id: Option<Uuid>,
+        audit: PathReadAudit,
+    ) {
+        let Some((action, actor_type)) = audit.labels() else {
+            return;
+        };
         if secret_ids.is_empty() {
             return;
         }
@@ -2845,15 +2860,18 @@ impl SecretsManager {
             .bind(secret_ids)
             .bind(user_id)
             .bind(module_id)
+            .bind(action)
+            .bind(actor_type)
             .execute(&self.db_pool)
             .await
         {
             tracing::warn!(
                 target: "talos_security",
                 event_kind = "secret_dispatch_read_unrecorded",
+                action,
                 count = secret_ids.len(),
                 error = %e,
-                "dispatch secret reads were not recorded in the audit log"
+                "secret reads were not recorded in the audit log"
             );
         }
     }
@@ -2865,10 +2883,16 @@ impl SecretsManager {
     /// behalf of a specific user. Without it, only secrets with no owner
     /// (owner_user_id IS NULL — system/global secrets) are returned, preventing
     /// cross-tenant leakage when a WASM module declares a path it does not own.
+    ///
+    /// `audit` says who is reading, for the audit row each delivered secret
+    /// leaves ([`PathReadAudit`], security review 2026-10-15, C2-2): a
+    /// dispatch's resolver, the controller's own integration code, or the
+    /// LLM-key cache fill (recorded nowhere: its later hits are not reads).
     pub async fn get_secrets_by_paths(
         &self,
         allowed_paths: &[String],
         owner_user_id: Option<Uuid>,
+        audit: PathReadAudit,
     ) -> Result<std::collections::HashMap<String, Zeroizing<String>>> {
         let is_wildcard = allowed_paths.iter().any(|p| p == "*");
 
@@ -2978,7 +3002,7 @@ impl SecretsManager {
             }
         }
 
-        self.record_dispatch_reads(&delivered, owner_user_id, None)
+        self.record_reads(&delivered, owner_user_id, None, audit)
             .await;
         Ok(secrets_map)
     }
@@ -3890,19 +3914,24 @@ impl SecretsManager {
             .await
             .map_err(|e| anyhow::Error::new(e).context("upsert_secret INSERT failed"))?;
         } else {
-            sqlx::query(
-                r#"
-                UPDATE secrets SET
-                    name = $1,
-                    encrypted_value = $2,
-                    encryption_key_id = $3,
-                    nonce = $4,
-                    description = $5,
-                    encryption_format_version = $6,
-                    updated_at = NOW()
-                WHERE id = $7
-                "#,
-            )
+            // The manage rule, as every other by-id write applies it
+            // (security review 2026-10-15, C2-1): the lookup above finds the
+            // row its CREATOR made, and a creator who has left the org that
+            // owns it may no longer change it. Until then this UPDATE was
+            // `WHERE id = $7` alone. Zero rows is a refusal, and the
+            // transaction (with nothing written) is dropped.
+            let updated = sqlx::query(concat!(
+                "UPDATE secrets SET \
+                    name = $1, \
+                    encrypted_value = $2, \
+                    encryption_key_id = $3, \
+                    nonce = $4, \
+                    description = $5, \
+                    encryption_format_version = $6, \
+                    updated_at = NOW() \
+                 WHERE id = $7 AND ",
+                may_manage_secret!("", "$8"),
+            ))
             .bind(name)
             .bind(&stored_value)
             .bind(key_id)
@@ -3910,9 +3939,17 @@ impl SecretsManager {
             .bind(description)
             .bind(version)
             .bind(secret_id)
+            .bind(creator_user_id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| anyhow::Error::new(e).context("upsert_secret UPDATE failed"))?;
+            .map_err(|e| anyhow::Error::new(e).context("upsert_secret UPDATE failed"))?
+            .rows_affected();
+            if updated == 0 {
+                anyhow::bail!(
+                    "upsert_secret: the existing secret at this path is not one this user may \
+                     change"
+                );
+            }
         }
 
         tx.commit()
@@ -6099,6 +6136,34 @@ pub(crate) const SECRET_AUDIT_INSERT_SQL: &str = "INSERT INTO secret_audit_log (
          (SELECT encode(sha256(convert_to(s.key_path, 'UTF8')), 'hex') \
             FROM secrets s WHERE s.id = $1))";
 
+/// Who read secrets by path, as the audit log records it (security review
+/// 2026-10-15, C2-2). Until then every bulk read by path was recorded as a
+/// `dispatch_read` by a `dispatch` actor — a watch renewal or an LLM-key cache
+/// fill included — so "which executions read this token" mixed in controller
+/// housekeeping with nothing to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathReadAudit {
+    /// A dispatch is handed the secrets: `dispatch_read` / `dispatch`.
+    Dispatch,
+    /// The controller's own code reads them (an integration refreshing or
+    /// using its token): `controller_read` / `system`.
+    Controller,
+    /// Not recorded: the LLM-key cache fill, whose hits are not reads.
+    NotRecorded,
+}
+
+impl PathReadAudit {
+    /// `(action, actor_type)`, or `None` when nothing is recorded.
+    #[must_use]
+    pub fn labels(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Dispatch => Some(("dispatch_read", "dispatch")),
+            Self::Controller => Some(("controller_read", "system")),
+            Self::NotRecorded => None,
+        }
+    }
+}
+
 /// Every secret a dispatch was handed, recorded in one statement beside the
 /// access counter (security review 2026-10-14, C-4): until then the
 /// highest-volume read path wrote only a counter, which cannot say which
@@ -6112,7 +6177,7 @@ pub(crate) const RECORD_DISPATCH_READS_SQL: &str = "WITH read AS ( \
          RETURNING id, key_path) \
      INSERT INTO secret_audit_log ( \
          secret_id, action, actor_type, actor_id, module_id, success, key_hash) \
-     SELECT read.id, 'dispatch_read', 'dispatch', $2, $3, true, \
+     SELECT read.id, $4, $5, $2, $3, true, \
             encode(sha256(convert_to(read.key_path, 'UTF8')), 'hex') \
      FROM read";
 

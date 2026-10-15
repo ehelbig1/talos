@@ -298,7 +298,11 @@ impl GoogleCloudIntegrationService {
             .as_ref()
             .ok_or_else(|| anyhow!("SecretsManager not configured"))?;
         let secrets = sm
-            .get_secrets_by_paths(std::slice::from_ref(&access_token_path), Some(user_id))
+            .get_secrets_by_paths(
+                std::slice::from_ref(&access_token_path),
+                Some(user_id),
+                talos_secrets_manager::PathReadAudit::Controller,
+            )
             .await
             .context("Failed to fetch Google Cloud access token from vault")?;
 

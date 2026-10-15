@@ -170,19 +170,22 @@ pub trait SecretsResolver: Send + Sync {
     /// Impls propagate backing-store errors through the `Err` arm; the
     /// executor decides the policy (a common choice is to swallow and
     /// log so a missing or broken LLM-key vault doesn't fail unrelated
-    /// nodes). Returning an empty `Ok(HashMap)` is correct when the
-    /// user has no LLM keys configured.
+    /// nodes). Returning an empty map is correct when the user has no LLM
+    /// keys configured.
+    ///
+    /// A [`SecretMap`], as every other resolved secret is: the keys stay
+    /// `Zeroizing` from the store to the seal (security review 2026-10-15,
+    /// C2-4 — this returned a plain `HashMap<String, String>`, so every
+    /// tier-2 dispatch copied the provider keys out of the zeroizing map and
+    /// dropped the copy unzeroed).
     ///
     /// The default body returns an empty map — useful for consumers
     /// running with `default-features = false` (no `llm-primitives`)
     /// and for in-process executors that don't orchestrate LLM
     /// workflows at all. Override when the resolver backs onto an
     /// LLM-key store.
-    async fn resolve_llm_keys(
-        &self,
-        _user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError> {
-        Ok(HashMap::new())
+    async fn resolve_llm_keys(&self, _user_id: Option<Uuid>) -> Result<SecretMap, BoxError> {
+        Ok(SecretMap::new())
     }
 
     /// Optional pre-fetch hook invoked with the vault paths about to be

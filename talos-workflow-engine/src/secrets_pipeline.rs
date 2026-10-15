@@ -340,10 +340,8 @@ pub(crate) async fn resolve_secrets_map_for(
     // by tier check" — much narrower exploit surface.
     if !matches!(max_llm_tier, talos_workflow_engine_core::LlmTier::Tier1) {
         match resolver.resolve_llm_keys(user_id).await {
-            Ok(keys) => secrets_map.extend(
-                keys.into_iter()
-                    .map(|(k, v)| (k, zeroize::Zeroizing::new(v))),
-            ),
+            // Already `Zeroizing` (C2-4): extended as they come.
+            Ok(keys) => secrets_map.extend(keys),
             Err(e) => tracing::debug!(
                 error = %e,
                 "Failed to pre-fetch LLM vault keys — worker will fall back to env vars"

@@ -1469,16 +1469,18 @@ impl ModuleRepository {
         user_id: Uuid,
         org_ids: &[Uuid],
     ) -> Result<Vec<ModuleDetailsRow>> {
-        let rows = sqlx::query_as::<_, ModuleDetailsRow>(
+        // The one module-visibility rule (`talos_tenancy::module_visible_to!`,
+        // shared with the secrets manager's `allowed_modules` check; C2-6).
+        let rows = sqlx::query_as::<_, ModuleDetailsRow>(concat!(
             "SELECT id, name,
                     COALESCE(size_bytes, 0) AS size_bytes,
                     COALESCE(content_hash, '') AS content_hash,
                     COALESCE(compiled_at, created_at) AS compiled_at,
                     config, config_schema, catalog_slug, source_code, capability_world, imported_interfaces, language
              FROM modules
-             WHERE id = ANY($1)
-               AND (user_id = $2 OR org_id = ANY($3) OR (user_id IS NULL AND org_id IS NULL))",
-        )
+             WHERE id = ANY($1) AND ",
+            talos_tenancy::module_visible_to!("", "$2", "$3"),
+        ))
         .bind(ids)
         .bind(user_id)
         .bind(org_ids)

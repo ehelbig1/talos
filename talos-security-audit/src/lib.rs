@@ -485,6 +485,51 @@ pub fn check_replay_guard(
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// secret_audit_log_extent — how large the append-only secret audit log is
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Render the `secret_audit_log_extent` check (security review 2026-10-15,
+/// C2-3): the secret audit log is append-only (an immutability trigger) and
+/// gains one row per secret a dispatch is handed, so its size and history are
+/// reported where an operator looks, with the retention position — archival is
+/// operator-side (`docs/secret-audit-log-retention-runbook.md`); nothing in
+/// the platform trims it. Informational: a large table is not a failure.
+/// `extent` is `(row estimate, oldest row's age in days)`; `Err` is an
+/// unreadable catalogue.
+#[must_use]
+pub fn check_secret_audit_log_extent(extent: &Result<(Option<i64>, Option<i64>), String>) -> Check {
+    let detail = match extent {
+        Err(_) => "NOT VERIFIED: the size of secret_audit_log could not be read".to_string(),
+        Ok((rows, days)) => format!(
+            "secret_audit_log: {} row(s), oldest {}; append-only — one row per secret a \
+             dispatch is handed — and archived only by the operator \
+             (docs/secret-audit-log-retention-runbook.md)",
+            rows.map_or_else(
+                || "an unknown number of".to_string(),
+                |n| format!("about {n}")
+            ),
+            days.map_or_else(|| "none".to_string(), |d| format!("{d} day(s) old")),
+        ),
+    };
+    Check {
+        name: "secret_audit_log_extent",
+        status: if extent.is_ok() {
+            Status::Info
+        } else {
+            Status::Warn
+        },
+        detail,
+        verification: if extent.is_ok() {
+            Verification::Parsed
+        } else {
+            Verification::NotVerified
+        },
+        points: 0,
+        parts: None,
+    }
+}
+
 /// Which key-encryption keys can unwrap this deployment's DEKs (security
 /// review 2026-10-14, C-12). Under `KEK_PROVIDER=vault` the env KEK
 /// (`TALOS_MASTER_KEY`) stays a live unwrap path — so a leaked Secret still
@@ -2281,7 +2326,8 @@ pub fn render_report(checks: &[Check]) -> serde_json::Value {
 /// Run every check and render the report.
 ///
 /// Idempotent and side-effect free: see the per-probe documentation. The only
-/// database access is a read of `pg_trigger`. The audit-chain probe performs
+/// database access is a read of `pg_trigger` (and, since 2026-10-15, of
+/// `secret_audit_log`'s size through the same repository). The audit-chain probe performs
 /// two READ-ONLY S3 operations against the WORM bucket through the read-only
 /// verifier identity and increments no counter — see [`probe_audit_chain`].
 /// `audit_chain_candidate` is resolved by the CALLER for the same reason
@@ -2316,8 +2362,19 @@ pub async fn run_security_audit(
         })
         .ok();
 
+    let audit_extent = sysrepo.secret_audit_log_extent().await.map_err(|e| {
+        tracing::error!(
+            target: "talos_security",
+            event_kind = "security_audit_extent_query_failed",
+            error = %e,
+            "security_audit could not read the size of secret_audit_log"
+        );
+        "unreadable".to_string()
+    });
+
     let checks = vec![
         check_production_mode(is_prod),
+        check_secret_audit_log_extent(&audit_extent),
         check_kek_posture(
             is_prod,
             &std::env::var("KEK_PROVIDER")

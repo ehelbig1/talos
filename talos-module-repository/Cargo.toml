@@ -20,6 +20,8 @@ talos-module-payload-encryption = { path = "../talos-module-payload-encryption" 
 # read. A leaf crate (types + pure decisions), so no layering cost.
 talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
+# `module_visible_to!`: the one module-visibility fragment (C2-6).
+talos-tenancy = { path = "../talos-tenancy" }
 # Catalog drift report: counts only workflows that are not retired (check 87).
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 tracing.workspace = true

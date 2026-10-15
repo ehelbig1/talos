@@ -389,14 +389,18 @@ impl SecretsResolver for InMemorySecretsResolver {
     async fn resolve_llm_keys(
         &self,
         user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError> {
+    ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
         let Some(uid) = user_id else {
-            return Ok(HashMap::new());
+            return Ok(talos_workflow_engine_core::SecretMap::new());
         };
         Ok(self
             .llm_keys
             .get(&uid)
-            .map(|e| e.clone())
+            .map(|e| {
+                e.iter()
+                    .map(|(k, v)| (k.clone(), zeroize::Zeroizing::new(v.clone())))
+                    .collect()
+            })
             .unwrap_or_default())
     }
 }
@@ -609,6 +613,6 @@ mod tests {
         assert_eq!(v.get("missing"), None);
 
         let l = r.resolve_llm_keys(Some(user)).await.unwrap();
-        assert_eq!(l.get("anthropic"), Some(&"secret-c".to_string()));
+        assert_eq!(l.get("anthropic").map(|v| v.as_str()), Some("secret-c"));
     }
 }
