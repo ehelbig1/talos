@@ -939,16 +939,11 @@ pub(crate) async fn build_platform_services(
     }
     // Wire in the unified credential service for dual-write token storage.
     google_calendar_service.with_credentials_service(oauth_credential_service.clone());
-    // Wire in the worker shared HMAC key for webhook-token signing. If
-    // the key isn't set, watch-channel creation will fail closed —
-    // safer than issuing channels Google will send to but we can't
-    // verify on arrival. Empty / short keys are rejected up-front.
-    if let Some(ref key) = worker_shared_key {
-        if let Err(e) = google_calendar_service.with_worker_shared_key(key.as_bytes().to_vec()) {
-            tracing::error!(error = %e, "gcal webhook HMAC key rejected; aborting");
-            return Err(e);
-        }
-    }
+    // The Google Calendar service no longer holds the worker shared key: a
+    // channel's token is random and only its hash is stored (security review
+    // 2026-10-14, F-6). The webhook handler still receives the key as an
+    // Extension, to verify a channel created before that change until the
+    // dual-verify window ends (`webhook_token::LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX`).
 
     // ---------- Push-channel inventories (operator surfaces) ----------
     //

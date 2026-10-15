@@ -116,9 +116,129 @@ pub async fn check_module_binding(
     Err(refusal)
 }
 
+/// What a channel owner is told when the workflow they named cannot be bound.
+///
+/// ONE sentence for "no such workflow", "not yours", "archived" and
+/// "disabled". The ownership read decides first, so a caller who does not own
+/// the workflow never learns its state; the owner is told the two states they
+/// can change. Every integration's `BindWorkflowRefusal::WorkflowNotBindable`
+/// says exactly this.
+pub const WORKFLOW_NOT_BINDABLE_MESSAGE: &str = "No such workflow, or it is archived or disabled.";
+
+/// Why a workflow could not be bound to a push channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WorkflowBindingRefusal {
+    /// The read answered: no workflow of this user's by that id, or one the
+    /// platform will not start (archived, or disabled).
+    #[error("workflow binding names no workflow this user can start")]
+    NotBindable,
+    /// The read failed. Nothing is bound on a rule that was not read.
+    #[error("workflow binding could not be verified")]
+    Unreadable,
+}
+
+/// The decision over what the workflow read returned: `None` for no row of
+/// this user's, else the row's `status` and `is_enabled`. `Err` carries the
+/// operator's `event_kind`. Pure, so the archived and disabled arms are tested
+/// without a database.
+pub fn workflow_binding_verdict(row: Option<(Option<&str>, bool)>) -> Result<(), &'static str> {
+    let Some((status, is_enabled)) = row else {
+        return Err("watch_workflow_binding_absent");
+    };
+    // The DISPATCH gate the trigger applies at every push
+    // (`not_dispatchable_reason`, whose decision is
+    // `talos_workflow_liveness::is_dispatchable`). A binding that gate would
+    // refuse could never start anything.
+    match talos_workflow_repository::not_dispatchable_reason(status, is_enabled) {
+        None => Ok(()),
+        Some("archived") => Err("watch_workflow_binding_archived"),
+        Some(_) => Err("watch_workflow_binding_disabled"),
+    }
+}
+
+/// Is `workflow_id` one `user_id` may bind a push channel to?
+///
+/// The one home of the question for every writer of a channel's workflow
+/// binding: each integration's `bind_channel_workflow` (Jira's
+/// `bind_registration_workflow`) and a create that names a workflow
+/// (structural lint check 102). Asked of the SAME repository read the trigger
+/// uses, and of the same dispatch gate, so "bindable" and "a push would start
+/// it" cannot drift apart. The trigger asks both again at every push; this is
+/// what stops a binding that could never fire.
+pub async fn workflow_is_bindable(
+    pool: &Pool<Postgres>,
+    user_id: Uuid,
+    workflow_id: Uuid,
+    integration: &'static str,
+) -> Result<(), WorkflowBindingRefusal> {
+    let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
+    let record = match repo.get_workflow(workflow_id, user_id).await {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::error!(
+                integration,
+                %user_id,
+                %workflow_id,
+                error = %e,
+                "push channel workflow binding: workflow read failed"
+            );
+            return Err(WorkflowBindingRefusal::Unreadable);
+        }
+    };
+    match workflow_binding_verdict(record.as_ref().map(|r| (r.status.as_deref(), r.is_enabled))) {
+        Ok(()) => Ok(()),
+        Err(event_kind) => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind,
+                integration,
+                %user_id,
+                %workflow_id,
+                "refusing to bind a push channel to a workflow this user cannot start"
+            );
+            Err(WorkflowBindingRefusal::NotBindable)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An archived or a disabled workflow is refused like a missing one; a
+    /// draft is bindable, as the trigger dispatches a draft.
+    #[test]
+    fn an_archived_or_disabled_workflow_is_not_bindable() {
+        assert_eq!(
+            workflow_binding_verdict(None),
+            Err("watch_workflow_binding_absent")
+        );
+        assert_eq!(
+            workflow_binding_verdict(Some((Some("archived"), true))),
+            Err("watch_workflow_binding_archived")
+        );
+        assert_eq!(
+            workflow_binding_verdict(Some((Some("active"), false))),
+            Err("watch_workflow_binding_disabled")
+        );
+        assert_eq!(
+            workflow_binding_verdict(Some((Some("draft"), true))),
+            Ok(())
+        );
+        assert_eq!(
+            workflow_binding_verdict(Some((Some("active"), true))),
+            Ok(())
+        );
+    }
+
+    /// The owner's sentence names what they can change and nothing about
+    /// anyone else.
+    #[test]
+    fn the_workflow_refusal_does_not_say_whose_the_workflow_is() {
+        let m = WORKFLOW_NOT_BINDABLE_MESSAGE.to_lowercase();
+        assert!(m.contains("archived") && m.contains("disabled"));
+        assert!(!m.contains("owner") && !m.contains("another user") && !m.contains("permission"));
+    }
 
     /// The caller must not be able to tell "no such module" from "not yours".
     /// The operator must. Both halves, in one test, because a future edit that

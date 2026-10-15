@@ -223,12 +223,12 @@ impl WebhooksMutations {
             })?;
         }
 
-        // Generate verification token if not provided
-        let verification_token = input.verification_token.unwrap_or_else(|| {
-            let mut random_bytes = [0u8; 32];
-            talos_random::fill(&mut random_bytes);
-            hex::encode(random_bytes)
-        });
+        // Generate verification token if not provided — the one minting both
+        // create paths share. Only its hash is stored; the token is returned
+        // once, below.
+        let verification_token = input
+            .verification_token
+            .unwrap_or_else(talos_webhook_repository::mint_verification_token);
 
         // MCP-S2: pre-generate the trigger id so we can bind it as AAD
         // into the AES-GCM tag at encrypt time. Without this binding,

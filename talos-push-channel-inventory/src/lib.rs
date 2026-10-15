@@ -209,7 +209,8 @@ pub enum BindWorkflowRefusal {
     NotSupported,
     /// No such channel for this user.
     ChannelNotFound,
-    /// No such workflow for this user ("not yours" is the same answer).
+    /// No such workflow for this user ("not yours" is the same answer), or one
+    /// the platform will not start (archived or disabled).
     WorkflowNotBindable,
     /// The channel or the workflow could not be read; nothing was changed.
     Unreadable,
@@ -222,7 +223,7 @@ impl BindWorkflowRefusal {
             Self::UnknownIntegration => "No such push integration here. list_push_channels names the ones surveyed.",
             Self::NotSupported => "Channels of this integration cannot start a workflow.",
             Self::ChannelNotFound => "No such push channel. List your channels again: a renewal gives a channel a new id.",
-            Self::WorkflowNotBindable => "No such workflow.",
+            Self::WorkflowNotBindable => "No such workflow, or it is archived or disabled.",
             Self::Unreadable => "The binding could not be checked, so nothing was changed. Try again.",
         }
     }

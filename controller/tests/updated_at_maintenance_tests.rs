@@ -451,7 +451,7 @@ async fn firing_a_webhook_does_not_date_it_but_renaming_it_does() {
     let user = seed_user(&pool).await;
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO webhook_triggers (id, name, verification_token, user_id) VALUES ($1, 'probe', $2, $3)",
+        "INSERT INTO webhook_triggers (id, name, verification_token_hash, user_id) VALUES ($1, 'probe', $2, $3)",
     )
     .bind(id)
     .bind(format!("tok-{id}"))

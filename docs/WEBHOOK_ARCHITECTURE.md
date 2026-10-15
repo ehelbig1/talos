@@ -50,7 +50,7 @@ CREATE TABLE webhook_listeners (
     module_id UUID REFERENCES wasm_modules(id),
 
     -- Security
-    verification_token TEXT,  -- For validating incoming requests
+    verification_token_hash TEXT,  -- SHA-256 of the static token (the token is never stored)
     signing_secret TEXT,      -- For HMAC verification
     allowed_ips TEXT[],       -- IP whitelist
 

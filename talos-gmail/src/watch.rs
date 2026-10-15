@@ -59,7 +59,10 @@ use talos_integration_helpers::audit::{
 use talos_integration_helpers::state_store::{
     ttl_with_grace, ChannelStore, CreateLockMap, FleetCreateGuard, RowUpdate, UpdateOutcome,
 };
-use talos_integration_helpers::watch_binding::{check_module_binding, ModuleBindingRefusal};
+use talos_integration_helpers::watch_binding::{
+    check_module_binding, workflow_is_bindable, ModuleBindingRefusal, WorkflowBindingRefusal,
+    WORKFLOW_NOT_BINDABLE_MESSAGE,
+};
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{
     IndexedSlots, IntegrationOp, IntegrationOpResult, ListFilter, StoredEntry,
@@ -236,7 +239,7 @@ impl BindWorkflowRefusal {
     pub fn user_facing_message(self) -> &'static str {
         match self {
             Self::ChannelNotFound => "No such watch channel. List your channels again: a renewal gives a channel a new id.",
-            Self::WorkflowNotBindable => "No such workflow.",
+            Self::WorkflowNotBindable => WORKFLOW_NOT_BINDABLE_MESSAGE,
             Self::Unreadable => "The binding could not be checked, so nothing was changed. Try again.",
         }
     }
@@ -250,6 +253,15 @@ impl BindWorkflowRefusal {
     }
 }
 
+impl From<WorkflowBindingRefusal> for BindWorkflowRefusal {
+    fn from(r: WorkflowBindingRefusal) -> Self {
+        match r {
+            WorkflowBindingRefusal::NotBindable => Self::WorkflowNotBindable,
+            WorkflowBindingRefusal::Unreadable => Self::Unreadable,
+        }
+    }
+}
+
 impl std::fmt::Display for BindWorkflowRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.user_facing_message())
@@ -257,42 +269,11 @@ impl std::fmt::Display for BindWorkflowRefusal {
 }
 impl std::error::Error for BindWorkflowRefusal {}
 
-/// Is `workflow_id` one `user_id` may bind a watch to?
-///
-/// Asked of the SAME repository read the trigger path uses, so "bindable" and
-/// "this user may start it" cannot drift apart. The trigger checks ownership
-/// again at every push; this check is what stops a binding that could never
-/// fire. The one home of the question for both writers of the binding: a
-/// create that names a workflow, and [`bind_channel_workflow`].
-async fn workflow_is_bindable(
-    pool: &sqlx::PgPool,
-    user_id: Uuid,
-    workflow_id: Uuid,
-) -> std::result::Result<(), BindWorkflowRefusal> {
-    let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
-    match repo.get_workflow(workflow_id, user_id).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => {
-            tracing::warn!(
-                target: "talos_audit",
-                event_kind = "gmail_watch_workflow_binding_refused",
-                %user_id,
-                %workflow_id,
-                "refusing to bind a gmail watch to a workflow this user does not own"
-            );
-            Err(BindWorkflowRefusal::WorkflowNotBindable)
-        }
-        Err(e) => {
-            tracing::error!(%user_id, %workflow_id, error = %e, "gmail watch binding: workflow read failed");
-            Err(BindWorkflowRefusal::Unreadable)
-        }
-    }
-}
-
 /// Bind the workflow a new message in this watch's mailbox starts, or clear
 /// the binding (`None`).
 ///
-/// * The workflow must be one `user_id` owns ([`workflow_is_bindable`]).
+/// * The workflow must be one `user_id` may start
+///   ([`talos_integration_helpers::watch_binding::workflow_is_bindable`]).
 /// * Only the binding changes, under the row lock: a concurrent cursor advance
 ///   is never reverted, and a watch a concurrent stop deleted is not
 ///   re-created. `updated_at_ms` is left alone — it is what the inventory
@@ -306,7 +287,9 @@ pub async fn bind_channel_workflow(
     workflow_id: Option<Uuid>,
 ) -> std::result::Result<GmailWatchRow, BindWorkflowRefusal> {
     if let Some(workflow_id) = workflow_id {
-        workflow_is_bindable(pool, user_id, workflow_id).await?;
+        workflow_is_bindable(pool, user_id, workflow_id, GMAIL_INTEGRATION_NAME)
+            .await
+            .map_err(BindWorkflowRefusal::from)?;
     }
 
     let store = ChannelStore::new(pool.clone(), GMAIL_INTEGRATION_NAME, WATCH_KEY_PREFIX);
@@ -482,7 +465,9 @@ impl GmailWatchService {
         // the binding it found and does not re-ask: the trigger asks at every
         // push, so a workflow that stopped being this user's starts nothing.
         if let Some(workflow_id) = workflow_id {
-            workflow_is_bindable(&self.pool, user_id, workflow_id).await?;
+            workflow_is_bindable(&self.pool, user_id, workflow_id, GMAIL_INTEGRATION_NAME)
+                .await
+                .map_err(BindWorkflowRefusal::from)?;
         }
 
         let guard = self.acquire_lock(user_id, integration_id).await?;
@@ -1211,7 +1196,7 @@ mod tests {
     #[test]
     fn a_binding_refusal_does_not_say_whose_the_workflow_is() {
         let said = BindWorkflowRefusal::WorkflowNotBindable.user_facing_message();
-        assert_eq!(said, "No such workflow.");
+        assert_eq!(said, WORKFLOW_NOT_BINDABLE_MESSAGE);
         assert_eq!(
             CreateWatchError::from(BindWorkflowRefusal::WorkflowNotBindable).user_facing_message(),
             said

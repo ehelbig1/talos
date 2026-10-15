@@ -506,20 +506,29 @@ pub async fn webhook_notification_handler(
     // Webhook verification pipeline
     //
     // Order matters, from cheapest to most expensive so a flood of
-    // malformed / unauthorised webhooks never reaches the database:
+    // malformed / unauthorised webhooks reaches the database as little as
+    // the token's form allows:
     //
     //   1. Header presence (channel_id, channel_token) + channel-id SHAPE
     //      (≤64 chars of [A-Za-z0-9_-]; Talos mints UUIDs).
-    //   2. Signed-token verify (constant-time HMAC, no I/O) — also
-    //      recovers the bound user_id without any lookup.
-    //   3. Per-channel rate-limit keyed on the VERIFIED (user_id,
+    //   2. Token FORM (no key, no I/O): the user it names, and whether it
+    //      is a hashed-form token (minted since 2026-10-14, F-6) or a legacy
+    //      worker-key HMAC. A legacy token is verified here, with no I/O,
+    //      and refused outright once the dual-verify window has ended.
+    //   3. integration_state lookup scoped to (gcal, named user). A
+    //      hashed-form token is authenticated only by its row, so a forged
+    //      one costs this one indexed read.
+    //   4. `channel_token_admits` over the row: a row with a stored hash
+    //      takes only the token it is the hash of (constant time) and never
+    //      a worker-key token; a row without one takes only a verified
+    //      legacy token, inside the window.
+    //   5. Per-channel rate-limit keyed on the VERIFIED (user_id,
     //      channel_id) (in-memory DashMap; no I/O). F8: this used to run
-    //      before step 2 on the bare header, so anyone who knew a channel
-    //      id — it is in every Google request — could burn that channel's
-    //      budget and drop the real notifications, with no token at all.
-    //   4. integration_state lookup scoped to (gcal, user_id).
-    //   5. Dedup of X-Goog-Message-Number (read-modify-write).
-    //   6. Dispatch in a spawned task.
+    //      before verification on the bare header, so anyone who knew a
+    //      channel id — it is in every Google request — could burn that
+    //      channel's budget and drop the real notifications, with no token.
+    //   6. Dedup of X-Goog-Message-Number (read-modify-write).
+    //   7. Dispatch in a spawned task.
     //
     // Any verification failure returns 403, logged with the channel id
     // but NEVER the token itself (it's a bearer secret).
@@ -540,43 +549,37 @@ pub async fn webhook_notification_handler(
         return StatusCode::BAD_REQUEST;
     }
 
-    // Signed-token verification happens BEFORE any database work AND before
-    // the per-channel limiter. The HMAC key must be present at this point
-    // (wired at startup).
     let Some(token_str) = channel_token else {
         tracing::warn!(channel_id = %ch_id, "🚨 Missing X-Goog-Channel-Token");
         return StatusCode::FORBIDDEN;
     };
-    let Some(ref shared_key_bytes) = worker_shared_key else {
-        tracing::error!("WORKER_SHARED_KEY not configured; cannot verify gcal webhook tokens");
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    };
-    let Some(user_id) =
-        crate::webhook_token::verify_channel_token(&token_str, &ch_id, shared_key_bytes.as_bytes())
-    else {
-        tracing::warn!(
-            channel_id = %ch_id,
-            "🚨 Invalid gcal webhook token (HMAC mismatch)"
-        );
+    // The token's form and the user it names — unauthenticated until step 4.
+    let Some((user_id, form)) = crate::webhook_token::claimed_channel_user(&token_str) else {
+        tracing::warn!(channel_id = %ch_id, "🚨 Malformed gcal webhook token");
         return StatusCode::FORBIDDEN;
     };
-
-    // Per-channel rate limit, keyed on the token-attested (user_id, channel).
-    if !service.allow_webhook_channel(&GoogleCalendarService::webhook_channel_limit_key(
-        user_id, &ch_id,
-    )) {
-        tracing::warn!(
-            channel_id = %ch_id,
-            user_id = %user_id,
-            "Google Calendar webhook rate limit exceeded — notification dropped"
-        );
-        return StatusCode::OK;
+    let legacy_key = worker_shared_key.as_ref().map(|k| k.as_bytes());
+    let now_unix = chrono::Utc::now().timestamp();
+    if form == crate::webhook_token::ChannelTokenForm::Legacy {
+        // A legacy token is checked before any database work, as it always
+        // was; past the window, or with no key to check it, it is refused.
+        let in_window = now_unix < crate::webhook_token::LEGACY_WSK_TOKENS_ACCEPTED_UNTIL_UNIX;
+        let verified = legacy_key
+            .and_then(|key| crate::webhook_token::verify_channel_token(&token_str, &ch_id, key));
+        if !in_window || verified != Some(user_id) {
+            tracing::warn!(
+                channel_id = %ch_id,
+                in_window,
+                "🚨 Invalid gcal webhook token (legacy form refused)"
+            );
+            return StatusCode::FORBIDDEN;
+        }
     }
 
     // Look up the channel in integration_state scoped to the user the
-    // token attested to. `None` means the row has been renewed/deleted
-    // while Google still had the old channel_id in flight — transient,
-    // treat as a stale webhook.
+    // token names. `None` means the row has been renewed/deleted while
+    // Google still had the old channel_id in flight — transient, treat as a
+    // stale webhook.
     let watch = match service.find_channel_by_google_id(user_id, &ch_id).await {
         Ok(Some(w)) => w,
         Ok(None) => {
@@ -596,6 +599,35 @@ pub async fn webhook_notification_handler(
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     };
+
+    // The authentication decision, over the row the token was routed to.
+    if !crate::webhook_token::channel_token_admits(
+        &token_str,
+        &ch_id,
+        user_id,
+        watch.token_hash.as_deref(),
+        legacy_key,
+        now_unix,
+    ) {
+        tracing::warn!(
+            channel_id = %ch_id,
+            row_has_hash = watch.token_hash.is_some(),
+            "🚨 Invalid gcal webhook token (does not match the channel)"
+        );
+        return StatusCode::FORBIDDEN;
+    }
+
+    // Per-channel rate limit, keyed on the token-attested (user_id, channel).
+    if !service.allow_webhook_channel(&GoogleCalendarService::webhook_channel_limit_key(
+        user_id, &ch_id,
+    )) {
+        tracing::warn!(
+            channel_id = %ch_id,
+            user_id = %user_id,
+            "Google Calendar webhook rate limit exceeded — notification dropped"
+        );
+        return StatusCode::OK;
+    }
 
     let channel_uuid = watch.id;
     let module_id = watch.module_id;

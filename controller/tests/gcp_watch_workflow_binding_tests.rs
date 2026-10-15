@@ -189,6 +189,82 @@ async fn a_workflow_is_bound_only_by_its_owner_to_the_owners_own_channel() {
     assert_eq!(audit(&w, alice, "workflow_unbound").await.len(), 1);
 }
 
+/// The owner's own workflow, archived or disabled, is refused: the trigger
+/// would refuse every push it started, so the binding would never fire
+/// (security review 2026-10-14, F-7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archived_workflow_cannot_be_bound() {
+    let w = world().await;
+    let (alice, channel) = user_with_channel(&w).await;
+    let archived = common::create_test_workflow(&w.pool, alice, "archived").await;
+    let disabled = common::create_test_workflow(&w.pool, alice, "disabled").await;
+    sqlx::query("UPDATE workflows SET status = 'archived' WHERE id = $1")
+        .bind(archived)
+        .execute(&w.pool)
+        .await
+        .expect("archive");
+    sqlx::query("UPDATE workflows SET is_enabled = false WHERE id = $1")
+        .bind(disabled)
+        .execute(&w.pool)
+        .await
+        .expect("disable");
+
+    for not_startable in [archived, disabled] {
+        assert_eq!(
+            bind(&w, alice, channel, Some(not_startable)).await,
+            Err(BindWorkflowRefusal::WorkflowNotBindable)
+        );
+    }
+    assert_eq!(stored_binding(&w, alice).await, None);
+    assert!(audit(&w, alice, "workflow_bound").await.is_empty());
+}
+
+/// F-5: a push signed for the wrong service account is a refusal anyone with
+/// a Google token can provoke, so it writes at most one audit row a day per
+/// channel; a second channel gets its own row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_push_writes_at_most_one_row_a_day_per_channel() {
+    use talos_integration_helpers::audit::{insert_channel_audit_once_per_day, ChannelAuditEvent};
+    let w = world().await;
+    let (user, channel) = user_with_channel(&w).await;
+    let event = || ChannelAuditEvent {
+        integration_id: None,
+        user_id: user,
+        event_type: "gcp_channel_push_rejected",
+        target: Some(SA),
+        success: false,
+        error_message: Some("service account mismatch"),
+        metadata: serde_json::json!({}),
+    };
+    let mut written = Vec::new();
+    for _ in 0..5 {
+        written.push(
+            insert_channel_audit_once_per_day(&w.pool, event(), channel)
+                .await
+                .expect("insert"),
+        );
+    }
+    assert_eq!(written, [true, false, false, false, false]);
+    assert_eq!(audit(&w, user, "gcp_channel_push_rejected").await.len(), 1);
+    let other = Uuid::new_v4();
+    assert!(insert_channel_audit_once_per_day(&w.pool, event(), other)
+        .await
+        .expect("insert"));
+    assert_eq!(audit(&w, user, "gcp_channel_push_rejected").await.len(), 2);
+    // The owner's view reads the row by its channel.
+    let tagged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM google_calendar_audit_log \
+         WHERE user_id = $1 AND metadata->>'channel_uuid' = $2 \
+           AND event_type = 'gcp_channel_push_rejected'",
+    )
+    .bind(user)
+    .bind(channel.to_string())
+    .fetch_one(&w.pool)
+    .await
+    .expect("count");
+    assert_eq!(tagged, 1);
+}
+
 /// Nothing replaces a Google Cloud channel's row (there is no renewal). The
 /// one path that rewrites it is the stamp a verified push leaves, and a
 /// binding that vanished at the first push would fail nothing and start

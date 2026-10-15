@@ -86,8 +86,6 @@ async fn world() -> World {
         Arc::new(controller::secrets::SecretsManager::new(pool.clone()).expect("secrets manager"));
     secrets.initialize().await.expect("initialize secrets");
     let svc = GoogleCalendarService::new(pool.clone(), secrets);
-    svc.with_worker_shared_key(vec![7_u8; 32])
-        .expect("shared key");
     svc.with_api_base_url_for_tests(&base);
     World {
         svc: Arc::new(svc),

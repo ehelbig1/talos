@@ -109,9 +109,11 @@ service. `docs/notification-contract.md` is the reference.
 
 3. **Inbound push/webhook requests must be authenticated before any DB work,**
    and mapped to the owning user via the *owned trigger/channel row* or a
-   verified token — not via request-supplied identifiers. (GCal: HMAC
-   `X-Goog-Channel-Token`; Gmail: Google-signed Pub/Sub JWT; generic webhooks:
-   HMAC signing secret or constant-time `verification_token`.)
+   verified token — not via request-supplied identifiers. (GCal: a random
+   per-channel `X-Goog-Channel-Token` checked against its hash in the row; Gmail:
+   Google-signed Pub/Sub JWT; generic webhooks:
+   HMAC signing secret or a static token compared on its stored SHA-256,
+   `verification_token_hash`.)
 
 4. **Never log a token, refresh token, or PII.** For gmail/gcal the OAuth
    `provider_key` IS the user's email — redact it

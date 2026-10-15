@@ -42,7 +42,6 @@ talos-oauth = { path = "../talos-oauth" }
 talos-public-url = { path = "../talos-public-url" }
 talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
 talos-task-supervision = { path = "../talos-task-supervision" }
-talos-workflow-repository = { path = "../talos-workflow-repository" }
 thiserror.workspace = true
 # The receiver answers Atlassian first and runs the starts in a task; the
 # refresh loop takes the controller's shutdown receiver.

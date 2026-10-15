@@ -10,6 +10,25 @@ use uuid::Uuid;
 /// (GraphQL `createWebhookTrigger` and MCP `create_webhook`).
 pub const MAX_WEBHOOKS_PER_USER: i64 = 500;
 
+/// Mint a webhook's static verification token: 32 bytes from the operating
+/// system's source, hex-encoded (64 chars). The one minting for both create
+/// paths (security review 2026-10-14, G-25 — the MCP path used a UUID).
+#[must_use]
+pub fn mint_verification_token() -> String {
+    hex::encode(talos_random::bytes::<32>())
+}
+
+/// What `webhook_triggers.verification_token_hash` holds for `token`: the hex
+/// SHA-256 of its UTF-8 bytes. The token itself is returned once, by the
+/// create, and never stored (security review 2026-10-14, F-3). The webhook
+/// router hashes a delivered token with this same function before its
+/// constant-time compare, and migration 20261014220000 backfilled existing
+/// rows with the same digest in SQL.
+#[must_use]
+pub fn verification_token_hash(token: &str) -> String {
+    talos_text_util::sha256_hex(token)
+}
+
 /// Take the per-user webhook-create advisory lock on `tx` and count the
 /// user's triggers under it. Salt 42939990001 — distinct from MCP-685's
 /// api-keys salt so the two subsystems don't block each other.
@@ -112,6 +131,8 @@ pub struct NewWebhookTrigger<'a> {
     pub id: Uuid,
     pub name: &'a str,
     pub module_id: Uuid,
+    /// The token the caller is handed; only [`verification_token_hash`] of it
+    /// is stored.
     pub verification_token: &'a str,
     pub signing_secret_enc: Option<&'a [u8]>,
     pub signing_key_id: Option<Uuid>,
@@ -246,7 +267,7 @@ impl WebhookRepository {
 
         sqlx::query(
             "INSERT INTO webhook_triggers \
-             (id, user_id, name, module_id, workflow_id, verification_token, \
+             (id, user_id, name, module_id, workflow_id, verification_token_hash, \
               max_requests_per_minute, auto_respond, sync_response, sync_timeout_secs, \
               signing_secret_enc, signing_key_id, signing_secret_format, event_filter, enabled, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, NOW())",
@@ -256,7 +277,7 @@ impl WebhookRepository {
         .bind(name)
         .bind(module_id)
         .bind(workflow_id)
-        .bind(verification_token)
+        .bind(verification_token_hash(verification_token))
         .bind(max_requests_per_minute)
         .bind(auto_respond)
         // sync_response mirrors auto_respond — both flags are needed for the
@@ -295,7 +316,7 @@ impl WebhookRepository {
         let id = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO webhook_triggers (
-                id, name, module_id, verification_token,
+                id, name, module_id, verification_token_hash,
                 signing_secret_enc, signing_key_id, signing_secret_format,
                 max_requests_per_minute, enabled, allowed_ips, user_id, event_filter
             )
@@ -306,7 +327,7 @@ impl WebhookRepository {
         .bind(t.id)
         .bind(t.name)
         .bind(t.module_id)
-        .bind(t.verification_token)
+        .bind(verification_token_hash(t.verification_token))
         .bind(t.signing_secret_enc)
         .bind(t.signing_key_id)
         .bind(t.signing_secret_format)
@@ -530,4 +551,36 @@ fn row_to_webhook(row: &sqlx::postgres::PgRow) -> Result<WebhookListRow> {
         created_at: row.try_get("created_at")?,
         event_filter: row.try_get("event_filter")?,
     })
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::{mint_verification_token, verification_token_hash};
+
+    /// 32 bytes of the operating system's randomness, hex: 64 lowercase hex
+    /// characters, and no two alike.
+    #[test]
+    fn a_minted_token_is_64_hex_chars_and_fresh_each_time() {
+        let a = mint_verification_token();
+        let b = mint_verification_token();
+        assert_eq!(a.len(), 64);
+        assert!(a
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(a, b);
+    }
+
+    /// The stored form is the SHA-256 the migration backfilled with
+    /// (`encode(sha256(convert_to(token, 'UTF8')), 'hex')`), never the token.
+    #[test]
+    fn the_stored_form_is_the_sha256_hex_and_never_the_token() {
+        let token = mint_verification_token();
+        let stored = verification_token_hash(&token);
+        assert_ne!(stored, token);
+        assert!(!stored.contains(&token));
+        assert_eq!(
+            verification_token_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }

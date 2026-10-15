@@ -582,7 +582,9 @@ impl BindWorkflowRefusal {
     pub fn user_facing_message(self) -> &'static str {
         match self {
             Self::ChannelNotFound => "No such push channel. List your channels again.",
-            Self::WorkflowNotBindable => "No such workflow.",
+            Self::WorkflowNotBindable => {
+                talos_integration_helpers::watch_binding::WORKFLOW_NOT_BINDABLE_MESSAGE
+            }
             Self::Unreadable => {
                 "The binding could not be checked, so nothing was changed. Try again."
             }
@@ -594,6 +596,18 @@ impl BindWorkflowRefusal {
         match self {
             Self::ChannelNotFound | Self::WorkflowNotBindable => axum::http::StatusCode::NOT_FOUND,
             Self::Unreadable => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+impl From<talos_integration_helpers::watch_binding::WorkflowBindingRefusal>
+    for BindWorkflowRefusal
+{
+    fn from(r: talos_integration_helpers::watch_binding::WorkflowBindingRefusal) -> Self {
+        use talos_integration_helpers::watch_binding::WorkflowBindingRefusal as Shared;
+        match r {
+            Shared::NotBindable => Self::WorkflowNotBindable,
+            Shared::Unreadable => Self::Unreadable,
         }
     }
 }
@@ -625,24 +639,14 @@ pub async fn bind_channel_workflow(
     workflow_id: Option<Uuid>,
 ) -> std::result::Result<GcpWatchRow, BindWorkflowRefusal> {
     if let Some(workflow_id) = workflow_id {
-        let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
-        match repo.get_workflow(workflow_id, user_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                tracing::warn!(
-                    target: "talos_audit",
-                    event_kind = "gcp_channel_workflow_binding_refused",
-                    %user_id,
-                    %workflow_id,
-                    "refusing to bind a google_cloud push channel to a workflow this user does not own"
-                );
-                return Err(BindWorkflowRefusal::WorkflowNotBindable);
-            }
-            Err(e) => {
-                tracing::error!(%user_id, %workflow_id, error = %e, "gcp channel binding: workflow read failed");
-                return Err(BindWorkflowRefusal::Unreadable);
-            }
-        }
+        talos_integration_helpers::watch_binding::workflow_is_bindable(
+            pool,
+            user_id,
+            workflow_id,
+            GOOGLE_CLOUD_INTEGRATION_NAME,
+        )
+        .await
+        .map_err(BindWorkflowRefusal::from)?;
     }
 
     let store = ChannelStore::new(
@@ -838,7 +842,7 @@ mod tests {
     fn a_binding_refusal_does_not_say_whose_the_workflow_is() {
         assert_eq!(
             BindWorkflowRefusal::WorkflowNotBindable.user_facing_message(),
-            "No such workflow."
+            talos_integration_helpers::watch_binding::WORKFLOW_NOT_BINDABLE_MESSAGE
         );
         for r in [
             BindWorkflowRefusal::ChannelNotFound,

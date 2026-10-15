@@ -409,7 +409,8 @@ async fn handle_create_webhook(
     // transaction; if the cap is breached it rolls back, releasing
     // the lock for the next waiter.
     const MAX_WEBHOOKS_PER_USER: i64 = 500;
-    let verification_token = Uuid::new_v4().to_string();
+    // G-25: the one minting, from the operating system's source (it was a UUID).
+    let verification_token = talos_webhook_repository::mint_verification_token();
     let webhook_id = Uuid::new_v4();
 
     match webhook_repo

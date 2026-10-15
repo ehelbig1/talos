@@ -56,8 +56,6 @@ talos-text-util = { path = "../talos-text-util" }
 talos-trace-nats = { path = "../talos-trace-nats" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-# The workflow a watch is bound to is asked of the read the trigger uses.
-talos-workflow-repository = { path = "../talos-workflow-repository" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 urlencoding.workspace = true
