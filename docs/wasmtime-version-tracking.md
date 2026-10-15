@@ -10,9 +10,9 @@ why, and when the operator should bump.
 
 | Crate                | Version  | Pinned in                                  |
 |----------------------|----------|--------------------------------------------|
-| `wasmtime`           | 49.0.2   | `Cargo.toml`, `[workspace.dependencies]`   |
-| `wasmtime-wasi`      | 49.0.2   | `Cargo.toml`, `[workspace.dependencies]`   |
-| `wasmtime-wasi-http` | 49.0.2   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime`           | 49.0.3   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime-wasi`      | 49.0.3   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime-wasi-http` | 49.0.3   | `Cargo.toml`, `[workspace.dependencies]`   |
 
 Since 2026-10-06 the three versions are declared once, in the workspace
 manifest. `talos-worker-runtime` (which links all three) and `worker` (whose
@@ -47,6 +47,12 @@ column is the version bumped *to*.
 
 | Version  | Identifier             | Class                                    |
 |----------|------------------------|------------------------------------------|
+| 49.0.3   | RUSTSEC-2026-0350      | `wasi:http`: guests can send absolute-form requests to a different host (egress bypass) |
+| 49.0.3   | RUSTSEC-2026-0352      | Filesystem sandbox escape when renaming symlinks with trailing slashes |
+| 49.0.3   | RUSTSEC-2026-0351      | `wasi:http`: a long URL before the query string crashes the host |
+| 49.0.3   | RUSTSEC-2026-0353…0362 | Component-model host panics (async-lifted `call`, cancelled `call_async`, stream/future type confusion, realloc call-to-host, zero-length stream writes, yield in a start function, recursive-type drop overflow, fused-adapter transcode, pending calls after a trap, async-entrypoint enforcement) |
+| 49.0.3   | RUSTSEC-2026-0363      | Component-model handle tables capped only per instance and charged to no limit |
+| 49.0.3   | RUSTSEC-2026-0364      | Exception tags can leave host data structures unaligned |
 | 49.0.2   | RUSTSEC-2026-0321      | WASI preview 0 `poll_oneoff` circumvents fuel consumption (GHSA-j366-h8gg-77pm) |
 | 49.0.2   | RUSTSEC-2026-0322      | Excessive host memory allocated when a guest has no stdio |
 | 49.0.2   | RUSTSEC-2026-0323      | `fd_readdir` copies uninitialized struct padding into guest memory |
