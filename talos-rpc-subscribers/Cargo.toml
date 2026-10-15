@@ -86,6 +86,8 @@ talos-capability-world = { path = "../talos-capability-world" }
 # the defect this package removed — leaves every test green. Dev-only, so the
 # production dep graph is unchanged; this crate never installs a subscriber.
 tracing-subscriber = { workspace = true, features = ["registry"] }
+# A replay-guard double for the cross-replica policy test.
+async-trait.workspace = true
 
 [lints]
 workspace = true

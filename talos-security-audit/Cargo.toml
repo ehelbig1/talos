@@ -38,6 +38,9 @@ talos-audit-ledger = { path = "../talos-audit-ledger" }
 # the process's ONE reader of TALOS_WRITE_CEILING_ENFORCED — re-reading it here
 # would be a second answer to "is this control live" (lint check 69's class).
 talos-rpc-subscribers = { path = "../talos-rpc-subscribers" }
+# `replay_guard`: whether THIS process's shared replay guard is registered and
+# reaching its store (B2-2), read from the guard itself, not from config.
+talos-replay-guard = { path = "../talos-replay-guard" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { workspace = true, features = ["time"] }

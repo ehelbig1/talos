@@ -48,6 +48,7 @@
 #![forbid(unsafe_code)]
 
 pub mod after_host_failure;
+pub mod dispatch;
 
 /// Every token `talos_worker_runtime::reason_class` can stamp.
 ///

@@ -31,6 +31,7 @@
 //!   nonce) so a memory-RPC nonce can't collide with a job-result nonce.
 
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// Result of an atomic check-and-record against the shared store.
@@ -66,6 +67,12 @@ pub trait ReplayGuard: Send + Sync {
     /// effort — a backend error leaves the key to expire with its TTL.
     async fn release(&self, _key: &str) {}
 
+    /// Whether the guard can reach its store now. A guard registered while
+    /// its store was down answers `false` until it connects.
+    fn connected(&self) -> bool {
+        true
+    }
+
     /// Short label for logs/metrics.
     fn name(&self) -> &'static str {
         "replay-guard"
@@ -79,22 +86,71 @@ pub trait ReplayGuard: Send + Sync {
 /// (Fresh); every other attempt within the TTL gets `nil` (Replay). Redis is
 /// already a required, prod-TLS-gated dependency, so this adds no new
 /// infrastructure.
+///
+/// A guard built by [`Self::registering`] holds no connection until Redis
+/// first answers: every call until then is [`ReplayOutcome::Unavailable`],
+/// which the caller's [`ReplayPolicy`] refuses when failing closed, and the
+/// guard tries to connect again (at most once per [`RECONNECT_EVERY`]).
+/// Until 2026-10-15 a guard whose first connect failed was never registered,
+/// and a process with no guard admitted every message for its lifetime
+/// (security review round 2, B2-2).
 #[derive(Clone)]
 pub struct RedisReplayGuard {
-    conn: redis::aio::ConnectionManager,
+    client: redis::Client,
+    conn: Arc<tokio::sync::OnceCell<redis::aio::ConnectionManager>>,
+    /// Unix millis before which no new connect is attempted.
+    next_connect_ms: Arc<AtomicU64>,
     prefix: String,
 }
 
+/// How often a guard with no connection tries to make one.
+pub const RECONNECT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 impl RedisReplayGuard {
-    /// Connect a guard from a shared `redis::Client`. The `ConnectionManager`
-    /// multiplexes + auto-reconnects, so this is created once at boot and cheap
-    /// to clone per call.
+    /// Connect a guard from a shared `redis::Client`, or fail. The
+    /// `ConnectionManager` multiplexes + auto-reconnects, so this is created
+    /// once at boot and cheap to clone per call.
     pub async fn connect(client: &redis::Client) -> redis::RedisResult<Self> {
+        let guard = Self::pending(client);
         let conn = talos_redis::manager(client.clone()).await?;
-        Ok(Self {
-            conn,
+        let _ = guard.conn.set(conn);
+        Ok(guard)
+    }
+
+    /// A guard to REGISTER whether or not Redis answers now: the second
+    /// value says whether it connected. One that did not answers
+    /// [`ReplayOutcome::Unavailable`] until Redis does.
+    pub async fn registering(client: &redis::Client) -> (Self, Result<(), redis::RedisError>) {
+        let guard = Self::pending(client);
+        match talos_redis::manager(client.clone()).await {
+            Ok(conn) => {
+                let _ = guard.conn.set(conn);
+                (guard, Ok(()))
+            }
+            Err(e) => {
+                guard.next_connect_ms.store(
+                    now_ms().saturating_add(RECONNECT_EVERY.as_millis() as u64),
+                    Ordering::Relaxed,
+                );
+                (guard, Err(e))
+            }
+        }
+    }
+
+    fn pending(client: &redis::Client) -> Self {
+        Self {
+            client: client.clone(),
+            conn: Arc::new(tokio::sync::OnceCell::new()),
+            next_connect_ms: Arc::new(AtomicU64::new(0)),
             prefix: "talos:nonce:".to_string(),
-        })
+        }
     }
 
     /// Override the key prefix (default `talos:nonce:`).
@@ -102,15 +158,56 @@ impl RedisReplayGuard {
         self.prefix = prefix.into();
         self
     }
+
+    /// The connection, making one when none was made and a try is due.
+    async fn connection(&self) -> Option<redis::aio::ConnectionManager> {
+        if let Some(conn) = self.conn.get() {
+            return Some(conn.clone());
+        }
+        let due = self.next_connect_ms.load(Ordering::Relaxed);
+        let now = now_ms();
+        if now < due
+            || self
+                .next_connect_ms
+                .compare_exchange(
+                    due,
+                    now.saturating_add(RECONNECT_EVERY.as_millis() as u64),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return None;
+        }
+        match talos_redis::manager(self.client.clone()).await {
+            Ok(conn) => {
+                tracing::info!(
+                    target: "talos_security",
+                    "distributed replay guard: Redis answered — the shared store is in use"
+                );
+                Some(self.conn.get_or_init(|| async { conn }).await.clone())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "talos_security",
+                    error = %e,
+                    "distributed replay guard: Redis still unreachable"
+                );
+                None
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl ReplayGuard for RedisReplayGuard {
     async fn check_and_record(&self, key: &str, ttl_secs: u64) -> ReplayOutcome {
+        let Some(mut conn) = self.connection().await else {
+            return ReplayOutcome::Unavailable;
+        };
         let full = format!("{}{}", self.prefix, key);
         // PX takes milliseconds; keep it >= the freshness window and never 0.
         let ttl_ms = ttl_secs.saturating_mul(1000).max(1);
-        let mut conn = self.conn.clone();
         // SET NX returns Some("OK") when it set the key, None when it existed.
         let res: redis::RedisResult<Option<String>> = redis::cmd("SET")
             .arg(&full)
@@ -124,11 +221,14 @@ impl ReplayGuard for RedisReplayGuard {
             Ok(Some(_)) => ReplayOutcome::Fresh,
             Ok(None) => ReplayOutcome::Replay,
             Err(e) => {
+                // The outcome only: whether it is refused or admitted is the
+                // caller's policy, which logs it (2026-10-15, B2-9 — this line
+                // said "falling back to per-replica protection" while a
+                // fail-closed caller refused).
                 tracing::warn!(
                     target: "talos_security",
                     error = %e,
-                    "distributed replay guard: Redis unavailable — falling back to per-replica \
-                     replay protection (HMAC + freshness still enforced)"
+                    "distributed replay guard: Redis unavailable for a check"
                 );
                 ReplayOutcome::Unavailable
             }
@@ -136,8 +236,10 @@ impl ReplayGuard for RedisReplayGuard {
     }
 
     async fn release(&self, key: &str) {
+        let Some(mut conn) = self.connection().await else {
+            return;
+        };
         let full = format!("{}{}", self.prefix, key);
-        let mut conn = self.conn.clone();
         let res: redis::RedisResult<i64> =
             redis::cmd("DEL").arg(&full).query_async(&mut conn).await;
         if let Err(e) = res {
@@ -147,6 +249,10 @@ impl ReplayGuard for RedisReplayGuard {
                 "distributed replay guard: a released key could not be deleted; it expires with its TTL"
             );
         }
+    }
+
+    fn connected(&self) -> bool {
+        self.conn.get().is_some()
     }
 
     fn name(&self) -> &'static str {
@@ -195,13 +301,118 @@ pub fn fail_closed_from_env() -> bool {
 }
 
 /// Resolve an [`ReplayOutcome`] into an admit/reject decision under a fail
-/// policy. `true` = admit, `false` = reject as replay.
+/// policy. `true` = admit, `false` = reject as replay. For a caller that has
+/// a guard in hand; [`ReplayPolicy::decide`] also answers for no guard.
 #[must_use]
 pub fn admit(outcome: ReplayOutcome, fail_closed: bool) -> bool {
     match outcome {
         ReplayOutcome::Fresh => true,
         ReplayOutcome::Replay => false,
         ReplayOutcome::Unavailable => !fail_closed,
+    }
+}
+
+/// The switch that turns the shared guard on, read in ONE place (the
+/// controller and the worker each read it by name until 2026-10-15).
+pub const DISTRIBUTED_REPLAY: &str = "TALOS_DISTRIBUTED_REPLAY";
+
+/// Whether this process is meant to have a shared guard.
+#[must_use]
+pub fn distributed_replay_from_env() -> bool {
+    talos_config::bool_env_or_default(DISTRIBUTED_REPLAY, false)
+}
+
+/// What a process does with a nonce the shared store must vouch for: whether
+/// a shared guard is meant to be there ([`DISTRIBUTED_REPLAY`]) and whether a
+/// store that cannot answer refuses ([`fail_closed_from_env`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayPolicy {
+    pub distributed: bool,
+    pub fail_closed: bool,
+}
+
+/// What a nonce comes to under a [`ReplayPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayVerdict {
+    /// Admit it.
+    Admit,
+    /// The store has seen it: a replay. Refuse.
+    Replay,
+    /// The store could not vouch for it — down, or never registered — and
+    /// the policy fails closed. Refuse.
+    StoreUnavailable,
+}
+
+impl ReplayPolicy {
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            distributed: distributed_replay_from_env(),
+            fail_closed: fail_closed_from_env(),
+        }
+    }
+
+    /// THE decision, for a guard's answer or for no guard at all (`None`).
+    /// No guard is "no store to vouch" exactly as a guard that cannot reach
+    /// its store is, when the switch says there should be one: a process
+    /// whose guard was never registered (no Redis configured, or a build
+    /// that skipped it) refuses when failing closed, where until 2026-10-15
+    /// it admitted everything for its lifetime (security review round 2,
+    /// B2-2). With the switch off, no guard is the configured posture and
+    /// the process-local caches are the whole defence, as before.
+    #[must_use]
+    pub fn decide(self, outcome: Option<ReplayOutcome>) -> ReplayVerdict {
+        match outcome {
+            Some(ReplayOutcome::Fresh) => ReplayVerdict::Admit,
+            Some(ReplayOutcome::Replay) => ReplayVerdict::Replay,
+            Some(ReplayOutcome::Unavailable) | None => {
+                let meant_to_vouch = outcome.is_some() || self.distributed;
+                if meant_to_vouch && self.fail_closed {
+                    ReplayVerdict::StoreUnavailable
+                } else {
+                    ReplayVerdict::Admit
+                }
+            }
+        }
+    }
+
+    /// Ask `guard` (if any) about `key` and decide.
+    pub async fn check(
+        self,
+        guard: Option<&dyn ReplayGuard>,
+        key: &str,
+        ttl_secs: u64,
+    ) -> ReplayVerdict {
+        let outcome = match guard {
+            Some(guard) => Some(guard.check_and_record(key, ttl_secs).await),
+            None => None,
+        };
+        self.decide(outcome)
+    }
+
+    /// [`Self::check`] against the registered guard.
+    pub async fn check_shared(self, key: &str, ttl_secs: u64) -> ReplayVerdict {
+        self.check(shared_replay_guard().as_deref(), key, ttl_secs)
+            .await
+    }
+}
+
+/// The shared guard's state, for `security_audit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardState {
+    /// No guard is registered.
+    NotRegistered,
+    /// A guard is registered; `connected` says whether its store answers.
+    Registered { connected: bool },
+}
+
+#[must_use]
+pub fn guard_state() -> GuardState {
+    match shared_replay_guard() {
+        None => GuardState::NotRegistered,
+        Some(guard) => GuardState::Registered {
+            connected: guard.connected(),
+        },
     }
 }
 
@@ -237,6 +448,77 @@ mod tests {
         // Unavailable: fail-open admits, fail-closed rejects.
         assert!(admit(ReplayOutcome::Unavailable, false));
         assert!(!admit(ReplayOutcome::Unavailable, true));
+    }
+
+    /// B2-2 (2026-10-15): with the switch on, a process that has NO guard
+    /// refuses when failing closed — the production default — exactly as a
+    /// guard that cannot reach its store does. With the switch off, no guard
+    /// is the configured posture and admits.
+    #[test]
+    fn a_missing_guard_in_production_refuses_when_failing_closed() {
+        let closed = ReplayPolicy {
+            distributed: true,
+            fail_closed: true,
+        };
+        assert_eq!(closed.decide(None), ReplayVerdict::StoreUnavailable);
+        assert_eq!(
+            closed.decide(Some(ReplayOutcome::Unavailable)),
+            ReplayVerdict::StoreUnavailable
+        );
+        assert_eq!(
+            closed.decide(Some(ReplayOutcome::Fresh)),
+            ReplayVerdict::Admit
+        );
+        assert_eq!(
+            closed.decide(Some(ReplayOutcome::Replay)),
+            ReplayVerdict::Replay
+        );
+
+        let open = ReplayPolicy {
+            distributed: true,
+            fail_closed: false,
+        };
+        assert_eq!(open.decide(None), ReplayVerdict::Admit);
+        assert_eq!(
+            open.decide(Some(ReplayOutcome::Unavailable)),
+            ReplayVerdict::Admit
+        );
+        assert_eq!(
+            open.decide(Some(ReplayOutcome::Replay)),
+            ReplayVerdict::Replay
+        );
+
+        let off = ReplayPolicy {
+            distributed: false,
+            fail_closed: true,
+        };
+        assert_eq!(
+            off.decide(None),
+            ReplayVerdict::Admit,
+            "no guard by configuration"
+        );
+    }
+
+    /// B2-2: a guard registered while Redis is down is registered, says it is
+    /// not connected, and answers `Unavailable` — which the fail-closed
+    /// policy refuses — instead of not existing.
+    #[tokio::test]
+    async fn a_guard_registered_while_redis_is_down_answers_unavailable() {
+        // Port 1 on loopback: nothing listens, the connect is refused.
+        let client = redis::Client::open("redis://127.0.0.1:1/").expect("client");
+        let (guard, connected) = RedisReplayGuard::registering(&client).await;
+        assert!(connected.is_err());
+        assert!(!guard.connected());
+        let outcome = guard.check_and_record("k", 60).await;
+        assert_eq!(outcome, ReplayOutcome::Unavailable);
+        let closed = ReplayPolicy {
+            distributed: true,
+            fail_closed: true,
+        };
+        assert_eq!(
+            closed.decide(Some(outcome)),
+            ReplayVerdict::StoreUnavailable
+        );
     }
 
     #[test]
@@ -277,6 +559,25 @@ mod tests {
             guard.check_and_record(&key, 60).await,
             ReplayOutcome::Replay,
             "second sighting within TTL must be Replay (cross-replica single-use)"
+        );
+    }
+
+    /// A guard registered while Redis answers is connected and works.
+    #[tokio::test]
+    async fn a_guard_registered_while_redis_answers_is_connected() {
+        let Ok(url) = std::env::var("TALOS_TEST_REDIS_URL") else {
+            eprintln!("skipping: TALOS_TEST_REDIS_URL unset");
+            return;
+        };
+        let client = redis::Client::open(url).expect("open redis client");
+        let (guard, connected) = RedisReplayGuard::registering(&client).await;
+        connected.expect("Redis answers");
+        assert!(guard.connected());
+        let key = format!("itest-registering:{}:{}", std::process::id(), now_secs());
+        assert_eq!(guard.check_and_record(&key, 60).await, ReplayOutcome::Fresh);
+        assert_eq!(
+            guard.check_and_record(&key, 60).await,
+            ReplayOutcome::Replay
         );
     }
 

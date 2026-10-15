@@ -543,6 +543,27 @@ fn failed_result(job_id: uuid::Uuid, start: &std::time::Instant, msg: &str) -> J
     }
 }
 
+/// The pipeline twin of [`failed_result`]: `overall_status: Failed`,
+/// `final_output: {"error": msg}`, unsigned (the publish path signs it).
+fn failed_pipeline_result(
+    job_id: uuid::Uuid,
+    start: &std::time::Instant,
+    msg: &str,
+) -> PipelineJobResult {
+    PipelineJobResult {
+        llm_usage: vec![],
+        crypto_scheme: 0,
+        job_id,
+        overall_status: JobStatus::Failed,
+        step_results: vec![],
+        final_output: json!({ "error": msg }).into(),
+        total_time_ms: start.elapsed().as_millis() as u64,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+    }
+}
+
 /// Build the operator-facing message for the per-job execution timeout.
 ///
 /// **Takes the same `Duration` that armed `tokio::time::timeout`**, so the
@@ -1233,10 +1254,17 @@ fn worker_result_signing_key() -> Option<&'static talos_workflow_job_protocol::D
 
 /// B-5 (2026-10-14): register the fleet-wide dispatch replay guard, under the
 /// controller's own switch (`TALOS_DISTRIBUTED_REPLAY`) and fail policy
-/// (`TALOS_REPLAY_FAIL_CLOSED`). Without it (no Redis, or the switch off) the
-/// process-local nonce cache is the whole defence, as before.
+/// (`TALOS_REPLAY_FAIL_CLOSED`). With the switch off the process-local nonce
+/// cache is the whole defence, as before.
+///
+/// B2-2 (2026-10-15): with the switch on, the guard is registered whether or
+/// not Redis answers at boot. Until Redis answers, every dispatch is
+/// `store_unavailable` — refused when failing closed, the production default —
+/// where until then a worker that booted during a Redis outage ran every
+/// dispatch unchecked for its lifetime. A worker with no Redis configured at
+/// all has no guard, which the same policy refuses when failing closed.
 async fn register_dispatch_replay_guard(client: &redis::Client) {
-    if !talos_config::bool_env_or_default("TALOS_DISTRIBUTED_REPLAY", false) {
+    if !talos_replay_guard::distributed_replay_from_env() {
         ::tracing::warn!(
             target: "talos_security",
             "TALOS_DISTRIBUTED_REPLAY is off — a replayed dispatch is refused only by the \
@@ -1244,25 +1272,26 @@ async fn register_dispatch_replay_guard(client: &redis::Client) {
         );
         return;
     }
-    match talos_replay_guard::RedisReplayGuard::connect(client).await {
-        Ok(guard) => {
-            let guard = guard.with_prefix(dispatch_replay::KEY_PREFIX);
-            match talos_replay_guard::register_shared_replay_guard(Arc::new(guard)) {
-                Ok(()) => ::tracing::info!(
-                    target: "talos_security",
-                    fail_closed = talos_replay_guard::fail_closed_from_env(),
-                    "dispatch replay guard registered (Redis) — a dispatch runs once per fleet"
-                ),
-                Err(e) => {
-                    ::tracing::error!(target: "talos_security", error = %e, "dispatch replay guard not registered")
-                }
-            }
-        }
+    let (guard, connected) = talos_replay_guard::RedisReplayGuard::registering(client).await;
+    let guard = guard.with_prefix(dispatch_replay::KEY_PREFIX);
+    let fail_closed = talos_replay_guard::fail_closed_from_env();
+    if let Err(e) = talos_replay_guard::register_shared_replay_guard(Arc::new(guard)) {
+        ::tracing::error!(target: "talos_security", error = %e, "dispatch replay guard not registered");
+        return;
+    }
+    match connected {
+        Ok(()) => ::tracing::info!(
+            target: "talos_security",
+            fail_closed,
+            "dispatch replay guard registered (Redis) — a dispatch runs once per fleet"
+        ),
         Err(e) => ::tracing::error!(
             target: "talos_security",
             error = %e,
-            "TALOS_DISTRIBUTED_REPLAY is on but the Redis replay guard could not connect — \
-             fleet-wide dispatch replay protection NOT active"
+            fail_closed,
+            "TALOS_DISTRIBUTED_REPLAY is on but Redis did not answer at boot — the replay \
+             guard is registered and connects when Redis does; until then every dispatch \
+             is refused when failing closed, admitted on this worker's cache otherwise"
         ),
     }
 }
@@ -2001,18 +2030,7 @@ async fn execute_pipeline_job(
     }
 
     // Helper for the fail-closed returns below (span mutation stays inline).
-    let fail = |msg: &str| PipelineJobResult {
-        llm_usage: vec![],
-        crypto_scheme: 0,
-        job_id: req.job_id,
-        overall_status: JobStatus::Failed,
-        step_results: vec![],
-        final_output: serde_json::json!({ "error": msg }).into(),
-        total_time_ms: start.elapsed().as_millis() as u64,
-        signature: vec![],
-        result_nonce: String::new(),
-        worker_id: String::new(),
-    };
+    let fail = |msg: &str| failed_pipeline_result(req.job_id, &start, msg);
 
     // RFC 0010 P3 (D3b) downgrade guard: under `TALOS_ENVELOPE_SEALING=required`
     // refuse a legacy pipeline that would DECRYPT a WSK envelope in ANY step. A
@@ -2781,6 +2799,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Warning: failed to register panic metrics: {e}");
     }
     rejected_jobs::seed();
+    dispatch_replay::seed();
 
     // MCP-580: spawn the circuit-breaker periodic cleanup task so the
     // per-host `records` DashMap doesn't grow monotonically with
@@ -3033,6 +3052,16 @@ async fn main() -> anyhow::Result<()> {
         // RFC 0014 P3b: queue local LLM calls with the controller and the
         // other workers, not only within this process. Never fatal.
         worker::local_llm_fleet::install(client.as_ref().clone()).await;
+    } else if talos_replay_guard::distributed_replay_from_env() {
+        // B2-2: the switch asks for a shared guard and there is no Redis to
+        // hold one; the replay policy refuses every dispatch when failing
+        // closed. Said once, loudly, at boot.
+        ::tracing::error!(
+            target: "talos_security",
+            fail_closed = talos_replay_guard::fail_closed_from_env(),
+            "TALOS_DISTRIBUTED_REPLAY is on but REDIS_URL is unset — no replay guard; every \
+             dispatch is refused when failing closed"
+        );
     }
 
     // PostgreSQL connection block removed Phase 2.10. Worker is now
@@ -3268,22 +3297,51 @@ async fn main() -> anyhow::Result<()> {
                                     )
                                     .is_ok();
                                 // B-5 (2026-10-14): once per fleet, not per worker.
-                                if request_authentic
-                                    && !dispatch_replay::first_use_fleet_wide(
+                                // B2-2/B2-3 (2026-10-15): the one replay policy decides,
+                                // a refusal is counted, and one for want of the store is
+                                // answered (a replay never is).
+                                if request_authentic {
+                                    let verdict = dispatch_replay::fleet_verdict(
                                         talos_replay_guard::shared_replay_guard().as_deref(),
                                         &dispatch_replay::dispatch_key("job", req.job_id, &req.job_nonce),
-                                        talos_replay_guard::fail_closed_from_env(),
+                                        talos_replay_guard::ReplayPolicy::from_env(),
                                     )
-                                    .await
-                                {
-                                    ::tracing::warn!(
-                                        target: "talos_security",
-                                        job_id = %req.job_id,
-                                        "dispatch refused: its nonce was already used on this fleet, \
-                                         or the shared replay store could not be asked; not run, no reply"
-                                    );
-                                    drop(permit);
-                                    return;
+                                    .await;
+                                    if verdict != talos_replay_guard::ReplayVerdict::Admit {
+                                        dispatch_replay::record_refusal(verdict);
+                                        if verdict == talos_replay_guard::ReplayVerdict::StoreUnavailable {
+                                            ::tracing::warn!(
+                                                target: "talos_security",
+                                                job_id = %req.job_id,
+                                                "dispatch refused: the shared replay store could not vouch \
+                                                 for its nonce (fail closed); answered Failed, transient"
+                                            );
+                                            let mut refused = failed_result(
+                                                req.job_id,
+                                                &std::time::Instant::now(),
+                                                dispatch_replay::STORE_UNAVAILABLE_ERROR,
+                                            );
+                                            if let Err(e) = sign_job_result_for(&mut refused, &req, &key_clone) {
+                                                ::tracing::error!(job_id = %req.job_id, error = %e, "CRITICAL: Failed to sign a refusal");
+                                            }
+                                            if let Err(e) = publish_result_with_retry(
+                                                &nc_clone, &refused, 3, reply_to, &key_clone,
+                                            )
+                                            .await
+                                            {
+                                                ::tracing::error!(job_id = %req.job_id, error = %e, "Failed to publish a refusal");
+                                            }
+                                        } else {
+                                            ::tracing::warn!(
+                                                target: "talos_security",
+                                                job_id = %req.job_id,
+                                                "dispatch refused: its nonce was already used on this fleet; \
+                                                 not run, no reply"
+                                            );
+                                        }
+                                        drop(permit);
+                                        return;
+                                    }
                                 }
                                 if request_authentic && !req.dry_run {
                                     // Tier 1: in-process (same-worker retry, free).
@@ -3558,24 +3616,52 @@ async fn main() -> anyhow::Result<()> {
                                         dvc.accept_legacy_hmac,
                                     )
                                     .is_ok();
-                                // B-5 (2026-10-14): once per fleet, not per worker.
-                                if request_authentic
-                                    && !dispatch_replay::first_use_fleet_wide(
+                                // B-5 (2026-10-14): once per fleet, not per worker;
+                                // B2-2/B2-3 (2026-10-15) — see the single-job site.
+                                if request_authentic {
+                                    let verdict = dispatch_replay::fleet_verdict(
                                         talos_replay_guard::shared_replay_guard().as_deref(),
                                         &dispatch_replay::dispatch_key("pipeline", req.job_id, &req.job_nonce),
-                                        talos_replay_guard::fail_closed_from_env(),
+                                        talos_replay_guard::ReplayPolicy::from_env(),
                                     )
-                                    .await
-                                {
-                                    ::tracing::warn!(
-                                        target: "talos_security",
-                                        job_id = %req.job_id,
-                                        "pipeline dispatch refused: its nonce was already used on \
-                                         this fleet, or the shared replay store could not be asked; \
-                                         not run, no reply"
-                                    );
-                                    drop(permit);
-                                    return;
+                                    .await;
+                                    if verdict != talos_replay_guard::ReplayVerdict::Admit {
+                                        dispatch_replay::record_refusal(verdict);
+                                        if verdict == talos_replay_guard::ReplayVerdict::StoreUnavailable {
+                                            ::tracing::warn!(
+                                                target: "talos_security",
+                                                job_id = %req.job_id,
+                                                "pipeline dispatch refused: the shared replay store could \
+                                                 not vouch for its nonce (fail closed); answered Failed, transient"
+                                            );
+                                            let mut refused = failed_pipeline_result(
+                                                req.job_id,
+                                                &std::time::Instant::now(),
+                                                dispatch_replay::STORE_UNAVAILABLE_ERROR,
+                                            );
+                                            if let Err(e) = sign_pipeline_result(&mut refused, &key_clone) {
+                                                ::tracing::error!(job_id = %req.job_id, error = %e, "CRITICAL: Failed to sign a refusal");
+                                            }
+                                            let payload = bytes::Bytes::from(
+                                                serde_json::to_vec(&refused).unwrap_or_default(),
+                                            );
+                                            let topic = reply_to.unwrap_or_else(|| {
+                                                talos_workflow_job_protocol::subjects::pipeline_results_for(req.job_id)
+                                            });
+                                            if let Err(e) = publish_bytes_with_retry(&nc_clone, topic, payload, 3).await {
+                                                ::tracing::error!(job_id = %req.job_id, error = %e, "Failed to publish a refusal");
+                                            }
+                                        } else {
+                                            ::tracing::warn!(
+                                                target: "talos_security",
+                                                job_id = %req.job_id,
+                                                "pipeline dispatch refused: its nonce was already used on this \
+                                                 fleet; not run, no reply"
+                                            );
+                                        }
+                                        drop(permit);
+                                        return;
+                                    }
                                 }
                                 if request_authentic {
                                     // Tier 1: in-process; tier 2: Redis (retry on a

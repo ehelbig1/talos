@@ -59,6 +59,9 @@ talos-random = { path = "../talos-random" }
 redis = { workspace = true, features = ["default", "tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }  # rustls for rediss:// (Upstash, ElastiCache TLS)
 talos-redis = { path = "../talos-redis" }
 talos-replay-guard = { path = "../talos-replay-guard" }
+# The marker a dispatch refused for want of the replay store is answered with
+# (B2-3); the controller's retry classifier reads the same constant.
+talos-reason-class = { path = "../talos-reason-class" }
 # rustls direct dep so worker/main.rs can install the ring CryptoProvider
 # at startup — required since rustls 0.23 stopped auto-selecting one when
 # multiple crates pull rustls in (redis + reqwest in our case).

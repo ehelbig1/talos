@@ -1642,46 +1642,54 @@ pub(crate) async fn init_graph_rag(
 
 /// Opt-in registration of the Redis-backed distributed replay guard
 /// (codebase-review finding #2). No-op unless `TALOS_DISTRIBUTED_REPLAY` is
-/// truthy; logs loudly (but does not fail boot) if enabled without a reachable
-/// Redis, since HMAC + freshness + the per-replica nonce cache still protect
-/// against forgery and within-replica replay — the shared guard only adds
-/// cross-replica single-use.
+/// truthy.
+///
+/// With the switch on, the guard is registered whether or not Redis answers
+/// at boot (security review 2026-10-15, B2-2): until Redis answers every
+/// signed RPC is `store_unavailable`, which `ReplayPolicy` refuses when
+/// failing closed (the production default). Until then a controller that
+/// booted during a Redis outage, or with `REDIS_URL` unset, ran with no
+/// cross-replica check and admitted everything for its lifetime. With
+/// `REDIS_URL` unset there is no guard, and the same policy refuses.
 pub(crate) async fn register_distributed_replay_guard(
     redis_client: Option<&std::sync::Arc<redis::Client>>,
 ) {
-    let enabled = talos_config::bool_env_or_default("TALOS_DISTRIBUTED_REPLAY", false);
-    if !enabled {
+    if !talos_replay_guard::distributed_replay_from_env() {
         return;
     }
+    let fail_closed = talos_replay_guard::fail_closed_from_env();
     let Some(client) = redis_client else {
-        tracing::warn!(
+        tracing::error!(
             target: "talos_security",
-            "TALOS_DISTRIBUTED_REPLAY is on but REDIS_URL is unset — cross-replica replay \
-             protection NOT active (per-replica nonce cache only)"
+            fail_closed,
+            "TALOS_DISTRIBUTED_REPLAY is on but REDIS_URL is unset — no replay guard; every \
+             signed RPC is refused when failing closed"
         );
         return;
     };
-    match talos_replay_guard::RedisReplayGuard::connect(client).await {
-        Ok(guard) => {
-            match talos_replay_guard::register_shared_replay_guard(std::sync::Arc::new(guard)) {
-                Ok(()) => tracing::info!(
-                    target: "talos_security",
-                    fail_closed = talos_replay_guard::fail_closed_from_env(),
-                    "distributed replay guard registered (Redis) — cross-replica RPC replay \
-                     protection active"
-                ),
-                Err(e) => tracing::error!(
-                    target: "talos_security",
-                    error = %e,
-                    "failed to register distributed replay guard"
-                ),
-            }
-        }
+    let (guard, connected) = talos_replay_guard::RedisReplayGuard::registering(client).await;
+    if let Err(e) = talos_replay_guard::register_shared_replay_guard(std::sync::Arc::new(guard)) {
+        tracing::error!(
+            target: "talos_security",
+            error = %e,
+            "failed to register distributed replay guard"
+        );
+        return;
+    }
+    match connected {
+        Ok(()) => tracing::info!(
+            target: "talos_security",
+            fail_closed,
+            "distributed replay guard registered (Redis) — cross-replica RPC replay \
+             protection active"
+        ),
         Err(e) => tracing::error!(
             target: "talos_security",
             error = %e,
-            "TALOS_DISTRIBUTED_REPLAY is on but connecting the Redis replay guard failed — \
-             cross-replica protection NOT active"
+            fail_closed,
+            "TALOS_DISTRIBUTED_REPLAY is on but Redis did not answer at boot — the replay \
+             guard is registered and connects when Redis does; until then every signed RPC \
+             is refused when failing closed"
         ),
     }
 }

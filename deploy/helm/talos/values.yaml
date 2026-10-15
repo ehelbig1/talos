@@ -393,6 +393,13 @@ controller:
     # comma-separated). Alternative: dynamic self-registration via
     # controller.workerRegistration + networkPolicy.workerRegistrationIngress.
     # TALOS_WORKER_PUBLIC_KEYS: "fleet=<64-hex from keygen --role worker>"
+    # A PRODUCTION controller refuses to boot while TALOS_RESULT_REQUIRE_ED25519
+    # or TALOS_RPC_REQUIRE_ED25519 is off, unless this names the surface still
+    # on the fleet-shared WORKER_SHARED_KEY: "result", "rpc", "result,rpc" or
+    # "all" — a boolean ("1", "true") is refused. install.sh sets it per
+    # worker-trust phase; a plain `helm install` must set it here
+    # (docs/worker-identity.md).
+    # TALOS_ALLOW_LEGACY_FLEET_HMAC: "result,rpc"
     # off | audit | required — RFC 0010 P3 per-execution secret sealing.
     # TALOS_ENVELOPE_SEALING: "audit"
     # Redis-backed distributed replay-nonce guard (codebase-review finding
@@ -829,6 +836,11 @@ worker:
     # Fleet identity the controller looks this worker's public key up
     # under (single-key fleet; per-worker identities go via extraEnv):
     # TALOS_WORKER_ID: "fleet"
+    # A PRODUCTION worker refuses to boot while TALOS_DISPATCH_REQUIRE_ED25519
+    # is off, unless this names "dispatch" (a boolean is refused). install.sh
+    # sets it per worker-trust phase; a plain `helm install` must set it here
+    # (docs/worker-identity.md).
+    # TALOS_ALLOW_LEGACY_FLEET_HMAC: "dispatch"
     # Keep in lockstep with controller.env TALOS_ENVELOPE_SEALING; the
     # worker enforces the inline-WSK downgrade guard under "required".
     # TALOS_ENVELOPE_SEALING: "required"

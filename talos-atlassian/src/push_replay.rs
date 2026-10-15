@@ -138,17 +138,14 @@ impl DeliveryReplayCache {
         self.previous.load().remove(hash);
     }
 
-    /// [`Self::check_and_record`], then — when the local answer is Fresh and a
-    /// shared guard is registered — the shared guard, for a token used on
-    /// another replica. A shared refusal releases the local record.
+    /// [`Self::check_and_record`], then — when the local answer is Fresh — the
+    /// shared replay policy (`talos_replay_guard::ReplayPolicy`), for a token
+    /// used on another replica. A shared refusal releases the local record.
     pub async fn admit(&self, hash: TokenHash, expires_at: u64) -> ReplayVerdict {
         let local = self.check_and_record(hash);
         if local != ReplayVerdict::Fresh {
             return local;
         }
-        let Some(guard) = talos_replay_guard::shared_replay_guard() else {
-            return ReplayVerdict::Fresh;
-        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -157,17 +154,16 @@ impl DeliveryReplayCache {
             .saturating_sub(now)
             .saturating_add(LEEWAY_SECS)
             .max(1);
-        let outcome = guard.check_and_record(&shared_key(&hash), ttl).await;
-        let verdict = match outcome {
-            talos_replay_guard::ReplayOutcome::Fresh => ReplayVerdict::Fresh,
-            talos_replay_guard::ReplayOutcome::Replay => ReplayVerdict::Replayed,
-            talos_replay_guard::ReplayOutcome::Unavailable => {
-                if talos_replay_guard::admit(outcome, talos_replay_guard::fail_closed_from_env()) {
-                    ReplayVerdict::Fresh
-                } else {
-                    ReplayVerdict::Unavailable
-                }
-            }
+        // The one replay policy (2026-10-15, B2-2): with no shared guard and
+        // the switch on, a fail-closed process refuses rather than trusting
+        // its own replica's memory alone.
+        let verdict = match talos_replay_guard::ReplayPolicy::from_env()
+            .check_shared(&shared_key(&hash), ttl)
+            .await
+        {
+            talos_replay_guard::ReplayVerdict::Admit => ReplayVerdict::Fresh,
+            talos_replay_guard::ReplayVerdict::Replay => ReplayVerdict::Replayed,
+            talos_replay_guard::ReplayVerdict::StoreUnavailable => ReplayVerdict::Unavailable,
         };
         if verdict != ReplayVerdict::Fresh {
             self.release(&hash);

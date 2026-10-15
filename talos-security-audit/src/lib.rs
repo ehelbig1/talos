@@ -430,6 +430,61 @@ pub fn check_fleet_identity(
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// replay_guard — is the cross-replica replay guard registered and reaching Redis?
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Render the `replay_guard` check (security review 2026-10-15, B2-2): with
+/// `TALOS_DISTRIBUTED_REPLAY` on, whether this controller's shared guard is
+/// registered and whether it reaches its store, and what an unreachable store
+/// does under the fail policy. Read from the guard itself
+/// (`talos_replay_guard::guard_state`), so a guard registered while Redis was
+/// down reports `fail` until Redis answers.
+#[must_use]
+pub fn check_replay_guard(
+    is_prod: bool,
+    policy: talos_replay_guard::ReplayPolicy,
+    state: talos_replay_guard::GuardState,
+) -> Check {
+    use talos_replay_guard::GuardState;
+    let consequence = if policy.fail_closed {
+        "every signed RPC is refused until it does (fail closed)"
+    } else {
+        "signed RPCs are admitted on this replica's nonce cache alone (fail open)"
+    };
+    let (status, detail) = match (policy.distributed, state) {
+        (false, _) => (
+            if is_prod { Status::Warn } else { Status::Info },
+            "TALOS_DISTRIBUTED_REPLAY is off: a signed message replayed to another replica \
+             inside its freshness window is refused only by the replica that saw it first"
+                .to_string(),
+        ),
+        (true, GuardState::Registered { connected: true }) => (
+            Status::Pass,
+            format!(
+                "shared replay guard registered and reaching Redis; an unreachable store {}",
+                if policy.fail_closed { "refuses" } else { "admits" }
+            ),
+        ),
+        (true, GuardState::Registered { connected: false }) => (
+            Status::Fail,
+            format!("shared replay guard registered but Redis has not answered; {consequence}"),
+        ),
+        (true, GuardState::NotRegistered) => (
+            Status::Fail,
+            format!("TALOS_DISTRIBUTED_REPLAY is on but no replay guard is registered (REDIS_URL unset?); {consequence}"),
+        ),
+    };
+    Check {
+        name: "replay_guard",
+        status,
+        detail,
+        verification: Verification::Parsed,
+        points: 0,
+        parts: None,
+    }
+}
+
 /// Which key-encryption keys can unwrap this deployment's DEKs (security
 /// review 2026-10-14, C-12). Under `KEK_PROVIDER=vault` the env KEK
 /// (`TALOS_MASTER_KEY`) stays a live unwrap path — so a leaked Secret still
@@ -2280,6 +2335,11 @@ pub async fn run_security_audit(
                     .ok()
                     .as_deref(),
             ),
+        ),
+        check_replay_guard(
+            is_prod,
+            talos_replay_guard::ReplayPolicy::from_env(),
+            talos_replay_guard::guard_state(),
         ),
         check_jwt_algorithm(
             talos_auth::jwt_selftest(),

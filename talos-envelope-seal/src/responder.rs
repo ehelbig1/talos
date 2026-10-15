@@ -88,11 +88,18 @@ pub async fn run_claim_responder(
             ClaimIntake::Admitted(slot) => slot,
             refused => {
                 dropped += 1;
-                // At most one line per 1 024 drops: a flood is not a log flood.
+                let reason = if matches!(refused, ClaimIntake::TooLarge) {
+                    "too_large"
+                } else {
+                    "saturated"
+                };
+                // Every drop is counted (B2-3, 2026-10-15); at most one line
+                // per 1 024 drops: a flood is not a log flood.
+                talos_metrics::record_claim_dropped(reason);
                 if dropped % 1024 == 1 {
                     tracing::warn!(
                         target: "talos_security",
-                        reason = if matches!(refused, ClaimIntake::TooLarge) { "too_large" } else { "saturated" },
+                        reason,
                         dropped,
                         "claim dropped unread"
                     );
