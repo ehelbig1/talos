@@ -23,7 +23,7 @@ describe("TestRhaiModal", () => {
       />,
     );
 
-    expect(screen.getByText(/Protocol Evaluation/i)).toBeInTheDocument();
+    expect(screen.getByText(/Test expression/i)).toBeInTheDocument();
     expect(screen.getByText(/ctx.value/i)).toBeInTheDocument();
   });
 
@@ -39,7 +39,7 @@ describe("TestRhaiModal", () => {
     );
 
     const runButton = screen.getByRole("button", {
-      name: /Initiate Logic Test/i,
+      name: /Run test/i,
     });
     fireEvent.click(runButton);
 
@@ -68,7 +68,7 @@ describe("TestRhaiModal", () => {
     );
 
     const runButton = screen.getByRole("button", {
-      name: /Initiate Logic Test/i,
+      name: /Run test/i,
     });
     fireEvent.click(runButton);
 

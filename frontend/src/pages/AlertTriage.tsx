@@ -120,14 +120,14 @@ export default function AlertTriage() {
       {/* Header */}
       <header className="px-10 pt-16 pb-8 shrink-0">
         <div className="flex items-center gap-5">
-          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center shadow-[0_0_30px_hsla(var(--primary),0.1)]">
+          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center">
             <AlertTriangle className="w-7 h-7 text-primary" />
           </div>
           <div>
-            <h1 className="text-2xl md:text-3xl font-black text-white tracking-tight font-outfit uppercase leading-tight">
+            <h1 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
               Alerts
             </h1>
-            <p className="text-[10px] text-muted-foreground/40 font-bold uppercase tracking-[0.3em] mt-2">
+            <p className="text-xs text-muted-foreground/70 font-bold mt-2">
               Ops alert triage · correct, acknowledge, resolve
             </p>
           </div>
@@ -151,18 +151,18 @@ export default function AlertTriage() {
               <span
                 key={sc.severity}
                 className={cn(
-                  "px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider border",
+                  "px-3 py-1.5 rounded-lg text-xs font-bold border",
                   severityStyle(sc.severity),
                 )}
               >
                 {sc.count} {sc.severity}
               </span>
             ))}
-            <span className="px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider border text-primary bg-primary/5 border-primary/20">
+            <span className="px-3 py-1.5 rounded-lg text-xs font-bold border text-primary bg-primary/5 border-primary/20">
               {digest.newLast24H} new in 24h
             </span>
             {digest.reopenedActive > 0 && (
-              <span className="px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider border text-destructive bg-destructive/10 border-destructive/30">
+              <span className="px-3 py-1.5 rounded-lg text-xs font-bold border text-destructive bg-destructive/10 border-destructive/30">
                 {digest.reopenedActive} reopened
               </span>
             )}
@@ -177,7 +177,7 @@ export default function AlertTriage() {
               type="button"
               onClick={() => setFilter(f)}
               className={cn(
-                "inline-flex items-center justify-center whitespace-nowrap rounded-lg px-4 py-1.5 text-[10px] font-black uppercase tracking-widest transition-premium",
+                "inline-flex items-center justify-center whitespace-nowrap rounded-lg px-4 py-1.5 text-xs font-semibold transition-premium",
                 filter === f
                   ? "bg-white/10 text-foreground shadow-sm border border-white/10"
                   : "text-muted-foreground/60 hover:text-foreground",
@@ -194,7 +194,7 @@ export default function AlertTriage() {
             {[1, 2, 3].map((i) => (
               <div
                 key={i}
-                className="h-32 bg-white/[0.02] border border-white/5 rounded-[2rem] animate-pulse"
+                className="h-32 bg-white/[0.02] border border-white/5 rounded-2xl animate-pulse"
               />
             ))}
           </div>
@@ -225,47 +225,47 @@ export default function AlertTriage() {
                 <Card
                   key={a.id}
                   className={cn(
-                    "rounded-[2rem] p-6 relative overflow-hidden",
+                    "rounded-2xl p-6 relative overflow-hidden",
                     rowBusy && "opacity-50 pointer-events-none",
                   )}
                 >
                   {/* Top row: title + badges */}
                   <div className="flex flex-wrap items-start gap-3 mb-4">
-                    <span className="text-sm font-black text-white truncate max-w-xl font-outfit">
+                    <span className="text-sm font-semibold text-white truncate max-w-xl font-outfit">
                       {a.title}
                     </span>
-                    <Badge className="text-[9px]">{a.source}</Badge>
+                    <Badge className="text-2xs">{a.source}</Badge>
                     {a.occurrenceCount > 1 && (
-                      <span className="text-[10px] font-bold text-muted-foreground/60">
+                      <span className="text-xs font-bold text-muted-foreground/60">
                         ×{a.occurrenceCount}
                       </span>
                     )}
                     {asIsoString(a.reopenedAt) && (
-                      <span className="px-2.5 py-0.5 rounded-lg text-[9px] font-bold uppercase tracking-wider inline-flex items-center border text-destructive bg-destructive/10 border-destructive/30">
+                      <span className="px-2.5 py-0.5 rounded-lg text-2xs font-bold uppercase tracking-wider inline-flex items-center border text-destructive bg-destructive/10 border-destructive/30">
                         <RotateCcw className="w-3 h-3 mr-1" />
                         reopened
                       </span>
                     )}
                     {a.correctedSeverity && (
-                      <span className="px-2.5 py-0.5 rounded-lg text-[9px] font-bold uppercase tracking-wider inline-flex items-center border text-primary bg-primary/5 border-primary/20">
+                      <span className="px-2.5 py-0.5 rounded-lg text-2xs font-bold uppercase tracking-wider inline-flex items-center border text-primary bg-primary/5 border-primary/20">
                         <ShieldCheck className="w-3 h-3 mr-1" />
                         corrected
                       </span>
                     )}
-                    <span className="ml-auto text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest shrink-0">
+                    <span className="ml-auto text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider shrink-0">
                       {relativeTime(asIsoString(a.lastSeen))}
                     </span>
                   </div>
 
                   {a.resource && (
-                    <p className="text-[11px] text-muted-foreground/50 font-medium mb-4 truncate">
+                    <p className="text-xs text-muted-foreground/50 font-medium mb-4 truncate">
                       {a.resource}
                     </p>
                   )}
 
                   {/* Severity chips */}
                   <div className="flex flex-wrap items-center gap-2 mb-4">
-                    <span className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-widest mr-1">
+                    <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider mr-1">
                       Severity
                     </span>
                     {ASSIGNABLE_SEVERITIES.map((sev) => {
@@ -279,7 +279,7 @@ export default function AlertTriage() {
                             correct.mutate({ alertId: a.id, severity: sev })
                           }
                           className={cn(
-                            "h-8 px-3 rounded-lg text-[9px] font-black uppercase tracking-widest border transition-premium disabled:cursor-default",
+                            "h-8 px-3 rounded-lg text-2xs font-semibold uppercase tracking-wider border transition-premium disabled:cursor-default",
                             isCurrent
                               ? severityStyle(sev)
                               : "bg-transparent text-muted-foreground/50 border-white/10 hover:bg-white/5 hover:text-foreground",

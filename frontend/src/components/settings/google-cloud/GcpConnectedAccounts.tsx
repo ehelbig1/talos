@@ -21,7 +21,7 @@ export function GcpConnectedAccounts({
   return (
     <div className="mb-4 pb-4 border-b border-border/40">
       <p
-        className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground mb-1.5"
+        className="text-xs font-semibold text-muted-foreground mb-1.5"
         title="OAuth consents available to watch channels and provisioning workflows. Connecting an account does not create a watch channel or any Pub/Sub resources — create a channel below, or run the GCP provisioning modules in a workflow."
       >
         Connected accounts
@@ -39,15 +39,15 @@ export function GcpConnectedAccounts({
               {i.account_email ?? "Google Cloud"}
             </span>
             {i.tier === "full" ? (
-              <span className="inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full bg-destructive/10 text-destructive border border-destructive/20">
+              <span className="inline-flex items-center text-xs font-semibold px-2 py-0.5 rounded-full bg-destructive/10 text-destructive border border-destructive/20">
                 Impersonation
               </span>
             ) : i.tier === "write" ? (
-              <span className="inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full bg-warning/10 text-warning border border-warning/20">
+              <span className="inline-flex items-center text-xs font-semibold px-2 py-0.5 rounded-full bg-warning/10 text-warning border border-warning/20">
                 Provisioning
               </span>
             ) : (
-              <span className="inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full bg-muted/20 text-muted-foreground border border-border/40">
+              <span className="inline-flex items-center text-xs font-semibold px-2 py-0.5 rounded-full bg-muted/20 text-muted-foreground border border-border/40">
                 Read-only
               </span>
             )}

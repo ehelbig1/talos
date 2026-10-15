@@ -44,23 +44,23 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
       className="max-w-md"
     >
       <div className="space-y-8 relative z-10 p-2 -mt-4">
-        <p className="text-muted-foreground/30 text-[10px] font-black uppercase tracking-[0.3em] leading-none mb-6">
+        <p className="text-muted-foreground/60 text-xs font-semibold leading-none mb-6">
           Executing as <span className="text-primary">{actor.name}</span>
         </p>
 
         <div className="relative z-10">
           {result ? (
             <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
-              <div className="bg-success/5 border border-success/20 rounded-[1.5rem] p-6 glass-light shadow-xl relative group overflow-hidden">
+              <div className="bg-success/5 border border-success/20 rounded-2xl p-6 glass-light shadow-xl relative group overflow-hidden">
                 <div className="absolute inset-0 bg-success/5 opacity-0 group-hover:opacity-100 transition-premium" />
                 <div className="flex items-center gap-3 mb-3">
-                  <div className="w-2 h-2 rounded-full bg-success animate-status-pulse shadow-[0_0_8px_hsla(var(--success),0.5)]" />
-                  <p className="text-success text-[10px] font-black uppercase tracking-[0.2em]">
-                    Protocol Sequence Synchronized
+                  <div className="w-2 h-2 rounded-full bg-success animate-status-pulse" />
+                  <p className="text-success text-xs font-semibold">
+                    Run started
                   </p>
                 </div>
                 <div className="space-y-1">
-                  <p className="text-muted-foreground/40 text-[9px] font-bold uppercase tracking-widest">
+                  <p className="text-muted-foreground/70 text-2xs font-bold uppercase tracking-wider">
                     Execution Trace Identifier
                   </p>
                   <p className="text-white font-mono text-xs break-all selection:bg-success/30">
@@ -70,7 +70,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
               </div>
               <button
                 onClick={onClose}
-                className="w-full py-4 text-[10px] font-black uppercase tracking-[0.2em] text-white bg-white/5 border border-white/5 rounded-2xl hover:bg-white/10 hover:border-white/20 transition-premium active:scale-95 shadow-xl glass-light"
+                className="w-full py-4 text-sm font-semibold text-white bg-white/5 border border-white/5 rounded-2xl hover:bg-white/10 hover:border-white/20 transition-premium active:scale-95 shadow-xl glass-light"
               >
                 Abort Viewport
               </button>
@@ -78,19 +78,19 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
           ) : (
             <div className="space-y-8">
               {isLoading ? (
-                <div className="flex items-center gap-4 text-muted-foreground/40 text-[10px] font-black uppercase tracking-[0.2em] py-8">
+                <div className="flex items-center gap-4 text-muted-foreground/70 text-xs font-semibold py-8">
                   <Loader2 className="w-5 h-5 animate-spin text-primary" />
                   Synchronizing Workflows...
                 </div>
               ) : published.length === 0 ? (
                 <div className="py-10 text-center bg-white/2 rounded-2xl border border-white/5 border-dashed">
-                  <p className="text-muted-foreground/40 text-[10px] font-black uppercase tracking-[0.2em]">
-                    No Published Protocols Detected
+                  <p className="text-muted-foreground/70 text-xs font-semibold">
+                    No published workflows yet
                   </p>
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <label className="text-[10px] font-black text-muted-foreground/30 uppercase tracking-[0.3em] ml-1">
+                  <label className="text-xs font-semibold text-muted-foreground/60 ml-1">
                     Select Execution Logic
                   </label>
                   <div className="relative group/select">
@@ -101,7 +101,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                       className="w-full bg-surface-4/40 backdrop-blur-xl border border-white/10 rounded-2xl px-6 py-4 text-sm text-white focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-premium appearance-none relative z-10 font-medium"
                     >
                       <option value="" className="bg-surface-3">
-                        —— IDENTIFY SEQUENCE ——
+                        Select a workflow…
                       </option>
                       {published.map((w) => (
                         <option
@@ -114,7 +114,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                       ))}
                     </select>
                     <div className="absolute right-6 top-1/2 -translate-y-1/2 pointer-events-none z-20">
-                      <ChevronRight className="w-4 h-4 text-muted-foreground/20 rotate-90" />
+                      <ChevronRight className="w-4 h-4 text-muted-foreground/50 rotate-90" />
                     </div>
                   </div>
                 </div>
@@ -125,7 +125,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                   selectedWorkflowId && triggerMut.mutate(selectedWorkflowId)
                 }
                 disabled={!selectedWorkflowId || triggerMut.isPending}
-                className="w-full flex items-center justify-center gap-4 bg-primary hover:bg-primary/90 disabled:opacity-20 disabled:cursor-not-allowed text-white text-[10px] font-black uppercase tracking-[0.2em] py-5 rounded-2xl transition-premium shadow-2xl hover:shadow-[0_15px_30px_-5px_hsla(var(--primary),0.4)] hover:scale-105 active:scale-95 border border-white/20"
+                className="w-full flex items-center justify-center gap-4 bg-primary hover:bg-primary/90 disabled:opacity-20 disabled:cursor-not-allowed text-white text-sm font-semibold py-5 rounded-2xl transition-premium shadow-2xl active:scale-95 border border-white/20"
               >
                 {triggerMut.isPending ? (
                   <>
@@ -135,7 +135,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                 ) : (
                   <>
                     <Play className="w-5 h-5 fill-current" />
-                    Deploy Sequence
+                    Run workflow
                   </>
                 )}
               </button>

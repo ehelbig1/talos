@@ -188,7 +188,7 @@ export function CreateGcpWatchDialog({
               placeholder="talos-gcp-pusher@my-project.iam.gserviceaccount.com"
               className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
             />
-            <p className="text-[11px] text-muted-foreground mt-1.5">
+            <p className="text-xs text-muted-foreground mt-1.5">
               The service account your Pub/Sub subscription signs pushes with (
               <code>--push-auth-service-account</code>). Every push JWT must be
               issued by this account.
@@ -237,7 +237,7 @@ export function CreateGcpWatchDialog({
                 className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
               />
             )}
-            <p className="text-[11px] text-muted-foreground mt-1.5">
+            <p className="text-xs text-muted-foreground mt-1.5">
               The module that runs on each incident. Leave unset to bind one
               later in the workflow builder.
             </p>

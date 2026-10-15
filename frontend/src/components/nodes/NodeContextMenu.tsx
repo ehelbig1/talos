@@ -54,7 +54,7 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
       ref={menuRef}
       style={{ position: "fixed", top: pos.y, left: pos.x }}
       className="z-[9999] glass-dark rounded-xl shadow-2xl py-1.5 min-w-[190px] border border-white/10 overflow-hidden
-        animate-in fade-in zoom-in-95 duration-150 origin-top-left"
+       animate-in fade-in zoom-in-95 duration-150 origin-top-left"
       role="menu"
       aria-label="Node context menu"
     >
@@ -72,7 +72,7 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
           <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-indigo-400 transition-premium" />
           Duplicate
         </span>
-        <kbd className="text-[10px] text-muted-foreground font-mono bg-white/5 px-1.5 py-0.5 rounded border border-white/5">
+        <kbd className="text-xs text-muted-foreground font-mono bg-white/5 px-1.5 py-0.5 rounded border border-white/5">
           ⌘D
         </kbd>
       </button>
@@ -108,7 +108,7 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
           <Trash2 className="w-3.5 h-3.5 opacity-70 group-hover:opacity-100 transition-opacity" />
           Remove Node
         </span>
-        <kbd className="text-[10px] text-red-500/50 font-mono bg-red-500/5 px-1.5 py-0.5 rounded border border-red-500/10">
+        <kbd className="text-xs text-red-500/50 font-mono bg-red-500/5 px-1.5 py-0.5 rounded border border-red-500/10">
           ⌫
         </kbd>
       </button>

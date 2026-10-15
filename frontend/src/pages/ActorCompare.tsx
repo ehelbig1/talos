@@ -69,8 +69,8 @@ export default function ActorCompare() {
   return (
     <div className="min-h-screen bg-background text-white relative overflow-hidden font-inter">
       {/* Ambient background glows */}
-      <div className="absolute top-[-10%] right-[-10%] w-[50%] h-[50%] bg-primary/5 rounded-full blur-[120px] animate-pulse" />
-      <div className="absolute bottom-[-5%] left-[-5%] w-[40%] h-[40%] bg-violet-500/5 rounded-full blur-[100px] animate-pulse delay-700" />
+      <div className="absolute top-[-10%] right-[-10%] w-[50%] h-[50%] bg-primary/5 rounded-full blur-[120px]" />
+      <div className="absolute bottom-[-5%] left-[-5%] w-[40%] h-[40%] bg-violet-500/5 rounded-full blur-[100px]" />
 
       <div className="max-w-7xl mx-auto px-8 py-10 space-y-12 relative z-10">
         {/* Page header */}
@@ -83,15 +83,15 @@ export default function ActorCompare() {
               <ChevronLeft className="w-5 h-5" />
             </button>
             <div className="flex items-center gap-5">
-              <div className="p-3.5 rounded-2xl bg-primary/10 border border-primary/20 shadow-[0_0_20px_hsla(var(--primary),0.15)]">
+              <div className="p-3.5 rounded-2xl bg-primary/10 border border-primary/20">
                 <GitCompare className="w-7 h-7 text-primary" />
               </div>
               <div>
-                <h1 className="text-2xl font-black tracking-tight font-outfit uppercase">
-                  Actor Strategic Compare
+                <h1 className="text-2xl font-semibold tracking-tight font-outfit">
+                  Compare actors
                 </h1>
-                <p className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.3em] mt-1">
-                  Simultaneous multi-actor protocol evaluation
+                <p className="text-xs text-muted-foreground/70 font-semibold mt-1">
+                  Run one workflow as several actors side by side
                 </p>
               </div>
             </div>
@@ -102,7 +102,7 @@ export default function ActorCompare() {
             {lanes.length > 0 && allDone && (
               <button
                 onClick={handleReset}
-                className="flex items-center gap-3 px-6 py-3 rounded-2xl bg-surface-2/40 border border-white/5 text-[11px] font-black uppercase tracking-widest text-muted-foreground/60 hover:text-white hover:bg-surface-2/60 transition-premium shadow-2xl active:scale-95"
+                className="flex items-center gap-3 px-6 py-3 rounded-2xl bg-surface-2/40 border border-white/5 text-sm font-semibold text-muted-foreground/60 hover:text-white hover:bg-surface-2/60 transition-premium shadow-2xl active:scale-95"
               >
                 <RefreshCw className="w-4 h-4" />
                 New Analysis
@@ -111,14 +111,14 @@ export default function ActorCompare() {
             <button
               onClick={handleRun}
               disabled={!canRun}
-              className="flex items-center gap-3 px-8 py-3.5 rounded-2xl bg-primary hover:bg-primary/90 disabled:opacity-40 disabled:grayscale disabled:cursor-not-allowed text-white text-[11px] font-black uppercase tracking-[0.2em] transition-premium shadow-[0_0_30px_hsla(var(--primary),0.2)] active:scale-95"
+              className="flex items-center gap-3 px-8 py-3.5 rounded-2xl bg-primary hover:bg-primary/90 disabled:opacity-40 disabled:grayscale disabled:cursor-not-allowed text-white text-sm font-semibold transition-premium active:scale-95"
             >
               {running ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
               ) : (
                 <Play className="w-4 h-4" />
               )}
-              {running ? "ANALYZING..." : "INITIATE PROTOCOL"}
+              {running ? "Running…" : "Run comparison"}
             </button>
           </div>
         </div>
@@ -167,12 +167,11 @@ export default function ActorCompare() {
               <GitCompare className="w-24 h-24 text-white/5 relative z-10" />
             </div>
             <div className="space-y-3 relative z-10">
-              <p className="text-sm font-black text-white/40 uppercase tracking-[0.3em] font-outfit">
-                Strategic Analysis Engine Offline
+              <p className="text-sm font-semibold text-white/70 font-outfit">
+                Nothing to compare yet
               </p>
-              <p className="text-[10px] text-muted-foreground/20 font-bold uppercase tracking-widest max-w-sm leading-relaxed">
-                Awaiting protocol designation and actor cohort assignment to
-                begin comparative telemetry collection.
+              <p className="text-xs text-muted-foreground/50 max-w-sm leading-relaxed">
+                Pick a workflow and at least two actors to start.
               </p>
             </div>
           </div>

@@ -22,7 +22,7 @@ export function CapabilityBadge({
   return (
     <div
       className={cn(
-        "inline-flex items-center gap-2.5 px-3 py-1.5 rounded-full border text-[9px] font-black tracking-[0.2em] uppercase transition-premium group overflow-hidden relative shadow-[0_0_15px_hsla(var(--primary),0.1)]",
+        "inline-flex items-center gap-2.5 px-3 py-1.5 rounded-full border text-2xs font-semibold tracking-wider uppercase transition-premium group overflow-hidden relative",
         visuals.bgColor,
         visuals.borderColor,
         visuals.color,
@@ -58,23 +58,23 @@ export function LlmConfigSection({
   if (!hasLlm) return null;
 
   const selectBase =
-    "w-full px-4 py-3 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
+    "w-full px-4 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
 
   return (
     <div className="p-6 bg-surface-3/40 border border-white/5 rounded-3xl space-y-6 shadow-2xl relative overflow-hidden group">
       <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-20 pointer-events-none" />
 
       <div className="flex items-center justify-between relative z-10">
-        <h4 className="text-[11px] font-black text-white flex items-center gap-3 uppercase tracking-[0.3em] font-outfit">
-          <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20 shadow-[0_0_20px_hsla(var(--primary),0.15)] group-hover:scale-110 transition-premium">
+        <h4 className="text-xs font-semibold text-white flex items-center gap-3 font-outfit">
+          <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20 transition-premium">
             <Brain className="w-4 h-4 text-primary" />
           </div>
-          Neural Core
+          Language model
         </h4>
         <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full">
           <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-          <span className="text-[8px] font-black text-primary tracking-widest uppercase">
-            Active_Link
+          <span className="text-2xs font-semibold text-primary tracking-wider uppercase">
+            Enabled
           </span>
         </div>
       </div>
@@ -82,8 +82,8 @@ export function LlmConfigSection({
       <div className="space-y-6 relative z-10">
         <div className="grid grid-cols-1 gap-6">
           <div className="space-y-3">
-            <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-              Cognitive Architecture
+            <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+              Provider
             </label>
             <div className="relative">
               <select
@@ -99,12 +99,12 @@ export function LlmConfigSection({
                 <option value="openai">OPENAI (GPT)</option>
                 <option value="gemini">GOOGLE (GEMINI)</option>
               </select>
-              <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40 pointer-events-none" />
+              <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/70 pointer-events-none" />
             </div>
           </div>
 
           <div className="space-y-3">
-            <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
+            <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
               Model Parameter
             </label>
             <div className="relative">
@@ -133,22 +133,22 @@ export function LlmConfigSection({
                   <option value="gemini-1.5-flash">GEMINI 1.5 FLASH</option>
                 </optgroup>
               </select>
-              <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40 pointer-events-none" />
+              <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/70 pointer-events-none" />
             </div>
           </div>
         </div>
 
         <div className="flex gap-6">
           <div className="flex-1 space-y-3">
-            <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-              Entropy
+            <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+              Temperature
             </label>
             <input
               type="number"
               min="0"
               max="2"
               step="0.1"
-              className="w-full px-5 py-3 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30"
+              className="w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30"
               value={(data.config?.llm_temperature as number) ?? 0.7}
               onChange={(e) =>
                 updateNodeData(nodeId, {
@@ -164,13 +164,13 @@ export function LlmConfigSection({
             />
           </div>
           <div className="flex-1 space-y-3">
-            <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
+            <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
               Capacitance
             </label>
             <input
               type="number"
               min="1"
-              className="w-full px-5 py-3 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30"
+              className="w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30"
               value={(data.config?.llm_max_tokens as number) ?? 4096}
               onChange={(e) =>
                 updateNodeData(nodeId, {
@@ -188,15 +188,15 @@ export function LlmConfigSection({
         </div>
 
         <div className="space-y-3">
-          <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-            Primary Directive
+          <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+            System prompt
           </label>
           <div className="relative group/directive">
             <div className="absolute -inset-0.5 bg-primary/10 rounded-2xl blur opacity-0 group-hover/directive:opacity-100 transition-premium" />
             <textarea
               rows={4}
-              className="relative w-full px-5 py-4 text-[11px] font-medium bg-black/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:outline-none transition-premium resize-none font-sans leading-relaxed selection:bg-primary/30 placeholder:text-muted-foreground/20"
-              placeholder="DEFINE_OPERATIONAL_DIRECTIVE..."
+              className="relative w-full px-5 py-4 text-xs font-medium bg-black/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:outline-none transition-premium resize-none font-sans leading-relaxed selection:bg-primary/30 placeholder:text-muted-foreground/50"
+              placeholder="Tell the model what to do…"
               value={(data.config?.llm_system_prompt as string) || ""}
               onChange={(e) =>
                 updateNodeData(nodeId, {
@@ -221,13 +221,13 @@ export function RetryPolicySection({
   updateNodeData: (id: string, data: Partial<WorkflowNodeData>) => void;
 }) {
   const inputBase =
-    "w-full px-5 py-3.5 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30";
+    "w-full px-5 py-3.5 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30";
 
   return (
     <div className="space-y-8 animate-in slide-in-from-top-4 duration-500">
       <div className="grid grid-cols-2 gap-6">
         <div className="space-y-3">
-          <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
+          <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
             Threshold
           </label>
           <input
@@ -253,7 +253,7 @@ export function RetryPolicySection({
         </div>
 
         <div className="space-y-3">
-          <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
+          <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
             Backoff (ms)
           </label>
           <input
@@ -275,14 +275,14 @@ export function RetryPolicySection({
       </div>
 
       <div className="space-y-4">
-        <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
+        <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
           Condition Logic (Rhai)
         </label>
         <div className="relative group/logic">
           <div className="absolute -inset-1 bg-primary/5 rounded-3xl blur opacity-20 group-hover/logic:opacity-40 transition-premium" />
           <textarea
             placeholder="ctx.last_error.code == 503"
-            className="relative w-full px-6 py-5 bg-black/40 border border-white/5 font-mono text-[11px] min-h-[140px] transition-premium rounded-[2rem] selection:bg-primary/30 leading-relaxed focus:outline-none focus:border-primary/40 focus:shadow-[0_0_30px_hsla(var(--primary),0.05)]"
+            className="relative w-full px-6 py-5 bg-black/40 border border-white/5 font-mono text-xs min-h-[140px] transition-premium rounded-2xl selection:bg-primary/30 leading-relaxed focus:outline-none focus:border-primary/40"
             value={data.retryPolicy?.retryCondition ?? ""}
             onChange={(e) => {
               const currentPolicy = data.retryPolicy || {};
@@ -298,12 +298,12 @@ export function RetryPolicySection({
 
         <div className="flex flex-wrap gap-3 pt-2">
           {[
-            { label: "PROTOCOL_FAULT", value: "ctx.last_error.code >= 500" },
+            { label: "Server error", value: "ctx.last_error.code >= 500" },
             {
-              label: "RATE_LIMIT",
+              label: "Rate limit",
               value: 'ctx.last_error.message.contains("rate limit")',
             },
-            { label: "PERSISTENT", value: "true" },
+            { label: "Always", value: "true" },
           ].map((snippet) => (
             <button
               type="button"
@@ -317,7 +317,7 @@ export function RetryPolicySection({
                   },
                 });
               }}
-              className="text-[9px] font-black px-4 py-2 bg-white/5 hover:bg-primary/10 border border-white/5 rounded-xl text-muted-foreground/40 hover:text-primary transition-premium shadow-lg uppercase tracking-[0.2em] active:scale-95"
+              className="text-2xs font-semibold px-4 py-2 bg-white/5 hover:bg-primary/10 border border-white/5 rounded-xl text-muted-foreground/70 hover:text-primary transition-premium shadow-lg active:scale-95"
             >
               {snippet.label}
             </button>
@@ -348,19 +348,19 @@ export function SystemInternalsSection({
   return (
     <div className="space-y-8 py-4 animate-in fade-in duration-700">
       <div className="space-y-4">
-        <label className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1 flex items-center gap-2">
-          <Activity size={12} className="text-primary/40" />
-          Protocol Identity
+        <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1 flex items-center gap-2">
+          <Activity size={12} className="text-primary/70" />
+          Identifiers
         </label>
         <div className="grid gap-4">
           <CopyField
-            label="Node_ID"
+            label="Node ID"
             value={node.id}
             copied={copiedNodeId}
             onCopy={onCopyNodeId}
           />
           <CopyField
-            label="Source_ID"
+            label="Module ID"
             value={moduleId}
             copied={copiedModuleId}
             onCopy={onCopyModuleId}
@@ -372,10 +372,10 @@ export function SystemInternalsSection({
         <button
           type="button"
           onClick={onDelete}
-          className="w-full py-4 rounded-2xl border border-destructive/20 bg-destructive/5 text-destructive text-[10px] font-black uppercase tracking-[0.3em] hover:bg-destructive/10 hover:border-destructive/40 transition-premium shadow-2xl active:scale-[0.98] group overflow-hidden relative"
+          className="w-full py-4 rounded-2xl border border-destructive/20 bg-destructive/5 text-destructive text-sm font-semibold hover:bg-destructive/10 hover:border-destructive/40 transition-premium shadow-2xl active:scale-[0.98] group overflow-hidden relative"
         >
           <div className="absolute inset-0 bg-gradient-to-r from-destructive/10 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium" />
-          <span className="relative z-10">Decommission Protocol Node</span>
+          <span className="relative z-10">Delete node</span>
         </button>
       </div>
     </div>

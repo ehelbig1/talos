@@ -14,8 +14,8 @@ export const DarkInput = React.forwardRef<
     <input
       ref={ref}
       className={cn(
-        "w-full bg-surface-4/40 backdrop-blur-xl border border-white/5 text-foreground rounded-2xl px-5 h-11 text-sm transition-premium placeholder:text-muted-foreground/20 gpu shadow-inner leading-normal",
-        "focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 focus:shadow-[0_0_30px_hsla(var(--primary),0.15),inset_0_0_10px_rgba(0,0,0,0.2)]",
+        "w-full bg-surface-4/60 border border-white/10 text-foreground rounded-xl px-4 h-10 text-sm transition-premium placeholder:text-muted-foreground/60 leading-normal",
+        "focus:outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/20",
         className,
       )}
       {...rest}

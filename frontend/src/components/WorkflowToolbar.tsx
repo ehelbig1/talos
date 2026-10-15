@@ -117,7 +117,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
   // Mutations
   const publishVersionMutation = usePublishWorkflowVersionMutation({
     onSuccess: () => {
-      toast.success("Version snapshot published");
+      toast.success("Version published");
       closeModal();
     },
     onError: () => toast.error("Failed to publish version"),
@@ -271,13 +271,13 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
       />
 
       <Dialog
-        title="Identity Assignment"
+        title="Rename workflow"
         open={modal.kind === "name"}
         onClose={closeModal}
       >
         <div className="space-y-6">
-          <p className="text-[11px] text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
-            Assign a unique operational identifier to this workflow sequence.
+          <p className="text-xs text-muted-foreground/60 leading-relaxed">
+            Give this workflow a name.
           </p>
           <div className="relative group">
             <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
@@ -293,14 +293,14 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
                 if (e.key === "Escape") closeModal();
               }}
               placeholder="Workflow Identifier..."
-              className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-xs font-black uppercase tracking-widest rounded-2xl relative z-10 shadow-inner"
+              className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10 shadow-inner"
             />
           </div>
           <div className="flex justify-end gap-3 pt-4 relative z-10">
             <Button
               variant="ghost"
               onClick={closeModal}
-              className="h-12 px-8 text-[10px] font-black uppercase tracking-widest text-muted-foreground/40 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+              className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
             >
               Abort
             </Button>
@@ -310,21 +310,21 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
               disabled={modal.kind === "name" && !modal.pendingName.trim()}
               className="h-12 px-10"
             >
-              Commit Identity
+              Save name
             </Button>
           </div>
         </div>
       </Dialog>
 
       <Dialog
-        title="Version Snapshot"
+        title="Publish version"
         open={modal.kind === "publish"}
         onClose={closeModal}
       >
         <div className="space-y-6">
-          <p className="text-[11px] text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
-            Create a named protocol snapshot. This allows for rapid rollback and
-            audit tracking across the deployment pipeline.
+          <p className="text-xs text-muted-foreground/60 leading-relaxed">
+            Publish the current graph as a version so you can roll back to it
+            later.
           </p>
           <div className="relative group">
             <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
@@ -347,15 +347,15 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
                 }
                 if (e.key === "Escape") closeModal();
               }}
-              placeholder="Snapshot details (e.g. Protocol optimization v2)..."
-              className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-xs font-black uppercase tracking-widest rounded-2xl relative z-10 shadow-inner"
+              placeholder="What changed? (optional)"
+              className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10 shadow-inner"
             />
           </div>
           <div className="flex justify-end gap-3 pt-4 relative z-10">
             <Button
               variant="ghost"
               onClick={closeModal}
-              className="h-12 px-8 text-[10px] font-black uppercase tracking-widest text-muted-foreground/40 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+              className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
             >
               Cancel
             </Button>
@@ -376,42 +376,35 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
               ) : (
                 <Tag className="w-4 h-4 mr-2" />
               )}
-              Publish Snapshot
+              Publish version
             </Button>
           </div>
         </div>
       </Dialog>
 
       {/* Build tools */}
-      <ToolbarGroup label="Protocol">
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleNew}
-          className="bg-surface-4 border-white/5"
-        >
+      <ToolbarGroup label="Add">
+        <Button variant="outline" size="sm" onClick={handleNew}>
           <PlusCircle className="w-3.5 h-3.5 mr-2" />
           New
         </Button>
 
         <Button
-          variant="secondary"
+          variant="outline"
           size="sm"
           onClick={() => setModal({ kind: "addExisting" })}
-          className="bg-indigo-500/5 text-indigo-300 border-indigo-500/20 hover:bg-indigo-500/15"
         >
           <FolderPlus className="w-3.5 h-3.5 mr-2" />
-          Library
+          From library
         </Button>
 
         <Button
-          variant="secondary"
+          variant="outline"
           size="sm"
           onClick={() => setModal({ kind: "create" })}
-          className="bg-emerald-500/5 text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/15"
         >
           <Zap className="w-3.5 h-3.5 mr-2" />
-          Modules
+          New module
         </Button>
 
         <div className="pt-0.5">
@@ -422,7 +415,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
       <div className="w-[1px] h-8 bg-white/5 mx-2" />
 
       {/* Deployment tools */}
-      <ToolbarGroup label="Deployment">
+      <ToolbarGroup label="Workflow">
         <Button
           variant={isSaving || nodeCount === 0 ? "outline" : "premium"}
           size="sm"
@@ -434,30 +427,28 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
           ) : (
             <Save className="w-3.5 h-3.5 mr-2" />
           )}
-          {isSaving ? "Syncing..." : "Save"}
+          {isSaving ? "Saving…" : "Save"}
         </Button>
 
         {workflowId && !isDirty && (
           <Button
-            variant="secondary"
+            variant="outline"
             size="sm"
             onClick={() => setModal({ kind: "publish", desc: "" })}
-            className="bg-violet-500/5 text-violet-400 border-violet-500/20 hover:bg-violet-500/15"
           >
             <Tag className="w-3.5 h-3.5 mr-2" />
-            Snapshot
+            Publish version
           </Button>
         )}
 
         {workflowId && (
           <Button
-            variant="secondary"
+            variant="outline"
             size="sm"
             onClick={() => setModal({ kind: "test" })}
-            className="bg-emerald-500/5 text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/15"
           >
             <Play className="w-3.5 h-3.5 mr-2" />
-            Validate
+            Test
           </Button>
         )}
 
@@ -466,8 +457,8 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
             variant="ghost"
             size="icon"
             onClick={() => setModal({ kind: "confirmDelete" })}
-            className="text-muted-foreground/40 hover:text-destructive hover:bg-destructive/10"
-            aria-label="Decommission Workflow"
+            className="text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10"
+            aria-label="Delete workflow"
           >
             <Trash2 className="w-4 h-4" />
           </Button>
@@ -493,11 +484,11 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
               "px-4",
               showInspector
                 ? "bg-white/5 text-white border-white/10"
-                : "text-muted-foreground/40 hover:text-white",
+                : "text-muted-foreground/70 hover:text-white",
             )}
           >
             <Settings2 className="w-4 h-4 mr-2" />
-            <span className="hidden sm:inline">Diagnostics</span>
+            <span className="hidden sm:inline">Inspector</span>
           </Button>
 
           <ResourceStats nodeCount={nodeCount} edgeCount={edgeCount} />

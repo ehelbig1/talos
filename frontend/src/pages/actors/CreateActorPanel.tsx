@@ -280,18 +280,18 @@ export function CreateActorPanel({
         <div className="flex items-center justify-between px-10 py-10 border-b border-white/5 shrink-0 bg-white/5">
           <div className="space-y-1">
             <div className="flex items-center gap-3">
-              <div className="w-2 h-2 rounded-full bg-primary shadow-[0_0_10px_hsla(var(--primary),0.5)] animate-pulse" />
-              <h2 className="text-white font-black text-2xl font-outfit uppercase tracking-tighter">
-                Provision Actor
+              <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
+              <h2 className="text-white font-semibold text-2xl font-outfit tracking-tight">
+                New actor
               </h2>
             </div>
-            <p className="text-muted-foreground/30 text-[10px] font-black uppercase tracking-[0.3em]">
-              Initialize Bounded Execution Identity
+            <p className="text-muted-foreground/60 text-xs font-semibold">
+              An identity your workflows run as
             </p>
           </div>
           <button
             onClick={handleClose}
-            className="w-12 h-12 flex items-center justify-center rounded-2xl text-muted-foreground/40 hover:text-white hover:bg-white/10 border border-transparent hover:border-white/10 transition-premium active:scale-90"
+            className="w-12 h-12 flex items-center justify-center rounded-2xl text-muted-foreground/70 hover:text-white hover:bg-white/10 border border-transparent hover:border-white/10 transition-premium active:scale-90"
           >
             <X className="w-6 h-6" />
           </button>
@@ -313,10 +313,9 @@ export function CreateActorPanel({
               {/* Template selection */}
               <div className="space-y-6">
                 <div className="flex items-center gap-3">
-                  <Info className="w-4 h-4 text-primary/40" />
-                  <p className="text-muted-foreground/60 text-xs font-bold uppercase tracking-widest leading-relaxed">
-                    Select a core persona template to initialize identity
-                    protocols.
+                  <Info className="w-4 h-4 text-primary/70" />
+                  <p className="text-muted-foreground/60 text-xs leading-relaxed">
+                    Start from a persona template.
                   </p>
                 </div>
                 <div className="grid grid-cols-1 gap-4">
@@ -327,9 +326,9 @@ export function CreateActorPanel({
                         key={t.id}
                         onClick={() => applyTemplate(t)}
                         className={cn(
-                          "w-full text-left p-6 rounded-[1.5rem] border transition-premium relative overflow-hidden group shadow-sm",
+                          "w-full text-left p-6 rounded-2xl border transition-premium relative overflow-hidden group shadow-sm",
                           isSelected
-                            ? "border-primary/40 bg-primary/10 shadow-[0_0_30px_hsla(var(--primary),0.1)]"
+                            ? "border-primary/40 bg-primary/10"
                             : "border-white/5 bg-white/2 hover:border-primary/20 hover:bg-white/5",
                         )}
                       >
@@ -337,19 +336,19 @@ export function CreateActorPanel({
                         <div className="flex items-center justify-between gap-4 relative z-10 mb-2">
                           <span
                             className={cn(
-                              "text-base font-black font-outfit uppercase tracking-tight",
+                              "text-base font-semibold font-outfit tracking-tight",
                               isSelected ? "text-primary" : "text-white",
                             )}
                           >
                             {t.name}
                           </span>
                           {t.id !== "custom" && (
-                            <span className="text-[9px] text-muted-foreground/20 font-black uppercase tracking-[0.2em] bg-white/5 px-2 py-1 rounded-lg border border-white/5">
+                            <span className="text-2xs text-muted-foreground/50 font-semibold uppercase tracking-wider bg-white/5 px-2 py-1 rounded-lg border border-white/5">
                               {t.defaultCapability}
                             </span>
                           )}
                         </div>
-                        <p className="text-muted-foreground/40 text-[11px] font-bold leading-relaxed uppercase tracking-wide relative z-10">
+                        <p className="text-muted-foreground/70 text-xs leading-relaxed relative z-10">
                           {t.description}
                         </p>
                       </button>
@@ -362,37 +361,36 @@ export function CreateActorPanel({
               {selectedTemplate && (
                 <div className="flex flex-col gap-8 border-t border-white/5 pt-10 animate-in fade-in slide-in-from-bottom-8 duration-700 delay-200">
                   <div className="space-y-3">
-                    <label className="text-[10px] font-black text-muted-foreground/30 uppercase tracking-[0.3em] ml-1">
-                      Identity Identifier{" "}
-                      <span className="text-primary">*</span>
+                    <label className="text-xs font-semibold text-muted-foreground/60 ml-1">
+                      Name <span className="text-primary">*</span>
                     </label>
                     <div className="relative group/input">
-                      <div className="absolute -inset-0.5 bg-primary/20 rounded-[1.25rem] blur opacity-0 group-focus-within/input:opacity-100 transition-premium pointer-events-none" />
+                      <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within/input:opacity-100 transition-premium pointer-events-none" />
                       <input
                         value={name}
                         onChange={(e) => setName(e.target.value)}
-                        placeholder="e.g. secure-provision-actor"
+                        placeholder="e.g. inbox-assistant"
                         maxLength={64}
                         autoFocus
-                        className="w-full bg-surface-4/40 border border-white/10 rounded-[1.25rem] px-6 py-4 text-sm text-white placeholder:text-muted-foreground/20 focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-premium relative z-10 font-medium"
+                        className="w-full bg-surface-4/40 border border-white/10 rounded-2xl px-6 py-4 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-premium relative z-10 font-medium"
                       />
                     </div>
-                    <p className="text-[9px] text-muted-foreground/20 font-bold uppercase tracking-widest ml-1">
-                      Kebab-case alphanumeric identifier sequence.
+                    <p className="text-2xs text-muted-foreground/50 font-bold uppercase tracking-wider ml-1">
+                      Lowercase letters, numbers and hyphens.
                     </p>
                   </div>
                   <div className="space-y-3">
-                    <label className="text-[10px] font-black text-muted-foreground/30 uppercase tracking-[0.3em] ml-1">
-                      Operational Protocol Description
+                    <label className="text-xs font-semibold text-muted-foreground/60 ml-1">
+                      Description
                     </label>
                     <div className="relative group/textarea">
-                      <div className="absolute -inset-0.5 bg-primary/20 rounded-[1.25rem] blur opacity-0 group-focus-within/textarea:opacity-100 transition-premium pointer-events-none" />
+                      <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within/textarea:opacity-100 transition-premium pointer-events-none" />
                       <textarea
                         value={description}
                         onChange={(e) => setDesc(e.target.value)}
-                        placeholder="Specify primary operational objectives..."
+                        placeholder="What is this actor for?"
                         rows={3}
-                        className="w-full bg-surface-4/40 border border-white/10 rounded-[1.25rem] px-6 py-4 text-sm text-white placeholder:text-muted-foreground/20 focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-premium resize-none relative z-10 font-medium"
+                        className="w-full bg-surface-4/40 border border-white/10 rounded-2xl px-6 py-4 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-premium resize-none relative z-10 font-medium"
                       />
                     </div>
                   </div>
@@ -405,39 +403,39 @@ export function CreateActorPanel({
           {step === 1 && (
             <div className="flex flex-col gap-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
               {/* Summary card */}
-              <div className="rounded-[2.5rem] border border-white/5 bg-white/5 p-10 glass-light relative overflow-hidden">
+              <div className="rounded-3xl border border-white/5 bg-white/5 p-10 glass-light relative overflow-hidden">
                 <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent pointer-events-none" />
-                <p className="text-[10px] font-black text-muted-foreground/20 uppercase tracking-[0.4em] mb-8 relative z-10">
+                <p className="text-xs font-semibold text-muted-foreground/50 mb-8 relative z-10">
                   Deployment Specification
                 </p>
                 <div className="flex flex-col gap-6 relative z-10">
                   <div className="flex items-center justify-between border-b border-white/5 pb-4">
-                    <span className="text-[11px] font-bold text-muted-foreground/40 uppercase tracking-widest">
+                    <span className="text-xs font-bold text-muted-foreground/70">
                       Identifier
                     </span>
-                    <span className="text-sm text-white font-black font-outfit uppercase tracking-tight">
+                    <span className="text-sm text-white font-semibold font-outfit">
                       {name}
                     </span>
                   </div>
                   <div className="flex items-center justify-between border-b border-white/5 pb-4">
-                    <span className="text-[11px] font-bold text-muted-foreground/40 uppercase tracking-widest">
-                      Protocol Persona
+                    <span className="text-xs font-bold text-muted-foreground/70">
+                      Persona
                     </span>
-                    <span className="text-sm text-white font-black font-outfit uppercase tracking-tight">
+                    <span className="text-sm text-white font-semibold font-outfit tracking-tight">
                       {selectedTemplate?.name ?? "Custom"}
                     </span>
                   </div>
                   <div className="flex items-center justify-between border-b border-white/5 pb-4">
-                    <span className="text-[11px] font-bold text-muted-foreground/40 uppercase tracking-widest">
+                    <span className="text-xs font-bold text-muted-foreground/70">
                       Capability Ceiling
                     </span>
                     <CapabilityBadge world={capWorld} size="md" />
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-[11px] font-bold text-muted-foreground/40 uppercase tracking-widest">
+                    <span className="text-xs font-bold text-muted-foreground/70">
                       Throughput Limit
                     </span>
-                    <span className="text-sm text-primary font-black font-outfit uppercase tracking-tight">
+                    <span className="text-sm text-primary font-semibold font-outfit tracking-tight">
                       {selectedBudgetPreset.rateLimit != null
                         ? `${selectedBudgetPreset.rateLimit} cycles / min`
                         : "Unrestricted"}
@@ -449,15 +447,15 @@ export function CreateActorPanel({
               {/* Advanced settings */}
               <button
                 onClick={() => setShowAdvanced((v) => !v)}
-                className="flex items-center gap-4 px-6 py-4 bg-white/5 border border-white/5 rounded-2xl text-[10px] font-black text-muted-foreground/40 uppercase tracking-[0.3em] hover:text-white hover:bg-white/10 hover:border-white/20 transition-premium active:scale-95 group shadow-xl"
+                className="flex items-center gap-4 px-6 py-4 bg-white/5 border border-white/5 rounded-2xl text-sm font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/10 hover:border-white/20 transition-premium active:scale-95 group shadow-xl"
               >
                 <ChevronRight
                   className={cn(
-                    "w-4 h-4 transition-transform text-primary/40 group-hover:text-primary",
+                    "w-4 h-4 transition-transform text-primary/70 group-hover:text-primary",
                     showAdvanced && "rotate-90",
                   )}
                 />
-                Toggle Advanced Governance Controls
+                Advanced limits
               </button>
 
               {showAdvanced && (
@@ -465,12 +463,11 @@ export function CreateActorPanel({
                   {/* Capability ceiling */}
                   <div className="space-y-6">
                     <div>
-                      <p className="text-[10px] font-black text-white/60 uppercase tracking-[0.3em] mb-2">
+                      <p className="text-xs font-semibold text-white/60 mb-2">
                         Capability Architecture
                       </p>
-                      <p className="text-[11px] text-muted-foreground/30 font-bold leading-relaxed uppercase tracking-widest">
-                        Specify the maximum permission ceiling for autonomous
-                        orchestration.
+                      <p className="text-xs text-muted-foreground/60 leading-relaxed">
+                        The most this actor's modules are allowed to do.
                       </p>
                     </div>
                     <div className="flex flex-col gap-3">
@@ -486,11 +483,11 @@ export function CreateActorPanel({
                             }
                             disabled={isAboveCeiling}
                             className={cn(
-                              "w-full text-left rounded-[1.25rem] border p-5 transition-premium relative overflow-hidden group shadow-sm",
+                              "w-full text-left rounded-2xl border p-5 transition-premium relative overflow-hidden group shadow-sm",
                               isAboveCeiling
                                 ? "opacity-20 cursor-not-allowed border-white/5 bg-transparent"
                                 : isSelected
-                                  ? "border-primary/40 bg-primary/10 shadow-[0_0_20px_hsla(var(--primary),0.05)]"
+                                  ? "border-primary/40 bg-primary/10"
                                   : "border-white/5 bg-white/2 hover:border-white/20 hover:bg-white/5",
                             )}
                           >
@@ -499,7 +496,7 @@ export function CreateActorPanel({
                                 className={cn(
                                   "w-5 h-5 rounded-full border-2 shrink-0 flex items-center justify-center transition-premium",
                                   isSelected
-                                    ? "border-primary bg-primary shadow-[0_0_10px_hsla(var(--primary),0.5)]"
+                                    ? "border-primary bg-primary"
                                     : "border-white/10",
                                 )}
                               >
@@ -509,15 +506,15 @@ export function CreateActorPanel({
                               </div>
                               <span
                                 className={cn(
-                                  "text-xs font-black uppercase tracking-widest transition-colors",
+                                  "text-xs font-semibold transition-colors",
                                   isSelected
                                     ? "text-white"
-                                    : "text-muted-foreground/40 group-hover:text-muted-foreground/60",
+                                    : "text-muted-foreground/70 group-hover:text-muted-foreground/60",
                                 )}
                               >
                                 {cfg.label}
                               </span>
-                              <span className="text-[10px] text-muted-foreground/20 font-mono ml-auto uppercase tracking-tighter">
+                              <span className="text-xs text-muted-foreground/50 font-mono ml-auto tracking-tighter">
                                 {world}
                               </span>
                             </div>
@@ -530,12 +527,11 @@ export function CreateActorPanel({
                   {/* Budget */}
                   <div className="space-y-6">
                     <div>
-                      <p className="text-[10px] font-black text-white/60 uppercase tracking-[0.3em] mb-2">
+                      <p className="text-xs font-semibold text-white/60 mb-2">
                         Throughput Throttle
                       </p>
-                      <p className="text-[11px] text-muted-foreground/30 font-bold leading-relaxed uppercase tracking-widest">
-                        Enforce execution ceilings to prevent protocol cascade
-                        failure.
+                      <p className="text-xs text-muted-foreground/60 leading-relaxed">
+                        Caps on runs and spend so a runaway workflow stops.
                       </p>
                     </div>
                     <div className="grid grid-cols-1 gap-3">
@@ -546,9 +542,9 @@ export function CreateActorPanel({
                             key={preset.id}
                             onClick={() => setBudgetId(preset.id)}
                             className={cn(
-                              "w-full text-left rounded-[1.25rem] border p-5 transition-premium relative overflow-hidden group shadow-sm",
+                              "w-full text-left rounded-2xl border p-5 transition-premium relative overflow-hidden group shadow-sm",
                               isSelected
-                                ? "border-primary/40 bg-primary/10 shadow-[0_0_20px_hsla(var(--primary),0.05)]"
+                                ? "border-primary/40 bg-primary/10"
                                 : "border-white/5 bg-white/2 hover:border-white/20 hover:bg-white/5",
                             )}
                           >
@@ -557,7 +553,7 @@ export function CreateActorPanel({
                                 className={cn(
                                   "w-5 h-5 rounded-full border-2 shrink-0 flex items-center justify-center transition-premium",
                                   isSelected
-                                    ? "border-primary bg-primary shadow-[0_0_10px_hsla(var(--primary),0.5)]"
+                                    ? "border-primary bg-primary"
                                     : "border-white/10",
                                 )}
                               >
@@ -568,20 +564,20 @@ export function CreateActorPanel({
                               <div className="flex flex-col">
                                 <span
                                   className={cn(
-                                    "text-xs font-black uppercase tracking-widest transition-colors",
+                                    "text-xs font-semibold transition-colors",
                                     isSelected
                                       ? "text-white"
-                                      : "text-muted-foreground/40 group-hover:text-muted-foreground/60",
+                                      : "text-muted-foreground/70 group-hover:text-muted-foreground/60",
                                   )}
                                 >
                                   {preset.label}
                                 </span>
-                                <span className="text-[9px] text-muted-foreground/20 font-bold uppercase tracking-widest mt-1">
+                                <span className="text-2xs text-muted-foreground/50 font-bold uppercase tracking-wider mt-1">
                                   {preset.summary}
                                 </span>
                               </div>
                               {preset.recommended && (
-                                <span className="text-[8px] font-black px-2 py-1 rounded bg-primary/20 text-primary uppercase tracking-[0.2em] ml-auto border border-primary/20">
+                                <span className="text-2xs font-semibold px-2 py-1 rounded bg-primary/20 text-primary uppercase tracking-wider ml-auto border border-primary/20">
                                   Optimal
                                 </span>
                               )}
@@ -602,7 +598,7 @@ export function CreateActorPanel({
           <button
             type="button"
             onClick={step === 0 ? handleClose : () => setStep(0)}
-            className="px-10 py-5 text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 bg-white/5 border border-white/5 rounded-2xl hover:text-white hover:bg-white/10 hover:border-white/20 transition-premium active:scale-95"
+            className="px-10 py-5 text-sm font-semibold text-muted-foreground/70 bg-white/5 border border-white/5 rounded-2xl hover:text-white hover:bg-white/10 hover:border-white/20 transition-premium active:scale-95"
           >
             {step === 0 ? "Abort" : "Previous Step"}
           </button>
@@ -612,24 +608,24 @@ export function CreateActorPanel({
               type="button"
               onClick={() => setStep(1)}
               disabled={!canAdvance}
-              className="flex items-center gap-4 px-10 py-5 text-[10px] font-black uppercase tracking-[0.2em] text-white bg-primary rounded-2xl transition-premium shadow-2xl hover:shadow-[0_15px_30px_-5px_hsla(var(--primary),0.4)] disabled:opacity-20 disabled:cursor-not-allowed hover:scale-105 active:scale-95 border border-white/20"
+              className="flex items-center gap-4 px-10 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-premium shadow-2xl disabled:opacity-20 disabled:cursor-not-allowed active:scale-95 border border-white/20"
             >
-              Verify Protocol <ChevronRight className="w-5 h-5" />
+              Next <ChevronRight className="w-5 h-5" />
             </button>
           ) : (
             <button
               type="button"
               onClick={handleCreate}
               disabled={isPending}
-              className="flex items-center gap-4 px-12 py-5 text-[10px] font-black uppercase tracking-[0.2em] text-white bg-primary rounded-2xl transition-premium shadow-2xl hover:shadow-[0_15px_30px_-5px_hsla(var(--primary),0.4)] disabled:opacity-50 disabled:cursor-not-allowed hover:scale-105 active:scale-95 border border-white/20"
+              className="flex items-center gap-4 px-12 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-premium shadow-2xl disabled:opacity-50 disabled:cursor-not-allowed active:scale-95 border border-white/20"
             >
               {isPending ? (
                 <>
                   <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
-                  Initializing...
+                  Creating…
                 </>
               ) : (
-                "Deploy Identity"
+                "Create actor"
               )}
             </button>
           )}

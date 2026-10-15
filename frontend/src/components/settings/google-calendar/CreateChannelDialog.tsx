@@ -240,13 +240,13 @@ export function CreateChannelDialog({
                     <span className="flex-1 truncate">
                       {c.summary}
                       {c.primary && (
-                        <span className="ml-2 text-[10px] font-bold text-primary">
+                        <span className="ml-2 text-xs font-bold text-primary">
                           PRIMARY
                         </span>
                       )}
                     </span>
                     {already && (
-                      <span className="text-[10px] text-muted-foreground italic">
+                      <span className="text-xs text-muted-foreground italic">
                         already watched
                       </span>
                     )}

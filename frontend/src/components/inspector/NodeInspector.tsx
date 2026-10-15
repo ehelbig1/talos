@@ -52,22 +52,20 @@ import {
 
 const STATUS_DOT: Record<NodeStatusType, string> = {
   idle: "bg-muted-foreground/20",
-  running:
-    "bg-primary animate-status-pulse shadow-[0_0_10px_hsla(var(--primary),0.5)]",
-  success: "bg-success shadow-[0_0_10px_hsla(var(--success),0.5)]",
-  failed: "bg-destructive shadow-[0_0_10px_hsla(var(--destructive),0.5)]",
+  running: "bg-primary animate-status-pulse",
+  success: "bg-success",
+  failed: "bg-destructive",
   skipped: "bg-muted-foreground/50",
-  awaiting_approval:
-    "bg-warning animate-pulse shadow-[0_0_10px_hsla(var(--warning),0.5)]",
+  awaiting_approval: "bg-warning animate-pulse",
 };
 
 const STATUS_LABEL: Record<NodeStatusType, string> = {
-  idle: "STATUS_IDLE",
-  running: "EXECUTING_LOGIC",
-  success: "SEQUENCE_COMPLETE",
-  failed: "EXECUTION_FAILURE",
-  skipped: "SKIPPED",
-  awaiting_approval: "PENDING_AUTHORIZATION",
+  idle: "Idle",
+  running: "Running",
+  success: "Succeeded",
+  failed: "Failed",
+  skipped: "Skipped",
+  awaiting_approval: "Awaiting approval",
 };
 
 interface NodeInspectorProps {
@@ -163,19 +161,19 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
       {/* Header */}
       <div className="flex items-center justify-between px-8 py-6 border-b border-white/5 bg-white/[0.02] relative z-10">
         <div className="flex items-center gap-5">
-          <div className="w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center shadow-[0_0_20px_hsla(var(--primary),0.15)] relative group overflow-hidden">
+          <div className="w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center relative group overflow-hidden">
             <div className="absolute inset-0 bg-primary/20 opacity-0 group-hover:opacity-100 transition-premium blur-xl" />
             <Puzzle className="w-6 h-6 text-primary relative z-10" />
           </div>
           <div>
-            <h3 className="text-lg font-black text-white tracking-tight font-outfit uppercase">
+            <h3 className="text-lg font-semibold text-white font-outfit">
               {node.data.label as string}
             </h3>
             <div className="flex items-center gap-2 mt-1">
               <div
                 className={cn("w-1.5 h-1.5 rounded-full", STATUS_DOT[status])}
               />
-              <p className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-[0.2em]">
+              <p className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
                 {STATUS_LABEL[status]}
               </p>
             </div>
@@ -184,7 +182,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
         <button
           type="button"
           onClick={onClose}
-          className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/40 hover:text-white hover:bg-white/10 transition-premium active:scale-95 shadow-xl"
+          className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-premium active:scale-95 shadow-xl"
         >
           <X className="h-5 w-5" />
         </button>
@@ -202,14 +200,14 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
           <TabsList className="w-full justify-start rounded-2xl border border-white/5 bg-black/20 p-1.5 gap-1 shrink-0 h-auto">
             <TabsTrigger
               value="config"
-              className="flex-1 text-[10px] font-black uppercase tracking-[0.2em] data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/40 rounded-xl py-3 px-5 transition-premium"
+              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-premium"
             >
               <Settings className="w-3.5 h-3.5 mr-2 opacity-40" />
               Configuration
             </TabsTrigger>
             <TabsTrigger
               value="logs"
-              className="flex-1 text-[10px] font-black uppercase tracking-[0.2em] data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/40 rounded-xl py-3 px-5 transition-premium"
+              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-premium"
             >
               <Activity className="w-3.5 h-3.5 mr-2 opacity-40" />
               Diagnostics
@@ -232,10 +230,10 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
 
           <div className="space-y-8 animate-in fade-in slide-in-from-bottom-2 duration-500">
             <div className="space-y-4">
-              <label className="text-[10px] font-black text-muted-foreground/30 uppercase tracking-[0.3em] ml-1">
+              <label className="text-xs font-semibold text-muted-foreground/60 ml-1">
                 Node Parameters
               </label>
-              <div className="bg-surface-3/40 border border-white/5 rounded-[2rem] p-6 glass-dark shadow-2xl">
+              <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 glass-dark shadow-2xl">
                 {isSmartClassifierModule(
                   node.data.moduleName,
                   node.data.configSchema,
@@ -274,9 +272,9 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
               <Collapsible
                 open={advancedOpen}
                 onOpenChange={setAdvancedOpen}
-                className="border border-white/5 rounded-[2rem] bg-white/[0.02] overflow-hidden transition-premium hover:bg-white/[0.03]"
+                className="border border-white/5 rounded-2xl bg-white/[0.02] overflow-hidden transition-premium hover:bg-white/[0.03]"
               >
-                <CollapsibleTrigger className="flex items-center gap-4 w-full px-8 py-5 text-[10px] font-black text-muted-foreground/60 uppercase tracking-[0.3em] hover:text-white transition-premium group">
+                <CollapsibleTrigger className="flex items-center gap-4 w-full px-8 py-5 text-sm font-semibold text-muted-foreground/60 hover:text-white transition-premium group">
                   <Zap className="w-4 h-4 text-primary opacity-40 group-hover:opacity-100 transition-premium" />
                   <span>Execution Controls</span>
                   <div className="flex-1 h-px bg-white/5" />
@@ -292,7 +290,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                     <FormField label="Conditional Skip (Rhai Script)">
                       <Textarea
                         placeholder="ctx.input.score < 0.5"
-                        className="bg-black/40 border-white/5 focus:border-primary/40 focus:ring-primary/10 font-mono text-[11px] min-h-[100px] rounded-2xl selection:bg-primary/30 leading-relaxed p-4"
+                        className="bg-black/40 border-white/5 focus:border-primary/40 focus:ring-primary/10 font-mono text-xs min-h-[100px] rounded-2xl selection:bg-primary/30 leading-relaxed p-4"
                         value={node.data.skipCondition ?? ""}
                         onChange={(e) =>
                           updateNodeData(node.id, {
@@ -304,11 +302,11 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
 
                     <div className="flex items-center justify-between p-6 rounded-2xl bg-black/40 border border-white/5 shadow-xl">
                       <div className="space-y-1">
-                        <label className="text-[10px] font-black text-white uppercase tracking-widest">
-                          Fault Immunity
+                        <label className="text-xs font-semibold text-white">
+                          Continue on error
                         </label>
-                        <p className="text-[9px] text-muted-foreground/40 font-bold uppercase tracking-tight">
-                          Continue sequence despite operational failure
+                        <p className="text-2xs text-muted-foreground/70 font-bold uppercase tracking-tight">
+                          Keep running the workflow if this node fails
                         </p>
                       </div>
                       <div
@@ -351,7 +349,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                   </div>
 
                   <div className="space-y-6 pt-8 border-t border-white/5">
-                    <p className="text-[9px] font-black text-muted-foreground/20 uppercase tracking-[0.2em] ml-1">
+                    <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider ml-1">
                       Self-Healing Policy
                     </p>
                     <RetryPolicySection
@@ -369,11 +367,11 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
               <Collapsible
                 open={internalsOpen}
                 onOpenChange={setInternalsOpen}
-                className="border border-white/5 rounded-[2rem] bg-white/[0.01] overflow-hidden transition-premium hover:bg-white/[0.02]"
+                className="border border-white/5 rounded-2xl bg-white/[0.01] overflow-hidden transition-premium hover:bg-white/[0.02]"
               >
-                <CollapsibleTrigger className="flex items-center gap-4 w-full px-8 py-5 text-[10px] font-black text-muted-foreground/40 uppercase tracking-[0.3em] hover:text-white transition-premium group">
-                  <Activity className="w-4 h-4 text-muted-foreground/20 group-hover:text-primary transition-premium" />
-                  <span>Core Metadata</span>
+                <CollapsibleTrigger className="flex items-center gap-4 w-full px-8 py-5 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium group">
+                  <Activity className="w-4 h-4 text-muted-foreground/50 group-hover:text-primary transition-premium" />
+                  <span>Details</span>
                   <div className="flex-1 h-px bg-white/5" />
                   <ChevronDown
                     className={cn(
@@ -404,7 +402,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
         >
           <div className="space-y-10 animate-in fade-in slide-in-from-bottom-2 duration-500">
             {/* Status Panel */}
-            <div className="p-6 rounded-[2rem] bg-surface-3/40 border border-white/5 shadow-2xl glass-dark relative overflow-hidden group">
+            <div className="p-6 rounded-2xl bg-surface-3/40 border border-white/5 shadow-2xl glass-dark relative overflow-hidden group">
               <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
               <div className="flex items-center justify-between relative z-10">
                 <div className="flex items-center gap-5">
@@ -421,13 +419,13 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                       )}
                     />
                   </div>
-                  <span className="text-sm font-black text-white tracking-[0.2em] uppercase font-outfit">
+                  <span className="text-sm font-semibold text-white font-outfit">
                     {STATUS_LABEL[status]}
                   </span>
                 </div>
                 <div className="flex flex-col items-end gap-1">
-                  <span className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest">
-                    REAL_TIME_TELEMETRY
+                  <span className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                    Live status
                   </span>
                   <div className="flex gap-1">
                     {[...Array(5)].map((_, i) => (
@@ -443,15 +441,13 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
             </div>
 
             {nodeStatus?.error && (
-              <div className="p-8 rounded-[2rem] bg-destructive/5 border border-destructive/10 space-y-5 shadow-2xl relative overflow-hidden group">
+              <div className="p-8 rounded-2xl bg-destructive/5 border border-destructive/10 space-y-5 shadow-2xl relative overflow-hidden group">
                 <div className="absolute inset-0 bg-gradient-to-br from-destructive/10 via-transparent to-transparent opacity-50" />
                 <div className="flex items-center gap-4 text-destructive relative z-10">
                   <div className="w-10 h-10 rounded-2xl bg-destructive/10 border border-destructive/20 flex items-center justify-center">
                     <AlertCircle className="w-5 h-5" />
                   </div>
-                  <span className="text-[11px] font-black uppercase tracking-[0.3em]">
-                    CRITICAL_FAULT_DETECTED
-                  </span>
+                  <span className="text-xs font-semibold">Node failed</span>
                 </div>
                 <div className="bg-black/40 p-6 rounded-2xl border border-destructive/10 relative z-10">
                   <p className="text-[12px] text-destructive/90 leading-relaxed font-mono selection:bg-destructive/30 break-all">
@@ -462,10 +458,10 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                   <div className="p-5 bg-warning/5 border border-warning/10 rounded-2xl text-warning relative z-10 flex gap-4 shadow-xl">
                     <Zap className="w-5 h-5 shrink-0 text-warning animate-pulse" />
                     <div className="space-y-1">
-                      <span className="text-[9px] font-black uppercase tracking-widest opacity-40 block">
-                        HEAL_DIRECTIVE
+                      <span className="text-2xs font-semibold uppercase tracking-wider opacity-40 block">
+                        Suggested fix
                       </span>
-                      <p className="text-[11px] font-black uppercase tracking-tight leading-relaxed italic">
+                      <p className="text-xs tracking-tight leading-relaxed italic">
                         {fixSuggestion}
                       </p>
                     </div>
@@ -481,7 +477,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                     <div className="w-8 h-8 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
                       <FileText size={16} />
                     </div>
-                    <label className="text-[10px] font-black text-white uppercase tracking-[0.3em]">
+                    <label className="text-xs font-semibold text-white">
                       Result Payload
                     </label>
                   </div>
@@ -497,15 +493,15 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                         // Clipboard API unavailable
                       }
                     }}
-                    className="w-10 h-10 flex items-center justify-center hover:bg-white/10 rounded-xl border border-white/5 text-muted-foreground/40 hover:text-white transition-premium shadow-xl"
+                    className="w-10 h-10 flex items-center justify-center hover:bg-white/10 rounded-xl border border-white/5 text-muted-foreground/70 hover:text-white transition-premium shadow-xl"
                     title="Copy Payload"
                   >
                     <Copy className="w-4 h-4" />
                   </button>
                 </div>
-                <div className="p-6 bg-black/40 border border-white/5 rounded-[2rem] shadow-inner relative overflow-hidden group">
+                <div className="p-6 bg-black/40 border border-white/5 rounded-2xl shadow-inner relative overflow-hidden group">
                   <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-20 pointer-events-none" />
-                  <pre className="text-[11px] text-foreground/70 font-mono overflow-auto max-h-[400px] selection:bg-primary/30 relative z-10 leading-relaxed custom-scrollbar p-2">
+                  <pre className="text-xs text-foreground/70 font-mono overflow-auto max-h-[400px] selection:bg-primary/30 relative z-10 leading-relaxed custom-scrollbar p-2">
                     {JSON.stringify(nodeResult, null, 2)}
                   </pre>
                   {/* Subtle scanline effect */}
@@ -517,22 +513,22 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
             {nodeEvents.length > 0 && (
               <div className="space-y-5">
                 <div className="flex items-center gap-4 px-2">
-                  <div className="w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-muted-foreground/40">
+                  <div className="w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-muted-foreground/70">
                     <Clock size={16} />
                   </div>
-                  <label className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-[0.3em]">
-                    Protocol Timeline
+                  <label className="text-xs font-semibold text-muted-foreground/70">
+                    Timeline
                   </label>
                 </div>
-                <div className="space-y-4 bg-white/[0.01] p-6 rounded-[2rem] border border-white/5 shadow-2xl relative overflow-hidden">
+                <div className="space-y-4 bg-white/[0.01] p-6 rounded-2xl border border-white/5 shadow-2xl relative overflow-hidden">
                   <div className="absolute inset-0 bg-gradient-to-tr from-white/[0.01] to-transparent opacity-50 pointer-events-none" />
                   {nodeEvents.map((ev: TimedEvent, idx: number) => (
                     <div
                       key={`${ev.nodeId ?? "global"}-${ev.elapsedMs}-${idx}`}
-                      className="flex gap-6 text-[10px] pb-5 border-b border-white/[0.03] last:border-0 last:pb-0 relative z-10 group"
+                      className="flex gap-6 text-xs pb-5 border-b border-white/[0.03] last:border-0 last:pb-0 relative z-10 group"
                     >
                       <div className="flex flex-col items-center gap-2 shrink-0">
-                        <span className="text-muted-foreground/20 font-black w-14 tabular-nums text-right group-hover:text-primary/40 transition-premium">
+                        <span className="text-muted-foreground/50 font-semibold w-14 tabular-nums text-right group-hover:text-primary/70 transition-premium">
                           +{(ev.elapsedMs / 1000).toFixed(2)}s
                         </span>
                       </div>
@@ -543,7 +539,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                           )}
                           <span
                             className={cn(
-                              "block font-black uppercase tracking-widest text-[11px]",
+                              "block font-semibold text-xs",
                               ev.status === "FAILED"
                                 ? "text-destructive"
                                 : ev.status === "WAITING"
@@ -555,8 +551,8 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                           </span>
                         </div>
                         {ev.retryAttempt != null && ev.retryAttempt > 0 && (
-                          <span className="inline-block text-[8px] px-3 py-1 rounded-full bg-warning/5 text-warning border border-warning/10 uppercase font-black tracking-[0.2em] shadow-lg">
-                            RECOVERY_ATTEMPT_{ev.retryAttempt}
+                          <span className="inline-block text-2xs px-3 py-1 rounded-full bg-warning/5 text-warning border border-warning/10 uppercase font-semibold tracking-wider shadow-lg">
+                            Retry {ev.retryAttempt}
                           </span>
                         )}
                       </div>
@@ -571,7 +567,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                 <div className="w-8 h-8 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
                   <Activity size={16} />
                 </div>
-                <label className="text-[10px] font-black text-white uppercase tracking-[0.3em]">
+                <label className="text-xs font-semibold text-white">
                   Historical Metrics
                 </label>
               </div>

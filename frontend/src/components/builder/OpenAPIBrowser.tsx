@@ -78,10 +78,10 @@ export function OpenAPIBrowser({
           onClick={discoverAPI}
           disabled={loading || !baseUrl}
           className={cn(
-            "h-10 px-6 text-[10px] font-black uppercase tracking-widest rounded-xl transition-premium active:scale-95",
+            "h-10 px-6 text-sm font-semibold rounded-xl transition-premium active:scale-95",
             baseUrl
-              ? "bg-primary hover:bg-primary/90 text-white shadow-lg shadow-primary/20"
-              : "bg-surface-3 text-muted-foreground/40 grayscale",
+              ? "bg-primary hover:bg-primary/90 text-white shadow-lg"
+              : "bg-surface-3 text-muted-foreground/70 grayscale",
           )}
         >
           {loading ? (
@@ -99,9 +99,7 @@ export function OpenAPIBrowser({
         {error && (
           <div className="p-3 bg-destructive/5 border border-destructive/20 rounded-xl flex items-center gap-2 text-destructive animate-in shake duration-500">
             <X className="h-3.5 w-3.5" />
-            <p className="m-0 text-[9px] font-black uppercase tracking-widest leading-none">
-              {error}
-            </p>
+            <p className="m-0 text-2xs font-semibold leading-none">{error}</p>
           </div>
         )}
       </div>
@@ -121,7 +119,7 @@ export function OpenAPIBrowser({
   }
 
   return (
-    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-[2.5rem] space-y-8 shadow-2xl animate-in zoom-in-95 duration-500">
+    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-3xl space-y-8 shadow-2xl animate-in zoom-in-95 duration-500">
       <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50 pointer-events-none" />
 
       <div className="flex items-center justify-between relative z-10">
@@ -130,37 +128,38 @@ export function OpenAPIBrowser({
             <Globe className="h-5 w-5 text-primary" />
           </div>
           <div>
-            <h4 className="text-[11px] font-black text-white uppercase tracking-[0.2em]">
+            <h4 className="text-xs font-semibold text-white">
               API Schema Deciphered
             </h4>
-            <p className="text-[9px] font-black text-muted-foreground/20 uppercase tracking-widest">
-              Detected {endpoints.length} Endpoint Vectors
+            <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
+              Found {endpoints.length} endpoint
+              {endpoints.length !== 1 ? "s" : ""}
             </p>
           </div>
         </div>
         <button
           type="button"
           onClick={() => setShowBrowser(false)}
-          className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/20 hover:text-white transition-premium"
+          className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-premium"
         >
           <X className="h-4 w-4" />
         </button>
       </div>
 
-      <div className="flex flex-col items-center justify-center py-10 px-6 bg-surface-4 rounded-[2rem] border-2 border-dashed border-white/5">
-        <Activity className="w-12 h-12 text-muted-foreground/10 mb-4" />
-        <p className="text-[10px] font-black text-muted-foreground/20 uppercase tracking-[0.3em]">
-          Zero Compatible Vectors Isolated
+      <div className="flex flex-col items-center justify-center py-10 px-6 bg-surface-4 rounded-2xl border-2 border-dashed border-white/5">
+        <Activity className="w-12 h-12 text-muted-foreground/30 mb-4" />
+        <p className="text-xs font-semibold text-muted-foreground/50">
+          No endpoints found
         </p>
       </div>
 
-      <div className="p-6 bg-primary/5 border border-primary/10 rounded-[2rem] flex items-start gap-4">
+      <div className="p-6 bg-primary/5 border border-primary/10 rounded-2xl flex items-start gap-4">
         <div className="shrink-0 p-2 rounded-xl bg-primary/10 border border-primary/20">
           <Zap className="w-4 h-4 text-primary" />
         </div>
-        <p className="text-[10px] text-primary/60 font-bold uppercase tracking-widest leading-relaxed">
-          Deployment Insight: Ensure the endpoint provides a valid
-          OpenAPI/Swagger JSON/YAML manifest for automated vector isolation.
+        <p className="text-xs text-primary/60 leading-relaxed">
+          The URL must serve a valid OpenAPI/Swagger document (JSON or YAML) so
+          endpoints can be read from it.
         </p>
       </div>
     </div>

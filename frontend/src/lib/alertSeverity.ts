@@ -16,9 +16,9 @@ export const SEVERITY_STYLE: Record<string, string> = {
   medium: "text-warning/80 bg-warning/5 border-warning/10",
   low: "text-muted-foreground/60 bg-white/5 border-white/10",
   info: "text-muted-foreground/50 bg-white/5 border-white/10",
-  noise: "text-muted-foreground/30 bg-white/[0.02] border-white/5",
+  noise: "text-muted-foreground/60 bg-white/[0.02] border-white/5",
   unclassified:
-    "text-muted-foreground/40 bg-transparent border-dashed border-white/10",
+    "text-muted-foreground/70 bg-transparent border-dashed border-white/10",
 };
 
 // The six human-assignable severities. `unclassified` is a valid severity

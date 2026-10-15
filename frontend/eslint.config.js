@@ -123,6 +123,32 @@ export default [
             ],
         },
     },
+    // Type scale and contrast floor (2026-10-15). The retired tokens made
+    // every label a 9 px, black-weight, letter-spaced caption at 30 %
+    // opacity; the floor is text-2xs (11 px), font-semibold, tracking-wider,
+    // and text-muted-foreground at /60 or more. Fix the primitive in
+    // src/components/ui before reaching for a one-off.
+    {
+        files: ["src/**/*.tsx"],
+        ignores: ["**/*.test.tsx", "**/__tests__/**"],
+        rules: {
+            "no-restricted-syntax": [
+                "error",
+                {
+                    selector:
+                        "Literal[value=/(^|\\s)(font-black|text-\\[(9|10)px\\]|tracking-\\[0\\.[2-4]em\\]|tracking-widest|text-muted-foreground\\/(10|20|40))(\\s|$)/]",
+                    message:
+                        "Retired type token. Floor: text-2xs, font-semibold, tracking-wider, text-muted-foreground/60. See src/components/ui.",
+                },
+                {
+                    selector:
+                        "TemplateElement[value.raw=/(^|\\s)(font-black|text-\\[(9|10)px\\]|tracking-\\[0\\.[2-4]em\\]|tracking-widest|text-muted-foreground\\/(10|20|40))(\\s|$)/]",
+                    message:
+                        "Retired type token. Floor: text-2xs, font-semibold, tracking-wider, text-muted-foreground/60. See src/components/ui.",
+                },
+            ],
+        },
+    },
     // Test files: allow `any`. Test doubles, mock fetch signatures, and
     // fixture payloads are deliberately loosely typed — enforcing precise
     // types on mocks adds churn without protecting production code. The rule

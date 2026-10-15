@@ -147,14 +147,14 @@ export function CreateSecretDialog({
               type="button"
               variant="ghost"
               onClick={onClose}
-              className="text-muted-foreground hover:text-foreground hover:bg-accent font-black uppercase tracking-widest text-[10px] h-11 px-6 rounded-xl transition-premium"
+              className="text-muted-foreground hover:text-foreground hover:bg-accent font-semibold text-sm h-11 px-6 rounded-xl transition-premium"
             >
               Cancel
             </Button>
             <Button
               type="submit"
               disabled={!name || !keyPath || !value || createMutation.isPending}
-              className="bg-primary hover:bg-primary/90 text-primary-foreground shadow-xl shadow-primary/20 px-8 h-11 border-b-4 border-primary/50 active:scale-95 transition-premium font-black uppercase tracking-widest text-[10px] rounded-xl"
+              className="bg-primary hover:bg-primary/90 text-primary-foreground shadow-xl px-8 h-11 border-b-4 border-primary/50 active:scale-95 transition-premium font-semibold text-sm rounded-xl"
             >
               {createMutation.isPending ? (
                 <div className="flex items-center gap-2">

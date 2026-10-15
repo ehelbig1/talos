@@ -172,15 +172,15 @@ export function ModuleBuilder({
   if (!open) return null;
 
   return (
-    <Dialog open={true} onClose={onClose} title="Strategic Module Architect">
+    <Dialog open={true} onClose={onClose} title="Module builder">
       <div className="space-y-8">
         {!selectedTemplateId ? (
           <div className="animate-in fade-in slide-in-from-bottom-4 duration-700">
             <Suspense
               fallback={
-                <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/20">
+                <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
                   <Loader2 className="w-10 h-10 animate-spin text-primary" />
-                  <p className="text-[10px] font-black uppercase tracking-[0.3em]">
+                  <p className="text-xs font-semibold">
                     Initializing Library...
                   </p>
                 </div>
@@ -194,21 +194,19 @@ export function ModuleBuilder({
             </Suspense>
           </div>
         ) : templateLoading ? (
-          <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/20">
+          <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
             <Loader2 className="w-10 h-10 animate-spin text-primary" />
-            <p className="text-[10px] font-black uppercase tracking-[0.3em]">
-              Synthesizing Template...
-            </p>
+            <p className="text-xs font-semibold">Loading template…</p>
           </div>
         ) : templateError ? (
-          <div className="p-8 bg-destructive/10 border border-destructive/20 rounded-[2.5rem] text-destructive animate-in shake duration-500 shadow-2xl glass-dark">
+          <div className="p-8 bg-destructive/10 border border-destructive/20 rounded-3xl text-destructive animate-in shake duration-500 shadow-2xl glass-dark">
             <div className="flex items-start gap-4">
               <Shield className="w-6 h-6 shrink-0" />
               <div className="space-y-1">
-                <p className="text-sm font-black uppercase tracking-tight font-outfit">
+                <p className="text-sm font-semibold tracking-tight font-outfit">
                   Template Corruption Detected
                 </p>
-                <p className="text-[11px] font-bold opacity-60 leading-relaxed">
+                <p className="text-xs font-bold opacity-60 leading-relaxed">
                   {sanitizeErrorMessage((templateError as Error).message)}
                 </p>
               </div>
@@ -217,7 +215,7 @@ export function ModuleBuilder({
               type="button"
               variant="outline"
               onClick={() => setSelectedTemplateId(null)}
-              className="mt-8 w-full h-12 border-destructive/20 text-destructive hover:bg-destructive/10 rounded-2xl font-black uppercase tracking-widest text-[10px] transition-premium active:scale-95"
+              className="mt-8 w-full h-12 border-destructive/20 text-destructive hover:bg-destructive/10 rounded-2xl font-semibold text-sm transition-premium active:scale-95"
             >
               <ArrowLeft className="h-3.5 w-3.5 mr-2" /> Return to Library
             </Button>
@@ -240,10 +238,10 @@ export function ModuleBuilder({
                 className="shrink-0 h-12 w-12 rounded-2xl bg-surface-2/60 border border-white/5 hover:bg-surface-3 transition-premium active:scale-90 relative z-10"
                 aria-label="Back to Templates"
               >
-                <ArrowLeft className="h-4 w-4 text-muted-foreground/40" />
+                <ArrowLeft className="h-4 w-4 text-muted-foreground/70" />
               </Button>
               <div className="flex items-center gap-4 relative z-10">
-                <div className="flex items-center justify-center w-16 h-16 bg-surface-3/60 border border-white/10 rounded-[1.5rem] shadow-2xl relative">
+                <div className="flex items-center justify-center w-16 h-16 bg-surface-3/60 border border-white/10 rounded-2xl shadow-2xl relative">
                   <div className="absolute -inset-2 bg-primary/10 rounded-full blur-xl opacity-50" />
                   {selectedTemplate.icon ? (
                     <span className="text-4xl filter drop-shadow-[0_0_8px_rgba(0,0,0,0.5)] relative z-10">
@@ -254,10 +252,10 @@ export function ModuleBuilder({
                   )}
                 </div>
                 <div className="flex flex-col">
-                  <h3 className="font-black text-white text-2xl tracking-tight font-outfit uppercase leading-none mb-1.5">
+                  <h3 className="font-semibold text-white text-2xl font-outfit leading-none mb-1.5">
                     {selectedTemplate.name}
                   </h3>
-                  <span className="text-[10px] font-black uppercase tracking-[0.3em] text-primary/60">
+                  <span className="text-xs font-semibold text-primary/60">
                     {selectedTemplate.category} ARCHITECTURE
                   </span>
                 </div>
@@ -269,8 +267,8 @@ export function ModuleBuilder({
               <div className="space-y-4">
                 <div className="flex items-center gap-3 px-1">
                   <Bot className="w-4 h-4 text-primary" />
-                  <label className="text-[10px] font-black text-white uppercase tracking-[0.2em]">
-                    Tactical Name
+                  <label className="text-xs font-semibold text-white">
+                    Module name
                   </label>
                 </div>
                 <div className="relative group">
@@ -279,8 +277,8 @@ export function ModuleBuilder({
                     type="text"
                     value={moduleName}
                     onChange={(e) => setModuleName(e.target.value)}
-                    placeholder="E.G. DATA_EXTRACTION_UNIT"
-                    className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-xs font-black uppercase tracking-widest rounded-2xl relative z-10 shadow-inner"
+                    placeholder="e.g. data-extractor"
+                    className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10 shadow-inner"
                   />
                 </div>
               </div>
@@ -298,11 +296,11 @@ export function ModuleBuilder({
                 )}
 
               {selectedTemplate.configSchema && (
-                <div className="bg-surface-2/40 border border-white/5 rounded-[2.5rem] p-10 space-y-6 shadow-2xl relative overflow-hidden glass-dark">
+                <div className="bg-surface-2/40 border border-white/5 rounded-3xl p-10 space-y-6 shadow-2xl relative overflow-hidden glass-dark">
                   <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50 pointer-events-none" />
                   <div className="flex items-center gap-3 relative z-10 mb-6">
                     <Database className="w-4 h-4 text-primary" />
-                    <h3 className="text-[10px] font-black text-white uppercase tracking-[0.2em]">
+                    <h3 className="text-xs font-semibold text-white">
                       Configuration Schema
                     </h3>
                   </div>
@@ -322,23 +320,23 @@ export function ModuleBuilder({
 
               {isWebhookTemplate && (
                 <div className="relative group/webhook">
-                  <div className="absolute -inset-0.5 bg-indigo-500/10 rounded-[2.5rem] blur opacity-50 pointer-events-none" />
-                  <div className="relative p-10 bg-surface-2/40 border border-white/5 rounded-[2.5rem] space-y-10 shadow-2xl glass-dark">
+                  <div className="absolute -inset-0.5 bg-indigo-500/10 rounded-3xl blur opacity-50 pointer-events-none" />
+                  <div className="relative p-10 bg-surface-2/40 border border-white/5 rounded-3xl space-y-10 shadow-2xl glass-dark">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-3">
                         <Webhook className="h-5 w-5 text-indigo-400" />
-                        <h3 className="text-[10px] font-black text-indigo-400 uppercase tracking-[0.3em]">
+                        <h3 className="text-xs font-semibold text-indigo-400">
                           Webhook Orchestration
                         </h3>
                       </div>
-                      <Badge className="bg-indigo-500/10 text-indigo-400 border-indigo-500/20 text-[8px] font-black px-2 py-1 uppercase tracking-widest">
+                      <Badge className="bg-indigo-500/10 text-indigo-400 border-indigo-500/20 text-2xs font-semibold px-2 py-1 uppercase tracking-wider">
                         External Ingress
                       </Badge>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
                       <div className="space-y-4">
-                        <label className="block text-[10px] font-black text-white/40 uppercase tracking-widest ml-1">
+                        <label className="block text-xs font-semibold text-white/70 ml-1">
                           Rate Limit Threshold
                         </label>
                         <div className="relative">
@@ -354,20 +352,20 @@ export function ModuleBuilder({
                             }
                             min="1"
                             max="1000"
-                            className="h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-xs font-black uppercase tracking-widest rounded-2xl shadow-inner"
+                            className="h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-sm font-semibold rounded-2xl shadow-inner"
                           />
-                          <span className="absolute right-5 top-1/2 -translate-y-1/2 text-[9px] font-black text-muted-foreground/20 uppercase tracking-tighter">
+                          <span className="absolute right-5 top-1/2 -translate-y-1/2 text-2xs font-semibold text-muted-foreground/50 uppercase tracking-tighter">
                             RPM
                           </span>
                         </div>
-                        <p className="text-[8px] text-muted-foreground/20 font-black uppercase tracking-widest px-2 leading-relaxed">
+                        <p className="text-2xs text-muted-foreground/50 px-2 leading-relaxed">
                           Maximum burst requests per 60s cycle. Monitor for
                           peaks.
                         </p>
                       </div>
 
                       <div className="space-y-4">
-                        <label className="block text-[10px] font-black text-white/40 uppercase tracking-widest ml-1">
+                        <label className="block text-xs font-semibold text-white/70 ml-1">
                           Ingress Restriction (IP)
                         </label>
                         <div className="flex gap-2">
@@ -376,7 +374,7 @@ export function ModuleBuilder({
                             value={ipInput}
                             onChange={(e) => setIpInput(e.target.value)}
                             placeholder="0.0.0.0"
-                            className="flex-1 h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-xs font-black uppercase tracking-widest rounded-2xl shadow-inner"
+                            className="flex-1 h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-sm font-semibold rounded-2xl shadow-inner"
                             onKeyDown={(e) => {
                               if (e.key === "Enter" && ipInput.trim()) {
                                 setWebhookSettings({
@@ -404,7 +402,7 @@ export function ModuleBuilder({
                                 setIpInput("");
                               }
                             }}
-                            className="h-14 px-6 bg-indigo-500 hover:bg-indigo-400 text-white border-none rounded-2xl active:scale-95 transition-premium shadow-xl shadow-indigo-500/20"
+                            className="h-14 px-6 bg-indigo-500 hover:bg-indigo-400 text-white border-none rounded-2xl active:scale-95 transition-premium shadow-xl"
                           >
                             Add
                           </Button>
@@ -414,7 +412,7 @@ export function ModuleBuilder({
                             {webhookSettings.allowedIps.map((ip, index) => (
                               <span
                                 key={ip}
-                                className="px-4 py-2 bg-surface-3/80 border border-white/10 rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-3 text-indigo-400 shadow-xl animate-in zoom-in-95 duration-200"
+                                className="px-4 py-2 bg-surface-3/80 border border-white/10 rounded-xl text-2xs font-semibold uppercase tracking-wider flex items-center gap-3 text-indigo-400 shadow-xl animate-in zoom-in-95 duration-200"
                               >
                                 {ip}
                                 <button
@@ -428,7 +426,7 @@ export function ModuleBuilder({
                                         ),
                                     });
                                   }}
-                                  className="text-white/20 hover:text-white transition-premium"
+                                  className="text-white/50 hover:text-white transition-premium"
                                 >
                                   <X className="h-3 w-3" />
                                 </button>
@@ -448,7 +446,7 @@ export function ModuleBuilder({
               <Button
                 variant="ghost"
                 onClick={onClose}
-                className="h-14 px-10 text-[10px] font-black uppercase tracking-widest text-muted-foreground/40 hover:text-white transition-premium bg-surface-2/60 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+                className="h-14 px-10 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2/60 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
               >
                 Abort Architect
               </Button>
@@ -464,8 +462,8 @@ export function ModuleBuilder({
                 }
                 disabled={!moduleName || createModuleMutation.isPending}
                 className={cn(
-                  "h-14 px-12 text-[10px] font-black uppercase tracking-widest transition-premium active:scale-[0.98] rounded-2xl",
-                  "bg-primary hover:bg-primary/90 text-white border-none shadow-2xl shadow-primary/20 hover:shadow-primary/40",
+                  "h-14 px-12 text-sm font-semibold transition-premium active:scale-[0.98] rounded-2xl",
+                  "bg-primary hover:bg-primary/90 text-white border-none shadow-2xl",
                   (!moduleName || createModuleMutation.isPending) &&
                     "opacity-50 grayscale cursor-not-allowed",
                 )}
@@ -482,7 +480,7 @@ export function ModuleBuilder({
             </div>
 
             {createModuleMutation.isError && (
-              <div className="p-6 bg-destructive/10 border border-destructive/20 rounded-[2.5rem] text-destructive text-[10px] font-black uppercase tracking-widest text-center shadow-2xl animate-in shake duration-500 glass-dark">
+              <div className="p-6 bg-destructive/10 border border-destructive/20 rounded-3xl text-destructive text-xs font-semibold text-center shadow-2xl animate-in shake duration-500 glass-dark">
                 Critical Deployment Failure:{" "}
                 {sanitizeErrorMessage(
                   createModuleMutation.error instanceof Error
@@ -545,19 +543,19 @@ function WebhookSuccessView({
   return (
     <div className="space-y-10 animate-in fade-in slide-in-from-bottom-8 duration-1000">
       <div className="text-center relative">
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-48 h-48 bg-success/10 rounded-full blur-[80px] animate-pulse" />
-        <div className="inline-flex items-center justify-center w-24 h-24 rounded-[3rem] bg-success/10 border border-success/20 mb-10 shadow-[0_0_50px_hsla(var(--success),0.2)] relative z-10">
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-48 h-48 bg-success/10 rounded-full blur-[80px]" />
+        <div className="inline-flex items-center justify-center w-24 h-24 rounded-3xl bg-success/10 border border-success/20 mb-10 relative z-10">
           <CheckCircle className="h-12 w-12 text-success" />
         </div>
-        <h2 className="text-4xl font-black text-white tracking-tighter font-outfit uppercase leading-none mb-4 relative z-10">
-          Uplink Established
+        <h2 className="text-4xl font-semibold text-white tracking-tight font-outfit leading-none mb-4 relative z-10">
+          Webhook ready
         </h2>
-        <p className="text-[10px] text-success font-black uppercase tracking-[0.5em] relative z-10">
-          Strategic Ingress Vector Ready
+        <p className="text-xs text-success font-semibold tracking-[0.5em] relative z-10">
+          Incoming requests will start this workflow
         </p>
       </div>
 
-      <div className="bg-surface-2/40 border border-white/5 rounded-[3rem] p-10 space-y-8 shadow-2xl relative overflow-hidden glass-dark">
+      <div className="bg-surface-2/40 border border-white/5 rounded-3xl p-10 space-y-8 shadow-2xl relative overflow-hidden glass-dark">
         <div className="absolute inset-0 bg-gradient-to-br from-success/5 via-transparent to-transparent opacity-50 pointer-events-none" />
         <CopyField
           label="Ingress Endpoint URL"
@@ -568,29 +566,29 @@ function WebhookSuccessView({
       </div>
 
       {isSlackWebhook ? (
-        <div className="bg-surface-2/40 border border-white/5 rounded-[3rem] p-12 relative overflow-hidden shadow-2xl glass-dark">
+        <div className="bg-surface-2/40 border border-white/5 rounded-3xl p-12 relative overflow-hidden shadow-2xl glass-dark">
           <div className="flex items-center gap-4 mb-10">
             <Webhook className="w-6 h-6 text-indigo-400" />
-            <h3 className="text-[12px] font-black text-white uppercase tracking-[0.3em]">
-              Slack Operational Directive
+            <h3 className="text-xs font-semibold text-white">
+              Set up Slack events
             </h3>
           </div>
           <ol className="space-y-8">
             {[
               {
-                text: "Access the Slack API Gateway",
+                text: "Open the Slack API site",
                 link: "api.slack.com/apps",
               },
-              { text: "Select your designated application" },
-              { text: "Initialize Event Subscriptions" },
-              { text: "Activate 'Enable Events' protocol" },
-              { text: "Inject the Ingress URL into the Request field" },
+              { text: "Select your app" },
+              { text: "Open Event Subscriptions" },
+              { text: "Turn on 'Enable Events'" },
+              { text: "Paste the webhook URL into the Request URL field" },
               {
-                text: "Subscribe to required bot event vectors (e.g. message.channels)",
+                text: "Subscribe to the bot events you need (e.g. message.channels)",
               },
             ].map((step, idx) => (
               <li key={idx} className="flex gap-6 items-start group">
-                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-[11px] font-black text-muted-foreground/40 group-hover:text-white group-hover:border-primary/40 transition-premium shadow-lg">
+                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-premium shadow-lg">
                   {idx + 1}
                 </span>
                 <p className="text-sm font-bold text-muted-foreground/60 leading-relaxed pt-1 group-hover:text-white transition-premium">
@@ -611,24 +609,24 @@ function WebhookSuccessView({
           </ol>
         </div>
       ) : (
-        <div className="bg-surface-2/40 border border-white/5 rounded-[3rem] p-12 relative overflow-hidden shadow-2xl glass-dark">
+        <div className="bg-surface-2/40 border border-white/5 rounded-3xl p-12 relative overflow-hidden shadow-2xl glass-dark">
           <div className="flex items-center gap-4 mb-10">
             <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20 shadow-lg">
               <Zap className="w-6 h-6 text-primary" />
             </div>
-            <h3 className="text-[12px] font-black text-white uppercase tracking-[0.3em]">
-              Ingress Setup Directive
+            <h3 className="text-xs font-semibold text-white">
+              Set up the sender
             </h3>
           </div>
           <ol className="space-y-8">
             {[
-              "Copy the strategic ingress URL above",
-              "Configure your external emitter to send POST requests",
-              "Ensure headers align with application/json protocols",
-              "Initiate test transmission to verify vector stability",
+              "Copy the webhook URL above",
+              "Configure the sending service to POST to it",
+              "Send the body as application/json",
+              "Send a test request to confirm it arrives",
             ].map((step, idx) => (
               <li key={idx} className="flex gap-6 items-start group">
-                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-[11px] font-black text-muted-foreground/40 group-hover:text-white group-hover:border-primary/40 transition-premium shadow-lg">
+                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-premium shadow-lg">
                   {idx + 1}
                 </span>
                 <p className="text-sm font-bold text-muted-foreground/60 leading-relaxed pt-1 group-hover:text-white transition-premium">
@@ -640,20 +638,20 @@ function WebhookSuccessView({
         </div>
       )}
 
-      <div className="p-8 bg-warning/5 border border-warning/20 rounded-[2.5rem] flex items-start gap-5 glass-light">
+      <div className="p-8 bg-warning/5 border border-warning/20 rounded-3xl flex items-start gap-5 glass-light">
         <div className="shrink-0 p-3 rounded-2xl bg-warning/10 border border-warning/20 shadow-lg">
           <Shield className="w-5 h-5 text-warning" />
         </div>
-        <p className="text-[11px] text-warning font-bold uppercase tracking-widest leading-relaxed">
-          Rate limiting and IP restrictions are active based on your tactical
-          configuration. Monitor ingress telemetry in the Dashboard.
+        <p className="text-xs text-warning leading-relaxed">
+          Rate limits and IP restrictions apply as configured. Incoming requests
+          show up in the Dashboard.
         </p>
       </div>
 
       <Button
         type="button"
         onClick={onClose}
-        className="w-full h-16 bg-success hover:bg-success/90 text-white text-[12px] font-black uppercase tracking-[0.4em] rounded-[1.5rem] transition-premium shadow-2xl shadow-success/20 hover:shadow-success/40 active:scale-[0.98]"
+        className="w-full h-16 bg-success hover:bg-success/90 text-white text-sm font-semibold rounded-2xl transition-premium shadow-2xl active:scale-[0.98]"
       >
         Acknowledge Deployment
       </Button>

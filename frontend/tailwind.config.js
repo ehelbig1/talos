@@ -21,6 +21,9 @@ module.exports = {
   ],
   theme: {
     extend: {
+      fontSize: {
+        '2xs': ['11px', { lineHeight: '1rem' }],
+      },
       fontFamily: {
         sans: ['ui-sans-serif', 'system-ui', ...defaultTheme.fontFamily.sans],
       },

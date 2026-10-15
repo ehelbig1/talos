@@ -31,8 +31,8 @@ describe("Inspector Component", () => {
 
     expect(screen.getByText("Workflow Registry")).toBeInTheDocument();
     expect(screen.getByText("My Awesome Workflow")).toBeInTheDocument();
-    // Workflow ID is now surfaced via the SYSTEM_UUID copy field.
-    expect(screen.getByText("SYSTEM_UUID")).toBeInTheDocument();
+    // Workflow ID is surfaced via the "Workflow ID" copy field.
+    expect(screen.getByText("Workflow ID")).toBeInTheDocument();
     expect(screen.getByText("wf-1")).toBeInTheDocument();
   });
 
@@ -144,7 +144,9 @@ describe("Inspector Component", () => {
 
     render(<Inspector />);
 
-    expect(screen.getByText("Link Properties")).toBeInTheDocument();
+    expect(
+      screen.getByText("How data flows between these nodes"),
+    ).toBeInTheDocument();
 
     const textarea = screen.getByPlaceholderText(/ctx.result.score > 0.8/i);
     fireEvent.change(textarea, { target: { value: "invalid script" } });
@@ -179,26 +181,22 @@ describe("Inspector Component", () => {
       { timeout: 3000 },
     );
 
-    // Expand the Core Metadata (System Internals) section
+    // Expand the Details (System Internals) section
     const advancedTrigger = screen.getByRole("button", {
-      name: /core metadata/i,
+      name: /^details$/i,
     });
     fireEvent.click(advancedTrigger);
 
     const deleteBtn = await screen.findByRole("button", {
-      name: /decommission protocol node/i,
+      name: /^delete node$/i,
     });
     fireEvent.click(deleteBtn);
 
     // Confirm dialog should appear
-    expect(
-      screen.getByText(
-        /Are you sure you want to terminate and remove node "Delete Me"\?/i,
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Delete node "Delete Me"\?/i)).toBeInTheDocument();
 
     const confirmBtn = screen.getByRole("button", {
-      name: /^terminate & remove$/i,
+      name: /^delete$/i,
     });
     fireEvent.click(confirmBtn);
 

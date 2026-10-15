@@ -69,8 +69,8 @@ describe("WorkflowExecutionHistoryPanel", () => {
 
     fireEvent.click(screen.getByText("completed"));
 
-    // The output section is now headed "Telemetric Stream".
-    expect(screen.getAllByText("Telemetric Stream").length).toBeGreaterThan(0);
+    // The output section is headed "Output".
+    expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
     expect(screen.getByText(/"result": "ok"/i)).toBeInTheDocument();
   });
 

@@ -144,8 +144,7 @@ describe("Dashboard", () => {
 
     renderWithProviders(<Dashboard />);
 
-    // Empty state was redesigned: heading "Initialize Workflow" + CTA.
-    const emptyMsg = await screen.findByText(/Initialize Workflow/i);
+    const emptyMsg = await screen.findByText(/No workflows yet/i);
     expect(emptyMsg).toBeInTheDocument();
   });
 
@@ -182,9 +181,7 @@ describe("Dashboard", () => {
     expect(await screen.findByText("Apple")).toBeInTheDocument();
     expect(await screen.findByText("Banana")).toBeInTheDocument();
 
-    const searchInput = screen.getByPlaceholderText(
-      /SEARCH AUTOMATED PIPELINES/i,
-    );
+    const searchInput = screen.getByPlaceholderText(/Search workflows/i);
     fireEvent.change(searchInput, { target: { value: "app" } });
 
     expect(screen.getByText("Apple")).toBeInTheDocument();
@@ -207,8 +204,7 @@ describe("Dashboard", () => {
 
     renderWithProviders(<Dashboard />);
 
-    // The edit action is now an icon button titled "Configure Architecture".
-    const editButton = await screen.findByTitle(/Configure Architecture/i);
+    const editButton = await screen.findByTitle(/Open in editor/i);
     await act(async () => {
       fireEvent.click(editButton);
     });

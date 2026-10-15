@@ -68,7 +68,7 @@ export default function ActorDetail() {
     mutationFn: () => terminateActor(id!, false),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["actors"] });
-      toast.success("Actor terminated");
+      toast.success("Actor deleted");
       navigate("/actors");
     },
     onError: (e: Error) => toast.error(sanitizeErrorMessage(e.message)),
@@ -91,11 +91,11 @@ export default function ActorDetail() {
               {[0, 1, 2, 3].map((i) => (
                 <div
                   key={i}
-                  className="h-32 rounded-[2rem] bg-surface-3/20 border border-white/5 animate-shimmer"
+                  className="h-32 rounded-2xl bg-surface-3/20 border border-white/5 animate-shimmer"
                 />
               ))}
             </div>
-            <div className="h-[400px] rounded-[3rem] bg-surface-3/20 border border-white/5 animate-shimmer" />
+            <div className="h-[400px] rounded-3xl bg-surface-3/20 border border-white/5 animate-shimmer" />
           </div>
         </div>
       </div>
@@ -105,18 +105,18 @@ export default function ActorDetail() {
   if (error || !actor) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-6 bg-background">
-        <div className="w-16 h-16 rounded-[2rem] bg-destructive/10 flex items-center justify-center text-destructive mb-4">
+        <div className="w-16 h-16 rounded-2xl bg-destructive/10 flex items-center justify-center text-destructive mb-4">
           <X className="w-8 h-8" />
         </div>
-        <p className="text-xl font-black text-white tracking-tight">
-          Identity Registry Error
+        <p className="text-xl font-semibold text-white tracking-tight">
+          Actor not found
         </p>
         <p className="text-muted-foreground font-medium">
-          The requested execution identity could not be located.
+          This actor does not exist or you do not have access to it.
         </p>
         <button
           onClick={() => navigate("/actors")}
-          className="px-6 py-2.5 text-xs font-black uppercase tracking-widest text-primary-foreground bg-primary rounded-xl transition-premium flex items-center gap-2"
+          className="px-6 py-2.5 text-sm font-semibold text-primary-foreground bg-primary rounded-xl transition-premium flex items-center gap-2"
         >
           <ChevronLeft className="w-4 h-4" /> Return to Registry
         </button>
@@ -142,12 +142,12 @@ export default function ActorDetail() {
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-4 flex-wrap">
-            <h1 className="text-3xl font-black text-white tracking-tight drop-shadow-sm">
+            <h1 className="text-3xl font-semibold text-white tracking-tight drop-shadow-sm">
               {actor.name}
             </h1>
             <span
               className={cn(
-                "px-3 py-1 rounded-full border border-white/5 text-[10px] font-black uppercase tracking-widest flex items-center gap-2",
+                "px-3 py-1 rounded-full border border-white/5 text-xs font-semibold flex items-center gap-2",
                 colors.badge,
               )}
             >
@@ -166,8 +166,8 @@ export default function ActorDetail() {
               {actor.description}
             </p>
           ) : (
-            <p className="text-muted-foreground/30 text-xs font-black uppercase tracking-widest mt-1 italic">
-              Operational Interface &bull; Secure Protocol
+            <p className="text-muted-foreground/60 text-xs font-semibold mt-1 italic">
+              No description
             </p>
           )}
         </div>
@@ -182,7 +182,7 @@ export default function ActorDetail() {
               }
               disabled={toggleMut.isPending}
               className={cn(
-                "px-6 py-2.5 text-xs font-black uppercase tracking-widest rounded-xl transition-premium active:scale-95 border",
+                "px-6 py-2.5 text-sm font-semibold rounded-xl transition-premium active:scale-95 border",
                 actor.status === "active"
                   ? "bg-warning/5 text-warning/80 border-warning/20 hover:bg-warning/10"
                   : "bg-success/5 text-success/80 border-success/20 hover:bg-success/10",
@@ -191,8 +191,8 @@ export default function ActorDetail() {
               {toggleMut.isPending
                 ? "..."
                 : actor.status === "active"
-                  ? "Suspend identity"
-                  : "Deploy identity"}
+                  ? "Suspend actor"
+                  : "Activate actor"}
             </button>
           </div>
         )}

@@ -33,34 +33,34 @@ function TriggersSection({ workflowId }: { workflowId: string | null }) {
   const triggers = [
     {
       icon: Calendar,
-      label: "CHRONOS SCHEDULE",
-      desc: "Deterministic time-based execution",
+      label: "Schedule",
+      desc: "Run on a timer",
       onClick: () => navigate("/settings#schedules"),
       color: "text-warning",
-      glow: "shadow-[0_0_15px_hsla(var(--warning),0.1)]",
+      glow: "",
     },
     {
       icon: Webhook,
-      label: "UPLINK WEBHOOK",
-      desc: "Reactive HTTP-triggered execution",
+      label: "Webhook",
+      desc: "Run when an HTTP request arrives",
       onClick: () => navigate("/settings#webhooks"),
       color: "text-primary",
-      glow: "shadow-[0_0_15px_hsla(var(--primary),0.1)]",
+      glow: "",
     },
     {
       icon: Play,
-      label: "MANUAL COMMAND",
-      desc: "Direct operator-led execution",
+      label: "Manual",
+      desc: "Run it yourself from the toolbar",
       onClick: undefined,
       color: "text-success",
-      glow: "shadow-[0_0_15px_hsla(var(--success),0.1)]",
+      glow: "",
     },
   ];
 
   return (
     <div className="space-y-4">
-      <p className="text-[10px] text-muted-foreground/40 uppercase tracking-[0.2em] font-black ml-1">
-        OPERATIONAL TRIGGERS
+      <p className="text-xs text-muted-foreground/70 font-semibold ml-1">
+        Triggers
       </p>
       <div className="grid grid-cols-1 gap-2">
         {triggers.map((t) => (
@@ -75,22 +75,22 @@ function TriggersSection({ workflowId }: { workflowId: string | null }) {
           >
             <div
               className={cn(
-                "p-2 rounded-xl bg-white/5 border border-white/10 transition-premium group-hover:scale-110",
+                "p-2 rounded-xl bg-white/5 border border-white/10 transition-premium",
                 t.color,
               )}
             >
               <t.icon className="w-4 h-4" />
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-[10px] text-white font-black uppercase tracking-widest font-outfit">
+              <p className="text-xs text-white font-semibold font-outfit">
                 {t.label}
               </p>
-              <p className="text-[9px] text-muted-foreground/40 font-bold uppercase tracking-tight">
+              <p className="text-2xs text-muted-foreground/70 font-bold uppercase tracking-tight">
                 {t.desc}
               </p>
             </div>
             {t.onClick && (
-              <span className="text-[9px] text-primary font-black uppercase tracking-widest opacity-0 group-hover:opacity-100 transition-premium">
+              <span className="text-2xs text-primary font-semibold uppercase tracking-wider opacity-0 group-hover:opacity-100 transition-premium">
                 CONFIGURE →
               </span>
             )}
@@ -196,15 +196,15 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
       {/* Header */}
       <div className="flex items-center justify-between px-8 py-6 border-b border-white/5 bg-white/[0.02] relative z-10">
         <div className="flex items-center gap-5">
-          <div className="w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center shadow-[0_0_20px_hsla(var(--primary),0.15)] relative group overflow-hidden">
+          <div className="w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center relative group overflow-hidden">
             <div className="absolute inset-0 bg-primary/20 opacity-0 group-hover:opacity-100 transition-premium blur-xl" />
             <Layout className="w-6 h-6 text-primary relative z-10" />
           </div>
           <div>
-            <h3 className="text-lg font-black text-white tracking-tight font-outfit uppercase">
+            <h3 className="text-lg font-semibold text-white tracking-tight font-outfit">
               Workflow Registry
             </h3>
-            <p className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-[0.2em] mt-1">
+            <p className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider mt-1">
               Global Configuration Hub
             </p>
           </div>
@@ -212,7 +212,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
         <button
           type="button"
           onClick={onClose}
-          className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/40 hover:text-white hover:bg-white/10 transition-premium active:scale-95 shadow-xl"
+          className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-premium active:scale-95 shadow-xl"
         >
           <X className="h-5 w-5" />
         </button>
@@ -226,14 +226,14 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
           <TabsList className="w-full justify-start rounded-2xl border border-white/5 bg-black/20 p-1.5 gap-1 shrink-0 h-auto">
             <TabsTrigger
               value="info"
-              className="flex-1 text-[10px] font-black uppercase tracking-[0.2em] data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/40 rounded-xl py-3 px-5 transition-premium"
+              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-premium"
             >
               <Info className="w-3.5 h-3.5 mr-2 opacity-40" />
               Manifest
             </TabsTrigger>
             <TabsTrigger
               value="executions"
-              className="flex-1 text-[10px] font-black uppercase tracking-[0.2em] data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/40 rounded-xl py-3 px-5 transition-premium"
+              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-premium"
             >
               <Clock className="w-3.5 h-3.5 mr-2 opacity-40" />
               History
@@ -246,24 +246,24 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
           className="flex-1 min-h-0 overflow-auto p-8 space-y-10 animate-in fade-in slide-in-from-bottom-2 duration-500 custom-scrollbar focus:outline-none"
         >
           <div className="space-y-4">
-            <label className="text-[10px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-              Protocol Designation
+            <label className="text-xs text-muted-foreground/60 font-semibold ml-1">
+              Name
             </label>
-            <div className="p-6 bg-surface-3/40 border border-white/5 rounded-[2rem] glass-dark shadow-2xl relative overflow-hidden group">
+            <div className="p-6 bg-surface-3/40 border border-white/5 rounded-2xl glass-dark shadow-2xl relative overflow-hidden group">
               <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-              <p className="text-3xl font-black text-white tracking-tighter font-outfit leading-none selection:bg-primary/30 break-all">
-                {workflowName || "UNTITLED_STREAM"}
+              <p className="text-3xl font-semibold text-white tracking-tight font-outfit leading-none selection:bg-primary/30 break-all">
+                {workflowName || "Untitled workflow"}
               </p>
             </div>
           </div>
 
           {workflowId && (
             <div className="space-y-4">
-              <label className="text-[10px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1">
-                System Identity
+              <label className="text-xs text-muted-foreground/60 font-semibold ml-1">
+                Workflow ID
               </label>
               <CopyField
-                label="SYSTEM_UUID"
+                label="ID"
                 value={workflowId}
                 copied={copiedWorkflowId}
                 onCopy={async () => {
@@ -286,24 +286,24 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
           )}
 
           <div className="grid grid-cols-2 gap-4">
-            <div className="p-6 bg-white/[0.02] border border-white/5 rounded-[2rem] shadow-xl glass-dark group hover:bg-white/[0.04] transition-premium">
-              <div className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black mb-3">
-                TOPOLOGY_NODES
+            <div className="p-6 bg-white/[0.02] border border-white/5 rounded-2xl shadow-xl glass-dark group hover:bg-white/[0.04] transition-premium">
+              <div className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold mb-3">
+                Nodes
               </div>
               <div className="flex items-center gap-3">
                 <div className="w-1.5 h-6 bg-primary/40 rounded-full" />
-                <div className="text-3xl font-black text-white font-outfit">
+                <div className="text-3xl font-semibold text-white font-outfit">
                   {nodeCount}
                 </div>
               </div>
             </div>
-            <div className="p-6 bg-white/[0.02] border border-white/5 rounded-[2rem] shadow-xl glass-dark group hover:bg-white/[0.04] transition-premium">
-              <div className="text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black mb-3">
-                DATA_EDGES
+            <div className="p-6 bg-white/[0.02] border border-white/5 rounded-2xl shadow-xl glass-dark group hover:bg-white/[0.04] transition-premium">
+              <div className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold mb-3">
+                Edges
               </div>
               <div className="flex items-center gap-3">
                 <div className="w-1.5 h-6 bg-success/40 rounded-full" />
-                <div className="text-3xl font-black text-white font-outfit">
+                <div className="text-3xl font-semibold text-white font-outfit">
                   {edgeCount}
                 </div>
               </div>
@@ -312,18 +312,18 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
 
           <TriggersSection workflowId={workflowId} />
 
-          <div className="p-8 bg-primary/5 border border-primary/10 rounded-[2.5rem] space-y-8 shadow-2xl relative overflow-hidden group">
+          <div className="p-8 bg-primary/5 border border-primary/10 rounded-3xl space-y-8 shadow-2xl relative overflow-hidden group">
             <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-50" />
-            <h4 className="text-[12px] font-black text-white flex items-center gap-4 uppercase tracking-[0.3em] font-outfit relative z-10">
-              <div className="p-2.5 rounded-2xl bg-primary/10 border border-primary/20 shadow-[0_0_20px_hsla(var(--primary),0.15)] group-hover:scale-110 transition-premium">
+            <h4 className="text-xs font-semibold text-white flex items-center gap-4 font-outfit relative z-10">
+              <div className="p-2.5 rounded-2xl bg-primary/10 border border-primary/20 transition-premium">
                 <Zap className="w-5 h-5 text-primary" />
               </div>
-              Operational Constraints
+              Limits
             </h4>
 
             <div className="space-y-8 relative z-10">
               <div className="space-y-3">
-                <label className="text-[10px] text-muted-foreground/40 uppercase tracking-[0.2em] font-black ml-1">
+                <label className="text-xs text-muted-foreground/70 font-semibold ml-1">
                   Concurrency Limit
                 </label>
                 <div className="flex items-center gap-5">
@@ -335,16 +335,16 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                     onChange={(e) =>
                       setMaxConcurrentExecutions(parseInt(e.target.value) || 1)
                     }
-                    className="w-24 bg-black/40 border border-white/5 rounded-2xl px-6 py-3 text-sm focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium font-black text-white shadow-inner"
+                    className="w-24 bg-black/40 border border-white/5 rounded-2xl px-6 py-3 text-sm focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium font-semibold text-white shadow-inner"
                   />
-                  <div className="text-[10px] text-muted-foreground/20 font-bold uppercase tracking-[0.2em] italic">
-                    SYSTEM_DEFAULT: 01
+                  <div className="text-xs text-muted-foreground/50 font-bold italic">
+                    Default: 1
                   </div>
                 </div>
               </div>
 
               <div className="space-y-3">
-                <label className="text-[10px] text-muted-foreground/40 uppercase tracking-[0.2em] font-black ml-1">
+                <label className="text-xs text-muted-foreground/70 font-semibold ml-1">
                   Runtime Priority
                 </label>
                 <div className="relative">
@@ -353,24 +353,24 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                     onChange={(e) =>
                       setPriority(e.target.value as "high" | "normal" | "low")
                     }
-                    className="w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-[11px] font-black uppercase tracking-[0.3em] focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer hover:bg-black/60 text-white shadow-inner"
+                    className="w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm font-semibold focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer hover:bg-black/60 text-white shadow-inner"
                   >
-                    <option value="low">LOW_PRIORITY</option>
-                    <option value="normal">NORMAL_PRIORITY</option>
-                    <option value="high">HIGH_PRIORITY</option>
+                    <option value="low">Low</option>
+                    <option value="normal">Normal</option>
+                    <option value="high">High</option>
                   </select>
-                  <ChevronDown className="absolute right-6 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/20 pointer-events-none" />
+                  <ChevronDown className="absolute right-6 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/50 pointer-events-none" />
                 </div>
               </div>
 
               <div className="space-y-4">
                 <div className="flex justify-between items-center px-1">
-                  <label className="text-[10px] text-muted-foreground/40 uppercase tracking-[0.2em] font-black">
+                  <label className="text-xs text-muted-foreground/70 font-semibold">
                     Intent Metadata (JSON)
                   </label>
                   {jsonError && (
-                    <span className="text-[9px] text-destructive font-black animate-pulse uppercase tracking-widest bg-destructive/10 px-2 py-0.5 rounded border border-destructive/20">
-                      SCHEMA_INVALID
+                    <span className="text-2xs text-destructive font-semibold animate-pulse uppercase tracking-wider bg-destructive/10 px-2 py-0.5 rounded border border-destructive/20">
+                      Invalid JSON
                     </span>
                   )}
                 </div>
@@ -379,12 +379,12 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                   onChange={handleJsonChange}
                   rows={6}
                   className={cn(
-                    "w-full bg-black/40 border transition-premium rounded-[2rem] p-6 text-[11px] font-mono focus:outline-none focus:ring-4 resize-none shadow-inner leading-relaxed selection:bg-primary/30 custom-scrollbar",
+                    "w-full bg-black/40 border transition-premium rounded-2xl p-6 text-xs font-mono focus:outline-none focus:ring-4 resize-none shadow-inner leading-relaxed selection:bg-primary/30 custom-scrollbar",
                     jsonError
                       ? "border-destructive/40 focus:ring-destructive/10"
                       : "border-white/5 focus:border-primary/40 focus:ring-primary/10",
                   )}
-                  placeholder='{ "OPERATIONAL_KEY": "VALUE" }'
+                  placeholder='{ "key": "value" }'
                   spellCheck={false}
                 />
               </div>
@@ -392,11 +392,11 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
           </div>
 
           {!workflowId && (
-            <div className="p-6 bg-warning/5 border border-warning/10 rounded-[2rem] flex gap-5 shadow-2xl glass-dark animate-status-pulse">
+            <div className="p-6 bg-warning/5 border border-warning/10 rounded-2xl flex gap-5 shadow-2xl glass-dark animate-status-pulse">
               <AlertTriangle className="w-6 h-6 text-warning shrink-0 mt-0.5" />
-              <p className="text-[10px] text-warning/80 font-black uppercase tracking-widest leading-relaxed">
-                WORKFLOW NOT PERSISTED. SAVE PROTOCOL TO INITIALIZE DEPLOYMENT
-                VECTORS AND TELEMETRY STREAMS.
+              <p className="text-xs text-warning/80 leading-relaxed">
+                This workflow is not saved yet. Save it to set up triggers and
+                see run history.
               </p>
             </div>
           )}
@@ -412,10 +412,10 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
             <div className="h-full flex flex-col items-center justify-center p-12 text-center space-y-8 opacity-20 grayscale">
               <div className="p-10 rounded-[3.5rem] bg-surface-3/40 border border-white/5 shadow-2xl relative overflow-hidden group">
                 <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent" />
-                <Zap className="w-12 h-12 text-muted-foreground/30 relative z-10" />
+                <Zap className="w-12 h-12 text-muted-foreground/60 relative z-10" />
               </div>
-              <p className="text-[12px] font-black uppercase tracking-[0.4em] text-muted-foreground/60 max-w-[240px] leading-relaxed">
-                INITIALIZE PERSISTENCE TO ACTIVATE HISTORY
+              <p className="text-xs text-muted-foreground/60 max-w-[240px] leading-relaxed">
+                Save the workflow to see its run history
               </p>
             </div>
           )}

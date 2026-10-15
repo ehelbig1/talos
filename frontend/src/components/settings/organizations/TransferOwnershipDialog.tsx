@@ -34,19 +34,19 @@ export function TransferOwnershipDialog({
   const isTransferConfirmed = confirmName.trim() === orgName;
 
   return (
-    <Dialog open={open} onClose={onClose} title="Identity_Shift">
+    <Dialog open={open} onClose={onClose} title="Transfer ownership">
       <div className="space-y-8">
         <div className="p-6 bg-destructive/10 border border-destructive/20 rounded-3xl flex items-start gap-5 relative overflow-hidden group">
           <div className="absolute inset-0 bg-destructive/5 blur-3xl animate-pulse opacity-20" />
           <AlertTriangle className="w-6 h-6 text-destructive shrink-0 mt-0.5 relative z-10" />
           <div className="space-y-2 relative z-10">
-            <p className="text-xs font-black text-destructive uppercase tracking-widest">
-              CRITICAL_GOVERNANCE_OVERRIDE
+            <p className="text-xs font-semibold text-destructive">
+              This cannot be undone
             </p>
-            <p className="text-[11px] text-destructive/70 leading-relaxed font-medium">
+            <p className="text-xs text-destructive/70 leading-relaxed font-medium">
               Transferring ownership grants{" "}
-              <span className="text-destructive font-black underline decoration-2">
-                FULL_SOVEREIGNTY
+              <span className="text-destructive font-semibold underline decoration-2">
+                full ownership
               </span>{" "}
               to another user. You will be demoted to Admin status immediately.
               This operation is irreversible without the new owner's consent.
@@ -56,11 +56,11 @@ export function TransferOwnershipDialog({
 
         <div className="space-y-6">
           <div className="space-y-2.5">
-            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 ml-1">
-              Successor_UUID
+            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
+              New owner's user ID
             </label>
             <Input
-              placeholder="Target User UUID"
+              placeholder="User ID"
               value={newOwnerId}
               onChange={(e) => onNewOwnerIdChange(e.target.value)}
               className="h-14 bg-white/[0.03] border-white/10 focus:border-destructive/50 focus:ring-destructive/20 rounded-xl px-4 font-mono text-sm text-white placeholder:text-white/10 transition-premium"
@@ -68,16 +68,16 @@ export function TransferOwnershipDialog({
           </div>
 
           <div className="space-y-2.5">
-            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 ml-1">
-              Security_Verification
+            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
+              Confirm
             </label>
             <div className="space-y-3">
-              <p className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest ml-1">
+              <p className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider ml-1">
                 Type <span className="text-white">"{orgName}"</span> to confirm
                 transfer
               </p>
               <Input
-                placeholder="Verification Phrase"
+                placeholder="Organization name"
                 value={confirmName}
                 onChange={(e) => onConfirmNameChange(e.target.value)}
                 className={cn(
@@ -94,17 +94,17 @@ export function TransferOwnershipDialog({
         <div className="flex gap-4 pt-4">
           <Button
             variant="outline"
-            className="flex-1 h-14 rounded-xl border-white/10 hover:bg-white/5 text-[10px] font-black uppercase tracking-widest"
+            className="flex-1 h-14 rounded-xl border-white/10 hover:bg-white/5 text-sm font-semibold"
             onClick={onClose}
           >
-            CANCEL_TRANSFER
+            Cancel
           </Button>
           <Button
-            className="flex-1 h-14 rounded-xl bg-destructive hover:bg-destructive/90 text-white font-black uppercase text-[10px] tracking-widest shadow-2xl shadow-destructive/20"
+            className="flex-1 h-14 rounded-xl bg-destructive hover:bg-destructive/90 text-white font-semibold text-sm shadow-2xl"
             disabled={!newOwnerId.trim() || !isTransferConfirmed || isPending}
             onClick={onSubmit}
           >
-            {isPending ? <LoadingSpinner /> : "EXECUTE_TRANSFER"}
+            {isPending ? <LoadingSpinner /> : "Transfer ownership"}
           </Button>
         </div>
       </div>

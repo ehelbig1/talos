@@ -195,12 +195,12 @@ function PrettyValue({
   depth?: number;
 }): React.ReactElement {
   if (value === null || value === undefined) {
-    return <span className="text-muted-foreground/40 italic">—</span>;
+    return <span className="text-muted-foreground/70 italic">—</span>;
   }
 
   if (typeof value === "string") {
     if (value.trim() === "")
-      return <span className="text-muted-foreground/40 italic">—</span>;
+      return <span className="text-muted-foreground/70 italic">—</span>;
     return (
       <span className="text-foreground/80 whitespace-pre-wrap break-words">
         {value}
@@ -214,7 +214,7 @@ function PrettyValue({
 
   if (Array.isArray(value)) {
     if (value.length === 0)
-      return <span className="text-muted-foreground/40 italic">none</span>;
+      return <span className="text-muted-foreground/70 italic">none</span>;
     return (
       <ul className="space-y-2">
         {value.map((item, i) => (
@@ -246,7 +246,7 @@ function PrettyValue({
     ([k]) => !k.startsWith("__"),
   );
   if (entries.length === 0)
-    return <span className="text-muted-foreground/40 italic">—</span>;
+    return <span className="text-muted-foreground/70 italic">—</span>;
 
   return (
     <div className={cn("space-y-2", depth > 0 && "space-y-1.5")}>
@@ -257,7 +257,7 @@ function PrettyValue({
             key={k}
             className={cn(isPrimitive ? "flex flex-wrap gap-x-2" : "space-y-1")}
           >
-            <span className="text-[11px] font-bold uppercase tracking-wider text-primary/60 shrink-0">
+            <span className="text-xs font-bold text-primary/60 shrink-0">
               {titleize(k)}
             </span>
             <div className={cn(isPrimitive ? "" : "pl-1")}>
@@ -278,7 +278,7 @@ function BriefingCard({ briefing }: { briefing: Briefing }) {
   const Icon = meta.icon;
 
   return (
-    <div className="bg-surface-3/30 border border-white/5 rounded-[2rem] p-6 flex flex-col gap-4 transition-premium hover:border-white/10 hover:shadow-2xl hover:shadow-primary/5 group relative overflow-hidden">
+    <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-6 flex flex-col gap-4 transition-premium hover:border-white/10 hover:shadow-2xl group relative overflow-hidden">
       <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
 
       <div className="flex items-start justify-between gap-3 relative z-10">
@@ -287,15 +287,15 @@ function BriefingCard({ briefing }: { briefing: Briefing }) {
             <Icon className="w-5 h-5" />
           </div>
           <div>
-            <h3 className="text-base font-black text-white tracking-tight">
+            <h3 className="text-base font-semibold text-white tracking-tight">
               {meta.title}
             </h3>
-            <p className="text-[10px] text-muted-foreground/50 font-bold uppercase tracking-widest mt-0.5">
+            <p className="text-xs text-muted-foreground/50 font-bold mt-0.5">
               {briefing.actorName}
             </p>
           </div>
         </div>
-        <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground/50 font-bold uppercase tracking-widest shrink-0">
+        <span className="flex items-center gap-1.5 text-xs text-muted-foreground/50 font-bold shrink-0">
           <Clock className="w-3 h-3" />
           {timeAgo(briefing.updatedAt)}
         </span>
@@ -307,7 +307,7 @@ function BriefingCard({ briefing }: { briefing: Briefing }) {
 
       <button
         onClick={() => setShowRaw((s) => !s)}
-        className="relative z-10 self-start flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-muted-foreground/30 hover:text-muted-foreground/70 transition-premium"
+        className="relative z-10 self-start flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60 hover:text-muted-foreground/70 transition-premium"
       >
         <ChevronDown
           className={cn(
@@ -318,7 +318,7 @@ function BriefingCard({ briefing }: { briefing: Briefing }) {
         {showRaw ? "Hide" : "Raw"} JSON
       </button>
       {showRaw && (
-        <pre className="relative z-10 text-[10px] text-foreground/60 font-mono bg-black/40 rounded-xl p-3 border border-white/5 overflow-x-auto max-h-64 thin-scrollbar">
+        <pre className="relative z-10 text-xs text-foreground/60 font-mono bg-black/40 rounded-xl p-3 border border-white/5 overflow-x-auto max-h-64 thin-scrollbar">
           {JSON.stringify(briefing.value, null, 2)}
         </pre>
       )}
@@ -350,17 +350,17 @@ export default function Briefings() {
         {/* Header */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="flex items-center gap-5">
-            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-[1.5rem] flex items-center justify-center text-primary shadow-[0_0_30px_hsla(var(--primary),0.1)]">
+            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary">
               <Sparkles className="w-7 h-7" />
             </div>
             <div>
-              <h1 className="text-3xl md:text-4xl font-black text-white tracking-tighter uppercase">
+              <h1 className="text-3xl md:text-4xl font-semibold text-white tracking-tight">
                 Briefings
               </h1>
               <p className="text-sm text-muted-foreground/60 font-medium mt-1">
                 The latest result from each of your workflows, in one place.
                 {lastUpdated && (
-                  <span className="text-muted-foreground/40">
+                  <span className="text-muted-foreground/70">
                     {" "}
                     Updated {timeAgo(lastUpdated)}.
                   </span>
@@ -371,7 +371,7 @@ export default function Briefings() {
           <button
             onClick={() => refetch()}
             disabled={isRefetching}
-            className="self-start flex items-center gap-2 px-4 py-2.5 rounded-2xl border border-white/5 bg-white/5 hover:bg-primary/10 hover:border-primary/20 hover:text-primary text-muted-foreground text-[10px] font-black uppercase tracking-widest transition-premium active:scale-95 disabled:opacity-50"
+            className="self-start flex items-center gap-2 px-4 py-2.5 rounded-2xl border border-white/5 bg-white/5 hover:bg-primary/10 hover:border-primary/20 hover:text-primary text-muted-foreground text-xs font-semibold transition-premium active:scale-95 disabled:opacity-50"
           >
             <RefreshCw
               className={cn("w-3.5 h-3.5", isRefetching && "animate-spin")}
@@ -403,25 +403,25 @@ export default function Briefings() {
             {[0, 1].map((i) => (
               <div
                 key={i}
-                className="h-64 rounded-[2rem] border border-white/5 bg-surface-3/20 animate-pulse"
+                className="h-64 rounded-2xl border border-white/5 bg-surface-3/20 animate-pulse"
               />
             ))}
           </div>
         ) : isError ? (
-          <div className="rounded-[2rem] border border-destructive/20 bg-destructive/5 p-10 text-center">
+          <div className="rounded-2xl border border-destructive/20 bg-destructive/5 p-10 text-center">
             <p className="text-sm text-destructive font-bold">
               Couldn&apos;t load your results.
             </p>
             <button
               onClick={() => refetch()}
-              className="mt-4 text-[10px] font-black uppercase tracking-widest text-muted-foreground hover:text-white"
+              className="mt-4 text-xs font-semibold text-muted-foreground hover:text-white"
             >
               Try again
             </button>
           </div>
         ) : !hasResults && unreadable.length === 0 ? (
-          <div className="rounded-[2rem] border border-dashed border-white/10 bg-black/10 p-16 text-center space-y-3">
-            <Sparkles className="w-8 h-8 text-muted-foreground/30 mx-auto" />
+          <div className="rounded-2xl border border-dashed border-white/10 bg-black/10 p-16 text-center space-y-3">
+            <Sparkles className="w-8 h-8 text-muted-foreground/60 mx-auto" />
             <p className="text-sm text-muted-foreground/60 font-medium max-w-md mx-auto">
               No results yet. When a scheduled workflow runs and writes its
               output to memory (a{" "}

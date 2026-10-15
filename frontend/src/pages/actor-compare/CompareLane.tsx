@@ -25,43 +25,43 @@ export function StatusBadge({ status }: { status: ExecStatus }) {
     { label: string; className: string; icon: React.ReactNode; glow: string }
   > = {
     idle: {
-      label: "IDLE",
-      className: "text-muted-foreground/40 bg-white/5",
+      label: "Idle",
+      className: "text-muted-foreground/70 bg-white/5",
       icon: <Clock className="w-3 h-3" />,
       glow: "",
     },
     triggering: {
-      label: "UPLINKING...",
+      label: "Starting…",
       className: "text-primary bg-primary/10",
       icon: <Loader2 className="w-3 h-3 animate-spin" />,
-      glow: "shadow-[0_0_10px_hsla(var(--primary),0.2)]",
+      glow: "",
     },
     queued: {
-      label: "QUEUED",
+      label: "Queued",
       className: "text-warning bg-warning/10",
       icon: <Clock className="w-3 h-3" />,
-      glow: "shadow-[0_0_10px_hsla(var(--warning),0.2)]",
+      glow: "",
     },
     running: {
-      label: "EXECUTING",
+      label: "Running",
       className: "text-primary bg-primary/10",
       icon: <Loader2 className="w-3 h-3 animate-spin" />,
-      glow: "shadow-[0_0_10px_hsla(var(--primary),0.3)]",
+      glow: "",
     },
     completed: {
-      label: "RESOLVED",
+      label: "Succeeded",
       className: "text-success bg-success/10",
       icon: <CheckCircle2 className="w-3 h-3" />,
-      glow: "shadow-[0_0_10px_hsla(var(--success),0.2)]",
+      glow: "",
     },
     failed: {
-      label: "FAULT",
+      label: "Failed",
       className: "text-destructive bg-destructive/10",
       icon: <XCircle className="w-3 h-3" />,
-      glow: "shadow-[0_0_10px_hsla(var(--destructive),0.2)]",
+      glow: "",
     },
     cancelled: {
-      label: "ABORTED",
+      label: "Cancelled",
       className: "text-muted-foreground/60 bg-white/5",
       icon: <XCircle className="w-3 h-3" />,
       glow: "",
@@ -71,7 +71,7 @@ export function StatusBadge({ status }: { status: ExecStatus }) {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-2 text-[10px] font-black px-3 py-1 rounded-full border border-white/5 transition-premium uppercase tracking-widest",
+        "inline-flex items-center gap-2 text-xs font-semibold px-3 py-1 rounded-full border border-white/5 transition-premium",
         className,
         glow,
       )}
@@ -116,7 +116,7 @@ export function CompareLane({ lane }: { lane: LaneState }) {
   return (
     <div
       className={cn(
-        "flex flex-col gap-6 rounded-[2.5rem] border p-8 transition-premium relative overflow-hidden glass-dark shadow-2xl",
+        "flex flex-col gap-6 rounded-3xl border p-8 transition-premium relative overflow-hidden glass-dark shadow-2xl",
         isActive
           ? "border-primary/30 bg-primary/5 ring-1 ring-primary/20"
           : lane.status === "completed"
@@ -131,15 +131,15 @@ export function CompareLane({ lane }: { lane: LaneState }) {
       {/* Actor header */}
       <div className="flex items-start justify-between gap-4 relative z-10">
         <div className="flex items-center gap-4 min-w-0">
-          <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center shrink-0 shadow-xl transition-premium hover:scale-110">
+          <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center shrink-0 shadow-xl transition-premium">
             <Bot className="w-6 h-6 text-primary" />
           </div>
           <div className="min-w-0">
-            <p className="text-sm font-black text-white truncate font-outfit uppercase tracking-tight">
+            <p className="text-sm font-semibold text-white truncate font-outfit">
               {lane.actor.name}
             </p>
             {lane.actor.description && (
-              <p className="text-[10px] text-muted-foreground/40 font-bold truncate uppercase tracking-widest mt-1">
+              <p className="text-xs text-muted-foreground/70 font-bold truncate mt-1">
                 {lane.actor.description}
               </p>
             )}
@@ -153,20 +153,20 @@ export function CompareLane({ lane }: { lane: LaneState }) {
         <div className="flex items-center justify-between px-1">
           {lane.executionId && (
             <div className="flex flex-col gap-1">
-              <span className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.2em]">
-                PROTOCOL_ID
+              <span className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                Run ID
               </span>
-              <span className="text-[10px] text-white font-mono opacity-60">
+              <span className="text-xs text-white font-mono opacity-60">
                 {lane.executionId.slice(0, 12)}...
               </span>
             </div>
           )}
           {(lane.status === "completed" || lane.status === "failed") && (
             <div className="flex flex-col gap-1 items-end">
-              <span className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.2em]">
-                DURATION
+              <span className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                Duration
               </span>
-              <span className="text-[10px] text-white font-black uppercase tracking-widest">
+              <span className="text-xs text-white font-semibold">
                 {formatDuration(lane.durationMs)}
               </span>
             </div>
@@ -175,9 +175,9 @@ export function CompareLane({ lane }: { lane: LaneState }) {
 
         {/* Error */}
         {lane.status === "failed" && lane.errorMessage && (
-          <div className="flex items-start gap-3 bg-destructive/10 border border-destructive/20 rounded-[1.5rem] px-5 py-4 shadow-xl animate-in fade-in slide-in-from-top-2">
+          <div className="flex items-start gap-3 bg-destructive/10 border border-destructive/20 rounded-2xl px-5 py-4 shadow-xl animate-in fade-in slide-in-from-top-2">
             <AlertTriangle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
-            <p className="text-[11px] text-destructive/80 font-bold uppercase tracking-wide leading-relaxed">
+            <p className="text-xs text-destructive/80 font-bold leading-relaxed">
               {lane.errorMessage}
             </p>
           </div>
@@ -187,14 +187,14 @@ export function CompareLane({ lane }: { lane: LaneState }) {
         {lane.output && (
           <div className="space-y-3">
             <div className="flex items-center gap-2 ml-1">
-              <div className="w-1.5 h-1.5 rounded-full bg-primary shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
-              <p className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.2em]">
-                DATA_PAYLOAD
+              <div className="w-1.5 h-1.5 rounded-full bg-primary" />
+              <p className="text-xs text-muted-foreground/70 font-semibold">
+                Output
               </p>
             </div>
             <div className="relative group">
               <div className="absolute -inset-px bg-gradient-to-b from-white/10 to-transparent rounded-2xl opacity-0 group-hover:opacity-100 transition-premium" />
-              <pre className="text-[11px] text-white/80 bg-surface-4/60 border border-white/5 rounded-2xl p-5 overflow-auto max-h-80 whitespace-pre-wrap break-words font-mono leading-relaxed shadow-inner selection:bg-primary/30 shadow-2xl">
+              <pre className="text-xs text-white/80 bg-surface-4/60 border border-white/5 rounded-2xl p-5 overflow-auto max-h-80 whitespace-pre-wrap break-words font-mono leading-relaxed shadow-inner selection:bg-primary/30 shadow-2xl">
                 {tryPrettyJson(lane.output)}
               </pre>
             </div>
@@ -206,17 +206,15 @@ export function CompareLane({ lane }: { lane: LaneState }) {
           <div className="space-y-3 pt-2">
             <button
               onClick={() => setShowLogs((v) => !v)}
-              className="flex items-center gap-3 px-4 py-2 rounded-xl bg-white/5 border border-white/5 text-[10px] text-muted-foreground/60 font-black uppercase tracking-[0.2em] hover:text-white hover:bg-white/10 transition-premium"
+              className="flex items-center gap-3 px-4 py-2 rounded-xl bg-white/5 border border-white/5 text-xs text-muted-foreground/60 font-semibold hover:text-white hover:bg-white/10 transition-premium"
             >
               <Clock className="w-3 h-3" />
-              {showLogs
-                ? "DISMISS LOGS"
-                : `REVEAL TELEMETRY (${lane.logs.length})`}
+              {showLogs ? "Hide logs" : `Show logs (${lane.logs.length})`}
             </button>
             {showLogs && (
               <div
                 ref={logsRef}
-                className="text-[10px] font-mono text-muted-foreground/40 bg-surface-4/60 border border-white/5 rounded-2xl p-5 max-h-48 overflow-y-auto space-y-1 custom-scrollbar shadow-inner animate-in fade-in zoom-in-95"
+                className="text-xs font-mono text-muted-foreground/70 bg-surface-4/60 border border-white/5 rounded-2xl p-5 max-h-48 overflow-y-auto space-y-1 custom-scrollbar shadow-inner animate-in fade-in zoom-in-95"
               >
                 {lane.logs.map((line, i) => (
                   <div
@@ -238,10 +236,10 @@ export function CompareLane({ lane }: { lane: LaneState }) {
         {lane.status === "idle" && (
           <div className="flex flex-col items-center justify-center py-10 opacity-20 gap-3 grayscale">
             <div className="p-4 rounded-2xl bg-white/5 border border-white/10">
-              <Bot className="w-8 h-8 text-muted-foreground/30" />
+              <Bot className="w-8 h-8 text-muted-foreground/60" />
             </div>
-            <p className="text-[10px] text-muted-foreground/60 font-black uppercase tracking-[0.2em]">
-              AWAITING_COMMAND
+            <p className="text-xs text-muted-foreground/60 font-semibold">
+              Waiting to start
             </p>
           </div>
         )}

@@ -59,29 +59,25 @@ function StatusIcon({ status }: { status: string }) {
     case "awaiting_approval":
       return <Clock className="w-4 h-4 text-warning shrink-0" />;
     default:
-      return <Clock className="w-4 h-4 text-muted-foreground/40 shrink-0" />;
+      return <Clock className="w-4 h-4 text-muted-foreground/70 shrink-0" />;
   }
 }
 
 function StatusPill({ status }: { status: string }) {
   const cls =
     {
-      completed:
-        "bg-success/10 text-success border-success/20 shadow-[0_0_15px_hsla(var(--success),0.15)]",
-      failed:
-        "bg-destructive/10 text-destructive border-destructive/20 shadow-[0_0_15px_hsla(var(--destructive),0.15)]",
-      running:
-        "bg-primary/10 text-primary border-primary/20 shadow-[0_0_15px_hsla(var(--primary),0.15)]",
-      awaiting_approval:
-        "bg-warning/10 text-warning border-warning/20 shadow-[0_0_15px_hsla(var(--warning),0.15)]",
+      completed: "bg-success/10 text-success border-success/20",
+      failed: "bg-destructive/10 text-destructive border-destructive/20",
+      running: "bg-primary/10 text-primary border-primary/20",
+      awaiting_approval: "bg-warning/10 text-warning border-warning/20",
       pending: "bg-warning/10 text-warning border-warning/20",
       timeout: "bg-warning/10 text-warning border-warning/20",
-    }[status] ?? "bg-surface-4 text-muted-foreground/40 border-white/5";
+    }[status] ?? "bg-surface-4 text-muted-foreground/70 border-white/5";
 
   return (
     <span
       className={cn(
-        "px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-[0.2em] border transition-premium",
+        "px-3 py-1 rounded-full text-2xs font-semibold uppercase tracking-wider border transition-premium",
         cls,
       )}
     >
@@ -101,17 +97,17 @@ function TriggerBadge({ triggerType }: { triggerType: string | null }) {
     }
   > = {
     actor_dispatch: {
-      label: "ACTOR_LINK",
+      label: "Actor",
       cls: "text-violet-400 bg-violet-400/10 border-violet-400/20",
       Icon: Bot,
     },
     scheduled: {
-      label: "SCHEDULED",
+      label: "Schedule",
       cls: "text-cyan-400 bg-cyan-400/10 border-cyan-400/20",
       Icon: CalendarClock,
     },
     webhook: {
-      label: "WEBHOOK",
+      label: "Webhook",
       cls: "text-blue-400 bg-blue-400/10 border-blue-400/20",
       Icon: Webhook,
     },
@@ -119,7 +115,7 @@ function TriggerBadge({ triggerType }: { triggerType: string | null }) {
   const cfg = configs[triggerType];
   if (!cfg)
     return (
-      <span className="px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-[0.2em] border bg-surface-4 text-muted-foreground/40 border-white/5">
+      <span className="px-3 py-1 rounded-full text-2xs font-semibold uppercase tracking-wider border bg-surface-4 text-muted-foreground/70 border-white/5">
         {triggerType.replace(/_/g, " ")}
       </span>
     );
@@ -127,7 +123,7 @@ function TriggerBadge({ triggerType }: { triggerType: string | null }) {
   return (
     <span
       className={cn(
-        "flex items-center gap-2 px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-[0.2em] border transition-premium",
+        "flex items-center gap-2 px-3 py-1 rounded-full text-2xs font-semibold uppercase tracking-wider border transition-premium",
         cls,
       )}
     >
@@ -170,7 +166,7 @@ function ExecutionRow({
   return (
     <div
       className={cn(
-        "group border border-white/5 bg-surface-3/30 rounded-[2rem] overflow-hidden backdrop-blur-3xl transition-premium shadow-2xl relative",
+        "group border border-white/5 bg-surface-3/30 rounded-2xl overflow-hidden backdrop-blur-3xl transition-premium shadow-2xl relative",
         isExpanded
           ? "border-primary/30 bg-surface-3/60"
           : "hover:bg-surface-3/50 hover:border-white/10",
@@ -185,7 +181,7 @@ function ExecutionRow({
         onClick={onToggle}
         aria-expanded={isExpanded}
       >
-        <div className="shrink-0 flex items-center justify-center w-12 h-12 rounded-2xl bg-black/20 border border-white/5 group-hover:scale-110 transition-premium shadow-xl relative overflow-hidden">
+        <div className="shrink-0 flex items-center justify-center w-12 h-12 rounded-2xl bg-black/20 border border-white/5 transition-premium shadow-xl relative overflow-hidden">
           <div
             className={cn(
               "absolute inset-0 opacity-10 blur-xl",
@@ -200,7 +196,7 @@ function ExecutionRow({
             <StatusPill status={exec.status} />
             <TriggerBadge triggerType={exec.triggerType} />
           </div>
-          <div className="flex items-center gap-4 text-muted-foreground/30 text-[10px] font-black uppercase tracking-widest truncate">
+          <div className="flex items-center gap-4 text-muted-foreground/60 text-xs font-semibold truncate">
             <span className="flex items-center gap-2">
               <Clock size={12} />
               {formatDistanceToNow(new Date(exec.startedAt), {
@@ -217,12 +213,12 @@ function ExecutionRow({
         </div>
 
         <div className="flex flex-col items-end gap-2 shrink-0 pr-2">
-          <span className="text-[11px] text-white/60 font-black uppercase tracking-widest font-outfit">
+          <span className="text-xs text-white/60 font-semibold font-outfit">
             {formatDuration(exec.durationMs)}
           </span>
           <ChevronRight
             className={cn(
-              "w-5 h-5 text-muted-foreground/20 shrink-0 transition-transform duration-500",
+              "w-5 h-5 text-muted-foreground/50 shrink-0 transition-transform duration-500",
               isExpanded && "rotate-90 text-primary",
             )}
           />
@@ -250,14 +246,14 @@ function ExecutionRow({
                       onRetry(exec.id);
                     }}
                     disabled={isRetrying}
-                    className="h-11 px-6 text-[10px] font-black uppercase tracking-[0.2em] rounded-2xl bg-violet-500/10 border border-violet-500/20 text-violet-400 hover:bg-violet-500/20 active:scale-95 transition-premium shadow-xl"
+                    className="h-11 px-6 text-sm font-semibold rounded-2xl bg-violet-500/10 border border-violet-500/20 text-violet-400 hover:bg-violet-500/20 active:scale-95 transition-premium shadow-xl"
                   >
                     {isRetrying ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
                     ) : (
                       <RotateCcw className="w-4 h-4" />
                     )}
-                    RETRY_EXECUTION
+                    Retry
                   </Button>
                 )}
               {onResume && exec.status === "awaiting_approval" && (
@@ -267,14 +263,14 @@ function ExecutionRow({
                     onResume(exec.id);
                   }}
                   disabled={isResuming}
-                  className="h-11 px-6 text-[10px] font-black uppercase tracking-[0.2em] rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20 active:scale-95 transition-premium shadow-xl"
+                  className="h-11 px-6 text-sm font-semibold rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20 active:scale-95 transition-premium shadow-xl"
                 >
                   {isResuming ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
                   ) : (
                     <PlayCircle className="w-4 h-4" />
                   )}
-                  RESUME_PROTOCOL
+                  Resume
                 </Button>
               )}
             </div>
@@ -282,16 +278,16 @@ function ExecutionRow({
 
           {exec.errorMessage && (
             <div className="space-y-4">
-              <label className="text-[10px] text-destructive uppercase tracking-[0.3em] font-black ml-1">
-                Operational Fault
+              <label className="text-xs text-destructive font-semibold ml-1">
+                Error
               </label>
               <div className="relative group/error">
                 <div className="absolute -inset-1 bg-destructive/10 rounded-3xl blur opacity-30 group-hover/error:opacity-50 transition-premium" />
-                <div className="relative p-6 bg-destructive/5 rounded-[2rem] border border-destructive/20 text-[12px] font-bold text-destructive shadow-2xl leading-relaxed">
+                <div className="relative p-6 bg-destructive/5 rounded-2xl border border-destructive/20 text-[12px] font-bold text-destructive shadow-2xl leading-relaxed">
                   <div className="flex items-center gap-3 mb-4 opacity-60">
                     <XCircle className="w-4 h-4" />
-                    <span className="font-black uppercase tracking-widest text-[9px]">
-                      CRITICAL_EXCEPTION
+                    <span className="font-semibold uppercase tracking-wider text-2xs">
+                      Run failed
                     </span>
                   </div>
                   <div className="bg-black/40 p-4 rounded-2xl border border-destructive/10 font-mono">
@@ -304,9 +300,9 @@ function ExecutionRow({
 
           <div className="space-y-4">
             <div className="flex items-center justify-between px-2">
-              <p className="text-muted-foreground/30 text-[10px] font-black uppercase tracking-[0.3em] flex items-center gap-3">
+              <p className="text-muted-foreground/60 text-xs font-semibold flex items-center gap-3">
                 <Activity className="w-4 h-4 text-primary" />
-                Telemetric Stream
+                Output
               </p>
               {outputText && (
                 <button
@@ -314,7 +310,7 @@ function ExecutionRow({
                     navigator.clipboard.writeText(outputText);
                     toast.success("Output copied to clipboard");
                   }}
-                  className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/40 hover:text-white transition-premium shadow-lg"
+                  className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white transition-premium shadow-lg"
                   title="Copy Output"
                 >
                   <Copy className="w-4 h-4" />
@@ -323,19 +319,19 @@ function ExecutionRow({
             </div>
             {outputText ? (
               <div className="relative">
-                <div className="absolute inset-0 bg-primary/5 rounded-[2rem] blur-3xl opacity-20 pointer-events-none" />
-                <div className="relative p-6 bg-black/40 rounded-[2rem] border border-white/5 shadow-2xl group overflow-hidden">
+                <div className="absolute inset-0 bg-primary/5 rounded-2xl blur-3xl opacity-20 pointer-events-none" />
+                <div className="relative p-6 bg-black/40 rounded-2xl border border-white/5 shadow-2xl group overflow-hidden">
                   <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-20 pointer-events-none" />
-                  <pre className="relative z-10 overflow-x-auto whitespace-pre-wrap max-h-96 text-[11px] font-mono text-foreground/70 custom-scrollbar selection:bg-primary/20 leading-relaxed p-2">
+                  <pre className="relative z-10 overflow-x-auto whitespace-pre-wrap max-h-96 text-xs font-mono text-foreground/70 custom-scrollbar selection:bg-primary/20 leading-relaxed p-2">
                     {outputText}
                   </pre>
                   <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.1)_50%),linear-gradient(90deg,rgba(255,0,0,0.02),rgba(0,255,0,0.01),rgba(0,0,255,0.02))] bg-[length:100%_4px,3px_100%]" />
                 </div>
               </div>
             ) : (
-              <div className="flex flex-col items-center justify-center py-12 px-6 bg-black/20 rounded-[2rem] border border-white/5 border-dashed">
-                <p className="text-muted-foreground/10 text-[10px] font-black uppercase tracking-[0.4em] italic">
-                  NULL_TELEMETRY_RECORD
+              <div className="flex flex-col items-center justify-center py-12 px-6 bg-black/20 rounded-2xl border border-white/5 border-dashed">
+                <p className="text-muted-foreground/30 text-xs font-semibold italic">
+                  No output recorded
                 </p>
               </div>
             )}
@@ -442,9 +438,8 @@ export const WorkflowExecutionHistoryPanel = React.memo(
           <div className="flex items-center gap-6">
             <div
               className={cn(
-                "flex items-center justify-center w-12 h-12 rounded-[1.25rem] bg-surface-3/60 border border-white/5 shadow-2xl transition-premium relative overflow-hidden",
-                hasRunning &&
-                  "border-primary/40 shadow-[0_0_25px_hsla(var(--primary),0.2)]",
+                "flex items-center justify-center w-12 h-12 rounded-2xl bg-surface-3/60 border border-white/5 shadow-2xl transition-premium relative overflow-hidden",
+                hasRunning && "border-primary/40",
               )}
             >
               <div
@@ -456,22 +451,22 @@ export const WorkflowExecutionHistoryPanel = React.memo(
               {hasRunning ? (
                 <Activity className="w-6 h-6 text-primary relative z-10" />
               ) : (
-                <Clock className="w-6 h-6 text-muted-foreground/40 relative z-10" />
+                <Clock className="w-6 h-6 text-muted-foreground/70 relative z-10" />
               )}
             </div>
             <div className="flex flex-col gap-1">
-              <h4 className="text-md font-black text-white tracking-tight font-outfit uppercase">
-                {onClose ? "Execution Registry" : "Execution Log"}
+              <h4 className="text-md font-semibold text-white tracking-tight font-outfit">
+                {onClose ? "Runs" : "Run history"}
               </h4>
               <div className="flex items-center gap-3">
-                <span className="text-[10px] text-muted-foreground/30 font-black uppercase tracking-[0.3em]">
-                  {onClose ? workflowName : "Historical Telemetry"}
+                <span className="text-xs text-muted-foreground/60 font-semibold">
+                  {onClose ? workflowName : "Past runs of this workflow"}
                 </span>
                 {hasRunning && (
-                  <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full shadow-[0_0_15px_hsla(var(--primary),0.1)]">
+                  <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full">
                     <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-                    <span className="text-[9px] font-black text-primary tracking-[0.2em] uppercase">
-                      Capture_Active
+                    <span className="text-2xs font-semibold text-primary tracking-wider uppercase">
+                      Running
                     </span>
                   </div>
                 )}
@@ -481,33 +476,31 @@ export const WorkflowExecutionHistoryPanel = React.memo(
           <Button
             onClick={() => refetch()}
             disabled={isFetching}
-            className="flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.2em] text-white/40 hover:text-white bg-white/5 hover:bg-white/10 px-6 h-12 rounded-2xl transition-premium active:scale-95 disabled:opacity-50 border border-white/5 shadow-2xl"
+            className="flex items-center gap-3 text-sm font-semibold text-white/70 hover:text-white bg-white/5 hover:bg-white/10 px-6 h-12 rounded-2xl transition-premium active:scale-95 disabled:opacity-50 border border-white/5 shadow-2xl"
           >
             <RefreshCw
               className={cn("w-4 h-4", isFetching && "animate-spin")}
             />
-            REFRESH_STREAM
+            Refresh
           </Button>
         </div>
 
         {/* Content */}
         {isLoading ? (
-          <div className="flex flex-col items-center justify-center py-24 gap-6 text-muted-foreground/20 animate-in fade-in duration-1000">
+          <div className="flex flex-col items-center justify-center py-24 gap-6 text-muted-foreground/50 animate-in fade-in duration-1000">
             <div className="relative">
-              <Loader2 className="w-12 h-12 animate-spin text-primary/40" />
+              <Loader2 className="w-12 h-12 animate-spin text-primary/70" />
               <div className="absolute inset-0 blur-xl bg-primary/20 animate-pulse" />
             </div>
-            <p className="text-[11px] font-black uppercase tracking-[0.4em]">
-              Synchronizing Registry...
-            </p>
+            <p className="text-xs font-semibold">Synchronizing Registry...</p>
           </div>
         ) : history.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-24 px-10 text-center bg-white/[0.02] rounded-[3rem] border border-white/5 border-dashed">
+          <div className="flex flex-col items-center justify-center py-24 px-10 text-center bg-white/[0.02] rounded-3xl border border-white/5 border-dashed">
             <div className="w-20 h-20 rounded-full bg-white/5 border border-white/5 flex items-center justify-center mb-6 opacity-40">
-              <Clock className="w-8 h-8 text-muted-foreground/20" />
+              <Clock className="w-8 h-8 text-muted-foreground/50" />
             </div>
-            <p className="text-[11px] font-black text-muted-foreground/10 uppercase tracking-[0.4em]">
-              NO_EXECUTION_RECORDS_FOUND
+            <p className="text-xs font-semibold text-muted-foreground/30">
+              No runs yet
             </p>
           </div>
         ) : (
@@ -537,7 +530,7 @@ export const WorkflowExecutionHistoryPanel = React.memo(
         <Dialog
           open={true}
           onClose={onClose}
-          title="Telemetry Feed"
+          title="Run history"
           className="max-w-2xl"
         >
           {content}

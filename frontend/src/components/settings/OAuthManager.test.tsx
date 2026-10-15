@@ -71,7 +71,7 @@ describe("OAuthManager", () => {
         screen.getByText(/No active credential link for Google/i),
       ).toBeInTheDocument(),
     );
-    expect(screen.getAllByText("ESTABLISH_LINK").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Connect").length).toBeGreaterThan(0);
   });
 
   it("redirects to the OAuth provider on a valid link URL", async () => {
@@ -89,7 +89,7 @@ describe("OAuthManager", () => {
     render(<OAuthManager />);
     await waitFor(() => expect(screen.getByText("Google")).toBeInTheDocument());
 
-    fireEvent.click(screen.getAllByText("ESTABLISH_LINK")[0]);
+    fireEvent.click(screen.getAllByText("Connect")[0]);
 
     await waitFor(() => {
       expect(window.location.href).toBe(
@@ -122,11 +122,11 @@ describe("OAuthManager", () => {
       expect(screen.getByText("user@example.com")).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByText("Disconnect_Protocol"));
+    fireEvent.click(screen.getByText("Disconnect"));
 
     await waitFor(() =>
-      expect(screen.getByText("Sever Protocol Link?")).toBeInTheDocument(),
+      expect(screen.getByText("Disconnect provider?")).toBeInTheDocument(),
     );
-    expect(screen.getByText("Sever Link")).toBeInTheDocument();
+    expect(screen.getAllByText("Disconnect")).toHaveLength(2);
   });
 });

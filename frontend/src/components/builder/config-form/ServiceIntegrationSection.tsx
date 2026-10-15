@@ -32,7 +32,7 @@ export function ServiceIntegrationSection({
       <CollapsibleTrigger asChild>
         <button
           type="button"
-          className="w-full p-4 bg-surface-3 hover:bg-surface-4 border border-white/5 rounded-2xl cursor-pointer text-[10px] font-black text-white uppercase tracking-widest flex items-center justify-between transition-premium shadow-xl group-hover/collapsible:border-primary/20"
+          className="w-full p-4 bg-surface-3 hover:bg-surface-4 border border-white/5 rounded-2xl cursor-pointer text-xs font-semibold text-white flex items-center justify-between transition-premium shadow-xl group-hover/collapsible:border-primary/20"
         >
           <div className="flex items-center gap-3">
             <div className="p-1.5 rounded-lg bg-primary/10 text-primary">
@@ -40,7 +40,7 @@ export function ServiceIntegrationSection({
             </div>
             <span>Configure Unified Integration</span>
           </div>
-          <ChevronDown className="h-4 w-4 text-muted-foreground/40 group-data-[state=open]/collapsible:rotate-180 transition-transform duration-500" />
+          <ChevronDown className="h-4 w-4 text-muted-foreground/70 group-data-[state=open]/collapsible:rotate-180 transition-transform duration-500" />
         </button>
       </CollapsibleTrigger>
       <CollapsibleContent className="mt-4 space-y-4 animate-in fade-in slide-in-from-top-2 duration-500">
@@ -66,10 +66,10 @@ export function ServiceIntegrationSection({
           (templateName.toLowerCase().includes("gmail") ||
             templateName.toLowerCase().includes("google-mail")) && (
             <div className="p-6 bg-surface-2/60 border border-white/5 rounded-2xl">
-              <div className="text-[10px] font-black text-primary uppercase tracking-[0.2em] mb-3 flex items-center gap-3">
-                <Mail className="h-4 w-4" /> Gmail Integration Vector
+              <div className="text-xs font-semibold text-primary mb-3 flex items-center gap-3">
+                <Mail className="h-4 w-4" /> Gmail
               </div>
-              <p className="m-0 text-[11px] font-bold text-muted-foreground/40 leading-relaxed uppercase tracking-widest">
+              <p className="m-0 text-xs text-muted-foreground/70 leading-relaxed">
                 Direct Gmail binding coming soon. Manually configure labels in
                 primary settings.
               </p>

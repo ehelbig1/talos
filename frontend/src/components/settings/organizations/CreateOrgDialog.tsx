@@ -33,25 +33,24 @@ export function CreateOrgDialog({
   onSubmit: () => void;
 }): React.ReactElement {
   return (
-    <Dialog open={open} onClose={onClose} title="Establish Syndicate">
+    <Dialog open={open} onClose={onClose} title="New organization">
       <div className="space-y-8">
         <div className="p-6 bg-primary/5 border border-primary/10 rounded-2xl flex items-start gap-4">
           <Building2 className="w-5 h-5 text-primary shrink-0 mt-0.5" />
-          <p className="text-[11px] text-muted-foreground/60 leading-relaxed font-medium">
-            Establish a new governing protocol. Organizations allow you to group
-            multiple operatives and resources under a single administrative
+          <p className="text-xs text-muted-foreground/60 leading-relaxed font-medium">
+            Organizations group members and resources under one administrative
             umbrella.
           </p>
         </div>
 
         <div className="space-y-6">
           <div className="space-y-2.5">
-            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 ml-1">
-              Organization_Identity
+            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
+              Name
             </label>
             <div className="relative group">
               <Input
-                placeholder="e.g. TACTICAL_UNIT_ALPHA"
+                placeholder="e.g. Acme Robotics"
                 value={name}
                 onChange={(e) => {
                   const value = e.target.value;
@@ -71,15 +70,15 @@ export function CreateOrgDialog({
           </div>
 
           <div className="space-y-2.5">
-            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 ml-1">
-              Uplink_Identifier
+            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
+              URL slug
             </label>
             <div className="relative flex items-center">
-              <span className="absolute left-4 text-muted-foreground/30 font-outfit text-sm">
+              <span className="absolute left-4 text-muted-foreground/60 font-outfit text-sm">
                 talos.sh/
               </span>
               <Input
-                placeholder="tactical-alpha"
+                placeholder="acme-robotics"
                 value={slug}
                 onChange={(e) =>
                   onSlugChange(
@@ -89,8 +88,8 @@ export function CreateOrgDialog({
                 className="h-14 bg-white/[0.03] border-white/10 focus:border-primary/50 focus:ring-primary/20 rounded-xl pl-[4.5rem] font-mono text-sm text-white placeholder:text-white/10 transition-premium"
               />
             </div>
-            <p className="text-[9px] text-muted-foreground/20 font-black uppercase tracking-widest ml-1">
-              LOWERCASE_ALPHANUMERIC_ONLY
+            <p className="text-2xs text-muted-foreground/50 font-semibold uppercase tracking-wider ml-1">
+              Lowercase letters, numbers and hyphens only
             </p>
           </div>
         </div>
@@ -98,10 +97,10 @@ export function CreateOrgDialog({
         <div className="flex gap-4 pt-4">
           <Button
             variant="outline"
-            className="flex-1 h-14 rounded-xl border-white/10 hover:bg-white/5 text-[10px] font-black uppercase tracking-widest"
+            className="flex-1 h-14 rounded-xl border-white/10 hover:bg-white/5 text-sm font-semibold"
             onClick={onAbort}
           >
-            ABORT_MISSION
+            Cancel
           </Button>
           <Button
             variant="premium"
@@ -109,7 +108,7 @@ export function CreateOrgDialog({
             disabled={!name || !slug || isPending}
             onClick={onSubmit}
           >
-            {isPending ? <LoadingSpinner /> : "ESTABLISH_UPLINK"}
+            {isPending ? <LoadingSpinner /> : "Create organization"}
           </Button>
         </div>
       </div>

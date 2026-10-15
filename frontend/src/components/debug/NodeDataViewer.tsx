@@ -59,7 +59,7 @@ const StringValue: React.FC<{ value: string }> = ({ value }) => {
         <button
           type="button"
           onClick={() => setExpanded(!expanded)}
-          className="ml-1 text-[9px] text-violet-400 hover:text-violet-300 underline underline-offset-2 transition-premium"
+          className="ml-1 text-2xs text-violet-400 hover:text-violet-300 underline underline-offset-2 transition-premium"
         >
           {expanded ? "collapse" : "expand"}
         </button>
@@ -90,7 +90,7 @@ const ArrayValue: React.FC<{
         {collapsed ? "[ ... ]" : "["}
       </button>
       {collapsed && (
-        <span className="text-[9px] text-muted-foreground/50 ml-1">
+        <span className="text-2xs text-muted-foreground/50 ml-1">
           {items.length} items
         </span>
       )}
@@ -136,7 +136,7 @@ const ObjectValue: React.FC<{
         {collapsed ? "{ ... }" : "{"}
       </button>
       {collapsed && (
-        <span className="text-[9px] text-muted-foreground/50 ml-1">
+        <span className="text-2xs text-muted-foreground/50 ml-1">
           {keys.length} keys
         </span>
       )}

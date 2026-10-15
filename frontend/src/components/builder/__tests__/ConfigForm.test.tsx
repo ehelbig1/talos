@@ -20,9 +20,7 @@ describe("ConfigForm", () => {
     render(<ConfigForm schema={mockSchema} value={{}} onChange={onChange} />);
 
     expect(screen.getByText(/Endpoint URL/i)).toBeInTheDocument();
-    expect(
-      screen.getByText(/Extended Configuration Vector/i),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/More settings/i)).toBeInTheDocument();
   });
 
   it("calls onChange when values change", () => {

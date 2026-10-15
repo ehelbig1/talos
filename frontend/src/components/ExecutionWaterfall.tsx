@@ -112,9 +112,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
             <path d="M9 21V9" />
           </svg>
         </div>
-        <p className="text-[10px] font-black uppercase tracking-[0.3em]">
-          No Telemetry Data
-        </p>
+        <p className="text-xs font-semibold">No timing data for this run</p>
       </div>
     );
   }
@@ -162,7 +160,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
                 x={x}
                 y={SVG_HEIGHT - 15}
                 textAnchor="middle"
-                className="fill-white/20 font-black text-[9px] tracking-widest"
+                className="fill-white/20 font-semibold text-2xs tracking-wider"
               >
                 {ms >= 1000 ? `${(ms / 1000).toFixed(1)}S` : `${ms}MS`}
               </text>
@@ -201,7 +199,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
                 x={LABEL_WIDTH - 20}
                 y={y + ROW_HEIGHT / 2 - 2}
                 textAnchor="end"
-                className="fill-white/40 group-hover/bar:fill-white font-black text-[10px] uppercase tracking-widest transition-premium"
+                className="fill-white/40 group-hover/bar:fill-white font-semibold text-xs transition-premium"
               >
                 {bar.nodeName.length > 24
                   ? bar.nodeName.slice(0, 22) + "..."
@@ -238,7 +236,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
               <text
                 x={barX + barW + 12}
                 y={y + ROW_HEIGHT / 2 - 2}
-                className="fill-white/20 font-mono text-[9px] font-bold group-hover/bar:fill-white/60 transition-premium"
+                className="fill-white/20 font-mono text-2xs font-bold group-hover/bar:fill-white/60 transition-premium"
               >
                 {bar.durationMs >= 1000
                   ? `${(bar.durationMs / 1000).toFixed(1)}S`

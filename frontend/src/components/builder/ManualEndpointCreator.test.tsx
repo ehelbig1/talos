@@ -11,16 +11,16 @@ describe("ManualEndpointCreator", () => {
     mockOnConfigure.mockClear();
   });
 
-  it('renders "Manual Vector Definition" button initially', () => {
+  it('renders "Define endpoint manually" button initially', () => {
     render(
       <ManualEndpointCreator baseUrl={baseUrl} onConfigure={mockOnConfigure} />,
     );
-    expect(screen.getByText(/Manual Vector Definition/i)).toBeInTheDocument();
+    expect(screen.getByText(/Define endpoint manually/i)).toBeInTheDocument();
   });
 
   it("disabled button if baseUrl is missing", () => {
     render(<ManualEndpointCreator baseUrl="" onConfigure={mockOnConfigure} />);
-    const btn = screen.getByText(/Manual Vector Definition/i).closest("button");
+    const btn = screen.getByText(/Define endpoint manually/i).closest("button");
     expect(btn).toBeDisabled();
   });
 
@@ -29,7 +29,7 @@ describe("ManualEndpointCreator", () => {
       <ManualEndpointCreator baseUrl={baseUrl} onConfigure={mockOnConfigure} />,
     );
 
-    fireEvent.click(screen.getByText(/Manual Vector Definition/i));
+    fireEvent.click(screen.getByText(/Define endpoint manually/i));
 
     expect(screen.getByText(/Method/i)).toBeInTheDocument();
     expect(
@@ -42,7 +42,7 @@ describe("ManualEndpointCreator", () => {
       <ManualEndpointCreator baseUrl={baseUrl} onConfigure={mockOnConfigure} />,
     );
 
-    fireEvent.click(screen.getByText(/Manual Vector Definition/i));
+    fireEvent.click(screen.getByText(/Define endpoint manually/i));
 
     // Add query parameter
     fireEvent.click(screen.getByRole("button", { name: /query/i }));
@@ -72,21 +72,18 @@ describe("ManualEndpointCreator", () => {
       <ManualEndpointCreator baseUrl={baseUrl} onConfigure={mockOnConfigure} />,
     );
 
-    fireEvent.click(screen.getByText(/Manual Vector Definition/i));
+    fireEvent.click(screen.getByText(/Define endpoint manually/i));
 
     // Fill form
     fireEvent.change(screen.getByPlaceholderText(/\/API\/V1\/RESOURCES/i), {
       target: { value: "/test-path" },
     });
-    fireEvent.change(
-      screen.getByPlaceholderText(/RETRIEVE TARGET RESOURCE BY IDENTIFIER/i),
-      {
-        target: { value: "Test Summary" },
-      },
-    );
+    fireEvent.change(screen.getByPlaceholderText(/Get a user by ID/i), {
+      target: { value: "Test Summary" },
+    });
 
     // Save
-    fireEvent.click(screen.getByText(/Synthesize & Lock Vector/i));
+    fireEvent.click(screen.getByText(/Save endpoint/i));
 
     // Should now show EndpointSelector with our new endpoint
     expect(screen.getByText("GET")).toBeInTheDocument();

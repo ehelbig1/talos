@@ -126,27 +126,27 @@ function NodeTraceCard({
         onClick={() => setExpanded((v) => !v)}
         disabled={!hasDetail}
       >
-        <span className="text-[10px] font-black text-muted-foreground/30 w-5 shrink-0 tabular-nums">
+        <span className="text-xs font-semibold text-muted-foreground/60 w-5 shrink-0 tabular-nums">
           {String(index + 1).padStart(2, "0")}
         </span>
         <div
           className={cn(
-            "flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[9px] font-black border shrink-0 uppercase tracking-widest",
+            "flex items-center gap-1.5 px-2.5 py-1 rounded-md text-2xs font-semibold border shrink-0 uppercase tracking-wider",
             statusConfig.color,
           )}
         >
           {statusConfig.icon}
           {trace.status}
         </div>
-        <span className="text-xs font-bold text-foreground/80 flex-1 truncate uppercase tracking-tight">
+        <span className="text-xs font-bold text-foreground/80 flex-1 truncate tracking-tight">
           {nodeLabel ?? (
-            <code className="font-mono text-muted-foreground/40">
+            <code className="font-mono text-muted-foreground/70">
               {trace.nodeId.slice(0, 8)}
             </code>
           )}
         </span>
         {trace.durationMs != null && (
-          <span className="text-[9px] font-black text-muted-foreground/40 tabular-nums shrink-0">
+          <span className="text-2xs font-semibold text-muted-foreground/70 tabular-nums shrink-0">
             {trace.durationMs}ms
           </span>
         )}
@@ -165,12 +165,12 @@ function NodeTraceCard({
         <div className="border-t border-white/5 px-6 pb-6 space-y-5 pt-5 animate-in slide-in-from-top-2 duration-300">
           {trace.logMessage && (
             <div className="space-y-3">
-              <p className="text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em] ml-1">
+              <p className="text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider ml-1">
                 {trace.status === "failed" ? "Diagnostic Fault" : "Node Log"}
               </p>
               <pre
                 className={cn(
-                  "text-[10px] font-mono border rounded-[1.25rem] p-5 overflow-x-auto max-h-48 whitespace-pre-wrap shadow-inner leading-relaxed",
+                  "text-xs font-mono border rounded-2xl p-5 overflow-x-auto max-h-48 whitespace-pre-wrap shadow-inner leading-relaxed",
                   trace.status === "failed"
                     ? "text-destructive/80 bg-destructive/10 border-destructive/20 font-bold"
                     : "text-foreground/60 bg-surface-4/60 border-white/5",
@@ -182,10 +182,10 @@ function NodeTraceCard({
           )}
           {trace.output && (
             <div className="space-y-3">
-              <p className="text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em] ml-1">
+              <p className="text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider ml-1">
                 Egress Result
               </p>
-              <pre className="text-[10px] font-mono text-primary/60 bg-primary/5 border border-primary/10 rounded-[1.25rem] p-5 overflow-x-auto max-h-64 whitespace-pre-wrap shadow-inner leading-relaxed">
+              <pre className="text-xs font-mono text-primary/60 bg-primary/5 border border-primary/10 rounded-2xl p-5 overflow-x-auto max-h-64 whitespace-pre-wrap shadow-inner leading-relaxed">
                 {trace.output}
               </pre>
             </div>
@@ -280,7 +280,7 @@ export function TestWorkflowModal({
       JSON.parse(v);
       setJsonError(null);
     } catch {
-      setJsonError("Invalid JSON Protocol");
+      setJsonError("Invalid JSON");
     }
   };
 
@@ -376,25 +376,25 @@ export function TestWorkflowModal({
     >
       <div className="space-y-8 relative z-10 p-2 -mt-4">
         <div className="flex items-center justify-between mb-2">
-          <p className="text-[11px] text-muted-foreground/60 font-medium truncate max-w-[400px] uppercase tracking-widest leading-none">
+          <p className="text-xs text-muted-foreground/60 font-medium truncate max-w-[400px] leading-none">
             {workflowName}
           </p>
           <div className="flex items-center gap-2">
-            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_hsla(var(--success),0.5)] animate-pulse" />
-            <span className="text-[9px] font-black text-emerald-500/60 uppercase tracking-[0.2em]">
-              Sandboxed Protocol
+            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+            <span className="text-2xs font-semibold text-emerald-500/60 uppercase tracking-wider">
+              Sandboxed
             </span>
           </div>
         </div>
 
         {/* Mock inputs */}
-        <div className="bg-surface-4/40 border border-white/5 rounded-[2rem] p-8 space-y-6 shadow-inner glass-light">
+        <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-8 space-y-6 shadow-inner glass-light">
           <div className="flex items-center justify-between">
-            <label className="text-[10px] font-black uppercase tracking-[0.3em] text-muted-foreground/40 ml-1">
+            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
               Synthetic Trigger Ingress (JSON)
             </label>
             {jsonError && (
-              <span className="text-[9px] font-black text-destructive uppercase tracking-widest animate-pulse">
+              <span className="text-2xs font-semibold text-destructive uppercase tracking-wider animate-pulse">
                 {jsonError}
               </span>
             )}
@@ -405,7 +405,7 @@ export function TestWorkflowModal({
             rows={4}
             spellCheck={false}
             className={cn(
-              "w-full bg-surface-3/40 border focus:outline-none focus:ring-1 rounded-2xl px-6 py-5 text-[11px] font-mono text-foreground placeholder:text-muted-foreground/10 resize-none transition-premium shadow-inner uppercase tracking-wider",
+              "w-full bg-surface-3/40 border focus:outline-none focus:ring-1 rounded-2xl px-6 py-5 text-sm font-mono text-foreground placeholder:text-muted-foreground/50 resize-none transition-premium shadow-inner",
               jsonError
                 ? "border-destructive/40 focus:border-destructive focus:ring-destructive/20"
                 : "border-white/5 focus:border-primary/40 focus:ring-primary/20",
@@ -414,25 +414,25 @@ export function TestWorkflowModal({
           <div className="flex items-center justify-between gap-6">
             <div className="flex items-start gap-3 flex-1">
               <AlertTriangle className="w-4 h-4 text-warning/40 shrink-0 mt-0.5" />
-              <p className="text-[10px] text-muted-foreground/30 font-bold uppercase tracking-widest leading-relaxed">
-                Executes the current DAG in a transient sandbox. Streams live
-                telemetry until the run resolves.
+              <p className="text-xs text-muted-foreground/60 leading-relaxed">
+                Runs the current graph in a sandbox and streams node output
+                until the run finishes.
               </p>
             </div>
             <Button
               onClick={handleRun}
               disabled={!!jsonError || testMutation.isPending || isRunning}
-              className="bg-primary hover:bg-primary/90 text-white font-black px-10 h-14 rounded-2xl shadow-2xl shadow-primary/20 transition-premium flex items-center gap-3 uppercase tracking-widest text-[10px] border border-white/10 shrink-0"
+              className="bg-primary hover:bg-primary/90 text-white font-semibold px-10 h-14 rounded-2xl shadow-2xl transition-premium flex items-center gap-3 text-sm border border-white/10 shrink-0"
             >
               {testMutation.isPending || isRunning ? (
                 <>
                   <LoadingSpinner className="w-4 h-4" />
-                  <span>{isRunning ? "EXECUTING..." : "DISPATCHING..."}</span>
+                  <span>{isRunning ? "Running…" : "Starting…"}</span>
                 </>
               ) : (
                 <>
                   <Play className="w-3.5 h-3.5 fill-current" />
-                  INITIATE RUN
+                  Run test
                 </>
               )}
             </Button>
@@ -440,13 +440,13 @@ export function TestWorkflowModal({
         </div>
 
         {/* Results */}
-        <div className="max-h-[460px] overflow-y-auto custom-scrollbar border border-white/5 rounded-[2rem] bg-surface-4/20 shadow-inner">
+        <div className="max-h-[460px] overflow-y-auto custom-scrollbar border border-white/5 rounded-2xl bg-surface-4/20 shadow-inner">
           {phase === "idle" && !testMutation.isPending && (
             <div className="flex flex-col items-center justify-center py-24 text-center px-6 opacity-20">
-              <div className="w-16 h-16 rounded-[1.5rem] bg-surface-3 border border-white/5 flex items-center justify-center mb-6 shadow-2xl">
+              <div className="w-16 h-16 rounded-2xl bg-surface-3 border border-white/5 flex items-center justify-center mb-6 shadow-2xl">
                 <Terminal size={32} className="text-muted-foreground" />
               </div>
-              <p className="text-[10px] font-black text-muted-foreground uppercase tracking-[0.4em]">
+              <p className="text-xs font-semibold text-muted-foreground">
                 Awaiting Diagnostic Initiation
               </p>
             </div>
@@ -458,7 +458,7 @@ export function TestWorkflowModal({
               <div className="flex items-center gap-4 flex-wrap">
                 <div
                   className={cn(
-                    "flex items-center gap-2 px-4 py-2 rounded-xl border text-[10px] font-black uppercase tracking-widest shadow-lg",
+                    "flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-semibold shadow-lg",
                     phase === "completed"
                       ? "bg-success/10 text-success border-success/20"
                       : phase === "failed"
@@ -480,7 +480,7 @@ export function TestWorkflowModal({
                   {isTerminal ? phase : "running"}
                 </div>
                 {elapsedMs != null && (
-                  <div className="flex items-center gap-2 px-4 py-2 rounded-xl border border-white/5 bg-white/[0.02] text-[10px] text-muted-foreground font-black uppercase tracking-widest shadow-lg">
+                  <div className="flex items-center gap-2 px-4 py-2 rounded-xl border border-white/5 bg-white/[0.02] text-xs text-muted-foreground font-semibold shadow-lg">
                     <Clock className="w-3.5 h-3.5 opacity-40" />
                     {elapsedMs}ms
                   </div>
@@ -489,17 +489,17 @@ export function TestWorkflowModal({
                   <div className="flex flex-col items-end gap-1">
                     <div className="flex items-center gap-3">
                       {succeeded > 0 && (
-                        <span className="text-success text-[10px] font-black uppercase tracking-widest">
+                        <span className="text-success text-xs font-semibold">
                           {succeeded} SUCCESS
                         </span>
                       )}
                       {failed > 0 && (
-                        <span className="text-destructive text-[10px] font-black uppercase tracking-widest">
+                        <span className="text-destructive text-xs font-semibold">
                           {failed} FAILURE
                         </span>
                       )}
                       {skipped > 0 && (
-                        <span className="text-muted-foreground/40 text-[10px] font-black uppercase tracking-widest">
+                        <span className="text-muted-foreground/70 text-xs font-semibold">
                           {skipped} SKIPPED
                         </span>
                       )}
@@ -520,13 +520,13 @@ export function TestWorkflowModal({
 
               {/* Global error */}
               {runError && (
-                <div className="bg-destructive/5 border border-destructive/20 rounded-[2rem] p-6 flex items-start gap-4 shadow-2xl glass-light">
+                <div className="bg-destructive/5 border border-destructive/20 rounded-2xl p-6 flex items-start gap-4 shadow-2xl glass-light">
                   <Activity className="w-5 h-5 text-destructive shrink-0 mt-0.5" />
                   <div className="space-y-2">
-                    <p className="text-[10px] font-black text-destructive uppercase tracking-[0.2em]">
+                    <p className="text-xs font-semibold text-destructive">
                       Orchestration Failure
                     </p>
-                    <p className="text-[11px] text-destructive/80 leading-relaxed font-mono font-bold">
+                    <p className="text-xs text-destructive/80 leading-relaxed font-mono font-bold">
                       {sanitizeErrorMessage(runError)}
                     </p>
                   </div>
@@ -538,8 +538,8 @@ export function TestWorkflowModal({
                 <div className="space-y-4">
                   <div className="flex items-center gap-3 px-1 mb-6">
                     <div className="h-px flex-1 bg-white/5" />
-                    <p className="text-[10px] font-black text-muted-foreground/20 uppercase tracking-[0.4em]">
-                      Telemetry Trace Sequence ({nodeTraces.length})
+                    <p className="text-xs font-semibold text-muted-foreground/50">
+                      Node trace ({nodeTraces.length})
                     </p>
                     <div className="h-px flex-1 bg-white/5" />
                   </div>
@@ -558,8 +558,8 @@ export function TestWorkflowModal({
                 !isTerminal && (
                   <div className="flex flex-col items-center justify-center py-16 gap-6">
                     <LoadingSpinner className="w-10 h-10 text-primary" />
-                    <p className="text-[10px] font-black text-primary/40 uppercase tracking-[0.4em] animate-pulse">
-                      Awaiting First Telemetry Frame...
+                    <p className="text-xs font-semibold text-primary/70 animate-pulse">
+                      Waiting for the first node…
                     </p>
                   </div>
                 )

@@ -23,7 +23,7 @@ export function renderField(
   isValid?: boolean,
 ) {
   const baseClassName = cn(
-    "w-full px-4 h-12 bg-surface-2 border border-white/5 rounded-xl text-xs font-black uppercase tracking-widest text-white placeholder-white/10 outline-none transition-premium shadow-inner",
+    "w-full px-4 h-12 bg-surface-2 border border-white/5 rounded-xl text-sm font-semibold text-white placeholder-white/10 outline-none transition-premium shadow-inner",
     isValid === false &&
       "border-destructive/40 ring-1 ring-destructive/20 bg-destructive/5 text-destructive",
     isValid === true &&
@@ -41,8 +41,8 @@ export function renderField(
             onChange={(e) => onChange(e.target.value)}
             className={baseClassName}
           >
-            <option value="" className="bg-surface-4 text-white/20">
-              SELECT OPTION...
+            <option value="" className="bg-surface-4 text-white/50">
+              Select an option…
             </option>
             {schema.enum?.map((opt: string) => (
               <option key={opt} value={opt} className="bg-surface-4 text-white">
@@ -96,7 +96,7 @@ export function renderField(
           />
           <label
             htmlFor={`field-${field}`}
-            className="text-[10px] font-black text-white/40 uppercase tracking-widest cursor-pointer"
+            className="text-xs font-semibold text-white/70 cursor-pointer"
           >
             Activate {field.replace(/_/g, " ")}
           </label>
@@ -148,9 +148,9 @@ export function renderField(
                 });
                 onChange([...arrayValue, newItem]);
               }}
-              className="h-11 px-6 bg-surface-2 hover:bg-surface-3 border border-white/5 rounded-xl text-[9px] font-black uppercase tracking-[0.2em] text-primary transition-premium flex items-center gap-2"
+              className="h-11 px-6 bg-surface-2 hover:bg-surface-3 border border-white/5 rounded-xl text-2xs font-semibold text-primary transition-premium flex items-center gap-2"
             >
-              <Plus className="h-4 w-4" /> Add Protocol Entry
+              <Plus className="h-4 w-4" /> Add entry
             </button>
           </div>
         );
@@ -179,15 +179,15 @@ export function renderField(
                     <div className="flex flex-col relative z-10">
                       <span
                         className={cn(
-                          "text-[10px] font-black uppercase tracking-[0.2em] mb-1 transition-premium",
+                          "text-xs font-semibold mb-1 transition-premium",
                           isSelected
                             ? "text-white"
-                            : "text-white/40 group-hover/preset:text-white",
+                            : "text-white/70 group-hover/preset:text-white",
                         )}
                       >
                         {preset.label}
                       </span>
-                      <span className="text-[9px] font-bold text-muted-foreground/40 leading-relaxed uppercase tracking-widest">
+                      <span className="text-2xs text-muted-foreground/70 leading-relaxed">
                         {preset.description}
                       </span>
                     </div>
@@ -201,8 +201,8 @@ export function renderField(
               })}
             </div>
             <Collapsible>
-              <CollapsibleTrigger className="text-[9px] font-black text-muted-foreground/20 uppercase tracking-[0.3em] hover:text-white transition-premium ml-1">
-                Deep Protocol Editor (JSON)
+              <CollapsibleTrigger className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider hover:text-white transition-premium ml-1">
+                Edit as JSON
               </CollapsibleTrigger>
               <CollapsibleContent className="mt-3 animate-in fade-in slide-in-from-top-2">
                 <textarea
@@ -217,7 +217,7 @@ export function renderField(
                   rows={4}
                   className={cn(
                     baseClassName,
-                    "h-auto py-4 font-mono text-[10px] normal-case tracking-normal",
+                    "h-auto py-4 font-mono text-xs normal-case tracking-normal",
                   )}
                 />
               </CollapsibleContent>
@@ -258,9 +258,9 @@ export function renderField(
             <button
               type="button"
               onClick={() => onChange([...arrayValue, ""])}
-              className="h-11 px-6 bg-surface-2 hover:bg-surface-3 border border-white/5 rounded-xl text-[9px] font-black uppercase tracking-[0.2em] text-primary transition-premium flex items-center gap-2"
+              className="h-11 px-6 bg-surface-2 hover:bg-surface-3 border border-white/5 rounded-xl text-2xs font-semibold text-primary transition-premium flex items-center gap-2"
             >
-              <Plus className="h-4 w-4" /> Add Vector
+              <Plus className="h-4 w-4" /> Add item
             </button>
           </div>
         );

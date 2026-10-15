@@ -44,22 +44,19 @@ export function statusColors(status: string) {
   switch (status) {
     case "active":
       return {
-        badge:
-          "bg-success/10 text-success border-success/20 shadow-[0_0_8px_hsla(var(--success),0.2)]",
+        badge: "bg-success/10 text-success border-success/20",
         dot: "bg-success",
         border: "border-l-success",
       };
     case "suspended":
       return {
-        badge:
-          "bg-warning/10 text-warning border-warning/20 shadow-[0_0_8px_hsla(var(--warning),0.2)]",
+        badge: "bg-warning/10 text-warning border-warning/20",
         dot: "bg-warning",
         border: "border-l-warning",
       };
     case "terminated":
       return {
-        badge:
-          "bg-destructive/10 text-destructive border-destructive/20 shadow-[0_0_8px_hsla(var(--destructive),0.2)]",
+        badge: "bg-destructive/10 text-destructive border-destructive/20",
         dot: "bg-destructive",
         border: "border-l-destructive",
       };
@@ -79,7 +76,7 @@ export function workflowStatusColor(status: string | null) {
     case "draft":
       return "text-amber-400";
     case "archived":
-      return "text-muted-foreground/40";
+      return "text-muted-foreground/70";
     default:
       return "text-muted-foreground";
   }
@@ -150,7 +147,7 @@ export function CapabilityBadge({ world }: { world: string }) {
     <span
       title={cfg.tooltipDetail}
       className={cn(
-        "inline-flex items-center gap-1 rounded-full border text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 whitespace-nowrap",
+        "inline-flex items-center gap-1 rounded-full border text-xs font-semibold px-2 py-0.5 whitespace-nowrap",
         cfg.textColor,
         cfg.bgColor,
         cfg.borderColor,
@@ -173,20 +170,20 @@ export function StatCard({
   accent?: string;
 }) {
   return (
-    <div className="bg-surface-4/40 border border-white/5 rounded-[2rem] p-6 glass transition-premium hover:border-white/10">
+    <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-6 glass transition-premium hover:border-white/10">
       <div
         className={cn(
-          "text-3xl font-black tabular-nums tracking-tight",
+          "text-3xl font-semibold tabular-nums tracking-tight",
           accent ?? "text-white",
         )}
       >
         {value}
       </div>
-      <div className="text-[10px] font-black text-muted-foreground uppercase tracking-widest mt-1.5">
+      <div className="text-xs font-semibold text-muted-foreground mt-1.5">
         {label}
       </div>
       {sub && (
-        <div className="text-[10px] text-muted-foreground/40 font-bold mt-1 uppercase">
+        <div className="text-xs text-muted-foreground/70 font-bold mt-1">
           {sub}
         </div>
       )}
@@ -213,7 +210,7 @@ export function LocalEmptyState({
 export function ManagedViaMcp({ tools }: { tools: string[] }) {
   return (
     <div className="mt-4 bg-background border border-white/5 rounded-xl px-4 py-3">
-      <p className="text-muted-foreground/40 text-xs font-medium uppercase tracking-wider mb-1.5">
+      <p className="text-muted-foreground/70 text-xs font-medium mb-1.5">
         Managed via MCP
       </p>
       <p className="text-muted-foreground text-sm">
@@ -251,7 +248,7 @@ export function TabBar({
     { id: "memory", label: "State" },
     { id: "budget", label: "Resources" },
     { id: "policies", label: "Rules" },
-    { id: "log", label: "Telemetry", count: counts.log },
+    { id: "log", label: "Activity", count: counts.log },
     ...(showHandoffs
       ? [{ id: "handoffs" as Tab, label: "Handoffs", count: counts.handoffs }]
       : []),
@@ -264,9 +261,9 @@ export function TabBar({
           key={t.id}
           onClick={() => onChange(t.id)}
           className={cn(
-            "px-5 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-premium flex items-center gap-2",
+            "px-5 py-2 rounded-xl text-xs font-semibold transition-premium flex items-center gap-2",
             active === t.id
-              ? "bg-primary text-primary-foreground shadow-lg shadow-primary/20"
+              ? "bg-primary text-primary-foreground shadow-lg"
               : "text-muted-foreground hover:text-foreground hover:bg-white/5",
           )}
         >
@@ -274,7 +271,7 @@ export function TabBar({
           {t.count !== undefined && t.count > 0 && (
             <span
               className={cn(
-                "text-[9px] px-1.5 py-0.5 rounded-full font-black",
+                "text-2xs px-1.5 py-0.5 rounded-full font-semibold",
                 active === t.id
                   ? "bg-white/20 text-white"
                   : "bg-surface-4 text-muted-foreground",
@@ -345,19 +342,19 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
         </p>
         <div className="flex items-center gap-2 mt-0.5 flex-wrap">
           {entry.workflowId && (
-            <span className="text-[10px] text-violet-400 font-mono">
+            <span className="text-xs text-violet-400 font-mono">
               wf:{entry.workflowId.slice(0, 8)}
             </span>
           )}
           {entry.executionId && (
-            <span className="text-[10px] text-sky-400 font-mono">
+            <span className="text-xs text-sky-400 font-mono">
               ex:{entry.executionId.slice(0, 8)}
             </span>
           )}
           {isExecutionEntry && (
             <button
               onClick={handleExpand}
-              className="text-[10px] text-muted-foreground/40 hover:text-violet-300 transition-premium flex items-center gap-0.5"
+              className="text-xs text-muted-foreground/70 hover:text-violet-300 transition-premium flex items-center gap-0.5"
             >
               {expanded ? (
                 <>
@@ -376,7 +373,7 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
         {expanded && (
           <div className="mt-2">
             {loadingOutput ? (
-              <div className="flex items-center gap-2 text-muted-foreground/40 text-xs py-2">
+              <div className="flex items-center gap-2 text-muted-foreground/70 text-xs py-2">
                 <Loader2 className="w-3 h-3 animate-spin" />
                 Loading output…
               </div>
@@ -395,7 +392,7 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
           </div>
         )}
       </div>
-      <time className="text-muted-foreground/40 text-[11px] shrink-0 mt-0.5">
+      <time className="text-muted-foreground/70 text-xs shrink-0 mt-0.5">
         {relativeTime(entry.timestamp)}
       </time>
     </div>

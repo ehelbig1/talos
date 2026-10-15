@@ -90,7 +90,7 @@ function MemoryTypeBadge({ type }: { type: string }) {
   return (
     <span
       className={cn(
-        "text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full",
+        "text-xs font-semibold px-2 py-0.5 rounded-full",
         meta.color,
         meta.bg,
       )}
@@ -131,7 +131,7 @@ function MemoryEntryRow({
       ? "text-red-400 bg-red-500/10"
       : urgency === 2
         ? "text-amber-400 bg-amber-500/10"
-        : "text-muted-foreground/40 bg-surface-3/60";
+        : "text-muted-foreground/70 bg-surface-3/60";
 
   const handleExtend = async () => {
     setExtending(true);
@@ -162,7 +162,7 @@ function MemoryEntryRow({
           {ttlLabel && (
             <span
               className={cn(
-                "text-[10px] font-medium px-1.5 py-0.5 rounded-full",
+                "text-xs font-medium px-1.5 py-0.5 rounded-full",
                 ttlColor,
               )}
             >
@@ -176,7 +176,7 @@ function MemoryEntryRow({
               onClick={handleExtend}
               disabled={extending}
               title="Refresh TTL to full duration"
-              className="text-[10px] text-muted-foreground/40 hover:text-emerald-400 transition-premium px-1.5 py-0.5 rounded disabled:opacity-40"
+              className="text-xs text-muted-foreground/70 hover:text-emerald-400 transition-premium px-1.5 py-0.5 rounded disabled:opacity-40"
             >
               {extending ? (
                 <Loader2 className="w-3 h-3 animate-spin" />
@@ -188,7 +188,7 @@ function MemoryEntryRow({
           {isMultiline && (
             <button
               onClick={() => setExpanded((v) => !v)}
-              className="p-1 text-muted-foreground/40 hover:text-muted-foreground transition-premium"
+              className="p-1 text-muted-foreground/70 hover:text-muted-foreground transition-premium"
               aria-label={expanded ? "Collapse" : "Expand"}
             >
               {expanded ? (
@@ -200,7 +200,7 @@ function MemoryEntryRow({
           )}
           <button
             onClick={() => onEdit(entry)}
-            className="p-1 text-muted-foreground/40 hover:text-violet-400 transition-premium"
+            className="p-1 text-muted-foreground/70 hover:text-violet-400 transition-premium"
             aria-label="Edit"
           >
             <Pencil className="w-3.5 h-3.5" />
@@ -208,7 +208,7 @@ function MemoryEntryRow({
           <button
             onClick={() => onDelete(entry.key)}
             disabled={deleting}
-            className="p-1 text-muted-foreground/40 hover:text-red-400 transition-premium disabled:opacity-40"
+            className="p-1 text-muted-foreground/70 hover:text-red-400 transition-premium disabled:opacity-40"
             aria-label="Delete"
           >
             <Trash2 className="w-3.5 h-3.5" />
@@ -293,14 +293,14 @@ function MemoryForm({
           onChange={(e) => setKey(e.target.value)}
           disabled={isEditing}
           placeholder="e.g. persona"
-          className="w-full bg-background border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-muted-foreground/30 focus:outline-none focus:border-violet-500/50 disabled:opacity-50 font-mono"
+          className="w-full bg-background border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-violet-500/50 disabled:opacity-50 font-mono"
         />
       </div>
 
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground font-medium">
           Type
-          <span className="ml-2 text-muted-foreground/40 font-normal">
+          <span className="ml-2 text-muted-foreground/70 font-normal">
             ({MEMORY_TYPE_META[memType].ttl})
           </span>
         </label>
@@ -321,7 +321,7 @@ function MemoryForm({
           ))}
         </div>
         {memType === "semantic" && (
-          <p className="text-[10px] text-violet-400/70 mt-1">
+          <p className="text-xs text-violet-400/70 mt-1">
             Semantic memories persist permanently and are injected as{" "}
             <code className="font-mono">__actor_context__</code> when this actor
             triggers a workflow with inject_memory_context enabled.
@@ -332,7 +332,7 @@ function MemoryForm({
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground font-medium">
           Value{" "}
-          <span className="text-muted-foreground/40 font-normal">(JSON)</span>
+          <span className="text-muted-foreground/70 font-normal">(JSON)</span>
         </label>
         <textarea
           value={value}
@@ -340,13 +340,13 @@ function MemoryForm({
           rows={5}
           placeholder='{"role": "AppSec Engineer", "expertise": ["OWASP", "threat modeling"]}'
           className={cn(
-            "w-full bg-background border rounded-lg px-3 py-2 text-sm text-white placeholder-muted-foreground/30 focus:outline-none font-mono resize-y",
+            "w-full bg-background border rounded-lg px-3 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none font-mono resize-y",
             jsonError
               ? "border-red-500/50 focus:border-red-500/70"
               : "border-white/10 focus:border-violet-500/50",
           )}
         />
-        {jsonError && <p className="text-[10px] text-red-400">{jsonError}</p>}
+        {jsonError && <p className="text-xs text-red-400">{jsonError}</p>}
       </div>
 
       <div className="flex justify-end gap-2">
@@ -535,17 +535,17 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
       {/* Search */}
       {memories.length > 3 && (
         <div className="relative">
-          <Filter className="w-3.5 h-3.5 text-muted-foreground/40 absolute left-3 top-1/2 -translate-y-1/2" />
+          <Filter className="w-3.5 h-3.5 text-muted-foreground/70 absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             value={memSearch}
             onChange={(e) => setMemSearch(e.target.value)}
             placeholder="Search key or value…"
-            className="w-full bg-surface-3/60 border border-white/5 rounded-xl pl-8 pr-8 py-2 text-sm text-white placeholder-muted-foreground/30 focus:outline-none focus:border-violet-500/40 transition-premium"
+            className="w-full bg-surface-3/60 border border-white/5 rounded-xl pl-8 pr-8 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-violet-500/40 transition-premium"
           />
           {memSearch && (
             <button
               onClick={() => setMemSearch("")}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground/40 hover:text-white transition-premium"
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground/70 hover:text-white transition-premium"
             >
               <X className="w-3.5 h-3.5" />
             </button>
@@ -639,7 +639,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
       ) : memories.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-14 gap-3">
           <Brain className="w-12 h-12 text-violet-500/20" />
-          <p className="text-muted-foreground/40 text-sm">No memories yet.</p>
+          <p className="text-muted-foreground/70 text-sm">No memories yet.</p>
           <button
             onClick={() => setShowForm(true)}
             className="text-xs text-violet-400 hover:text-violet-300 transition-premium"
@@ -649,7 +649,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
         </div>
       ) : filtered.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-10 gap-2">
-          <p className="text-muted-foreground/40 text-sm">
+          <p className="text-muted-foreground/70 text-sm">
             No memories match your search.
           </p>
           <button
@@ -668,7 +668,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
             <div key={type}>
               <div className="flex items-center gap-2 mb-2">
                 <MemoryTypeBadge type={type} />
-                <span className="text-[10px] text-muted-foreground/40">
+                <span className="text-xs text-muted-foreground/70">
                   {MEMORY_TYPE_META[type as MemoryType]?.ttl}
                 </span>
               </div>

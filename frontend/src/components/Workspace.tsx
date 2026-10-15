@@ -107,12 +107,12 @@ function Workspace() {
       {
         key: "Delete",
         handler: handleDeleteSelected,
-        description: "Terminate & Remove Node",
+        description: "Delete node",
       },
       {
         key: "Backspace",
         handler: handleDeleteSelected,
-        description: "Terminate & Remove Node",
+        description: "Delete node",
       },
     ],
     [
@@ -143,11 +143,11 @@ function Workspace() {
       {/* Dynamic Background Glows */}
       <div className="absolute inset-0 pointer-events-none overflow-hidden select-none z-0">
         <div
-          className="absolute top-[-10%] left-[-5%] w-[50%] h-[50%] bg-primary/10 blur-[120px] rounded-full mix-blend-screen animate-pulse"
+          className="absolute top-[-10%] left-[-5%] w-[50%] h-[50%] bg-primary/10 blur-[120px] rounded-full mix-blend-screen"
           style={{ animationDuration: "12s" }}
         />
         <div
-          className="absolute bottom-[-10%] right-[-5%] w-[50%] h-[50%] bg-indigo-500/10 blur-[120px] rounded-full mix-blend-screen animate-pulse"
+          className="absolute bottom-[-10%] right-[-5%] w-[50%] h-[50%] bg-indigo-500/10 blur-[120px] rounded-full mix-blend-screen"
           style={{ animationDuration: "18s" }}
         />
       </div>
@@ -194,7 +194,7 @@ function Workspace() {
 
             <Panel position="bottom-right" className="!m-8 z-20">
               <MiniMap
-                className="!bg-surface-3/40 !backdrop-blur-2xl !border-white/5 !rounded-[2rem] !shadow-2xl overflow-hidden glass"
+                className="!bg-surface-3/40 !backdrop-blur-2xl !border-white/5 !rounded-2xl !shadow-2xl overflow-hidden glass"
                 maskColor="hsla(var(--background), 0.8)"
                 nodeColor={(n) => {
                   if (n.data?.category === "control-flow")
@@ -210,22 +210,19 @@ function Workspace() {
 
           {nodeCount === 0 && (
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-30 px-6">
-              <div className="text-center pointer-events-auto bg-surface-3/40 border border-white/10 p-16 rounded-[4rem] shadow-[0_32px_120px_rgba(0,0,0,0.5)] max-w-xl w-full backdrop-blur-3xl glass relative overflow-hidden group">
+              <div className="text-center pointer-events-auto bg-surface-3/40 border border-white/10 p-16 rounded-3xl shadow-[0_32px_120px_rgba(0,0,0,0.5)] max-w-xl w-full backdrop-blur-3xl glass relative overflow-hidden group">
                 <div className="absolute inset-0 bg-gradient-to-br from-primary/20 via-transparent to-transparent opacity-50" />
 
                 <div className="relative z-10">
-                  <div className="w-24 h-24 mx-auto mb-10 rounded-[2.5rem] bg-surface-4/60 border border-white/10 flex items-center justify-center shadow-2xl group-hover:scale-110 group-hover:rotate-6 transition-premium duration-700">
-                    <Zap className="w-12 h-12 text-primary fill-primary/10 drop-shadow-[0_0_20px_hsla(var(--primary),0.6)]" />
+                  <div className="w-24 h-24 mx-auto mb-10 rounded-3xl bg-surface-4/60 border border-white/10 flex items-center justify-center shadow-2xl transition-premium duration-700">
+                    <Zap className="w-12 h-12 text-primary fill-primary/10" />
                   </div>
 
-                  <h3 className="text-4xl font-black text-white tracking-tighter mb-4 font-outfit">
-                    Mission Control
+                  <h3 className="text-4xl font-semibold text-white tracking-tight mb-4 font-outfit">
+                    Start building
                   </h3>
                   <p className="text-sm text-muted-foreground/80 mb-2 leading-relaxed font-medium">
-                    The platform is primed and awaiting protocol deployment.
-                  </p>
-                  <p className="text-[10px] font-black text-primary/40 uppercase tracking-[0.3em] mb-12">
-                    Initialize Workspace &bull; Deploy Core Modules
+                    This workflow has no nodes yet. Add a module to begin.
                   </p>
 
                   <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
@@ -233,17 +230,17 @@ function Workspace() {
                       onClick={() =>
                         useUIStore.getState().setToolbarModal("addExisting")
                       }
-                      className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-[10px] font-black uppercase tracking-widest bg-primary text-white rounded-2xl transition-premium shadow-xl shadow-primary/20 hover:scale-105 active:scale-95"
+                      className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-sm font-semibold bg-primary text-white rounded-2xl transition-premium shadow-xl active:scale-95"
                     >
                       <FolderPlus className="w-4 h-4" />
-                      Initialize Module
+                      Add a module
                     </button>
                     <button
                       onClick={() => navigate("/library#templates")}
-                      className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-[10px] font-black uppercase tracking-widest bg-white/5 text-muted-foreground border border-white/10 hover:text-white hover:bg-white/10 rounded-2xl transition-premium active:scale-95"
+                      className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-sm font-semibold bg-white/5 text-muted-foreground border border-white/10 hover:text-white hover:bg-white/10 rounded-2xl transition-premium active:scale-95"
                     >
                       <BookOpen className="w-4 h-4" />
-                      Load Template
+                      Browse templates
                     </button>
                   </div>
                 </div>

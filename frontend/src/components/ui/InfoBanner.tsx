@@ -11,7 +11,7 @@ export const InfoBanner: React.FC<
 > = ({ children, className }) => (
   <DarkSurfaceDiv
     className={cn(
-      "border border-primary/20 rounded-2xl p-5 bg-primary/5 shadow-2xl relative overflow-hidden group",
+      "border border-primary/20 rounded-xl p-4 bg-primary/5 relative overflow-hidden",
       className,
     )}
   >

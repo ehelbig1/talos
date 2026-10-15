@@ -74,10 +74,10 @@ export default function AuditSettings() {
 
   if (isLoading)
     return (
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2.5rem] p-10 shadow-2xl animate-pulse">
+      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl animate-pulse">
         <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
         <div className="space-y-6">
-          <div className="h-32 bg-white/[0.02] border border-white/5 rounded-[2rem]" />
+          <div className="h-32 bg-white/[0.02] border border-white/5 rounded-2xl" />
           <div className="grid grid-cols-2 gap-6">
             <div className="h-20 bg-white/[0.02] border border-white/5 rounded-2xl" />
             <div className="h-20 bg-white/[0.02] border border-white/5 rounded-2xl" />
@@ -90,38 +90,37 @@ export default function AuditSettings() {
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
       {/* Header */}
       <div className="flex items-center gap-6">
-        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-[2rem] flex items-center justify-center shadow-[0_0_30px_hsla(var(--primary),0.1)] group">
-          <Shield className="w-8 h-8 text-primary group-hover:scale-110 transition-premium" />
+        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center group">
+          <Shield className="w-8 h-8 text-primary transition-premium" />
         </div>
         <div>
           <SectionHeader
             level="h2"
-            className="text-2xl md:text-3xl font-black text-white tracking-tighter font-outfit uppercase mb-1"
+            className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit mb-1"
           >
-            Audit Streaming
+            Audit streaming
           </SectionHeader>
           <div className="flex items-center gap-3">
-            <span className="text-[10px] font-black uppercase tracking-[0.2em] text-primary bg-primary/5 px-3 py-1 rounded-full border border-primary/20">
-              Enterprise_Protocol
+            <span className="text-xs font-semibold text-primary bg-primary/5 px-3 py-1 rounded-full border border-primary/20">
+              OpenTelemetry
             </span>
-            <span className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40">
-              OpenTelemetry_Pipeline
+            <span className="text-xs font-semibold text-muted-foreground/70">
+              Export to your SIEM
             </span>
           </div>
         </div>
       </div>
 
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2.5rem] p-10 shadow-2xl relative overflow-hidden group">
+      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl relative overflow-hidden group">
         <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
 
         <div className="relative z-10">
-          <p className="text-sm text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed mb-10 max-w-2xl">
-            Stream zero-trust AI execution logs directly into your existing SIEM
-            using secure OpenTelemetry pipelines. Every execution is signed and
-            non-repudiable.
+          <p className="text-sm text-muted-foreground/70 leading-relaxed mb-10 max-w-2xl">
+            Stream signed run logs to your existing SIEM over OpenTelemetry.
+            Every run is signed and non-repudiable.
           </p>
 
-          <div className="bg-black/40 border border-white/5 rounded-[2rem] p-8 transition-premium group/box">
+          <div className="bg-black/40 border border-white/5 rounded-2xl p-8 transition-premium group/box">
             <div className="flex items-center justify-between mb-10">
               <div className="flex items-center gap-6">
                 <div
@@ -129,16 +128,16 @@ export default function AuditSettings() {
                     "w-14 h-14 rounded-2xl flex items-center justify-center transition-premium shadow-2xl",
                     enabled
                       ? "bg-success/10 border border-success/20 text-success"
-                      : "bg-white/5 border border-white/10 text-muted-foreground/20",
+                      : "bg-white/5 border border-white/10 text-muted-foreground/50",
                   )}
                 >
                   <CloudUpload className="w-7 h-7" />
                 </div>
                 <div>
-                  <h4 className="text-xl font-black text-white tracking-tight uppercase font-outfit">
+                  <h4 className="text-xl font-semibold text-white tracking-tight font-outfit">
                     Real-time Propagation
                   </h4>
-                  <p className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-widest mt-1">
+                  <p className="text-xs text-muted-foreground/70 font-semibold mt-1">
                     Toggle audit log streaming via OTLP
                   </p>
                 </div>
@@ -152,9 +151,7 @@ export default function AuditSettings() {
                 onClick={() => setEnabled(!enabled)}
                 className={cn(
                   "relative inline-flex h-8 w-14 items-center rounded-full transition-premium focus:outline-none ring-offset-black",
-                  enabled
-                    ? "bg-success shadow-[0_0_20px_hsla(var(--success),0.4)]"
-                    : "bg-white/10",
+                  enabled ? "bg-success" : "bg-white/10",
                 )}
               >
                 <span
@@ -170,22 +167,22 @@ export default function AuditSettings() {
               <div className="space-y-8 animate-in fade-in slide-in-from-top-4 duration-500">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-8 pt-8 border-t border-white/5">
                   <div className="space-y-3">
-                    <Label className="text-[10px] font-black uppercase tracking-[0.3em] text-muted-foreground/40 flex items-center gap-2 ml-1">
+                    <Label className="text-xs font-semibold text-muted-foreground/70 flex items-center gap-2 ml-1">
                       <Server className="w-3.5 h-3.5 text-primary" />
-                      Collector_Endpoint
+                      Collector endpoint
                     </Label>
                     <Input
                       value={endpoint}
                       onChange={(e) => setEndpoint(e.target.value)}
                       placeholder="https://otel-collector.internal:4317"
-                      className="h-14 bg-black/40 border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/20 focus:ring-primary/20 transition-premium shadow-inner"
+                      className="h-14 bg-black/40 border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/50 focus:ring-primary/20 transition-premium shadow-inner"
                     />
                   </div>
 
                   <div className="space-y-3">
-                    <Label className="text-[10px] font-black uppercase tracking-[0.3em] text-muted-foreground/40 flex items-center gap-2 ml-1">
+                    <Label className="text-xs font-semibold text-muted-foreground/70 flex items-center gap-2 ml-1">
                       <Settings2 className="w-3.5 h-3.5 text-primary" />
-                      Transport_Protocol
+                      Transport protocol
                     </Label>
                     <div className="relative">
                       <select
@@ -200,7 +197,7 @@ export default function AuditSettings() {
                             reinstate when the HTTP exporter branch lands. */}
                         <option value="grpc">gRPC (Binary/Protobuf)</option>
                       </select>
-                      <div className="absolute right-6 top-1/2 -translate-y-1/2 pointer-events-none text-muted-foreground/40">
+                      <div className="absolute right-6 top-1/2 -translate-y-1/2 pointer-events-none text-muted-foreground/70">
                         <ArrowRight className="w-4 h-4 rotate-90" />
                       </div>
                     </div>
@@ -208,19 +205,19 @@ export default function AuditSettings() {
                 </div>
 
                 <div className="space-y-3">
-                  <Label className="text-[10px] font-black uppercase tracking-[0.3em] text-muted-foreground/40 flex items-center gap-2 ml-1">
+                  <Label className="text-xs font-semibold text-muted-foreground/70 flex items-center gap-2 ml-1">
                     <Lock className="w-3.5 h-3.5 text-primary" />
-                    Authentication_Headers (JSON_VOLATILE)
+                    Authentication headers (JSON)
                   </Label>
                   <Textarea
                     value={headers}
                     onChange={(e) => setHeaders(e.target.value)}
                     placeholder='{ "Authorization": "Bearer ...", "x-team-id": "..." }'
-                    className="bg-black/40 border-white/5 text-white placeholder:text-muted-foreground/20 rounded-2xl min-h-[120px] font-mono text-xs resize-none focus:ring-primary/20 transition-premium border-dashed shadow-inner p-6"
+                    className="bg-black/40 border-white/5 text-white placeholder:text-muted-foreground/50 rounded-2xl min-h-[120px] font-mono text-xs resize-none focus:ring-primary/20 transition-premium border-dashed shadow-inner p-6"
                   />
                   <div className="flex items-center gap-3 px-1 mt-2">
-                    <div className="w-2 h-2 rounded-full bg-primary animate-pulse shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
-                    <p className="text-[10px] text-muted-foreground/20 font-black uppercase tracking-widest">
+                    <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
+                    <p className="text-xs text-muted-foreground/50 font-semibold">
                       Headers are AES-256-GCM encrypted before vault commit.
                     </p>
                   </div>
@@ -239,17 +236,17 @@ export default function AuditSettings() {
               {saving ? (
                 <div className="flex items-center gap-3">
                   <Loader2 className="w-5 h-5 animate-spin" />
-                  <span>SYNCING_CONFIG...</span>
+                  <span>Saving…</span>
                 </div>
               ) : isUpdated ? (
                 <div className="flex items-center gap-3">
                   <Check className="w-5 h-5 text-success" />
-                  <span>CONFIG_SYNCHRONIZED</span>
+                  <span>Saved</span>
                 </div>
               ) : (
                 <div className="flex items-center gap-3">
                   <CloudUpload className="w-5 h-5" />
-                  <span>UPDATE_AUDIT_PROTOCOL</span>
+                  <span>Save settings</span>
                 </div>
               )}
             </Button>
@@ -258,15 +255,15 @@ export default function AuditSettings() {
       </div>
 
       {/* Info Box */}
-      <div className="bg-surface-3/40 border border-white/5 rounded-[2.5rem] p-8 flex items-start gap-6 hover:border-white/10 transition-premium group">
+      <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 flex items-start gap-6 hover:border-white/10 transition-premium group">
         <div className="w-14 h-14 bg-primary/5 border border-primary/10 rounded-2xl flex items-center justify-center shrink-0 group-hover:bg-primary/10 transition-premium shadow-inner">
           <Database className="w-7 h-7 text-primary" />
         </div>
         <div className="space-y-2">
-          <h4 className="text-lg font-black text-white uppercase tracking-tight font-outfit">
+          <h4 className="text-lg font-semibold text-white tracking-tight font-outfit">
             Persistence & Isolation
           </h4>
-          <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest max-w-3xl">
+          <p className="text-xs text-muted-foreground/70 leading-relaxed max-w-3xl">
             Talos automatically buffers audit events locally during network
             partitions. Once the OTLP collector is reachable, buffered logs are
             flushed in chronological order to maintain strict causality and

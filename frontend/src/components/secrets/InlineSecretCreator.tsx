@@ -75,7 +75,7 @@ export function InlineSecretCreator({
                 setIsOpen(false);
                 setError("");
               }}
-              className="flex items-center text-[10px] font-bold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-premium"
+              className="flex items-center text-xs font-bold text-muted-foreground hover:text-foreground transition-premium"
             >
               <X className="w-3.5 h-3.5 mr-1" />
               Cancel
@@ -131,7 +131,7 @@ export function InlineSecretCreator({
               </Button>
               <a
                 href="#/secrets"
-                className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-primary hover:text-primary/80 transition-premium px-2"
+                className="flex items-center gap-1.5 text-xs font-bold text-primary hover:text-primary/80 transition-premium px-2"
               >
                 <span>Full Form</span>
                 <ExternalLink className="w-3 h-3" />

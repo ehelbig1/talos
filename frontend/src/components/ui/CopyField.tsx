@@ -27,16 +27,16 @@ export const CopyField = ({
         className,
       )}
     >
-      <code className="text-[10px] font-mono text-muted-foreground bg-transparent px-2 py-1 flex-1 truncate">
+      <code className="text-xs font-mono text-muted-foreground bg-transparent px-2 py-1 flex-1 truncate">
         {value}
       </code>
       <Button
         size="sm"
         variant="ghost"
         onClick={onCopy}
-        className="text-[10px] font-black uppercase tracking-widest h-7 px-3 text-primary hover:text-primary/80 hover:bg-primary/10 rounded-lg transition-premium active:scale-[0.95]"
+        className="h-7 px-3 text-primary hover:text-primary/80 hover:bg-primary/10"
       >
-        {copied ? "✓ Copied" : "Copy"}
+        {copied ? "Copied" : "Copy"}
       </Button>
     </div>
   </FormField>

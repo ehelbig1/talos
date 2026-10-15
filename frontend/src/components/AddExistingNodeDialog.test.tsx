@@ -22,7 +22,7 @@ describe("AddExistingNodeDialog", () => {
         onClose={mockOnClose}
       />,
     );
-    expect(screen.getByText(/Synchronizing Registry.../i)).toBeInTheDocument();
+    expect(screen.getByText(/Loading…/i)).toBeInTheDocument();
   });
 
   it("renders module list after loading", async () => {
@@ -52,7 +52,7 @@ describe("AddExistingNodeDialog", () => {
 
     fireEvent.click(screen.getByText("Existing Module"));
 
-    const addButton = screen.getByText("Initialize Node");
+    const addButton = screen.getByText("Add node");
     fireEvent.click(addButton);
 
     await waitFor(() => {
@@ -81,12 +81,10 @@ describe("AddExistingNodeDialog", () => {
       expect(screen.getByText("Existing Module")).toBeInTheDocument();
     });
 
-    const searchInput = screen.getByPlaceholderText(
-      "FILTER OPERATIONAL BLUEPRINTS...",
-    );
+    const searchInput = screen.getByPlaceholderText("Search modules…");
     fireEvent.change(searchInput, { target: { value: "Something Else" } });
 
-    expect(screen.getByText(/No Blueprint Matches/i)).toBeInTheDocument();
+    expect(screen.getByText(/No modules match/i)).toBeInTheDocument();
     expect(screen.queryByText("Existing Module")).not.toBeInTheDocument();
   });
 });

@@ -40,14 +40,16 @@ describe("TwoFactorSettings", () => {
   it("renders the enabled/protected state when 2FA is on", () => {
     render(<TwoFactorSettings enabled={true} />);
     expect(
-      screen.getByText(/Identity_Sovereignty_Verified/i),
+      screen.getByText(/Two-factor authentication is on/i),
     ).toBeInTheDocument();
-    expect(screen.getByText(/DEACTIVATE_PROTECTION/i)).toBeInTheDocument();
+    expect(screen.getByText(/^Turn off$/i)).toBeInTheDocument();
   });
 
   it("renders the setup entry point when 2FA is disabled", () => {
     render(<TwoFactorSettings enabled={false} />);
-    expect(screen.getByText(/INITIALIZE_SETUP_SEQUENCE/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Set up two-factor authentication/i),
+    ).toBeInTheDocument();
   });
 
   it("runs the setup flow and shows the secret to scan", async () => {
@@ -65,13 +67,13 @@ describe("TwoFactorSettings", () => {
     });
 
     render(<TwoFactorSettings enabled={false} />);
-    fireEvent.click(screen.getByText(/INITIALIZE_SETUP_SEQUENCE/i));
+    fireEvent.click(screen.getByText(/Set up two-factor authentication/i));
 
     await waitFor(() => {
       expect(screen.getByText("JBSWY3DPEHPK3PXP")).toBeInTheDocument();
     });
     // Manual key section header renders in the setup step.
-    expect(screen.getByText(/Manual_Cipher_Key/i)).toBeInTheDocument();
+    expect(screen.getByText(/Manual setup key/i)).toBeInTheDocument();
     // The QR image is a PNG data URL built from the bare base64.
     expect(screen.getByAltText("2FA QR Code")).toHaveAttribute(
       "src",
@@ -81,12 +83,14 @@ describe("TwoFactorSettings", () => {
 
   it("opens the deactivate confirmation gate before disabling", async () => {
     render(<TwoFactorSettings enabled={true} />);
-    fireEvent.click(screen.getByText(/DEACTIVATE_PROTECTION/i));
+    fireEvent.click(screen.getByText(/^Turn off$/i));
 
     await waitFor(() => {
-      expect(screen.getByText("Deactivate Protection?")).toBeInTheDocument();
+      expect(
+        screen.getByText("Turn off two-factor authentication?"),
+      ).toBeInTheDocument();
     });
-    expect(screen.getByText("Yes, Deactivate")).toBeInTheDocument();
+    expect(screen.getAllByText(/^Turn off$/i)).toHaveLength(2);
   });
 
   it("surfaces a setup error without crashing", async () => {
@@ -99,12 +103,12 @@ describe("TwoFactorSettings", () => {
     });
 
     render(<TwoFactorSettings enabled={false} />);
-    fireEvent.click(screen.getByText(/INITIALIZE_SETUP_SEQUENCE/i));
+    fireEvent.click(screen.getByText(/Set up two-factor authentication/i));
 
     // The initial setup button remains after an error (no crash, no secret).
     await waitFor(() => {
       expect(
-        screen.getByText(/INITIALIZE_SETUP_SEQUENCE/i),
+        screen.getByText(/Set up two-factor authentication/i),
       ).toBeInTheDocument();
     });
   });

@@ -16,7 +16,7 @@ describe("ModuleBuilder", () => {
         onModuleCreated={mockOnModuleCreated}
       />,
     );
-    expect(screen.getByText("Strategic Module Architect")).toBeInTheDocument();
+    expect(screen.getByText("Module builder")).toBeInTheDocument();
   });
 
   it("calls onClose when close button is clicked", async () => {

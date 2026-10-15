@@ -18,8 +18,8 @@ export function WatchChannelStatusBadge({
     <span
       className={
         tone === "ok"
-          ? "inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20"
-          : "inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-warning/10 text-warning border border-warning/20"
+          ? "inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20"
+          : "inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-warning/10 text-warning border border-warning/20"
       }
     >
       {children}
@@ -37,7 +37,7 @@ export function RecentFailureBadge({
 }): React.ReactElement {
   return (
     <span
-      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-destructive/10 text-destructive border border-destructive/20"
+      className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-destructive/10 text-destructive border border-destructive/20"
       title={`${failure.error_message}\n\nFailed at: ${new Date(failure.failed_at).toLocaleString()}`}
     >
       <AlertTriangle size={10} />

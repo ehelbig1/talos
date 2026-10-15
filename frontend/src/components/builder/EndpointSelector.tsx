@@ -153,14 +153,14 @@ export function EndpointSelector({
 
   if (!selectedEndpoint) {
     return (
-      <div className="bg-surface-2/40 border border-white/5 rounded-[2rem] p-8 space-y-6 shadow-2xl animate-in zoom-in-95 duration-500 relative overflow-hidden">
+      <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-8 space-y-6 shadow-2xl animate-in zoom-in-95 duration-500 relative overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50 pointer-events-none" />
         <div className="flex items-center gap-3 relative z-10 mb-2">
           <div className="p-1.5 rounded-lg bg-primary/10 text-primary">
             <Target className="h-4 w-4" />
           </div>
-          <h4 className="text-[10px] font-black text-white uppercase tracking-[0.2em]">
-            Select Isolated Vector
+          <h4 className="text-xs font-semibold text-white">
+            Choose an endpoint
           </h4>
         </div>
         <div className="max-h-96 overflow-y-auto flex flex-col gap-3 pr-2 custom-scrollbar relative z-10">
@@ -173,7 +173,7 @@ export function EndpointSelector({
               <div className="flex items-center gap-4 mb-3">
                 <span
                   className={cn(
-                    "px-2.5 py-1 rounded-lg text-[9px] font-black uppercase tracking-widest border transition-premium",
+                    "px-2.5 py-1 rounded-lg text-2xs font-semibold uppercase tracking-wider border transition-premium",
                     getMethodStyles(endpoint.method),
                   )}
                 >
@@ -184,7 +184,7 @@ export function EndpointSelector({
                 </code>
               </div>
               {endpoint.summary && (
-                <p className="text-[10px] font-bold text-muted-foreground/40 uppercase tracking-widest line-clamp-1 leading-relaxed">
+                <p className="text-xs text-muted-foreground/70 line-clamp-1 leading-relaxed">
                   {endpoint.summary}
                 </p>
               )}
@@ -209,7 +209,7 @@ export function EndpointSelector({
     pathParameters.length + queryParameters.length + headerParameters.length;
 
   return (
-    <div className="bg-surface-2/60 border border-primary/20 rounded-[2.5rem] p-8 space-y-10 shadow-2xl animate-in zoom-in-95 duration-500 relative overflow-hidden">
+    <div className="bg-surface-2/60 border border-primary/20 rounded-3xl p-8 space-y-10 shadow-2xl animate-in zoom-in-95 duration-500 relative overflow-hidden">
       <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50 pointer-events-none" />
 
       <div className="relative z-10">
@@ -218,18 +218,18 @@ export function EndpointSelector({
             <div className="flex items-center gap-4">
               <span
                 className={cn(
-                  "px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-widest border shadow-lg",
+                  "px-3 py-1.5 rounded-xl text-xs font-semibold border shadow-lg",
                   getMethodStyles(selectedEndpoint.method),
                 )}
               >
                 {selectedEndpoint.method}
               </span>
-              <code className="text-xl font-mono font-black text-white tracking-tight">
+              <code className="text-xl font-mono font-semibold text-white tracking-tight">
                 {selectedEndpoint.path}
               </code>
             </div>
             {selectedEndpoint.summary && (
-              <p className="m-0 text-[11px] font-bold text-muted-foreground/40 uppercase tracking-widest leading-relaxed">
+              <p className="m-0 text-xs text-muted-foreground/70 leading-relaxed">
                 {selectedEndpoint.summary}
               </p>
             )}
@@ -237,7 +237,7 @@ export function EndpointSelector({
           <button
             type="button"
             onClick={() => setSelectedEndpoint(null)}
-            className="p-2 rounded-xl hover:bg-white/5 text-muted-foreground/20 hover:text-white transition-premium"
+            className="p-2 rounded-xl hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-premium"
           >
             <X className="h-5 w-5" />
           </button>
@@ -251,15 +251,15 @@ export function EndpointSelector({
             type="button"
             onClick={() => setActiveTab("params")}
             className={cn(
-              "pb-4 text-[10px] font-black uppercase tracking-[0.2em] transition-premium relative",
+              "pb-4 text-xs font-semibold transition-premium relative",
               activeTab === "params"
                 ? "text-primary"
-                : "text-muted-foreground/40 hover:text-white",
+                : "text-muted-foreground/70 hover:text-white",
             )}
           >
             Parameters
             {totalParams > 0 && (
-              <span className="ml-2 px-2 py-0.5 bg-primary/10 border border-primary/20 rounded-full text-[8px] animate-pulse">
+              <span className="ml-2 px-2 py-0.5 bg-primary/10 border border-primary/20 rounded-full text-2xs animate-pulse">
                 {totalParams}
               </span>
             )}
@@ -272,10 +272,10 @@ export function EndpointSelector({
               type="button"
               onClick={() => setActiveTab("body")}
               className={cn(
-                "pb-4 text-[10px] font-black uppercase tracking-[0.2em] transition-premium relative",
+                "pb-4 text-xs font-semibold transition-premium relative",
                 activeTab === "body"
                   ? "text-primary"
-                  : "text-muted-foreground/40 hover:text-white",
+                  : "text-muted-foreground/70 hover:text-white",
               )}
             >
               Request Manifest
@@ -295,8 +295,8 @@ export function EndpointSelector({
               <div className="space-y-4">
                 <div className="flex items-center gap-3 px-1">
                   <Link className="h-3.5 w-3.5 text-primary" />
-                  <h5 className="text-[9px] font-black text-white/40 uppercase tracking-[0.3em]">
-                    Isolated Path Variables
+                  <h5 className="text-2xs font-semibold text-white/70 uppercase tracking-wider">
+                    Path variables
                   </h5>
                 </div>
                 <div className="grid gap-6">
@@ -318,8 +318,8 @@ export function EndpointSelector({
               <div className="space-y-4">
                 <div className="flex items-center gap-3 px-1">
                   <Search className="h-3.5 w-3.5 text-primary" />
-                  <h5 className="text-[9px] font-black text-white/40 uppercase tracking-[0.3em]">
-                    Query Injection Vectors
+                  <h5 className="text-2xs font-semibold text-white/70 uppercase tracking-wider">
+                    Query parameters
                   </h5>
                 </div>
                 <div className="grid gap-6">
@@ -341,7 +341,7 @@ export function EndpointSelector({
               <div className="space-y-4">
                 <div className="flex items-center gap-3 px-1">
                   <Clipboard className="h-3.5 w-3.5 text-primary" />
-                  <h5 className="text-[9px] font-black text-white/40 uppercase tracking-[0.3em]">
+                  <h5 className="text-2xs font-semibold text-white/70 uppercase tracking-wider">
                     Header Metadata Streams
                   </h5>
                 </div>
@@ -364,8 +364,8 @@ export function EndpointSelector({
             )}
 
             {totalParams === 0 && (
-              <div className="py-20 text-center bg-surface-4 border-2 border-dashed border-white/5 rounded-[2rem] animate-in fade-in">
-                <p className="text-[10px] font-black text-muted-foreground/20 uppercase tracking-[0.4em]">
+              <div className="py-20 text-center bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl animate-in fade-in">
+                <p className="text-xs font-semibold text-muted-foreground/50">
                   Zero Parameters Required for Operation
                 </p>
               </div>
@@ -377,7 +377,7 @@ export function EndpointSelector({
           <div className="space-y-6 animate-in fade-in slide-in-from-right-4 duration-500">
             <div className="flex items-center gap-3 px-1">
               <FileText className="h-4 w-4 text-primary" />
-              <h5 className="text-[10px] font-black text-white/60 uppercase tracking-[0.2em]">
+              <h5 className="text-xs font-semibold text-white/60">
                 Payload Manifest Construction
               </h5>
             </div>
@@ -386,7 +386,7 @@ export function EndpointSelector({
                 {Object.entries(bodySchema.properties).map(([key, prop]) => (
                   <div key={key} className="space-y-3">
                     <div className="flex items-center justify-between px-1">
-                      <label className="text-[10px] font-black text-white/40 uppercase tracking-widest">
+                      <label className="text-xs font-semibold text-white/70">
                         {key}
                         {(
                           bodySchema.required as string[] | undefined
@@ -396,7 +396,7 @@ export function EndpointSelector({
                       </label>
                     </div>
                     {prop.description && (
-                      <p className="text-[9px] font-bold text-muted-foreground/20 uppercase tracking-widest leading-relaxed px-1">
+                      <p className="text-2xs font-bold text-muted-foreground/50 leading-relaxed px-1">
                         {prop.description}
                       </p>
                     )}
@@ -413,7 +413,7 @@ export function EndpointSelector({
                       placeholder={String(
                         prop.example || prop.default || `Enter ${key}...`,
                       ).toUpperCase()}
-                      className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-xs font-black uppercase tracking-widest text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium shadow-inner"
+                      className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium shadow-inner"
                     />
                   </div>
                 ))}
@@ -432,7 +432,7 @@ export function EndpointSelector({
                   }}
                   placeholder='{ "PAYLOAD": "METADATA" }'
                   rows={10}
-                  className="relative w-full p-6 bg-surface-4 border border-white/5 rounded-[2rem] text-xs font-mono text-primary placeholder-primary/20 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium outline-none shadow-2xl custom-scrollbar"
+                  className="relative w-full p-6 bg-surface-4 border border-white/5 rounded-2xl text-xs font-mono text-primary placeholder-primary/20 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium outline-none shadow-2xl custom-scrollbar"
                 />
               </div>
             )}
@@ -444,27 +444,26 @@ export function EndpointSelector({
       <div className="relative z-10 flex gap-4 pt-10 border-t border-white/5">
         <Button
           onClick={handleApplyConfiguration}
-          className="flex-1 h-14 bg-primary hover:bg-primary/90 text-white text-[11px] font-black uppercase tracking-[0.3em] rounded-2xl transition-premium shadow-2xl shadow-primary/20 active:scale-95 flex items-center justify-center gap-3"
+          className="flex-1 h-14 bg-primary hover:bg-primary/90 text-white text-sm font-semibold rounded-2xl transition-premium shadow-2xl active:scale-95 flex items-center justify-center gap-3"
         >
           <Zap className="h-4 w-4" /> Finalize Configuration
         </Button>
         <Button
           onClick={() => setSelectedEndpoint(null)}
           variant="ghost"
-          className="h-14 px-10 bg-surface-3 hover:bg-surface-4 text-muted-foreground/40 hover:text-white text-[10px] font-black uppercase tracking-widest rounded-2xl border border-white/5 transition-premium active:scale-95"
+          className="h-14 px-10 bg-surface-3 hover:bg-surface-4 text-muted-foreground/70 hover:text-white text-sm font-semibold rounded-2xl border border-white/5 transition-premium active:scale-95"
         >
           Abort
         </Button>
       </div>
 
-      <div className="p-6 bg-primary/5 border border-primary/10 rounded-[2rem] flex items-start gap-4">
+      <div className="p-6 bg-primary/5 border border-primary/10 rounded-2xl flex items-start gap-4">
         <div className="shrink-0 p-2 rounded-xl bg-primary/10 border border-primary/20">
           <Settings className="w-4 h-4 text-primary" />
         </div>
-        <p className="text-[10px] text-primary/60 font-bold uppercase tracking-widest leading-relaxed">
-          Deployment Insight: Review all parameters carefully. Incorrect path
-          variables or payload manifests may cause execution instability across
-          the workflow core.
+        <p className="text-xs text-primary/60 leading-relaxed">
+          Check the parameters carefully. A wrong path variable or body shape
+          will make the node fail at run time.
         </p>
       </div>
     </div>
@@ -485,17 +484,17 @@ function ParameterInput({
       <div className="flex items-center justify-between px-1">
         <label
           htmlFor={`param-${parameter.name}`}
-          className="flex items-center gap-2 text-[10px] font-black text-white uppercase tracking-widest"
+          className="flex items-center gap-2 text-xs font-semibold text-white"
         >
           <code className="text-primary font-bold">{parameter.name}</code>
           {parameter.required && <span className="text-primary">*</span>}
         </label>
-        <Badge className="bg-white/5 text-muted-foreground/20 border-white/10 text-[7px] font-black uppercase tracking-widest">
+        <Badge className="bg-white/5 text-muted-foreground/50 border-white/10 text-2xs font-semibold uppercase tracking-wider">
           {parameter.in.toUpperCase()}
         </Badge>
       </div>
       {parameter.description && (
-        <p className="text-[9px] font-bold text-muted-foreground/20 uppercase tracking-widest leading-relaxed px-1">
+        <p className="text-2xs font-bold text-muted-foreground/50 leading-relaxed px-1">
           {parameter.description}
         </p>
       )}
@@ -515,7 +514,7 @@ function ParameterInput({
             `IDENTIFIER VALUE...`,
         ).toUpperCase()}
         required={parameter.required}
-        className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-xs font-black uppercase tracking-widest text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium shadow-inner"
+        className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium shadow-inner"
       />
     </div>
   );

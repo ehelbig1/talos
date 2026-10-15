@@ -71,7 +71,7 @@ export function ChannelTable({
                   <div className="font-medium text-foreground">
                     {ch.calendar_id}
                   </div>
-                  <div className="text-[10px] text-muted-foreground font-mono mt-0.5">
+                  <div className="text-xs text-muted-foreground font-mono mt-0.5">
                     {ch.google_channel_id.slice(0, 12)}…
                   </div>
                 </td>

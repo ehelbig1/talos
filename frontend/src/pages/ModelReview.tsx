@@ -88,14 +88,14 @@ function isTeacherAudit(value: unknown): value is TeacherAudit {
 function TeacherCeilingCard({ audit }: { audit: unknown }) {
   if (!isTeacherAudit(audit)) {
     return (
-      <div className="px-6 py-5 bg-white/[0.02] border border-white/5 rounded-[2rem]">
+      <div className="px-6 py-5 bg-white/[0.02] border border-white/5 rounded-2xl">
         <div className="flex items-center gap-2 mb-1">
-          <GraduationCap className="w-4 h-4 text-muted-foreground/40" />
-          <span className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-[0.25em]">
+          <GraduationCap className="w-4 h-4 text-muted-foreground/70" />
+          <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
             Teacher ceiling
           </span>
         </div>
-        <p className="text-[10px] text-muted-foreground/30 font-bold uppercase tracking-widest mt-2">
+        <p className="text-xs text-muted-foreground/60 font-bold mt-2">
           Not audited yet — run ml_teacher_audit to measure the teacher's
           accuracy against gold corrections.
         </p>
@@ -108,19 +108,19 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
     const total = Math.max(audit.gold_rows, 1);
     const progressPct = Math.min(100, Math.round((done / total) * 100));
     return (
-      <div className="px-6 py-5 bg-white/[0.02] border border-primary/20 rounded-[2rem]">
+      <div className="px-6 py-5 bg-white/[0.02] border border-primary/20 rounded-2xl">
         <div className="flex items-center gap-2 mb-3">
           <GraduationCap className="w-4 h-4 text-primary animate-pulse" />
-          <span className="text-[9px] text-primary/80 font-black uppercase tracking-[0.25em]">
+          <span className="text-2xs text-primary/80 font-semibold uppercase tracking-wider">
             Teacher ceiling — auditing
           </span>
-          <span className="ml-auto text-[10px] text-muted-foreground/50 font-bold">
+          <span className="ml-auto text-xs text-muted-foreground/50 font-bold">
             {done}/{audit.gold_rows}
           </span>
         </div>
         <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
           <div
-            className="h-full bg-primary shadow-[0_0_10px_hsla(var(--primary),0.6)] transition-all duration-500 ease-premium-out"
+            className="h-full bg-primary transition-all duration-500 ease-premium-out"
             style={{ width: `${progressPct}%` }}
           />
         </div>
@@ -130,14 +130,14 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
 
   if (audit.status === "failed") {
     return (
-      <div className="px-6 py-5 bg-white/[0.02] border border-destructive/20 rounded-[2rem]">
+      <div className="px-6 py-5 bg-white/[0.02] border border-destructive/20 rounded-2xl">
         <div className="flex items-center gap-2 mb-1">
           <AlertTriangle className="w-4 h-4 text-destructive/70" />
-          <span className="text-[9px] text-destructive/70 font-black uppercase tracking-[0.25em]">
+          <span className="text-2xs text-destructive/70 font-semibold uppercase tracking-wider">
             Teacher ceiling — audit failed
           </span>
         </div>
-        <p className="text-[10px] text-muted-foreground/40 font-bold uppercase tracking-widest mt-2">
+        <p className="text-xs text-muted-foreground/70 font-bold mt-2">
           {audit.error}
         </p>
       </div>
@@ -147,11 +147,11 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
   // complete
   const perClassEntries = Object.entries(audit.per_class);
   return (
-    <div className="px-6 py-5 bg-white/[0.02] border border-white/5 rounded-[2rem]">
+    <div className="px-6 py-5 bg-white/[0.02] border border-white/5 rounded-2xl">
       <div className="flex flex-wrap items-center gap-x-8 gap-y-3">
         <div className="flex items-center gap-2">
           <GraduationCap className="w-4 h-4 text-primary/70" />
-          <span className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-[0.25em]">
+          <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
             Teacher ceiling
           </span>
         </div>
@@ -161,7 +161,7 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
           hint={`${audit.agree}/${audit.compared} agree`}
         />
         <Stat label="Parse failed" value={String(audit.parse_failed)} />
-        <span className="ml-auto text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.25em]">
+        <span className="ml-auto text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
           {new Date(audit.audited_at).toLocaleString()} · teacher:{" "}
           {audit.teacher.model}
         </span>
@@ -172,7 +172,7 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
             const classPct = n > 0 ? (agree / n) * 100 : 0;
             return (
               <div key={label} className="flex items-center gap-3">
-                <span className="w-28 shrink-0 text-[10px] text-muted-foreground/60 font-bold truncate capitalize">
+                <span className="w-28 shrink-0 text-xs text-muted-foreground/60 font-bold truncate capitalize">
                   {label}
                 </span>
                 <div className="flex-1 h-1.5 bg-white/5 rounded-full overflow-hidden">
@@ -181,7 +181,7 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
                     style={{ width: `${classPct}%` }}
                   />
                 </div>
-                <span className="w-16 shrink-0 text-[10px] text-muted-foreground/40 font-bold text-right tabular-nums">
+                <span className="w-16 shrink-0 text-xs text-muted-foreground/70 font-bold text-right tabular-nums">
                   {agree}/{n}
                 </span>
               </div>
@@ -269,15 +269,15 @@ export default function ModelReview() {
       {/* Header */}
       <header className="px-10 pt-16 pb-8 shrink-0">
         <div className="flex items-center gap-5">
-          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center shadow-[0_0_30px_hsla(var(--primary),0.1)]">
+          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center">
             <BrainCircuit className="w-7 h-7 text-primary" />
           </div>
           <div>
-            <h1 className="text-2xl md:text-3xl font-black text-white tracking-tight font-outfit uppercase leading-tight">
+            <h1 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
               Model Review
             </h1>
-            <p className="text-[10px] text-muted-foreground/40 font-bold uppercase tracking-[0.3em] mt-2">
-              Human-in-the-loop distillation · teach the small model
+            <p className="text-xs text-muted-foreground/70 font-bold mt-2">
+              Review and correct what your classifiers predicted.
             </p>
           </div>
         </div>
@@ -290,17 +290,17 @@ export default function ModelReview() {
             {[1, 2].map((i) => (
               <div
                 key={i}
-                className="h-28 w-72 bg-white/[0.02] border border-white/5 rounded-[2rem] animate-pulse"
+                className="h-28 w-72 bg-white/[0.02] border border-white/5 rounded-2xl animate-pulse"
               />
             ))}
           </div>
         ) : models.length === 0 ? (
-          <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-[2.5rem]">
-            <BrainCircuit className="w-16 h-16 text-muted-foreground/10 mb-6 mx-auto" />
-            <p className="text-sm text-muted-foreground/50 font-black uppercase tracking-[0.2em]">
+          <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-3xl">
+            <BrainCircuit className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto" />
+            <p className="text-sm text-muted-foreground/50 font-semibold">
               No models yet
             </p>
-            <p className="text-[10px] text-muted-foreground/30 font-bold uppercase tracking-widest mt-2">
+            <p className="text-xs text-muted-foreground/60 font-bold mt-2">
               Distilled classifiers appear here as they start learning.
             </p>
           </div>
@@ -314,18 +314,18 @@ export default function ModelReview() {
                   type="button"
                   onClick={() => setPicked(m.name)}
                   className={cn(
-                    "text-left w-72 rounded-[2rem] p-6 border transition-premium relative overflow-hidden group",
+                    "text-left w-72 rounded-2xl p-6 border transition-premium relative overflow-hidden group",
                     isActive
                       ? "bg-primary/[0.06] border-primary/30 shadow-xl"
                       : "bg-white/[0.02] border-white/5 hover:bg-white/[0.04] hover:border-white/10",
                   )}
                 >
                   <div className="flex items-start justify-between gap-3">
-                    <span className="text-sm font-black text-white truncate font-outfit">
+                    <span className="text-sm font-semibold text-white truncate font-outfit">
                       {m.name}
                     </span>
                     {m.pendingDisagreements > 0 && (
-                      <span className="shrink-0 bg-warning text-black text-[10px] font-black rounded-full px-2.5 py-1 min-w-[1.6rem] text-center shadow-[0_0_10px_hsla(var(--warning),0.5)]">
+                      <span className="shrink-0 bg-warning text-black text-xs font-semibold rounded-full px-2.5 py-1 min-w-[1.6rem] text-center">
                         {m.pendingDisagreements}
                       </span>
                     )}
@@ -333,14 +333,14 @@ export default function ModelReview() {
                   <div className="flex items-center gap-2 mt-4">
                     <span
                       className={cn(
-                        "text-[9px] font-black uppercase tracking-widest px-2.5 py-1 rounded-lg border",
+                        "text-2xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-lg border",
                         LIFECYCLE_STYLE[m.lifecycleState] ??
                           LIFECYCLE_STYLE.llm_only,
                       )}
                     >
                       {lifecycleLabel(m.lifecycleState)}
                     </span>
-                    <span className="text-[9px] text-muted-foreground/40 font-bold uppercase tracking-widest">
+                    <span className="text-2xs text-muted-foreground/70 font-bold uppercase tracking-wider">
                       acc {pct(m.promotedAccuracy)}
                     </span>
                   </div>
@@ -355,7 +355,7 @@ export default function ModelReview() {
           <div className="mt-10">
             {/* Status strip */}
             {feed && (
-              <div className="flex flex-wrap items-center gap-x-8 gap-y-3 mb-8 px-6 py-5 bg-white/[0.02] border border-white/5 rounded-[2rem]">
+              <div className="flex flex-wrap items-center gap-x-8 gap-y-3 mb-8 px-6 py-5 bg-white/[0.02] border border-white/5 rounded-2xl">
                 <Stat
                   label="Lifecycle"
                   value={lifecycleLabel(feed.lifecycleState)}
@@ -366,8 +366,8 @@ export default function ModelReview() {
                   hint={`${feed.shadowObservations} obs · era ${feed.shadowEpoch}`}
                 />
                 <Stat label="Pending review" value={String(pending.length)} />
-                <div className="ml-auto flex items-center gap-2 text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.25em]">
-                  <Sparkles className="w-3.5 h-3.5 text-primary/40" />
+                <div className="ml-auto flex items-center gap-2 text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                  <Sparkles className="w-3.5 h-3.5 text-primary/70" />
                   Corrections train the model toward promotion
                 </div>
               </div>
@@ -386,7 +386,7 @@ export default function ModelReview() {
                 {[1, 2, 3].map((i) => (
                   <div
                     key={i}
-                    className="h-40 bg-white/[0.02] border border-white/5 rounded-[2rem] animate-pulse"
+                    className="h-40 bg-white/[0.02] border border-white/5 rounded-2xl animate-pulse"
                   />
                 ))}
               </div>
@@ -396,27 +396,27 @@ export default function ModelReview() {
               // that silently hides work (found live 2026-07-14: a
               // schema/query version skew errored the feed while the
               // badge showed 10 pending).
-              <div className="text-center py-24 bg-white/[0.01] border border-dashed border-destructive/20 rounded-[2.5rem]">
-                <p className="text-sm text-destructive/80 font-black uppercase tracking-[0.2em]">
+              <div className="text-center py-24 bg-white/[0.01] border border-dashed border-destructive/20 rounded-3xl">
+                <p className="text-sm text-destructive/80 font-semibold">
                   Could not load the review queue
                 </p>
-                <p className="text-[10px] text-muted-foreground/40 font-bold uppercase tracking-widest mt-2">
+                <p className="text-xs text-muted-foreground/70 font-bold mt-2">
                   The pending count in the model list is still accurate.
                 </p>
                 <button
                   onClick={() => refetchFeed()}
-                  className="mt-6 px-5 py-2 text-[10px] font-black uppercase tracking-[0.2em] text-foreground/80 bg-white/[0.04] border border-white/10 rounded-full hover:bg-white/[0.08] transition-premium"
+                  className="mt-6 px-5 py-2 text-xs font-semibold text-foreground/80 bg-white/[0.04] border border-white/10 rounded-full hover:bg-white/[0.08] transition-premium"
                 >
                   Retry
                 </button>
               </div>
             ) : pending.length === 0 ? (
-              <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-[2.5rem] group">
+              <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-3xl group">
                 <CheckCircle2 className="w-16 h-16 text-success/25 mb-6 mx-auto group-hover:text-success/50 transition-premium" />
-                <p className="text-sm text-muted-foreground font-black uppercase tracking-[0.2em]">
+                <p className="text-sm text-muted-foreground font-semibold">
                   All caught up
                 </p>
-                <p className="text-[10px] text-muted-foreground/30 font-bold uppercase tracking-widest mt-2">
+                <p className="text-xs text-muted-foreground/60 font-bold mt-2">
                   No disagreements waiting on your review.
                 </p>
               </div>
@@ -428,7 +428,7 @@ export default function ModelReview() {
                     <div
                       key={d.id}
                       className={cn(
-                        "bg-white/[0.02] border border-white/5 rounded-[2rem] p-6 transition-premium relative overflow-hidden",
+                        "bg-white/[0.02] border border-white/5 rounded-2xl p-6 transition-premium relative overflow-hidden",
                         rowBusy && "opacity-50 pointer-events-none",
                       )}
                     >
@@ -436,7 +436,7 @@ export default function ModelReview() {
                       <div className="flex flex-wrap items-center gap-3 mb-4">
                         <span
                           className={cn(
-                            "text-[9px] font-black uppercase tracking-widest px-2.5 py-1 rounded-lg border",
+                            "text-2xs font-semibold uppercase tracking-wider px-2.5 py-1 rounded-lg border",
                             d.kind === "divergence"
                               ? "text-warning bg-warning/5 border-warning/20"
                               : "text-muted-foreground/60 bg-white/5 border-white/10",
@@ -446,26 +446,26 @@ export default function ModelReview() {
                             ? "Model disagreed"
                             : "Model abstained"}
                         </span>
-                        <span className="flex items-center gap-1.5 text-[10px] font-bold text-muted-foreground/60">
+                        <span className="flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60">
                           <Cpu className="w-3.5 h-3.5 text-warning/70" />
                           model:{" "}
-                          <span className="font-black text-white/80">
+                          <span className="font-semibold text-white/80">
                             {d.fastLabel ?? "—"}
                           </span>
                           {d.fastConfidence != null && (
-                            <span className="text-muted-foreground/40">
+                            <span className="text-muted-foreground/70">
                               ({pct(d.fastConfidence)})
                             </span>
                           )}
                         </span>
-                        <span className="flex items-center gap-1.5 text-[10px] font-bold text-muted-foreground/60">
+                        <span className="flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60">
                           <Bot className="w-3.5 h-3.5 text-primary/70" />
                           llm:{" "}
-                          <span className="font-black text-white/80">
+                          <span className="font-semibold text-white/80">
                             {d.llmLabel}
                           </span>
                         </span>
-                        <span className="ml-auto text-[9px] text-muted-foreground/30 font-black uppercase tracking-widest">
+                        <span className="ml-auto text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
                           {new Date(d.createdAt).toLocaleString()}
                         </span>
                       </div>
@@ -477,7 +477,7 @@ export default function ModelReview() {
 
                       {/* Correct-label actions + dismiss */}
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-widest mr-1">
+                        <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider mr-1">
                           Correct label
                         </span>
                         {labelOptions.map((label) => {
@@ -493,7 +493,7 @@ export default function ModelReview() {
                                 })
                               }
                               className={cn(
-                                "h-9 rounded-xl font-black text-[10px] uppercase tracking-widest border transition-premium",
+                                "h-9 rounded-xl font-semibold text-xs border transition-premium",
                                 suggested
                                   ? "bg-primary/10 hover:bg-primary text-primary hover:text-black border-primary/30"
                                   : "bg-white/[0.03] hover:bg-white/10 text-white/80 border-white/10",
@@ -512,7 +512,7 @@ export default function ModelReview() {
                           onClick={() =>
                             resolve.mutate({ disagreementId: d.id })
                           }
-                          className="h-9 rounded-xl font-black text-[10px] uppercase tracking-widest text-muted-foreground/50 hover:text-destructive hover:bg-destructive/10 border border-transparent hover:border-destructive/20 ml-auto"
+                          className="h-9 rounded-xl font-semibold text-xs text-muted-foreground/50 hover:text-destructive hover:bg-destructive/10 border border-transparent hover:border-destructive/20 ml-auto"
                         >
                           <X className="w-3.5 h-3.5 mr-1.5" />
                           Dismiss
@@ -541,13 +541,13 @@ function Stat({
 }) {
   return (
     <div className="flex flex-col">
-      <span className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-[0.25em]">
+      <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
         {label}
       </span>
-      <span className="text-lg font-black text-white leading-tight mt-1 capitalize">
+      <span className="text-lg font-semibold text-white leading-tight mt-1 capitalize">
         {value}
         {hint && (
-          <span className="text-[10px] text-muted-foreground/40 font-bold lowercase ml-2">
+          <span className="text-xs text-muted-foreground/70 font-bold lowercase ml-2">
             {hint}
           </span>
         )}

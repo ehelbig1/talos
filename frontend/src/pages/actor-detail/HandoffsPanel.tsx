@@ -69,10 +69,10 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
           message="No handoffs recorded yet"
         />
         <div className="bg-surface-3/60 border border-white/5 rounded-2xl px-5 py-4">
-          <p className="text-muted-foreground/40 text-xs leading-relaxed">
+          <p className="text-muted-foreground/70 text-xs leading-relaxed">
             Handoffs let this actor delegate work to another actor
             mid-execution. Use the{" "}
-            <code className="text-violet-300 bg-violet-500/10 px-1 rounded font-mono text-[11px]">
+            <code className="text-violet-300 bg-violet-500/10 px-1 rounded font-mono text-xs">
               handoff_to_actor
             </code>{" "}
             MCP tool or call it from a workflow node to start building a handoff
@@ -91,7 +91,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
           <h2 className="text-white font-medium text-sm mb-4 flex items-center gap-2">
             <Bot className="w-4 h-4 text-violet-400" />
             Partner Actors
-            <span className="text-[10px] bg-surface-4/60 text-muted-foreground px-1.5 py-0.5 rounded-full ml-1">
+            <span className="text-xs bg-surface-4/60 text-muted-foreground px-1.5 py-0.5 rounded-full ml-1">
               {partnerFreq.length}
             </span>
           </h2>
@@ -118,7 +118,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
                     </span>
                   )}
                 </div>
-                <div className="flex items-center gap-3 shrink-0 text-[11px]">
+                <div className="flex items-center gap-3 shrink-0 text-xs">
                   {p.outCount > 0 && (
                     <span className="text-violet-400" title="Outbound handoffs">
                       → {p.outCount}
@@ -141,7 +141,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
           <h2 className="text-white font-medium text-sm mb-4 flex items-center gap-2">
             <GitBranch className="w-4 h-4 text-violet-400" />
             Outbound Handoffs
-            <span className="text-[10px] bg-surface-4/60 text-muted-foreground px-1.5 py-0.5 rounded-full ml-1">
+            <span className="text-xs bg-surface-4/60 text-muted-foreground px-1.5 py-0.5 rounded-full ml-1">
               {outbound.length}
             </span>
           </h2>
@@ -166,7 +166,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
                       name
                     )}
                   </p>
-                  <time className="text-muted-foreground/40 text-[11px] shrink-0">
+                  <time className="text-muted-foreground/70 text-xs shrink-0">
                     {relativeTime(e.timestamp)}
                   </time>
                 </div>
@@ -181,7 +181,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
           <h2 className="text-white font-medium text-sm mb-4 flex items-center gap-2">
             <GitBranch className="w-4 h-4 text-emerald-400" />
             Inbound Handoffs
-            <span className="text-[10px] bg-surface-4/60 text-muted-foreground px-1.5 py-0.5 rounded-full ml-1">
+            <span className="text-xs bg-surface-4/60 text-muted-foreground px-1.5 py-0.5 rounded-full ml-1">
               {inbound.length}
             </span>
           </h2>
@@ -206,7 +206,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
                       name
                     )}
                   </p>
-                  <time className="text-muted-foreground/40 text-[11px] shrink-0">
+                  <time className="text-muted-foreground/70 text-xs shrink-0">
                     {relativeTime(e.timestamp)}
                   </time>
                 </div>

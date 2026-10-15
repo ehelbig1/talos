@@ -24,7 +24,7 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
     <div className="flex gap-6 group animate-in fade-in slide-in-from-left-4 duration-500">
       {/* Timestamp */}
       <div className="w-14 pt-1.5 shrink-0 text-right">
-        <span className="text-[10px] font-black font-mono text-muted-foreground/20 group-hover:text-primary transition-premium tracking-tighter">
+        <span className="text-xs font-semibold font-mono text-muted-foreground/50 group-hover:text-primary transition-premium tracking-tighter">
           +{formatDuration(ev.elapsedMs)}
         </span>
       </div>
@@ -34,15 +34,15 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
         <div className="relative z-10 flex flex-col items-center shrink-0 pt-2">
           <div
             className={cn(
-              "w-3 h-3 rounded-full border-2 bg-background transition-premium group-hover:scale-150 relative",
+              "w-3 h-3 rounded-full border-2 bg-background transition-premium relative",
               isFailed
-                ? "border-destructive shadow-[0_0_15px_hsla(var(--destructive),0.4)]"
+                ? "border-destructive"
                 : isCompleted
-                  ? "border-success shadow-[0_0_15px_hsla(var(--success),0.4)]"
+                  ? "border-success"
                   : isRunningStatus
-                    ? "border-primary animate-status-pulse shadow-[0_0_15px_hsla(var(--primary),0.4)]"
+                    ? "border-primary animate-status-pulse"
                     : isApproval
-                      ? "border-warning shadow-[0_0_15px_hsla(var(--warning),0.4)]"
+                      ? "border-warning"
                       : "border-muted-foreground/10",
             )}
           >
@@ -56,7 +56,7 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
           <div className="flex flex-wrap items-center gap-3 mb-3">
             <span
               className={cn(
-                "text-[9px] font-black px-2.5 py-1 rounded-full uppercase tracking-[0.2em] shadow-sm",
+                "text-2xs font-semibold px-2.5 py-1 rounded-full uppercase tracking-wider shadow-sm",
                 isFailed
                   ? "bg-destructive/10 text-destructive border border-destructive/20"
                   : isCompleted
@@ -70,26 +70,26 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
             </span>
 
             {ev.nodeId && (
-              <span className="text-sm font-black text-white font-outfit tracking-tight truncate max-w-[220px] group-hover:text-primary transition-premium">
+              <span className="text-sm font-semibold text-white font-outfit tracking-tight truncate max-w-[220px] group-hover:text-primary transition-premium">
                 {nodeName}
               </span>
             )}
 
             <div className="flex items-center gap-2">
               {ev.retryAttempt != null && ev.retryAttempt > 0 && (
-                <Badge className="bg-warning/5 text-warning/80 text-[8px] font-black h-4 px-2 border-warning/20 rounded-md tracking-widest uppercase">
+                <Badge className="bg-warning/5 text-warning/80 text-2xs font-semibold h-4 px-2 border-warning/20 rounded-md tracking-wider uppercase">
                   RETRY_{ev.retryAttempt}
                 </Badge>
               )}
               {ev.iterationIndex != null && (
-                <Badge className="bg-primary/5 text-primary/80 text-[8px] font-black h-4 px-2 border-primary/20 rounded-md tracking-widest uppercase">
+                <Badge className="bg-primary/5 text-primary/80 text-2xs font-semibold h-4 px-2 border-primary/20 rounded-md tracking-wider uppercase">
                   ITER_{ev.iterationIndex + 1}
                   {ev.iterationTotal ? `/${ev.iterationTotal}` : ""}
                 </Badge>
               )}
               {ev.checkpointSaved && (
-                <Badge className="bg-success/5 text-success/80 text-[8px] font-black h-4 px-2 border-success/20 rounded-md tracking-widest uppercase">
-                  SNAPSHOT_STORED
+                <Badge className="bg-success/5 text-success/80 text-2xs font-semibold h-4 px-2 border-success/20 rounded-md tracking-wider uppercase">
+                  Checkpoint saved
                 </Badge>
               )}
             </div>
@@ -101,10 +101,10 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
                   href={`${import.meta.env.VITE_JAEGER_URL}${ev.traceId}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/20 hover:text-primary flex items-center gap-2 ml-auto transition-premium group/link"
+                  className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/50 hover:text-primary flex items-center gap-2 ml-auto transition-premium group/link"
                 >
-                  <ExternalLink className="h-3 w-3 group-hover:scale-110 transition-transform" />
-                  Trace_Link
+                  <ExternalLink className="h-3 w-3 transition-transform" />
+                  Open trace
                 </a>
               )}
           </div>
@@ -113,7 +113,7 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
             <div className="mt-4 relative group/logbox">
               <div className="absolute -inset-0.5 bg-primary/5 rounded-2xl opacity-0 group-hover/logbox:opacity-100 transition-premium pointer-events-none" />
               <div className="relative bg-surface-4/40 rounded-2xl p-5 border border-white/5 shadow-2xl glass-dark optimize-blur transition-premium group-hover:border-white/10 group-hover:bg-surface-4/60">
-                <p className="text-[11px] leading-relaxed text-muted-foreground group-hover:text-white/80 transition-colors font-mono break-words selection:bg-primary/30">
+                <p className="text-xs leading-relaxed text-muted-foreground group-hover:text-white/80 transition-colors font-mono break-words selection:bg-primary/30">
                   {ev.logMessage}
                 </p>
               </div>
@@ -125,7 +125,7 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
               {ev.approvalRequired.map((op) => (
                 <span
                   key={op}
-                  className="text-[9px] px-3 py-1 rounded-full bg-warning/5 text-warning/60 border border-warning/10 font-black uppercase tracking-[0.2em] shadow-sm"
+                  className="text-2xs px-3 py-1 rounded-full bg-warning/5 text-warning/60 border border-warning/10 font-semibold uppercase tracking-wider shadow-sm"
                 >
                   {op}
                 </span>
