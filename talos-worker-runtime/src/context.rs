@@ -226,7 +226,7 @@ pub struct TalosContext {
     /// resolver, local-only egress, no proxy, no redirects) — never upstream's
     /// raw connect. Reachable only from the trusted world, whose
     /// `outgoing-handler` is the gated one (`host::wasi_http`).
-    wasi_http_hooks: crate::host::wasi_http::HardenedWasiHttpHooks,
+    pub(crate) wasi_http_hooks: crate::host::wasi_http::HardenedWasiHttpHooks,
 
     /// Allowed outbound hosts for the `http::fetch` host function.
     /// An empty list means "deny all" (safe default; use `["*"]` to allow any host).
@@ -1516,6 +1516,15 @@ mod write_ceiling_decision_tests {
             WriteCeiling::ReadOnly,
             Wildcard
         ));
+    }
+}
+
+impl TalosContext {
+    /// The execution's sandbox directory — the WASI preopen of a filesystem
+    /// world and where `talos:core/files` writes. Read by the epoch callback's
+    /// size check (E2-2).
+    pub(crate) fn sandbox_dir(&self) -> &std::path::Path {
+        self._ephemeral_dir.path()
     }
 }
 

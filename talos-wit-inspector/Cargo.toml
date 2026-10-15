@@ -13,6 +13,8 @@ wasmparser = "0.224"
 
 [dev-dependencies]
 proptest.workspace = true
+# A real component for the sentinel test (E2-7).
+wat.workspace = true
 
 [lints]
 workspace = true

@@ -30,6 +30,13 @@
 //!
 //! A runtime with no seal key (an embedded rehearsal surface, a test) does not
 //! use the Redis tier at all; its in-process tier is unchanged.
+//!
+//! An entry also carries its own expiry, sealed with it (security review
+//! 2026-10-15, E2-5): `{"v": output, "exp": unix seconds}`. [`open`] refuses an
+//! expired entry whatever TTL Redis holds, so a Redis writer who cannot forge
+//! an entry can no longer pin a captured, genuine one past the operator's
+//! `WASM_RESULT_CACHE_TTL_SECS` by re-`SET`ting it with a longer TTL. The
+//! format is `talos-rc2:`; an `rc1` entry (no expiry) is a miss.
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -43,7 +50,7 @@ const SEAL_KEY_LABEL: &[u8] = b"talos-result-cache-seal/v1";
 /// Derives one entry's AES key from the seal key and the cache key.
 const ENTRY_KEY_LABEL: &[u8] = b"talos-result-cache-entry/v1";
 /// Version tag in front of every sealed Redis value.
-pub(crate) const SEALED_PREFIX: &str = "talos-rc1:";
+pub(crate) const SEALED_PREFIX: &str = "talos-rc2:";
 const NONCE_LEN: usize = 12;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -82,11 +89,33 @@ impl std::fmt::Debug for ResultCacheSealKey {
     }
 }
 
-/// Seal `value` for the Redis entry `cache_key`. `None` only if the output
-/// cannot be serialised or the cipher fails; the caller then skips the write.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Seal `value` for the Redis entry `cache_key`, valid for `ttl_secs` from
+/// now. `None` only if the output cannot be serialised or the cipher fails;
+/// the caller then skips the write.
 #[must_use]
-pub fn seal(key: &ResultCacheSealKey, cache_key: &str, value: &JsonValue) -> Option<String> {
-    let plaintext = serde_json::to_vec(value).ok()?;
+pub fn seal(
+    key: &ResultCacheSealKey,
+    cache_key: &str,
+    value: &JsonValue,
+    ttl_secs: u64,
+) -> Option<String> {
+    seal_until(key, cache_key, value, now_secs().saturating_add(ttl_secs))
+}
+
+/// [`seal`] with the expiry stated (unix seconds).
+fn seal_until(
+    key: &ResultCacheSealKey,
+    cache_key: &str,
+    value: &JsonValue,
+    exp: u64,
+) -> Option<String> {
+    let plaintext = serde_json::to_vec(&serde_json::json!({ "v": value, "exp": exp })).ok()?;
     let mut nonce = [0u8; NONCE_LEN];
     talos_random::fill(&mut nonce);
     let ciphertext = key
@@ -133,7 +162,12 @@ pub fn open(key: &ResultCacheSealKey, cache_key: &str, stored: &str) -> Option<J
             },
         )
         .ok()?;
-    serde_json::from_slice(&plaintext).ok()
+    let mut entry: JsonValue = serde_json::from_slice(&plaintext).ok()?;
+    let exp = entry.get("exp")?.as_u64()?;
+    if exp < now_secs() {
+        return None;
+    }
+    entry.get_mut("v").map(JsonValue::take)
 }
 
 #[cfg(test)]
@@ -150,7 +184,7 @@ mod tests {
     #[test]
     fn a_sealed_entry_opens_under_the_same_key_and_cache_key() {
         let v = json!({"answer": 42, "items": ["a", "b"]});
-        let sealed = seal(&key(), CK, &v).expect("seals");
+        let sealed = seal(&key(), CK, &v, 60).expect("seals");
         assert!(sealed.starts_with(SEALED_PREFIX));
         assert_eq!(open(&key(), CK, &sealed), Some(v.clone()));
         // A second worker of the fleet derives the same seal key.
@@ -162,7 +196,7 @@ mod tests {
 
     #[test]
     fn the_output_is_not_stored_in_clear() {
-        let sealed = seal(&key(), CK, &json!({"token_echo": "visible-marker"})).unwrap();
+        let sealed = seal(&key(), CK, &json!({"token_echo": "visible-marker"}), 60).unwrap();
         assert!(!sealed.contains("visible-marker"));
         assert!(!sealed.contains("token_echo"));
     }
@@ -171,7 +205,7 @@ mod tests {
     /// stored value is flipped in turn — prefix, nonce, ciphertext and tag.
     #[test]
     fn an_entry_with_a_flipped_byte_is_ignored() {
-        let sealed = seal(&key(), CK, &json!({"ok": true})).unwrap();
+        let sealed = seal(&key(), CK, &json!({"ok": true}), 60).unwrap();
         let bytes = sealed.as_bytes();
         for i in 0..bytes.len() {
             let mut b = bytes.to_vec();
@@ -206,13 +240,13 @@ mod tests {
     /// input's) does not open there.
     #[test]
     fn an_entry_moved_to_another_cache_key_is_ignored() {
-        let sealed = seal(&key(), CK, &json!({"ok": true})).unwrap();
+        let sealed = seal(&key(), CK, &json!({"ok": true}), 60).unwrap();
         assert_eq!(open(&key(), "wasm:result:modhash:other", &sealed), None);
     }
 
     #[test]
     fn an_entry_sealed_under_another_fleet_key_is_ignored() {
-        let sealed = seal(&key(), CK, &json!({"ok": true})).unwrap();
+        let sealed = seal(&key(), CK, &json!({"ok": true}), 60).unwrap();
         let other = ResultCacheSealKey::derive(&[8u8; 32]);
         assert_eq!(open(&other, CK, &sealed), None);
     }
@@ -220,7 +254,11 @@ mod tests {
     #[test]
     fn two_seals_of_one_value_differ() {
         let v = json!({"ok": true});
-        assert_ne!(seal(&key(), CK, &v), seal(&key(), CK, &v), "fresh nonce");
+        assert_ne!(
+            seal(&key(), CK, &v, 60),
+            seal(&key(), CK, &v, 60),
+            "fresh nonce"
+        );
     }
 
     /// TEXTUAL pin: the runtime's Redis tier reads and writes ONLY through
@@ -235,8 +273,19 @@ mod tests {
         assert!(!get.contains("serde_json::from_str"));
         let put = &src[src.find("async fn cache_result(").unwrap()..];
         let put = &put[..put.find("\n    }\n").unwrap()];
-        assert!(put.contains("crate::result_cache_seal::seal(seal, cache_key, result)"));
+        assert!(put.contains("crate::result_cache_seal::seal(seal, cache_key, result, ttl_secs)"));
         assert!(!put.contains("serde_json::to_string"));
+    }
+
+    /// E2-5 (2026-10-15): an entry past its sealed expiry is a miss even if
+    /// Redis still serves it (a re-SET with a longer TTL); one within it opens.
+    #[test]
+    fn an_entry_past_its_sealed_expiry_is_ignored() {
+        let v = json!({"ok": true});
+        let expired = seal_until(&key(), CK, &v, now_secs().saturating_sub(1)).unwrap();
+        assert_eq!(open(&key(), CK, &expired), None);
+        let fresh = seal_until(&key(), CK, &v, now_secs() + 60).unwrap();
+        assert_eq!(open(&key(), CK, &fresh), Some(v));
     }
 
     #[test]

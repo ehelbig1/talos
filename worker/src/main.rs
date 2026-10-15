@@ -525,6 +525,21 @@ async fn publish_result_with_retry(
 /// decryption, module acquisition, hash checks): `status: Failed`,
 /// `output_payload: {"error": msg}`, elapsed time from `start`, and
 /// empty logs/signature/nonce/worker-id (the publish path signs it).
+/// The world a job's signed `capability_world` hint names: `Ok(None)` for no
+/// hint, `Ok(Some(world))` for a world this worker knows, `Err` for a hint it
+/// does not (the parser maps any unknown string to `Unknown`, which the
+/// runtime would read as "no hint" — E2-3).
+fn job_world_hint(raw: Option<&str>) -> Result<Option<worker::wit_inspector::CapabilityWorld>, ()> {
+    use worker::wit_inspector::CapabilityWorld;
+    match raw {
+        None => Ok(None),
+        Some(s) => match s.parse::<CapabilityWorld>() {
+            Ok(CapabilityWorld::Unknown) | Err(_) => Err(()),
+            Ok(world) => Ok(Some(world)),
+        },
+    }
+}
+
 fn failed_result(job_id: uuid::Uuid, start: &std::time::Instant, msg: &str) -> JobResult {
     JobResult {
         dispatch_attempt: 0,
@@ -1757,8 +1772,28 @@ async fn execute_job(
     // the runtime uses it instead of re-inspecting the WASM binary.  This is critical for
     // sandbox modules whose Wizer-snapshotted binary may have lost embedded WIT world-name
     // strings that inspect_component relies on.
-    let capability_world_hint: Option<worker::wit_inspector::CapabilityWorld> =
-        req.capability_world.as_deref().and_then(|s| s.parse().ok());
+    //
+    // A signed hint naming no world this worker knows is a REFUSAL, not "no
+    // hint" (security review 2026-10-15, E2-3): until then it fell back to
+    // the binary's inspected world — the pre-G-1 behaviour, wider than the
+    // world the controller checked whenever the inspection is wider.
+    let capability_world_hint = match job_world_hint(req.capability_world.as_deref()) {
+        Ok(hint) => hint,
+        Err(()) => {
+            ::tracing::warn!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                "capability-world-unrecognised: the job's signed world hint names no world \
+                 this worker knows; refused before instantiation"
+            );
+            return failed_result(
+                req.job_id,
+                &start,
+                "capability-world-unrecognised: the job names a capability world this worker \
+                 does not know",
+            );
+        }
+    };
 
     // Honor the controller-supplied `timeout_ms` from the job request. The
     // controller has already sourced it from the node's `timeout_secs` (or the
@@ -3910,6 +3945,25 @@ async fn main() -> anyhow::Result<()> {
 }
 #[cfg(test)]
 mod result_publish_tests {
+    /// E2-3 (2026-10-15): a hint this worker does not know is refused, never
+    /// read as "no hint"; a known one in either spelling is that world.
+    #[test]
+    fn an_unrecognised_world_hint_is_refused_not_dropped() {
+        use worker::wit_inspector::CapabilityWorld;
+        assert_eq!(super::job_world_hint(None), Ok(None));
+        assert_eq!(
+            super::job_world_hint(Some("http-node")),
+            Ok(Some(CapabilityWorld::Http))
+        );
+        assert_eq!(
+            super::job_world_hint(Some("automation-node")),
+            Ok(Some(CapabilityWorld::Trusted))
+        );
+        for unknown in ["automation-node-v2", "", "llm-node", "unknown"] {
+            assert_eq!(super::job_world_hint(Some(unknown)), Err(()), "{unknown:?}");
+        }
+    }
+
     use super::*;
 
     // Serial guard for env-mutating tests in this module. Without it,
