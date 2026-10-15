@@ -169,6 +169,17 @@ services:
       # .env (TALOS_RPC_GUEST_ROLE=) to run module SQL as the app user instead.
       TALOS_RPC_GUEST_ROLE: ${TALOS_RPC_GUEST_ROLE-talos_guest}
       TALOS_ADMIN_QUERY_DATABASE_URL: ${TALOS_ADMIN_QUERY_DATABASE_URL:-}
+      # Security switches the chart sets on the controller, set the same way
+      # here (scripts/check-deploy-posture.py rule 7 keeps them in step; until
+      # 2026-10-15 this file, used on its own, ran with all four off):
+      # row security's per-transaction role, the actor write ceiling (also on
+      # the worker), cross-replica single use of signed RPCs, and failing
+      # closed when the replay store cannot answer — RUST_ENV is staging
+      # here, where that default is open.
+      TALOS_RLS_SET_ROLE: ${TALOS_RLS_SET_ROLE:-true}
+      TALOS_WRITE_CEILING_ENFORCED: "1"
+      TALOS_DISTRIBUTED_REPLAY: ${TALOS_DISTRIBUTED_REPLAY:-true}
+      TALOS_REPLAY_FAIL_CLOSED: ${TALOS_REPLAY_FAIL_CLOSED:-true}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       NATS_URL: nats://nats:4222
       NATS_USER: ${NATS_USER:?NATS_USER required}
@@ -294,6 +305,12 @@ services:
       NATS_PASSWORD: ${NATS_WORKER_PASSWORD:?NATS_WORKER_PASSWORD required in .env.production}
       WORKER_SHARED_KEY: ${WORKER_SHARED_KEY:?WORKER_SHARED_KEY required in .env.production}
       RUST_LOG: info
+      # The worker's half of the chart's security switches (see the
+      # controller): the write ceiling, and a dispatch run once per fleet —
+      # three replicas share the job queue group below.
+      TALOS_WRITE_CEILING_ENFORCED: "1"
+      TALOS_DISTRIBUTED_REPLAY: ${TALOS_DISTRIBUTED_REPLAY:-true}
+      TALOS_REPLAY_FAIL_CLOSED: ${TALOS_REPLAY_FAIL_CLOSED:-true}
       # Metrics server configuration
       METRICS_PORT: "9091"
       METRICS_AUTH_TOKENS: ${METRICS_AUTH_TOKENS:?METRICS_AUTH_TOKENS required in .env.production}

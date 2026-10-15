@@ -172,6 +172,26 @@ pub const SCHEDULER_OUTCOME_CANCELLED: &str = "cancelled";
 pub const CRASH_RECOVERY_OUTCOMES: [&str; 5] =
     ["resumed", "failed", "reclaimed", "fenced", "cancelled"];
 
+/// The complete, closed set of `reason` label values on
+/// `talos_envelope_claims_dropped_total`, all pre-seeded at 0: a secret claim
+/// the controller's responder dropped unread because it was larger than a
+/// claim can be, or because every responder slot was busy (security review
+/// 2026-10-15, B2-3 — until then a WARN per 1 024 drops was the only trace).
+pub const CLAIM_DROP_REASONS: [&str; 2] = ["too_large", "saturated"];
+
+/// Count one secret claim the responder dropped unread. `reason` is one of
+/// [`CLAIM_DROP_REASONS`]; anything else is not counted.
+pub fn record_claim_dropped(reason: &'static str) {
+    if !CLAIM_DROP_REASONS.contains(&reason) {
+        return;
+    }
+    if let Some(m) = global() {
+        m.envelope_claims_dropped_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+}
+
 /// Process-global metrics registry.
 ///
 /// Initialised once in `main.rs` after [`TalosMetrics::new`] succeeds.
@@ -1098,6 +1118,10 @@ pub struct TalosMetrics {
     // `outcome`: resumed | failed | reclaimed. Lets operators alert on a
     // restart-resume sweep that silently does nothing or whose resumes fail.
     pub crash_recovery_total: CounterVec,
+
+    /// Secret claims the envelope-seal responder dropped unread, by `reason`
+    /// ([`CLAIM_DROP_REASONS`]).
+    pub envelope_claims_dropped_total: CounterVec,
 
     /// Rhai expressions that FAILED TO EVALUATE and were replaced by the
     /// call site's silent default. Labelled by [`CONDITION_EVAL_KINDS`].
@@ -2764,6 +2788,21 @@ impl TalosMetrics {
         for outcome in CRASH_RECOVERY_OUTCOMES {
             crash_recovery_total
                 .with_label_values(&[outcome])
+                .inc_by(0.0);
+        }
+
+        let envelope_claims_dropped_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_envelope_claims_dropped_total",
+                "Secret claims the envelope-seal responder dropped unread, by reason \
+                 (too_large | saturated)",
+            ),
+            &["reason"], // CLAIM_DROP_REASONS
+        )?;
+        registry.register(Box::new(envelope_claims_dropped_total.clone()))?;
+        for reason in CLAIM_DROP_REASONS {
+            envelope_claims_dropped_total
+                .with_label_values(&[reason])
                 .inc_by(0.0);
         }
 
@@ -4459,6 +4498,7 @@ impl TalosMetrics {
             workflow_executions_total,
             workflow_execution_duration_seconds,
             crash_recovery_total,
+            envelope_claims_dropped_total,
             condition_eval_failures_total,
             wasm_log_orphaned_total,
             module_execution_record_started_failures_total,
@@ -5940,6 +5980,20 @@ mod tests {
     // registered, pre-seeded at 0 for every outcome (so dashboards/alerts
     // have a series in steady state), and increment correctly. A regression
     // here means the crash-recovery observability surface silently disappears.
+    #[test]
+    fn envelope_claim_drops_are_seeded_by_reason() {
+        let m = TalosMetrics::new().unwrap();
+        let rendered = m.render_prometheus().expect("render");
+        for reason in CLAIM_DROP_REASONS {
+            assert!(
+                rendered.contains(&format!(
+                    "talos_envelope_claims_dropped_total{{reason=\"{reason}\"}} 0"
+                )),
+                "envelope_claims_dropped_total[{reason}] not pre-seeded at 0\n{rendered}"
+            );
+        }
+    }
+
     #[test]
     fn crash_recovery_metric_seeded_and_increments() {
         let m = TalosMetrics::new().unwrap();

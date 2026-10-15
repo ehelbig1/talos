@@ -56,9 +56,12 @@ pub struct SurfaceSwitch {
 /// The acknowledgement variable.
 pub const ALLOW_LEGACY_FLEET_HMAC: &str = "TALOS_ALLOW_LEGACY_FLEET_HMAC";
 
-/// The surfaces `raw` acknowledges. `all` (or a boolean true) is every
-/// surface; an unknown word is refused, so a typo cannot silently
-/// acknowledge nothing (or everything).
+/// The surfaces `raw` acknowledges: surface names, comma-separated, or `all`.
+/// An unknown word is refused, so a typo cannot silently acknowledge nothing
+/// (or everything). A boolean (`1`, `true`, `yes`, `on`) is refused too
+/// (security review 2026-10-15, B2-8): it is the habit every other
+/// `TALOS_ALLOW_*` switch teaches, and here it acknowledged all three surfaces
+/// for an operator who meant one. Acknowledging everything is spelled `all`.
 pub fn parse_acknowledged(raw: Option<&str>) -> Result<Vec<LegacyFleetSurface>, String> {
     let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
         return Ok(Vec::new());
@@ -71,7 +74,13 @@ pub fn parse_acknowledged(raw: Option<&str>) -> Result<Vec<LegacyFleetSurface>, 
     let mut out = Vec::new();
     for word in raw.split(',').map(|w| w.trim().to_ascii_lowercase()) {
         match word.as_str() {
-            "all" | "1" | "true" | "yes" | "on" => return Ok(all.to_vec()),
+            "all" => return Ok(all.to_vec()),
+            "1" | "true" | "yes" | "on" => {
+                return Err(format!(
+                    "{ALLOW_LEGACY_FLEET_HMAC}={word} is a boolean; this setting names the \
+                     surfaces it acknowledges: dispatch, result, rpc (comma-separated) or all"
+                ))
+            }
             "dispatch" => out.push(LegacyFleetSurface::Dispatch),
             "result" => out.push(LegacyFleetSurface::Result),
             "rpc" => out.push(LegacyFleetSurface::Rpc),
@@ -210,5 +219,11 @@ mod tests {
             parse_acknowledged(Some("rcp")).is_err(),
             "a typo is refused"
         );
+        // B2-8: a boolean acknowledges nothing; it is refused, and says why.
+        for boolean in ["1", "true", "YES", "on"] {
+            let refused = parse_acknowledged(Some(boolean)).expect_err(boolean);
+            assert!(refused.contains("boolean"), "{refused}");
+        }
+        assert!(parse_acknowledged(Some("rpc,1")).is_err());
     }
 }

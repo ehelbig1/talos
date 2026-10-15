@@ -19,6 +19,8 @@ async-nats.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 tracing.workspace = true
+# The responder counts the claims it drops (B2-3).
+talos-metrics = { path = "../talos-metrics" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }

@@ -28,6 +28,18 @@ to the compose file, the chart or a workflow undoes it silently.
    workflows, never `workflows/.+@`.
 6. `frontend/.dockerignore` excludes `.env*` (H-7): the frontend build
    context is `frontend/`, so the root file's rule does not apply there.
+7. Every `TALOS_*` switch the chart sets on the controller or the worker is
+   set the same way on that service in `docker-compose.prod.yml` (security
+   review 2026-10-15, H2-1). The list is the chart's own `controller.env` /
+   `worker.env` — enumerated, not hand-kept — so a switch added to the chart
+   is a failure here until the compose file states it; a boolean is compared
+   by its truth value, an empty chart value (a secret placeholder) is
+   skipped, and a non-security switch is exempted by name with its reason.
+   The compose file runs `RUST_ENV=staging`, so a switch whose production
+   default the chart relies on is stated there too
+   (`TALOS_REPLAY_FAIL_CLOSED`). Before this rule the compose file, used on
+   its own as its header says, ran with the write ceiling unenforced, row
+   security's role switch off and no fleet-wide replay guard.
 """
 
 from __future__ import annotations
@@ -46,6 +58,18 @@ WORKFLOWS = ".github/workflows"
 SIGNING_WORKFLOWS = ("main-publish.yml", "release.yml")
 IDENTITY_FILES = ("deploy/k3s/install.sh", "deploy/helm/talos/values.yaml")
 DOCKERIGNORE = "frontend/.dockerignore"
+VALUES = "deploy/helm/talos/values.yaml"
+PARITY_SERVICES = ("controller", "worker")
+# Chart switches that are not a security posture, each with why.
+PARITY_EXEMPT = {
+    "TALOS_DISABLE_POOLING": "the wasmtime pooling allocator's memory layout, chosen for pod limits",
+}
+# Switches the chart leaves to RUST_ENV=production's default, which the
+# compose file (RUST_ENV=staging) must state, with the value it must have.
+STAGING_MUST_STATE = {"TALOS_REPLAY_FAIL_CLOSED": "true"}
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+_ENV_LINE = re.compile(r"^(?P<indent> *)(?P<key>TALOS_[A-Z0-9_]+):\s*(?P<value>.*?)\s*(?:#.*)?$")
 
 _TRUSTED = re.compile(r"^\s*TRUSTED_PROXY_CIDRS:\s*(\S.*?)\s*(?:#.*)?$", re.M)
 _SUBNET = re.compile(r"^\s*-\s*subnet:\s*(\S.*?)\s*(?:#.*)?$", re.M)
@@ -215,6 +239,80 @@ def frontend_context_excludes_env(root: str) -> list[str]:
     return []
 
 
+
+
+def _service_env(text: str, path: tuple[str, ...]) -> dict[str, str] | None:
+    """The `TALOS_*` entries of the mapping at `path` (each step one level of
+    two-space indentation deeper), or `None` when the path is absent."""
+    lines = text.splitlines()
+    start, depth = 0, 0
+    for step in path:
+        pat = re.compile(rf"^{' ' * (2 * depth)}{re.escape(step)}:\s*(?:#.*)?$")
+        for i in range(start, len(lines)):
+            line = lines[i]
+            if pat.match(line):
+                start, depth = i + 1, depth + 1
+                break
+            stripped = line.strip()
+            if depth and stripped and not stripped.startswith("#"):
+                if len(line) - len(line.lstrip(" ")) < 2 * depth:
+                    return None
+        else:
+            return None
+    out: dict[str, str] = {}
+    for line in lines[start:]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent < 2 * depth:
+            break
+        m = _ENV_LINE.match(line)
+        if m and len(m.group("indent")) == 2 * depth:
+            out[m.group("key")] = _default(m.group("value"))
+    return out
+
+
+def _truth(value: str) -> bool | None:
+    v = value.strip().lower()
+    return True if v in _TRUTHY else False if v in _FALSY else None
+
+
+def security_switch_parity(root: str) -> list[str]:
+    chart = _read(root, VALUES)
+    compose = _read(root, COMPOSE)
+    if chart is None:
+        return [f"{VALUES}: not found"]
+    if compose is None:
+        return [f"{COMPOSE}: not found"]
+    out: list[str] = []
+    for svc in PARITY_SERVICES:
+        chart_env = _service_env(chart, (svc, "env"))
+        compose_env = _service_env(compose, ("services", svc, "environment"))
+        if chart_env is None:
+            out.append(f"{VALUES}: no `{svc}.env` mapping")
+            continue
+        if compose_env is None:
+            out.append(f"{COMPOSE}: no `services.{svc}.environment` mapping")
+            continue
+        wanted = {k: v for k, v in chart_env.items() if v != "" and k not in PARITY_EXEMPT}
+        wanted.update(STAGING_MUST_STATE)
+        for key, value in sorted(wanted.items()):
+            if key not in compose_env:
+                out.append(
+                    f"{COMPOSE}: the {svc} does not set {key}, which the chart sets to "
+                    f"{value!r} — the compose stack runs without that posture"
+                )
+                continue
+            want, got = _truth(value), _truth(compose_env[key])
+            if want is not None and want != got:
+                out.append(
+                    f"{COMPOSE}: the {svc}'s {key} defaults to {compose_env[key]!r}; the chart "
+                    f"sets {value!r}"
+                )
+    return out
+
+
 RULES = (
     compose_trusts_its_proxies,
     egress_except_parity,
@@ -222,6 +320,7 @@ RULES = (
     checksum_hashes_no_data,
     signing_identity_is_named,
     frontend_context_excludes_env,
+    security_switch_parity,
 )
 
 
@@ -233,10 +332,27 @@ def problems(root: str) -> list[str]:
 
 
 def self_test() -> int:
+    # The chart's values file carries rule 5's identity line AND rule 7's env
+    # blocks: one fixture, built from both halves.
+    chart_env = (
+        "controller:\n  replicaCount: 2\n  env:\n"
+        "    TALOS_WRITE_CEILING_ENFORCED: \"1\"   # both sides\n"
+        "    TALOS_AUDIT_SIGNING_KEY: \"\"\n"
+        "    # TALOS_ALLOW_LEGACY_FLEET_HMAC: \"rpc\"\n"
+        "    TALOS_DISABLE_POOLING: \"true\"\n"
+        "  ports: []\n"
+        "worker:\n  env:\n"
+        "    TALOS_WRITE_CEILING_ENFORCED: \"1\"\n"
+    )
     good: dict[str, str] = {
         COMPOSE: (
             "services:\n  controller:\n    environment:\n"
             "      TRUSTED_PROXY_CIDRS: ${TALOS_COMPOSE_SUBNET:-172.29.0.0/24}\n"
+            "      TALOS_WRITE_CEILING_ENFORCED: \"1\"\n"
+            "      TALOS_REPLAY_FAIL_CLOSED: ${TALOS_REPLAY_FAIL_CLOSED:-true}\n"
+            "  worker:\n    environment:\n"
+            "      TALOS_WRITE_CEILING_ENFORCED: \"true\"\n"
+            "      TALOS_REPLAY_FAIL_CLOSED: \"1\"\n"
             "networks:\n  talos-network:\n    ipam:\n      config:\n"
             "        - subnet: ${TALOS_COMPOSE_SUBNET:-172.29.0.0/24}\n"
         ),
@@ -259,7 +375,7 @@ def self_test() -> int:
         f"{WORKFLOWS}/template-publish.yml": "permissions:\n  # signing-identity: templates only\n  id-token: write   # cosign\n",
         f"{WORKFLOWS}/quality.yml": "permissions:\n  contents: read\n",
         IDENTITY_FILES[0]: '    certIdentityRegex: "^https://x/\\\\.github/workflows/(main-publish\\\\.yml|release\\\\.yml)@refs/heads/main$"\n',
-        IDENTITY_FILES[1]: '    certIdentityRegex: "^https://x/\\.github/workflows/(main-publish\\.yml|release\\.yml)@refs/(heads/main|tags/v.+)$"\n',
+        IDENTITY_FILES[1]: chart_env + '    certIdentityRegex: "^https://x/\\.github/workflows/(main-publish\\.yml|release\\.yml)@refs/(heads/main|tags/v.+)$"\n',
         DOCKERIGNORE: "node_modules/\n.env*\n",
     }
 
@@ -302,7 +418,14 @@ def self_test() -> int:
     expect("template-publish.yml:2", **{f"{WORKFLOWS}/template-publish.yml": "permissions:\n  id-token: write\n"})
     expect(None, **{f"{WORKFLOWS}/release.yml": "permissions:\n  id-token: write\n"})
     expect("admits ANY workflow", **{IDENTITY_FILES[0]: '    certIdentityRegex: "^https://x/\\\\.github/workflows/.+@refs/heads/main$"\n'})
-    expect("does not name", **{IDENTITY_FILES[1]: '    certIdentityRegex: "^https://x/\\.github/workflows/main-publish\\.yml@refs/heads/main$"\n'})
+    expect("does not name", **{IDENTITY_FILES[1]: chart_env + '    certIdentityRegex: "^https://x/\\.github/workflows/main-publish\\.yml@refs/heads/main$"\n'})
+    # 7. switch parity: a chart switch the compose service lacks, or states
+    #    the other way; the staging-stated switch; a new chart switch.
+    expect("the worker does not set TALOS_WRITE_CEILING_ENFORCED", **{COMPOSE: good[COMPOSE].replace('      TALOS_WRITE_CEILING_ENFORCED: "true"\n', "")})
+    expect("controller's TALOS_WRITE_CEILING_ENFORCED defaults to '0'", **{COMPOSE: good[COMPOSE].replace('ENFORCED: "1"', 'ENFORCED: "0"')})
+    expect("the controller does not set TALOS_REPLAY_FAIL_CLOSED", **{COMPOSE: good[COMPOSE].replace("      TALOS_REPLAY_FAIL_CLOSED: ${TALOS_REPLAY_FAIL_CLOSED:-true}\n", "")})
+    expect("the worker does not set TALOS_DISTRIBUTED_REPLAY", **{VALUES: good[VALUES] + '    TALOS_DISTRIBUTED_REPLAY: "true"\n'})
+    expect("no `worker.env` mapping", **{VALUES: good[VALUES].replace('worker:\n  env:\n    TALOS_WRITE_CEILING_ENFORCED: "1"\n', "")})
     # 6. dockerignore
     expect("does not exclude `.env*`", **{DOCKERIGNORE: ".env\n.env.local\n"})
     expect("not found", **{DOCKERIGNORE: None})
@@ -320,7 +443,7 @@ def main() -> int:
         for line in found:
             print(f"  {line}", file=sys.stderr)
         return 1
-    print("✓ deployment posture: compose proxy trust, egress parity, nginx body limits, secret checksum, signing identity, .env exclusion")
+    print("✓ deployment posture: compose proxy trust, egress parity, nginx body limits, secret checksum, signing identity, .env exclusion, chart/compose switch parity")
     return 0
 
 

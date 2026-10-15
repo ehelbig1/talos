@@ -126,6 +126,47 @@ pub(crate) const ADMISSION_PER_PERMIT: usize = 8;
 /// (`a_fire_and_forget_message_executes_once`).
 pub(crate) const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How many messages in a row may be shed after waiting [`ADMISSION_WAIT`]
+/// before the loop stops waiting (security review 2026-10-15, B2-4). While
+/// the loop waits it does not read the subscription, and the NATS client
+/// keeps filling that subscription's channel — bounded in COUNT (async-nats'
+/// default, 65 536 messages) but not in bytes, and a signed-RPC payload may
+/// be several MiB. A burst is a run of waits that end in admission; a flood is
+/// a run that end in sheds. After this many sheds in a row the loop sheds the
+/// following messages without waiting — parse-free, as before the wait was
+/// added — until one is admitted again, so a flood holds the channel for at
+/// most `ADMISSION_SHEDS_BEFORE_DRAIN × ADMISSION_WAIT` (6 s) of inflow per
+/// episode instead of indefinitely. Chosen over a smaller subscription
+/// capacity because the controller's one NATS client also carries the
+/// dispatcher's reply inboxes and the results subjects, where a slow-consumer
+/// drop loses a run's answer.
+pub(crate) const ADMISSION_SHEDS_BEFORE_DRAIN: u32 = 3;
+
+/// Whether the next message waits for a slot: [`ADMISSION_WAIT`], or nothing
+/// once [`ADMISSION_SHEDS_BEFORE_DRAIN`] messages in a row were shed.
+#[derive(Debug, Default)]
+pub(crate) struct AdmissionPacer {
+    consecutive_sheds: u32,
+}
+
+impl AdmissionPacer {
+    pub(crate) fn wait(&self) -> std::time::Duration {
+        if self.consecutive_sheds >= ADMISSION_SHEDS_BEFORE_DRAIN {
+            std::time::Duration::ZERO
+        } else {
+            ADMISSION_WAIT
+        }
+    }
+
+    pub(crate) fn record(&mut self, admitted: bool) {
+        self.consecutive_sheds = if admitted {
+            0
+        } else {
+            self.consecutive_sheds.saturating_add(1)
+        };
+    }
+}
+
 const SHED_LOG_EVERY_SECS: u64 = 10;
 static SHED_SINCE_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SHED_LAST_LOG_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -353,6 +394,7 @@ pub(crate) fn spawn_rpc_subscriber<H, Fut>(
             };
             backoff_secs = 1;
             let mut shutdown_requested = false;
+            let mut pacer = AdmissionPacer::default();
             loop {
                 let msg = tokio::select! {
                     biased;
@@ -367,15 +409,16 @@ pub(crate) fn spawn_rpc_subscriber<H, Fut>(
                         None => break,
                     },
                 };
-                intake(
+                let admitted = intake(
                     &admission,
                     spec.subject,
-                    ADMISSION_WAIT,
+                    pacer.wait(),
                     &mut in_flight,
                     msg,
                     |m| handler(m, sem.clone()),
                 )
                 .await;
+                pacer.record(admitted);
             }
             // Inner loop exited.
             if shutdown_requested {
@@ -638,6 +681,29 @@ mod intake_tests {
         while in_flight.join_next().await.is_some() {}
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(one.available_permits(), 1, "the slot is returned");
+    }
+
+    /// B2-4: a flood stops holding the subscription — after
+    /// `ADMISSION_SHEDS_BEFORE_DRAIN` sheds in a row the next message does not
+    /// wait — and one admission restores the wait for the next burst.
+    #[test]
+    fn a_run_of_sheds_stops_the_wait_until_a_message_is_admitted() {
+        assert_eq!(ADMISSION_WAIT, std::time::Duration::from_secs(2));
+        assert_eq!(ADMISSION_SHEDS_BEFORE_DRAIN, 3);
+        let mut pacer = AdmissionPacer::default();
+        for _ in 0..ADMISSION_SHEDS_BEFORE_DRAIN {
+            assert_eq!(pacer.wait(), ADMISSION_WAIT, "a burst still waits");
+            pacer.record(false);
+        }
+        assert_eq!(pacer.wait(), std::time::Duration::ZERO, "a flood drains");
+        pacer.record(false);
+        assert_eq!(pacer.wait(), std::time::Duration::ZERO);
+        pacer.record(true);
+        assert_eq!(
+            pacer.wait(),
+            ADMISSION_WAIT,
+            "one admission ends the episode"
+        );
     }
 
     /// A taken slot is held for the handler's whole life and returned after.

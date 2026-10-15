@@ -2482,3 +2482,37 @@ fn kek_posture_reports_two_live_keks_until_the_legacy_one_is_disabled() {
         assert_eq!(c.points, 0, "kek_posture is unweighted");
     }
 }
+
+/// B2-2 (2026-10-15): the guard's state is reported from the guard — a guard
+/// registered while Redis was down, or none at all with the switch on, fails.
+#[test]
+fn the_replay_guard_is_reported_from_its_own_state() {
+    use talos_replay_guard::{GuardState, ReplayPolicy};
+    let on = ReplayPolicy {
+        distributed: true,
+        fail_closed: true,
+    };
+    assert_eq!(
+        check_replay_guard(true, on, GuardState::Registered { connected: true }).status,
+        Status::Pass
+    );
+    let down = check_replay_guard(true, on, GuardState::Registered { connected: false });
+    assert_eq!(down.status, Status::Fail);
+    assert!(down.detail.contains("refused"), "{}", down.detail);
+    assert_eq!(
+        check_replay_guard(true, on, GuardState::NotRegistered).status,
+        Status::Fail
+    );
+    let off = ReplayPolicy {
+        distributed: false,
+        fail_closed: true,
+    };
+    assert_eq!(
+        check_replay_guard(true, off, GuardState::NotRegistered).status,
+        Status::Warn
+    );
+    assert_eq!(
+        check_replay_guard(false, off, GuardState::NotRegistered).status,
+        Status::Info
+    );
+}

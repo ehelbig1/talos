@@ -201,6 +201,15 @@ pub fn classify_error(error_msg: &str) -> String {
     if lower.contains("reason_class=cancelled") {
         return "cancelled".to_string();
     }
+    // A verified dispatch the worker did not run because the shared replay
+    // store could not vouch for its nonce (fail closed). Transient: the store
+    // comes back, and the re-send carries a fresh nonce (2026-10-15, B2-3).
+    if lower.contains(&format!(
+        "reason_class={}",
+        talos_reason_class::dispatch::REPLAY_STORE_UNAVAILABLE
+    )) {
+        return "replay_store_unavailable".to_string();
+    }
     // RFC 0014 P4a: which progress deadline cut a LOCAL LLM exchange. Hoisted
     // above the generic `timed out` arm, which every one of these messages
     // also matches: the ceiling kind must NOT read transient (the call was
@@ -409,6 +418,7 @@ pub fn is_transient_error_type(error_type: &str) -> bool {
             | "network_transient"
             | "timeout"
             | "database_transient"
+            | "replay_store_unavailable"
             | "inference_first_byte_timeout"
             | "inference_idle_timeout"
     )
@@ -573,6 +583,15 @@ pub async fn diagnose_failures(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B2-3 (2026-10-15): the worker's answer to a dispatch refused for want
+    /// of the replay store is transient, so the dispatcher re-sends it.
+    #[test]
+    fn a_dispatch_refused_for_want_of_the_replay_store_is_retried() {
+        let class = classify_error(talos_reason_class::dispatch::REPLAY_STORE_UNAVAILABLE_MESSAGE);
+        assert_eq!(class, "replay_store_unavailable");
+        assert!(is_transient_error_type(&class));
+    }
 
     #[test]
     fn error_classification() {

@@ -59,11 +59,11 @@ const SHARED_NONCE_TTL_SECS: u64 = 120;
 /// window is also rejected — closing the "single-use degrades to
 /// freshness-window-bounded replay across the fleet" gap.
 ///
-/// Returns `true` (admit) when NO shared guard is registered — the default, so
-/// behaviour is byte-identical to before this layer existed. When a guard IS
-/// registered, returns `false` (reject) on a cross-replica replay, and applies
-/// the operator's fail policy on backend unavailability (fail-open by default;
-/// HMAC + freshness + per-replica nonce still hold).
+/// What it answers is [`talos_replay_guard::ReplayPolicy::decide`]'s: a
+/// replay is refused; a store that cannot vouch — down, or never registered
+/// while `TALOS_DISTRIBUTED_REPLAY` is on — is refused when failing closed
+/// (the production default). With the switch off and no guard, it admits:
+/// the per-replica cache is then the whole defence, as before this layer.
 ///
 /// The key namespaces on `subject` so a memory-op nonce can't collide with a
 /// graph-search nonce, and on `actor_id` (host-supplied, not guest-controllable)
@@ -73,20 +73,47 @@ pub(crate) async fn crossreplica_replay_ok(
     actor_id: uuid::Uuid,
     nonce: &str,
 ) -> bool {
-    let Some(guard) = talos_replay_guard::shared_replay_guard() else {
-        return true;
-    };
+    crossreplica_replay_ok_under(
+        talos_replay_guard::ReplayPolicy::from_env(),
+        talos_replay_guard::shared_replay_guard().as_deref(),
+        subject,
+        actor_id,
+        nonce,
+    )
+    .await
+}
+
+/// [`crossreplica_replay_ok`] under a stated policy and guard.
+pub(crate) async fn crossreplica_replay_ok_under(
+    policy: talos_replay_guard::ReplayPolicy,
+    guard: Option<&dyn talos_replay_guard::ReplayGuard>,
+    subject: &str,
+    actor_id: uuid::Uuid,
+    nonce: &str,
+) -> bool {
     let key = format!("{subject}:{actor_id}:{nonce}");
-    let outcome = guard.check_and_record(&key, SHARED_NONCE_TTL_SECS).await;
-    if outcome == talos_replay_guard::ReplayOutcome::Replay {
-        tracing::warn!(
-            target: "talos_security",
-            %subject,
-            %actor_id,
-            "cross-replica replay rejected: nonce already seen on another controller replica"
-        );
+    match policy.check(guard, &key, SHARED_NONCE_TTL_SECS).await {
+        talos_replay_guard::ReplayVerdict::Admit => true,
+        talos_replay_guard::ReplayVerdict::Replay => {
+            tracing::warn!(
+                target: "talos_security",
+                %subject,
+                %actor_id,
+                "cross-replica replay rejected: nonce already seen on another controller replica"
+            );
+            false
+        }
+        talos_replay_guard::ReplayVerdict::StoreUnavailable => {
+            tracing::warn!(
+                target: "talos_security",
+                %subject,
+                %actor_id,
+                "rpc refused: the shared replay store could not vouch for its nonce \
+                 (fail closed)"
+            );
+            false
+        }
     }
-    talos_replay_guard::admit(outcome, talos_replay_guard::fail_closed_from_env())
 }
 
 // ============================================================================
@@ -2883,6 +2910,48 @@ pub(crate) fn guest_fence(
              is fixed or unset"
                 .to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod crossreplica_tests {
+    use super::*;
+    use talos_replay_guard::{ReplayGuard, ReplayOutcome, ReplayPolicy};
+
+    struct Down;
+
+    #[async_trait::async_trait]
+    impl ReplayGuard for Down {
+        async fn check_and_record(&self, _key: &str, _ttl_secs: u64) -> ReplayOutcome {
+            ReplayOutcome::Unavailable
+        }
+    }
+
+    /// B2-2 (2026-10-15): a controller whose guard was never registered
+    /// refuses a signed RPC when the switch is on and it fails closed (the
+    /// production default), as one whose store is down does.
+    #[tokio::test]
+    async fn a_missing_guard_in_production_refuses_when_failing_closed() {
+        let actor = uuid::Uuid::new_v4();
+        let closed = ReplayPolicy {
+            distributed: true,
+            fail_closed: true,
+        };
+        assert!(!crossreplica_replay_ok_under(closed, None, "talos.memory.op", actor, "n1").await);
+        assert!(
+            !crossreplica_replay_ok_under(closed, Some(&Down), "talos.memory.op", actor, "n2")
+                .await
+        );
+        let open = ReplayPolicy {
+            distributed: true,
+            fail_closed: false,
+        };
+        assert!(crossreplica_replay_ok_under(open, None, "talos.memory.op", actor, "n3").await);
+        let off = ReplayPolicy {
+            distributed: false,
+            fail_closed: true,
+        };
+        assert!(crossreplica_replay_ok_under(off, None, "talos.memory.op", actor, "n4").await);
     }
 }
 
