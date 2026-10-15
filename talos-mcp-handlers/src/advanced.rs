@@ -783,6 +783,44 @@ async fn handle_query_paginated(
         );
     }
 
+    // Every statement that reaches the gate is recorded, whatever comes of
+    // it (security review 2026-10-15, D2-4): `query_paginated_statement`
+    // records a statement that returns rows itself, before it hands them out,
+    // and leaves `unrecorded` empty; any other way out — refused, failed —
+    // is recorded here.
+    let statement = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let requested_page = args.get("page").and_then(|v| v.as_i64()).unwrap_or(1);
+    let mut unrecorded = Some(talos_advanced_repository::AdminQueryOutcome::Refused);
+    let response = query_paginated_statement(req_id, args, state, user_id, &mut unrecorded).await;
+    if let Some(outcome) = unrecorded {
+        if let Err(e) = state
+            .advanced_repo
+            .record_admin_query(user_id, statement, requested_page, outcome)
+            .await
+        {
+            tracing::error!(
+                error = %e,
+                outcome = outcome.as_str(),
+                "query_paginated: a statement that returned no rows could not be recorded"
+            );
+        }
+    }
+    response
+}
+
+/// One platform-admin `query_paginated` statement, after the admin check.
+/// `unrecorded` starts as `Refused`, becomes `Failed` once the statement is
+/// run, and is cleared once a statement that returned rows is recorded.
+async fn query_paginated_statement(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+    unrecorded: &mut Option<talos_advanced_repository::AdminQueryOutcome>,
+) -> JsonRpcResponse {
     // What SQL may run: the text rules (MCP-627 / MCP-1002) and the parsed
     // gate (2026-10-08) — one statement, a read, only functions the allow
     // list admits, only public tables that are not withheld — live in
@@ -925,6 +963,7 @@ async fn handle_query_paginated(
         talos_advanced_repository::PaginationMode::Offset { offset }
     };
 
+    *unrecorded = Some(talos_advanced_repository::AdminQueryOutcome::Failed);
     let rows = state
         .advanced_repo
         .execute_paginated_select(base_query, page_size, mode)
@@ -962,9 +1001,20 @@ async fn handle_query_paginated(
             };
 
             let row_count = result_rows.len();
+            // The rows are handed out only once this is recorded; a failure
+            // to record is not a statement that failed, so nothing more is.
+            *unrecorded = None;
             if let Err(e) = state
                 .advanced_repo
-                .record_admin_query(user_id, base_query, page, row_count)
+                .record_admin_query(
+                    user_id,
+                    // As the caller sent it, the text every outcome hashes.
+                    args.get("query")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default(),
+                    page,
+                    talos_advanced_repository::AdminQueryOutcome::Returned(row_count),
+                )
                 .await
             {
                 tracing::error!(error = %e, "query_paginated: the run could not be recorded");
@@ -5759,8 +5809,8 @@ mod query_record_pin {
     fn the_rows_are_handed_out_only_after_the_run_is_recorded() {
         let src = include_str!("advanced.rs");
         let start = src
-            .find("\nasync fn handle_query_paginated(")
-            .expect("the handler");
+            .find("\nasync fn query_paginated_statement(")
+            .expect("the handler's statement half");
         let body = &src[start..];
         let body = &body[..body[1..].find("\nasync fn ").map_or(body.len(), |e| e + 1)];
         let record = body

@@ -102,3 +102,17 @@ Security review 2026-10-14, findings **B-2** (High), **B-3**, **B-4** and
 - Guest-SQL tests run against the migrated database (`lib-migrated`) with a
   fixture table in the platform's policy shape, not against a granted platform
   table (a grant on a shared test database would leak into other suites).
+
+## Corrections, 2026-10-15 (security review round 2, B2-1 and D2-2)
+
+- "Guest-SQL tests run against the migrated database (`lib-migrated`)" was
+  not true for `data_plane_tenancy_db_tests`: no `lib-migrated` item named it,
+  so the unit job ran it with no `TALOS_TEST_DATABASE_URL` and it returned
+  green over zero assertions. It is named now, and
+  `scripts/ci_test_targets.py check` refuses a library test that reads a
+  `TALOS_TEST_*` service variable and no filter names.
+- The 0 `execution_state` rows measured above were not an empty fleet: the
+  worker sent the job's `job_id` (its `module_executions` row) as the write's
+  execution id, which names no run, so the pre-fix writes were orphan-swept
+  and every write since this package was refused `NotLive`. The write now
+  names the run. See `2026-10-15-state-write-names-the-run.md`.

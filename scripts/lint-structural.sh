@@ -5260,6 +5260,8 @@ if [ "$CI_GATE_FAIL" -eq 0 ]; then
         yellow "  → a binary that reads TALOS_TEST_* needs '// ci-store: <migrated|selfcontained|redis|services>'"
         yellow "    (the integration runner provides that store) or '// ci-ungated: <reason>'."
         yellow "    Do NOT leave it to run in the DB-free job: it would early-return green."
+        yellow "  → a LIBRARY test (under src/) that reads one is named by a 'lib'/'lib-migrated'"
+        yellow "    filter in scripts/test-integration.sh, or marked '// ci-ungated: <reason>'."
         CI_GATE_FAIL=1
     fi
 

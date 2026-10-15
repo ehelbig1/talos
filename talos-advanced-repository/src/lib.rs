@@ -4267,29 +4267,42 @@ impl AdvancedRepository {
     ///
     /// See `docs/engineering-log/packages/2026-10-08-query-paginated-admin-read-role.md`
     /// and `docs/engineering-log/packages/2026-10-09-query-paginated-own-login.md`.
-    /// Record one `query_paginated` run in `admin_event_log`: who ran it, the
-    /// SHA-256 of the statement (never its text, which can carry literals),
-    /// the page and how many rows it returned (security review 2026-10-14,
-    /// D-5). The caller returns no rows when this fails: a cross-tenant read
-    /// that cannot be recorded is not handed out.
+    /// Record one `query_paginated` statement in `admin_event_log`: who ran
+    /// it, the SHA-256 of the statement (never its text, which can carry
+    /// literals), the page and what came of it (security review 2026-10-14,
+    /// D-5). Every statement that reaches the gate leaves one row — refused,
+    /// failed or returned (2026-10-15, D2-4: until then only a statement that
+    /// returned rows was recorded, so a probe with statements that error left
+    /// no trace). The table is append-only, so the row is written once the
+    /// outcome is known. For `Returned`, the caller hands out no rows when
+    /// this fails: a cross-tenant read that cannot be recorded is not handed
+    /// out.
     pub async fn record_admin_query(
         &self,
         user_id: Uuid,
         statement: &str,
         page: i64,
-        row_count: usize,
+        outcome: AdminQueryOutcome,
     ) -> anyhow::Result<()> {
         let statement_sha256 = talos_text_util::sha256_hex(statement);
+        let (summary, row_count) = match outcome {
+            AdminQueryOutcome::Returned(n) => {
+                (format!("query_paginated returned {n} row(s)"), Some(n))
+            }
+            AdminQueryOutcome::Refused => ("query_paginated refused a statement".to_string(), None),
+            AdminQueryOutcome::Failed => ("query_paginated: a statement failed".to_string(), None),
+        };
         talos_admin_event_log::insert(
             &self.db_pool,
             Some(user_id),
             "admin_query_paginated",
             "query",
             None,
-            &format!("query_paginated returned {row_count} row(s)"),
+            &summary,
             Some(&serde_json::json!({
                 "statement_sha256": statement_sha256,
                 "page": page,
+                "outcome": outcome.as_str(),
                 "row_count": row_count,
             })),
         )
@@ -5246,6 +5259,28 @@ pub fn is_read_only_refusal(error: &PaginatedSelectError) -> bool {
         .as_database_error()
         .and_then(|e| e.code())
         .is_some_and(|code| code == "25006")
+}
+
+/// What one `query_paginated` statement came to, as recorded
+/// ([`AdvancedRepository::record_admin_query`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminQueryOutcome {
+    /// The gate (or an argument it travels with) refused it; nothing ran.
+    Refused,
+    /// It ran and failed, or its rows could not be returned.
+    Failed,
+    /// It returned this many rows.
+    Returned(usize),
+}
+
+impl AdminQueryOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::Failed => "failed",
+            Self::Returned(_) => "returned",
+        }
+    }
 }
 
 /// Pagination mode for `execute_paginated_select`. The `column` field in

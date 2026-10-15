@@ -133,6 +133,7 @@ impl wit_state::Host for TalosContext {
         // worker no longer needs direct Postgres credentials.
         spawn_state_write_through(
             self.nats_client.as_ref().cloned(),
+            self.workflow_id.as_deref(),
             self.execution_id.as_deref(),
             self.actor_id,
             &scoped,
@@ -164,6 +165,7 @@ impl wit_state::Host for TalosContext {
         // tombstone-less key.
         spawn_state_write_through(
             self.nats_client.as_ref().cloned(),
+            self.workflow_id.as_deref(),
             self.execution_id.as_deref(),
             self.actor_id,
             &scoped,

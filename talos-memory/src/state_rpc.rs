@@ -65,6 +65,30 @@ pub const MAX_STATE_BYTES_PER_EXECUTION: i64 = 16 * 1024 * 1024;
 /// store), so such a row is only ever growth.
 pub const STATE_WRITABLE_STATUSES: &[&str] = &["running", "resuming", "waiting"];
 
+/// The run a dispatch's durable state belongs to: `execution_state.execution_id`
+/// IS the run (`workflow_executions.id`), which is what the controller's
+/// liveness check, the archival move and the orphan sweep all key on
+/// (security review 2026-10-15, B2-1). A workflow node's job names its run in
+/// `workflow_execution_id` and its own `module_executions` row in `job_id`; a
+/// module-bound dispatch (webhook, push channel) has no run and sends its own
+/// id in both, so it has no durable state — its `state` calls stay in the
+/// worker's memory for the execution. Until 2026-10-15 the worker sent
+/// `job_id`, which names no run, and every honest write was refused.
+pub fn durable_state_run(workflow_execution_id: &str, job_id: &str) -> Option<Uuid> {
+    let run = Uuid::parse_str(workflow_execution_id).ok()?;
+    let job = Uuid::parse_str(job_id).ok()?;
+    (run != job).then_some(run)
+}
+
+/// Why a dispatch's `state` call sent no durable write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateWriteNotSent {
+    /// The dispatch belongs to no run ([`durable_state_run`]).
+    NoRun,
+    /// The key or value is malformed, or no signing key is registered.
+    Unsigned,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateWriteRequest {
     pub execution_id: Uuid,
@@ -145,6 +169,27 @@ fn sign_body_bytes(
 }
 
 impl StateWriteRequest {
+    /// THE durable write a dispatch's `state::set` (`value: Some`) or
+    /// `state::delete` (`value: None`) sends, from the two ids the worker's
+    /// execution context holds for the job: its `workflow_execution_id` and
+    /// its `job_id`. The request names the run ([`durable_state_run`]).
+    pub fn for_dispatch(
+        workflow_execution_id: &str,
+        job_id: &str,
+        actor_id: Uuid,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<Self, StateWriteNotSent> {
+        let run =
+            durable_state_run(workflow_execution_id, job_id).ok_or(StateWriteNotSent::NoRun)?;
+        let (value, is_delete) = match value {
+            Some(v) => (v.to_string(), false),
+            None => (String::new(), true),
+        };
+        Self::new_signed(run, actor_id, key.to_string(), value, is_delete)
+            .ok_or(StateWriteNotSent::Unsigned)
+    }
+
     pub fn new_signed(
         execution_id: Uuid,
         actor_id: Uuid,
@@ -284,5 +329,38 @@ mod structural_tests {
     fn accepts_at_cap_value() {
         let at_cap = "v".repeat(MAX_STATE_VALUE_BYTES);
         assert!(validate_structure("foo", &at_cap, false));
+    }
+}
+
+#[cfg(test)]
+mod durable_state_run_tests {
+    use super::*;
+
+    #[test]
+    fn a_workflow_nodes_state_names_its_run_not_its_job() {
+        let run = Uuid::new_v4();
+        let job = Uuid::new_v4();
+        assert_eq!(
+            durable_state_run(&run.to_string(), &job.to_string()),
+            Some(run)
+        );
+    }
+
+    #[test]
+    fn a_module_bound_dispatch_has_no_durable_state() {
+        let own = Uuid::new_v4().to_string();
+        assert_eq!(durable_state_run(&own, &own), None);
+        assert_eq!(
+            StateWriteRequest::for_dispatch(&own, &own, Uuid::new_v4(), "k", Some("v"))
+                .unwrap_err(),
+            StateWriteNotSent::NoRun
+        );
+    }
+
+    #[test]
+    fn an_unparseable_id_names_no_run() {
+        let run = Uuid::new_v4().to_string();
+        assert_eq!(durable_state_run(&run, "exec-1"), None);
+        assert_eq!(durable_state_run("", &run), None);
     }
 }

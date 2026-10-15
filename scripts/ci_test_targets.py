@@ -29,6 +29,16 @@ binary that reads a `TALOS_TEST_{DATABASE,REDIS,NATS}…` variable but carries n
 service and let it early-return green — "a green check over zero assertions is
 worse than an honest exclusion" (check 64).
 
+The same refusal one directory level down (security review 2026-10-15, D2-2):
+a LIBRARY test (a file under a crate's `src/`) that reads one of those
+variables must be named by a `lib` / `lib-migrated` filter in
+scripts/test-integration.sh, or carry `// ci-ungated: <reason>`. The unit job
+runs every library test with no service, so an unnamed one returns green over
+zero assertions — the guest-tenancy and state-write gates did, from the day
+they were mutation-proved. "Named" is cargo's own rule: the filter is a
+substring of a test path the file defines (its module path, an inline `mod`
+in it, or a function in it).
+
 Usage:
   ci_test_targets.py list <category>   crate<TAB>binary[<TAB>store] per line
   ci_test_targets.py grouped dbfree    crate<TAB>bin1 bin2 … (one line per crate)
@@ -49,6 +59,13 @@ UNGATED_RE = re.compile(r"^\s*(//|#)\s*ci-ungated:", re.M)
 STORE_RE = re.compile(r"^\s*//\s*ci-store:\s*([a-z]+)\b", re.M)
 SERIAL_RE = re.compile(r"^\s*//\s*ci-runner:\s*integration-serial\b", re.M)
 SERVICE_ENV_RE = re.compile(r"TALOS_TEST_(DATABASE|REDIS|NATS)[A-Z_]*")
+# A library test READS the variable: the name as a string literal, not a
+# mention in a doc comment.
+SERVICE_ENV_READ_RE = re.compile(r'"TALOS_TEST_(DATABASE|REDIS|NATS)[A-Z_]*"')
+LIB_FILTER_RE = re.compile(r'^\s*"(lib|lib-migrated)\|([^|]+)\|--lib(?: ([^|]*))?\|', re.M)
+INLINE_MOD_RE = re.compile(r"^\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+(\w+)\s*\{", re.M)
+FN_RE = re.compile(r"\bfn\s+(\w+)")
+INTEGRATION_SCRIPT = ROOT / "scripts" / "test-integration.sh"
 
 
 def crate_name(crate_dir: Path) -> str:
@@ -152,12 +169,141 @@ def classify():
     return targets, errors
 
 
+def lib_filters():
+    """{crate: [filter, …]} from test-integration.sh's `lib` / `lib-migrated`
+    work items. An empty filter is the whole `--lib`."""
+    out = {}
+    try:
+        text = INTEGRATION_SCRIPT.read_text()
+    except OSError:
+        return out
+    for _kind, crate, flt in LIB_FILTER_RE.findall(text):
+        out.setdefault(crate, []).append((flt or "").strip())
+    return out
+
+
+def src_files():
+    """(crate_dir, path) for every .rs file under a crate's src/."""
+    for dirpath, dirnames, files in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        here = Path(dirpath)
+        if here.name != "src" or not (here.parent / "Cargo.toml").is_file():
+            continue
+        for sub, subdirs, subfiles in os.walk(here):
+            subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+            for f in sorted(subfiles):
+                if f.endswith(".rs"):
+                    yield here.parent, Path(sub) / f
+        dirnames[:] = []
+
+
+def module_path(src_dir: Path, path: Path) -> str:
+    parts = list(path.relative_to(src_dir).with_suffix("").parts)
+    if parts and parts[-1] in ("lib", "main", "mod"):
+        parts = parts[:-1]
+    return "::".join(parts)
+
+
+def unnamed_lib_tests():
+    """Errors for library tests that read a service variable and that no
+    test-integration.sh filter names."""
+    filters = lib_filters()
+    errors = []
+    for crate_dir, path in src_files():
+        text = path.read_text(errors="replace")
+        if not SERVICE_ENV_READ_RE.search(text) or UNGATED_RE.search(text):
+            continue
+        crate = crate_name(crate_dir)
+        base = module_path(crate_dir / "src", path)
+        join = (lambda a, b: f"{a}::{b}" if a else b)
+        candidates = {base} if base else set()
+        for m in INLINE_MOD_RE.findall(text):
+            candidates.add(join(base, m))
+        for fn in FN_RE.findall(text):
+            candidates.add(join(base, fn))
+            for m in INLINE_MOD_RE.findall(text):
+                candidates.add(join(join(base, m), fn))
+        named = any(
+            flt == "" or any(flt in c for c in candidates)
+            for flt in filters.get(crate, [])
+        )
+        if not named:
+            errors.append(
+                f"{path.relative_to(ROOT)}: a library test reads a TALOS_TEST_* service "
+                "variable but no `lib`/`lib-migrated` filter in scripts/test-integration.sh "
+                "names it — the unit job runs it with no service and it returns green; "
+                "name it there or mark the file `// ci-ungated: <reason>`"
+            )
+    return errors
+
+
+def self_test():
+    """The library-test leg over a fabricated tree: a file that reads a
+    service variable is an error until a filter names it or it is marked."""
+    import tempfile
+    global ROOT, INTEGRATION_SCRIPT
+    saved = (ROOT, INTEGRATION_SCRIPT)
+    failures = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        crate = root / "talos-x"
+        (crate / "src" / "deep").mkdir(parents=True)
+        (crate / "Cargo.toml").write_text('[package]\nname = "talos-x"\n')
+        (crate / "src" / "lib.rs").write_text("pub fn f() {}\n")
+        reader = 'let u = std::env::var("TALOS_TEST_DATABASE_URL");\n'
+        (crate / "src" / "deep" / "db_tests.rs").write_text(
+            "#[tokio::test]\nasync fn lands() {\n" + reader + "}\n"
+        )
+        (crate / "src" / "other.rs").write_text(
+            "#[cfg(test)]\nmod live_redis {\n#[test]\nfn t() {\n"
+            'let u = std::env::var("TALOS_TEST_REDIS_URL");\n}\n}\n'
+        )
+        (crate / "src" / "doc.rs").write_text("/// skips without `TALOS_TEST_DATABASE_URL`\n")
+        script = root / "test-integration.sh"
+        ROOT, INTEGRATION_SCRIPT = root, script
+
+        def flagged():
+            return sorted(e.split(":", 1)[0] for e in unnamed_lib_tests())
+
+        script.write_text("WORK+=(\n)\n")
+        if flagged() != ["talos-x/src/deep/db_tests.rs", "talos-x/src/other.rs"]:
+            failures.append(f"unnamed readers not both flagged: {flagged()}")
+        script.write_text(
+            'WORK+=(\n    "lib-migrated|talos-x|--lib deep::db_tests|x [migrated]"\n'
+            '    "lib|talos-x|--lib live_redis|y [redis]"\n)\n'
+        )
+        if flagged():
+            failures.append(f"named readers still flagged: {flagged()}")
+        script.write_text('WORK+=(\n    "lib|talos-y|--lib|other crate"\n)\n')
+        if len(flagged()) != 2:
+            failures.append("a filter for another crate must not name these files")
+        script.write_text('WORK+=(\n    "lib|talos-x|--lib|whole lib"\n)\n')
+        if flagged():
+            failures.append(f"a bare --lib names the whole crate: {flagged()}")
+        script.write_text("WORK+=(\n)\n")
+        (crate / "src" / "other.rs").write_text(
+            "// ci-ungated: needs a broker no runner has\n"
+            'let u = std::env::var("TALOS_TEST_REDIS_URL");\n'
+        )
+        if flagged() != ["talos-x/src/deep/db_tests.rs"]:
+            failures.append(f"a ci-ungated file must not be flagged: {flagged()}")
+    ROOT, INTEGRATION_SCRIPT = saved
+    for f in failures:
+        print(f"✗ {f}")
+    if not failures:
+        print("✓ ci_test_targets self-test")
+    return 1 if failures else 0
+
+
 def main(argv):
+    if len(argv) == 2 and argv[1] == "--self-test":
+        return self_test()
     if len(argv) < 2 or argv[1] not in ("list", "grouped", "check"):
         print(__doc__, file=sys.stderr)
         return 2
     targets, errors = classify()
     if argv[1] == "check":
+        errors = errors + unnamed_lib_tests()
         for e in errors:
             print(f"✗ {e}")
         counts = {c: sum(1 for t in targets if t[0] == c) for c in CATEGORIES}
