@@ -152,7 +152,10 @@ async fn cosign_verify_artifact(
 /// sets `TALOS_SIGSTORE_REQUIRED=true` with a permissive pattern
 /// discovers it HERE rather than per-pull.
 async fn verify_oci_artifact_signature(reference: &Reference) -> Result<bool> {
-    let policy = SigstorePolicy::from_env();
+    // An unrecognised policy is refused like a Required failure (E-7): the
+    // sync's start gate already declines on it, so this arm is reached only
+    // if the variable changed under a running process.
+    let policy = SigstorePolicy::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     if policy == SigstorePolicy::Disabled {
         return Ok(true);
     }
@@ -307,6 +310,17 @@ pub async fn start_registry_sync_loop(registry: Arc<ModuleRegistry>) -> TaskExit
     // The controller stays up for everything else; only OCI sync is withheld,
     // which is fail-safe (no unverified templates) vs. failing the whole pod.
     let sigstore_raw = env::var("TALOS_SIGSTORE_REQUIRED").unwrap_or_default();
+    // E-7 (2026-10-14): an UNRECOGNISED value is refused in every
+    // environment, not only in production — a misspelt `required` used to
+    // mean `Disabled` on a dev or staging controller.
+    if let Err(e) = SigstorePolicy::from_env_str(&sigstore_raw) {
+        tracing::error!(
+            target: "talos_registry",
+            "CRITICAL: refusing to start OCI registry sync: {e}. The catalog is NOT \
+             refreshed meanwhile."
+        );
+        return TaskExit::Declined(DeclineReason::PolicyNotExplicit);
+    }
     if talos_config::is_production() && !SigstorePolicy::raw_env_is_explicit(&sigstore_raw) {
         tracing::error!(
             target: "talos_registry",

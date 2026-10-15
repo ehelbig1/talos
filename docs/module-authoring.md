@@ -119,6 +119,14 @@ interface logging {
 }
 ```
 
+Limits per execution (2026-10-14): at most 10 000 messages, at most 10 000
+bytes per message (a longer one is cut and marked `...[TRUNCATED]`), and at
+most **1 MiB of log in total** across `log` and `log-json` — a message that
+would cross it is dropped, and so is every message after it. Control
+characters are written as escapes: a newline arrives as the two characters
+`\n`, ESC as `\u{1b}`, so one call is always one log line. In `log-json` this
+applies to every string and key of the payload.
+
 ## Creating a Rust Module
 
 ### Preferred path: `compile_custom_sandbox`

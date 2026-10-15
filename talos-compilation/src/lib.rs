@@ -85,11 +85,33 @@ pub(crate) fn check_advisory_db_age(db_path: &str) -> Result<()> {
 /// [`check_advisory_db_age`] with the posture passed in, so the refusal arm
 /// is driven by a test without touching the process-global `RUST_ENV`.
 pub(crate) fn check_advisory_db_age_as(db_path: &str, production: bool) -> Result<()> {
+    check_measured_advisory_db_age_as(
+        db_path,
+        advisory_db::advisory_db_age_days(db_path),
+        production,
+    )
+}
+
+/// The gate over an age measured ELSEWHERE — the builder image's copy, dated
+/// inside the sandbox container `cargo audit` runs in (G-21, 2026-10-14).
+/// `db_path` names the copy in the messages.
+pub(crate) fn check_measured_advisory_db_age(
+    db_path: &str,
+    age: std::result::Result<u64, advisory_db::AdvisoryDbAgeError>,
+) -> Result<()> {
+    check_measured_advisory_db_age_as(db_path, age, talos_config::is_production())
+}
+
+pub(crate) fn check_measured_advisory_db_age_as(
+    db_path: &str,
+    age: std::result::Result<u64, advisory_db::AdvisoryDbAgeError>,
+    production: bool,
+) -> Result<()> {
     use advisory_db::{
-        advisory_db_age_days, advisory_db_gate_outcome, advisory_db_max_age_days,
-        AdvisoryDbGateOutcome, ADVISORY_DB_WARN_AGE_DAYS,
+        advisory_db_gate_outcome, advisory_db_max_age_days, AdvisoryDbGateOutcome,
+        ADVISORY_DB_WARN_AGE_DAYS,
     };
-    let age_days = match advisory_db_age_days(db_path) {
+    let age_days = match age {
         Ok(age) => age,
         Err(e) => {
             // A DB that cannot be dated is a separate failure mode the audit
@@ -330,6 +352,28 @@ mod advisory_db_age_tests {
             1,
             "check_advisory_db_age must pass talos_config::is_production() to the seam"
         );
+    }
+
+    /// G-21 (2026-10-14), textual: the compile path dates the builder copy
+    /// through the probe the audit's own sandbox decision returned. The
+    /// needles are assembled at run time so this test cannot match itself.
+    #[test]
+    fn the_compile_gate_dates_the_copy_the_audit_reads() {
+        let src = include_str!("lib.rs");
+        for needle in [
+            [
+                "container::audit_command_with_db_probe",
+                "(workspace, &cargo_registry_cache)",
+            ]
+            .concat(),
+            [
+                "advisory_db::builder_advisory_db_age_days",
+                "(probe, slot).await",
+            ]
+            .concat(),
+        ] {
+            assert_eq!(src.matches(needle.as_str()).count(), 1, "{needle}");
+        }
     }
 
     /// 400 days old — past every limit an operator could reasonably set —
@@ -1222,7 +1266,11 @@ impl CompilationService {
         );
         // `cargo_registry_cache` was hoisted up above (H-6) for the
         // sandboxed lockfile-gen step; reuse it here.
-        let audit_cmd = container::audit_command(workspace, &cargo_registry_cache);
+        let (audit_cmd, audit_db_probe) =
+            match container::audit_command_with_db_probe(workspace, &cargo_registry_cache) {
+                Ok((cmd, probe)) => (Ok(cmd), probe),
+                Err(e) => (Err(e), None),
+            };
         // Stable image-baked advisory DB path. Both controller/Dockerfile
         // and Dockerfile.builder stage the DB at /opt/talos-advisory-db
         // (chmod a+rX, world-readable). Passing --db explicitly avoids
@@ -1235,7 +1283,18 @@ impl CompilationService {
         // the full policy. We run this BEFORE the audit so a stale
         // DB produces a clear actionable error instead of a confusing
         // "0 vulnerabilities found" pass against an obsolete snapshot.
-        if let Err(e) = check_advisory_db_age(audit_db) {
+        //
+        // G-21 (2026-10-14): the gate dates the copy the audit READS. In
+        // container mode that is the builder image's, dated by a probe in
+        // the same image; in host mode the host's, `stat`ed directly.
+        let db_age_checked = match audit_db_probe {
+            Some(probe) => check_measured_advisory_db_age(
+                audit_db,
+                advisory_db::builder_advisory_db_age_days(probe, slot).await,
+            ),
+            None => check_advisory_db_age(audit_db),
+        };
+        if let Err(e) = db_age_checked {
             self.send_event(
                 user_id,
                 job_id,

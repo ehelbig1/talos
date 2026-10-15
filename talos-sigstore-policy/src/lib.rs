@@ -319,10 +319,15 @@ pub const SIGSTORE_POLICY_ENV: &str = "TALOS_SIGSTORE_REQUIRED";
 /// `_index` and each template) must be Sigstore-verified before use.
 ///
 /// * `Disabled` — no verification (dev). The SILENT default for an
-///   unset/unrecognised value; both production gates refuse that state
-///   unless the operator spelled `disabled` (or an alias) explicitly.
+///   unset/empty value; both production gates refuse that state unless the
+///   operator spelled `disabled` (or an alias) explicitly.
 /// * `Audit` — verify, log, continue (migration window).
 /// * `Required` — verify, refuse on failure (production).
+///
+/// A value that is none of the spellings is not a policy: the parser returns
+/// [`UnrecognisedSigstorePolicy`], and both consumers refuse to run with it in
+/// every environment (security review 2026-10-14, E-7). Until then a typo
+/// such as `requried` meant `Disabled` outside production.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigstorePolicy {
     Disabled,
@@ -330,11 +335,33 @@ pub enum SigstorePolicy {
     Required,
 }
 
+/// [`SIGSTORE_POLICY_ENV`] holds a value that is not one of the policy
+/// spellings. Carries the value (trimmed, at most 64 characters) so the
+/// operator sees what was read; the variable names a mode, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrecognisedSigstorePolicy {
+    pub value: String,
+}
+
+impl std::fmt::Display for UnrecognisedSigstorePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{SIGSTORE_POLICY_ENV}={:?} is not a Sigstore policy: set `required` (verify, \
+             refuse on failure), `audit` (verify, log, continue) or `disabled` (no \
+             verification, an explicit acceptance of the risk)",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for UnrecognisedSigstorePolicy {}
+
 impl SigstorePolicy {
-    /// Read and parse [`SIGSTORE_POLICY_ENV`]. Unset/empty/unrecognised →
-    /// `Disabled`; see [`SigstorePolicy::raw_env_is_explicit`] for the
-    /// production gates' explicitness test over the same raw string.
-    pub fn from_env() -> Self {
+    /// Read and parse [`SIGSTORE_POLICY_ENV`]. Unset/empty → `Disabled`;
+    /// unrecognised → `Err`. See [`SigstorePolicy::raw_env_is_explicit`] for
+    /// the production gates' explicitness test over the same raw string.
+    pub fn from_env() -> Result<Self, UnrecognisedSigstorePolicy> {
         Self::from_env_str(&std::env::var(SIGSTORE_POLICY_ENV).unwrap_or_default())
     }
 
@@ -342,23 +369,25 @@ impl SigstorePolicy {
     ///   * `required` / `true` / `1`                → `Required`
     ///   * `audit` / `warn`                         → `Audit`
     ///   * `disabled` / `off` / `0` / `false` / `no` → `Disabled` (explicit opt-out)
-    ///   * anything else, including empty           → `Disabled` (silent default)
+    ///   * empty or whitespace                      → `Disabled` (silent default)
+    ///   * anything else                            → `Err`
     ///
-    /// The silent-default arm is fail-SAFE in the parser (an unknown value
-    /// never upgrades to a stricter policy) and POLICED by the production
-    /// gates, which refuse to run unless [`raw_env_is_explicit`](Self::raw_env_is_explicit)
-    /// holds — the 2026-05-22 wasm-security review's MEDIUM-4: an operator
-    /// who forgot the variable got Sigstore silently disabled with no
-    /// startup warning.
-    #[must_use]
-    pub fn from_env_str(raw: &str) -> Self {
+    /// The silent-default arm is POLICED by the production gates, which refuse
+    /// to run unless [`raw_env_is_explicit`](Self::raw_env_is_explicit) holds
+    /// — the 2026-05-22 wasm-security review's MEDIUM-4: an operator who
+    /// forgot the variable got Sigstore silently disabled with no startup
+    /// warning. An unknown value is an `Err` that both consumers refuse in
+    /// every environment (E-7).
+    pub fn from_env_str(raw: &str) -> Result<Self, UnrecognisedSigstorePolicy> {
         // allow-inline-env-bool: a three-valued policy (package AR), not a boolean;
         // `yes`/`on` are deliberately not Sigstore spellings.
         match raw.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "required" => Self::Required,
-            "audit" | "warn" => Self::Audit,
-            "disabled" | "off" | "0" | "false" | "no" => Self::Disabled,
-            _ => Self::Disabled,
+            "true" | "1" | "required" => Ok(Self::Required),
+            "audit" | "warn" => Ok(Self::Audit),
+            "disabled" | "off" | "0" | "false" | "no" | "" => Ok(Self::Disabled),
+            _ => Err(UnrecognisedSigstorePolicy {
+                value: raw.trim().chars().take(64).collect(),
+            }),
         }
     }
 
@@ -579,32 +608,54 @@ mod tests {
         ] {
             assert_eq!(
                 SigstorePolicy::from_env_str(v),
-                SigstorePolicy::Required,
+                Ok(SigstorePolicy::Required),
                 "{v:?}"
             );
         }
         for v in ["audit", "warn", "  audit  "] {
             assert_eq!(
                 SigstorePolicy::from_env_str(v),
-                SigstorePolicy::Audit,
+                Ok(SigstorePolicy::Audit),
                 "{v:?}"
             );
         }
         for v in ["disabled", "off", "0", "false", "no", "\tDISABLED\n"] {
             assert_eq!(
                 SigstorePolicy::from_env_str(v),
-                SigstorePolicy::Disabled,
+                Ok(SigstorePolicy::Disabled),
                 "{v:?}"
             );
         }
-        // Silent default: never upgrades.
-        for v in ["", "   ", "typo", "enabled", "maybe", "true-ish"] {
+        // Silent default: unset/empty only.
+        for v in ["", "   ", "\t\n"] {
             assert_eq!(
                 SigstorePolicy::from_env_str(v),
-                SigstorePolicy::Disabled,
+                Ok(SigstorePolicy::Disabled),
                 "{v:?}"
             );
         }
+    }
+
+    /// E-7 (2026-10-14): a value that is none of the spellings is an error,
+    /// never `Disabled` — a misspelt `required` must not run unverified.
+    #[test]
+    fn an_unrecognised_policy_is_an_error() {
+        for v in [
+            "typo", "requried", "enabled", "maybe", "true-ish", "yes", "on",
+        ] {
+            let err = SigstorePolicy::from_env_str(v).expect_err(v);
+            assert_eq!(err.value, v.trim());
+            assert!(err.to_string().contains(SIGSTORE_POLICY_ENV), "{err}");
+        }
+        // The carried value is capped, so a pasted blob is not echoed whole.
+        let long = "x".repeat(500);
+        assert_eq!(
+            SigstorePolicy::from_env_str(&long)
+                .expect_err("long")
+                .value
+                .len(),
+            64
+        );
     }
 
     #[test]
@@ -658,7 +709,14 @@ mod tests {
             // `yes` / `on` are deliberately NOT sigstore spellings: this is a
             // three-valued policy, not `talos_config::bool_env`'s vocabulary.
             assert!(!SigstorePolicy::raw_env_is_explicit(v));
-            assert_eq!(SigstorePolicy::from_env_str(v), SigstorePolicy::Disabled);
+            if v.is_empty() {
+                assert_eq!(
+                    SigstorePolicy::from_env_str(v),
+                    Ok(SigstorePolicy::Disabled)
+                );
+            } else {
+                assert!(SigstorePolicy::from_env_str(v).is_err(), "{v:?}");
+            }
         }
     }
 

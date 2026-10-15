@@ -68,6 +68,14 @@
 #                                      it demands an explicit choice, and "disabled" is one).
 #                              "audit"    → verify, log on failure, continue (migration).
 #                              "required" → verify, refuse on failure (production).
+#                              With TALOS_REGISTRY_URL set, "disabled" (or unset) is
+#                              REFUSED unless TALOS_ALLOW_UNSIGNED_TEMPLATES=yes; a value
+#                              that is not one of these is refused always.
+#                              This is NOT the image admission switch
+#                              (TALOS_DISABLE_SIGSTORE): that one covers the three
+#                              service images, this one the WASM templates.
+#   TALOS_ALLOW_UNSIGNED_TEMPLATES  "yes" → accept registry templates with no signature
+#                              check (TALOS_SIGSTORE_REQUIRED disabled). Default: no.
 #   TALOS_SIGSTORE_IDENTITY_REGEXP  Regex matched against the SAN URI of the Fulcio cert
 #                                   (`<workflow URL>@<git ref>`). Unset while enforcement
 #                                   is on → derived from TALOS_GHCR_OWNER/TALOS_GHCR_REPO as
@@ -150,6 +158,17 @@ done
 TALOS_API_HOST="${TALOS_API_HOST:-api.$TALOS_HOST}"
 TALOS_FRONTEND_HOST="${TALOS_FRONTEND_HOST:-$TALOS_HOST}"
 TALOS_GHCR_REPO="${TALOS_GHCR_REPO:-talos}"
+
+# Template signature verification (security review 2026-10-14, H-1): with a
+# registry configured, `disabled` is refused unless
+# TALOS_ALLOW_UNSIGNED_TEMPLATES=yes, and a value that is not a policy is
+# refused always. Checked here, before anything is installed. The rule lives
+# in lib/template-signing.sh (tested by tests/template-signing-test.sh).
+# shellcheck source=lib/template-signing.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/template-signing.sh"
+if ! ts_refusal="$(ts_template_signing_refusal "${TALOS_REGISTRY_URL:-}" "${TALOS_SIGSTORE_REQUIRED:-}" "${TALOS_ALLOW_UNSIGNED_TEMPLATES:-no}")"; then
+    die "$ts_refusal"
+fi
 
 # Template-signing identity: pinned to template-publish.yml ON refs/heads/main.
 # YAML-escaped (doubled backslashes) because it lands in a double-quoted

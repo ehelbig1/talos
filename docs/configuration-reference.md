@@ -201,7 +201,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_MAX_CONCURRENT_EXECUTIONS` | built-in default | controller | Execution-level concurrency semaphore | |
 | `WASM_RESULT_CACHE_CAPACITY` | `256` | worker | Result-cache entry cap | |
 | `WASM_INSTANCE_CACHE_MAX_PER_TIER` | `256` | worker | Instance-cache cap per tier | |
-| `WASM_RESULT_CACHE_TTL_SECS` | none (disabled if unset) | worker | Result-cache TTL | |
+| `WASM_RESULT_CACHE_TTL_SECS` | none (disabled if unset) | worker | Result-cache TTL. The in-process tier is per worker; the Redis tier (shared by the fleet) is used only by the worker binary, and every Redis entry is AES-256-GCM sealed under a key derived from `WORKER_SHARED_KEY` and bound to its cache key (2026-10-14, E-4): an entry that does not open — a flipped byte, a moved or plaintext value, a pre-2026-10-14 entry, an entry from before a key rotation — is a miss and the module runs | |
 | `TALOS_DISABLE_POOLING` | `false` | worker | Disable wasmtime instance pooling | |
 | `TALOS_WASM_DEBUG_INFO` | off | worker | Emit WASM debug info | |
 | `WASM_MAX_JSON_SIZE` | built-in default | worker | Max JSON parse/serialize size in host functions | |
@@ -259,7 +259,8 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `ANTHROPIC_API_KEY` | none (vault-first; env is fallback) | both | Anthropic key fallback for LLM + graph-RAG | 🔒 |
+| `ANTHROPIC_API_KEY` | none (vault-first; env is fallback) | both | Anthropic key fallback for LLM + graph-RAG. On the WORKER the env fallback (this, `OPENAI_API_KEY`, `GEMINI_API_KEY`) is refused outside development (any `RUST_ENV` but development/dev/local/test) unless `TALOS_WORKER_ALLOW_ENV_PROVIDER_KEYS` is true (2026-10-14, E-5); the key then comes only from the vault path delivered with the job | 🔒 |
+| `TALOS_WORKER_ALLOW_ENV_PROVIDER_KEYS` | `false` | worker | Opt-in, outside development, for the worker's LLM provider-key env fallback (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` in the worker pod). Off: a worker outside development resolves a provider key only from the job's vault map, and logs once if a key is set in its environment and refused. On: every tier-2 tenant's module may spend the operator's key, and the worker holds that credential. In development (`RUST_ENV` development/dev/local/test or unset) the fallback is always on | 🔒 (posture) |
 | `GEMINI_API_KEY` | none (vault-first; env is fallback) | worker | Gemini key: the worker's env fallback for the `gemini/api_key` LLM vault path (`talos-worker-runtime/src/host/llm.rs`); the controller reads no `GEMINI_API_KEY` | 🔒 |
 | `OPENAI_API_KEY` | none (optional) | both | OpenAI key: the controller's embeddings fallback AND the worker's env fallback for the `openai/api_key` LLM vault path (same mechanism as `ANTHROPIC_API_KEY`) | 🔒 |
 | `OLLAMA_URL` | `http://ollama:11434` | both | Local Ollama endpoint (Tier-1 local LLM) | |
@@ -308,11 +309,11 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 | `GITHUB_APP_PRIVATE_KEY` | none | talos-github | App RS256 signing key (PEM, PKCS#1 or PKCS#8). | 🔒 |
 | `GITHUB_APP_WEBHOOK_SECRET` | none | talos-github | App webhook HMAC secret. | 🔒 |
 | `GITHUB_APP_CLIENT_ID` / `GITHUB_APP_CLIENT_SECRET` / `GITHUB_APP_REDIRECT_URI` | none | talos-github | The App's user authorization, required by the connect flow: after the install redirect Talos authorizes the connecting GitHub user and claims the installation only if GitHub lists it for that user (the Setup-URL `installation_id` is spoofable). All three or none — some-but-not-all fails the boot; none keeps the connect flow OFF (503) while existing installations still mint tokens. `_REDIRECT_URI` is the App's Callback URL, `https://<host>/api/github/authorized`. | 🔒 (secret) |
-| `EMAIL_API_URL` | none (optional) | worker | Outbound email API URL (host function) | |
+| `EMAIL_API_URL` | none (optional) | worker | Outbound email API URL (host function). **Operator-held worker credential** (with `EMAIL_API_KEY` and the three `S3_*` credentials below; 2026-10-14, E-5): read from the worker process environment when the job carries no `EMAIL_API_URL`/`EMAIL_API_KEY` secret, so every tenant's module that may send email sends it through the operator's account. These are the exceptions to the credential-free worker: set them only for a deployment whose operator accepts that every module with the email or object-storage capability uses them | |
 | `EMAIL_API_KEY` | none (optional) | worker | Email API key | 🔒 |
 | `EMAIL_FROM` | built-in default | worker | Default From address | |
 | `S3_ENDPOINT` | none (optional) | worker | Endpoint for the `talos:core/object-storage` WIT host functions a WASM module calls. Imported only by the `automation-node` world; the host fns answer `NotConfigured` for any other capability world. **Unrelated to the audit ledger** (that reads `AWS_ENDPOINT_URL`/`MINIO_ENDPOINT`) and unrelated to module artifact storage (compiled WASM lives in `modules.wasm_bytes` and the OCI registry). | |
-| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | none | worker | S3 credentials | 🔒 |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | none | worker | S3 credentials. **Operator-held worker credentials** (see `EMAIL_API_URL`): read from the worker process environment, used by every `automation-node` module's object-storage calls | 🔒 |
 | `S3_REGION` | built-in default | worker | S3 region | |
 | `DLP_PROVIDER` | `builtin` | talos-dlp-provider | DLP provider selection | |
 | `DLP_WEBHOOK_URL` | `""` | talos-dlp-provider | External DLP webhook URL (receives unredacted data). Must be `https://` in production — a plaintext URL is refused there and the builtin redactor is used | |
@@ -327,7 +328,7 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 | `TALOS_REGISTRY_NAMESPACE` | `talos-tools` | talos-registry | OCI namespace for templates | |
 | `OCI_REGISTRY_USERNAME` / `OCI_REGISTRY_PASSWORD` | none (anonymous) | both | OCI registry basic-auth (PAT works as password for GHCR) | 🔒 |
 | `REGISTRY_PUBLISH_TOKEN` | none in dev; REQUIRED in production (unset ⇒ the publish endpoint refuses every POST with 503) | talos-registry | Bearer token gating the template publish API | 🔒 |
-| `TALOS_SIGSTORE_REQUIRED` | prod refuses OCI sync unless an explicit policy is set | both | Sigstore verification policy: `required` / `audit` / `disabled` | 🔒 |
+| `TALOS_SIGSTORE_REQUIRED` | prod refuses OCI sync unless an explicit policy is set | both | Sigstore verification policy for OCI TEMPLATES: `required` / `audit` / `disabled` (aliases `true`/`1`, `warn`, `off`/`0`/`false`/`no`; empty = `disabled`). Any other value is refused in every environment: the worker does not boot and the controller does not sync (2026-10-14, E-7). Under `audit` a pull that was not verified — including one with no `TALOS_SIGSTORE_IDENTITY_REGEXP` — runs but is never cached. `deploy/k3s/install.sh` refuses `disabled` while `TALOS_REGISTRY_URL` is set unless `TALOS_ALLOW_UNSIGNED_TEMPLATES=yes` (H-1). Not the image-admission switch (`security.sigstore.enabled`) | 🔒 |
 | `TALOS_SIGSTORE_IDENTITY_REGEXP` | `""` | both | cosign `--certificate-identity-regexp` — pin to the publish workflow URL AND its ref (`…/template-publish\.yml@refs/heads/main$`): a pattern ending at `@` admits a signature from any branch a `workflow_dispatch` was pointed at. `install.sh` derives this form when enforcement is on and the variable is unset | 🔒 |
 | `TALOS_SIGSTORE_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` | both | cosign OIDC issuer pin | 🔒 |
 | `TALOS_COSIGN_MIN_VERSION` | `2.0.0` | worker | Minimum cosign binary version | 🔒 |

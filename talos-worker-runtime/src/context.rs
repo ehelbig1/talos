@@ -443,6 +443,11 @@ pub struct TalosContext {
     /// egress by assigning to it.
     pub(crate) dev_egress: DevEgressOptIns,
 
+    /// Whether an LLM provider key may come from the worker process
+    /// environment (E-5): refused in production without the opt-in. Read once,
+    /// in [`Self::new`]; see [`EnvProviderKeys`].
+    pub(crate) env_provider_keys: EnvProviderKeys,
+
     /// Per-actor write ceiling — the mutation-permission gate. `ReadOnly`
     /// refuses every data-mutating host op (agent-memory writes, non-GET
     /// HTTP, DB execute, webhook/email/messaging sends, object-storage
@@ -563,6 +568,10 @@ pub struct TalosContext {
 
     /// Number of log messages emitted in this execution.
     pub(crate) log_message_count: AtomicU64,
+
+    /// Guest log bytes relayed this execution, against
+    /// [`crate::host::MAX_LOG_BYTES_PER_EXECUTION`] (E-12).
+    pub(crate) log_bytes: AtomicU64,
 
     /// Host-diagnostic entries published into the per-execution log
     /// stream this execution (see [`Self::emit_host_diagnostic`]).
@@ -1129,6 +1138,96 @@ impl DevEgressOptIns {
             private_host_targets: crate::host::allow_private_host_targets(),
             insecure_http: crate::host::insecure_http_opt_in(),
         }
+    }
+}
+
+/// Whether an execution may take an LLM provider key (`ANTHROPIC_API_KEY`,
+/// `OPENAI_API_KEY`, `GEMINI_API_KEY`) from the WORKER PROCESS environment
+/// when the job's vault map has none — ONE home (security review 2026-10-14,
+/// E-5).
+///
+/// The env fallback is a development bootstrap: with a key in the worker
+/// pod's environment, every tier-2 tenant's module spends the operator's key,
+/// and the worker holds a provider credential the "credential-free worker"
+/// invariant says it does not. Outside development it is REFUSED unless the
+/// operator sets `TALOS_WORKER_ALLOW_ENV_PROVIDER_KEYS` true, so the vault path
+/// (`anthropic/api_key`, …, delivered per job) is the only source. "Outside
+/// development" is `talos_auth_types::browser_hardening_required()` (any
+/// `RUST_ENV` but development/dev/local/test): the fallback is a control a
+/// tenant meets, so it follows that rule, not `is_production()` — a
+/// `RUST_ENV=staging` deployment that faces users refuses it too.
+///
+/// Read once per execution in [`TalosContext::new`], like [`DevEgressOptIns`];
+/// the `read` function is the process environment outside tests.
+#[derive(Clone, Copy)]
+pub struct EnvProviderKeys {
+    permitted: bool,
+    read: fn(&str) -> Option<String>,
+}
+
+/// The operator's explicit production opt-in for [`EnvProviderKeys`].
+pub const ENV_PROVIDER_KEYS_OPT_IN: &str = "TALOS_WORKER_ALLOW_ENV_PROVIDER_KEYS";
+
+fn process_env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+impl EnvProviderKeys {
+    /// The rule, pure: in development the fallback is on; anywhere hardened
+    /// only with the opt-in.
+    #[must_use]
+    pub fn permitted(hardened: bool, opted_in: bool) -> bool {
+        !hardened || opted_in
+    }
+
+    /// The process environment's answer. The ONE call site outside tests is
+    /// [`TalosContext::new`].
+    pub(crate) fn from_env() -> Self {
+        Self {
+            permitted: Self::permitted(
+                talos_auth_types::browser_hardening_required(),
+                talos_config::bool_env_or_default(ENV_PROVIDER_KEYS_OPT_IN, false),
+            ),
+            read: process_env_var,
+        }
+    }
+
+    /// Test-only: a stated rule and a stated environment.
+    #[cfg(test)]
+    pub(crate) fn stated(permitted: bool, read: fn(&str) -> Option<String>) -> Self {
+        Self { permitted, read }
+    }
+
+    /// The env fallback for `env_name`, or `None` when refused or unset. A
+    /// refusal of a key that IS set is logged once per process, so the
+    /// operator learns why a module reports the provider as not configured.
+    pub(crate) fn lookup(&self, env_name: &str) -> Option<String> {
+        let value = (self.read)(env_name).filter(|v| !v.is_empty());
+        if !self.permitted {
+            if value.is_some() {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        env_name,
+                        opt_in = ENV_PROVIDER_KEYS_OPT_IN,
+                        "an LLM provider key is set in the worker environment but production \
+                         refuses the env fallback — store it in the vault (delivered per job), \
+                         or set the opt-in to accept the worker holding it"
+                    );
+                }
+            }
+            return None;
+        }
+        value
+    }
+}
+
+impl std::fmt::Debug for EnvProviderKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvProviderKeys")
+            .field("permitted", &self.permitted)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1847,6 +1946,7 @@ impl TalosContext {
             secret_access_count: AtomicU64::new(0),
             fs_bytes_written: AtomicU64::new(0),
             log_message_count: AtomicU64::new(0),
+            log_bytes: AtomicU64::new(0),
             host_diag_count: AtomicU64::new(0),
             denial_ledger_count: AtomicU64::new(0),
             secret_use_recorded: std::collections::HashSet::new(),
@@ -1938,6 +2038,7 @@ impl TalosContext {
             local_egress_only,
             // The value the resolver above was built with.
             dev_egress,
+            env_provider_keys: EnvProviderKeys::from_env(),
             // Default `Write` (permissive) at construction; live dispatch
             // paths re-stamp this from the signed `JobRequest.max_write_ceiling`
             // right after `new()`, mirroring `max_llm_tier`. Tests / legacy
@@ -1966,6 +2067,14 @@ impl TalosContext {
         self.http_client = http_client;
         self.wasi_http_hooks = wasi_http_hooks;
         self.dev_egress = dev_egress;
+        self
+    }
+
+    /// Test-only: run this context under a STATED env-provider-key rule and
+    /// environment instead of the process's. See [`EnvProviderKeys`].
+    #[cfg(test)]
+    pub(crate) fn with_env_provider_keys(mut self, keys: EnvProviderKeys) -> Self {
+        self.env_provider_keys = keys;
         self
     }
 
@@ -4414,6 +4523,66 @@ mod secret_use_ledger_tests {
         t1.set_audit_ledger(l1.clone());
         assert!(t1.get_llm_api_key_by_name("anthropic").await.is_none());
         assert!(t1.secret_use_recorded.is_empty(), "a refusal is not a use");
+    }
+
+    /// A stated worker environment holding one provider key.
+    fn provider_key_in_worker_env(name: &str) -> Option<String> {
+        (name == "ANTHROPIC_API_KEY").then(|| "sk-ant-from-worker-env".to_string())
+    }
+
+    /// E-5 (2026-10-14): with a provider key in the worker environment and
+    /// none in the job's vault map, a production worker resolves NOTHING; the
+    /// opt-in and a non-production worker keep the fallback.
+    #[tokio::test]
+    async fn production_refuses_an_llm_provider_key_from_the_worker_env() {
+        let mk = |production: bool, opted_in: bool| {
+            TalosContext::new(
+                CapabilityWorld::Agent,
+                vec![],
+                vec!["POST".to_string()],
+                128,
+                HashMap::new(), // the vault map has no provider key
+                None,
+                None,
+                false,
+                None,
+                Arc::new(crate::expose_fallback::ExposeFallback::new()),
+                LlmTier::Tier2,
+                None,
+            )
+            .expect("context builds")
+            .with_env_provider_keys(EnvProviderKeys::stated(
+                EnvProviderKeys::permitted(production, opted_in),
+                provider_key_in_worker_env,
+            ))
+        };
+
+        let mut prod = mk(true, false);
+        assert_eq!(
+            prod.get_llm_api_key(crate::host::wit_llm::Provider::Anthropic)
+                .await,
+            None
+        );
+        assert_eq!(prod.get_llm_api_key_by_name("anthropic").await, None);
+        assert!(prod.secret_use_recorded.is_empty(), "nothing was resolved");
+
+        // CONTROL: the operator's opt-in, and a non-production worker.
+        for (production, opted_in) in [(true, true), (false, false)] {
+            let mut c = mk(production, opted_in);
+            assert_eq!(
+                c.get_llm_api_key_by_name("anthropic").await.as_deref(),
+                Some("sk-ant-from-worker-env"),
+                "production={production} opted_in={opted_in}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_env_provider_key_rule() {
+        assert!(!EnvProviderKeys::permitted(true, false));
+        assert!(EnvProviderKeys::permitted(true, true));
+        assert!(EnvProviderKeys::permitted(false, false));
+        assert!(EnvProviderKeys::permitted(false, true));
     }
 
     /// TEXTUAL pin (stated): the two host-internal plaintext lookups have
