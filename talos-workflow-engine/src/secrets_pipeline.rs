@@ -296,7 +296,14 @@ pub(crate) async fn resolve_secrets_map_for(
     // contains `vault://anthropic/api_key` would otherwise seal that key
     // into a tier-1 job. Filter the LLM-provider paths out of the dynamic
     // set too, before both the OAuth refresh hook and the resolve.
-    let vault_paths = filter_tier1_paths(vault_paths, max_llm_tier);
+    //
+    // And only what the module's grant admits (security review 2026-10-14,
+    // G-27): the worker refuses a `vault://` reference outside
+    // `allowed_secrets` when the module reads it, so resolving one here only
+    // sealed a secret into an envelope that could not use it. The same
+    // matcher the worker applies (`vault_path_permitted`).
+    let vault_paths =
+        granted_vault_paths(&filter_tier1_paths(vault_paths, max_llm_tier), &extra_paths);
     if !vault_paths.is_empty() {
         resolver.refresh_vault_paths(&vault_paths).await;
         match resolver.resolve_by_paths(&vault_paths, user_id).await {
@@ -367,6 +374,16 @@ pub(crate) async fn resolve_secrets_map_for(
 ///
 /// [`LlmTier::Tier1`]: talos_workflow_engine_core::LlmTier::Tier1
 /// [`LlmTier::Tier2`]: talos_workflow_engine_core::LlmTier::Tier2
+/// The `vault://` paths of a node's config that its module's grant
+/// (`allowed`, the module's `allowed_secrets`) admits.
+pub(crate) fn granted_vault_paths(paths: &[String], allowed: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|p| talos_workflow_job_protocol::vault_path_permitted(allowed, p))
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn filter_tier1_paths(
     paths: &[String],
     max_llm_tier: talos_workflow_engine_core::LlmTier,
@@ -568,5 +585,26 @@ mod tests {
             t2.contains_key("anthropic/api_key"),
             "tier-2 keeps LLM keys for host llm::* consumption"
         );
+    }
+}
+
+#[cfg(test)]
+mod granted_vault_path_tests {
+    use super::granted_vault_paths;
+
+    /// G-27 (2026-10-14): a config reference outside the module's grant is
+    /// not resolved for the job.
+    #[test]
+    fn only_granted_config_references_are_resolved() {
+        let paths: Vec<String> = ["svc/token", "other/key", "oauth/gmail/a/b"]
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect();
+        let allowed = vec!["svc/token".to_string(), "oauth/gmail/*".to_string()];
+        assert_eq!(
+            granted_vault_paths(&paths, &allowed),
+            vec!["svc/token".to_string(), "oauth/gmail/a/b".to_string()]
+        );
+        assert!(granted_vault_paths(&paths, &[]).is_empty());
     }
 }

@@ -292,15 +292,19 @@ async fn test_approval_queue_and_resource_quotas() {
         .await
         .unwrap();
 
-    let quota_query = r#"
-        query GetQuotas {
-            resourceQuotas {
+    // The org is named: with no `orgId` the quotas read is for the caller's
+    // PERSONAL org (security review 2026-10-14, A-9), and this org is not it.
+    let quota_query = format!(
+        r#"
+        query GetQuotas {{
+            resourceQuotas(orgId: "{org_id}") {{
                 cpuCores
                 concurrentExecutions
-            }
-        }
-    "#;
-    let resp = client.execute(quota_query).await;
+            }}
+        }}
+    "#
+    );
+    let resp = client.execute(quota_query.as_str()).await;
     let data: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&resp.data).unwrap()).unwrap();
     assert_eq!(data["resourceQuotas"]["cpuCores"], 16);

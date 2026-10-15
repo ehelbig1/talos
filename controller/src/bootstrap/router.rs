@@ -2840,6 +2840,9 @@ pub(crate) fn build_router(
         .route("/api/slack/channels", post(slack::list_channels_handler))
         .route("/api/slack/users", post(slack::list_users_handler))
         .with_state(slack_api_client.clone())
+        // `create_app_handler` stores the created app's credentials in the
+        // vault under the caller (security review 2026-10-14, F-9).
+        .layer(Extension(secrets_manager.clone()))
         .layer(DefaultBodyLimit::max(8192))
         .layer(from_fn(rest_auth_middleware)) // Runs 5th (last) - needs auth_service extension
         .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations

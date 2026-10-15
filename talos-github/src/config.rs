@@ -11,7 +11,6 @@
 //! | `GITHUB_APP_ID`             | no      | JWT `iss`; presence = App enabled |
 //! | `GITHUB_APP_SLUG`           | no      | install-redirect URL (B2b)        |
 //! | `GITHUB_APP_PRIVATE_KEY`    | YES     | RS256 signing key (PEM)           |
-//! | `GITHUB_APP_WEBHOOK_SECRET` | YES     | App webhook HMAC secret (B5)      |
 //! | `GITHUB_APP_CLIENT_ID`      | no      | user-authorization (connect flow) |
 //! | `GITHUB_APP_CLIENT_SECRET`  | YES     | user-authorization token exchange |
 //! | `GITHUB_APP_REDIRECT_URI`   | no      | the App's registered Callback URL |
@@ -34,7 +33,6 @@ use crate::error::GithubAppError;
 const ENV_APP_ID: &str = "GITHUB_APP_ID";
 const ENV_APP_SLUG: &str = "GITHUB_APP_SLUG";
 const ENV_PRIVATE_KEY: &str = "GITHUB_APP_PRIVATE_KEY";
-const ENV_WEBHOOK_SECRET: &str = "GITHUB_APP_WEBHOOK_SECRET";
 const ENV_CLIENT_ID: &str = "GITHUB_APP_CLIENT_ID";
 const ENV_CLIENT_SECRET: &str = "GITHUB_APP_CLIENT_SECRET";
 const ENV_REDIRECT_URI: &str = "GITHUB_APP_REDIRECT_URI";
@@ -118,7 +116,6 @@ impl GithubUserAuthConfig {
 pub struct GithubAppConfig {
     pub app_id: String,
     pub app_slug: String,
-    webhook_secret: Zeroizing<String>,
     private_key_pem: Zeroizing<String>,
     /// `None` = the connect flow is disabled (see the module docs).
     user_auth: Option<GithubUserAuthConfig>,
@@ -129,7 +126,6 @@ impl std::fmt::Debug for GithubAppConfig {
         f.debug_struct("GithubAppConfig")
             .field("app_id", &self.app_id)
             .field("app_slug", &self.app_slug)
-            .field("webhook_secret", &"<redacted>")
             .field("private_key_pem", &"<redacted>")
             .field("user_auth", &self.user_auth)
             .finish()
@@ -146,17 +142,14 @@ impl GithubAppConfig {
         app_id: String,
         app_slug: String,
         private_key_pem: String,
-        webhook_secret: String,
     ) -> Result<Self, GithubAppError> {
         let app_id = require_non_blank(ENV_APP_ID, app_id)?;
         let app_slug = require_non_blank(ENV_APP_SLUG, app_slug)?;
         let private_key_pem = require_non_blank(ENV_PRIVATE_KEY, private_key_pem)?;
-        let webhook_secret = require_non_blank(ENV_WEBHOOK_SECRET, webhook_secret)?;
 
         let cfg = Self {
             app_id,
             app_slug,
-            webhook_secret: Zeroizing::new(webhook_secret),
             private_key_pem: Zeroizing::new(private_key_pem),
             user_auth: None,
         };
@@ -180,7 +173,6 @@ impl GithubAppConfig {
             app_id,
             env_required(ENV_APP_SLUG)?,
             env_required(ENV_PRIVATE_KEY)?,
-            env_required(ENV_WEBHOOK_SECRET)?,
         )?;
         let cfg = match GithubUserAuthConfig::from_env()? {
             Some(user_auth) => cfg.with_user_auth(user_auth),
@@ -203,11 +195,6 @@ impl GithubAppConfig {
     /// Parse the configured private key into a signing key.
     pub fn signing_key(&self) -> Result<AppSigningKey, GithubAppError> {
         AppSigningKey::from_pem(&self.private_key_pem)
-    }
-
-    /// The App webhook HMAC secret (B5 — verifying App-delivered webhooks).
-    pub fn webhook_secret(&self) -> &str {
-        &self.webhook_secret
     }
 
     /// Build a live API client for this App (feature `client`).
@@ -260,38 +247,24 @@ mod tests {
 
     #[test]
     fn from_values_ok_and_signing_key_parses() {
-        let cfg = GithubAppConfig::from_values(
-            "123".into(),
-            "my-app".into(),
-            test_key_pem(),
-            "whsec".into(),
-        )
-        .unwrap();
+        let cfg =
+            GithubAppConfig::from_values("123".into(), "my-app".into(), test_key_pem()).unwrap();
         assert_eq!(cfg.app_id, "123");
         assert_eq!(cfg.app_slug, "my-app");
-        assert_eq!(cfg.webhook_secret(), "whsec");
         assert!(cfg.signing_key().is_ok());
     }
 
     #[test]
     fn rejects_blank_fields() {
         let k = test_key_pem();
-        assert!(
-            GithubAppConfig::from_values("  ".into(), "a".into(), k.clone(), "s".into()).is_err()
-        );
-        assert!(
-            GithubAppConfig::from_values("1".into(), "".into(), k.clone(), "s".into()).is_err()
-        );
-        assert!(
-            GithubAppConfig::from_values("1".into(), "a".into(), "   ".into(), "s".into()).is_err()
-        );
-        assert!(GithubAppConfig::from_values("1".into(), "a".into(), k, "".into()).is_err());
+        assert!(GithubAppConfig::from_values("  ".into(), "a".into(), k.clone()).is_err());
+        assert!(GithubAppConfig::from_values("1".into(), "".into(), k.clone()).is_err());
+        assert!(GithubAppConfig::from_values("1".into(), "a".into(), "   ".into()).is_err());
     }
 
     #[test]
     fn rejects_unparseable_key() {
-        let err =
-            GithubAppConfig::from_values("1".into(), "a".into(), "not a pem".into(), "s".into());
+        let err = GithubAppConfig::from_values("1".into(), "a".into(), "not a pem".into());
         assert!(err.is_err());
     }
 
@@ -328,7 +301,7 @@ mod tests {
             "https://talos.example/api/github/authorized".into(),
         )
         .unwrap();
-        let cfg = GithubAppConfig::from_values("1".into(), "a".into(), test_key_pem(), "w".into())
+        let cfg = GithubAppConfig::from_values("1".into(), "a".into(), test_key_pem())
             .unwrap()
             .with_user_auth(ua);
         let dbg = format!("{cfg:?}");
@@ -342,16 +315,11 @@ mod tests {
 
     #[test]
     fn debug_redacts_secrets() {
-        let cfg = GithubAppConfig::from_values(
-            "1".into(),
-            "a".into(),
-            test_key_pem(),
-            "supersecret".into(),
-        )
-        .unwrap();
+        let pem = test_key_pem();
+        let cfg = GithubAppConfig::from_values("1".into(), "a".into(), pem.clone()).unwrap();
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("redacted"));
-        assert!(!dbg.contains("supersecret"));
+        assert!(!dbg.contains(pem.trim()));
         assert!(!dbg.contains("PRIVATE"));
     }
 }

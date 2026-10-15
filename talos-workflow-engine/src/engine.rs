@@ -2229,7 +2229,15 @@ impl ParallelWorkflowEngine {
         // Named for what it gates, and supplied by the caller — see
         // `ChainDispatch` for the whole history, including why the value
         // every production entry point passes is `Disabled`.
-        let chains_live = chain_dispatch == ChainDispatch::Enabled;
+        //
+        // Never for a dry run or an actor-bound run (security review
+        // 2026-10-14, B-8): the pipeline wire type (`PipelineJobRequest`)
+        // carries neither `dry_run` nor `actor_id`, so a chained step of a
+        // rehearsal would send for real and lose its actor. The chain path
+        // stays disabled in production; this keeps the day it is enabled
+        // from inheriting that.
+        let chains_live =
+            chain_dispatch == ChainDispatch::Enabled && !self.dry_run && self.actor_id.is_none();
 
         // On seeded resume the detector would build chains spanning
         // already-completed nodes and re-dispatch them, which is why the

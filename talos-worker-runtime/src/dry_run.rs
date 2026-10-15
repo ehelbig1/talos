@@ -13,8 +13,9 @@
 //!
 //! # What a dry run does NOT stub
 //!
-//! `email::send`, `graphql::execute` (a mutation is a POST), `database`,
-//! `object_storage`, `files` and `http_stream` have no dry-run branch; memory
+//! `database`, `object_storage`, `files` and `http_stream` have no dry-run
+//! branch (`email::send` and a `graphql::execute` that may be a mutation are
+//! stubbed since 2026-10-14, security review G-27); memory
 //! writes and LLM calls are real too. A node that used one of those under a
 //! dry run reports `stubbed_calls: 0`, which is the truth: nothing of its was
 //! stubbed.
@@ -38,6 +39,11 @@ pub enum StubbedSurface {
     Messaging,
     /// `agent-orchestration` invoke / send.
     AgentOrchestration,
+    /// `email::send` (2026-10-14, security review G-27).
+    Email,
+    /// `graphql::execute` of a document that may be a mutation (2026-10-14,
+    /// G-27).
+    Graphql,
 }
 
 impl StubbedSurface {
@@ -48,6 +54,8 @@ impl StubbedSurface {
             Self::Webhook => "webhook",
             Self::Messaging => "messaging",
             Self::AgentOrchestration => "agent_orchestration",
+            Self::Email => "email",
+            Self::Graphql => "graphql",
         }
     }
 }
@@ -182,5 +190,29 @@ mod tests {
         let for_an_entry_future = ledger.clone();
         for_an_entry_future.record(StubbedSurface::Http);
         assert_eq!(ledger.snapshot().get(&StubbedSurface::Http), Some(&1));
+    }
+}
+
+/// Whether a GraphQL document may carry a mutation (or subscription), so a
+/// dry run must not send it: the word `mutation` or `subscription` anywhere in
+/// it. Errs toward stubbing — a query that merely names a field `mutation…` is
+/// stubbed too, which costs a rehearsal an answer, never a side effect.
+#[must_use]
+pub fn graphql_may_mutate(document: &str) -> bool {
+    document.contains("mutation") || document.contains("subscription")
+}
+
+#[cfg(test)]
+mod graphql_dry_run_tests {
+    use super::graphql_may_mutate;
+
+    #[test]
+    fn a_mutation_is_stubbed_and_a_plain_query_is_not() {
+        assert!(graphql_may_mutate(
+            "mutation { createIssue(input: {}) { id } }"
+        ));
+        assert!(graphql_may_mutate("  mutation Named($x: ID!) { a(x: $x) }"));
+        assert!(!graphql_may_mutate("query { viewer { login } }"));
+        assert!(!graphql_may_mutate("{ viewer { login } }"));
     }
 }

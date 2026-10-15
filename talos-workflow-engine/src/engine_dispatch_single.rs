@@ -1431,7 +1431,11 @@ mod oauth_repair_tests {
             paths: &[String],
             _user_id: Option<Uuid>,
         ) -> Result<talos_workflow_engine_core::SecretMap, BoxError> {
-            self.log.lock().expect("log mutex").push("resolve");
+            // Counts reads of a concrete credential; the grant's pattern
+            // entries (`oauth/gmail/*`) name no stored path.
+            if paths.iter().any(|p| !p.ends_with('*')) {
+                self.log.lock().expect("log mutex").push("resolve");
+            }
             Ok(paths
                 .iter()
                 .map(|p| {
@@ -1466,7 +1470,10 @@ mod oauth_repair_tests {
             capability_world: "network-node".into(),
             allowed_hosts: vec![],
             allowed_methods: vec![],
-            allowed_secrets: vec![],
+            // The module holds the grant its credential needs: a config
+            // `vault://` reference outside it is not resolved for the job
+            // (security review 2026-10-14, G-27).
+            allowed_secrets: vec!["oauth/gmail/*".into(), "stripe/*".into()],
             requires_approval_for: vec![],
             integration_name: None,
             config: None,

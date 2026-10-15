@@ -57,9 +57,9 @@ describe("SlackAppCreator", () => {
           success: true,
           app_id: "A123",
           client_id: "C123",
-          client_secret: "secret",
-          signing_secret: "sign",
-          verification_token: "v123",
+          client_secret_path: "slack/app/a123/client_secret",
+          signing_secret_path: "slack/app/a123/signing_secret",
+          verification_token_path: "slack/app/a123/verification_token",
           bot_user_id: "U123",
         });
       }),
@@ -98,6 +98,9 @@ describe("SlackAppCreator", () => {
       expect.objectContaining({
         appId: "A123",
         botUserId: "U123",
+        // The node config gets vault references, never the values.
+        clientSecret: "vault://slack/app/a123/client_secret",
+        signingSecret: "vault://slack/app/a123/signing_secret",
       }),
     );
   });

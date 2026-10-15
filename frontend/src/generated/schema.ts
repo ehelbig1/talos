@@ -1443,6 +1443,7 @@ export type MutationRootUpdateMemberRoleArgs = {
 
 export type MutationRootUpdateResourceQuotasArgs = {
   input: UpdateResourceQuotasInput;
+  orgId?: InputMaybe<Scalars["UUID"]["input"]>;
 };
 
 export type MutationRootUpdateScheduleArgs = {
@@ -1926,6 +1927,10 @@ export type QueryRootOrganizationMembersArgs = {
 
 export type QueryRootPendingApprovalsArgs = {
   limit?: InputMaybe<Scalars["Int"]["input"]>;
+};
+
+export type QueryRootResourceQuotasArgs = {
+  orgId?: InputMaybe<Scalars["UUID"]["input"]>;
 };
 
 export type QueryRootSecretArgs = {

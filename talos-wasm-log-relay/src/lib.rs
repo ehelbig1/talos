@@ -34,6 +34,22 @@ use talos_workflow_job_protocol::subjects::{CONTROLLER_WASM_LOG_QUEUE_GROUP, WAS
 /// alert's `{{ $labels.kind }}` annotation names exactly these.
 pub const WASM_LOG_ORPHAN_NO_EXECUTION_ROW: &str = "no_execution_row";
 pub const WASM_LOG_ORPHAN_UNPARSEABLE_ID: &str = "unparseable_id";
+/// The line's `execution_id` is not the one its subject (`wasm.log.<id>`)
+/// names (security review 2026-10-14, B-7).
+pub const WASM_LOG_ORPHAN_SUBJECT_MISMATCH: &str = "subject_mismatch";
+
+/// The execution id a `wasm.log.<execution_id>` subject names. The worker
+/// publishes each execution's lines on its own subject, so a line is accepted
+/// only for the execution its subject names: a publisher cannot plant a line
+/// in another execution by writing that execution's id into the payload of a
+/// subject it was handed for its own (security review 2026-10-14, B-7). The
+/// lines stay unsigned — the stated limit.
+#[must_use]
+pub fn subject_execution_id(subject: &str) -> Option<uuid::Uuid> {
+    subject
+        .strip_prefix("wasm.log.")
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+}
 
 /// Maximum characters of WASM-emitted log content broadcast on the
 /// `execution_updates` GraphQL subscription. Mirrors the persistence
@@ -105,6 +121,23 @@ pub enum ParsedLog {
     /// never counted as one — conflating them would make the alert's `kind`
     /// label lie about what to go grep.
     Malformed,
+    /// A line whose `execution_id` is not the one its subject names
+    /// (security review 2026-10-14, B-7). Discarded by both halves.
+    SubjectMismatch,
+}
+
+/// THE reader of a `wasm.log.*` message; both halves of the relay call it.
+/// [`parse_log_line`], then the subject binding: a line belongs to the
+/// execution its subject names, which the worker derives from the job, not to
+/// whatever id the guest wrote into the payload.
+#[must_use]
+pub fn parse_log_message(msg: &async_nats::Message) -> ParsedLog {
+    match parse_log_line(&msg.payload) {
+        ParsedLog::Line(line) if subject_execution_id(&msg.subject) != Some(line.execution_id) => {
+            ParsedLog::SubjectMismatch
+        }
+        other => other,
+    }
 }
 
 /// THE parser for a `wasm.log.*` payload; both halves of the relay call it.
@@ -163,7 +196,7 @@ pub async fn persist_log_message(
     // DEBUG, not INFO: measured 2026-09-13 this line was 21 % of controller
     // INFO volume, acknowledging a message the worker had already relayed.
     tracing::debug!("📩 Received WASM log from NATS topic: {}", msg.subject);
-    let line = match parse_log_line(&msg.payload) {
+    let line = match parse_log_message(msg) {
         ParsedLog::Line(line) => line,
         ParsedLog::UnparseableId => {
             // The line is discarded here and nothing downstream will ever
@@ -186,6 +219,20 @@ pub async fn persist_log_message(
         }
         ParsedLog::Malformed => {
             tracing::debug!("Failed to parse WASM log message");
+            return;
+        }
+        ParsedLog::SubjectMismatch => {
+            if let Some(m) = talos_metrics::global() {
+                m.wasm_log_orphaned_total
+                    .with_label_values(&[WASM_LOG_ORPHAN_SUBJECT_MISMATCH])
+                    .inc();
+            }
+            tracing::warn!(
+                target: "talos_controller",
+                event_kind = "wasm_log_subject_mismatch",
+                subject = %msg.subject,
+                "WASM log line discarded: its execution_id is not the one its subject names"
+            );
             return;
         }
     };
@@ -342,7 +389,9 @@ pub fn broadcast_log_message(
     if tx.receiver_count() == 0 {
         return BroadcastOutcome::NoListeners;
     }
-    let ParsedLog::Line(line) = parse_log_line(&msg.payload) else {
+    // The same reader as the persisting half, subject binding included
+    // (B-7): a line is streamed only to the execution its subject names.
+    let ParsedLog::Line(line) = parse_log_message(msg) else {
         return BroadcastOutcome::NotALine;
     };
     let _ = tx.send(ExecutionEvent {
@@ -538,8 +587,12 @@ mod relay_unit_tests {
     use super::*;
 
     fn msg(payload: &str) -> async_nats::Message {
+        msg_on(&format!("wasm.log.{EXEC}"), payload)
+    }
+
+    fn msg_on(subject: &str, payload: &str) -> async_nats::Message {
         async_nats::Message {
-            subject: "wasm.log.test".to_string().into(),
+            subject: subject.to_string().into(),
             reply: None,
             payload: payload.as_bytes().to_vec().into(),
             headers: None,
@@ -550,6 +603,43 @@ mod relay_unit_tests {
     }
 
     const EXEC: &str = "5b0f7a52-5c1e-4a53-9a0e-6f3f0d6c9a11";
+
+    /// B-7 (2026-10-14): a line is accepted only for the execution its
+    /// subject names.
+    #[test]
+    fn a_line_belongs_to_the_execution_its_subject_names() {
+        let other = "0c0ffee0-0000-4000-8000-000000000001";
+        assert_eq!(
+            subject_execution_id(&format!("wasm.log.{EXEC}")).map(|u| u.to_string()),
+            Some(EXEC.to_string())
+        );
+        assert_eq!(subject_execution_id("wasm.log.test"), None);
+        assert_eq!(subject_execution_id("wasm.other.x"), None);
+        let payload = format!(r#"{{"execution_id":"{EXEC}","message":"m"}}"#);
+        // The one reader both halves call: persisting and streaming alike.
+        assert_eq!(
+            parse_log_message(&msg_on(&format!("wasm.log.{other}"), &payload)),
+            ParsedLog::SubjectMismatch
+        );
+        assert_eq!(
+            parse_log_message(&msg_on("wasm.log.not-a-uuid", &payload)),
+            ParsedLog::SubjectMismatch
+        );
+        assert!(matches!(
+            parse_log_message(&msg(&payload)),
+            ParsedLog::Line(_)
+        ));
+        let (tx, _rx) = tokio::sync::broadcast::channel(4);
+        assert_eq!(
+            broadcast_log_message(&msg_on(&format!("wasm.log.{other}"), &payload), &tx),
+            BroadcastOutcome::NotALine,
+            "a payload naming another execution is not streamed"
+        );
+        assert_eq!(
+            broadcast_log_message(&msg(&payload), &tx),
+            BroadcastOutcome::Sent
+        );
+    }
     const NODE: &str = "0e2d6c1b-2f3a-4b8c-9d7e-1a2b3c4d5e6f";
 
     #[test]

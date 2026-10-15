@@ -319,7 +319,13 @@ impl PlatformQueries {
         ))
     }
 
-    async fn resource_quotas(&self, ctx: &Context<'_>) -> Result<ResourceQuota> {
+    async fn resource_quotas(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "The organization to read quotas for (you must be a member). \
+                          Omitted: your personal organization.")]
+        org_id: Option<Uuid>,
+    ) -> Result<ResourceQuota> {
         // MCP-757 sibling: paired mutation `update_resource_quotas` is
         // `require_2fa` + Admin-scoped; this read surface had no scope
         // gate, so a non-Admin API key could discover the org's capacity
@@ -334,28 +340,19 @@ impl PlatformQueries {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        let org_ids = talos_organizations::OrganizationService::list_user_org_ids(db_pool, user_id)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "graphql: org membership lookup failed");
-                async_graphql::Error::new("Request could not be completed").extend_safe()
-            })?;
-
-        let org_id = match org_ids.first() {
-            Some(o) => *o,
-            None => {
-                return Ok(ResourceQuota {
-                    cpu_cores: 1,
-                    used_cpu: 0,
-                    memory_gb: 2,
-                    used_memory: 0,
-                    storage_gb: 10,
-                    used_storage: 0,
-                    concurrent_executions: 5,
-                    active_executions: 0,
-                });
-            }
-        };
+        // The org the caller names (a member of it), or their personal one
+        // (security review 2026-10-14, A-9: until then the first membership).
+        let org_id = talos_organizations::OrganizationService::quota_org_for(
+            db_pool,
+            user_id,
+            org_id,
+            talos_organizations::OrgRole::Viewer,
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "graphql: quota org refused or unreadable");
+            async_graphql::Error::new("Organization not found or access denied").extend_safe()
+        })?;
 
         let quotas =
             talos_organizations::OrganizationService::get_org_quota_limits(db_pool, org_id)

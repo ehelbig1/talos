@@ -4884,21 +4884,20 @@ impl EncryptedSecrets {
             .map_err(|_| "invalid nonce length".to_string())?;
 
         // The AES-GCM key is an HKDF subkey of the root, never the raw root
-        // (which is also the HMAC signing key). For a non-empty `aad` (the
-        // production per-job path) try the v2 per-job key first, then fall
-        // back to the v1 static key so envelopes sealed by a not-yet-rolled
-        // controller still open during the rolling deploy. (Roll workers
-        // first/together: a worker that only knows v1 cannot open a v2
-        // envelope.) For an empty `aad` there is only the v1 key. AES-GCM's
-        // tag makes the extra attempt safe — a wrong key cannot forge a
-        // passing tag. `aad` is bound into the tag on every attempt.
+        // (which is also the HMAC signing key). A non-empty `aad` (the
+        // production per-job path) opens ONLY under the v2 per-job key; an
+        // empty `aad` only under the v1 key. Until 2026-10-14 a per-job
+        // envelope also tried the v1 static key, for a controller not yet
+        // rolled to v2 sealing — every controller has sealed v2 since
+        // 2026-06-17 (#237), and the fallback only widened the set of keys
+        // that open a per-job envelope back to one static key (security
+        // review B-10).
         let candidates: Vec<zeroize::Zeroizing<[u8; 32]>> = if aad.is_empty() {
             vec![zeroize::Zeroizing::new(derive_envelope_aead_key_v1(key))]
         } else {
-            vec![
-                zeroize::Zeroizing::new(derive_envelope_aead_key_v2(key, aad)),
-                zeroize::Zeroizing::new(derive_envelope_aead_key_v1(key)),
-            ]
+            vec![zeroize::Zeroizing::new(derive_envelope_aead_key_v2(
+                key, aad,
+            ))]
         };
 
         for aead_key in candidates {
@@ -5335,8 +5334,10 @@ pub struct JobRequest {
     /// supply or change this value — the worker reads it from the
     /// request, never from WIT arguments.
     ///
-    /// Not part of the HMAC commitment (it's not a capability, just a
-    /// scoping identifier); the RPC layer signs it separately.
+    /// Bound by the dispatch signature (`lp(integration_name)` in
+    /// `signing_payload`, pinned by the wire-format snapshots) — until
+    /// 2026-10-14 this comment said it was not (security review B-12) — and
+    /// the RPC layer signs it again on every integration-state request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration_name: Option<String>,
 
@@ -5859,6 +5860,24 @@ impl JobRequest {
         if self.max_fuel != 0 {
             use std::fmt::Write as _;
             let _ = write!(payload, ":fuel={}", self.max_fuel);
+        }
+
+        // The secret envelope's nonce, AT THE VERY END (after `:fuel=`), only
+        // when the job carries an envelope (security review 2026-10-14, B-10).
+        // Until then only the ciphertext was hashed in, so an on-path attacker
+        // could flip the nonce of a validly signed dispatch and the job failed
+        // as "decrypt failed" rather than as a refused signature. Twelve bytes,
+        // hex, fixed width — no length prefix. A secret-less job appends
+        // nothing and is byte-identical to the pre-field format; a job WITH
+        // secrets changes its signed bytes, so controller and worker roll
+        // together, as for `:fuel=`.
+        if !self.encrypted_secrets.nonce.is_empty() {
+            use std::fmt::Write as _;
+            let _ = write!(
+                payload,
+                ":sn={}",
+                hex::encode(&self.encrypted_secrets.nonce)
+            );
         }
 
         payload.into_bytes()
@@ -9255,11 +9274,11 @@ mod tests {
         );
     }
 
-    /// Migration: an envelope sealed under the legacy v1 static key (a
-    /// not-yet-rolled controller) must still open via the v2-first decrypt
-    /// fallback once the worker is on the new code.
+    /// An envelope sealed under the legacy v1 static key with a per-job AAD
+    /// does not open: the v2→v1 fallback for a not-yet-rolled controller was
+    /// removed on 2026-10-14 (B-10), four months after v2 sealing shipped.
     #[test]
-    fn legacy_v1_envelope_opens_via_fallback() {
+    fn a_per_job_envelope_does_not_open_under_the_v1_key() {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
         use aes_gcm::{Aes256Gcm, Nonce};
         let key = test_key();
@@ -9285,8 +9304,9 @@ mod tests {
             ciphertext,
             nonce: nonce_bytes.to_vec(),
         };
-        // v2-first decrypt must fall back to v1 and recover the secrets.
-        assert_eq!(env.decrypt_with_aad(&key, aad).unwrap(), secrets);
+        // Since 2026-10-14 (B-10) a per-job envelope opens only under its v2
+        // key: the v1 static key no longer opens one.
+        assert!(env.decrypt_with_aad(&key, aad).is_err());
     }
 
     /// The strongest proof the slice does what Part 2 claims: a sealed

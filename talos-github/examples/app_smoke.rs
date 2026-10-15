@@ -13,7 +13,6 @@
 //!
 //!      GITHUB_APP_ID=123456 \
 //!      GITHUB_APP_SLUG=my-test-app \
-//!      GITHUB_APP_WEBHOOK_SECRET=anything-nonblank \
 //!      GITHUB_APP_PRIVATE_KEY="$(cat ~/Downloads/my-test-app.private-key.pem)" \
 //!      cargo run -p talos-github --features client --example app_smoke -- <INSTALLATION_ID>
 //!

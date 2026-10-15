@@ -244,6 +244,13 @@ impl ParallelWorkflowEngine {
             // uniformly. L-1: AAD = execution_id binds each step's legacy AES-GCM
             // tag to this dispatch (steps share the execution_id AAD deliberately;
             // step-level granularity is enforced by the wider JobRequest HMAC).
+            // The step module's grant, as the single-node path passes it: it
+            // is also what admits a step config's `vault://` references
+            // (security review 2026-10-14, G-27).
+            let step_grant: Vec<String> = artifact
+                .as_ref()
+                .map(|a| a.allowed_secrets.clone())
+                .unwrap_or_default();
             let step_secrets = match (self.secrets_resolver.as_ref(), &worker_shared_key) {
                 (Some(resolver), Some(key)) => {
                     crate::secrets_pipeline::build_dispatch_secrets_for(
@@ -252,7 +259,7 @@ impl ParallelWorkflowEngine {
                         step_node_id,
                         self.user_id,
                         &vault_paths,
-                        &[],
+                        &step_grant,
                         key.as_bytes(),
                         self.max_llm_tier,
                         execution_id.as_bytes(),

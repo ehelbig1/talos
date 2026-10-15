@@ -369,9 +369,13 @@ where
 
 /// An https base address with no query or fragment, without its trailing `/`.
 fn usable_base(s: &str, name: &str) -> Result<String, String> {
+    // No `user:password@` in the authority (2026-10-14, security review F-11):
+    // it would carry credentials in this adapter's own request line.
     let link = usable_link(s)
-        .filter(|l| !l.contains('?') && !l.contains('#'))
-        .ok_or_else(|| format!("{name} must be an https:// address with no query"))?;
+        .filter(|l| !l.contains('?') && !l.contains('#') && !host_of(l).contains('@'))
+        .ok_or_else(|| {
+            format!("{name} must be an https:// address with no query or credentials")
+        })?;
     Ok(link.trim_end_matches('/').to_string())
 }
 
@@ -615,6 +619,14 @@ pub fn run(input: String) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-11 (2026-10-14): an address with `user:password@` is refused.
+    #[test]
+    fn a_base_with_userinfo_is_refused() {
+        assert!(usable_base("https://user:pw@example.test/", "BASE_URL").is_err());
+        assert!(usable_base("https://user@example.test", "BASE_URL").is_err());
+        assert!(usable_base("https://example.test", "BASE_URL").is_ok());
+    }
     use serde_json::{json, Value};
     use talos_module_testkit::host;
 

@@ -1152,6 +1152,18 @@ impl TalosContext {
             return Err(wit_graphql::Error::Networkerror);
         }
 
+        // Dry run: a document that may be a mutation is answered here, not
+        // sent (security review 2026-10-14, G-27); every gate above ran.
+        if self.dry_run && crate::dry_run::graphql_may_mutate(&query) {
+            tracing::info!(url = %url, "Dry-run: intercepted GraphQL mutation");
+            self.dry_run_ledger
+                .record(crate::dry_run::StubbedSurface::Graphql);
+            return Ok(wit_graphql::Response {
+                data: Some(r#"{"__dry_run__":true}"#.to_string()),
+                errors: None,
+            });
+        }
+
         // The introspection scan runs HERE — after the allowlist, the method
         // gate and the rate-limit charge — since 2026-09-25. It used to run
         // before all of them, and it was quadratic: a guest could send a 1 MB

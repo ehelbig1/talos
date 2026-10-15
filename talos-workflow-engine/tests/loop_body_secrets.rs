@@ -72,7 +72,10 @@ async fn a_loop_body_is_given_the_secrets_its_config_and_grant_name() {
         .add_module(
             "body",
             body_module,
-            Some(json!({ "AUTH": "Bearer vault://svc/from_config" })),
+            Some(json!({
+                "AUTH": "Bearer vault://cfg/from_config",
+                "OTHER": "Bearer vault://other/not_granted",
+            })),
         )
         .edge("loop", "body")
         .build()
@@ -101,7 +104,7 @@ async fn a_loop_body_is_given_the_secrets_its_config_and_grant_name() {
             capability_world: "http-node".into(),
             allowed_hosts: vec!["api.example.com".into()],
             allowed_methods: vec!["GET".into()],
-            allowed_secrets: vec!["svc/from_grant".into()],
+            allowed_secrets: vec!["svc/from_grant".into(), "cfg/*".into()],
             requires_approval_for: vec![],
             integration_name: None,
             config: None,
@@ -131,7 +134,7 @@ async fn a_loop_body_is_given_the_secrets_its_config_and_grant_name() {
     let paths = resolver.paths.lock().unwrap().clone();
     let asks = |path: &str| paths.iter().filter(|p| p.as_str() == path).count();
     assert_eq!(
-        asks("svc/from_config"),
+        asks("cfg/from_config"),
         2,
         "the loop did not ask for its body's config reference: {paths:?}"
     );
@@ -139,6 +142,15 @@ async fn a_loop_body_is_given_the_secrets_its_config_and_grant_name() {
         asks("svc/from_grant"),
         2,
         "the loop did not ask for its body module's exact-path grant: {paths:?}"
+    );
+    // A config reference the module's grant does not admit is never
+    // resolved: the worker would refuse it at substitution, so fetching it
+    // only sealed an unusable secret into the job (security review
+    // 2026-10-14, G-27).
+    assert_eq!(
+        asks("other/not_granted"),
+        0,
+        "a config reference outside the grant was resolved: {paths:?}"
     );
     // The module's own secrets are looked up by the MODULE's id.
     let module_ids = resolver.module_ids.lock().unwrap().clone();

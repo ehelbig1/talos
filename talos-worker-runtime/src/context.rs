@@ -725,6 +725,18 @@ pub struct TalosContext {
     pub dry_run_ledger: crate::dry_run::DryRunLedger,
 }
 
+/// The sandbox's bytes go back to the process-wide budget when the context —
+/// and with it the execution's tempdir — goes (security review 2026-10-14,
+/// E-8).
+impl Drop for TalosContext {
+    fn drop(&mut self) {
+        crate::host::limits::release_process_fs_bytes(
+            self.fs_bytes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+}
+
 impl WasiView for TalosContext {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {

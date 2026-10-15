@@ -129,6 +129,22 @@ impl wit_files::Host for TalosContext {
                     break;
                 }
             }
+            // And against the whole process's budget (E-8): admitted only
+            // when both have room; the per-execution reservation is returned
+            // when this one is refused.
+            if !reserve_process_fs_bytes(bytes) {
+                self.fs_bytes_written.fetch_sub(bytes, Ordering::Relaxed);
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    attempted = bytes,
+                    limit = MAX_FS_BYTES_PER_PROCESS,
+                    "File system write would exceed the worker's sandbox budget — not admitting"
+                );
+                if let Some(ref m) = self.metrics {
+                    m.record_rate_limit_exceeded("fs");
+                }
+                return Err(wit_files::Error::Permissiondenied);
+            }
 
             tokio::task::block_in_place(|| {
                 // Create parent directories within the sandbox if needed.

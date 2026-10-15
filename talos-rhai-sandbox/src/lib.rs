@@ -112,6 +112,15 @@ pub const MAX_ARRAY_SIZE: usize = 500;
 /// See the crate-level "Size-cap semantics" section.
 pub const MAX_MAP_SIZE: usize = 500;
 
+/// Maximum nesting depth of an expression at the top level, and inside a
+/// function body. Rhai's own defaults are these numbers in a release build
+/// and half of them in a debug build; pinned so the parse limit is the same
+/// in every build and cannot move with a `rhai` bump (security review
+/// 2026-10-14, G-27).
+pub const MAX_EXPR_DEPTH: usize = 64;
+/// See [`MAX_EXPR_DEPTH`].
+pub const MAX_FUNCTION_EXPR_DEPTH: usize = 32;
+
 /// Operation cap for [`SandboxProfile::Expression`].
 pub const EXPRESSION_MAX_OPERATIONS: u64 = 1_000;
 
@@ -235,6 +244,7 @@ pub fn sandboxed_engine(profile: SandboxProfile) -> Engine {
     engine.set_max_string_size(MAX_STRING_SIZE);
     engine.set_max_array_size(MAX_ARRAY_SIZE);
     engine.set_max_map_size(MAX_MAP_SIZE);
+    engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_FUNCTION_EXPR_DEPTH);
 
     // SECURITY: no dynamic code execution.
     engine.disable_symbol("eval");
@@ -268,6 +278,8 @@ mod config_parity_tests {
         assert_eq!(e.max_string_size(), 65_536, "string size");
         assert_eq!(e.max_array_size(), 500, "array size");
         assert_eq!(e.max_map_size(), 500, "map size");
+        assert_eq!(e.max_expr_depth(), 64, "expression depth");
+        assert_eq!(e.max_function_expr_depth(), 32, "function expression depth");
     }
 
     /// The 10× dispatch budget, pinned so the decision recorded in
@@ -286,6 +298,8 @@ mod config_parity_tests {
         assert_eq!(d.max_string_size(), e.max_string_size());
         assert_eq!(d.max_array_size(), e.max_array_size());
         assert_eq!(d.max_map_size(), e.max_map_size());
+        assert_eq!(d.max_expr_depth(), e.max_expr_depth());
+        assert_eq!(d.max_function_expr_depth(), e.max_function_expr_depth());
     }
 
     /// The constants and the engine the builder returns must agree — a
