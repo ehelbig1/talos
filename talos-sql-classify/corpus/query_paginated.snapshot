@@ -463,3 +463,12 @@ T=table(api_keys)        P=relation("API_KEYS",blocked) | SELECT * FROM "API_KEY
 T=ok                     P=ok | SELECT lower(name), count(*) FROM public.t WHERE created_at > now() - interval '1 day' GROUP BY 1
 T=ok                     P=ok | SELECT date_trunc('hour', created_at) AS h, avg(duration_ms) FROM t GROUP BY 1 ORDER BY 1
 T=ok                     P=ok | SELECT id, payload->>'kind' AS kind, jsonb_array_length(payload->'items') FROM t LIMIT 10
+T=ok                     P=ok | SELECT repeat('x', 1073741823) FROM generate_series(1, 1000)
+T=ok                     P=ok | SELECT lpad('x', 100000, 'y') AS padded
+T=ok                     P=ok | SELECT rpad(name, 100000) FROM t
+T=ok                     P=ok | SELECT * FROM generate_subscripts(ARRAY[1, 2, 3], 1)
+T=schema(pg_catalog)     P=relation(pg_catalog.pg_class,not-public) | SELECT relname, reltuples FROM pg_catalog.pg_class
+T=schema(information_schema) P=relation(information_schema.columns,not-public) | SELECT * FROM information_schema.columns
+T=ok                     P=relation(pg_stat_user_tables,catalog) | SELECT * FROM pg_stat_user_tables
+T=ok                     P=relation(public.pg_roles,catalog) | SELECT * FROM public.pg_roles
+T=schema(information_schema) P=relation(information_schema.tables,not-public) | SELECT t.id FROM t JOIN information_schema.tables it ON it.table_name = t.name

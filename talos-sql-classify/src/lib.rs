@@ -386,6 +386,82 @@ pub enum ReadRelation<'a> {
     TableCommand,
 }
 
+/// Why a relation a statement reads is not an ordinary table of the `public`
+/// schema, as [`public_table_name`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotPublicTable {
+    /// Qualified by a schema other than `public` (`pg_catalog.pg_class`,
+    /// `information_schema.columns`), by more than a schema, or with a part
+    /// that is not an identifier.
+    NotPublic,
+    /// A name beginning `pg_` — a system catalog or view, bare or
+    /// `public.`-qualified (both resolve to `pg_catalog` first).
+    SystemCatalog,
+    /// `FROM ONLY t`, which sqlparser reads as a table named `only`.
+    OnlyKeyword,
+    /// Postgres's `TABLE t` command.
+    TableCommand,
+}
+
+/// The relation's table name, folded as Postgres folds it and lower-cased,
+/// when it names an ordinary `public` table: bare or `public.`-qualified, not
+/// `pg_`-prefixed. The ONE rule every caller-SQL gate applies to what a
+/// statement reads — `query_paginated`, the worker's validator and the
+/// controller's re-check of `talos.database.query` (security review
+/// 2026-10-14, D-4: until then a module could enumerate every tenant's
+/// schema from `pg_catalog` and `information_schema`).
+pub fn public_table_name(relation: ReadRelation<'_>) -> Result<String, NotPublicTable> {
+    let name = match relation {
+        ReadRelation::Named(name) => name,
+        ReadRelation::TableCommand => return Err(NotPublicTable::TableCommand),
+    };
+    let Some(parts) = name
+        .0
+        .iter()
+        .map(|part| part.as_ident())
+        .collect::<Option<Vec<&sqlparser::ast::Ident>>>()
+    else {
+        return Err(NotPublicTable::NotPublic);
+    };
+    let folded = |ident: &sqlparser::ast::Ident| match ident.quote_style {
+        None => ident.value.to_ascii_lowercase(),
+        Some(_) => ident.value.clone(),
+    };
+    let table = match parts.as_slice() {
+        [table] => *table,
+        [schema, table] if folded(schema) == "public" => *table,
+        _ => return Err(NotPublicTable::NotPublic),
+    };
+    // Compared without regard to case even when quoted: stricter than
+    // Postgres, which would read `"USERS"` as a different table from `users`.
+    let table_name = folded(table).to_ascii_lowercase();
+    if table.quote_style.is_none() && table_name == "only" {
+        return Err(NotPublicTable::OnlyKeyword);
+    }
+    if table_name.starts_with("pg_") {
+        return Err(NotPublicTable::SystemCatalog);
+    }
+    Ok(table_name)
+}
+
+/// The first relation `stmt` reads that [`public_table_name`] refuses, as it
+/// is spelled, with the reason. `None` when every relation is a public table.
+pub fn first_relation_not_public(stmt: &Statement) -> Option<(String, NotPublicTable)> {
+    match try_for_each_relation(stmt, |relation| match public_table_name(relation) {
+        Ok(_) => ControlFlow::Continue(()),
+        Err(why) => ControlFlow::Break((
+            match relation {
+                ReadRelation::Named(name) => name.to_string(),
+                ReadRelation::TableCommand => "TABLE".to_string(),
+            },
+            why,
+        )),
+    }) {
+        ControlFlow::Break(found) => Some(found),
+        ControlFlow::Continue(()) => None,
+    }
+}
+
 /// Call `f` with every relation `stmt` reads by name, anywhere in it: the
 /// top-level `FROM`, joins, subqueries in any expression, CTE bodies and
 /// derived tables (sqlparser's `Visit` reaches every table factor).

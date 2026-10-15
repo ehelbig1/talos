@@ -738,6 +738,15 @@ pub async fn dispatch(
     }
 }
 
+/// The highest `page` `query_paginated` takes (security review 2026-10-14,
+/// D-6): `(page - 1) * page_size` overflowed `i64` for a large one.
+const MAX_QUERY_PAGE: i64 = 1_000_000;
+
+/// The row offset of `page` (1-based), or `None` when it does not fit.
+fn page_offset(page: i64, page_size: i64) -> Option<i64> {
+    page.checked_sub(1)?.checked_mul(page_size)
+}
+
 async fn handle_query_paginated(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -882,12 +891,12 @@ async fn handle_query_paginated(
     let page: i64 = match args.get("page") {
         None | Some(serde_json::Value::Null) => 1,
         Some(v) => match v.as_i64() {
-            Some(n) if n >= 1 => n,
+            Some(n) if (1..=MAX_QUERY_PAGE).contains(&n) => n,
             Some(n) => {
                 return mcp_error(
                     req_id,
                     -32602,
-                    &format!("page must be a positive integer (≥ 1), got {n}"),
+                    &format!("page must be an integer from 1 to {MAX_QUERY_PAGE}, got {n}"),
                 )
             }
             None => {
@@ -906,9 +915,14 @@ async fn handle_query_paginated(
             after: cursor_val,
         }
     } else {
-        talos_advanced_repository::PaginationMode::Offset {
-            offset: (page - 1) * page_size,
-        }
+        let Some(offset) = page_offset(page, page_size) else {
+            return mcp_error(
+                req_id,
+                -32602,
+                "page and page_size give an offset out of range",
+            );
+        };
+        talos_advanced_repository::PaginationMode::Offset { offset }
     };
 
     let rows = state
@@ -948,6 +962,14 @@ async fn handle_query_paginated(
             };
 
             let row_count = result_rows.len();
+            if let Err(e) = state
+                .advanced_repo
+                .record_admin_query(user_id, base_query, page, row_count)
+                .await
+            {
+                tracing::error!(error = %e, "query_paginated: the run could not be recorded");
+                return crate::utils::database_error(req_id);
+            }
 
             // Build next_cursor from the last displayed row if cursor-based.
             // `cursor_column.is_some()` is the same predicate the mode-builder above
@@ -5641,5 +5663,46 @@ mod archive_policy_render_tests {
         assert_eq!(v["archive_after_days"]["source"], "database");
         assert_eq!(v["purge_after_days"]["days"], 90);
         assert_eq!(v["total_lifetime_days"]["days"], 97);
+    }
+}
+
+#[cfg(test)]
+mod query_page_tests {
+    use super::{page_offset, MAX_QUERY_PAGE};
+
+    /// D-6 (security review 2026-10-14): the offset is checked arithmetic,
+    /// and the largest page the handler admits still fits at the largest
+    /// page size.
+    #[test]
+    fn the_offset_never_overflows() {
+        assert_eq!(page_offset(1, 100), Some(0));
+        assert_eq!(page_offset(3, 100), Some(200));
+        assert_eq!(page_offset(i64::MAX, 1000), None);
+        assert_eq!(page_offset(i64::MIN, 1000), None);
+        assert!(page_offset(MAX_QUERY_PAGE, 1000).is_some());
+    }
+}
+
+#[cfg(test)]
+mod query_record_pin {
+    /// SOURCE PIN, stated as textual (D-5, 2026-10-14): `query_paginated`
+    /// records the run before it builds the response that carries the rows,
+    /// and returns the database error when the record fails. The record
+    /// itself is driven against a database by `admin_query_record_tests`.
+    #[test]
+    fn the_rows_are_handed_out_only_after_the_run_is_recorded() {
+        let src = include_str!("advanced.rs");
+        let start = src
+            .find("\nasync fn handle_query_paginated(")
+            .expect("the handler");
+        let body = &src[start..];
+        let body = &body[..body[1..].find("\nasync fn ").map_or(body.len(), |e| e + 1)];
+        let record = body
+            .find(".record_admin_query(")
+            .expect("the run is recorded");
+        let rows = body.find("\"rows\": result_rows").expect("the response");
+        assert!(record < rows, "the record precedes the response");
+        let refusal = &body[record..rows];
+        assert!(refusal.contains("return crate::utils::database_error(req_id)"));
     }
 }

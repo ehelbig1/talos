@@ -3,12 +3,12 @@
 //! live in `talos-sql-classify/corpus/` (see the README there).
 //!
 //! The verdict is composed the way the `talos.database.query` handler
-//! composes it: one statement, a data statement, no denied function — and
-//! then whether it mutates, which is what the write ceiling is asked.
+//! composes it: one statement, a data statement, no denied function, no
+//! relation outside the public schema — and then whether it mutates, which is what the write ceiling is asked.
 
 use super::{
     controller_permits_data_statement, controller_side_denied_function,
-    controller_statement_mutates, statement_type_label,
+    controller_side_non_public_relation, controller_statement_mutates, statement_type_label,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -38,6 +38,9 @@ fn verdict(sql: &str) -> String {
     }
     if let Some(name) = controller_side_denied_function(stmt) {
         return format!("refuse function {name}");
+    }
+    if let Some(name) = controller_side_non_public_relation(stmt) {
+        return format!("refuse relation {name}");
     }
     format!(
         "admit {} {}",

@@ -223,3 +223,38 @@ async fn unset_runs_as_the_pool_user() {
         who.rows_json
     );
 }
+
+/// A guest transaction carries its own bounds (security review 2026-10-14,
+/// D-3): the server stops a statement when the RPC's budget does, and a sort
+/// or hash spills past 4 MB rather than growing in memory.
+#[tokio::test]
+async fn a_guest_transaction_runs_under_its_own_time_and_memory_bounds() {
+    let Some(url) = database_url() else { return };
+    let pool = pool(&url).await;
+    for role in [
+        GuestRoleSetting::Unset,
+        GuestRoleSetting::Role("talos_guest"),
+    ] {
+        let timeout = run(
+            &pool,
+            "SELECT current_setting('statement_timeout') AS t",
+            role,
+        )
+        .await
+        .expect("statement_timeout read");
+        let want_timeout = format!("\"{}s\"", talos_memory::database_rpc::QUERY_TIMEOUT_SECS);
+        assert!(
+            timeout.rows_json.contains(&want_timeout),
+            "{}",
+            timeout.rows_json
+        );
+        let work_mem = run(&pool, "SELECT current_setting('work_mem') AS w", role)
+            .await
+            .expect("work_mem read");
+        assert!(
+            work_mem.rows_json.contains("\"4MB\""),
+            "{}",
+            work_mem.rows_json
+        );
+    }
+}

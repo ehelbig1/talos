@@ -53,6 +53,11 @@ pub enum SqlValidationError {
     /// function's name as written, lower-cased where Postgres folds it
     /// (`pg_sleep`, `pg_catalog.pg_sleep`, `public.f`, `"F"`).
     DisallowedFunction(String),
+    /// The statement reads a relation that is not an ordinary `public`
+    /// table — a `pg_catalog` or `information_schema` view, a `pg_` name, a
+    /// name in another schema (`talos_sql_classify::public_table_name`,
+    /// security review 2026-10-14, D-4). The string is the name as written.
+    NonPublicRelation(String),
 }
 
 impl fmt::Display for SqlValidationError {
@@ -93,6 +98,11 @@ impl fmt::Display for SqlValidationError {
                  function that changes nothing, reads nothing stored beyond its \
                  arguments and runs no SQL). It is rejected from WASM modules \
                  regardless of `allowed_sql_operations`."
+            ),
+            Self::NonPublicRelation(name) => write!(
+                f,
+                "SQL reads `{name}`, which is not a table of the public schema: module \
+                 SQL reads no system catalog, information_schema view or other schema."
             ),
         }
     }
@@ -517,7 +527,7 @@ fn enforce_cte_mutation_policy(
 fn check_called_functions(stmt: &Statement) -> Result<(), SqlValidationError> {
     match talos_sql_classify::first_function_not_admitted(
         stmt,
-        talos_workflow_job_protocol::is_allowed_sql_function,
+        talos_workflow_job_protocol::is_allowed_guest_sql_function,
     ) {
         Some(name) => Err(SqlValidationError::DisallowedFunction(name)),
         None => Ok(()),
@@ -772,6 +782,11 @@ pub fn validate_sql_with_policy(
     // calls `pg_read_server_files` fails even when SELECT is the only
     // permitted operation). See `check_called_functions`.
     check_called_functions(stmt)?;
+
+    // What it reads by name: ordinary public tables only, never a catalog.
+    if let Some((name, _)) = talos_sql_classify::first_relation_not_public(stmt) {
+        return Err(SqlValidationError::NonPublicRelation(name));
+    }
 
     // A statement can carry another (a writable CTE, a `WITH … INSERT`). The
     // root's kind is checked against the allowlist below; everything it
@@ -1487,6 +1502,53 @@ mod tests {
     // `DisallowedFunction` because the function-walk runs before the
     // allowlist gate; this means even a SELECT-only module gets blocked.
     // ────────────────────────────────────────────────────────────────────
+
+    /// Security review 2026-10-14, D-3: functions that build a value or a
+    /// set of the caller's chosen size are refused from module SQL, and
+    /// D-4: so is any read of a catalog or another schema. An ordinary
+    /// public-table read is the control.
+    #[test]
+    fn size_builders_and_catalog_reads_are_refused_from_module_sql() {
+        for (sql, function) in [
+            (
+                "SELECT repeat('x', 1073741823) FROM generate_series(1, 1000)",
+                "repeat",
+            ),
+            ("SELECT lpad('x', 100000, 'y')", "lpad"),
+            ("SELECT * FROM generate_series(1, 10) g", "generate_series"),
+        ] {
+            match validate_sql(sql, &[]).unwrap_err() {
+                SqlValidationError::DisallowedFunction(name) => assert_eq!(name, function),
+                other => panic!("{sql}: expected DisallowedFunction, got {other:?}"),
+            }
+        }
+        for (sql, relation) in [
+            (
+                "SELECT relname FROM pg_catalog.pg_class",
+                "pg_catalog.pg_class",
+            ),
+            (
+                "SELECT * FROM information_schema.columns",
+                "information_schema.columns",
+            ),
+            ("SELECT * FROM pg_stat_user_tables", "pg_stat_user_tables"),
+            (
+                "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM pg_roles)",
+                "pg_roles",
+            ),
+        ] {
+            match validate_sql(sql, &[]).unwrap_err() {
+                SqlValidationError::NonPublicRelation(name) => assert_eq!(name, relation),
+                other => panic!("{sql}: expected NonPublicRelation, got {other:?}"),
+            }
+        }
+        for sql in [
+            "SELECT lower(name) FROM t",
+            "SELECT * FROM public.t JOIN u ON u.id = t.id",
+        ] {
+            assert!(validate_sql(sql, &[]).is_ok(), "{sql}");
+        }
+    }
 
     #[test]
     fn pg_sleep_blocked_in_select() {

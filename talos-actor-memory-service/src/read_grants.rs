@@ -234,15 +234,20 @@ pub async fn mint(
     }
     let ttl_hours = i32::try_from(stored_ttl_hours(request.ttl_hours)).unwrap_or(24);
 
-    let mut tx = talos_db::begin_user_scoped(pool, user_id).await?;
+    // The sweep removes EVERY user's long-expired grants, so it is a system
+    // statement on the pool, never part of this user's scoped transaction:
+    // inside it, a row-security policy on the table would silently narrow it
+    // to one user (security review 2026-10-14, D-1 / D-10).
     sqlx::query(
         "DELETE FROM memory_read_grants \
          WHERE expires_at < NOW() - make_interval(days => $1::int)",
     )
     .bind(KEEP_EXPIRED_DAYS)
-    .execute(&mut *tx)
+    .execute(pool)
     .await
     .context("sweep expired read grants")?;
+
+    let mut tx = talos_db::begin_user_scoped(pool, user_id).await?;
 
     let live: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM memory_read_grants \

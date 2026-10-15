@@ -463,3 +463,12 @@ ReadOnly                 | SELECT * FROM "API_KEYS"
 ReadOnly                 | SELECT lower(name), count(*) FROM public.t WHERE created_at > now() - interval '1 day' GROUP BY 1
 ReadOnly                 | SELECT date_trunc('hour', created_at) AS h, avg(duration_ms) FROM t GROUP BY 1 ORDER BY 1
 ReadOnly                 | SELECT id, payload->>'kind' AS kind, jsonb_array_length(payload->'items') FROM t LIMIT 10
+ReadOnly                 | SELECT repeat('x', 1073741823) FROM generate_series(1, 1000)
+ReadOnly                 | SELECT lpad('x', 100000, 'y') AS padded
+ReadOnly                 | SELECT rpad(name, 100000) FROM t
+ReadOnly                 | SELECT * FROM generate_subscripts(ARRAY[1, 2, 3], 1)
+ReadOnly                 | SELECT relname, reltuples FROM pg_catalog.pg_class
+ReadOnly                 | SELECT * FROM information_schema.columns
+ReadOnly                 | SELECT * FROM pg_stat_user_tables
+ReadOnly                 | SELECT * FROM public.pg_roles
+ReadOnly                 | SELECT t.id FROM t JOIN information_schema.tables it ON it.table_name = t.name

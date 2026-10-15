@@ -618,6 +618,7 @@ impl GoogleCloudIntegrationService {
         &self,
         user_id: Uuid,
     ) -> Result<Vec<GoogleCloudIntegrationInfo>> {
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let integrations = sqlx::query_as::<_, GoogleCloudIntegrationInfo>(
             r#"
             SELECT id, account_email, account_name, scope, tier, is_active,
@@ -628,8 +629,9 @@ impl GoogleCloudIntegrationService {
             "#,
         )
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(integrations)
     }
@@ -640,6 +642,7 @@ impl GoogleCloudIntegrationService {
         integration_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<GoogleCloudIntegrationInfo>> {
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let integration = sqlx::query_as::<_, GoogleCloudIntegrationInfo>(
             r#"
             SELECT id, account_email, account_name, scope, tier, is_active,
@@ -650,8 +653,9 @@ impl GoogleCloudIntegrationService {
         )
         .bind(integration_id)
         .bind(user_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(integration)
     }
@@ -662,6 +666,7 @@ impl GoogleCloudIntegrationService {
         integration_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<GoogleCloudIntegration>> {
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let integration = sqlx::query_as::<_, GoogleCloudIntegration>(
             r#"
             SELECT *
@@ -671,8 +676,9 @@ impl GoogleCloudIntegrationService {
         )
         .bind(integration_id)
         .bind(user_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(integration)
     }
@@ -691,14 +697,16 @@ impl GoogleCloudIntegrationService {
         // settings UI disconnects both tiers through one handler, and a
         // write-tier row must revoke + clean up under
         // `oauth/google_cloud_write/*`, not the read namespace.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let row: Option<(Uuid, Option<String>, String)> = sqlx::query_as(
             "SELECT provider_key, account_email, tier FROM google_cloud_integrations \
              WHERE id = $1 AND user_id = $2 AND is_active = TRUE",
         )
         .bind(integration_id)
         .bind(user_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         let (provider_key, account_email, row_tier) = match row {
             Some((pk, email, tier)) => (Some(pk), email, tier),

@@ -33,12 +33,19 @@ pub async fn list_user_service_integrations(
     pool: &PgPool,
     user_id: Uuid,
 ) -> Result<Vec<ServiceIntegrationRow>> {
+    // Inside the user's own scope, so each provider table's row-security
+    // policy is evaluated beside the `user_id` predicate (security review
+    // 2026-10-14, D-1).
+    let mut tx = talos_db::begin_user_scoped(pool, user_id).await?;
     // sql-safe: table, column and tag names are &'static str fields of the PROVIDERS registry; the user id is bound
-    sqlx::query_as::<_, ServiceIntegrationRow>(sqlx::AssertSqlSafe(connections_union_sql()))
-        .bind(user_id)
-        .fetch_all(pool)
-        .await
-        .context("Failed to list user service integrations")
+    let rows =
+        sqlx::query_as::<_, ServiceIntegrationRow>(sqlx::AssertSqlSafe(connections_union_sql()))
+            .bind(user_id)
+            .fetch_all(&mut *tx)
+            .await
+            .context("Failed to list user service integrations")?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
 /// The cross-provider listing, one `UNION ALL` branch per registry entry.
@@ -103,12 +110,15 @@ pub async fn list_user_connections(pool: &PgPool, user_id: Uuid) -> Result<Vec<C
         "SELECT * FROM ({}) c ORDER BY provider_id, created_at, id LIMIT {MAX_LISTED_CONNECTIONS}",
         connections_union_sql()
     );
+    let mut tx = talos_db::begin_user_scoped(pool, user_id).await?;
     // sql-safe: table, column and tag names are &'static str fields of the PROVIDERS registry; the user id is bound
-    sqlx::query_as::<_, ConnectionRow>(sqlx::AssertSqlSafe(sql))
+    let rows = sqlx::query_as::<_, ConnectionRow>(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
-        .context("Failed to list user connections")
+        .context("Failed to list user connections")?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
 /// Outcome of a disconnect: whether a row was affected, plus the vault
@@ -169,14 +179,16 @@ pub async fn disconnect_user_integration(
         )
     };
 
+    let mut tx = talos_db::begin_user_scoped(pool, user_id).await?;
     // sql-safe: table, column and tag names are &'static str fields of the PROVIDERS registry; the user id is bound
     let row: Option<(Option<String>, Option<String>, Option<String>)> =
         sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(id)
             .bind(user_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .context("Failed to disconnect integration")?;
+    tx.commit().await?;
 
     Ok(match row {
         Some((provider_key, tier, account_email)) => DisconnectOutcome {
