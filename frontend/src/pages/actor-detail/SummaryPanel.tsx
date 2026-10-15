@@ -152,9 +152,7 @@ export function SummaryPanel({
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Left: Identity & Metadata */}
         <div className="lg:col-span-2 space-y-8">
-          <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 glass relative overflow-hidden group">
-            <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
-
+          <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-8 relative overflow-hidden group">
             <div className="relative z-10">
               {editing ? (
                 <div className="space-y-6">
@@ -212,7 +210,7 @@ export function SummaryPanel({
                     <button
                       onClick={() => doUpdate()}
                       disabled={updatePending || !editName.trim()}
-                      className="flex items-center gap-2 text-sm font-semibold bg-primary text-primary-foreground px-6 py-3 rounded-xl transition-premium hover:shadow-lg active:scale-95 disabled:opacity-50"
+                      className="flex items-center gap-2 text-sm font-semibold bg-primary text-primary-foreground px-6 py-3 rounded-xl transition-premium active:scale-95 disabled:opacity-50"
                     >
                       <Save className="w-4 h-4" />
                       {updatePending ? "Saving…" : "Save"}
@@ -342,7 +340,7 @@ export function SummaryPanel({
         {/* Right: Quick Telemetry & Actions */}
         <div className="space-y-8">
           {/* Recent Activity Feed */}
-          <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 glass h-full">
+          <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-8 h-full">
             <div className="flex items-center justify-between mb-8">
               <h3 className="text-xs font-semibold text-white">
                 Recent activity

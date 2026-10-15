@@ -279,9 +279,7 @@ function BriefingCard({ briefing }: { briefing: Briefing }) {
   const Icon = meta.icon;
 
   return (
-    <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-6 flex flex-col gap-4 transition-premium hover:border-white/10 hover:shadow-2xl group relative overflow-hidden">
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
+    <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-6 flex flex-col gap-4 transition-premium hover:border-white/10 group relative overflow-hidden">
       <div className="flex items-start justify-between gap-3 relative z-10">
         <div className="flex items-center gap-3">
           <div className="w-11 h-11 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary shrink-0">

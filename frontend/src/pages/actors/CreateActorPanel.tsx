@@ -270,12 +270,12 @@ export function CreateActorPanel({
     <>
       {/* Backdrop */}
       <div
-        className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-md animate-in fade-in duration-500"
+        className="fixed inset-0 z-[100] bg-black/60 animate-in fade-in duration-500"
         onClick={handleClose}
       />
 
       {/* Panel */}
-      <div className="fixed right-0 top-0 bottom-0 z-[101] w-full md:w-[560px] bg-surface-3/40 backdrop-blur-3xl border-l border-white/10 flex flex-col shadow-[0_0_100px_rgba(0,0,0,0.8)] glass gpu animate-in slide-in-from-right-full duration-700 ease-premium">
+      <div className="fixed right-0 top-0 bottom-0 z-[101] w-full md:w-[560px] bg-surface-3/40 border-l border-white/10 flex flex-col animate-in slide-in-from-right-full duration-700 ease-premium">
         {/* Panel header */}
         <div className="flex items-center justify-between px-10 py-10 border-b border-white/5 shrink-0 bg-white/5">
           <div className="space-y-1">
@@ -306,7 +306,7 @@ export function CreateActorPanel({
         </div>
 
         {/* Step content */}
-        <div className="flex-1 overflow-y-auto px-10 py-10 custom-scrollbar optimize-blur">
+        <div className="flex-1 overflow-y-auto px-10 py-10 custom-scrollbar">
           {/* Step 0: Template + Identity */}
           {step === 0 && (
             <div className="flex flex-col gap-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
@@ -332,7 +332,6 @@ export function CreateActorPanel({
                             : "border-white/5 bg-white/2 hover:border-primary/20 hover:bg-white/5",
                         )}
                       >
-                        <div className="absolute inset-0 bg-gradient-to-br from-white/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium" />
                         <div className="flex items-center justify-between gap-4 relative z-10 mb-2">
                           <span
                             className={cn(
@@ -365,7 +364,6 @@ export function CreateActorPanel({
                       Name <span className="text-primary">*</span>
                     </label>
                     <div className="relative group/input">
-                      <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within/input:opacity-100 transition-premium pointer-events-none" />
                       <input
                         value={name}
                         onChange={(e) => setName(e.target.value)}
@@ -384,7 +382,6 @@ export function CreateActorPanel({
                       Description
                     </label>
                     <div className="relative group/textarea">
-                      <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within/textarea:opacity-100 transition-premium pointer-events-none" />
                       <textarea
                         value={description}
                         onChange={(e) => setDesc(e.target.value)}
@@ -403,8 +400,7 @@ export function CreateActorPanel({
           {step === 1 && (
             <div className="flex flex-col gap-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
               {/* Summary card */}
-              <div className="rounded-3xl border border-white/5 bg-white/5 p-10 glass-light relative overflow-hidden">
-                <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent pointer-events-none" />
+              <div className="rounded-2xl border border-white/5 bg-white/5 p-10 bg-white/[0.03] border border-white/5 relative overflow-hidden">
                 <p className="text-xs font-semibold text-muted-foreground/50 mb-8 relative z-10">
                   Deployment Specification
                 </p>
@@ -447,7 +443,7 @@ export function CreateActorPanel({
               {/* Advanced settings */}
               <button
                 onClick={() => setShowAdvanced((v) => !v)}
-                className="flex items-center gap-4 px-6 py-4 bg-white/5 border border-white/5 rounded-2xl text-sm font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/10 hover:border-white/20 transition-premium active:scale-95 group shadow-xl"
+                className="flex items-center gap-4 px-6 py-4 bg-white/5 border border-white/5 rounded-2xl text-sm font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/10 hover:border-white/20 transition-premium active:scale-95 group"
               >
                 <ChevronRight
                   className={cn(
@@ -608,7 +604,7 @@ export function CreateActorPanel({
               type="button"
               onClick={() => setStep(1)}
               disabled={!canAdvance}
-              className="flex items-center gap-4 px-10 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-premium shadow-2xl disabled:opacity-20 disabled:cursor-not-allowed active:scale-95 border border-white/20"
+              className="flex items-center gap-4 px-10 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-premium disabled:opacity-20 disabled:cursor-not-allowed active:scale-95 border border-white/20"
             >
               Next <ChevronRight className="w-5 h-5" />
             </button>
@@ -617,7 +613,7 @@ export function CreateActorPanel({
               type="button"
               onClick={handleCreate}
               disabled={isPending}
-              className="flex items-center gap-4 px-12 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-premium shadow-2xl disabled:opacity-50 disabled:cursor-not-allowed active:scale-95 border border-white/20"
+              className="flex items-center gap-4 px-12 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-premium disabled:opacity-50 disabled:cursor-not-allowed active:scale-95 border border-white/20"
             >
               {isPending ? (
                 <>

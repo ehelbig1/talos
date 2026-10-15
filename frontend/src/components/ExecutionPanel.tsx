@@ -218,9 +218,7 @@ export default function ExecutionPanel() {
   );
 
   return (
-    <div className="flex flex-col bg-surface-1/60 backdrop-blur-3xl border-l border-white/5 text-foreground shadow-2xl relative overflow-hidden transition-premium">
-      <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-
+    <div className="flex flex-col bg-surface-1/60 border-l border-white/5 text-foreground relative overflow-hidden transition-premium">
       <ConfirmDialog
         open={confirmPending !== null}
         title={confirmPending?.title ?? "Confirm"}
@@ -253,7 +251,7 @@ export default function ExecutionPanel() {
 
       {/* Main Content Area — Only visible when telemetry is toggled */}
       {showTimeline && (
-        <div className="border-t border-white/5 overflow-hidden flex flex-col bg-surface-2/60 backdrop-blur-3xl animate-in slide-in-from-top-4 duration-500 relative z-20">
+        <div className="border-t border-white/5 overflow-hidden flex flex-col bg-surface-2/60 animate-in slide-in-from-top-4 duration-500 relative z-20">
           {executionId && (
             <div className="px-6 py-2 bg-white/5 border-b border-white/5 flex items-center justify-between">
               <div className="flex items-center gap-4">
@@ -323,7 +321,7 @@ export default function ExecutionPanel() {
                   className={cn(
                     "px-4 py-1.5 text-2xs font-semibold uppercase tracking-wider rounded-lg transition-premium",
                     viewMode === mode
-                      ? "bg-primary text-primary-foreground shadow-lg"
+                      ? "bg-primary text-primary-foreground"
                       : "text-muted-foreground/70 hover:text-white",
                   )}
                 >
@@ -338,8 +336,7 @@ export default function ExecutionPanel() {
             {events.length === 0 ? (
               <div className="py-20 flex flex-col items-center justify-center text-center">
                 <div className="relative mb-8 group">
-                  <div className="absolute -inset-10 bg-primary/5 rounded-full blur-[60px] opacity-0 group-hover:opacity-100 transition-premium" />
-                  <div className="relative p-8 rounded-[3.5rem] bg-surface-2/40 border border-white/5 shadow-2xl transition-premium group-hover:border-primary/20">
+                  <div className="relative p-8 rounded-[3.5rem] bg-surface-2/40 border border-white/5 transition-premium group-hover:border-primary/20">
                     <Activity className="h-16 w-16 text-muted-foreground/50 group-hover:text-primary transition-premium stroke-[1px]" />
                   </div>
                 </div>

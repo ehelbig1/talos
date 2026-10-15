@@ -105,7 +105,7 @@ export function ManualEndpointCreator({
         className={cn(
           "h-10 px-6 text-sm font-semibold rounded-xl transition-premium active:scale-95",
           baseUrl
-            ? "bg-emerald-500 hover:bg-emerald-400 text-white shadow-lg shadow-emerald-500/20"
+            ? "bg-emerald-500 hover:bg-emerald-400 text-white shadow-emerald-500/20"
             : "bg-surface-3 text-muted-foreground/70 grayscale",
         )}
       >
@@ -115,9 +115,7 @@ export function ManualEndpointCreator({
   }
 
   return (
-    <div className="bg-surface-2/60 border border-emerald-500/20 rounded-3xl p-8 space-y-8 shadow-2xl animate-in zoom-in-95 duration-500 relative overflow-hidden">
-      <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/5 via-transparent to-transparent opacity-50 pointer-events-none" />
-
+    <div className="bg-surface-2/60 border border-emerald-500/20 rounded-2xl p-8 space-y-8 animate-in zoom-in-95 duration-500 relative overflow-hidden">
       <div className="flex items-center justify-between relative z-10">
         <div className="flex items-center gap-3">
           <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
@@ -297,7 +295,7 @@ export function ManualEndpointCreator({
             onClick={saveEndpoint}
             disabled={!currentEndpoint.path}
             className={cn(
-              "flex-1 h-12 text-sm font-semibold rounded-2xl transition-premium shadow-2xl active:scale-95 flex items-center justify-center gap-3",
+              "flex-1 h-12 text-sm font-semibold rounded-2xl transition-premium active:scale-95 flex items-center justify-center gap-3",
               currentEndpoint.path
                 ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20"
                 : "bg-surface-3 text-muted-foreground/70",

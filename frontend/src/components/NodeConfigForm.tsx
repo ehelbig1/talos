@@ -282,7 +282,7 @@ export const NodeConfigForm = React.memo(
                 className={inputBase}
               />
             </div>
-            <div className="flex items-center gap-4 px-5 py-4 bg-primary/5 border border-primary/10 rounded-2xl shadow-inner">
+            <div className="flex items-center gap-4 px-5 py-4 bg-primary/5 border border-primary/10 rounded-2xl">
               <div className="p-2 bg-primary/10 rounded-xl text-primary">
                 <Info className="w-4 h-4" />
               </div>
@@ -329,7 +329,7 @@ export const NodeConfigForm = React.memo(
                 </div>
                 <Button
                   onClick={() => setTestModalOpen(true)}
-                  className="h-11 px-6 text-sm font-semibold rounded-2xl bg-white/5 border border-white/5 text-white/70 hover:text-white hover:bg-white/10 transition-premium active:scale-95 shadow-xl"
+                  className="h-11 px-6 text-sm font-semibold rounded-2xl bg-white/5 border border-white/5 text-white/70 hover:text-white hover:bg-white/10 transition-premium active:scale-95"
                 >
                   Test expression
                 </Button>
@@ -360,7 +360,7 @@ export const NodeConfigForm = React.memo(
               </p>
             </div>
 
-            <div className="flex items-center gap-4 px-5 py-4 bg-surface-3/60 border border-white/5 rounded-2xl shadow-2xl">
+            <div className="flex items-center gap-4 px-5 py-4 bg-surface-3/60 border border-white/5 rounded-2xl">
               <div className="p-2.5 rounded-xl bg-violet-500/10 border border-violet-500/20 text-violet-400">
                 <IterationCcw className="w-4 h-4" />
               </div>
@@ -560,8 +560,7 @@ export const NodeConfigForm = React.memo(
                 className={inputBase}
               />
             </div>
-            <div className="flex items-center gap-4 px-6 py-5 bg-amber-500/5 border border-amber-500/20 rounded-2xl shadow-2xl relative overflow-hidden group">
-              <div className="absolute inset-0 bg-gradient-to-br from-amber-500/5 to-transparent opacity-50" />
+            <div className="flex items-center gap-4 px-6 py-5 bg-amber-500/5 border border-amber-500/20 rounded-2xl relative overflow-hidden group">
               <div className="p-3 bg-amber-500/10 rounded-2xl text-amber-500 transition-premium relative z-10">
                 <Clock className="w-5 h-5" />
               </div>
@@ -587,7 +586,7 @@ export const NodeConfigForm = React.memo(
             <div className="relative group/json">
               <div
                 className={cn(
-                  "absolute -inset-1 rounded-3xl blur opacity-0 transition-premium",
+                  "absolute -inset-1 rounded-2xl blur opacity-0 transition-premium",
                   jsonError
                     ? "bg-destructive/10 group-hover/json:opacity-100"
                     : "bg-primary/5 group-hover/json:opacity-100",

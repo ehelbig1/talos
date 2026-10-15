@@ -154,7 +154,7 @@ export function CreateSecretDialog({
             <Button
               type="submit"
               disabled={!name || !keyPath || !value || createMutation.isPending}
-              className="bg-primary hover:bg-primary/90 text-primary-foreground shadow-xl px-8 h-11 border-b-4 border-primary/50 active:scale-95 transition-premium font-semibold text-sm rounded-xl"
+              className="bg-primary hover:bg-primary/90 text-primary-foreground px-8 h-11 border-b-4 border-primary/50 active:scale-95 transition-premium font-semibold text-sm rounded-xl"
             >
               {createMutation.isPending ? (
                 <div className="flex items-center gap-2">

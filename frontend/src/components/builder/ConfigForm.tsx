@@ -186,7 +186,7 @@ export const ConfigForm = React.memo(function ConfigForm({
                 {fieldSchema.description && (
                   <div className="group/info relative">
                     <AlertTriangle className="h-3.5 w-3.5 text-muted-foreground/50 cursor-help hover:text-primary transition-premium" />
-                    <div className="absolute bottom-full right-0 mb-3 w-64 p-3 bg-surface-4 border border-white/10 rounded-xl shadow-2xl opacity-0 group-hover/info:opacity-100 transition-premium pointer-events-none z-50">
+                    <div className="absolute bottom-full right-0 mb-3 w-64 p-3 bg-surface-4 border border-white/10 rounded-xl opacity-0 group-hover/info:opacity-100 transition-premium pointer-events-none z-50">
                       <p className="text-xs font-bold text-white/60 leading-relaxed">
                         {fieldSchema.description}
                       </p>
@@ -217,8 +217,7 @@ export const ConfigForm = React.memo(function ConfigForm({
               {field === "URL" &&
                 !!value[field] &&
                 !validationErrors[field] && (
-                  <div className="bg-surface-2 border border-white/5 rounded-2xl p-6 space-y-6 shadow-inner relative overflow-hidden group/http">
-                    <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
+                  <div className="bg-surface-2 border border-white/5 rounded-2xl p-6 space-y-6 relative overflow-hidden group/http">
                     <div className="flex items-center justify-between relative z-10">
                       <div className="flex items-center gap-3">
                         <div className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-400">

@@ -57,12 +57,12 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
   return (
     <Dialog open={true} onClose={onClose} title="Add existing module">
       <div className="space-y-8">
-        <div className="relative overflow-hidden p-6 bg-primary/5 border border-white/5 rounded-3xl shadow-inner glass-light group">
+        <div className="relative overflow-hidden p-6 bg-primary/5 border border-white/5 rounded-2xl bg-white/[0.03] border border-white/5 group">
           <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-premium">
             <Library className="w-12 h-12 text-primary" />
           </div>
           <div className="flex items-start gap-5 relative z-10">
-            <div className="shrink-0 w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center shadow-xl">
+            <div className="shrink-0 w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center">
               <Library className="w-6 h-6 text-primary" />
             </div>
             <div className="space-y-1">
@@ -78,7 +78,6 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
         </div>
 
         <div className="relative group/search">
-          <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within/search:opacity-100 transition-premium" />
           <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/60 group-focus-within/search:text-primary transition-premium z-10" />
           <DarkInput
             type="text"
@@ -102,7 +101,7 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
               <ErrorBanner message={error} />
             </div>
           ) : filteredModules.length === 0 ? (
-            <div className="flex-1 flex flex-col items-center justify-center py-20 px-8 text-center border-2 border-dashed border-white/5 rounded-3xl bg-surface-1/10 grayscale opacity-20">
+            <div className="flex-1 flex flex-col items-center justify-center py-20 px-8 text-center border-2 border-dashed border-white/5 rounded-2xl bg-surface-1/10 grayscale opacity-20">
               <Search className="w-12 h-12 text-muted-foreground/70 mb-6" />
               <p className="text-xs font-semibold text-muted-foreground mb-2">
                 No modules match

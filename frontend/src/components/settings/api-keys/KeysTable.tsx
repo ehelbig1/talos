@@ -37,8 +37,7 @@ export function KeysTable({
 }) {
   return (
     <div className="relative">
-      <div className="absolute -inset-0.5 bg-gradient-to-r from-indigo-500/20 to-purple-500/20 rounded-[22px] blur opacity-75 group-hover:opacity-100 transition duration-1000 group-hover:duration-200"></div>
-      <Card className="relative bg-surface-3/80 border-white/10 backdrop-blur-xl overflow-hidden rounded-[20px] shadow-2xl border">
+      <Card className="relative bg-surface-3/80 border-white/10 overflow-hidden rounded-[20px] border">
         {isLoading ? (
           <div className="p-24 flex flex-col items-center justify-center gap-4">
             <LoadingSpinner className="w-8 h-8 text-indigo-500" />

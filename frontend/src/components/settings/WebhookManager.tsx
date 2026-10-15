@@ -89,10 +89,8 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
 
   if (result) {
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xl animate-in fade-in duration-500">
-        <div className="bg-surface-3/90 backdrop-blur-3xl border border-white/10 rounded-3xl p-10 w-full max-w-lg shadow-2xl relative overflow-hidden">
-          <div className="absolute inset-0 bg-gradient-to-br from-success/10 via-transparent to-transparent opacity-50 pointer-events-none" />
-
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 animate-in fade-in duration-500">
+        <div className="bg-surface-3/90 border border-white/10 rounded-2xl p-10 w-full max-w-lg relative overflow-hidden">
           <div className="flex items-center gap-5 mb-10 relative z-10">
             <div className="w-14 h-14 bg-success/10 border border-success/20 rounded-2xl flex items-center justify-center">
               <CheckCircle2 className="w-7 h-7 text-success" />
@@ -112,7 +110,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
               <p className="text-xs font-semibold text-muted-foreground/70 ml-1">
                 Webhook URL
               </p>
-              <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 shadow-inner group">
+              <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 group">
                 <code className="text-xs font-mono text-primary flex-1 truncate selection:bg-primary/30">
                   {result.webhookUrl}
                 </code>
@@ -124,7 +122,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
                 <p className="text-xs font-semibold text-muted-foreground/70 ml-1">
                   Verification token
                 </p>
-                <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 shadow-inner group">
+                <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 group">
                   <code className="text-xs font-mono text-warning/80 flex-1 truncate selection:bg-warning/30">
                     {result.verificationToken}
                   </code>
@@ -135,7 +133,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
           </div>
 
           <Button
-            className="w-full mt-10 h-14 rounded-2xl font-semibold text-sm shadow-xl"
+            className="w-full mt-10 h-14 rounded-2xl font-semibold text-sm"
             onClick={onClose}
             variant="premium"
           >
@@ -147,10 +145,8 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xl animate-in fade-in duration-500">
-      <div className="bg-surface-3/90 backdrop-blur-3xl border border-white/10 rounded-3xl p-10 w-full max-w-md shadow-2xl relative overflow-hidden">
-        <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-50 pointer-events-none" />
-
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 animate-in fade-in duration-500">
+      <div className="bg-surface-3/90 border border-white/10 rounded-2xl p-10 w-full max-w-md relative overflow-hidden">
         <div className="flex items-center justify-between mb-10 relative z-10">
           <div className="space-y-1">
             <h3 className="text-xl font-semibold text-white tracking-tight font-outfit">
@@ -179,7 +175,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. GitHub push"
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner"
+              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium"
             />
           </div>
 
@@ -190,7 +186,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
             <select
               value={moduleId}
               onChange={(e) => setModuleId(e.target.value)}
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner appearance-none cursor-pointer"
+              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer"
             >
               <option value="" className="bg-surface-3">
                 Select a workflow…
@@ -213,7 +209,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
               max={1000}
               value={rateLimit}
               onChange={(e) => setRateLimit(parseInt(e.target.value, 10) || 60)}
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-xs font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner"
+              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-xs font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium"
             />
           </div>
 
@@ -255,7 +251,7 @@ export default function WebhookManager() {
 
   if (isLoading) {
     return (
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl animate-pulse">
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
         <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
         <div className="space-y-4">
           {[1, 2].map((i) => (
@@ -275,9 +271,7 @@ export default function WebhookManager() {
         <CreateWebhookDialog onClose={() => setShowCreate(false)} />
       )}
 
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl relative overflow-hidden">
-        <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden">
         {/* Header */}
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-12 relative z-10">
           <div className="flex items-center gap-6">
@@ -296,7 +290,7 @@ export default function WebhookManager() {
           <Button
             onClick={() => setShowCreate(true)}
             variant="premium"
-            className="h-14 px-8 rounded-2xl shadow-2xl flex items-center gap-3 w-full md:w-auto"
+            className="h-14 px-8 rounded-2xl flex items-center gap-3 w-full md:w-auto"
           >
             <Plus className="w-5 h-5" />
             New webhook
@@ -304,8 +298,7 @@ export default function WebhookManager() {
         </div>
 
         {triggers.length === 0 ? (
-          <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-3xl relative group overflow-hidden">
-            <div className="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 transition-premium blur-3xl pointer-events-none" />
+          <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
             <Webhook className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto group-hover:text-primary/20 transition-premium" />
             <p className="text-sm text-muted-foreground font-semibold">
               No webhooks yet
@@ -328,13 +321,11 @@ export default function WebhookManager() {
                   key={t.id}
                   className="bg-white/[0.02] border border-white/5 rounded-2xl p-6 hover:bg-white/[0.04] hover:border-white/10 transition-premium group relative overflow-hidden"
                 >
-                  <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
                   <div className="flex items-start justify-between gap-6 mb-5 relative z-10">
                     <div className="flex items-center gap-4 min-w-0">
                       <div
                         className={cn(
-                          "w-2.5 h-2.5 rounded-full shrink-0 shadow-[0_0_10px_rgba(0,0,0,0.5)]",
+                          "w-2.5 h-2.5 rounded-full shrink-0",
                           t.enabled
                             ? "bg-success animate-status-pulse"
                             : "bg-muted-foreground/30",
@@ -414,7 +405,7 @@ export default function WebhookManager() {
                   </div>
 
                   {/* URL */}
-                  <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 shadow-inner relative z-10">
+                  <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 relative z-10">
                     <code className="text-xs font-mono text-primary/80 flex-1 truncate selection:bg-primary/30 tracking-tight">
                       {t.webhookUrl}
                     </code>

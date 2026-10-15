@@ -70,12 +70,9 @@ export function AuthForm() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-background relative overflow-hidden font-inter">
       {/* Dynamic Background */}
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-50 pointer-events-none" />
 
       <div className="relative z-10 w-full max-w-[420px] px-6 py-12 animate-in fade-in duration-500">
-        <div className="bg-surface-1/80 border border-white/10 rounded-3xl p-10 shadow-2xl backdrop-blur-xl relative overflow-hidden">
-          <div className="absolute inset-0 bg-gradient-to-b from-white/[0.02] to-transparent pointer-events-none" />
-
+        <div className="bg-surface-1/80 border border-white/10 rounded-2xl p-10 relative overflow-hidden">
           {/* Logo & Branding */}
           <div className="text-center mb-10 relative">
             <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 mb-5">

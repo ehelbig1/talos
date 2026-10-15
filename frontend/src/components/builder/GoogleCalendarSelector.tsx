@@ -166,9 +166,7 @@ export function GoogleCalendarSelector({
   }
 
   return (
-    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-3xl space-y-8 shadow-2xl">
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50 pointer-events-none" />
-
+    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-2xl space-y-8">
       <div className="flex items-center justify-between relative z-10">
         <div className="flex items-center gap-3">
           <div className="p-2 rounded-xl bg-primary/10 border border-primary/20">
@@ -213,7 +211,7 @@ export function GoogleCalendarSelector({
             href="/settings"
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center justify-center rounded-xl font-semibold transition-premium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:opacity-30 disabled:pointer-events-none active:scale-95 select-none h-11 px-8 bg-primary hover:bg-primary/90 text-white text-sm shadow-xl transition-premium"
+            className="inline-flex items-center justify-center rounded-xl font-semibold transition-premium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:opacity-30 disabled:pointer-events-none active:scale-95 select-none h-11 px-8 bg-primary hover:bg-primary/90 text-white text-sm transition-premium"
           >
             Initialize Connection <ArrowRight className="ml-2 w-3.5 h-3.5" />
           </a>
@@ -363,7 +361,7 @@ export function GoogleCalendarSelector({
               {selectedCalendars.length > 0 && !setupComplete && (
                 <Button
                   onClick={handleConfirmSelection}
-                  className="w-full h-12 bg-primary hover:bg-primary/90 text-white text-sm font-semibold rounded-2xl shadow-2xl active:scale-95 transition-premium mt-4"
+                  className="w-full h-12 bg-primary hover:bg-primary/90 text-white text-sm font-semibold rounded-2xl active:scale-95 transition-premium mt-4"
                 >
                   Watch {selectedCalendars.length} calendar
                   {selectedCalendars.length > 1 ? "s" : ""}

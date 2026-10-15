@@ -96,7 +96,7 @@ export default function ActorDetail() {
                 />
               ))}
             </div>
-            <div className="h-[400px] rounded-3xl bg-surface-3/20 border border-white/5 animate-shimmer" />
+            <div className="h-[400px] rounded-2xl bg-surface-3/20 border border-white/5 animate-shimmer" />
           </div>
         </div>
       </div>

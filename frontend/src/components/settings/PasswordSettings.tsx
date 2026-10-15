@@ -74,7 +74,7 @@ export default function PasswordSettings() {
   };
 
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-10 glass relative overflow-hidden">
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden">
       <div className="relative z-10 space-y-8 max-w-xl">
         <div className="flex items-center gap-4">
           <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary">

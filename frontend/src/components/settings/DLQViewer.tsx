@@ -211,9 +211,7 @@ export function DLQViewer() {
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-1000">
-      <div className="bg-surface-3/30 border border-white/5 rounded-3xl p-10 shadow-2xl backdrop-blur-3xl relative overflow-hidden group/header">
-        <div className="absolute inset-0 bg-gradient-to-br from-destructive/10 via-transparent to-transparent opacity-50 pointer-events-none transition-premium group-hover/header:opacity-100" />
-
+      <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-10 relative overflow-hidden group/header">
         <div className="flex flex-col md:flex-row items-center justify-between gap-8 relative z-10">
           <div className="flex items-center gap-6">
             <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive transition-premium">
@@ -264,13 +262,13 @@ export function DLQViewer() {
         </div>
       </div>
 
-      <div className="flex gap-2 p-2 bg-surface-3/30 border border-white/5 rounded-2xl backdrop-blur-xl max-w-xl mx-auto shadow-2xl">
+      <div className="flex gap-2 p-2 bg-surface-3/30 border border-white/5 rounded-2xl max-w-xl mx-auto">
         <button
           onClick={() => setActiveTab("nodes")}
           className={cn(
             "flex-1 flex items-center justify-center gap-3 py-4 rounded-2xl text-sm font-semibold transition-premium relative overflow-hidden group",
             activeTab === "nodes"
-              ? "bg-destructive text-white shadow-2xl"
+              ? "bg-destructive text-white"
               : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
           )}
         >
@@ -281,7 +279,7 @@ export function DLQViewer() {
               className={cn(
                 "px-2 py-0.5 rounded-lg text-2xs font-semibold min-w-[1.2rem] text-center relative z-10 transition-premium",
                 activeTab === "nodes"
-                  ? "bg-white text-destructive shadow-lg"
+                  ? "bg-white text-destructive"
                   : "bg-destructive/10 text-destructive",
               )}
             >
@@ -294,7 +292,7 @@ export function DLQViewer() {
           className={cn(
             "flex-1 flex items-center justify-center gap-3 py-4 rounded-2xl text-sm font-semibold transition-premium relative overflow-hidden group",
             activeTab === "webhooks"
-              ? "bg-amber-500 text-black shadow-2xl shadow-amber-500/20"
+              ? "bg-amber-500 text-black shadow-amber-500/20"
               : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
           )}
         >
@@ -305,7 +303,7 @@ export function DLQViewer() {
               className={cn(
                 "px-2 py-0.5 rounded-lg text-2xs font-semibold min-w-[1.2rem] text-center relative z-10 transition-premium",
                 activeTab === "webhooks"
-                  ? "bg-black text-amber-500 shadow-lg"
+                  ? "bg-black text-amber-500"
                   : "bg-amber-500/10 text-amber-500",
               )}
             >
@@ -318,7 +316,7 @@ export function DLQViewer() {
       <div className="space-y-6">
         {activeTab === "nodes" ? (
           pendingNodes.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-32 bg-surface-3/20 border border-dashed border-white/5 rounded-3xl text-center group">
+            <div className="flex flex-col items-center justify-center py-32 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
               <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-premium group-hover:rotate-12 group-hover:text-success/20">
                 <Shield size={40} />
               </div>
@@ -333,10 +331,8 @@ export function DLQViewer() {
             pendingNodes.map((entry) => (
               <div
                 key={entry.id}
-                className="bg-surface-3/30 border border-white/5 rounded-3xl p-8 transition-premium hover:border-white/10 hover:shadow-2xl group relative overflow-hidden"
+                className="bg-surface-3/30 border border-white/5 rounded-2xl p-8 transition-premium hover:border-white/10 group relative overflow-hidden"
               >
-                <div className="absolute inset-0 bg-gradient-to-br from-destructive/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
                 <div className="flex items-start justify-between mb-8 relative z-10">
                   <div className="flex items-center gap-5">
                     <div className="w-12 h-12 rounded-xl bg-destructive/10 border border-destructive/20 flex items-center justify-center text-destructive">
@@ -362,7 +358,7 @@ export function DLQViewer() {
                 </div>
 
                 <div className="mb-8 relative z-10">
-                  <div className="bg-black/60 border border-white/5 rounded-2xl p-6 shadow-inner relative overflow-hidden group/error">
+                  <div className="bg-black/60 border border-white/5 rounded-2xl p-6 relative overflow-hidden group/error">
                     <div className="absolute top-0 right-0 p-3 opacity-20 group-hover/error:opacity-100 transition-premium">
                       <AlertCircle size={14} className="text-destructive" />
                     </div>
@@ -386,7 +382,7 @@ export function DLQViewer() {
                   <button
                     onClick={() => handleNodeReplay(entry.id)}
                     disabled={isReplayingNode}
-                    className="h-12 px-8 bg-destructive text-white rounded-2xl text-sm font-semibold transition-premium active:scale-95 disabled:opacity-50 flex items-center gap-3 shadow-2xl"
+                    className="h-12 px-8 bg-destructive text-white rounded-2xl text-sm font-semibold transition-premium active:scale-95 disabled:opacity-50 flex items-center gap-3"
                   >
                     {isReplayingNode ? (
                       <Loader2 size={14} className="animate-spin" />
@@ -400,7 +396,7 @@ export function DLQViewer() {
             ))
           )
         ) : pendingWebhooks.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-32 bg-surface-3/20 border border-dashed border-white/5 rounded-3xl text-center group">
+          <div className="flex flex-col items-center justify-center py-32 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
             <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-premium group-hover:rotate-12 group-hover:text-amber-500/20">
               <Database size={40} />
             </div>
@@ -415,10 +411,8 @@ export function DLQViewer() {
           pendingWebhooks.map((entry) => (
             <div
               key={entry.id}
-              className="bg-surface-3/30 border border-white/5 rounded-3xl p-8 transition-premium hover:border-white/10 hover:shadow-2xl group relative overflow-hidden"
+              className="bg-surface-3/30 border border-white/5 rounded-2xl p-8 transition-premium hover:border-white/10 group relative overflow-hidden"
             >
-              <div className="absolute inset-0 bg-gradient-to-br from-amber-500/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
               <div className="flex items-start justify-between mb-8 relative z-10">
                 <div className="flex items-center gap-5">
                   <div className="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-500">
@@ -443,7 +437,7 @@ export function DLQViewer() {
 
               {entry.payload && (
                 <div className="mb-8 relative z-10">
-                  <div className="bg-black/60 border border-white/5 rounded-2xl p-6 shadow-inner max-h-40 overflow-y-auto custom-scrollbar group/code">
+                  <div className="bg-black/60 border border-white/5 rounded-2xl p-6 max-h-40 overflow-y-auto custom-scrollbar group/code">
                     <div className="absolute top-3 right-5 opacity-0 group-hover/code:opacity-100 transition-premium">
                       <span className="text-2xs font-semibold text-primary/70 uppercase tracking-wider">
                         Payload
@@ -471,7 +465,7 @@ export function DLQViewer() {
                 <button
                   onClick={() => replayWebhook({ id: entry.id })}
                   disabled={isReplayingWebhook}
-                  className="h-12 px-8 bg-amber-500 text-black rounded-2xl text-sm font-semibold transition-premium active:scale-95 disabled:opacity-50 flex items-center gap-3 shadow-2xl"
+                  className="h-12 px-8 bg-amber-500 text-black rounded-2xl text-sm font-semibold transition-premium active:scale-95 disabled:opacity-50 flex items-center gap-3"
                 >
                   {isReplayingWebhook ? (
                     <Loader2 size={14} className="animate-spin" />
@@ -486,8 +480,7 @@ export function DLQViewer() {
         )}
       </div>
 
-      <div className="flex items-center justify-between px-10 py-8 bg-surface-3/20 border border-white/5 rounded-3xl shadow-2xl relative overflow-hidden group/footer">
-        <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
+      <div className="flex items-center justify-between px-10 py-8 bg-surface-3/20 border border-white/5 rounded-2xl relative overflow-hidden group/footer">
         <div className="flex items-center gap-4 relative z-10">
           <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
           <span className="text-xs text-muted-foreground/70 font-semibold">

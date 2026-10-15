@@ -53,7 +53,7 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
     <div
       ref={menuRef}
       style={{ position: "fixed", top: pos.y, left: pos.x }}
-      className="z-[9999] glass-dark rounded-xl shadow-2xl py-1.5 min-w-[190px] border border-white/10 overflow-hidden
+      className="z-[9999] bg-surface-3 rounded-xl py-1.5 min-w-[190px] border border-white/10 overflow-hidden
        animate-in fade-in zoom-in-95 duration-150 origin-top-left"
       role="menu"
       aria-label="Node context menu"

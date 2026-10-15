@@ -120,7 +120,7 @@ export const NodeBadges: React.FC<NodeBadgesProps> = ({
           className={cn(
             "text-2xs font-bold mt-2 px-1.5 py-0.5 rounded-md inline-flex items-center gap-1 border",
             systemStyle.color,
-            "bg-black/40 border-current/20 backdrop-blur-sm",
+            "bg-black/40 border-current/20",
           )}
         >
           <systemStyle.icon className="w-2.5 h-2.5" />

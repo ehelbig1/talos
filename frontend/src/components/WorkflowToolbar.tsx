@@ -305,7 +305,6 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
             Give this workflow a name.
           </p>
           <div className="relative group">
-            <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
             <Input
               ref={nameInputRef}
               type="text"
@@ -318,7 +317,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
                 if (e.key === "Escape") closeModal();
               }}
               placeholder="Workflow name"
-              className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10 shadow-inner"
+              className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10"
             />
           </div>
           <div className="flex justify-end gap-3 pt-4 relative z-10">
@@ -352,7 +351,6 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
             later.
           </p>
           <div className="relative group">
-            <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
             <Input
               type="text"
               value={modal.kind === "publish" ? modal.desc : ""}
@@ -373,7 +371,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
                 if (e.key === "Escape") closeModal();
               }}
               placeholder="What changed? (optional)"
-              className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10 shadow-inner"
+              className="h-14 bg-surface-2/40 border-white/5 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-sm font-semibold rounded-2xl relative z-10"
             />
           </div>
           <div className="flex justify-end gap-3 pt-4 relative z-10">

@@ -68,7 +68,7 @@ const TerminalRow = React.memo(function TerminalRow({
         {entry.structured ? (
           <div className="inline-block align-top w-full">
             {entry.structured.type === "llm_stream" && (
-              <div className="flex gap-4 items-start bg-primary/5 p-4 rounded-2xl border border-primary/10 shadow-2xl glass-dark optimize-blur">
+              <div className="flex gap-4 items-start bg-primary/5 p-4 rounded-2xl border border-primary/10 bg-surface-3 border border-white/10">
                 <div className="flex flex-col items-center gap-1 shrink-0 mt-1">
                   <Badge
                     variant="outline"
@@ -83,7 +83,7 @@ const TerminalRow = React.memo(function TerminalRow({
               </div>
             )}
             {entry.structured.type === "tool_call" && (
-              <div className="flex flex-col gap-3 bg-warning/5 p-4 rounded-2xl border border-warning/10 shadow-2xl glass-dark optimize-blur">
+              <div className="flex flex-col gap-3 bg-warning/5 p-4 rounded-2xl border border-warning/10 bg-surface-3 border border-white/10">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
                     <Badge
@@ -121,7 +121,7 @@ const TerminalRow = React.memo(function TerminalRow({
               </div>
             )}
             {entry.structured.type === "token_usage" && (
-              <div className="flex items-center gap-4 bg-success/5 px-4 py-2 rounded-full border border-success/10 shadow-lg w-fit mt-1">
+              <div className="flex items-center gap-4 bg-success/5 px-4 py-2 rounded-full border border-success/10 w-fit mt-1">
                 <Cpu className="h-3.5 w-3.5 text-success" />
                 <div className="flex items-center gap-3">
                   <span className="text-success/80 font-semibold text-xs">
@@ -234,10 +234,9 @@ const Terminal = () => {
   if (terminalState === "collapsed") {
     return (
       <div
-        className="h-full flex items-center justify-between px-6 cursor-pointer hover:bg-white/[0.04] transition-premium border-t border-white/5 bg-surface-2/60 backdrop-blur-3xl relative overflow-hidden"
+        className="h-full flex items-center justify-between px-6 cursor-pointer hover:bg-white/[0.04] transition-premium border-t border-white/5 bg-surface-2/60 relative overflow-hidden"
         onClick={() => setTerminalState("compact")}
       >
-        <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
         <div className="flex items-center gap-6 relative z-10">
           <div className="flex items-center gap-3 text-muted-foreground/70">
             <TerminalIcon className="h-4 w-4" />
@@ -273,12 +272,10 @@ const Terminal = () => {
   return (
     <div
       className={cn(
-        "h-full flex flex-col bg-surface-1/80 backdrop-blur-3xl border-t border-white/5 shadow-[0_-20px_50px_rgba(0,0,0,0.5)] transition-premium relative overflow-hidden",
+        "h-full flex flex-col bg-surface-1/80 border-t border-white/5 transition-premium relative overflow-hidden",
         terminalState === "full" ? "rounded-t-3xl" : "",
       )}
     >
-      <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-
       {/* Header */}
       <div className="flex items-center justify-between px-6 py-3 border-b border-white/5 bg-surface-2/40 relative z-10">
         <div className="flex items-center gap-6">
@@ -300,7 +297,7 @@ const Terminal = () => {
                   className={cn(
                     "text-2xs px-4 py-1.5 rounded-lg transition-premium font-semibold uppercase tracking-wider",
                     filter === level
-                      ? "bg-primary text-primary-foreground shadow-lg"
+                      ? "bg-primary text-primary-foreground"
                       : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
                   )}
                 >
@@ -336,7 +333,7 @@ const Terminal = () => {
                   <Trash2 className="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent className="bg-surface-4 border-white/5 text-xs font-semibold text-white shadow-2xl">
+              <TooltipContent className="bg-surface-4 border-white/5 text-xs font-semibold text-white">
                 Clear logs
               </TooltipContent>
             </Tooltip>
@@ -385,7 +382,7 @@ const Terminal = () => {
 
         {filteredLogEntries.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center opacity-10 gap-6 grayscale">
-            <div className="p-8 rounded-3xl bg-surface-3/40 border border-white/5 shadow-2xl">
+            <div className="p-8 rounded-2xl bg-surface-3/40 border border-white/5">
               <TerminalIcon className="h-12 w-12 stroke-[1px]" />
             </div>
             <div className="text-center">

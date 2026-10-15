@@ -116,7 +116,7 @@ export function CompareLane({ lane }: { lane: LaneState }) {
   return (
     <div
       className={cn(
-        "flex flex-col gap-6 rounded-3xl border p-8 transition-premium relative overflow-hidden glass-dark shadow-2xl",
+        "flex flex-col gap-6 rounded-2xl border p-8 transition-premium relative overflow-hidden bg-surface-3 border border-white/10",
         isActive
           ? "border-primary/30 bg-primary/5 ring-1 ring-primary/20"
           : lane.status === "completed"
@@ -126,12 +126,10 @@ export function CompareLane({ lane }: { lane: LaneState }) {
               : "border-white/5 bg-surface-1/40",
       )}
     >
-      <div className="absolute inset-0 bg-gradient-to-b from-white/[0.02] to-transparent pointer-events-none" />
-
       {/* Actor header */}
       <div className="flex items-start justify-between gap-4 relative z-10">
         <div className="flex items-center gap-4 min-w-0">
-          <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center shrink-0 shadow-xl transition-premium">
+          <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center shrink-0 transition-premium">
             <Bot className="w-6 h-6 text-primary" />
           </div>
           <div className="min-w-0">
@@ -175,7 +173,7 @@ export function CompareLane({ lane }: { lane: LaneState }) {
 
         {/* Error */}
         {lane.status === "failed" && lane.errorMessage && (
-          <div className="flex items-start gap-3 bg-destructive/10 border border-destructive/20 rounded-2xl px-5 py-4 shadow-xl animate-in fade-in slide-in-from-top-2">
+          <div className="flex items-start gap-3 bg-destructive/10 border border-destructive/20 rounded-2xl px-5 py-4 animate-in fade-in slide-in-from-top-2">
             <AlertTriangle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
             <p className="text-xs text-destructive/80 font-bold leading-relaxed">
               {lane.errorMessage}
@@ -193,8 +191,7 @@ export function CompareLane({ lane }: { lane: LaneState }) {
               </p>
             </div>
             <div className="relative group">
-              <div className="absolute -inset-px bg-gradient-to-b from-white/10 to-transparent rounded-2xl opacity-0 group-hover:opacity-100 transition-premium" />
-              <pre className="text-xs text-white/80 bg-surface-4/60 border border-white/5 rounded-2xl p-5 overflow-auto max-h-80 whitespace-pre-wrap break-words font-mono leading-relaxed shadow-inner selection:bg-primary/30 shadow-2xl">
+              <pre className="text-xs text-white/80 bg-surface-4/60 border border-white/5 rounded-2xl p-5 overflow-auto max-h-80 whitespace-pre-wrap break-words font-mono leading-relaxed selection:bg-primary/30">
                 {tryPrettyJson(lane.output)}
               </pre>
             </div>
@@ -214,7 +211,7 @@ export function CompareLane({ lane }: { lane: LaneState }) {
             {showLogs && (
               <div
                 ref={logsRef}
-                className="text-xs font-mono text-muted-foreground/70 bg-surface-4/60 border border-white/5 rounded-2xl p-5 max-h-48 overflow-y-auto space-y-1 custom-scrollbar shadow-inner animate-in fade-in zoom-in-95"
+                className="text-xs font-mono text-muted-foreground/70 bg-surface-4/60 border border-white/5 rounded-2xl p-5 max-h-48 overflow-y-auto space-y-1 custom-scrollbar animate-in fade-in zoom-in-95"
               >
                 {lane.logs.map((line, i) => (
                   <div

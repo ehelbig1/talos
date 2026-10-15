@@ -72,8 +72,6 @@ export function IntegrationsManager() {
   return (
     <div className="max-w-6xl mx-auto space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-1000">
       <div className="relative group">
-        <div className="absolute -inset-8 bg-primary/5 rounded-3xl blur-[80px] opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8 relative z-10">
           <div className="space-y-4">
             <div className="flex items-center gap-5">
@@ -209,8 +207,7 @@ export function IntegrationsManager() {
         onConfirm={handleDisconnectService}
       />
 
-      <div className="p-10 bg-surface-3/40 border border-white/5 rounded-3xl flex flex-col md:flex-row items-start md:items-center gap-8 relative overflow-hidden group hover:border-white/10 transition-premium shadow-2xl">
-        <div className="absolute inset-0 bg-gradient-to-r from-warning/5 via-transparent to-transparent opacity-50" />
+      <div className="p-10 bg-surface-3/40 border border-white/5 rounded-2xl flex flex-col md:flex-row items-start md:items-center gap-8 relative overflow-hidden group hover:border-white/10 transition-premium">
         <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning shrink-0 group-hover:rotate-6 transition-premium">
           <HelpCircle size={32} />
         </div>

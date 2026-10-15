@@ -117,7 +117,7 @@ export default function CapabilityCeilingManager() {
 
   if (loading) {
     return (
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl animate-pulse">
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
         <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
         <div className="space-y-4">
           {[1, 2, 3].map((i) => (
@@ -133,7 +133,7 @@ export default function CapabilityCeilingManager() {
 
   if (error) {
     return (
-      <div className="bg-destructive/5 border border-destructive/20 rounded-3xl p-10 text-center">
+      <div className="bg-destructive/5 border border-destructive/20 rounded-2xl p-10 text-center">
         <p className="text-sm text-destructive font-semibold mb-6">{error}</p>
         <button
           onClick={loadData}
@@ -157,9 +157,7 @@ export default function CapabilityCeilingManager() {
   const sortedRanks = [...rankGroups.entries()].sort(([a], [b]) => a - b);
 
   return (
-    <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl relative overflow-hidden group">
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
       {/* Header */}
       <div className="flex items-center justify-between mb-10 relative z-10">
         <div className="flex items-center gap-5">
@@ -193,17 +191,11 @@ export default function CapabilityCeilingManager() {
             tierBorder(currentRank),
           )}
         >
-          <div
-            className={cn(
-              "absolute inset-0 opacity-20 blur-[100px] pointer-events-none",
-              tierBg(currentRank),
-            )}
-          />
           <div className="flex items-center justify-between relative z-10">
             <div className="flex items-center gap-6">
               <div
                 className={cn(
-                  "w-16 h-16 rounded-2xl border-2 flex items-center justify-center shadow-2xl transition-premium",
+                  "w-16 h-16 rounded-2xl border-2 flex items-center justify-center transition-premium",
                   tierBorder(currentRank),
                   tierBg(currentRank),
                 )}
@@ -307,26 +299,12 @@ export default function CapabilityCeilingManager() {
                       className={cn(
                         "flex-1 min-w-[240px] flex items-center gap-4 px-6 py-5 rounded-2xl border transition-premium group/world relative overflow-hidden",
                         isCurrent
-                          ? cn(
-                              "border-2",
-                              tierBg(rank),
-                              tierBorder(rank),
-                              "shadow-xl",
-                            )
+                          ? cn("border-2", tierBg(rank), tierBorder(rank))
                           : isAccessible
                             ? "bg-white/[0.02] border-white/5 hover:border-white/10 hover:bg-white/[0.04]"
                             : "bg-black/20 border-white/[0.02] opacity-30 cursor-not-allowed",
                       )}
                     >
-                      {isCurrent && (
-                        <div
-                          className={cn(
-                            "absolute inset-0 opacity-10 blur-2xl pointer-events-none",
-                            tierBg(rank),
-                          )}
-                        />
-                      )}
-
                       <div className="flex-1 min-w-0 relative z-10">
                         <div className="flex items-center gap-3">
                           <span

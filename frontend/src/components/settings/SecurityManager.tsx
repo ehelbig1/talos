@@ -70,7 +70,7 @@ interface ResultBoxProps {
 
 function ResultBox({ children }: ResultBoxProps) {
   return (
-    <div className="mt-6 flex items-start gap-4 p-5 bg-success/5 border border-success/20 rounded-2xl animate-in fade-in slide-in-from-top-2 duration-500 shadow-inner">
+    <div className="mt-6 flex items-start gap-4 p-5 bg-success/5 border border-success/20 rounded-2xl animate-in fade-in slide-in-from-top-2 duration-500">
       <CheckCircle2 className="w-5 h-5 text-success shrink-0 mt-0.5" />
       <div className="text-xs text-success/80 leading-relaxed">{children}</div>
     </div>
@@ -101,11 +101,9 @@ function RotateDekCard() {
           result && "border-success/20",
         )}
       >
-        <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
         <div className="flex items-start justify-between gap-8 relative z-10">
           <div className="flex items-start gap-6">
-            <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary shrink-0 shadow-2xl transition-premium">
+            <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary shrink-0 transition-premium">
               <KeyRound size={28} />
             </div>
             <div>
@@ -127,7 +125,7 @@ function RotateDekCard() {
             onClick={() => setConfirmOpen(true)}
             disabled={mutation.isPending}
             variant="premium"
-            className="shrink-0 h-14 px-8 rounded-2xl shadow-2xl"
+            className="shrink-0 h-14 px-8 rounded-2xl"
           >
             {mutation.isPending ? (
               <div className="flex items-center gap-3">
@@ -201,11 +199,9 @@ function ReEncryptSecretsCard() {
           result && "border-success/20",
         )}
       >
-        <div className="absolute inset-0 bg-gradient-to-r from-warning/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
         <div className="flex items-start justify-between gap-8 relative z-10">
           <div className="flex items-start gap-6">
-            <div className="w-14 h-14 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning shrink-0 shadow-2xl transition-premium">
+            <div className="w-14 h-14 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning shrink-0 transition-premium">
               <Lock size={28} />
             </div>
             <div>
@@ -226,7 +222,7 @@ function ReEncryptSecretsCard() {
             onClick={() => setConfirmOpen(true)}
             disabled={mutation.isPending}
             variant="premium"
-            className="shrink-0 h-14 px-8 rounded-2xl shadow-2xl"
+            className="shrink-0 h-14 px-8 rounded-2xl"
           >
             {mutation.isPending ? (
               <div className="flex items-center gap-3">
@@ -307,21 +303,14 @@ function RotateMasterKeyCard() {
   return (
     <div
       className={cn(
-        "bg-black/40 border-2 rounded-3xl p-10 overflow-hidden relative transition-premium group",
+        "bg-black/40 border-2 rounded-2xl p-10 overflow-hidden relative transition-premium group",
         result ? "border-success/20" : "border-destructive/20",
       )}
     >
-      <div
-        className={cn(
-          "absolute inset-0 opacity-10 blur-[120px] pointer-events-none",
-          result ? "bg-success/20" : "bg-destructive/20",
-        )}
-      />
-
       <div className="relative z-10 space-y-8">
         {/* Title row */}
         <div className="flex items-start gap-6">
-          <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive shrink-0 shadow-2xl transition-premium">
+          <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive shrink-0 transition-premium">
             <ShieldAlert size={32} />
           </div>
           <div>
@@ -343,7 +332,7 @@ function RotateMasterKeyCard() {
         </div>
 
         {/* Strong warning box */}
-        <div className="flex items-start gap-5 p-6 bg-destructive/[0.04] border border-destructive/20 rounded-2xl shadow-inner">
+        <div className="flex items-start gap-5 p-6 bg-destructive/[0.04] border border-destructive/20 rounded-2xl">
           <AlertTriangle className="w-6 h-6 text-destructive shrink-0 mt-1" />
           <div className="text-xs text-destructive/80 leading-relaxed space-y-2">
             <p className="text-destructive">
@@ -381,7 +370,7 @@ function RotateMasterKeyCard() {
                   setNewMasterKey(e.target.value)
                 }
                 className={cn(
-                  "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-4 focus:ring-destructive/10 transition-premium shadow-inner",
+                  "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-4 focus:ring-destructive/10 transition-premium",
                   newMasterKey.length > 0 &&
                     !isKeyValid &&
                     "border-destructive/40 focus:border-destructive/60",
@@ -423,7 +412,7 @@ function RotateMasterKeyCard() {
                   setConfirmPhrase(e.target.value)
                 }
                 className={cn(
-                  "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner",
+                  "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-4 focus:ring-primary/10 transition-premium",
                   isConfirmed && "border-success/40",
                 )}
               />
@@ -437,7 +426,7 @@ function RotateMasterKeyCard() {
             onClick={handleSubmit}
             disabled={!canSubmit}
             variant="premium"
-            className="h-16 px-12 rounded-2xl shadow-2xl bg-destructive/10 hover:bg-destructive text-destructive hover:text-black border border-destructive/20 transition-premium"
+            className="h-16 px-12 rounded-2xl bg-destructive/10 hover:bg-destructive text-destructive hover:text-black border border-destructive/20 transition-premium"
           >
             {mutation.isPending ? (
               <div className="flex items-center gap-3">
@@ -497,11 +486,9 @@ function RotateEncryptionKeyCard() {
           rotatedCount !== null && "border-success/20",
         )}
       >
-        <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
         <div className="flex items-start justify-between gap-8 relative z-10">
           <div className="flex items-start gap-6">
-            <div className="w-14 h-14 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-muted-foreground shrink-0 shadow-2xl transition-premium">
+            <div className="w-14 h-14 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-muted-foreground shrink-0 transition-premium">
               <RotateCcw size={28} />
             </div>
             <div>
@@ -522,7 +509,7 @@ function RotateEncryptionKeyCard() {
             onClick={() => setConfirmOpen(true)}
             disabled={mutation.isPending}
             variant="premium"
-            className="shrink-0 h-14 px-8 rounded-2xl shadow-2xl bg-white/5 hover:bg-white/10 text-white border border-white/10"
+            className="shrink-0 h-14 px-8 rounded-2xl bg-white/5 hover:bg-white/10 text-white border border-white/10"
           >
             {mutation.isPending ? (
               <div className="flex items-center gap-3">
@@ -573,7 +560,6 @@ export default function SecurityManager() {
       {/* Page header */}
       <div className="flex items-center gap-6">
         <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive relative">
-          <div className="absolute inset-0 bg-destructive/5 rounded-full blur-xl animate-pulse" />
           <ShieldAlert size={32} className="relative z-10" />
         </div>
         <div>
@@ -590,8 +576,7 @@ export default function SecurityManager() {
       </div>
 
       {/* Global warning banner */}
-      <div className="flex items-start gap-5 px-8 py-6 bg-destructive/[0.03] border border-destructive/10 rounded-3xl relative overflow-hidden group">
-        <div className="absolute inset-0 bg-destructive/5 opacity-0 group-hover:opacity-100 transition-premium blur-3xl pointer-events-none" />
+      <div className="flex items-start gap-5 px-8 py-6 bg-destructive/[0.03] border border-destructive/10 rounded-2xl relative overflow-hidden group">
         <AlertTriangle className="w-6 h-6 text-destructive shrink-0 mt-1 relative z-10" />
         <div className="relative z-10">
           <p className="text-sm font-semibold text-white mb-1.5 break-words">
@@ -623,8 +608,7 @@ export default function SecurityManager() {
       </div>
 
       {/* Info footer */}
-      <div className="flex items-start gap-6 p-8 bg-surface-3/40 border border-white/5 rounded-3xl relative overflow-hidden group">
-        <div className="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 transition-premium blur-3xl pointer-events-none" />
+      <div className="flex items-start gap-6 p-8 bg-surface-3/40 border border-white/5 rounded-2xl relative overflow-hidden group">
         <div className="w-14 h-14 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-muted-foreground/70 shrink-0 relative z-10 transition-premium">
           <Info size={28} />
         </div>

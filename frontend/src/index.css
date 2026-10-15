@@ -112,28 +112,10 @@
 }
 
 /* Performance Optimizations */
-@utility gpu {
-  transform: translate3d(0, 0, 0);
-  backface-visibility: hidden;
-  perspective: 1000px;
-  will-change: transform, opacity;
-}
-
-@utility optimize-blur {
-  contain: paint;
-}
-
 @utility transition-premium {
   transition-property: all;
   transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
   transition-duration: 300ms;
-}
-
-@utility glass {
-  backdrop-filter: blur(64px);
-  border-color: hsla(0, 0%, 100%, 0.05);
-  background-color: hsla(0, 0%, 100%, 0.02);
-  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
 }
 
 @utility surface-elevation {
@@ -249,36 +231,6 @@
 }
 
 /* Glassmorphism primitives */
-@utility glass-card {
-  background: hsla(var(--surface-3), 0.6);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid hsla(var(--foreground), 0.08);
-  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
-}
-
-@utility glass-nav {
-  background: hsla(var(--surface-1), 0.8);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border-bottom: 1px solid hsla(var(--foreground), 0.05);
-}
-
-@utility glass-dark {
-  background: hsla(var(--surface-4), 0.85);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  border: 1px solid hsla(var(--foreground), 0.1);
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
-}
-
-@utility glass-light {
-  background: hsla(var(--white), 0.03);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid hsla(var(--white), 0.05);
-}
-
 /* ─── Accessibility: Reduced Motion ─────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -327,13 +279,6 @@
   filter: drop-shadow(0 0 8px hsla(var(--primary), 0.4));
 }
 
-@utility glass-panel {
-  background: hsla(var(--surface-3), 0.4);
-  backdrop-filter: blur(32px);
-  border: 1px solid hsla(var(--foreground), 0.05);
-  box-shadow: 0 10px 40px -10px rgba(0, 0, 0, 0.4);
-}
-
 @utility animate-float {
   animation: float 6s ease-in-out infinite;
 }
@@ -357,14 +302,4 @@
     transparent 75%
   );
   animation: shimmer 1.5s infinite linear;
-}
-
-/* Performance: GPU-optimized glassmorphism */
-.glass-card,
-.glass-nav,
-.glass,
-.glass-panel {
-  contain: paint;
-  will-change: backdrop-filter;
-  transform: translateZ(0); /* Force GPU layer */
 }

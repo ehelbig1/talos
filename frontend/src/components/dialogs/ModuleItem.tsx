@@ -26,15 +26,12 @@ export const ModuleItem: React.FC<Props> = ({ module, selected, onSelect }) => {
           : "bg-surface-4/40 border-white/5 hover:border-white/20 hover:bg-surface-4/60",
       )}
     >
-      {selected && (
-        <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-50 pointer-events-none animate-in fade-in duration-500" />
-      )}
       <div className="flex justify-between items-start">
         <div className="flex-1">
           <div className="flex items-center gap-3">
             <div
               className={cn(
-                "w-5 h-5 rounded-full border flex items-center justify-center transition-premium shadow-inner",
+                "w-5 h-5 rounded-full border flex items-center justify-center transition-premium",
                 selected
                   ? "border-primary bg-primary"
                   : "border-white/10 bg-surface-4",
@@ -93,7 +90,7 @@ export const ModuleItem: React.FC<Props> = ({ module, selected, onSelect }) => {
         <div className="flex flex-col items-end gap-2">
           <Badge
             variant="outline"
-            className="text-2xs font-mono font-bold text-muted-foreground/50 border-white/5 bg-surface-4/60 px-2 py-0.5 flex items-center gap-1.5 rounded-lg shadow-inner group-hover:border-primary/20 transition-premium"
+            className="text-2xs font-mono font-bold text-muted-foreground/50 border-white/5 bg-surface-4/60 px-2 py-0.5 flex items-center gap-1.5 rounded-lg group-hover:border-primary/20 transition-premium"
           >
             <Fingerprint className="w-3 h-3 opacity-40" />
             {module.id.slice(0, 8).toUpperCase()}

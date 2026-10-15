@@ -290,7 +290,7 @@ export default function Dashboard() {
             {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
               <div
                 key={i}
-                className="bg-surface-3/20 border border-white/5 rounded-3xl h-[300px] animate-pulse"
+                className="bg-surface-3/20 border border-white/5 rounded-2xl h-[300px] animate-pulse"
               />
             ))}
           </div>

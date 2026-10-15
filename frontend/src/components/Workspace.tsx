@@ -139,18 +139,6 @@ function Workspace() {
 
   return (
     <div className="flex-1 flex flex-col min-w-0 bg-background relative overflow-hidden h-full">
-      {/* Dynamic Background Glows */}
-      <div className="absolute inset-0 pointer-events-none overflow-hidden select-none z-0">
-        <div
-          className="absolute top-[-10%] left-[-5%] w-[50%] h-[50%] bg-primary/10 blur-[120px] rounded-full mix-blend-screen"
-          style={{ animationDuration: "12s" }}
-        />
-        <div
-          className="absolute bottom-[-10%] right-[-5%] w-[50%] h-[50%] bg-indigo-500/10 blur-[120px] rounded-full mix-blend-screen"
-          style={{ animationDuration: "18s" }}
-        />
-      </div>
-
       <div className="flex flex-1 overflow-hidden relative z-10">
         <div className="flex-1 relative">
           <ReactFlow
@@ -185,13 +173,13 @@ function Workspace() {
             <div className="absolute bottom-8 left-8 z-20">
               <Controls
                 showInteractive={false}
-                className="!m-0 !bg-surface-3/40 !backdrop-blur-2xl !border-white/5 !shadow-2xl !rounded-2xl overflow-hidden [&>button]:!bg-transparent [&>button]:!border-white/10 [&>button]:!text-muted-foreground [&>button:hover]:!text-foreground [&>button:hover]:!bg-white/5 [&>button]:!transition-premium"
+                className="!m-0 !bg-surface-3/40 !backdrop-blur-2xl !border-white/5 !rounded-2xl overflow-hidden [&>button]:!bg-transparent [&>button]:!border-white/10 [&>button]:!text-muted-foreground [&>button:hover]:!text-foreground [&>button:hover]:!bg-white/5 [&>button]:!transition-premium"
               />
             </div>
 
             <Panel position="bottom-right" className="!m-8 z-20">
               <MiniMap
-                className="!bg-surface-3/40 !backdrop-blur-2xl !border-white/5 !rounded-2xl !shadow-2xl overflow-hidden glass"
+                className="!bg-surface-3/40 !backdrop-blur-2xl !border-white/5 !rounded-2xl overflow-hidden"
                 maskColor="hsla(var(--background), 0.8)"
                 nodeColor={(n) => {
                   if (n.data?.category === "control-flow")
@@ -207,11 +195,9 @@ function Workspace() {
 
           {nodeCount === 0 && (
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-30 px-6">
-              <div className="text-center pointer-events-auto bg-surface-3/40 border border-white/10 p-16 rounded-3xl shadow-[0_32px_120px_rgba(0,0,0,0.5)] max-w-xl w-full backdrop-blur-3xl glass relative overflow-hidden group">
-                <div className="absolute inset-0 bg-gradient-to-br from-primary/20 via-transparent to-transparent opacity-50" />
-
+              <div className="text-center pointer-events-auto bg-surface-3/40 border border-white/10 p-16 rounded-2xl max-w-xl w-full relative">
                 <div className="relative z-10">
-                  <div className="w-24 h-24 mx-auto mb-10 rounded-3xl bg-surface-4/60 border border-white/10 flex items-center justify-center shadow-2xl transition-premium duration-700">
+                  <div className="w-24 h-24 mx-auto mb-10 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center shadow-2xl transition-premium duration-700">
                     <Zap className="w-12 h-12 text-primary fill-primary/10" />
                   </div>
 
@@ -250,7 +236,6 @@ function Workspace() {
         <div
           className={cn(
             "border-l border-white/5 bg-surface-1/60 backdrop-blur-3xl transition-premium z-20",
-            showInspector ? "shadow-[-20px_0_60px_rgba(0,0,0,0.3)]" : "",
           )}
           style={{ width: showInspector ? "420px" : "0px" }}
         >
@@ -272,9 +257,6 @@ function Workspace() {
       <div
         className={cn(
           "border-t border-white/5 bg-surface-1/60 backdrop-blur-3xl text-foreground transition-premium z-30",
-          terminalState !== "collapsed"
-            ? "shadow-[0_-20px_60px_rgba(0,0,0,0.3)]"
-            : "",
         )}
         style={{ height: `${terminalHeight}px` }}
       >

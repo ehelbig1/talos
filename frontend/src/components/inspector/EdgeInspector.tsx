@@ -38,9 +38,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
   }, [edge.data?.condition]);
 
   return (
-    <div className="flex flex-col h-full bg-surface-2/80 backdrop-blur-3xl relative border-l border-white/5 shadow-[-20px_0_50px_rgba(0,0,0,0.4)] animate-in slide-in-from-right duration-500">
-      <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent opacity-20 pointer-events-none" />
-
+    <div className="flex flex-col h-full bg-surface-2/80 relative border-l border-white/5 animate-in slide-in-from-right duration-500">
       <div className="flex items-center justify-between px-6 py-4 border-b border-white/5 bg-surface-2/40 relative z-10">
         <div className="flex items-center gap-4">
           <div className="w-10 h-10 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center">
@@ -78,28 +76,24 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
                   label: "Success",
                   icon: CheckCircle2,
                   color: "text-success",
-                  glow: "",
                 },
                 {
                   value: "error",
                   label: "Fault",
                   icon: AlertCircle,
                   color: "text-destructive",
-                  glow: "",
                 },
                 {
                   value: "conditional",
                   label: "Router",
                   icon: GitBranch,
                   color: "text-primary",
-                  glow: "",
                 },
                 {
                   value: "OnFailure",
                   label: "Fail-Safe",
                   icon: ShieldAlert,
                   color: "text-warning",
-                  glow: "",
                 },
               ].map((type) => (
                 <button
@@ -113,7 +107,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
                   className={cn(
                     "flex items-center gap-3 p-4 rounded-2xl border text-left transition-premium group relative overflow-hidden",
                     edge.data?.edgeType === type.value
-                      ? `bg-white/[0.03] border-white/20 ${type.glow} shadow-2xl`
+                      ? "bg-white/[0.03] border-white/20"
                       : "bg-surface-3/20 border-white/5 hover:bg-white/[0.03] hover:border-white/10",
                   )}
                 >
@@ -144,7 +138,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
           </div>
 
           {edge.data?.edgeType === "conditional" && (
-            <div className="p-6 bg-primary/5 border border-primary/10 rounded-2xl space-y-5 shadow-2xl glass-dark optimize-blur">
+            <div className="p-6 bg-primary/5 border border-primary/10 rounded-2xl space-y-5 bg-surface-3 border border-white/10">
               <h4 className="text-xs font-semibold text-white flex items-center gap-3 font-outfit">
                 <div className="p-2 rounded-xl bg-primary/10 border border-primary/20">
                   <Sparkles className="w-4 h-4 text-primary" />
@@ -180,8 +174,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
             <label className="text-xs text-muted-foreground/70 font-semibold ml-1">
               Data Mapping Architecture
             </label>
-            <div className="bg-surface-4/20 p-6 rounded-2xl border border-white/5 shadow-2xl relative overflow-hidden">
-              <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-30 pointer-events-none" />
+            <div className="bg-surface-4/20 p-6 rounded-2xl border border-white/5 relative overflow-hidden">
               <Textarea
                 placeholder="ctx.input.query = ctx.result.original_query"
                 className="bg-transparent border-0 focus:ring-0 p-0 font-mono text-xs min-h-[80px] selection:bg-primary/30 leading-relaxed text-white/80"

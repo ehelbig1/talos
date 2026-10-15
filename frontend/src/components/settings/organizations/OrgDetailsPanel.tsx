@@ -43,12 +43,10 @@ export function OrgDetailsPanel({
 }): React.ReactElement {
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-right-4 duration-700">
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl relative overflow-hidden group">
-        <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
-
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-10 relative z-10">
           <div className="flex items-center gap-6">
-            <div className="w-16 h-16 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-3xl font-semibold font-outfit text-white shadow-2xl">
+            <div className="w-16 h-16 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-3xl font-semibold font-outfit text-white">
               {selectedOrg?.name.charAt(0).toUpperCase()}
             </div>
             <div>
@@ -155,7 +153,7 @@ export function OrgDetailsPanel({
 /** Placeholder shown when no organization is selected. */
 export function NoOrgSelected(): React.ReactElement {
   return (
-    <div className="h-full flex flex-col items-center justify-center p-12 border border-dashed border-white/5 rounded-3xl bg-white/[0.01]">
+    <div className="h-full flex flex-col items-center justify-center p-12 border border-dashed border-white/5 rounded-2xl bg-white/[0.01]">
       <div className="w-16 h-16 bg-white/5 rounded-2xl flex items-center justify-center mb-6 border border-white/10">
         <Building2 className="w-8 h-8 text-muted-foreground/70" />
       </div>

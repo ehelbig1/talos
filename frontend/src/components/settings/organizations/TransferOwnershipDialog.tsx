@@ -36,8 +36,7 @@ export function TransferOwnershipDialog({
   return (
     <Dialog open={open} onClose={onClose} title="Transfer ownership">
       <div className="space-y-8">
-        <div className="p-6 bg-destructive/10 border border-destructive/20 rounded-3xl flex items-start gap-5 relative overflow-hidden group">
-          <div className="absolute inset-0 bg-destructive/5 blur-3xl animate-pulse opacity-20" />
+        <div className="p-6 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-start gap-5 relative overflow-hidden group">
           <AlertTriangle className="w-6 h-6 text-destructive shrink-0 mt-0.5 relative z-10" />
           <div className="space-y-2 relative z-10">
             <p className="text-xs font-semibold text-destructive">
@@ -100,7 +99,7 @@ export function TransferOwnershipDialog({
             Cancel
           </Button>
           <Button
-            className="flex-1 h-14 rounded-xl bg-destructive hover:bg-destructive/90 text-white font-semibold text-sm shadow-2xl"
+            className="flex-1 h-14 rounded-xl bg-destructive hover:bg-destructive/90 text-white font-semibold text-sm"
             disabled={!newOwnerId.trim() || !isTransferConfirmed || isPending}
             onClick={onSubmit}
           >

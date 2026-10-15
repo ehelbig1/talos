@@ -107,7 +107,7 @@ export function OAuthCallback() {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-[#0F1117]">
-      <div className="bg-surface-3/60 border border-white/5 rounded-xl p-12 w-full max-w-md shadow-2xl text-center">
+      <div className="bg-surface-3/60 border border-white/5 rounded-xl p-12 w-full max-w-md text-center">
         {status === "loading" && (
           <>
             <div className="animate-spin w-14 h-14 mx-auto mb-6 rounded-full border-4 border-white/10 border-t-violet-500" />

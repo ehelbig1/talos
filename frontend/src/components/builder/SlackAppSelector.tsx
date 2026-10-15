@@ -169,9 +169,7 @@ export function SlackAppSelector({
   }
 
   return (
-    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-3xl space-y-8 shadow-2xl">
-      <div className="absolute inset-0 bg-gradient-to-br from-[#4A154B]/5 via-transparent to-transparent opacity-50 pointer-events-none" />
-
+    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-2xl space-y-8">
       {showCreator && (
         <SlackAppCreator
           webhookUrl={(currentConfig?.WEBHOOK_URL as string) || ""}
@@ -254,7 +252,7 @@ export function SlackAppSelector({
           <Button
             onClick={handleConnect}
             disabled={connecting}
-            className="h-11 px-8 bg-[#4A154B] hover:bg-[#4A154B]/90 text-white text-sm font-semibold rounded-xl shadow-xl shadow-[#4A154B]/20 active:scale-95 transition-premium"
+            className="h-11 px-8 bg-[#4A154B] hover:bg-[#4A154B]/90 text-white text-sm font-semibold rounded-xl active:scale-95 transition-premium"
           >
             {connecting ? (
               <div className="flex items-center gap-3">
@@ -283,7 +281,7 @@ export function SlackAppSelector({
                   className={cn(
                     "group relative p-4 text-left rounded-2xl border transition-premium hover:scale-[1.01] active:scale-[0.98] overflow-hidden",
                     isSelected
-                      ? "bg-[#4A154B]/10 border-[#4A154B] shadow-[0_0_20px_rgba(74,21,75,0.1)]"
+                      ? "bg-[#4A154B]/10 border-[#4A154B]"
                       : "bg-surface-3 border-white/5 hover:bg-surface-4 hover:border-white/20",
                   )}
                 >

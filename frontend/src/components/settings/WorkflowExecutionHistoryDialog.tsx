@@ -198,7 +198,7 @@ export default function WorkflowExecutionHistoryDialog({
           </button>
         </div>
 
-        <div className="max-h-[520px] overflow-y-auto custom-scrollbar border border-white/5 rounded-2xl bg-surface-4/20 shadow-inner">
+        <div className="max-h-[520px] overflow-y-auto custom-scrollbar border border-white/5 rounded-2xl bg-surface-4/20">
           {isLoading ? (
             <div className="p-20 flex flex-col items-center justify-center gap-4">
               <LoadingSpinner className="w-8 h-8 text-primary" />
@@ -340,7 +340,7 @@ export default function WorkflowExecutionHistoryDialog({
                               colSpan={5}
                               className="px-6 pb-4 bg-destructive/[0.02]"
                             >
-                              <div className="flex items-start gap-2.5 px-6 py-4 bg-destructive/5 border border-destructive/15 rounded-2xl shadow-inner">
+                              <div className="flex items-start gap-2.5 px-6 py-4 bg-destructive/5 border border-destructive/15 rounded-2xl">
                                 <AlertCircle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
                                 <pre className="text-xs text-destructive/80 font-mono whitespace-pre-wrap break-all leading-relaxed font-bold">
                                   {sanitizeErrorMessage(
@@ -389,7 +389,7 @@ export default function WorkflowExecutionHistoryDialog({
           <div className="p-2 text-center space-y-6">
             <div
               className={cn(
-                "w-16 h-16 rounded-2xl flex items-center justify-center mx-auto shadow-2xl border",
+                "w-16 h-16 rounded-2xl flex items-center justify-center mx-auto border",
                 confirmAction.type === "retry"
                   ? "bg-primary/10 border-primary/20 text-primary"
                   : "bg-warning/10 border-warning/20 text-warning",
@@ -420,7 +420,7 @@ export default function WorkflowExecutionHistoryDialog({
                 onClick={handleConfirm}
                 disabled={actionPending}
                 className={cn(
-                  "flex-1 text-sm font-semibold h-12 rounded-2xl transition-premium shadow-2xl border border-white/10",
+                  "flex-1 text-sm font-semibold h-12 rounded-2xl transition-premium border border-white/10",
                   confirmAction.type === "retry"
                     ? "bg-primary hover:bg-primary/90"
                     : "bg-warning hover:bg-warning/90 text-background",

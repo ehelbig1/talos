@@ -112,7 +112,7 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
           {ev.logMessage && (
             <div className="mt-4 relative group/logbox">
               <div className="absolute -inset-0.5 bg-primary/5 rounded-2xl opacity-0 group-hover/logbox:opacity-100 transition-premium pointer-events-none" />
-              <div className="relative bg-surface-4/40 rounded-2xl p-5 border border-white/5 shadow-2xl glass-dark optimize-blur transition-premium group-hover:border-white/10 group-hover:bg-surface-4/60">
+              <div className="relative bg-surface-4/40 rounded-2xl p-5 border border-white/5 bg-surface-3 border border-white/10 transition-premium group-hover:border-white/10 group-hover:bg-surface-4/60">
                 <p className="text-xs leading-relaxed text-muted-foreground group-hover:text-white/80 transition-colors font-mono break-words selection:bg-primary/30">
                   {ev.logMessage}
                 </p>

@@ -19,7 +19,7 @@ export function NewKeyDialog({
   return (
     <Dialog open={true} onClose={onClose}>
       <div
-        className="bg-surface-3/90 border border-amber-500/20 shadow-[0_0_100px_rgba(245,158,11,0.1)] rounded-2xl overflow-hidden w-[520px] animate-in zoom-in-95 duration-300"
+        className="bg-surface-3/90 border border-amber-500/20 rounded-2xl overflow-hidden w-[520px] animate-in zoom-in-95 duration-300"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-8 py-6 border-b border-amber-500/10 flex items-center justify-between bg-amber-500/[0.03]">
@@ -54,7 +54,7 @@ export function NewKeyDialog({
               <div className="absolute top-3 left-4 text-2xs font-bold uppercase tracking-wider text-muted-foreground pointer-events-none">
                 Talos Secret Credential
               </div>
-              <pre className="bg-black border border-white/5 text-amber-500 p-6 pt-10 rounded-xl text-[14px] font-mono break-all whitespace-pre-wrap leading-relaxed shadow-inner">
+              <pre className="bg-black border border-white/5 text-amber-500 p-6 pt-10 rounded-xl text-[14px] font-mono break-all whitespace-pre-wrap leading-relaxed">
                 {newKey}
               </pre>
               <Button

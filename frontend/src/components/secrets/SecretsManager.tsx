@@ -164,10 +164,8 @@ function SecretsManager() {
 
       {/* Edit secret value dialog */}
       {secretToEdit && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-300">
-          <div className="bg-surface-3/60 border border-white/5 rounded-3xl p-10 w-full max-w-lg shadow-[0_0_100px_rgba(0,0,0,0.5)] glass relative overflow-hidden group">
-            <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
-
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 animate-in fade-in duration-300">
+          <div className="bg-surface-3/60 border border-white/5 rounded-2xl p-10 w-full max-w-lg relative overflow-hidden group">
             <div className="flex items-center justify-between mb-8 relative z-10">
               <div className="flex items-center gap-5">
                 <div className="w-12 h-12 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
@@ -200,7 +198,6 @@ function SecretsManager() {
                   New value
                 </label>
                 <div className="relative group/input">
-                  <div className="absolute -inset-0.5 bg-primary/10 rounded-2xl blur opacity-0 group-hover/input:opacity-100 transition-premium" />
                   <input
                     type="password"
                     autoFocus
@@ -214,7 +211,7 @@ function SecretsManager() {
 
               <div className="flex gap-4">
                 <button
-                  className="flex-1 bg-primary text-black font-semibold py-4 rounded-2xl text-sm transition-premium active:scale-95 shadow-2xl disabled:opacity-50 disabled:grayscale"
+                  className="flex-1 bg-primary text-black font-semibold py-4 rounded-2xl text-sm transition-premium active:scale-95 disabled:opacity-50 disabled:grayscale"
                   disabled={!editValue.trim() || updateSecretMutation.isPending}
                   onClick={() =>
                     updateSecretMutation.mutate({
@@ -243,8 +240,6 @@ function SecretsManager() {
       )}
 
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8 relative group">
-        <div className="absolute -inset-8 bg-primary/5 rounded-3xl blur-[80px] opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-
         <div className="flex items-center gap-6 relative z-10">
           <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-premium">
             <Key className="w-8 h-8 text-primary" />
@@ -269,9 +264,7 @@ function SecretsManager() {
         </button>
       </div>
 
-      <div className="bg-surface-3/30 border border-white/5 rounded-3xl shadow-2xl overflow-hidden min-h-[500px] glass relative group/registry">
-        <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-20 pointer-events-none" />
-
+      <div className="bg-surface-3/30 border border-white/5 rounded-2xl overflow-hidden min-h-[500px] relative group/registry">
         {isLoading ? (
           <div className="flex flex-col items-center justify-center py-48 gap-6">
             <div className="relative">
@@ -348,8 +341,7 @@ function SecretsManager() {
                     <td className="px-10 py-8">
                       <div className="flex items-center gap-4 group/reveal">
                         <div className="relative group/code">
-                          <div className="absolute -inset-2 bg-primary/10 rounded-xl blur opacity-0 group-hover/code:opacity-100 transition-premium" />
-                          <code className="relative px-4 py-2 bg-black/40 border border-white/5 rounded-xl text-xs font-mono text-primary/80 shadow-inner block min-w-[140px] text-center">
+                          <code className="relative px-4 py-2 bg-black/40 border border-white/5 rounded-xl text-xs font-mono text-primary/80 block min-w-[140px] text-center">
                             {revealedSecretId === secret.id
                               ? secret.keyPath
                               : "••••••••••••"}
@@ -449,13 +441,11 @@ function SecretsManager() {
       </div>
 
       {/* Advanced Security Section */}
-      <div className="bg-amber-500/5 border border-amber-500/20 rounded-3xl p-12 shadow-2xl backdrop-blur-xl group relative overflow-hidden transition-premium hover:border-amber-500/40">
-        <div className="absolute top-0 right-0 w-96 h-96 bg-amber-500/10 rounded-full blur-[120px] -mr-48 -mt-48 pointer-events-none group-hover:bg-amber-500/20 transition-premium duration-1000" />
-
+      <div className="bg-amber-500/5 border border-amber-500/20 rounded-2xl p-12 group relative overflow-hidden transition-premium hover:border-amber-500/40">
         <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-12 relative z-10">
           <div className="flex-1 space-y-6">
             <div className="flex items-center gap-6">
-              <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center shadow-inner group-hover:rotate-6 transition-premium duration-500">
+              <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center group-hover:rotate-6 transition-premium duration-500">
                 <ShieldCheck className="w-8 h-8 text-amber-500" />
               </div>
               <div className="flex flex-col">
@@ -487,7 +477,7 @@ function SecretsManager() {
           </div>
 
           <button
-            className="bg-amber-500 text-black font-semibold text-sm px-12 h-20 rounded-2xl transition-premium active:scale-95 flex items-center gap-4 shadow-2xl shadow-amber-500/20 group/rotate relative overflow-hidden shrink-0"
+            className="bg-amber-500 text-black font-semibold text-sm px-12 h-20 rounded-2xl transition-premium active:scale-95 flex items-center gap-4 shadow-amber-500/20 group/rotate relative overflow-hidden shrink-0"
             onClick={() => {
               setConfirmRotateKey(true);
             }}
