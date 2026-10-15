@@ -206,7 +206,7 @@ const ExecutionItem = React.memo(
             <div className="flex items-center gap-3 mb-1">
               <StatusPill status={exec.status} />
               {(exec.retryCount ?? 0) > 0 && (
-                <span className="text-2xs font-semibold uppercase tracking-wider text-warning px-2 py-0.5 rounded-lg bg-warning/5 border border-warning/10">
+                <span className="text-xs font-medium text-warning px-2 py-0.5 rounded-lg bg-warning/5 border border-warning/10">
                   Retries: {exec.retryCount}
                 </span>
               )}
@@ -387,7 +387,7 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
               Run history
             </h4>
             <div className="flex items-center gap-3">
-              <span className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
+              <span className="text-xs font-medium text-muted-foreground/50">
                 {hasRunning ? "A run is in progress…" : "Past runs"}
               </span>
               {hasRunning && (

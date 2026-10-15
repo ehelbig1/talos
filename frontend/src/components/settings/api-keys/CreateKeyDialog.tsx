@@ -154,7 +154,7 @@ export function CreateKeyDialog({
                   <div className="flex items-center justify-between w-full mb-1.5">
                     <span
                       className={cn(
-                        "text-2xs font-bold uppercase tracking-wider",
+                        "text-xs font-medium",
                         selectedScopes.includes(s.value)
                           ? "text-indigo-400"
                           : "text-muted-foreground",

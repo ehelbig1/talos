@@ -48,7 +48,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
             <h3 className="text-sm font-semibold text-white tracking-tight font-outfit">
               Edge
             </h3>
-            <p className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
+            <p className="text-xs text-muted-foreground/70 font-medium">
               How data flows between these nodes
             </p>
           </div>

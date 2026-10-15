@@ -39,7 +39,7 @@ export function MemberRow({
               </span>
             )}
           </div>
-          <div className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+          <div className="text-xs text-muted-foreground/60 font-medium">
             Joined {formatDate(member.joinedAt)} &bull; ID:{" "}
             {member.userId.slice(0, 8)}
           </div>

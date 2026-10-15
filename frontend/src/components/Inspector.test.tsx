@@ -29,7 +29,7 @@ describe("Inspector Component", () => {
 
     render(<Inspector />);
 
-    expect(screen.getByText("Workflow Registry")).toBeInTheDocument();
+    expect(screen.getByText("Workflow")).toBeInTheDocument();
     expect(screen.getByText("My Awesome Workflow")).toBeInTheDocument();
     // Workflow ID is surfaced via the "Workflow ID" copy field.
     expect(screen.getByText("Workflow ID")).toBeInTheDocument();

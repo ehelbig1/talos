@@ -201,7 +201,7 @@ export function renderField(
               })}
             </div>
             <Collapsible>
-              <CollapsibleTrigger className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider hover:text-white transition-ui ml-1">
+              <CollapsibleTrigger className="text-xs font-medium text-muted-foreground/50 hover:text-white transition-ui ml-1">
                 Edit as JSON
               </CollapsibleTrigger>
               <CollapsibleContent className="mt-3">

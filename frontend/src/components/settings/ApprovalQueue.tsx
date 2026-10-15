@@ -112,7 +112,7 @@ export function ApprovalQueue() {
             {activeTab === "pending" ? pending.length : decided.length}
           </span>
           <span className="text-2xs text-warning font-semibold uppercase tracking-wider mt-1">
-            {activeTab === "pending" ? "Active Requests" : "Recent Decisions"}
+            {activeTab === "pending" ? "Waiting" : "Decided"}
           </span>
         </div>
       </div>
@@ -177,7 +177,7 @@ export function ApprovalQueue() {
                       Run {approval.executionId.slice(0, 12)}
                     </span>
                   </div>
-                  <div className="flex items-center gap-2 text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground/70 font-medium">
                     <Clock className="w-3.5 h-3.5 opacity-40" />
                     {new Date(approval.requestedAt).toLocaleString()}
                   </div>
@@ -272,14 +272,14 @@ export function ApprovalQueue() {
                 )}
 
                 <div className="flex items-center gap-6 pt-4 border-t border-white/5">
-                  <div className="flex items-center gap-2 text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground/70 font-medium">
                     <User className="w-3.5 h-3.5 opacity-30" />
                     Decided by{" "}
                     {approval.decidedBy
                       ? approval.decidedBy.slice(0, 8)
                       : "the system"}
                   </div>
-                  <button className="flex items-center gap-2 text-2xs text-primary/70 hover:text-primary font-semibold uppercase tracking-wider transition-ui ml-auto">
+                  <button className="flex items-center gap-2 text-xs text-primary/70 hover:text-primary font-medium transition-ui ml-auto">
                     <ExternalLink className="w-3.5 h-3.5" />
                     View audit log
                   </button>
@@ -293,7 +293,7 @@ export function ApprovalQueue() {
       <div className="mt-10 pt-6 border-t border-white/5 flex items-center justify-between relative z-10">
         <div className="flex items-center gap-3">
           <Zap className="w-4 h-4 text-warning opacity-30" />
-          <p className="text-2xs text-muted-foreground/50 font-semibold uppercase tracking-wider">
+          <p className="text-xs text-muted-foreground/50 font-medium">
             Approvals are checked in real time
           </p>
         </div>

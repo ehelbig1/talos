@@ -176,7 +176,7 @@ export function GoogleCalendarSelector({
             <h4 className="text-xs font-semibold text-white">
               Google Calendar
             </h4>
-            <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
+            <p className="text-xs font-medium text-muted-foreground/50">
               Watch calendars for changes
             </p>
           </div>
@@ -222,7 +222,7 @@ export function GoogleCalendarSelector({
             <div className="flex items-center gap-2 px-1">
               <Shield className="w-3.5 h-3.5 text-primary/60" />
               <p className="m-0 text-2xs font-semibold text-white/70 uppercase tracking-wider">
-                PHASE 1: AUTHENTICATION TUNNEL
+                Step 1: connect Google
               </p>
             </div>
             <div className="grid gap-3">
@@ -263,7 +263,7 @@ export function GoogleCalendarSelector({
                         >
                           {integration.email || "Google account"}
                         </span>
-                        <span className="block text-2xs font-semibold text-muted-foreground/50 uppercase tracking-tighter mt-0.5">
+                        <span className="block text-xs font-medium text-muted-foreground/50 mt-0.5">
                           Established:{" "}
                           {new Date(
                             integration.created_at,
@@ -293,8 +293,8 @@ export function GoogleCalendarSelector({
               {loadingCalendars ? (
                 <div className="p-10 flex flex-col items-center justify-center gap-4 bg-surface-3 border border-white/5 rounded-2xl">
                   <Loader2 className="h-8 w-8 animate-spin text-primary" />
-                  <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
-                    Deciphering Calendars...
+                  <p className="text-xs font-medium text-muted-foreground/50">
+                    Loading calendars…
                   </p>
                 </div>
               ) : calendars.length === 0 ? (

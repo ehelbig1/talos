@@ -51,9 +51,9 @@ export function SuggestionsBanner({
         {!showSuggestions ? (
           <button
             onClick={onShow}
-            className="text-2xs font-semibold text-primary uppercase tracking-wider hover:text-white transition-ui"
+            className="text-xs font-medium text-primary hover:text-white transition-ui"
           >
-            Review Analysis
+            Review
           </button>
         ) : (
           <button
@@ -79,7 +79,7 @@ export function SuggestionsBanner({
                       {JSON.stringify(s.value)}
                     </code>
                   </p>
-                  <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/50">
+                  <p className="text-xs font-medium text-muted-foreground/50">
                     Reason: {s.reason}
                   </p>
                 </div>

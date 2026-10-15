@@ -255,8 +255,8 @@ export default function ExecutionPanel() {
           {executionId && (
             <div className="px-6 py-2 bg-white/5 border-b border-white/5 flex items-center justify-between">
               <div className="flex items-center gap-4">
-                <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60">
-                  Active Session
+                <span className="text-xs font-medium text-muted-foreground/60">
+                  Run
                 </span>
                 <div className="flex items-center gap-2 group">
                   <code className="text-xs text-primary font-mono bg-primary/10 px-2 py-1 rounded-lg border border-primary/20">
@@ -319,7 +319,7 @@ export default function ExecutionPanel() {
                   key={mode}
                   onClick={() => setViewMode(mode)}
                   className={cn(
-                    "px-4 py-1.5 text-2xs font-semibold uppercase tracking-wider rounded-lg transition-ui",
+                    "px-4 py-1.5 text-xs font-medium rounded-lg transition-ui",
                     viewMode === mode
                       ? "bg-primary text-primary-foreground"
                       : "text-muted-foreground/70 hover:text-white",

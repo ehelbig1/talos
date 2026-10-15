@@ -71,7 +71,7 @@ export const ModuleItem: React.FC<Props> = ({ module, selected, onSelect }) => {
                 );
               })()}
 
-            <div className="flex items-center gap-5 text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60">
+            <div className="flex items-center gap-5 text-xs font-medium text-muted-foreground/60">
               <div className="flex items-center gap-2 group/meta">
                 <HardDrive className="h-3.5 w-3.5 opacity-40 group-hover/meta:text-primary transition-ui" />
                 <span className="group-hover/meta:text-muted-foreground/60 transition-ui">

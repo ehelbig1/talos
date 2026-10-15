@@ -79,7 +79,7 @@ export function LlmConfigSection({
       <div className="space-y-6 relative z-10">
         <div className="grid grid-cols-1 gap-6">
           <div className="space-y-3">
-            <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+            <label className="text-xs text-muted-foreground/60 font-medium ml-1">
               Provider
             </label>
             <div className="relative">
@@ -101,8 +101,8 @@ export function LlmConfigSection({
           </div>
 
           <div className="space-y-3">
-            <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-              Model Parameter
+            <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+              Model
             </label>
             <div className="relative">
               <select
@@ -137,7 +137,7 @@ export function LlmConfigSection({
 
         <div className="flex gap-6">
           <div className="flex-1 space-y-3">
-            <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+            <label className="text-xs text-muted-foreground/60 font-medium ml-1">
               Temperature
             </label>
             <input
@@ -161,8 +161,8 @@ export function LlmConfigSection({
             />
           </div>
           <div className="flex-1 space-y-3">
-            <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-              Capacitance
+            <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+              Maximum tokens
             </label>
             <input
               type="number"
@@ -185,7 +185,7 @@ export function LlmConfigSection({
         </div>
 
         <div className="space-y-3">
-          <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+          <label className="text-xs text-muted-foreground/60 font-medium ml-1">
             System prompt
           </label>
           <div className="relative group/directive">
@@ -223,7 +223,7 @@ export function RetryPolicySection({
     <div className="space-y-8">
       <div className="grid grid-cols-2 gap-6">
         <div className="space-y-3">
-          <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+          <label className="text-xs text-muted-foreground/60 font-medium ml-1">
             Threshold
           </label>
           <input
@@ -249,7 +249,7 @@ export function RetryPolicySection({
         </div>
 
         <div className="space-y-3">
-          <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+          <label className="text-xs text-muted-foreground/60 font-medium ml-1">
             Backoff (ms)
           </label>
           <input
@@ -271,8 +271,8 @@ export function RetryPolicySection({
       </div>
 
       <div className="space-y-4">
-        <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-          Condition Logic (Rhai)
+        <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+          Condition (Rhai)
         </label>
         <div className="relative group/logic">
           <textarea
@@ -343,7 +343,7 @@ export function SystemInternalsSection({
   return (
     <div className="space-y-8 py-4">
       <div className="space-y-4">
-        <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1 flex items-center gap-2">
+        <label className="text-xs text-muted-foreground/60 font-medium ml-1 flex items-center gap-2">
           <Activity size={12} className="text-primary/70" />
           Identifiers
         </label>

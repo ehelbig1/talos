@@ -85,13 +85,13 @@ function TriggersSection({ workflowId }: { workflowId: string | null }) {
               <p className="text-xs text-white font-semibold font-outfit">
                 {t.label}
               </p>
-              <p className="text-2xs text-muted-foreground/70 font-bold uppercase tracking-tight">
+              <p className="text-xs text-muted-foreground/70 font-medium">
                 {t.desc}
               </p>
             </div>
             {t.onClick && (
-              <span className="text-2xs text-primary font-semibold uppercase tracking-wider opacity-0 group-hover:opacity-100 transition-ui">
-                CONFIGURE →
+              <span className="text-xs text-primary font-medium opacity-0 group-hover:opacity-100 transition-ui">
+                Configure
               </span>
             )}
           </button>
@@ -199,10 +199,10 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
           </div>
           <div>
             <h3 className="text-lg font-semibold text-white tracking-tight font-outfit">
-              Workflow Registry
+              Workflow
             </h3>
-            <p className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider mt-1">
-              Global Configuration Hub
+            <p className="text-xs text-muted-foreground/70 font-medium mt-1">
+              Name, description, actor and limits
             </p>
           </div>
         </div>

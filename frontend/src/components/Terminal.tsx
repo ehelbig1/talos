@@ -247,7 +247,7 @@ const Terminal = () => {
               <div className="flex items-center gap-2 px-2.5 py-0.5 bg-destructive/10 border border-destructive/20 rounded-full">
                 <div className="w-1.5 h-1.5 rounded-full bg-destructive" />
                 <span className="text-2xs font-semibold text-destructive uppercase tracking-wider">
-                  {errorCount} FAULTS
+                  {errorCount} errors
                 </span>
               </div>
             )}
@@ -255,7 +255,7 @@ const Terminal = () => {
               <div className="flex items-center gap-2 px-2.5 py-0.5 bg-warning/10 border border-warning/20 rounded-full">
                 <div className="w-1.5 h-1.5 rounded-full bg-warning" />
                 <span className="text-2xs font-semibold text-warning uppercase tracking-wider">
-                  {warningCount} ALERTS
+                  {warningCount} warnings
                 </span>
               </div>
             )}
@@ -295,7 +295,7 @@ const Terminal = () => {
                   key={level}
                   onClick={() => setFilter(level)}
                   className={cn(
-                    "text-2xs px-4 py-1.5 rounded-lg transition-ui font-semibold uppercase tracking-wider",
+                    "text-xs px-4 py-1.5 rounded-lg transition-ui font-medium",
                     filter === level
                       ? "bg-primary text-primary-foreground"
                       : "text-muted-foreground/70 hover:text-white hover:bg-white/5",

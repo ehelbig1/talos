@@ -78,12 +78,12 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
             <div className="flex items-center gap-2">
               {ev.retryAttempt != null && ev.retryAttempt > 0 && (
                 <Badge className="bg-warning/5 text-warning/80 text-2xs font-semibold h-4 px-2 border-warning/20 rounded-md tracking-wider uppercase">
-                  RETRY_{ev.retryAttempt}
+                  Retry {ev.retryAttempt}
                 </Badge>
               )}
               {ev.iterationIndex != null && (
                 <Badge className="bg-primary/5 text-primary/80 text-2xs font-semibold h-4 px-2 border-primary/20 rounded-md tracking-wider uppercase">
-                  ITER_{ev.iterationIndex + 1}
+                  Loop {ev.iterationIndex + 1}
                   {ev.iterationTotal ? `/${ev.iterationTotal}` : ""}
                 </Badge>
               )}
@@ -101,7 +101,7 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
                   href={`${import.meta.env.VITE_JAEGER_URL}${ev.traceId}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/50 hover:text-primary flex items-center gap-2 ml-auto transition-ui group/link"
+                  className="text-xs font-medium text-muted-foreground/50 hover:text-primary flex items-center gap-2 ml-auto transition-ui group/link"
                 >
                   <ExternalLink className="h-3 w-3 transition-transform" />
                   Open trace

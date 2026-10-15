@@ -325,7 +325,7 @@ export function ModuleBuilder({
                         </h3>
                       </div>
                       <Badge className="bg-indigo-500/10 text-indigo-400 border-indigo-500/20 text-2xs font-semibold px-2 py-1 uppercase tracking-wider">
-                        External Ingress
+                        Receives webhooks
                       </Badge>
                     </div>
 
@@ -349,8 +349,8 @@ export function ModuleBuilder({
                             max="1000"
                             className="h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-sm font-semibold rounded-2xl"
                           />
-                          <span className="absolute right-5 top-1/2 -translate-y-1/2 text-2xs font-semibold text-muted-foreground/50 uppercase tracking-tighter">
-                            RPM
+                          <span className="absolute right-5 top-1/2 -translate-y-1/2 text-xs font-medium text-muted-foreground/50">
+                            requests/min
                           </span>
                         </div>
                         <p className="text-2xs text-muted-foreground/50 px-2 leading-relaxed">

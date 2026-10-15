@@ -194,7 +194,7 @@ function SecretsManager() {
 
             <div className="space-y-8 relative z-10">
               <div className="space-y-3">
-                <label className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60 ml-1">
+                <label className="text-xs font-medium text-muted-foreground/60 ml-1">
                   New value
                 </label>
                 <div className="relative group/input">
@@ -357,12 +357,12 @@ function SecretsManager() {
                           </button>
                         ) : confirmReveal === secret.id ? (
                           <div className="flex items-center gap-3 bg-amber-500/10 border border-amber-500/20 px-4 py-2 rounded-2xl">
-                            <span className="text-2xs font-semibold text-amber-500 uppercase tracking-wider">
+                            <span className="text-xs font-medium text-amber-500">
                               Reveal value?
                             </span>
                             <button
                               onClick={() => revealSecret(secret.id)}
-                              className="text-2xs font-semibold text-amber-400 hover:text-white transition-ui underline underline-offset-4 uppercase"
+                              className="text-xs font-medium text-amber-400 hover:text-white transition-ui underline underline-offset-4"
                             >
                               YES
                             </button>
@@ -394,7 +394,7 @@ function SecretsManager() {
                         </div>
                         <div className="flex items-center gap-2.5">
                           <Activity size={12} className="text-success/40" />
-                          <span className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                          <span className="text-xs text-muted-foreground/60 font-medium">
                             {secret.accessCount} read
                             {secret.accessCount !== 1 ? "s" : ""}
                           </span>
@@ -460,7 +460,7 @@ function SecretsManager() {
                     </span>
                   </div>
                   <div className="w-1 h-1 rounded-full bg-amber-500/30" />
-                  <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider leading-none">
+                  <span className="text-xs text-muted-foreground/70 font-medium leading-none">
                     Rotation re-encrypts every secret
                   </span>
                 </div>

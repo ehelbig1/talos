@@ -61,7 +61,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                 </div>
                 <div className="space-y-1">
                   <p className="text-muted-foreground/70 text-2xs font-bold uppercase tracking-wider">
-                    Execution Trace Identifier
+                    Execution id
                   </p>
                   <p className="text-white font-mono text-xs break-all selection:bg-success/30">
                     {result.execId}

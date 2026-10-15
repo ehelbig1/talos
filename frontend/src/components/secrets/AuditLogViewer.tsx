@@ -87,7 +87,7 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
                 variant="outline"
                 className="text-2xs uppercase font-semibold tracking-wider bg-success/10 text-success border-success/20 px-2 h-5 rounded-md"
               >
-                Active Audit
+                Audited
               </Badge>
             </div>
           </div>

@@ -366,7 +366,7 @@ function UpcomingSchedules() {
                   <div className="text-sm font-medium text-white truncate">
                     {s.workflowName ?? s.workflowId.slice(0, 8) + "…"}
                   </div>
-                  <div className="text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider mt-1">
+                  <div className="text-xs font-medium text-muted-foreground/70 mt-1">
                     {s.cronExpression}
                   </div>
                 </div>

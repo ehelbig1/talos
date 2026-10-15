@@ -162,7 +162,7 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
           hint={`${audit.agree}/${audit.compared} agree`}
         />
         <Stat label="Parse failed" value={String(audit.parse_failed)} />
-        <span className="ml-auto text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+        <span className="ml-auto text-xs text-muted-foreground/60 font-medium">
           {new Date(audit.audited_at).toLocaleString()} · teacher:{" "}
           {audit.teacher.model}
         </span>
@@ -330,7 +330,7 @@ export default function ModelReview() {
                       >
                         {lifecycleLabel(m.lifecycleState)}
                       </span>
-                      <span className="text-2xs text-muted-foreground/70 font-bold uppercase tracking-wider">
+                      <span className="text-xs text-muted-foreground/70 font-medium">
                         acc {pct(m.promotedAccuracy)}
                       </span>
                     </div>
@@ -356,7 +356,7 @@ export default function ModelReview() {
                     hint={`${feed.shadowObservations} obs · era ${feed.shadowEpoch}`}
                   />
                   <Stat label="Pending review" value={String(pending.length)} />
-                  <div className="ml-auto flex items-center gap-2 text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                  <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground/60 font-medium">
                     <Sparkles className="w-3.5 h-3.5 text-primary/70" />
                     Corrections train the model toward promotion
                   </div>
@@ -455,7 +455,7 @@ export default function ModelReview() {
                               {d.llmLabel}
                             </span>
                           </span>
-                          <span className="ml-auto text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                          <span className="ml-auto text-xs text-muted-foreground/60 font-medium">
                             {new Date(d.createdAt).toLocaleString()}
                           </span>
                         </div>

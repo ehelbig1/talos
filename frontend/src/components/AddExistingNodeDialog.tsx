@@ -143,7 +143,7 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
         <div className="flex items-center justify-between pt-8 border-t border-white/5 relative z-10">
           <div className="flex items-center gap-3">
             <div className="w-1.5 h-1.5 rounded-full bg-primary/40" />
-            <p className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+            <p className="text-xs text-muted-foreground/60 font-medium">
               {filteredModules.length} module
               {filteredModules.length !== 1 ? "s" : ""}
             </p>

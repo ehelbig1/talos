@@ -177,8 +177,8 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-6">
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Request Method
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Method
               </label>
               <div className="relative">
                 <select
@@ -198,8 +198,8 @@ export const NodeConfigForm = React.memo(
             </div>
 
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Target Endpoint URL
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                URL
               </label>
               <Input
                 id="url-input"
@@ -211,7 +211,7 @@ export const NodeConfigForm = React.memo(
             </div>
 
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
                 Headers (JSON)
               </label>
               <Textarea
@@ -224,8 +224,8 @@ export const NodeConfigForm = React.memo(
             </div>
 
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Payload Body (JSON)
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Body (JSON)
               </label>
               <Textarea
                 rows={4}
@@ -241,7 +241,7 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-6">
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
                 Model
               </label>
               <Input
@@ -253,7 +253,7 @@ export const NodeConfigForm = React.memo(
               />
             </div>
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
                 Prompt
               </label>
               <Textarea
@@ -271,8 +271,8 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-6">
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                JSONPath Data Extraction
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                JSONPath
               </label>
               <Input
                 id="path-input"
@@ -296,8 +296,8 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-8">
             <div className="space-y-4">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Collection Source (Rhai)
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Items (Rhai)
               </label>
               <div className="flex gap-3">
                 <div className="relative flex-1 group/input">
@@ -345,8 +345,8 @@ export const NodeConfigForm = React.memo(
             </div>
 
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Iteration Memory Handle
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Loop variable
               </label>
               <Input
                 id="output-handle-input"
@@ -355,7 +355,7 @@ export const NodeConfigForm = React.memo(
                 onChange={handleOutputHandleChange}
                 className={inputBase}
               />
-              <p className="text-2xs text-muted-foreground/50 font-semibold uppercase tracking-wider px-1">
+              <p className="text-xs text-muted-foreground/50 font-medium px-1">
                 The local scope identifier for individual collection members.
               </p>
             </div>
@@ -386,8 +386,8 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-6">
             <div className="space-y-4">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Termination Condition (Rhai)
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Stop when (Rhai)
               </label>
               <Textarea
                 id="loop-condition"
@@ -410,8 +410,8 @@ export const NodeConfigForm = React.memo(
             </div>
 
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Iteration Limit
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Maximum iterations
               </label>
               <Input
                 type="number"
@@ -429,8 +429,8 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-4">
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Static Cycle Count
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Repeat count
               </label>
               <Input
                 type="number"
@@ -448,8 +448,8 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-6">
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Aggregation Mode
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Combine
               </label>
               <div className="relative">
                 <select
@@ -470,8 +470,8 @@ export const NodeConfigForm = React.memo(
             </div>
             {config.joinMode === "N" && (
               <div className="space-y-3">
-                <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                  Threshold Count (N)
+                <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                  Threshold (N)
                 </label>
                 <Input
                   type="number"
@@ -485,8 +485,8 @@ export const NodeConfigForm = React.memo(
               </div>
             )}
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Consolidation Logic (Rhai)
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Combine with (Rhai)
               </label>
               <Textarea
                 id="agg-expr"
@@ -508,8 +508,8 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-6">
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Exception Pattern (Regex)
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Error pattern (regex)
               </label>
               <Input
                 id="error-pattern"
@@ -531,7 +531,7 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-6">
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
                 Sub-workflow ID
               </label>
               <Input
@@ -550,8 +550,8 @@ export const NodeConfigForm = React.memo(
         return (
           <div className="space-y-8">
             <div className="space-y-3">
-              <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-                Manual Intervention Label
+              <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+                Approval label
               </label>
               <Input
                 placeholder="Awaiting Executive Override..."
@@ -580,8 +580,8 @@ export const NodeConfigForm = React.memo(
         // Fallback: generic JSON editor with error handling
         return (
           <div className="space-y-4">
-            <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
-              Advanced Object Configuration
+            <label className="text-xs text-muted-foreground/60 font-medium ml-1">
+              Raw configuration (JSON)
             </label>
             <div className="relative group/json">
               <div

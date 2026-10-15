@@ -160,8 +160,8 @@ export function CompilationStatus() {
 
             <div className="flex flex-col gap-1 min-w-0 flex-1">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-2xs font-semibold uppercase tracking-wider text-white/30 truncate">
-                  Build Log :: {job.jobId.slice(0, 8)}
+                <span className="text-xs font-medium text-white/30 truncate">
+                  Build log · {job.jobId.slice(0, 8)}
                 </span>
                 {job.status !== "success" && job.status !== "failed" && (
                   <div className="flex items-center gap-1.5">

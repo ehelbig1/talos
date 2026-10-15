@@ -43,7 +43,7 @@ export const LoadingSpinner: React.FC<LoadingSpinnerProps> = ({
     </div>
     <div className="flex flex-col items-center gap-1">
       <span className="text-xs font-semibold text-white">Loading</span>
-      <span className="text-2xs font-bold text-muted-foreground/70 uppercase tracking-wider">
+      <span className="text-xs font-medium text-muted-foreground/70">
         Please wait
       </span>
     </div>

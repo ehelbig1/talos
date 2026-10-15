@@ -198,7 +198,7 @@ export function SlackAppSelector({
             <h4 className="text-xs font-semibold text-white">
               Slack Workspace Integration
             </h4>
-            <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
+            <p className="text-xs font-medium text-muted-foreground/50">
               Send and receive Slack messages
             </p>
           </div>
@@ -309,7 +309,7 @@ export function SlackAppSelector({
                       >
                         {integration.team_name}
                       </span>
-                      <span className="block text-2xs font-semibold text-muted-foreground/50 uppercase tracking-tighter mt-0.5">
+                      <span className="block text-xs font-medium text-muted-foreground/50 mt-0.5">
                         ID: {integration.team_id}{" "}
                         {integration.last_used_at &&
                           `• Active: ${new Date(integration.last_used_at).toLocaleDateString()}`}

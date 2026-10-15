@@ -169,7 +169,7 @@ export default function McpServerSettings() {
                   </span>
                 </div>
                 <div className="w-1 h-1 rounded-full bg-white/10" />
-                <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider leading-none">
+                <span className="text-xs text-muted-foreground/70 font-medium leading-none">
                   Let AI agents use Talos as a tool
                 </span>
               </div>
@@ -200,7 +200,7 @@ export default function McpServerSettings() {
 
             <div className="space-y-6 relative z-10">
               <div className="space-y-2.5">
-                <label className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60 ml-1">
+                <label className="text-xs font-medium text-muted-foreground/60 ml-1">
                   Agent name
                 </label>
                 <div className="relative group/input">
@@ -216,7 +216,7 @@ export default function McpServerSettings() {
               </div>
 
               <div className="space-y-2.5">
-                <label className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60 ml-1">
+                <label className="text-xs font-medium text-muted-foreground/60 ml-1">
                   Role
                 </label>
                 <div className="relative group/input">
@@ -262,7 +262,7 @@ export default function McpServerSettings() {
                 <div className="mt-6 p-6 bg-primary/5 border border-primary/20 rounded-2xl space-y-4 relative overflow-hidden group/token">
                   <div className="flex items-center gap-3 text-primary relative z-10">
                     <Check className="w-4 h-4" />
-                    <span className="text-2xs font-semibold uppercase tracking-wider">
+                    <span className="text-xs font-medium">
                       Agent token created
                     </span>
                   </div>
@@ -362,7 +362,7 @@ export default function McpServerSettings() {
                   <span className="text-2xl font-semibold text-white tracking-tight leading-none">
                     {agents.length}
                   </span>
-                  <span className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                  <span className="text-xs text-muted-foreground/60 font-medium">
                     agents
                   </span>
                 </div>
@@ -399,7 +399,7 @@ export default function McpServerSettings() {
                           <h5 className="text-sm font-semibold text-white group-hover:text-primary transition-ui">
                             {agent.name}
                           </h5>
-                          <p className="text-2xs font-mono text-muted-foreground/50 mt-1 uppercase">
+                          <p className="text-xs font-mono text-muted-foreground/50 mt-1">
                             ID: {agent.id.slice(0, 16)}...
                           </p>
                         </div>
@@ -485,7 +485,7 @@ export default function McpServerSettings() {
                     <h5 className="text-xs font-semibold text-white">
                       {inst.title}
                     </h5>
-                    <p className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                    <p className="text-xs text-muted-foreground/60 font-medium">
                       {inst.desc}
                     </p>
                   </div>

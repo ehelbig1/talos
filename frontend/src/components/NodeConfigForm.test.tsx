@@ -26,8 +26,8 @@ describe("NodeConfigForm", () => {
     );
 
     // Labels were reworded in the redesign; assert on the new copy + controls.
-    expect(screen.getByText(/Request Method/i)).toBeInTheDocument();
-    expect(screen.getByText(/Target Endpoint URL/i)).toBeInTheDocument();
+    expect(screen.getByText(/Method/i)).toBeInTheDocument();
+    expect(screen.getByText(/URL/i)).toBeInTheDocument();
     expect(screen.getByDisplayValue("POST")).toBeInTheDocument();
     expect(
       screen.getByDisplayValue("https://api.test.com"),
@@ -87,10 +87,10 @@ describe("NodeConfigForm", () => {
       <NodeConfigForm type="foreach" config={config} onChange={onChange} />,
     );
 
-    expect(screen.getByText(/Collection Source \(Rhai\)/i)).toBeInTheDocument();
-    expect(screen.getByText(/Iteration Memory Handle/i)).toBeInTheDocument();
+    expect(screen.getByText(/Items \(Rhai\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/Loop variable/i)).toBeInTheDocument();
 
-    // input_path = "items" → its current value identifies the Collection Source input.
+    // input_path = "items" → its current value identifies the Items input.
     const inputPath = screen.getByDisplayValue("items");
     fireEvent.change(inputPath, { target: { value: "ctx.results" } });
 
@@ -155,10 +155,8 @@ describe("NodeConfigForm", () => {
       <NodeConfigForm type="unknown" config={config} onChange={onChange} />,
     );
 
-    // Fallback editor's label was reworded to "Advanced Object Configuration".
-    expect(
-      screen.getByText(/Advanced Object Configuration/i),
-    ).toBeInTheDocument();
+    // Fallback editor's label was reworded to "Raw configuration (JSON)".
+    expect(screen.getByText(/Raw configuration \(JSON\)/i)).toBeInTheDocument();
     const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
     expect(textarea).toBeInTheDocument();
     expect(textarea.value).toContain("custom");

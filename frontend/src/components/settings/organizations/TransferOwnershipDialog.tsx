@@ -71,7 +71,7 @@ export function TransferOwnershipDialog({
               Confirm
             </label>
             <div className="space-y-3">
-              <p className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider ml-1">
+              <p className="text-xs text-muted-foreground/60 font-medium ml-1">
                 Type <span className="text-white">"{orgName}"</span> to confirm
                 transfer
               </p>

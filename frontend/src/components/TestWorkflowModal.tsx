@@ -166,7 +166,7 @@ function NodeTraceCard({
           {trace.logMessage && (
             <div className="space-y-3">
               <p className="text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider ml-1">
-                {trace.status === "failed" ? "Diagnostic Fault" : "Node Log"}
+                {trace.status === "failed" ? "Error" : "Log"}
               </p>
               <pre
                 className={cn(
@@ -183,7 +183,7 @@ function NodeTraceCard({
           {trace.output && (
             <div className="space-y-3">
               <p className="text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider ml-1">
-                Egress Result
+                Output
               </p>
               <pre className="text-xs font-mono text-primary/60 bg-primary/5 border border-primary/10 rounded-2xl p-5 overflow-x-auto max-h-64 whitespace-pre-wrap leading-relaxed">
                 {trace.output}
@@ -394,7 +394,7 @@ export function TestWorkflowModal({
               Synthetic Trigger Ingress (JSON)
             </label>
             {jsonError && (
-              <span className="text-2xs font-semibold text-destructive uppercase tracking-wider">
+              <span className="text-xs font-medium text-destructive">
                 {jsonError}
               </span>
             )}

@@ -136,6 +136,12 @@ export default [
                 "error",
                 {
                     selector:
+                        'JSXOpeningElement[name.name="label"] > JSXAttribute[name.name="className"] > Literal[value=/\\buppercase\\b/]',
+                    message:
+                        "A form label is read, not scanned: sentence case at text-xs font-medium. Caps are for a one-to-three-word section eyebrow or a tiny status badge only.",
+                },
+                {
+                    selector:
                         "Literal[value=/(^|\\s)(font-black|text-\\[(9|10)px\\]|tracking-\\[0\\.[2-4]em\\]|tracking-widest|text-muted-foreground\\/(10|20|40))(\\s|$)/]",
                     message:
                         "Retired type token. Floor: text-2xs, font-semibold, tracking-wider, text-muted-foreground/60. See src/components/ui.",

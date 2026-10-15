@@ -279,7 +279,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
 
           {/* Footer */}
           <div className="flex justify-between items-center pt-6 border-t border-white/5">
-            <span className="text-2xs text-muted-foreground/50 font-semibold uppercase tracking-wider">
+            <span className="text-xs text-muted-foreground/50 font-medium">
               {filteredTemplates.length} template
               {filteredTemplates.length !== 1 ? "s" : ""}
             </span>
@@ -377,7 +377,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                   variant="outline"
                   className="bg-primary/5 border-primary/20 text-2xs font-semibold uppercase tracking-wider text-primary px-2"
                 >
-                  <Check className="w-2.5 h-2.5 mr-1.5" /> JSON SCHEMA VALIDATED
+                  <Check className="w-2.5 h-2.5 mr-1.5" /> Schema valid
                 </Badge>
               </div>
 
