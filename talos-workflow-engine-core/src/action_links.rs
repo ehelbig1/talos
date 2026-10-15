@@ -408,7 +408,7 @@ impl std::fmt::Display for TargetsFault {
 
 /// Caller-supplied text as a refusal may echo it: no control characters, at
 /// most 60 characters.
-fn shown(text: &str) -> String {
+pub(crate) fn shown(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(60).collect()
 }
 
@@ -481,7 +481,7 @@ pub fn is_action_links_node(node: &JsonValue) -> bool {
         || node.get("type").and_then(JsonValue::as_str) == Some("system:action_links")
 }
 
-fn graph_nodes(graph: &JsonValue) -> impl Iterator<Item = &JsonValue> {
+pub(crate) fn graph_nodes(graph: &JsonValue) -> impl Iterator<Item = &JsonValue> {
     graph
         .get("nodes")
         .and_then(JsonValue::as_array)
@@ -489,7 +489,7 @@ fn graph_nodes(graph: &JsonValue) -> impl Iterator<Item = &JsonValue> {
         .flatten()
 }
 
-fn node_id_shown(node: &JsonValue) -> String {
+pub(crate) fn node_id_shown(node: &JsonValue) -> String {
     shown(node.get("id").and_then(JsonValue::as_str).unwrap_or("?"))
 }
 

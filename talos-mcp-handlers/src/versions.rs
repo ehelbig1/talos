@@ -496,7 +496,7 @@ async fn handle_rollback_workflow(
         .update_workflow_graph_json(workflow_id, user_id, &graph_json)
         .await
     {
-        if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+        if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
             return resp;
         }
         tracing::error!(workflow_id = %workflow_id, "rollback_workflow update failed: {:#}", e);

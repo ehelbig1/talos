@@ -610,16 +610,22 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
         SystemNodeKind::DynamicDispatch {
             dispatch_expression,
             timeout_secs,
-        } => (
-            "dispatch",
-            json!({
+            targets,
+        } => ("dispatch", {
+            let mut data = json!({
                 "dispatch_expression": dispatch_expression,
                 "timeout_secs": timeout_secs,
                 // A typed, non-zero timeout is an author's choice: opt the
                 // node into enforcement (see `graph_parser::child_timeout_secs`).
                 "enforce_timeout": *timeout_secs > 0,
-            }),
-        ),
+            });
+            // Absent, not `null`, when undeclared: the legacy reading.
+            if let Some(targets) = targets {
+                data[talos_workflow_engine_core::dispatch_targets::DISPATCH_TARGETS_KEY] =
+                    json!(targets.iter().map(Uuid::to_string).collect::<Vec<_>>());
+            }
+            data
+        }),
         SystemNodeKind::CapabilityDispatch {
             required_capabilities,
             fallback_workflow_id,
@@ -1641,6 +1647,7 @@ mod tests {
             SystemNodeKind::DynamicDispatch {
                 dispatch_expression: "classifier.route".into(),
                 timeout_secs: 45,
+                targets: Some(vec![Uuid::from_u128(9)]),
             },
         )
         .await;
@@ -1649,7 +1656,8 @@ mod tests {
             SystemNodeKind::DynamicDispatch {
                 dispatch_expression: ref e,
                 timeout_secs: 45,
-            } if e == "classifier.route"
+                targets: Some(ref t),
+            } if e == "classifier.route" && t == &vec![Uuid::from_u128(9)]
         ));
     }
 

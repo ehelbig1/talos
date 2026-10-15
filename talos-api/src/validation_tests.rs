@@ -601,3 +601,52 @@ fn test_validate_workflow_execution_timeout_cap_is_one_hour() {
     // decision context. Bumping it should land in a reviewed commit.
     assert_eq!(MAX_WORKFLOW_EXECUTION_TIMEOUT_SECS, 3600);
 }
+
+// ============================================================================
+// validate_workflow_graph_structure (security review 2026-10-14, G-26)
+// ============================================================================
+
+/// GraphQL `createWorkflow` / `updateWorkflow` take a graph whole; they are
+/// held to the structural checks `create_workflow` runs on the graph it
+/// builds.
+#[test]
+fn a_graphql_graph_with_501_nodes_a_cycle_or_a_broken_skip_condition_is_refused() {
+    let nodes: Vec<serde_json::Value> = (0..501)
+        .map(|i| serde_json::json!({ "id": format!("n{i}"), "data": {} }))
+        .collect();
+    let too_many = serde_json::json!({ "nodes": nodes, "edges": [] }).to_string();
+    let err = validate_workflow_graph_structure(&too_many).unwrap_err();
+    assert!(err.message.contains("500 node limit"), "{}", err.message);
+
+    let cycle = serde_json::json!({
+        "nodes": [ { "id": "a" }, { "id": "b" } ],
+        "edges": [ { "source": "a", "target": "b" }, { "source": "b", "target": "a" } ],
+    })
+    .to_string();
+    assert!(validate_workflow_graph_structure(&cycle)
+        .unwrap_err()
+        .message
+        .contains("cycle"));
+
+    // An authoring surface refuses a skip_condition that does not parse.
+    let skip = serde_json::json!({
+        "nodes": [ { "id": "send", "data": { "skip_condition": "!!!(" } } ], "edges": [],
+    })
+    .to_string();
+    assert!(validate_workflow_graph_structure(&skip)
+        .unwrap_err()
+        .message
+        .contains("node 'send': skip_condition"));
+}
+
+#[test]
+fn a_well_formed_graphql_graph_passes_the_structure_check() {
+    let graph = serde_json::json!({
+        "nodes": [ { "id": "a", "data": { "skip_condition": "dry_run == true" } }, { "id": "b" } ],
+        "edges": [ { "source": "a", "target": "b" } ],
+    })
+    .to_string();
+    assert!(validate_workflow_graph_structure(&graph).is_ok());
+    // Not JSON: the save path has its own answer.
+    assert!(validate_workflow_graph_structure("{not json").is_ok());
+}

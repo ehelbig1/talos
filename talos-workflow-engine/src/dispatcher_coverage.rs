@@ -286,6 +286,7 @@ mod tests {
             SystemNodeKind::DynamicDispatch {
                 dispatch_expression: "\"x\"".into(),
                 timeout_secs: 30,
+                targets: None,
             },
             SystemNodeKind::CapabilityDispatch {
                 required_capabilities: vec!["x".into()],

@@ -423,7 +423,10 @@ pub const DEFAULT_MAX_PREFETCH_SUCCESSORS: usize = 8;
 /// 500 is well above any reasonable hand-authored workflow but small
 /// enough to make a runaway code-gen path obvious. Override per-engine
 /// via [`ParallelWorkflowEngine::set_max_workflow_nodes`].
-pub const DEFAULT_MAX_WORKFLOW_NODES: usize = 500;
+/// The value is `talos_workflow_engine_core::graph_limits::MAX_GRAPH_NODES`,
+/// the one home the graph writers read too.
+pub const DEFAULT_MAX_WORKFLOW_NODES: usize =
+    talos_workflow_engine_core::graph_limits::MAX_GRAPH_NODES;
 
 /// Default for [`ParallelWorkflowEngine::max_node_output_bytes`] — the
 /// per-node output size guard. Outputs over this limit get replaced
@@ -1957,8 +1960,11 @@ impl ParallelWorkflowEngine {
         // that forgets — must not be able to seed `__actor_context__`,
         // `__staleness__` or `__degraded_inputs__` onto the root nodes' input.
         // Same function, one list: `reserved_keys::ENGINE_AUTHORED_INPUT_KEYS`.
+        // A ROOT seed also drops `__action_links__`
+        // (`ROOT_TRIGGER_REFUSED_OUTPUT_KEYS`, review G-12): a link request
+        // reaches an `action_links` node only from a module in this run.
         let mut trigger_input = trigger_input;
-        talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys(&mut trigger_input);
+        talos_workflow_engine_core::reserved_keys::strip_root_trigger_keys(&mut trigger_input);
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
         // THE PRODUCTION ENTRY POINT, and the reason `ChainDispatch` exists as
@@ -2002,8 +2008,11 @@ impl ParallelWorkflowEngine {
         // that forgets — must not be able to seed `__actor_context__`,
         // `__staleness__` or `__degraded_inputs__` onto the root nodes' input.
         // Same function, one list: `reserved_keys::ENGINE_AUTHORED_INPUT_KEYS`.
+        // A ROOT seed also drops `__action_links__`
+        // (`ROOT_TRIGGER_REFUSED_OUTPUT_KEYS`, review G-12): a link request
+        // reaches an `action_links` node only from a module in this run.
         let mut trigger_input = trigger_input;
-        talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys(&mut trigger_input);
+        talos_workflow_engine_core::reserved_keys::strip_root_trigger_keys(&mut trigger_input);
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
         // Same policy as the non-cancellable twin, and stated HERE for the same
@@ -2335,6 +2344,49 @@ impl ParallelWorkflowEngine {
                 self.release_successors($idx, $how, &mut results, &mut joins, &mut ready);
             }};
         }
+        // A node that AGGREGATES its parents' outputs locally (`fan_in`,
+        // `collect`, `synthesize`) can be larger than any one of them: sixteen
+        // parents just under the per-node cap fan into one output sixteen
+        // times over it. Its output is held to the module path's size guard
+        // (`oversized_output_error`, security review 2026-10-14, G-14): an
+        // oversized one FAILS the node through the ordinary failure routing
+        // (error edges, `continue_on_error`), and is never committed.
+        macro_rules! commit_aggregate_or_fail {
+            ($idx:expr, $id:expr, $value:expr) => {{
+                let value = $value;
+                match crate::engine_completion::oversized_output_error(
+                    &value,
+                    self.max_node_output_bytes,
+                ) {
+                    None => commit_and_release!($idx, $id, value, Release::Succeeded),
+                    Some(msg) => {
+                        tracing::warn!(
+                            node_id = %$id,
+                            limit = self.max_node_output_bytes,
+                            "Aggregated node output exceeds the configured size limit — failing the node"
+                        );
+                        let chains_ctx = if chains_live {
+                            Some((chains.as_slice(), &node_to_chain))
+                        } else {
+                            None
+                        };
+                        self.progress.mark_finished($id);
+                        self.handle_completed_future(
+                            $idx,
+                            Err(msg),
+                            execution_id,
+                            0, // no wall_time for synchronous system-node eval
+                            chains_ctx,
+                            &exec_ctx,
+                            &mut results,
+                            &mut joins,
+                            &mut ready,
+                        )
+                        .await?;
+                    }
+                }
+            }};
+        }
         // A PAUSE commits the pausing node's envelope and deliberately
         // releases NOTHING: the run returns right after, and the resume seeds
         // the node's external value, whose edges resolve at seed time.
@@ -2508,7 +2560,7 @@ impl ParallelWorkflowEngine {
 
                 // ── FanIn aggregation (local computation, no dispatch) ───────
                 if let Some(output) = self.try_dispatch_fan_in(node_idx, node_id, &results) {
-                    commit_and_release!(node_idx, node_id, output, Release::Succeeded);
+                    commit_aggregate_or_fail!(node_idx, node_id, output);
                     continue;
                 }
 
@@ -2516,7 +2568,7 @@ impl ParallelWorkflowEngine {
                 if let Some(output) =
                     self.try_dispatch_collect(node_idx, node_id, execution_id, &results)
                 {
-                    commit_and_release!(node_idx, node_id, output, Release::Succeeded);
+                    commit_aggregate_or_fail!(node_idx, node_id, output);
                     continue;
                 }
 
@@ -2741,7 +2793,7 @@ impl ParallelWorkflowEngine {
                 if let Some(output) =
                     self.try_dispatch_synthesize(node_idx, node_id, execution_id, &results)
                 {
-                    commit_and_release!(node_idx, node_id, output, Release::Succeeded);
+                    commit_aggregate_or_fail!(node_idx, node_id, output);
                     continue;
                 }
 

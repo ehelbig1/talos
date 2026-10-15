@@ -172,10 +172,16 @@ impl ParallelWorkflowEngine {
         // "…"}` string form #733 taught the classifier to read — used to
         // fail the run under the generic wording below, discarding the
         // very text that caused the failure.
+        // The per-node output size guard, as on the module path
+        // (`handle_completed_future`): a system node's output (a sub-workflow's
+        // collapsed result, an ensemble's map, a judge envelope) is the next
+        // node's input and part of the stored run output, so it is held to the
+        // same cap — an oversized one FAILS the node (security review
+        // 2026-10-14, G-14).
         let reason = if output_reports_error(&output) {
             Some(error_reason(&output).unwrap_or_else(|| "system node rejected output".to_string()))
         } else {
-            None
+            oversized_output_error(&output, self.max_node_output_bytes)
         };
         if let Some(msg) = reason {
             self.handle_completed_future(

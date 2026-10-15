@@ -2571,14 +2571,16 @@ impl AdvancedRepository {
     }
 
     /// Create a workflow schedule.
+    ///
+    /// Takes a [`talos_schedule_spec::ScheduleSpec`]: its only constructor
+    /// runs every cron and timezone check, so this write cannot store a
+    /// schedule that skipped them, and it carries the first due time.
     pub async fn create_workflow_schedule(
         &self,
         sid: Uuid,
         wf_id: Uuid,
         user_id: Uuid,
-        cron: &str,
-        timezone: &str,
-        next_trigger_at: Option<DateTime<Utc>>,
+        schedule: &talos_schedule_spec::ScheduleSpec,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO workflow_schedules \
@@ -2588,9 +2590,9 @@ impl AdvancedRepository {
         .bind(sid)
         .bind(wf_id)
         .bind(user_id)
-        .bind(cron)
-        .bind(timezone)
-        .bind(next_trigger_at)
+        .bind(schedule.cron_expression())
+        .bind(schedule.timezone())
+        .bind(schedule.next_trigger_at())
         .execute(&self.db_pool)
         .await
         .map(|_| ())
@@ -2659,6 +2661,9 @@ impl AdvancedRepository {
             }
             None => talos_db::begin_user_scoped(&self.db_pool, user_id).await?,
         };
+        // The per-node and workflow caps (security review 2026-10-14, G-11:
+        // this write stored `retry_count: 9000` from `config_overrides`).
+        talos_workflow_repository::graph_caps::refuse_over_cap_graph(graph_json)?;
         talos_workflow_repository::action_link_targets::refuse_unowned_targets_on_conn(
             &mut tx, user_id, None, graph_json,
         )

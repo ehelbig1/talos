@@ -261,12 +261,12 @@ async fn handle_create_schedule(
             Err(resp) => return resp,
         };
 
-    if let Err(msg) = validate_schedule_cron(&cron_expression) {
-        return mcp_error(req_id, -32602, &msg);
-    }
-    if let Err(msg) = validate_schedule_timezone(&timezone) {
-        return mcp_error(req_id, -32602, &msg);
-    }
+    // Every check a stored schedule passes, from the one home every schedule
+    // writer takes its value from (`talos_schedule_spec`).
+    let spec = match talos_scheduler::ScheduleSpec::validated(&cron_expression, &timezone) {
+        Ok(spec) => spec,
+        Err(e) => return mcp_error(req_id, -32602, &e.to_string()),
+    };
 
     // Verify workflow ownership
     let wf_exists: bool = state
@@ -281,19 +281,13 @@ async fn handle_create_schedule(
     // Compute next_trigger_at now so the scheduler loop picks this schedule up
     // on its first tick. Without this, the WHERE next_trigger_at IS NOT NULL filter
     // in the scheduler would silently ignore newly created schedules forever.
-    let next_trigger_at = talos_scheduler::calculate_next_trigger(&cron_expression, &timezone).ok();
+    // `ScheduleSpec` carries it, computed when the schedule was checked.
+    let next_trigger_at = Some(spec.next_trigger_at());
 
     let schedule_id = Uuid::new_v4();
     let sched_repo = talos_schedule_repo::ScheduleRepository::new(state.db_pool.clone());
     match sched_repo
-        .create_schedule(
-            schedule_id,
-            workflow_id,
-            user_id,
-            &cron_expression,
-            &timezone,
-            next_trigger_at,
-        )
+        .create_schedule(schedule_id, workflow_id, user_id, &spec)
         .await
     {
         Ok(_) => {
@@ -348,25 +342,13 @@ async fn handle_create_schedule(
     }
 }
 
-/// Enforce a minimum schedule interval of 60 seconds (one trigger per minute
-/// at most). This prevents resource exhaustion from expressions like
-/// `* * * * * *` (every second) across many workflows simultaneously.
-const MIN_SCHEDULE_INTERVAL_SECS: u64 = 60;
-
 /// Every check a cron expression passes before it is stored, by
 /// `create_schedule` and `update_schedule` alike. The error is the sentence
-/// the caller is shown.
-///
-/// Parsed with the same croner library the scheduler uses, so storage and
-/// execution agree on validity. The field-count check is a fast first gate;
-/// the parse catches semantic errors (invalid ranges, etc.).
+/// the caller is shown. Since 2026-10-15 the one home is
+/// `talos_schedule_spec::validate_schedule_cron` (the 60 s floor included),
+/// which `ScheduleSpec::validated` runs for every schedule writer.
 fn validate_schedule_cron(cron_expression: &str) -> Result<(), String> {
-    let field_count = cron_expression.split_whitespace().count();
-    if !(5..=6).contains(&field_count) {
-        return Err("Invalid cron expression: must have 5 or 6 space-separated fields".to_string());
-    }
-    talos_scheduler::validate_cron(cron_expression)?;
-    talos_scheduler::validate_cron_min_interval(cron_expression, MIN_SCHEDULE_INTERVAL_SECS)
+    talos_scheduler::validate_schedule_cron(cron_expression)
 }
 
 /// The timezone check, shared the same way.
@@ -376,11 +358,8 @@ fn validate_schedule_cron(cron_expression: &str) -> Result<(), String> {
 /// `calculate_next_trigger` returned None when the chrono_tz parse failed —
 /// which the scheduler loop reads as "never run".
 fn validate_schedule_timezone(timezone: &str) -> Result<(), String> {
-    talos_scheduler::validate_timezone(timezone).map_err(|e| {
-        format!(
-            "{e}. Use an IANA timezone identifier like 'UTC', 'America/New_York', or 'Europe/London'."
-        )
-    })
+    talos_scheduler::validate_timezone(timezone)
+        .map_err(|e| talos_scheduler::ScheduleSpecError::Timezone(e).to_string())
 }
 
 /// What `update_schedule` was asked to change, validated.

@@ -48,6 +48,8 @@ tokio = { workspace = true, features = ["time"] }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-tenancy = { path = "../talos-tenancy" }
 talos-text-util = { path = "../talos-text-util" }
+# A schedule write takes a `ScheduleSpec`, whose constructor runs every check.
+talos-schedule-spec = { path = "../talos-schedule-spec" }
 tracing.workspace = true
 uuid.workspace = true
 

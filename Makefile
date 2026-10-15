@@ -297,7 +297,7 @@ lint: ## Fast gate: rustfmt + WIT drift + structural lints (no clippy) + offline
 	@python3 scripts/check-sql-safe-reasons.py
 	@printf '▶ the sqlx command-line tool matches the library\n'
 	@python3 scripts/check-sqlx-cli-pin.py
-	@printf '▶ every write of a workflow graph is behind the action-link targets rule\n'
+	@printf '▶ every write of a workflow graph is behind the targets rule and the caps\n'
 	@python3 scripts/check-graph-writers.py
 	@printf '▶ deployment artefacts keep their reviewed posture\n'
 	@python3 scripts/check-deploy-posture.py

@@ -155,6 +155,12 @@ Treat the payload as you would any trigger input: validate it. The label and
 the payload come from the same module, so a module you would not trust to
 start the target workflow should not be upstream of this node.
 
+A request never comes from the run's TRIGGER: the engine drops
+`__action_links__` from a root trigger payload before the run starts
+(2026-10-15), so a node placed at the graph root, fed by a webhook, mints
+nothing a caller asked for. A request reaches the node only as the output of
+a module in the same run.
+
 ## What the page shows, and where it travels
 
 The confirmation page shows the link's `label` and the NAME of the workflow

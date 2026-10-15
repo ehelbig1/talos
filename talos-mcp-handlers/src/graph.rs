@@ -9,106 +9,14 @@ use std::sync::Arc;
 use talos_workflow_repository::{GraphWrite, VersionedGraph};
 use uuid::Uuid;
 
-// Thread-local Rhai validation engine — created once per thread, reused for syntax checks.
-// `rhai::Engine` contains `Rc` and is not `Send`; `thread_local!` avoids that constraint.
-//
-// COMPILE-ONLY, and deliberately NOT built by `talos_rhai_sandbox::sandboxed_engine`
-// (the builder every EVALUATING engine must come from — lint check 63). Two
-// independent reasons this engine cannot leak to stdout, either of which
-// would be sufficient:
-//   1. `new_raw()`, not `new()`. `Engine::new()` is what installs the
-//      `println!`-backed `print`/`debug` handlers; `new_raw()` leaves both
-//      as `None`, and rhai's dispatch site is `if let Some(ref print) =
-//      self.print` — a `None` handler emits nothing and still yields unit.
-//      `new_raw()` also registers no StandardPackage at all.
-//   2. Nothing here evaluates. The only method called on this engine is
-//      `Engine::compile` (see `validate_rhai_expression` below), which
-//      parses to AST and never dispatches a function call, so `print`
-//      cannot fire regardless of the handler.
-// A dry-run that DOES evaluate (`dry_run_retry_condition`) deliberately
-// routes to `talos_engine::rhai_helpers::evaluate_condition_with_error`,
-// i.e. the production sandbox, rather than evaluating on this engine.
-//
-// DO NOT add an `eval` / `run` / `call_fn` / `eval_ast` call on this engine.
-// Reason 2 above is what makes the exemption sound, and check 63 exempts
-// `new_raw()` by construction, so it CANNOT catch such an addition. Nor is
-// stdout the only exposure: `Engine::RAW` starts from `Limits::new()`, whose
-// `num_operations` is `None` — no operation cap at all — so an eval here
-// would let one authoring request spin a controller thread forever.
-// Evaluating anything means `talos_rhai_sandbox::sandboxed_engine`.
-std::thread_local! {
-    static RHAI_VALIDATION_ENGINE: rhai::Engine = {
-        let mut e = rhai::Engine::new_raw();
-        e.disable_symbol("eval");
-        e
-    };
-}
-
-fn with_rhai_validation_engine<F, R>(f: F) -> R
-where
-    F: FnOnce(&rhai::Engine) -> R,
-{
-    RHAI_VALIDATION_ENGINE.with(f)
-}
-
-/// Compile-only Rhai syntax check used by every handler that accepts a
-/// user-supplied expression (edge condition, retry condition, retry
-/// delay, dispatch expression, skip condition, …).
-///
-/// On failure, returns a single user-facing error string that names the
-/// `field_name` and includes the line/column from `rhai::ParseError`.
-/// Callers map this to MCP -32602 verbatim — no error-class branching
-/// needed.
-pub(crate) fn validate_rhai_expression(field_name: &str, source: &str) -> Result<(), String> {
-    with_rhai_validation_engine(|eng| eng.compile(source)).map_err(|e| {
-        format!(
-            "{} Rhai syntax error at line {}, column {}: {}",
-            field_name,
-            e.position().line().unwrap_or(0),
-            e.position().position().unwrap_or(0),
-            e
-        )
-    })?;
-    Ok(())
-}
-
-/// The ONE authoring-time gate for a node's `skip_condition`, on every write
-/// path that accepts one as a named parameter.
-///
-/// # Why a skip condition earns its own gate
-///
-/// `skip_condition` is the platform's only FAIL-OPEN expression. At runtime an
-/// expression that cannot be evaluated defaults to `false`, and `false` on a
-/// skip condition means "do not skip" — so a broken gate RUNS the node its
-/// author wrote it to stop. A typo in `"dry_run == true"` fires the send, the
-/// workflow reports `completed`, and the only evidence is a counter
-/// (`talos_condition_eval_failures_total{kind="skip_condition"}`) plus a WARN.
-/// Rejecting at authoring time is the cheapest possible catch: an expression
-/// that cannot PARSE can never gate anything, so persisting it is never right.
-///
-/// # What this proves, and what it cannot
-///
-/// PARSE only. It cannot see the failure that actually bit — an unbound
-/// variable (`input.dry_run` when the trigger key binds bare as `dry_run`)
-/// parses perfectly and only fails at eval, against a context this function
-/// does not have. `test_condition` with a representative payload is the tool
-/// for that half, and `add_skip_condition` attaches
-/// [`dry_run_skip_condition`]'s warning pointing there.
-///
-/// Returns the TRIMMED expression so callers persist exactly what was
-/// validated (MCP-235: whitespace slipped past the empty check, then Rhai
-/// returned unit `()` at runtime — a non-bool, i.e. the fail-open case).
-pub(crate) fn validate_skip_condition(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("skip_condition must be non-empty and non-whitespace".to_string());
-    }
-    if raw.len() > 2000 {
-        return Err("skip_condition must be ≤ 2000 characters".to_string());
-    }
-    validate_rhai_expression("skip_condition", trimmed)?;
-    Ok(trimmed.to_string())
-}
+// The compile-only Rhai engine, `validate_rhai_expression` and
+// `validate_skip_condition` moved to `talos_workflow_creation_helpers` on
+// 2026-10-15 so every writer of a whole graph (GraphQL, the imports, the
+// copies) parses a `skip_condition` with the same function this crate uses
+// (`validate_graph_structure`). Read the safety notes on the engine there.
+pub(crate) use talos_workflow_creation_helpers::{
+    validate_rhai_expression, validate_skip_condition,
+};
 
 /// Authoring-time check of an edge `condition` against the graph it is being
 /// added to: the warning to return when the condition reads a variable that
@@ -446,7 +354,7 @@ pub(crate) fn graph_write_response(
         Err(e) => {
             // What an `action_links` node may start: a refusal the caller
             // can act on, not a failed write.
-            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, req_id) {
+            if let Some(resp) = crate::utils::graph_write_refusal_response(&e, req_id) {
                 return Err(resp);
             }
             tracing::error!(workflow_id = %wf_id, site, "graph write failed: {}", e);
@@ -1735,7 +1643,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_expression_dispatch_node",
-            "description": "Add a Rhai expression-based dispatch node to a workflow. At runtime, evaluates a Rhai expression against the node's input to select a child workflow ID, then executes it as a sub-workflow. For capability-based routing (find any workflow matching a set of tags) use add_capability_dispatch_node instead.\n\nExpression scope: top-level input fields are available as bare variables (e.g. `route == \"A\"` when input is `{\"route\": \"A\"}`). The whole input is ALSO available as `input`, `ctx`, and `inputs` (aliases) so `input.route`, `ctx.route`, and `inputs.route` all work. Use the wrapper form for nested fields (e.g. `input.user.tier == \"premium\"`). The expression MUST return a string — the target workflow's UUID or name.",
+            "description": "Add a Rhai expression-based dispatch node to a workflow. At runtime, evaluates a Rhai expression against the node's input to select a child workflow ID, then executes it as a sub-workflow. For capability-based routing (find any workflow matching a set of tags) use add_capability_dispatch_node instead.\n\nExpression scope: top-level input fields are available as bare variables (e.g. `route == \"A\"` when input is `{\"route\": \"A\"}`). The whole input is ALSO available as `input`, `ctx`, and `inputs` (aliases) so `input.route`, `ctx.route`, and `inputs.route` all work. Use the wrapper form for nested fields (e.g. `input.user.tier == \"premium\"`). The expression MUST return a string — the target workflow's UUID or name.\n\nPass `targets` (the workflow UUIDs this node may start): a resolved workflow outside it is refused. A node without `targets` is the legacy behaviour (any of your workflows the expression names) and will become a validation warning.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1755,7 +1663,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "type": "number",
                         "description": "Execution timeout in seconds for the dispatched sub-workflow (default: 30). Enforced ONLY when enforce_timeout is true (#796); otherwise this number is advisory and the child is bounded by the run's remaining budget (minus a 2 s reserve), failing as a clean node error when that runs out."
                     },
-                    "enforce_timeout": { "type": "boolean", "description": "Opt-in: enforce timeout_secs as a hard per-child deadline. Omit (default) to leave timeout_secs advisory — the authoring default of 30/60 s is not an author's choice, and LLM-bearing children legitimately run for minutes." }
+                    "enforce_timeout": { "type": "boolean", "description": "Opt-in: enforce timeout_secs as a hard per-child deadline. Omit (default) to leave timeout_secs advisory — the authoring default of 30/60 s is not an author's choice, and LLM-bearing children legitimately run for minutes." },
+                    "targets": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "description": "The workflow UUIDs this node may start (1 to 32, each a workflow of yours). When given, a run whose expression resolves to any other workflow FAILS (the refusal is counted). Declare it: the expression usually reads its input, and without a declared set whoever writes that input (a webhook caller, text an upstream module read) chooses which of your workflows runs. Omitting it is the legacy behaviour — any of your workflows the expression names, by UUID or name — and will become a validation warning."
+                    }
                 },
                 "required": ["workflow_id", "node_id", "dispatch_expression"]
             }
@@ -2334,6 +2249,43 @@ async fn handle_set_speculative_prefetch(
 
 // ── update_node_config ──────────────────────────────────────────────────────
 
+/// What a patch to a node's CONFIG (`data`) may carry: the rule
+/// `update_node_config`'s `merge_config` applies, and the one
+/// `duplicate_workflow`'s `patch_node_configs` and `promote_workflow`'s
+/// `config_overrides` apply too (security review 2026-10-14, G-11).
+///
+/// * Engine-internal `__` keys are dropped (`__skip_condition`,
+///   `__continue_on_error`, … are managed by the engine and their dedicated
+///   tools).
+/// * A `skip_condition` must parse ([`validate_skip_condition`]); `null`
+///   (delete it) is allowed, any other non-string is refused.
+///
+/// The error is the sentence the caller is shown.
+pub(crate) fn config_patch_as_update_node_config_allows(
+    patch: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let filtered: serde_json::Map<String, serde_json::Value> = patch
+        .iter()
+        .filter(|(k, _)| !k.starts_with("__"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    // An explicit `null` is a "delete this key" instruction, not a type
+    // error. A string gets the full parse gate: a skip_condition is
+    // FAIL-OPEN at runtime, so a length cap alone is not enough.
+    if let Some(sc) = filtered.get("skip_condition") {
+        if let Some(expr) = sc.as_str() {
+            validate_skip_condition(expr)?;
+        } else if !sc.is_null() {
+            return Err(
+                "skip_condition must be a string (or null to delete it); use \
+                        add_skip_condition for validated updates"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(filtered)
+}
+
 async fn handle_update_node_config(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -2494,28 +2446,15 @@ async fn handle_update_node_config(
             // sets AND explicit-null deletes) so a merge patch can't
             // touch runtime control fields reserved for the engine and
             // their dedicated MCP actions.
+            //
+            // The rule is `config_patch_as_update_node_config_allows`, which
+            // `duplicate_workflow` and `promote_workflow` apply to the configs
+            // they patch too.
             let patch = if let Some(obj) = raw_patch.as_object() {
-                let filtered: serde_json::Map<String, serde_json::Value> = obj
-                    .iter()
-                    .filter(|(k, _)| !k.starts_with("__"))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                // Validate skip_condition if caller is trying to set it here.
-                // Unlike update_config, an explicit `null` here is a valid
-                // RFC 7386 "delete this key" instruction, not a type error.
-                if let Some(sc) = filtered.get("skip_condition") {
-                    if let Some(expr) = sc.as_str() {
-                        // Same full parse gate as `update_config` above — see
-                        // the comment there for why a length cap alone is not
-                        // enough on a fail-open expression.
-                        if let Err(msg) = validate_skip_condition(expr) {
-                            return mcp_error(req_id, -32602, &msg);
-                        }
-                    } else if !sc.is_null() {
-                        return mcp_error(req_id, -32602, "skip_condition must be a string (or null to delete it); use add_skip_condition for validated updates");
-                    }
+                match config_patch_as_update_node_config_allows(obj) {
+                    Ok(filtered) => serde_json::Value::Object(filtered),
+                    Err(msg) => return mcp_error(req_id, -32602, &msg),
                 }
-                serde_json::Value::Object(filtered)
             } else {
                 raw_patch
             };
@@ -5279,6 +5218,13 @@ async fn handle_duplicate_workflow(
 
     // Apply modifications
     let modifications = args.get("modifications");
+    // The same 1 MB wire cap `update_node_config` applies to its `config`
+    // (security review 2026-10-14, G-11: `modifications` had no cap).
+    if let Some(m) = modifications {
+        if let Err(resp) = crate::utils::enforce_payload_size_limit(m, req_id.clone()) {
+            return resp;
+        }
+    }
 
     // Remove nodes from graph
     // MCP-297 (2026-05-11): pre-fix `filter_map(|v| v.as_str()...)`
@@ -5338,7 +5284,13 @@ async fn handle_duplicate_workflow(
         }
     }
 
-    // Patch node configs (merge specified keys into matching node's config/data)
+    // Patch node configs: merge the given keys into the matching node's
+    // `data` — the node's CONFIG, as `update_node_config` writes it — and
+    // nowhere else. Until 2026-10-15 a node with no `data` object took the
+    // patch at NODE level, so `type`, `kind`, `retry_count` and a whole
+    // `data` could be set there (security review 2026-10-14, G-11). Each
+    // patch is held to `update_node_config`'s rules: engine-internal `__`
+    // keys stripped, a `skip_condition` parsed, the merged config ≤ 100 KB.
     if let Some(patches) = modifications
         .and_then(|m| m.get("patch_node_configs"))
         .and_then(|v| v.as_object())
@@ -5352,27 +5304,83 @@ async fn handle_duplicate_workflow(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        if let Some(patch) = patches.get(&node_id).and_then(|v| v.as_object()) {
-                            // Merge patch into node's data object (or config)
-                            let data = node
-                                .as_object_mut()
-                                .and_then(|n| n.get_mut("data"))
-                                .and_then(|d| d.as_object_mut());
-                            if let Some(data_map) = data {
-                                for (k, v) in patch {
-                                    data_map.insert(k.clone(), v.clone());
-                                }
-                            } else if let Some(node_map) = node.as_object_mut() {
-                                // Fallback: merge directly into node if no data sub-object
-                                for (k, v) in patch {
-                                    node_map.insert(k.clone(), v.clone());
-                                }
+                        let Some(patch) = patches.get(&node_id).and_then(|v| v.as_object()) else {
+                            continue;
+                        };
+                        let patch = match config_patch_as_update_node_config_allows(patch) {
+                            Ok(p) => p,
+                            Err(msg) => {
+                                return mcp_error(
+                                    req_id,
+                                    -32602,
+                                    &format!(
+                                        "modifications.patch_node_configs['{}']: {msg}",
+                                        talos_text_util::bounded_preview(&node_id, 64)
+                                    ),
+                                )
                             }
+                        };
+                        let Some(node_map) = node.as_object_mut() else {
+                            return mcp_error(
+                                req_id,
+                                -32602,
+                                "Invalid node structure: expected object",
+                            );
+                        };
+                        let data = node_map
+                            .entry("data")
+                            .or_insert_with(|| serde_json::json!({}));
+                        if data.is_null() {
+                            *data = serde_json::json!({});
+                        }
+                        let Some(data_map) = data.as_object_mut() else {
+                            return mcp_error(
+                                req_id,
+                                -32602,
+                                &format!(
+                                    "modifications.patch_node_configs['{}']: the node's config \
+                                     is not an object and cannot be patched",
+                                    talos_text_util::bounded_preview(&node_id, 64)
+                                ),
+                            );
+                        };
+                        for (k, v) in patch {
+                            data_map.insert(k, v);
+                        }
+                        if serde_json::to_string(&*data_map)
+                            .map(|s| s.len())
+                            .unwrap_or(0)
+                            > 100_000
+                        {
+                            return mcp_error(
+                                req_id,
+                                -32602,
+                                "config must be ≤ 100 KB when serialized after merge",
+                            );
                         }
                     }
                 }
                 graph_json = serde_json::to_string(&graph).unwrap_or(graph_json);
             }
+        }
+    }
+
+    // The structural checks every writer of a whole graph runs (ids, counts,
+    // acyclicity). A `skip_condition` the SOURCE already held is reported,
+    // not refused: the copy is no worse than the workflow it copies, and a
+    // patched one was parsed above.
+    let mut structure_warnings: Vec<String> = Vec::new();
+    if let Ok(graph) = serde_json::from_str::<serde_json::Value>(&graph_json) {
+        match talos_workflow_creation_helpers::validate_graph_structure(&graph) {
+            Ok(found) => {
+                structure_warnings.extend(found.skip_condition_faults.into_iter().map(|fault| {
+                    format!(
+                        "{fault} (copied from the source workflow: a skip_condition that does \
+                         not parse never skips its node)"
+                    )
+                }))
+            }
+            Err(msg) => return mcp_error(req_id, -32602, &msg),
         }
     }
 
@@ -5432,8 +5440,7 @@ async fn handle_duplicate_workflow(
                 match state.workflow_repo.copy_input_schema(wf_id, new_id).await {
                     Ok(_) => true,
                     Err(e) => {
-                        if let Some(resp) =
-                            crate::utils::action_targets_refusal_response(&e, &req_id)
+                        if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id)
                         {
                             return resp;
                         }
@@ -5450,19 +5457,28 @@ async fn handle_duplicate_workflow(
             } else {
                 false
             };
+            let mut response = serde_json::json!({
+                "workflow_id": new_id.to_string(),
+                "name": new_name,
+                "cloned_from": wf_id.to_string(),
+                "tags": tags,
+                "input_schema_copied": input_schema_copied,
+            });
+            if !structure_warnings.is_empty() {
+                response["warnings"] = serde_json::json!(structure_warnings);
+            }
             mcp_text(
                 req_id,
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "workflow_id": new_id.to_string(),
-                    "name": new_name,
-                    "cloned_from": wf_id.to_string(),
-                    "tags": tags,
-                    "input_schema_copied": input_schema_copied,
-                }))
-                .unwrap_or_default(),
+                &serde_json::to_string_pretty(&response).unwrap_or_default(),
             )
         }
         Err(e) => {
+            // The rules every graph write is held to (the per-node and
+            // workflow caps, what a node may start) have words of their own:
+            // the same words `update_node_config` gives.
+            if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
+                return resp;
+            }
             tracing::error!("duplicate_workflow insert failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to duplicate workflow")
         }
@@ -5836,10 +5852,26 @@ async fn handle_add_dispatch_node(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    // The workflows this node may start (security review 2026-10-14, G-7).
+    // Shape here, with the strict rule every graph write is held to; whether
+    // each is a workflow of the caller's is asked in front of the write
+    // (`talos_workflow_repository::action_link_targets`), so this tool and
+    // every other graph writer give the same answer.
+    let declared_targets =
+        match talos_workflow_engine_core::dispatch_targets::check_dispatch_targets(
+            args.get("targets"),
+        ) {
+            Ok(t) => t,
+            Err(fault) => return mcp_error(req_id, -32602, &fault.to_string()),
+        };
     let mut data = serde_json::json!({
         "dispatch_expression": dispatch_expression,
         "timeout_secs": timeout_secs,
     });
+    if let Some(ref targets) = declared_targets {
+        data[talos_workflow_engine_core::dispatch_targets::DISPATCH_TARGETS_KEY] =
+            serde_json::json!(targets.iter().map(Uuid::to_string).collect::<Vec<_>>());
+    }
     stamp_enforce_timeout(&mut data, enforce_timeout);
     let timeout_display = describe_child_timeout(timeout_secs, enforce_timeout);
 
@@ -5848,9 +5880,18 @@ async fn handle_add_dispatch_node(
         Err(resp) => return resp,
     };
 
+    let targets_display = match declared_targets {
+        Some(ref t) => format!(
+            "{} declared workflow(s); any other resolved target is refused",
+            t.len()
+        ),
+        None => "not declared (legacy: any of your workflows the expression names; \
+                 this will become a validation warning — pass `targets`)"
+            .to_string(),
+    };
     mcp_text(req_id, &format!(
-        "Dynamic dispatch node '{}' added to workflow {}.\nExpression: {}\nTimeout: {}\n\nAt runtime, the expression is evaluated against the node's input to determine which workflow to invoke.{}",
-        added.node_id, added.workflow_id, dispatch_expression, timeout_display, added.auto_publish_note
+        "Dynamic dispatch node '{}' added to workflow {}.\nExpression: {}\nTimeout: {}\nTargets: {}\n\nAt runtime, the expression is evaluated against the node's input to determine which workflow to invoke.{}",
+        added.node_id, added.workflow_id, dispatch_expression, timeout_display, targets_display, added.auto_publish_note
     ))
 }
 

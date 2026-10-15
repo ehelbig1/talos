@@ -1,0 +1,16 @@
+[package]
+name = "talos-schedule-spec"
+description = "What a workflow schedule must be before it is stored: the cron and timezone checks and the validated ScheduleSpec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+croner.workspace = true
+
+[lints]
+workspace = true

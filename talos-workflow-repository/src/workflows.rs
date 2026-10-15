@@ -816,6 +816,8 @@ impl WorkflowRepository {
         // CHECK enforces (see `begin_personal_org_write`). The resolved org
         // is bound as `org_id` ($12) so the row's org matches the scope.
         let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+        // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
+        crate::graph_caps::refuse_over_cap_graph(graph_json)?;
         crate::action_link_targets::refuse_unowned_targets_on_conn(
             &mut tx, user_id, None, graph_json,
         )
@@ -960,6 +962,8 @@ impl WorkflowRepository {
         intent: Option<&serde_json::Value>,
         org_id: Uuid,
     ) -> Result<(Uuid, i64)> {
+        // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
+        crate::graph_caps::refuse_over_cap_graph(graph_json)?;
         crate::action_link_targets::refuse_unowned_targets_on_conn(
             &mut *conn, user_id, None, graph_json,
         )
@@ -1015,6 +1019,9 @@ impl WorkflowRepository {
         // also write. Asked only when the graph has such a node. A row the
         // accessor cannot write then gets the answer the statement below
         // would give, without its graph being compared with anything.
+        // The per-node and workflow caps (`crate::graph_caps`), on the owner
+        // and the organisation path alike.
+        crate::graph_caps::refuse_over_cap_graph(graph_json)?;
         if crate::action_link_targets::names_action_targets(graph_json)? {
             let Some(owner) = sqlx::query_scalar::<_, Uuid>(
                 "SELECT user_id FROM workflows \
@@ -2102,6 +2109,8 @@ impl WorkflowRepository {
         // RFC 0006 / RFC 0005 S3: scope to the creator's personal org so the
         // org-pin WITH CHECK enforces; bind the resolved org as `org_id` ($7).
         let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+        // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
+        crate::graph_caps::refuse_over_cap_graph(graph_json)?;
         crate::action_link_targets::refuse_unowned_targets_on_conn(
             &mut tx, user_id, None, graph_json,
         )
@@ -2150,6 +2159,8 @@ impl WorkflowRepository {
         // RFC 0006 / RFC 0005 S3: scope to the creator's personal org so the
         // org-pin WITH CHECK enforces; bind the resolved org as `org_id` ($8).
         let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+        // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
+        crate::graph_caps::refuse_over_cap_graph(graph_json)?;
         crate::action_link_targets::refuse_unowned_targets_on_conn(
             &mut tx, user_id, None, graph_json,
         )
@@ -2334,6 +2345,8 @@ impl WorkflowRepository {
         // RFC 0006 / RFC 0005 S3: scope to the creator's personal org so the
         // org-pin WITH CHECK enforces; bind the resolved org as `org_id` ($6).
         let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+        // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
+        crate::graph_caps::refuse_over_cap_graph(graph_json)?;
         crate::action_link_targets::refuse_unowned_targets_on_conn(
             &mut tx, user_id, None, graph_json,
         )
@@ -2400,6 +2413,8 @@ impl WorkflowRepository {
         user_id: Uuid,
         graph_json: &str,
     ) -> Result<u64> {
+        // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
+        crate::graph_caps::refuse_over_cap_graph(graph_json)?;
         crate::action_link_targets::refuse_unowned_targets_on_pool(
             &self.db_pool,
             user_id,
@@ -2684,6 +2699,8 @@ impl WorkflowRepository {
         existing_id: Option<Uuid>,
     ) -> Result<Uuid> {
         let id: Uuid = if let Some(eid) = existing_id {
+            // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
+            crate::graph_caps::refuse_over_cap_graph(graph_json)?;
             crate::action_link_targets::refuse_unowned_targets_on_pool(
                 &self.db_pool,
                 user_id,
@@ -2712,6 +2729,8 @@ impl WorkflowRepository {
             // resolved org as `org_id` ($4). (The UPDATE branch above doesn't
             // move org_id, so it stays unscoped — permit-via-unset.)
             let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
+            // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
+            crate::graph_caps::refuse_over_cap_graph(graph_json)?;
             crate::action_link_targets::refuse_unowned_targets_on_conn(
                 &mut tx, user_id, None, graph_json,
             )
@@ -2735,6 +2754,15 @@ impl WorkflowRepository {
 
     /// Upsert a workflow_schedules row for a workflow (one schedule per workflow).
     ///
+    /// Takes a [`talos_schedule_spec::ScheduleSpec`], whose only constructor
+    /// runs every cron and timezone check the schedule tools run, so no
+    /// caller of this write can store a schedule that skipped them (security
+    /// review 2026-10-14, G-10: `import_platform_state` stored any non-empty
+    /// cron and any timezone here). The spec's first due time is written as
+    /// `next_trigger_at`, so a new row fires without waiting for the
+    /// scheduler's start-up backfill, and a replaced schedule is due by its
+    /// own expression rather than the one it replaced.
+    ///
     /// Defense-in-depth: the INSERT...SELECT predicate on `workflows.user_id`
     /// fails closed if the workflow doesn't belong to the caller — even if a
     /// future caller bypasses upstream ownership checks. We then verify rows
@@ -2743,26 +2771,27 @@ impl WorkflowRepository {
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
-        cron: &str,
-        timezone: &str,
+        schedule: &talos_schedule_spec::ScheduleSpec,
         is_enabled: bool,
     ) -> Result<()> {
         let result = sqlx::query(
-            "INSERT INTO workflow_schedules (workflow_id, user_id, cron_expression, timezone, is_enabled, created_at, updated_at) \
-             SELECT $1, $2, $3, $4, $5, NOW(), NOW() \
+            "INSERT INTO workflow_schedules (workflow_id, user_id, cron_expression, timezone, is_enabled, next_trigger_at, created_at, updated_at) \
+             SELECT $1, $2, $3, $4, $5, $6, NOW(), NOW() \
              FROM workflows \
              WHERE id = $1 AND user_id = $2 \
              ON CONFLICT (workflow_id) DO UPDATE SET \
                cron_expression = EXCLUDED.cron_expression, \
                timezone = EXCLUDED.timezone, \
                is_enabled = EXCLUDED.is_enabled, \
+               next_trigger_at = EXCLUDED.next_trigger_at, \
                updated_at = NOW()",
         )
         .bind(workflow_id)
         .bind(user_id)
-        .bind(cron)
-        .bind(timezone)
+        .bind(schedule.cron_expression())
+        .bind(schedule.timezone())
         .bind(is_enabled)
+        .bind(schedule.next_trigger_at())
         .execute(&self.db_pool)
         .await?;
         if result.rows_affected() == 0 {

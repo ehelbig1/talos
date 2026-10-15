@@ -4057,31 +4057,17 @@ async fn handle_deploy_workflow(
     // through to the scheduler and silently produced
     // next_trigger_at = NULL (schedule never fires). Mirrors the
     // create_schedule validation chain.
-    if let Some(ref cron) = cron_expression {
-        let field_count = cron.split_whitespace().count();
-        if !(5..=6).contains(&field_count) {
-            return mcp_error(
-                req_id,
-                -32602,
-                "Invalid cron_expression: must have 5 or 6 space-separated fields",
-            );
-        }
-        if let Err(e) = talos_scheduler::validate_cron(cron) {
-            return mcp_error(req_id, -32602, &e);
-        }
-        // MCP-618 (2026-05-12): enforce 60s minimum cron interval to
-        // match `handle_create_schedule` (schedules.rs:241). Pre-fix
-        // both `handle_deploy_workflow` and `handle_promote_workflow`
-        // composite-action handlers accepted any parseable cron, so a
-        // user could deploy a workflow that fires every second via
-        // either composite path while the canonical `create_schedule`
-        // tool rejected the same expression. The GraphQL surface
-        // (mutations.rs:1355) already enforces the gate; bring the
-        // MCP composite handlers to parity.
-        if let Err(e) = talos_scheduler::validate_cron_min_interval(cron, 60) {
-            return mcp_error(req_id, -32602, &e);
-        }
-    }
+    //
+    // Since 2026-10-15 the chain (field count, parse, the 60 s floor of
+    // MCP-618, the timezone) is `ScheduleSpec::validated`, the one home every
+    // schedule writer takes its value from.
+    let schedule_spec = match cron_expression.as_deref() {
+        Some(cron) => match talos_scheduler::ScheduleSpec::validated(cron, &timezone) {
+            Ok(spec) => Some(spec),
+            Err(e) => return mcp_error(req_id, -32602, &e.to_string()),
+        },
+        None => None,
+    };
     if let Err(e) = talos_scheduler::validate_timezone(&timezone) {
         return mcp_error(
             req_id,
@@ -4164,12 +4150,11 @@ async fn handle_deploy_workflow(
 
     // Optionally create schedule
     let mut schedule_id_str: Option<String> = None;
-    if let Some(ref cron) = cron_expression {
-        let next_trigger_at = talos_scheduler::calculate_next_trigger(cron, &timezone).ok();
+    if let Some(ref spec) = schedule_spec {
         let sid = Uuid::new_v4();
         let insert_result = state
             .advanced_repo
-            .create_workflow_schedule(sid, wf_id, user_id, cron, &timezone, next_trigger_at)
+            .create_workflow_schedule(sid, wf_id, user_id, spec)
             .await;
 
         match insert_result {
@@ -4338,32 +4323,31 @@ async fn handle_promote_workflow(
             );
         }
     };
+    // The same 1 MB wire cap `update_node_config` applies to its `config`
+    // (security review 2026-10-14, G-11). Each override is then held to that
+    // tool's per-config rules where it is applied below.
+    if let Err(resp) = crate::utils::enforce_payload_size_limit(
+        &serde_json::Value::Object(config_overrides.clone()),
+        req_id.clone(),
+    ) {
+        return resp;
+    }
 
     // MCP-195 (2026-05-08): semantic cron validation in addition to
     // field-count. Pre-fix `cron_expression: "5 5 5 5 99"` (invalid
     // day-of-week range) passed the 5-field check, persisted, and
     // produced a NULL next_trigger_at — the schedule never fired.
     // Mirrors create_schedule and deploy_workflow.
-    if let Some(ref cron) = cron_expression {
-        let field_count = cron.split_whitespace().count();
-        if !(5..=6).contains(&field_count) {
-            return mcp_error(
-                req_id,
-                -32602,
-                "Invalid cron_expression: must have 5 or 6 fields",
-            );
-        }
-        if let Err(e) = talos_scheduler::validate_cron(cron) {
-            return mcp_error(req_id, -32602, &e);
-        }
-        // MCP-618 (2026-05-12): minimum-interval gate, same shape as
-        // `handle_deploy_workflow`. The `promote_workflow` composite
-        // path also creates schedules and must enforce the same 60s
-        // minimum as `create_schedule`.
-        if let Err(e) = talos_scheduler::validate_cron_min_interval(cron, 60) {
-            return mcp_error(req_id, -32602, &e);
-        }
-    }
+    // MCP-618's 60 s floor included; since 2026-10-15 the whole chain is
+    // `ScheduleSpec::validated`, the one home every schedule writer takes its
+    // value from.
+    let schedule_spec = match cron_expression.as_deref() {
+        Some(cron) => match talos_scheduler::ScheduleSpec::validated(cron, &timezone) {
+            Ok(spec) => Some(spec),
+            Err(e) => return mcp_error(req_id, -32602, &e.to_string()),
+        },
+        None => None,
+    };
 
     // Fetch source workflow
     let src_row = state
@@ -4413,8 +4397,25 @@ async fn handle_promote_workflow(
 
                 if let Some(override_obj) = config_overrides.get(&label).and_then(|v| v.as_object())
                 {
+                    // `update_node_config`'s rules for a config patch: `__`
+                    // keys dropped, a `skip_condition` parsed (G-11).
+                    let override_obj =
+                        match crate::graph::config_patch_as_update_node_config_allows(override_obj)
+                        {
+                            Ok(filtered) => filtered,
+                            Err(msg) => {
+                                return mcp_error(
+                                    req_id,
+                                    -32602,
+                                    &format!(
+                                        "config_overrides['{}']: {msg}",
+                                        talos_text_util::bounded_preview(&label, 64)
+                                    ),
+                                )
+                            }
+                        };
                     if let Some(data) = node.get_mut("data").and_then(|v| v.as_object_mut()) {
-                        for (field, val) in override_obj {
+                        for (field, val) in &override_obj {
                             // Remove any case-variant of this key (e.g. "url" when setting "URL")
                             // to avoid stale shadow keys left over from LLM prefill.
                             let field_lower = field.to_lowercase();
@@ -4428,12 +4429,37 @@ async fn handle_promote_workflow(
                             }
                             data.insert(field.clone(), val.clone());
                         }
+                        if serde_json::to_string(&*data).map(|s| s.len()).unwrap_or(0) > 100_000 {
+                            return mcp_error(
+                                req_id,
+                                -32602,
+                                "config must be ≤ 100 KB when serialized after merge",
+                            );
+                        }
                         overrides_applied.push(label.clone());
                     }
                 }
             }
         }
     }
+
+    // The structural checks every writer of a whole graph runs (ids, counts,
+    // acyclicity). A `skip_condition` the SOURCE already held is reported,
+    // not refused; an overridden one was parsed above.
+    let structure_warnings: Vec<String> =
+        match talos_workflow_creation_helpers::validate_graph_structure(&graph) {
+            Ok(found) => found
+                .skip_condition_faults
+                .into_iter()
+                .map(|fault| {
+                    format!(
+                        "{fault} (copied from the source workflow: a skip_condition that does \
+                         not parse never skips its node)"
+                    )
+                })
+                .collect(),
+            Err(msg) => return mcp_error(req_id, -32602, &msg),
+        };
 
     let new_graph_json = graph.to_string();
     let new_wf_id = Uuid::new_v4();
@@ -4451,7 +4477,7 @@ async fn handle_promote_workflow(
         )
         .await
     {
-        if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+        if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
             return resp;
         }
         tracing::error!(source_workflow_id = %src_id, "promote_workflow insert failed: {}", e);
@@ -4502,15 +4528,14 @@ async fn handle_promote_workflow(
 
     // Optionally create schedule
     let mut schedule_id_str: Option<String> = None;
-    if let Some(ref cron) = cron_expression {
+    if let Some(ref spec) = schedule_spec {
         // MCP-1185: use caller-validated timezone (defaults to "UTC"
         // when omitted, matching pre-fix behaviour for backward
         // compatibility).
-        let next_trigger_at = talos_scheduler::calculate_next_trigger(cron, &timezone).ok();
         let sid = Uuid::new_v4();
         if state
             .advanced_repo
-            .create_workflow_schedule(sid, new_wf_id, user_id, cron, &timezone, next_trigger_at)
+            .create_workflow_schedule(sid, new_wf_id, user_id, spec)
             .await
             .is_ok()
         {
@@ -4536,6 +4561,9 @@ async fn handle_promote_workflow(
         // schedule was created in the intended zone (silent UTC
         // default was the pre-fix direction-class regression).
         result["timezone"] = serde_json::json!(timezone);
+    }
+    if !structure_warnings.is_empty() {
+        result["warnings"] = serde_json::json!(structure_warnings);
     }
 
     mcp_text(

@@ -1619,11 +1619,12 @@ async fn handle_create_workflow(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    if input_nodes.len() > 500 {
-        return mcp_error(req_id, -32602, "Workflow exceeds 500 node limit");
-    }
-    if input_edges.len() > 2000 {
-        return mcp_error(req_id, -32602, "Workflow exceeds 2000 edge limit");
+    // The one home for both numbers (the engine's load cap reads it too).
+    if let Some(refusal) = talos_workflow_engine_core::graph_limits::graph_size_refusal(
+        input_nodes.len(),
+        input_edges.len(),
+    ) {
+        return mcp_error(req_id, -32602, &refusal);
     }
 
     // Empty node array is allowed — caller can add nodes afterwards via add_node_to_workflow.
@@ -1783,12 +1784,21 @@ async fn handle_create_workflow(
     // workflow that fails only at trigger time with "workflow graph
     // contains a cycle". The add_edge and from-description authoring
     // paths already gate on this — close the gap on create_workflow.
-    if let Err(msg) = talos_workflow_creation_helpers::validate_acyclic(&graph_edges, &all_node_ids)
-    {
-        return mcp_error(req_id, -32602, &msg);
-    }
-
+    //
+    // Since 2026-10-15 this is `validate_graph_structure` on the graph as it
+    // will be stored — the one structural check every writer of a whole
+    // graph runs (acyclicity over the full edge set, ids, counts, and each
+    // node's `skip_condition`, refused here because this is an authoring
+    // path).
     let mut graph_json_value = serde_json::json!({ "nodes": graph_nodes, "edges": graph_edges });
+    match talos_workflow_creation_helpers::validate_graph_structure(&graph_json_value) {
+        Ok(found) => {
+            if let Some(fault) = found.skip_condition_faults.into_iter().next() {
+                return mcp_error(req_id, -32602, &fault);
+            }
+        }
+        Err(msg) => return mcp_error(req_id, -32602, &msg),
+    }
     // MCP-239 (2026-05-08): MCP-227 family — pre-fix `as_u64()` returned
     // None for negative / fractional / wrong-type, the `if let Some`
     // skipped the persistence, and the workflow was created with NO
@@ -2021,7 +2031,7 @@ async fn handle_create_workflow(
             )
         }
         Err(e) => {
-            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+            if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
                 return resp;
             }
             tracing::error!(err = ?e, "create_workflow failed");
@@ -6546,7 +6556,7 @@ async fn handle_clone_workflow(
             ))
         }
         Err(e) => {
-            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+            if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
                 return Some(resp);
             }
             tracing::error!("clone_workflow insert failed: {}", e);
@@ -6960,6 +6970,21 @@ async fn handle_import_workflow(
     if let Err(e) = talos_workflow_types::validate_graph_timeouts(&graph_json_str) {
         return Some(mcp_error(req_id.clone(), -32602, &e));
     }
+    // The structural checks every writer of a whole graph runs (ids, counts,
+    // acyclicity; security review 2026-10-14, G-26). A `skip_condition` that
+    // does not parse is WARNED about, not refused: refusing an expression
+    // already live in an export would make an existing workflow unrestorable.
+    let import_warnings: Vec<String> =
+        match talos_workflow_creation_helpers::validate_graph_structure(&graph_json) {
+            Ok(found) => found
+                .skip_condition_faults
+                .into_iter()
+                .map(|fault| {
+                    format!("{fault} (imported as written: it will not skip its node until fixed)")
+                })
+                .collect(),
+            Err(msg) => return Some(mcp_error(req_id.clone(), -32602, &msg)),
+        };
 
     match state
         .workflow_repo
@@ -6979,18 +7004,21 @@ async fn handle_import_workflow(
     {
         Ok(new_id) => {
             crate::utils::spawn_workflow_post_create_tasks(&state.db_pool, new_id, user_id);
+            let mut response = serde_json::json!({
+                "workflow_id": new_id.to_string(),
+                "name": wf_name,
+                "message": "Workflow imported successfully",
+            });
+            if !import_warnings.is_empty() {
+                response["warnings"] = serde_json::json!(import_warnings);
+            }
             Some(mcp_text(
                 req_id.clone(),
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "workflow_id": new_id.to_string(),
-                    "name": wf_name,
-                    "message": "Workflow imported successfully",
-                }))
-                .unwrap_or_default(),
+                &serde_json::to_string_pretty(&response).unwrap_or_default(),
             ))
         }
         Err(e) => {
-            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+            if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
                 return Some(resp);
             }
             tracing::error!("import_workflow insert failed: {}", e);
@@ -10713,7 +10741,7 @@ async fn handle_instantiate_workflow_pattern(
             ))
         }
         Err(e) => {
-            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+            if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
                 return Some(resp);
             }
             tracing::error!(
@@ -13142,7 +13170,7 @@ async fn handle_plan_and_execute_workflow(
             )
             .await
         {
-            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+            if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
                 return resp;
             }
             tracing::error!(
@@ -13219,7 +13247,7 @@ async fn handle_plan_and_execute_workflow(
         )
         .await
     {
-        if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+        if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
             return resp;
         }
         tracing::error!(
@@ -13700,7 +13728,7 @@ async fn handle_create_tree_of_thoughts_workflow(
             .unwrap_or_default(),
         ),
         Err(e) => {
-            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+            if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
                 return resp;
             }
             tracing::error!("create_tree_of_thoughts_workflow failed: {}", e);
@@ -13839,6 +13867,20 @@ async fn handle_import_yaml_workflow(
     if let Err(e) = talos_workflow_types::validate_graph_timeouts(&graph_json_str) {
         return mcp_error(req_id, -32602, &e);
     }
+    // The structural checks every writer of a whole graph runs (ids, counts,
+    // acyclicity; security review 2026-10-14, G-26). A `skip_condition` that
+    // does not parse is WARNED about, as on `import_workflow`.
+    let import_warnings: Vec<String> =
+        match talos_workflow_creation_helpers::validate_graph_structure(&graph_json) {
+            Ok(found) => found
+                .skip_condition_faults
+                .into_iter()
+                .map(|fault| {
+                    format!("{fault} (imported as written: it will not skip its node until fixed)")
+                })
+                .collect(),
+            Err(msg) => return mcp_error(req_id, -32602, &msg),
+        };
 
     match state
         .workflow_repo
@@ -13853,16 +13895,25 @@ async fn handle_import_yaml_workflow(
         )
         .await
     {
-        Ok(_) => mcp_text(req_id, &serde_json::to_string(&serde_json::json!({
-            "workflow_id": wf_id,
-            "name": yaml_wf.name,
-            "node_count": yaml_wf.nodes.len(),
-            "edge_count": yaml_wf.edges.len(),
-            "status": "imported",
-            "note": "Workflow created from YAML. Node module references need to be resolved — use add_node_to_workflow with rust_code for inline nodes.",
-        })).unwrap_or_default()),
+        Ok(_) => {
+            let mut response = serde_json::json!({
+                "workflow_id": wf_id,
+                "name": yaml_wf.name,
+                "node_count": yaml_wf.nodes.len(),
+                "edge_count": yaml_wf.edges.len(),
+                "status": "imported",
+                "note": "Workflow created from YAML. Node module references need to be resolved — use add_node_to_workflow with rust_code for inline nodes.",
+            });
+            if !import_warnings.is_empty() {
+                response["warnings"] = serde_json::json!(import_warnings);
+            }
+            mcp_text(
+                req_id,
+                &serde_json::to_string(&response).unwrap_or_default(),
+            )
+        }
         Err(e) => {
-            if let Some(resp) = crate::utils::action_targets_refusal_response(&e, &req_id) {
+            if let Some(resp) = crate::utils::graph_write_refusal_response(&e, &req_id) {
                 return resp;
             }
             tracing::error!("import_yaml_workflow failed: {:#}", e);

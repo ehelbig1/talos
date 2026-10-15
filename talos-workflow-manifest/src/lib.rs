@@ -449,6 +449,15 @@ impl WorkflowManifestService {
                     id
                 }
                 Err(e) => {
+                    // A rule every graph write is held to (what a node may
+                    // start, the per-node and workflow caps) has words of its
+                    // own; anything else is a database error.
+                    if let Some(refusal) = talos_workflow_repository::graph_write_refusal(&e) {
+                        outcome
+                            .warnings
+                            .push(format!("Workflow '{}' not imported: {}", name, refusal));
+                        continue;
+                    }
                     tracing::error!(
                         "import_platform_state: failed to upsert workflow '{}': {:#}",
                         name,
@@ -478,28 +487,45 @@ impl WorkflowManifestService {
             // omits the `schedule` key and doesn't trigger this branch.
             if let Some(schedule_json) = wf.get("schedule") {
                 match talos_workflow_repository::parse_imported_schedule(schedule_json) {
-                    Some(schedule) => match self
-                        .workflow_repo
-                        .upsert_workflow_schedule(
-                            workflow_id,
-                            user_id,
-                            schedule.cron_expression,
-                            schedule.timezone,
-                            schedule.is_enabled,
-                        )
-                        .await
-                    {
-                        Ok(_) => outcome.imported_schedules += 1,
-                        Err(e) => {
-                            tracing::warn!(
-                                "import_platform_state: schedule upsert failed for '{}': {:#}",
-                                name,
-                                e
-                            );
-                            outcome
-                                .warnings
-                                .push(format!("Failed to import schedule for workflow '{}'", name));
+                    // Held to the checks every schedule tool applies (5 or 6
+                    // fields, the scheduler's own parser, at most once a
+                    // minute, an IANA timezone). A schedule that fails them is
+                    // NOT written: it is not counted as imported, and a
+                    // workflow that already has a schedule keeps it (security
+                    // review 2026-10-14, G-10).
+                    Some(schedule) => match talos_schedule_spec::ScheduleSpec::validated(
+                        schedule.cron_expression,
+                        schedule.timezone,
+                    ) {
+                        Err(fault) => {
+                            outcome.warnings.push(format!(
+                                "Workflow '{}': schedule not imported: {}",
+                                name, fault
+                            ));
                         }
+                        Ok(spec) => match self
+                            .workflow_repo
+                            .upsert_workflow_schedule(
+                                workflow_id,
+                                user_id,
+                                &spec,
+                                schedule.is_enabled,
+                            )
+                            .await
+                        {
+                            Ok(_) => outcome.imported_schedules += 1,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "import_platform_state: schedule upsert failed for '{}': {:#}",
+                                    name,
+                                    e
+                                );
+                                outcome.warnings.push(format!(
+                                    "Failed to import schedule for workflow '{}'",
+                                    name
+                                ));
+                            }
+                        },
                     },
                     None => {
                         outcome.warnings.push(format!(

@@ -336,6 +336,13 @@ pub enum SystemNodeKind {
         dispatch_expression: String,
         /// Hard timeout for the dispatched target in seconds.
         timeout_secs: u64,
+        /// The workflows the author says this node may start
+        /// ([`crate::dispatch_targets`]). `None` is the legacy, undeclared
+        /// reading: any workflow the expression names that resolves for the
+        /// running user. `Some` admits only its members; an empty list
+        /// admits nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        targets: Option<Vec<Uuid>>,
     },
     /// Dispatch to any worker that advertises the required capabilities.
     CapabilityDispatch {

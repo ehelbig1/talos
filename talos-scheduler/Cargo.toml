@@ -10,8 +10,6 @@ publish.workspace = true
 anyhow.workspace = true
 async-nats.workspace = true
 chrono.workspace = true
-chrono-tz.workspace = true
-croner = "2.0"
 serde_json.workspace = true
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "uuid", "json", "chrono"] }
 talos-actor-repository = { path = "../talos-actor-repository" }
@@ -28,6 +26,8 @@ talos-execution-repository = { path = "../talos-execution-repository" }
 talos-execution-result-collector = { path = "../talos-execution-result-collector" }
 talos-module-executions = { path = "../talos-module-executions" }
 talos-registry = { path = "../talos-registry" }
+# The cron / timezone checks and `ScheduleSpec`, re-exported for existing callers.
+talos-schedule-spec = { path = "../talos-schedule-spec" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-task-supervision = { path = "../talos-task-supervision" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }

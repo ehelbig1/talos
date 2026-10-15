@@ -1853,12 +1853,14 @@ impl ParallelWorkflowEngine {
             Some(SystemNodeKind::DynamicDispatch {
                 dispatch_expression,
                 timeout_secs,
+                targets,
             }),
         ) = self.node_meta.get(&node_id)?
         else {
             return None;
         };
         let timeout_secs = *timeout_secs;
+        let declared_targets = targets.clone();
         let expression = dispatch_expression.clone();
         let inputs = self.gather_inputs(node_idx, results);
 
@@ -1918,6 +1920,30 @@ impl ParallelWorkflowEngine {
                         );
                         Err(format!(
                             "Could not resolve dispatch target: {target_id_or_name}"
+                        ))
+                    }
+                    // The author's declared set (security review 2026-10-14,
+                    // G-7): when the node declares `targets`, the workflow the
+                    // expression resolved to must be one of them. The
+                    // expression usually reads its input, so without this
+                    // whoever wrote that input chose which of the owner's
+                    // workflows ran. Undeclared is the legacy reading.
+                    Some(sub_wf_id)
+                        if !talos_workflow_engine_core::dispatch_targets::dispatch_target_admitted(
+                            declared_targets.as_deref(),
+                            sub_wf_id,
+                        ) =>
+                    {
+                        talos_metrics::record_expression_dispatch_target_refusal();
+                        tracing::warn!(
+                            %node_id,
+                            dispatched_workflow_id = %sub_wf_id,
+                            "DynamicDispatch refused: the resolved workflow is not among the \
+                             node's declared targets"
+                        );
+                        Err(format!(
+                            "Dispatch refused: workflow {sub_wf_id} is not among this node's \
+                             declared targets"
                         ))
                     }
                     Some(sub_wf_id) => {

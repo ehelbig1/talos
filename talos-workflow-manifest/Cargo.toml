@@ -20,6 +20,9 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 talos-module-repository = { path = "../talos-module-repository" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 
+# An imported schedule is checked as every schedule tool checks it.
+talos-schedule-spec = { path = "../talos-schedule-spec" }
+
 # Talos crates — services
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 

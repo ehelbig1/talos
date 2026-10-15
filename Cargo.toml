@@ -33,6 +33,7 @@ members = [
     "talos-auth-types",
     "talos-actor-types",
     "talos-workflow-types",
+    "talos-schedule-spec",
     "talos-auth",
     "talos-rate-limit",
     "talos-csrf",
@@ -231,6 +232,7 @@ bytes = "1.11.1"
 cap-std = "4.0"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+croner = "2.0"
 dashmap = "6.1.0"
 dotenvy = "0.15"
 ed25519-dalek = "3"

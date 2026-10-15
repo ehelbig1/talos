@@ -7753,6 +7753,7 @@ dependencies = [
  "talos-execution-finalizer",
  "talos-random",
  "talos-registry",
+ "talos-schedule-spec",
  "talos-tenancy",
  "talos-text-util",
  "talos-workflow-repository",
@@ -9725,7 +9726,17 @@ dependencies = [
  "anyhow",
  "chrono",
  "sqlx",
+ "talos-schedule-spec",
  "uuid",
+]
+
+[[package]]
+name = "talos-schedule-spec"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz 0.10.4",
+ "croner",
 ]
 
 [[package]]
@@ -9735,8 +9746,6 @@ dependencies = [
  "anyhow",
  "async-nats",
  "chrono",
- "chrono-tz 0.10.4",
- "croner",
  "serde_json",
  "sqlx",
  "talos-actor-memory-service",
@@ -9751,6 +9760,7 @@ dependencies = [
  "talos-metrics",
  "talos-module-executions",
  "talos-registry",
+ "talos-schedule-spec",
  "talos-secrets-manager",
  "talos-shutdown",
  "talos-task-supervision",
@@ -10340,6 +10350,7 @@ name = "talos-workflow-creation-helpers"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "rhai",
  "serde_json",
  "talos-text-util",
  "talos-workflow-engine-core",
@@ -10463,6 +10474,7 @@ dependencies = [
  "serde",
  "serde_json",
  "talos-module-repository",
+ "talos-schedule-spec",
  "talos-secrets-manager",
  "talos-workflow-repository",
  "thiserror 2.0.18",
@@ -10490,11 +10502,13 @@ dependencies = [
  "talos-execution-finalizer",
  "talos-execution-pause",
  "talos-metrics",
+ "talos-schedule-spec",
  "talos-secrets-manager",
  "talos-tenancy",
  "talos-text-util",
  "talos-workflow-engine-core",
  "talos-workflow-liveness",
+ "talos-workflow-types",
  "tokio",
  "tracing",
  "uuid",

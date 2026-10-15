@@ -30,6 +30,10 @@ talos-execution-pause = { path = "../talos-execution-pause" }
 talos-metrics = { path = "../talos-metrics" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
+# A schedule write takes a `ScheduleSpec`, whose constructor runs every check.
+talos-schedule-spec = { path = "../talos-schedule-spec" }
+# The per-node and workflow caps every graph write is held to.
+talos-workflow-types = { path = "../talos-workflow-types" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing.workspace = true

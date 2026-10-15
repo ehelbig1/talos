@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 pub mod action_link_targets;
 mod executions;
+pub mod graph_caps;
 mod graph_export;
 pub mod graph_version;
 pub mod origin;
@@ -21,7 +22,24 @@ mod stats;
 mod templates;
 mod workflows;
 
-pub use action_link_targets::{action_targets_refusal, ActionTargetsRefusal};
+pub use action_link_targets::{
+    action_targets_refusal, dispatch_targets_refusal, ActionTargetsRefusal, DispatchTargetsRefusal,
+};
+pub use graph_caps::{graph_caps_refusal, GraphCapsRefusal};
+
+/// The words to give a caller when a graph write was refused by one of the
+/// rules every graph write is held to (what an `action_links` or
+/// `expression_dispatch` node may start, and the per-node and workflow caps),
+/// or `None` when it failed for any other reason. The ONE place a handler
+/// asks which graph-write refusals have words of their own; anything else is
+/// an internal error and gets the handler's generic failure.
+#[must_use]
+pub fn graph_write_refusal(error: &anyhow::Error) -> Option<String> {
+    action_targets_refusal(error)
+        .map(ToString::to_string)
+        .or_else(|| dispatch_targets_refusal(error).map(ToString::to_string))
+        .or_else(|| graph_caps_refusal(error).map(ToString::to_string))
+}
 pub use executions::*;
 pub use graph_export::*;
 pub use graph_version::{GraphWrite, VersionedGraph};
