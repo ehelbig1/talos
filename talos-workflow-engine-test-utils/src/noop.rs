@@ -1,8 +1,6 @@
 //! Policy impls that do nothing. Use these when a test doesn't care
 //! about the trait's output but the engine requires one to be wired.
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use talos_workflow_engine_core::{
@@ -245,7 +243,7 @@ pub struct NoopSecretEnvelope;
 impl SecretEnvelope for NoopSecretEnvelope {
     async fn seal(
         &self,
-        _secrets: &HashMap<String, String>,
+        _secrets: &talos_workflow_engine_core::SecretMap,
         _shared_key: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), BoxError> {
         Ok((Vec::new(), Vec::new()))

@@ -12,7 +12,6 @@ use aes_gcm::{
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -1525,7 +1524,7 @@ trait SignedMessage {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| format!("system time error: {e}"))?
             .as_secs();
-        let rand_bytes: [u8; 16] = rand::rng().random();
+        let rand_bytes: [u8; 16] = talos_random::bytes::<16>();
         self.set_nonce(format!("{}:{}", ts, hex::encode(rand_bytes)));
 
         let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key)
@@ -1650,7 +1649,7 @@ trait SignedMessage {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| format!("system time error: {e}"))?
             .as_secs();
-        let rand_bytes: [u8; 16] = rand::rng().random();
+        let rand_bytes: [u8; 16] = talos_random::bytes::<16>();
         self.set_nonce(format!("{}:{}", ts, hex::encode(rand_bytes)));
         let sig = signing_key.sign(&self.ed25519_signing_input());
         self.set_signature(sig.to_bytes().to_vec());
@@ -4655,7 +4654,7 @@ impl EncryptedSecrets {
 ///
 /// # Security properties
 ///
-/// * Fresh 96-bit nonce per call (`rand::thread_rng`).
+/// * Fresh 96-bit nonce per call (`talos_random`).
 /// * Authenticated (AES-GCM's GMAC covers the ciphertext).
 /// * Key length is validated — a non-32-byte key returns an error
 ///   rather than silently truncating.
@@ -4669,7 +4668,7 @@ pub struct AesGcmSecretEnvelope;
 impl talos_workflow_engine_core::SecretEnvelope for AesGcmSecretEnvelope {
     async fn seal(
         &self,
-        secrets: &HashMap<String, String>,
+        secrets: &talos_workflow_engine_core::SecretMap,
         shared_key: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), talos_workflow_engine_core::BoxError> {
         // Empty map is a valid input — return the sentinel (empty
@@ -4687,7 +4686,7 @@ impl talos_workflow_engine_core::SecretEnvelope for AesGcmSecretEnvelope {
     /// AES-GCM tag.
     async fn seal_with_aad(
         &self,
-        secrets: &HashMap<String, String>,
+        secrets: &talos_workflow_engine_core::SecretMap,
         shared_key: &[u8],
         aad: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), talos_workflow_engine_core::BoxError> {
@@ -4712,7 +4711,10 @@ impl EncryptedSecrets {
     /// a transposed ciphertext (lifted from one execution into another
     /// with the same shared key) fail to decrypt rather than relying
     /// solely on the wider JobRequest HMAC to catch the tamper.
-    pub fn encrypt(secrets: &HashMap<String, String>, key: &[u8]) -> Result<Self, String> {
+    pub fn encrypt<V: AsRef<str>>(
+        secrets: &HashMap<String, V>,
+        key: &[u8],
+    ) -> Result<Self, String> {
         Self::encrypt_with_aad(secrets, key, &[])
     }
 
@@ -4737,8 +4739,8 @@ impl EncryptedSecrets {
     /// AES-GCM construction degenerates to "no AAD" and ciphertext
     /// is byte-identical to the no-AAD path (assuming the same
     /// nonce, which is randomly generated per call).
-    pub fn encrypt_with_aad(
-        secrets: &HashMap<String, String>,
+    pub fn encrypt_with_aad<V: AsRef<str>>(
+        secrets: &HashMap<String, V>,
         key: &[u8],
         aad: &[u8],
     ) -> Result<Self, String> {
@@ -4750,8 +4752,15 @@ impl EncryptedSecrets {
         }
 
         // Plaintext buffer and subkey are wiped on drop (every return path).
+        // The map is serialized through BORROWED values, so a caller holding
+        // `Zeroizing<String>` values (security review 2026-10-14, C-10) passes
+        // them without a plain copy; the JSON is identical to a String map's.
+        let view: HashMap<&str, &str> = secrets
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_ref()))
+            .collect();
         let plaintext = zeroize::Zeroizing::new(
-            serde_json::to_vec(secrets).map_err(|e| format!("serialize secrets: {e}"))?,
+            serde_json::to_vec(&view).map_err(|e| format!("serialize secrets: {e}"))?,
         );
 
         // The AES-GCM key is an HKDF subkey of the root, never the raw
@@ -12802,7 +12811,7 @@ mod protocol_review_2026_09_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_secs();
-        let r: [u8; 16] = rand::rng().random();
+        let r: [u8; 16] = talos_random::bytes::<16>();
         format!("{ts}:{}", hex::encode(r))
     }
 

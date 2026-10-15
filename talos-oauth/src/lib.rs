@@ -642,11 +642,12 @@ pub fn check_login_extra_scopes(provider: &OAuthProvider, scopes: Option<&[Strin
 /// withhold the cookie on that navigation, breaking every login.
 /// Returns `(plaintext_nonce, sha256_hex_hash)`.
 pub fn generate_oauth_session_binding() -> (String, String) {
-    // ~244 bits of entropy from two v4 UUIDs (122 bits each), hex-
-    // encoded so the value passes `validate_oauth_state_token_format`'s
-    // charset rules and is a safe cookie value. No new RNG dependency:
-    // `uuid` is already a direct dep and v4 draws from the OS CSPRNG.
-    let nonce = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    // 256 bits from `talos_random` (the operating system's source; the
+    // workspace's one home for bearer-token bytes, security review
+    // 2026-10-14, C-9), hex-encoded so the value passes
+    // `validate_oauth_state_token_format`'s charset rules and is a safe
+    // cookie value.
+    let nonce = hex::encode(talos_random::bytes::<32>());
     let hash = hash_oauth_session_binding(&nonce);
     (nonce, hash)
 }

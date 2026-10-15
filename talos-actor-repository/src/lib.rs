@@ -75,7 +75,6 @@ pub struct ActorDetail {
     pub description: Option<String>,
     pub status: String,
     pub max_capability_world: String,
-    pub secret_grants: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub metadata: Option<serde_json::Value>,
 }
@@ -327,7 +326,6 @@ pub struct SourceActorCloneRow {
     pub name: String,
     pub max_capability_world: String,
     pub description: Option<String>,
-    pub secret_grants: Vec<String>,
     /// The source actor's privacy / mutation ceilings, copied VERBATIM onto the
     /// clone (2026-09-10). Pre-fix a clone of a `tier1` + `readonly` actor was
     /// inserted at the column defaults — `tier2`, `write`, no egress override —
@@ -482,7 +480,6 @@ pub struct ActorFullSummary {
     pub description: Option<String>,
     pub status: String,
     pub max_capability_world: String,
-    pub secret_grants: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub metadata: Option<serde_json::Value>,
     // Execution stats
@@ -964,7 +961,7 @@ impl ActorRepository {
     /// Fetch full actor detail (name, description, status, capability world, grants, metadata).
     pub async fn get_actor_detail(&self, actor_id: Uuid) -> Result<Option<ActorDetail>> {
         let row = sqlx::query(
-            "SELECT name, description, status, max_capability_world, secret_grants, created_at, metadata \
+            "SELECT name, description, status, max_capability_world, created_at, metadata \
              FROM actors WHERE id = $1",
         )
         .bind(actor_id)
@@ -977,7 +974,6 @@ impl ActorRepository {
                 description: r.try_get("description")?,
                 status: r.try_get("status")?,
                 max_capability_world: r.try_get("max_capability_world")?,
-                secret_grants: r.try_get("secret_grants")?,
                 created_at: r.try_get("created_at")?,
                 metadata: r.try_get("metadata")?,
             })
@@ -1043,7 +1039,7 @@ impl ActorRepository {
     pub async fn get_actor_full_summary(&self, actor_id: Uuid) -> Result<Option<ActorFullSummary>> {
         let row = sqlx::query(
             "SELECT a.name, a.description, a.status, a.max_capability_world, \
-                    a.secret_grants, a.created_at, a.metadata, \
+                    a.created_at, a.metadata, \
                     COALESCE(e.total, 0)        AS exec_total, \
                     COALESCE(e.last_24h, 0)     AS exec_last_24h, \
                     COALESCE(e.completed, 0)    AS exec_completed, \
@@ -1084,7 +1080,6 @@ impl ActorRepository {
                 description: r.try_get("description")?,
                 status: r.try_get("status")?,
                 max_capability_world: r.try_get("max_capability_world")?,
-                secret_grants: r.try_get("secret_grants")?,
                 created_at: r.try_get("created_at")?,
                 metadata: r.try_get("metadata")?,
                 exec_total: r.try_get("exec_total")?,
@@ -1468,33 +1463,6 @@ impl ActorRepository {
         .fetch_one(&self.db_pool)
         .await?;
         Ok(count)
-    }
-
-    // ── Secret grants ──────────────────────────────────────────────────────
-
-    /// Append a key_path to an actor's secret_grants array, skipping if already present.
-    /// Scoped to the requesting user (L T4-2). Returns rows_affected so callers can
-    /// detect not-found / cross-tenant (== 0) vs already-granted (== 0 too — combine
-    /// with a pre-check if the distinction matters).
-    pub async fn grant_secret_access(
-        &self,
-        actor_id: Uuid,
-        user_id: Uuid,
-        key_path: &str,
-    ) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE actors \
-             SET secret_grants = array_append(secret_grants, $1), updated_at = now() \
-             WHERE id = $2 \
-               AND user_id = $3 \
-               AND NOT ($1 = ANY(secret_grants))",
-        )
-        .bind(key_path)
-        .bind(actor_id)
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(result.rows_affected())
     }
 
     // ── Budget policies ────────────────────────────────────────────────────
@@ -3672,7 +3640,7 @@ impl ActorRepository {
         user_id: Uuid,
     ) -> Result<Option<SourceActorCloneRow>> {
         let row = sqlx::query(
-            "SELECT name, description, max_capability_world, secret_grants, \
+            "SELECT name, description, max_capability_world, \
                     max_llm_tier, egress_scope, max_write_ceiling, http_verb_ceiling \
              FROM actors WHERE id = $1 AND user_id = $2 AND status != 'terminated'",
         )
@@ -3686,9 +3654,6 @@ impl ActorRepository {
                 name: r.try_get("name")?,
                 max_capability_world: r.try_get("max_capability_world")?,
                 description: r.try_get::<Option<_>, _>("description")?,
-                secret_grants: r
-                    .try_get::<Option<_>, _>("secret_grants")?
-                    .unwrap_or_default(),
                 ceilings: ActorCeilingColumns {
                     max_llm_tier: r.try_get("max_llm_tier")?,
                     egress_scope: r.try_get::<Option<String>, _>("egress_scope")?,
@@ -3700,40 +3665,10 @@ impl ActorRepository {
         .transpose()
     }
 
-    /// Insert a cloned actor with explicit secret grants.
-    pub async fn insert_actor_with_grants(
-        &self,
-        actor_id: Uuid,
-        user_id: Uuid,
-        name: &str,
-        description: Option<&str>,
-        max_capability_world: &str,
-        secret_grants: &[String],
-    ) -> Result<()> {
-        // RFC 0006 / RFC 0005 S3: scope to the owner's personal org so the
-        // org-pin WITH CHECK enforces (org_id is trigger-stamped, not bound).
-        let mut tx = self.begin_personal_org_write(user_id).await?;
-        sqlx::query(
-            "INSERT INTO actors (id, user_id, name, description, max_capability_world, secret_grants) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(actor_id)
-        .bind(user_id)
-        .bind(name)
-        .bind(description)
-        .bind(max_capability_world)
-        .bind(secret_grants)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// MCP-434 (2026-05-11): atomic INSERT/COUNT for clone_actor's
     /// per-user limit gate. Sibling to insert_actor_with_limit_check
-    /// (the create_actor variant) but accepts a `secret_grants` array
-    /// to preserve the source actor's cross-namespace grants on the
-    /// clone.
+    /// (the create_actor variant) for a clone, carrying the source's
+    /// ceilings.
     ///
     /// Pre-MCP-434 clone_actor ran SELECT COUNT + INSERT as two
     /// statements with MCP-401 fail-CLOSED on the count query. The
@@ -3746,16 +3681,14 @@ impl ActorRepository {
     /// handler translates to the same "limit reached" error.
     ///
     /// Returns rows_affected (0 if the limit gate fired, 1 on
-    /// successful insert). Distinct from insert_actor_with_grants
-    /// (always 1) so the handler can branch on the limit-hit case.
-    pub async fn insert_actor_with_grants_and_limit_check(
+    /// successful insert), so the handler can branch on the limit-hit case.
+    pub async fn insert_cloned_actor_with_limit_check(
         &self,
         actor_id: Uuid,
         user_id: Uuid,
         name: &str,
         description: Option<&str>,
         max_capability_world: &str,
-        secret_grants: &[String],
         ceilings: &ActorCeilingColumns,
         max_actors_per_user: i64,
     ) -> Result<u64> {
@@ -3778,17 +3711,16 @@ impl ActorRepository {
         // escalation guard (`20260924120000`) is `BEFORE UPDATE`, so a clone
         // copies a source's grant exactly as it copies `max_write_ceiling`.
         let result = sqlx::query(
-            "INSERT INTO actors (id, user_id, name, description, max_capability_world, secret_grants, \
+            "INSERT INTO actors (id, user_id, name, description, max_capability_world, \
                                  max_llm_tier, egress_scope, max_write_ceiling, http_verb_ceiling) \
-             SELECT $1, $2, $3, $4, $5, $6, $8, $9, $10, $11 \
-             WHERE (SELECT COUNT(*) FROM actors WHERE user_id = $2) < $7",
+             SELECT $1, $2, $3, $4, $5, $7, $8, $9, $10 \
+             WHERE (SELECT COUNT(*) FROM actors WHERE user_id = $2) < $6",
         )
         .bind(actor_id)
         .bind(user_id)
         .bind(name)
         .bind(description)
         .bind(max_capability_world)
-        .bind(secret_grants)
         .bind(max_actors_per_user)
         .bind(max_llm_tier)
         .bind(egress_scope)

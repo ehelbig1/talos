@@ -111,9 +111,14 @@ impl SealContext {
     /// Serialize a resolved secrets map into a seal context. The map is consumed
     /// by the caller after this; the serialized copy here is the only retained
     /// form and is zeroized on drop.
-    pub fn new(secrets: &HashMap<String, String>) -> Result<Self, String> {
-        let json =
-            serde_json::to_vec(secrets).map_err(|e| format!("serialize seal context: {e}"))?;
+    pub fn new<V: AsRef<str>>(secrets: &HashMap<String, V>) -> Result<Self, String> {
+        // Borrowed values (C-10): a `Zeroizing<String>` map passes without a
+        // plain copy; the JSON is identical to a String map's.
+        let view: HashMap<&str, &str> = secrets
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_ref()))
+            .collect();
+        let json = serde_json::to_vec(&view).map_err(|e| format!("serialize seal context: {e}"))?;
         Ok(Self {
             secrets_json: Zeroizing::new(json),
         })
@@ -680,7 +685,10 @@ mod tests {
 
         let exec = Uuid::new_v4();
         let seals = InFlightSeals::new();
-        seals.register(exec, SealContext::new(&HashMap::new()).unwrap());
+        seals.register(
+            exec,
+            SealContext::new(&HashMap::<String, String>::new()).unwrap(),
+        );
 
         let we = WorkerEphemeral::generate();
         let claim =

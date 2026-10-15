@@ -812,15 +812,10 @@ impl SecretsManager {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        // get_secrets_by_paths returns plain Strings; wrap each value in
-        // Zeroizing immediately so the cache and the returned map share
-        // the same protection. The intermediate plain-String map exists
-        // for one statement before being consumed by .into_iter().
-        let plaintext_keys = self.get_secrets_by_paths(&paths, user_id).await?;
-        let zeroizing_keys: std::collections::HashMap<String, Zeroizing<String>> = plaintext_keys
-            .into_iter()
-            .map(|(k, v)| (k, Zeroizing::new(v)))
-            .collect();
+        // get_secrets_by_paths returns Zeroizing values (C-10), so the cache
+        // and the returned map hold the same protection with no plain copy.
+        let zeroizing_keys: std::collections::HashMap<String, Zeroizing<String>> =
+            self.get_secrets_by_paths(&paths, user_id).await?;
 
         // MCP-771 (2026-05-13): `LLM_KEYS_CACHE_TTL_SECS=0` previously
         // parsed cleanly and produced expires_at == now → every
@@ -1605,22 +1600,14 @@ impl SecretsManager {
         //     cross-user when the operator lists them in allowed_modules.
         let row = match &requestor {
             SecretRequestor::User(user_id) => {
-                sqlx::query(
-                    r#"
-                    SELECT id,
-                           encrypted_value,
-                           encryption_key_id,
-                           encryption_format_version,
-                           allowed_modules,
-                           expires_at,
-                           owner_user_id,
-                           org_id
-                    FROM secrets
-                    WHERE key_path = $1
-                      AND (owner_user_id = $2 OR org_id = ANY($3))
-                    LIMIT 1
-                "#,
-                )
+                sqlx::query(concat!(
+                    "SELECT id, encrypted_value, encryption_key_id, \
+                            encryption_format_version, allowed_modules, expires_at, \
+                            owner_user_id, org_id \
+                     FROM secrets WHERE key_path = $1 AND ",
+                    may_manage_secret!("", "$2", "$3"),
+                    " LIMIT 1"
+                ))
                 .bind(key_path)
                 .bind(user_id)
                 .bind(accessible_org_ids)
@@ -1817,12 +1804,12 @@ impl SecretsManager {
         // pre-fix RETURNING semantics; existence-leak protection is
         // intact because the gate is in this WHERE clause).
         let row: Option<(Uuid, Option<Uuid>, Option<Uuid>)> =
-            sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<Uuid>)>(
-                r#"SELECT id, owner_user_id, org_id FROM secrets
-               WHERE key_path = $1
-                 AND ($2::uuid IS NULL OR owner_user_id = $2::uuid OR org_id = ANY($3))
-               FOR UPDATE"#,
-            )
+            sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<Uuid>)>(concat!(
+                "SELECT id, owner_user_id, org_id FROM secrets \
+                 WHERE key_path = $1 AND ($2::uuid IS NULL OR ",
+                may_manage_secret!("", "$2::uuid", "$3"),
+                ") FOR UPDATE"
+            ))
             .bind(key_path)
             .bind(updater_user_id)
             .bind(accessible_org_ids)
@@ -2248,7 +2235,28 @@ impl SecretsManager {
         // per-context subkey from the DEK named by the row's `key_id`
         // (v3 → global DEK, v4 → per-org DEK; `get_dek` resolves by id,
         // so decrypt needs no org awareness).
-        match crate::SecretFormat::from_version(format_version)?.decrypt_route() {
+        let format = crate::SecretFormat::from_version(format_version)?;
+        // C-7 (2026-10-14): a v3 row is sealed under the GLOBAL DEK only. One
+        // whose key id names an org's DEK claims a scope it is not in, and is
+        // refused. (v4-under-global is not refused here: it crosses no
+        // tenant, and 2 such module-payload rows exist from 2026-09-10 — the
+        // C-6 mislabel. The full org match needs the row's org:
+        // [`Self::decrypt_versioned_scoped`].)
+        // A blob too short to carry a nonce fails as `Aead` below with no DEK
+        // lookup; the scope check is only for one that could open.
+        if matches!(format, crate::SecretFormat::V3Derived) && encrypted.len() >= 12 {
+            let dek = self.get_dek(key_id).await?;
+            if dek.org_id.is_some() {
+                tracing::error!(
+                    target: "talos_security",
+                    event_kind = "dek_scope_mismatch",
+                    %key_id,
+                    "a v3 row names an org DEK — refusing to decrypt"
+                );
+                return Err(SecretsError::Aead);
+            }
+        }
+        match format.decrypt_route() {
             crate::DecryptRoute::LegacyNoAad => self.decrypt_value_by_key(key_id, encrypted).await,
             crate::DecryptRoute::CallerAad => {
                 self.decrypt_value_by_key_with_aad(key_id, encrypted, aad)
@@ -2259,6 +2267,40 @@ impl SecretsManager {
                     .await
             }
         }
+    }
+
+    /// [`Self::decrypt_versioned`] for a row whose org the caller knows: a
+    /// v3 or v4 row is decrypted only under the DEK its scope allows
+    /// (`dek_scope_matches_row` — the check `secrets` rows have had since
+    /// RFC 0013), so a v4 row naming ANOTHER org's DEK is refused (security
+    /// review 2026-10-14, C-7).
+    pub async fn decrypt_versioned_scoped(
+        &self,
+        key_id: Uuid,
+        encrypted: &[u8],
+        aad: &[u8],
+        format_version: i16,
+        row_org_id: Option<Uuid>,
+    ) -> Result<Zeroizing<String>, SecretsError> {
+        let format = crate::SecretFormat::from_version(format_version)?;
+        if matches!(
+            format,
+            crate::SecretFormat::V3Derived | crate::SecretFormat::V4OrgDerived
+        ) && encrypted.len() >= 12
+        {
+            let dek = self.get_dek(key_id).await?;
+            if !dek_scope_matches_row(format, dek.org_id, row_org_id) {
+                tracing::error!(
+                    target: "talos_security",
+                    event_kind = "dek_scope_mismatch",
+                    %key_id,
+                    "a row names a DEK outside its org scope — refusing to decrypt"
+                );
+                return Err(SecretsError::Aead);
+            }
+        }
+        self.decrypt_versioned(key_id, encrypted, aad, format_version)
+            .await
     }
 
     /// Convenience wrapper around `encrypt_value_with_aad` for callers
@@ -2639,7 +2681,7 @@ impl SecretsManager {
         &self,
         module_id: Uuid,
         user_id: Option<Uuid>,
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<std::collections::HashMap<String, Zeroizing<String>>> {
         self.get_module_secrets_inner(module_id, user_id).await
     }
 
@@ -2668,7 +2710,7 @@ impl SecretsManager {
         &self,
         module_id: Uuid,
         user_id: Uuid,
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<std::collections::HashMap<String, Zeroizing<String>>> {
         self.get_module_secrets_inner(module_id, Some(user_id))
             .await
     }
@@ -2677,7 +2719,7 @@ impl SecretsManager {
         &self,
         module_id: Uuid,
         user_id: Option<Uuid>,
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<std::collections::HashMap<String, Zeroizing<String>>> {
         use sqlx::Row as _;
         // N T2-N1: SELECT now also pulls `encryption_format_version` so
         // the per-row decrypt dispatches v0 (legacy no-AAD) vs v1
@@ -2688,19 +2730,16 @@ impl SecretsManager {
         // MCP-589: scope by `user_id` when supplied. Mirrors the
         // `get_secrets_by_paths` predicate so global/system secrets
         // (owner_user_id IS NULL) AND user-owned secrets BOTH
-        // surface, but other users' secrets do NOT. `created_by`
-        // is also accepted for legacy rows where owner_user_id was
-        // never populated.
+        // surface, but other users' secrets do NOT — through the one
+        // dispatch-read rule (`may_dispatch_read_secret!`, C-2).
         let rows = if let Some(uid) = user_id {
-            sqlx::query(
-                r#"
-                SELECT id, key_path, encrypted_value, encryption_key_id,
-                       encryption_format_version, expires_at, org_id
-                FROM secrets
-                WHERE $1 = ANY(allowed_modules)
-                  AND (owner_user_id IS NULL OR owner_user_id = $2 OR created_by = $2)
-                "#,
-            )
+            sqlx::query(concat!(
+                "SELECT id, key_path, encrypted_value, encryption_key_id, \
+                        encryption_format_version, expires_at, org_id \
+                 FROM secrets \
+                 WHERE $1 = ANY(allowed_modules) AND ",
+                may_dispatch_read_secret!("$2")
+            ))
             .bind(module_id)
             .bind(uid)
             .fetch_all(&self.db_pool)
@@ -2762,7 +2801,7 @@ impl SecretsManager {
                 .await
             {
                 Ok(plaintext) => {
-                    secrets_map.insert(key_path.clone(), plaintext.to_string());
+                    secrets_map.insert(key_path.clone(), plaintext);
                     accessed_ids.push(id);
                 }
                 Err(e) => {
@@ -2783,21 +2822,40 @@ impl SecretsManager {
             }
         }
 
-        if !accessed_ids.is_empty() {
-            if let Err(e) = sqlx::query!(
-                "UPDATE secrets SET last_accessed_at = NOW(), access_count = access_count + 1 WHERE id = ANY($1)",
-                &accessed_ids
-            )
-            .execute(&self.db_pool)
-            .await {
-                tracing::warn!("Failed to update access stats for module secrets: {}", e);
-            }
-
-            // Note: Audit log for mass reading could be added here if needed, but for performance,
-            // module bulk secret access is often treated as a single event or omitted.
-        }
+        self.record_dispatch_reads(&accessed_ids, user_id, Some(module_id))
+            .await;
 
         Ok(secrets_map)
+    }
+
+    /// The access counter and one `dispatch_read` audit row per delivered
+    /// secret, in one statement ([`RECORD_DISPATCH_READS_SQL`], C-4). A
+    /// failure is logged, not raised: the dispatch already holds the values,
+    /// and refusing it now would not un-read them.
+    async fn record_dispatch_reads(
+        &self,
+        secret_ids: &[Uuid],
+        user_id: Option<Uuid>,
+        module_id: Option<Uuid>,
+    ) {
+        if secret_ids.is_empty() {
+            return;
+        }
+        if let Err(e) = sqlx::query(RECORD_DISPATCH_READS_SQL)
+            .bind(secret_ids)
+            .bind(user_id)
+            .bind(module_id)
+            .execute(&self.db_pool)
+            .await
+        {
+            tracing::warn!(
+                target: "talos_security",
+                event_kind = "secret_dispatch_read_unrecorded",
+                count = secret_ids.len(),
+                error = %e,
+                "dispatch secret reads were not recorded in the audit log"
+            );
+        }
     }
 
     /// Fetch secrets by their key_paths (from a module's allowed_secrets list).
@@ -2811,7 +2869,7 @@ impl SecretsManager {
         &self,
         allowed_paths: &[String],
         owner_user_id: Option<Uuid>,
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<std::collections::HashMap<String, Zeroizing<String>>> {
         let is_wildcard = allowed_paths.iter().any(|p| p == "*");
 
         // N T2-N1: include `id` (for AAD) and `encryption_format_version`
@@ -2828,12 +2886,13 @@ impl SecretsManager {
         );
         let records: Vec<PathRecord> = if is_wildcard {
             if let Some(uid) = owner_user_id {
-                sqlx::query_as(
+                sqlx::query_as(concat!(
                     "SELECT id, key_path, encrypted_value, encryption_key_id, \
                             encryption_format_version, expires_at, org_id \
                      FROM secrets \
-                     WHERE owner_user_id IS NULL OR owner_user_id = $1 OR created_by = $1",
-                )
+                     WHERE ",
+                    may_dispatch_read_secret!("$1")
+                ))
                 .bind(uid)
                 .fetch_all(&self.db_pool)
                 .await?
@@ -2848,13 +2907,13 @@ impl SecretsManager {
                 .await?
             }
         } else if let Some(uid) = owner_user_id {
-            sqlx::query_as(
+            sqlx::query_as(concat!(
                 "SELECT id, key_path, encrypted_value, encryption_key_id, \
                         encryption_format_version, expires_at, org_id \
                  FROM secrets \
-                 WHERE key_path = ANY($1) \
-                   AND (owner_user_id IS NULL OR owner_user_id = $2 OR created_by = $2)",
-            )
+                 WHERE key_path = ANY($1) AND ",
+                may_dispatch_read_secret!("$2")
+            ))
             .bind(allowed_paths)
             .bind(uid)
             .fetch_all(&self.db_pool)
@@ -2873,6 +2932,7 @@ impl SecretsManager {
         };
 
         let mut secrets_map = std::collections::HashMap::new();
+        let mut delivered: Vec<Uuid> = Vec::new();
         let now = chrono::Utc::now();
 
         for (
@@ -2905,7 +2965,8 @@ impl SecretsManager {
                 .await
             {
                 Ok(plaintext) => {
-                    secrets_map.insert(key_path, plaintext.to_string());
+                    secrets_map.insert(key_path, plaintext);
+                    delivered.push(secret_id);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -2917,6 +2978,8 @@ impl SecretsManager {
             }
         }
 
+        self.record_dispatch_reads(&delivered, owner_user_id, None)
+            .await;
         Ok(secrets_map)
     }
 
@@ -2973,12 +3036,12 @@ impl SecretsManager {
         // Lock the rows first. (id, owner_user_id) so cache invalidation can
         // be scoped to each deleted secret's actual owner — same rationale as
         // update_secret.
-        let doomed: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
-            r#"SELECT id, owner_user_id FROM secrets
-               WHERE key_path = $1
-                 AND ($2::uuid IS NULL OR owner_user_id = $2::uuid OR created_by = $2::uuid OR org_id = ANY($3))
-               FOR UPDATE"#,
-        )
+        let doomed: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(concat!(
+            "SELECT id, owner_user_id FROM secrets \
+             WHERE key_path = $1 AND ($2::uuid IS NULL OR ",
+            may_manage_secret!("", "$2::uuid", "$3"),
+            ") FOR UPDATE"
+        ))
         .bind(key_path)
         .bind(deleter_user_id)
         .bind(accessible_org_ids)
@@ -3080,17 +3143,19 @@ impl SecretsManager {
         accessible_org_ids: &[Uuid],
     ) -> Result<Vec<Secret>> {
         let rows = if let Some(user_id) = owner_user_id {
-            sqlx::query(
+            sqlx::query(concat!(
                 r#"
                 SELECT id, name, key_path, description, created_by,
                        created_at, updated_at, expires_at,
                        owner_user_id, org_id, allowed_modules,
                        last_accessed_at, access_count
                 FROM secrets
-                WHERE owner_user_id = $1 OR created_by = $1 OR org_id = ANY($2)
+                WHERE "#,
+                may_manage_secret!("", "$1", "$2"),
+                r#"
                 ORDER BY created_at DESC
-                "#,
-            )
+                "#
+            ))
             .bind(user_id)
             .bind(accessible_org_ids)
             .fetch_all(&self.db_pool)
@@ -3130,18 +3195,20 @@ impl SecretsManager {
             // internal/admin all-rows path and stays permissive.)
             let scope = talos_tenancy::TenantReadScope::new(user_id, accessible_org_ids.to_vec());
             let mut tx = talos_db::begin_tenant_read_scoped(&self.db_pool, &scope).await?;
-            let rows = sqlx::query(
+            let rows = sqlx::query(concat!(
                 r#"
                 SELECT id, name, key_path, description, created_by,
                        created_at, updated_at, expires_at,
                        owner_user_id, org_id, allowed_modules,
                        last_accessed_at, access_count
                 FROM secrets
-                WHERE owner_user_id = $1 OR created_by = $1 OR org_id = ANY($2)
+                WHERE "#,
+                may_manage_secret!("", "$1", "$2"),
+                r#"
                 ORDER BY created_at DESC, id DESC
                 LIMIT $3 OFFSET $4
-                "#,
-            )
+                "#
+            ))
             .bind(user_id)
             .bind(accessible_org_ids)
             .bind(limit)
@@ -3199,7 +3266,7 @@ impl SecretsManager {
         let scope =
             talos_tenancy::TenantReadScope::new(requestor_user_id, accessible_org_ids.to_vec());
         let mut tx = talos_db::begin_tenant_read_scoped(&self.db_pool, &scope).await?;
-        let row = sqlx::query(
+        let row = sqlx::query(concat!(
             r#"
             SELECT id, name, key_path, description, created_by,
                    created_at, updated_at, expires_at,
@@ -3207,9 +3274,11 @@ impl SecretsManager {
                    last_accessed_at, access_count
             FROM secrets
             WHERE key_path = $1
-              AND (owner_user_id = $2 OR created_by = $2 OR org_id = ANY($3))
-            "#,
-        )
+              AND "#,
+            may_manage_secret!("", "$2", "$3"),
+            r#"
+            "#
+        ))
         .bind(key_path)
         .bind(requestor_user_id)
         .bind(accessible_org_ids)
@@ -3229,7 +3298,7 @@ impl SecretsManager {
         requestor_user_id: Uuid,
         accessible_org_ids: &[Uuid],
     ) -> Result<Secret> {
-        let row = sqlx::query(
+        let row = sqlx::query(concat!(
             r#"
             SELECT id, name, key_path, description, created_by,
                    created_at, updated_at, expires_at,
@@ -3237,9 +3306,11 @@ impl SecretsManager {
                    last_accessed_at, access_count
             FROM secrets
             WHERE id = $1
-              AND (owner_user_id = $2 OR created_by = $2 OR org_id = ANY($3))
-            "#,
-        )
+              AND "#,
+            may_manage_secret!("", "$2", "$3"),
+            r#"
+            "#
+        ))
         .bind(secret_id)
         .bind(requestor_user_id)
         .bind(accessible_org_ids)
@@ -3272,31 +3343,22 @@ impl SecretsManager {
         offset: i64,
         user_id: Option<Uuid>,
     ) -> Result<Vec<AuditLogEntry>> {
-        let records = sqlx::query_as!(
-            AuditLogEntry,
-            r#"
-            SELECT l.id,
-                   l.secret_id as "secret_id!",
-                   l.action,
-                   l.actor_type,
-                   l.actor_id,
-                   l.module_id,
-                   l.success as "success!",
-                   l.error_message,
-                   l.ip_address::text as "ip_address",
-                   l.timestamp as "timestamp!"
-            FROM secret_audit_log l
-            JOIN secrets s ON s.id = l.secret_id
-            WHERE l.secret_id = $1 
-              AND ($4::uuid IS NULL OR s.owner_user_id = $4::uuid OR s.created_by = $4::uuid)
-            ORDER BY l.timestamp DESC, l.id DESC
-            LIMIT $2 OFFSET $3
-            "#,
-            secret_id,
-            limit,
-            offset,
-            user_id
-        )
+        // C-2 / C-11 (2026-10-14): the audit of a secret is visible to whoever
+        // may manage the secret, by the same rule (`may_manage_secret!`).
+        let records = sqlx::query_as::<_, AuditLogEntry>(concat!(
+            "SELECT l.id, l.secret_id, l.action, l.actor_type, l.actor_id, l.module_id, \
+                    l.success, l.error_message, l.ip_address::text AS ip_address, \
+                    l.timestamp \
+             FROM secret_audit_log l \
+             JOIN secrets s ON s.id = l.secret_id \
+             WHERE l.secret_id = $1 AND ($4::uuid IS NULL OR ",
+            may_manage_secret!("s.", "$4::uuid"),
+            ") ORDER BY l.timestamp DESC, l.id DESC LIMIT $2 OFFSET $3"
+        ))
+        .bind(secret_id)
+        .bind(limit)
+        .bind(offset)
+        .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
 
@@ -3349,25 +3411,17 @@ impl SecretsManager {
             };
             talos_dlp_provider::redact_str(truncated)
         });
-        sqlx::query!(
-            r#"
-            INSERT INTO secret_audit_log (
-                secret_id, action, actor_type, actor_id, module_id,
-                success, error_message, ip_address
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            "#,
-            secret_id,
-            action,
-            actor_type,
-            actor_id,
-            module_id,
-            success,
-            redacted_err.as_deref(),
-            ip_str.as_deref()
-        )
-        .execute(&self.db_pool)
-        .await?;
+        sqlx::query(SECRET_AUDIT_INSERT_SQL)
+            .bind(secret_id)
+            .bind(action)
+            .bind(actor_type)
+            .bind(actor_id)
+            .bind(module_id)
+            .bind(success)
+            .bind(redacted_err.as_deref())
+            .bind(ip_str.as_deref())
+            .execute(&self.db_pool)
+            .await?;
 
         Ok(())
     }
@@ -3403,25 +3457,17 @@ impl SecretsManager {
             };
             talos_dlp_provider::redact_str(truncated)
         });
-        sqlx::query!(
-            r#"
-            INSERT INTO secret_audit_log (
-                secret_id, action, actor_type, actor_id, module_id,
-                success, error_message, ip_address
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            "#,
-            secret_id,
-            action,
-            actor_type,
-            actor_id,
-            module_id,
-            success,
-            redacted_err.as_deref(),
-            ip_str.as_deref()
-        )
-        .execute(&mut **tx)
-        .await?;
+        sqlx::query(SECRET_AUDIT_INSERT_SQL)
+            .bind(secret_id)
+            .bind(action)
+            .bind(actor_type)
+            .bind(actor_id)
+            .bind(module_id)
+            .bind(success)
+            .bind(redacted_err.as_deref())
+            .bind(ip_str.as_deref())
+            .execute(&mut **tx)
+            .await?;
         Ok(())
     }
 
@@ -3512,11 +3558,13 @@ impl SecretsManager {
 
     /// List distinct namespaces with secret counts for a user.
     pub async fn list_namespaces(&self, owner_user_id: Uuid) -> Result<Vec<(String, i64)>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(concat!(
             "SELECT DISTINCT namespace, COUNT(*)::bigint AS secret_count \
-             FROM secrets WHERE created_by = $1 \
-             GROUP BY namespace ORDER BY namespace",
-        )
+             FROM secrets WHERE ",
+            may_manage_secret!("", "$1"),
+            " \
+             GROUP BY namespace ORDER BY namespace"
+        ))
         .bind(owner_user_id)
         .fetch_all(&self.db_pool)
         .await?;
@@ -3550,22 +3598,22 @@ impl SecretsManager {
         limit: i64,
     ) -> Result<Vec<SecretSummary>> {
         let rows = if let Some(ns) = namespace_filter {
-            sqlx::query(
+            sqlx::query(concat!(
                 "SELECT id, name, key_path, description, created_at, expires_at, namespace, rotation_reminder_days \
-                 FROM secrets WHERE created_by = $1 AND namespace = $2 \
-                 ORDER BY created_at DESC LIMIT $3",
-            )
+                 FROM secrets WHERE ", may_manage_secret!("", "$1"), " AND namespace = $2 \
+                 ORDER BY created_at DESC LIMIT $3"
+            ))
             .bind(user_id)
             .bind(ns)
             .bind(limit)
             .fetch_all(&self.db_pool)
             .await?
         } else {
-            sqlx::query(
+            sqlx::query(concat!(
                 "SELECT id, name, key_path, description, created_at, expires_at, namespace, rotation_reminder_days \
-                 FROM secrets WHERE created_by = $1 \
-                 ORDER BY created_at DESC LIMIT $2",
-            )
+                 FROM secrets WHERE ", may_manage_secret!("", "$1"), " \
+                 ORDER BY created_at DESC LIMIT $2"
+            ))
             .bind(user_id)
             .bind(limit)
             .fetch_all(&self.db_pool)
@@ -3581,13 +3629,13 @@ impl SecretsManager {
         user_id: Uuid,
         within_days: i32,
     ) -> Result<Vec<SecretSummary>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(concat!(
             "SELECT id, name, key_path, description, created_at, expires_at, namespace, rotation_reminder_days \
              FROM secrets \
-             WHERE created_by = $1 AND expires_at IS NOT NULL \
+             WHERE ", may_manage_secret!("", "$1"), " AND expires_at IS NOT NULL \
                AND expires_at < NOW() + make_interval(days => $2::int) \
-             ORDER BY expires_at ASC LIMIT 100",
-        )
+             ORDER BY expires_at ASC LIMIT 100"
+        ))
         .bind(user_id)
         .bind(within_days)
         .fetch_all(&self.db_pool)
@@ -3611,7 +3659,10 @@ impl SecretsManager {
     /// without a namespace pin); the operator either picks an `Id`
     /// directly or scopes by `KeyPath` (which is per-tenant unique).
     ///
-    /// All variants are `created_by = $user_id` scoped — cross-tenant
+    /// The `Id` variant applies the manage rule (`may_manage_secret!`, C-2);
+    /// the name and key-path variants resolve only the caller's OWN creations
+    /// (`created_by`, an identity lookup), and every by-id operation a
+    /// resolved id leads to applies the manage rule again. Cross-tenant
     /// resolution is impossible.
     pub async fn resolve_to_id(
         &self,
@@ -3627,16 +3678,19 @@ impl SecretsManager {
         // 2nd row.
         let ids: Vec<Uuid> = match ident {
             crate::SecretIdentifier::Id(id) => {
-                let found: Option<Uuid> =
-                    sqlx::query_scalar("SELECT id FROM secrets WHERE id = $1 AND created_by = $2")
-                        .bind(id)
-                        .bind(user_id)
-                        .fetch_optional(&self.db_pool)
-                        .await
-                        .map_err(|e| {
-                            tracing::error!(err = ?e, "resolve_to_id Id lookup failed");
-                            SecretResolveError::Internal(e.into())
-                        })?;
+                let found: Option<Uuid> = sqlx::query_scalar(concat!(
+                    "SELECT id FROM secrets WHERE id = $1 AND ",
+                    may_manage_secret!("", "$2"),
+                    ""
+                ))
+                .bind(id)
+                .bind(user_id)
+                .fetch_optional(&self.db_pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!(err = ?e, "resolve_to_id Id lookup failed");
+                    SecretResolveError::Internal(e.into())
+                })?;
                 found.into_iter().collect()
             }
             crate::SecretIdentifier::KeyPath {
@@ -3987,7 +4041,7 @@ impl SecretsManager {
     // The handler-level pattern post-r306 is:
     //   let id = manager.resolve_to_id(SecretIdentifier::Name { … }, user)?;
     //   manager.<op>_by_id(user, id, …).await?;
-    // Each by-id method re-asserts `created_by = $user_id` in the WHERE
+    // Each by-id method re-asserts `may_manage_secret!` (C-2) in the WHERE
     // clause as defense-in-depth — a stale id from a different scope
     // can't accidentally mutate the caller's row.
 
@@ -3998,17 +4052,19 @@ impl SecretsManager {
     /// id didn't match (stale/foreign).
     pub async fn delete_secret_by_id(&self, user_id: Uuid, secret_id: Uuid) -> Result<bool> {
         // RFC 0005 S3: open the tx scoped to the acting user so the `secrets`
-        // RLS USING + WITH CHECK (owner pin) back up the existing
-        // `created_by = $user_id` WHERE filter. begin_user_scoped sets
+        // RLS USING + WITH CHECK (owner pin) back up the manage rule
+        // (`may_manage_secret!`) in the WHERE. begin_user_scoped sets
         // app.current_user_id (the org pin permits via unset). Safe + latent
         // while TALOS_RLS_SET_ROLE is off (only sets the GUC, no role switch).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id)
             .await
             .context("Failed to begin secret-delete-by-id transaction")?;
 
-        let key_path: Option<String> = sqlx::query_scalar(
-            "SELECT key_path FROM secrets WHERE id = $1 AND created_by = $2 FOR UPDATE",
-        )
+        let key_path: Option<String> = sqlx::query_scalar(concat!(
+            "SELECT key_path FROM secrets WHERE id = $1 AND ",
+            may_manage_secret!("", "$2"),
+            " FOR UPDATE"
+        ))
         .bind(secret_id)
         .bind(user_id)
         .fetch_optional(&mut *tx)
@@ -4036,12 +4092,16 @@ impl SecretsManager {
         .await
         .context("Failed to insert audit row for delete_secret_by_id")?;
 
-        let removed = sqlx::query("DELETE FROM secrets WHERE id = $1 AND created_by = $2")
-            .bind(secret_id)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let removed = sqlx::query(concat!(
+            "DELETE FROM secrets WHERE id = $1 AND ",
+            may_manage_secret!("", "$2"),
+            ""
+        ))
+        .bind(secret_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         if removed != 1 {
             anyhow::bail!(
                 "secret delete removed {removed} row(s) of the 1 locked; nothing was committed"
@@ -4059,7 +4119,7 @@ impl SecretsManager {
     }
 
     /// Update namespace on a secret looked up by id. Re-asserts
-    /// `created_by = $user_id` for defense-in-depth. Returns
+    /// `may_manage_secret!` (C-2) for defense-in-depth. Returns
     /// `Ok(true)` when the row was updated, `Ok(false)` if the id
     /// didn't match.
     pub async fn set_secret_namespace_by_id(
@@ -4077,14 +4137,16 @@ impl SecretsManager {
         // module that referenced it by `(name, default)`. The L-5
         // tx-atomic pattern guarantees the audit row commits iff the
         // UPDATE lands.
-        // RFC 0005 S3: user-scoped tx — RLS backstop for `created_by = $user_id`.
+        // RFC 0005 S3: user-scoped tx — RLS backstop for the manage rule (`may_manage_secret!`).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id)
             .await
             .context("Failed to begin namespace-update transaction")?;
-        let result = sqlx::query(
+        let result = sqlx::query(concat!(
             "UPDATE secrets SET namespace = $1 \
-             WHERE id = $2 AND created_by = $3",
-        )
+             WHERE id = $2 AND ",
+            may_manage_secret!("", "$3"),
+            ""
+        ))
         .bind(namespace)
         .bind(secret_id)
         .bind(user_id)
@@ -4128,14 +4190,16 @@ impl SecretsManager {
         // expiry from "tomorrow" to "next year" silently disables
         // the rotation-reminder mechanism. The audit row records the
         // event so security review can spot suspicious extensions.
-        // RFC 0005 S3: user-scoped tx — RLS backstop for `created_by = $user_id`.
+        // RFC 0005 S3: user-scoped tx — RLS backstop for the manage rule (`may_manage_secret!`).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id)
             .await
             .context("Failed to begin expiry-update transaction")?;
-        let result = sqlx::query(
+        let result = sqlx::query(concat!(
             "UPDATE secrets SET expires_at = $1, rotation_reminder_days = $2 \
-             WHERE id = $3 AND created_by = $4",
-        )
+             WHERE id = $3 AND ",
+            may_manage_secret!("", "$4"),
+            ""
+        ))
         .bind(expires_at)
         .bind(reminder_days)
         .bind(secret_id)
@@ -4182,9 +4246,11 @@ impl SecretsManager {
         // rotated ciphertext stays in the same DEK scope. Pre-fetch the org
         // (scoped to created_by, matching the UPDATE guard below); no row →
         // stale id / foreign tenant → return None like the UPDATE does.
-        let target_org: Option<Uuid> = match sqlx::query_scalar::<_, Option<Uuid>>(
-            "SELECT org_id FROM secrets WHERE id = $1 AND created_by = $2",
-        )
+        let target_org: Option<Uuid> = match sqlx::query_scalar::<_, Option<Uuid>>(concat!(
+            "SELECT org_id FROM secrets WHERE id = $1 AND ",
+            may_manage_secret!("", "$2"),
+            ""
+        ))
         .bind(secret_id)
         .bind(user_id)
         .fetch_optional(&self.db_pool)
@@ -4202,18 +4268,20 @@ impl SecretsManager {
 
         // UPDATE + audit row in a single transaction (L-5) so the
         // rotation event is observable iff the rotation lands.
-        // RFC 0005 S3: user-scoped tx — RLS backstop for `created_by = $user_id`.
+        // RFC 0005 S3: user-scoped tx — RLS backstop for the manage rule (`may_manage_secret!`).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id)
             .await
             .context("Failed to begin rotate-by-id transaction")?;
 
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
+        let row: Option<(String, Option<String>)> = sqlx::query_as(concat!(
             "UPDATE secrets \
              SET encrypted_value = $1, encryption_key_id = $2, nonce = $3, \
                  encryption_format_version = $4, updated_at = NOW() \
-             WHERE id = $5 AND created_by = $6 \
-             RETURNING key_path, description",
-        )
+             WHERE id = $5 AND ",
+            may_manage_secret!("", "$6"),
+            " \
+             RETURNING key_path, description"
+        ))
         .bind(&stored_value)
         .bind(key_id)
         .bind(nonce_bytes)
@@ -4419,11 +4487,11 @@ impl SecretsManager {
     /// [`DISPATCH_READABLE_KEY_PATHS_CAP`] paths is an error ("could not
     /// check"), not a truncated answer.
     pub async fn list_dispatch_readable_key_paths(&self, user_id: Uuid) -> Result<Vec<String>> {
-        let paths = sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT key_path FROM secrets \
-             WHERE owner_user_id IS NULL OR owner_user_id = $1 OR created_by = $1 \
-             ORDER BY key_path LIMIT $2",
-        )
+        let paths = sqlx::query_scalar::<_, String>(concat!(
+            "SELECT DISTINCT key_path FROM secrets WHERE ",
+            may_dispatch_read_secret!("$1"),
+            " ORDER BY key_path LIMIT $2"
+        ))
         .bind(user_id)
         .bind(DISPATCH_READABLE_KEY_PATHS_CAP as i64 + 1)
         .fetch_all(&self.db_pool)
@@ -4499,10 +4567,11 @@ impl SecretsManager {
         key_path: &str,
         user_id: Uuid,
     ) -> Result<bool> {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM secrets WHERE key_path = $1 \
-               AND (owner_user_id IS NULL OR owner_user_id = $2 OR created_by = $2))",
-        )
+        let exists: bool = sqlx::query_scalar(concat!(
+            "SELECT EXISTS(SELECT 1 FROM secrets WHERE key_path = $1 AND ",
+            may_dispatch_read_secret!("$2"),
+            ")"
+        ))
         .bind(key_path)
         .bind(user_id)
         .fetch_one(&self.db_pool)
@@ -4604,11 +4673,11 @@ impl SecretsManager {
         user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<SecretHealthRow>> {
-        let rows = sqlx::query(
-            "SELECT name, key_path, created_at, expires_at \
-             FROM secrets WHERE created_by = $1 \
-             ORDER BY created_at ASC, key_path ASC LIMIT $2",
-        )
+        let rows = sqlx::query(concat!(
+            "SELECT name, key_path, created_at, expires_at FROM secrets WHERE ",
+            may_manage_secret!("", "$1"),
+            " ORDER BY created_at ASC, key_path ASC LIMIT $2"
+        ))
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.db_pool)
@@ -4630,13 +4699,16 @@ impl SecretsManager {
     ///
     /// Exists so `check_secret_health` can say what its cap dropped instead of
     /// emitting `total_secrets_checked: 200` and letting the reader assume that
-    /// is the whole vault. Same `created_by = $1` predicate as the list read, so
+    /// is the whole vault. Same `may_manage_secret!` rule as the list read, so
     /// the two are counting the same set.
     pub async fn count_secrets_for_health_check(&self, user_id: Uuid) -> Result<i64> {
-        let row = sqlx::query("SELECT COUNT(*)::bigint AS n FROM secrets WHERE created_by = $1")
-            .bind(user_id)
-            .fetch_one(&self.db_pool)
-            .await?;
+        let row = sqlx::query(concat!(
+            "SELECT COUNT(*)::bigint AS n FROM secrets WHERE ",
+            may_manage_secret!("", "$1")
+        ))
+        .bind(user_id)
+        .fetch_one(&self.db_pool)
+        .await?;
         Ok(row.try_get::<Option<i64>, _>("n")?.unwrap_or(0))
     }
 
@@ -5737,7 +5809,7 @@ pub struct DekTableMigrationStatus {
     pub pending: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AuditLogEntry {
     pub id: Uuid,
     pub secret_id: Uuid,
@@ -6014,6 +6086,35 @@ pub(crate) async fn unwrap_dek_with_fallback(
             ))
         })
 }
+
+/// One audit row for a secret, with its `key_hash` — the SHA-256 of the
+/// secret's `key_path`, read from the row at insert time (security review
+/// 2026-10-14, C-4). Rows are written BEFORE a delete, so the hash is always
+/// there to read, and it keeps a deleted secret's history attributable after
+/// `secret_id` names nothing.
+pub(crate) const SECRET_AUDIT_INSERT_SQL: &str = "INSERT INTO secret_audit_log ( \
+         secret_id, action, actor_type, actor_id, module_id, \
+         success, error_message, ip_address, key_hash) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+         (SELECT encode(sha256(convert_to(s.key_path, 'UTF8')), 'hex') \
+            FROM secrets s WHERE s.id = $1))";
+
+/// Every secret a dispatch was handed, recorded in one statement beside the
+/// access counter (security review 2026-10-14, C-4): until then the
+/// highest-volume read path wrote only a counter, which cannot say which
+/// user or module read a secret when. One `dispatch_read` row per delivered
+/// secret, `actor_type = 'dispatch'`, `actor_id` = the user the dispatch ran
+/// for, `module_id` = the module whose grant delivered it (for a path grant,
+/// none).
+pub(crate) const RECORD_DISPATCH_READS_SQL: &str = "WITH read AS ( \
+         UPDATE secrets SET last_accessed_at = NOW(), access_count = access_count + 1 \
+         WHERE id = ANY($1) \
+         RETURNING id, key_path) \
+     INSERT INTO secret_audit_log ( \
+         secret_id, action, actor_type, actor_id, module_id, success, key_hash) \
+     SELECT read.id, 'dispatch_read', 'dispatch', $2, $3, true, \
+            encode(sha256(convert_to(read.key_path, 'UTF8')), 'hex') \
+     FROM read";
 
 /// Whether a derived-format secret row may be decrypted under the DEK it
 /// names. v3 is sealed only under the GLOBAL DEK; v4 only under the row's own

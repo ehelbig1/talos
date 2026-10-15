@@ -82,7 +82,7 @@ async fn resolve_dispatch_secrets_map(
     sm: &Arc<SecretsManager>,
     module_id: Uuid,
     user_id: Uuid,
-) -> HashMap<String, String> {
+) -> HashMap<String, zeroize::Zeroizing<String>> {
     // MCP-589: route through the user-scoped variant so a malicious
     // user with a secret declaring `allowed_modules: [shared_module]`
     // can't poison the encrypted-secrets payload for another user's
@@ -117,7 +117,7 @@ async fn resolve_dispatch_secrets_map(
             for (k, v) in llm_keys {
                 secrets_map
                     .entry(k)
-                    .or_insert_with(|| v.as_str().to_string());
+                    .or_insert_with(|| zeroize::Zeroizing::new(v.as_str().to_string()));
             }
         }
         Err(e) => {
@@ -226,8 +226,8 @@ pub async fn prepare_module_dispatch_secrets(
 /// [`prepare_module_dispatch_secrets`] so the branch logic is unit-testable
 /// without a `SecretsManager` / Postgres. `module_id` is used only for log
 /// correlation.
-fn finish_dispatch_delivery(
-    secrets_map: HashMap<String, String>,
+fn finish_dispatch_delivery<V: AsRef<str>>(
+    secrets_map: HashMap<String, V>,
     execution_id: Uuid,
     sealing_handle: Option<&ModuleSealingHandle>,
     module_id: Uuid,
@@ -338,7 +338,12 @@ mod dispatch_delivery_tests {
         // A no-secret dispatch never seals and never registers — an empty
         // envelope is allowed under `required`, so the worker runs it as-is.
         let h = handle();
-        let d = finish_dispatch_delivery(HashMap::new(), Uuid::new_v4(), Some(&h), Uuid::new_v4());
+        let d = finish_dispatch_delivery(
+            HashMap::<String, String>::new(),
+            Uuid::new_v4(),
+            Some(&h),
+            Uuid::new_v4(),
+        );
         assert_eq!(d.sealing, 0);
         assert!(d.claim_inbox.is_none());
         assert!(d.secret_paths.is_empty());

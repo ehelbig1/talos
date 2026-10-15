@@ -27,7 +27,6 @@
 //! per-call AES cost is single-digit microseconds on typical
 //! workloads.
 
-use std::collections::HashMap;
 use std::fmt;
 
 use async_trait::async_trait;
@@ -181,7 +180,7 @@ pub trait SecretEnvelope: Send + Sync {
     /// (missing secrets) rather than sending corrupted ciphertext.
     async fn seal(
         &self,
-        secrets: &HashMap<String, String>,
+        secrets: &crate::SecretMap,
         shared_key: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), BoxError>;
 
@@ -201,7 +200,7 @@ pub trait SecretEnvelope: Send + Sync {
     /// `AesGcmSecretEnvelope`) override this method.
     async fn seal_with_aad(
         &self,
-        secrets: &HashMap<String, String>,
+        secrets: &crate::SecretMap,
         shared_key: &[u8],
         _aad: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), BoxError> {

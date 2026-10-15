@@ -43,6 +43,8 @@ pub mod vault_kek_provider;
 
 mod format;
 mod identifier;
+#[macro_use]
+mod secret_predicates;
 mod manager;
 
 pub use errors::SecretsError;

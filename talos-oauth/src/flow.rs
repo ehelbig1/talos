@@ -134,9 +134,9 @@ pub async fn issue_bound_state(
     user_id: Uuid,
     binding: &BrowserBinding,
 ) -> Result<String> {
-    // Same shape as the binding nonce: two v4 UUIDs, hex — passes the format
-    // gate and is URL-safe without encoding.
-    let state = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    // Same shape as the binding nonce: 32 bytes from `talos_random`, hex —
+    // passes the format gate and is URL-safe without encoding (C-9).
+    let state = hex::encode(talos_random::bytes::<32>());
     insert_state_row(pool, provider, &state, None, user_id, binding, None).await?;
     Ok(state)
 }

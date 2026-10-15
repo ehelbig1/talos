@@ -1088,15 +1088,15 @@ fn grade_a_is_reachable_in_development_only_at_perfection() {
 fn weights_sum_to_max_score() {
     let sum: u32 = CHECK_WEIGHTS.iter().map(|(_, p, _)| *p).sum();
     assert_eq!(sum, MAX_SCORE, "CHECK_WEIGHTS no longer sums to MAX_SCORE");
-    // Nine SCORED checks plus THREE deliberately weighted 0 —
-    // `write_ceiling_enforcement`, `audit_chain_verification` and
-    // `fleet_identity` (each entry argues its own zero). Twelve entries, nine
-    // weights.
-    assert_eq!(CHECK_WEIGHTS.len(), 12);
+    // Nine SCORED checks plus FOUR deliberately weighted 0 —
+    // `write_ceiling_enforcement`, `audit_chain_verification`,
+    // `fleet_identity` and `kek_posture` (each entry argues its own zero).
+    // Thirteen entries, nine weights.
+    assert_eq!(CHECK_WEIGHTS.len(), 13);
     assert_eq!(
         CHECK_WEIGHTS.iter().filter(|(_, p, _)| *p > 0).count(),
         9,
-        "exactly three checks are deliberately unweighted"
+        "exactly four checks are deliberately unweighted"
     );
 }
 
@@ -2448,5 +2448,37 @@ fn fleet_identity_passes_only_when_both_controller_surfaces_require_ed25519() {
         check_fleet_identity(true, true, true, &Err("bad".into())),
     ] {
         assert_eq!((c.points, c.forfeited()), (0, 0), "{c:?}");
+    }
+}
+
+// ── kek_posture (security review 2026-10-14, C-12) ──────────────────────────
+
+#[test]
+fn kek_posture_reports_two_live_keks_until_the_legacy_one_is_disabled() {
+    assert_eq!(
+        check_kek_posture(true, "vault", true, false).status,
+        Status::Pass
+    );
+    let both = check_kek_posture(true, "vault", false, false);
+    assert_eq!(both.status, Status::Warn);
+    assert!(both.detail.contains("two KEKs live"), "{}", both.detail);
+    assert_eq!(
+        check_kek_posture(true, "env", false, true).status,
+        Status::Warn
+    );
+    assert_eq!(
+        check_kek_posture(true, "env", false, false).status,
+        Status::Fail
+    );
+    assert_eq!(
+        check_kek_posture(false, "env", false, false).status,
+        Status::Info
+    );
+    assert_eq!(
+        check_kek_posture(true, "kms", false, false).status,
+        Status::Fail
+    );
+    for c in [both, check_kek_posture(true, "env", false, false)] {
+        assert_eq!(c.points, 0, "kek_posture is unweighted");
     }
 }

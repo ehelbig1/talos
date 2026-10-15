@@ -305,12 +305,15 @@ impl GoogleCloudIntegrationService {
         // Path deliberately NOT in the message (it embeds user_id — the
         // MCP-988 oauth-path-PII class); callers log user_id as a
         // structured field already.
-        secrets.get(&access_token_path).cloned().ok_or_else(|| {
-            anyhow!(
-                "Google Cloud access token not found in vault. \
+        secrets
+            .get(&access_token_path)
+            .map(|v| v.to_string())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Google Cloud access token not found in vault. \
                  Reconnect the Google Cloud integration."
-            )
-        })
+                )
+            })
     }
 
     /// Generate the OAuth authorization URL for connecting a GCP account.

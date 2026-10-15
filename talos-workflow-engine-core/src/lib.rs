@@ -215,7 +215,7 @@ pub use secret_envelope::{
 };
 pub use secrets::{
     BoxError, ForcedRefresh, GcpImpersonationTokenProvider, GithubInstallationTokenProvider,
-    MintReadiness, SecretsResolver,
+    MintReadiness, SecretMap, SecretsResolver,
 };
 pub use shared_key::{WorkerKeyRing, WorkerSharedKey};
 pub use started_by::StartedByResolver;

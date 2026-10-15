@@ -111,6 +111,35 @@ fn inc_payload_crypto_failure(op: &'static str, stage: &'static str) {
     }
 }
 
+/// The format version a bundle records, from the version the encryption
+/// RETURNED (security review 2026-10-14, C-6; CLAUDE.md: bind the returned
+/// version, never a local decision). The slot AAD carries the version it was
+/// built for, so a ciphertext sealed under any OTHER version is bound to the
+/// wrong one: a mismatch is refused (and the write retried), never relabelled.
+pub(crate) fn returned_format_version(chosen: i16, returned: i16) -> anyhow::Result<i16> {
+    if returned != chosen {
+        anyhow::bail!(
+            "payload_encryption: encryption returned format v{returned}, the slot was \
+             prepared for v{chosen}; refusing a bundle whose label and AAD disagree"
+        );
+    }
+    Ok(returned)
+}
+
+#[cfg(test)]
+mod returned_format_version_tests {
+    use super::returned_format_version;
+
+    #[test]
+    fn the_returned_version_is_recorded_and_a_disagreeing_one_is_refused() {
+        assert_eq!(returned_format_version(4, 4).unwrap(), 4);
+        assert_eq!(returned_format_version(3, 3).unwrap(), 3);
+        // An org row whose encryption fell back to the global DEK (v3).
+        assert!(returned_format_version(4, 3).is_err());
+        assert!(returned_format_version(3, 4).is_err());
+    }
+}
+
 /// Canonical AAD builder for a module-payload slot at a given format version.
 /// **Both the writer (`encrypt_payload_bundle`) and every reader MUST build
 /// the AAD through this one function** so the two sides can never drift.
@@ -269,11 +298,15 @@ pub async fn encrypt_payload_bundle(
             .inspect_err(|_| inc_payload_crypto_failure("encrypt", stage))
             .with_context(|| format!("payload_encryption: serialize {slot:?}"))?;
         let aad = payload_slot_aad(module_execution_id, slot, format_version);
-        let (kid, ciphertext, _version) = sm
+        let (kid, ciphertext, version) = sm
             .encrypt_value_aad_v4_or_global(&plain, org_id, &aad)
             .await
             .inspect_err(|_| inc_payload_crypto_failure("encrypt", stage))
             .with_context(|| format!("payload_encryption: encrypt {slot:?}"))?;
+        // C-6 (2026-10-14): the bundle records the version the encryption
+        // RETURNED, and only when it is the one the slot AAD was built for.
+        bundle.format_version = returned_format_version(format_version, version)
+            .inspect_err(|_| inc_payload_crypto_failure("encrypt", stage))?;
         if let Some(prev) = bundle.key_id {
             // M-3: a single bundle write must reuse the same DEK across
             // columns. If the active DEK rotated mid-write the bundle

@@ -17,6 +17,7 @@ repository = "https://github.com/aegix-dev/talos-workflow-engine"
 homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
+zeroize.workspace = true
 # The supervision wrapper for the module rate-limit eviction loop (a pure
 # ticker: attribution only — see the call site). `version` is load-bearing
 # for the same reason it is on `talos-workflow-liveness` below: this crate

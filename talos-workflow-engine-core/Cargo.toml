@@ -20,6 +20,7 @@ homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 async-trait.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+zeroize.workspace = true
 # Node-identity derivation (`engine_node_uuid`): the graph-node-id -> UUID
 # mapping every `execution_events.node_id` row is keyed by. Pure-Rust, no_std
 # capable, no transitive weight — the alternative is each reader forking the

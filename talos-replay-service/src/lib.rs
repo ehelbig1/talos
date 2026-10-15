@@ -622,7 +622,7 @@ impl ReplayService {
         )
         .await
         {
-            Ok(map) => map,
+            Ok(map) => talos_oauth::resolver::into_runtime_secrets(map),
             Err(e) => {
                 tracing::warn!(
                     "replay: secret prefetch failed (continuing with empty map): {}",

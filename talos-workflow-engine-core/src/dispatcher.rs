@@ -261,7 +261,7 @@ pub struct DispatchJob {
     /// the wire (`JobRequest` carries no plaintext; the worker obtains the
     /// values via a signed claim + on-claim ephemeral seal). `None` = the
     /// legacy inline WSK envelope path (today's default).
-    pub plaintext_secrets: Option<std::collections::HashMap<String, String>>,
+    pub plaintext_secrets: Option<crate::SecretMap>,
     /// The vault paths this job is permitted to resolve, sent in the clear
     /// on the `JobRequest` when claim-based sealing is active (paths are
     /// not secrets; values are). Empty for the legacy path.

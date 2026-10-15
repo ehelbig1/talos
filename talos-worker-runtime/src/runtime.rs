@@ -2045,6 +2045,8 @@ impl RetryPolicy {
     /// Jitter adds randomness (±25%) to the backoff to prevent thundering herd
     /// problems when multiple modules retry simultaneously after a transient failure.
     /// The formula is: base_backoff * (0.75 + random(0..0.5))
+    // disallowed-method: rand::random — retry jitter is not a key, nonce, salt or token
+    #[allow(clippy::disallowed_methods)]
     pub fn backoff_for_attempt(&self, attempt: u32) -> Duration {
         // Cap exponent to prevent f32 overflow on high attempt counts.
         let capped_attempt = attempt.min(20) as i32;

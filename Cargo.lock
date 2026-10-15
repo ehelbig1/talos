@@ -8896,6 +8896,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -9391,6 +9392,7 @@ dependencies = [
  "talos-http-body",
  "talos-http-utils",
  "talos-metrics",
+ "talos-random",
  "talos-redis",
  "talos-secrets-manager",
  "talos-text-util",
@@ -9400,6 +9402,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -10362,6 +10365,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -10373,6 +10377,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -10407,6 +10412,7 @@ dependencies = [
  "talos-workflow-engine-core",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -10420,7 +10426,6 @@ dependencies = [
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
- "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",

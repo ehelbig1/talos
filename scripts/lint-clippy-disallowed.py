@@ -2,7 +2,7 @@
 """The structural side of the clippy `disallowed-methods` rules in clippy.toml.
 
 Four "never call X outside Y" checks (29, 53, 63, 78) used to find their call
-sites with grep. Clippy now finds them by TYPE — an alias, a re-export or a
+sites with grep (check 100, the `rand` generators, was built this way). Clippy now finds them by TYPE — an alias, a re-export or a
 UFCS call cannot hide one — and fails `cargo clippy -D warnings` in CI. What
 clippy cannot know is WHICH files are allowed to call the method: it only sees
 an `#[allow(clippy::disallowed_methods)]`, and that attribute silences EVERY
@@ -59,6 +59,14 @@ RULES = {
         "path": "talos_workflow_engine_nats::NatsNodeDispatcher::new",
         "sanctioned": ["talos-engine/src/nats_run.rs", "talos-workflow-engine-nats/*"],
         "defined": ("talos-workflow-engine-nats/src/dispatcher.rs", r"impl NatsNodeDispatcher \{[\s\S]*?pub fn new\("),
+    },
+    # The `rand` crate's convenience generators (security review 2026-10-14,
+    # C-5): bytes for a key, nonce, salt or token come from `talos_random`.
+    # Sanctioned: tests, and one marked non-secret use (retry jitter).
+    100: {
+        "paths": ["rand::rng", "rand::random"],
+        "sanctioned": ["talos-worker-runtime/src/runtime.rs"] + TESTS,
+        "defined": None,
     },
     # Every way the `redis` crate opens an async connection. From 1.0 each of
     # them carries the library's default deadlines unless a config is passed,

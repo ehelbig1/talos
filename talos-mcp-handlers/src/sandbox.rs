@@ -2096,6 +2096,7 @@ async fn handle_run_sandbox(
             agent.user_id,
         )
         .await
+        .map(talos_oauth::resolver::into_runtime_secrets)
         .unwrap_or_default()
     } else {
         std::collections::HashMap::new()
@@ -4245,6 +4246,7 @@ async fn handle_test_module(
             Some(user_id),
         )
         .await
+        .map(talos_oauth::resolver::into_runtime_secrets)
         .unwrap_or_default()
     } else {
         std::collections::HashMap::new()

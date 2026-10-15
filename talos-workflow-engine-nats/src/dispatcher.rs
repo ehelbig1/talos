@@ -2162,10 +2162,20 @@ impl NodeDispatcher for NatsNodeDispatcher {
         let claim_based = request.steps.iter().any(|j| j.plaintext_secrets.is_some());
         // Per-step plaintext maps, aligned index-for-index with `steps`. Steps
         // with no secrets contribute an empty map so the vector stays aligned.
-        let per_step_secrets: Vec<std::collections::HashMap<String, String>> = request
+        // Borrowed views (C-10): the values stay in the steps' `Zeroizing`
+        // maps; the one serialized copy below is itself zeroized.
+        let empty = talos_workflow_engine_core::SecretMap::new();
+        let per_step_secrets: Vec<std::collections::HashMap<&str, &str>> = request
             .steps
             .iter()
-            .map(|j| j.plaintext_secrets.clone().unwrap_or_default())
+            .map(|j| {
+                j.plaintext_secrets
+                    .as_ref()
+                    .unwrap_or(&empty)
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect()
+            })
             .collect();
         // Union of the per-step secret NAMES (not values) for the signed
         // `secret_paths` metadata.
@@ -2726,10 +2736,12 @@ mod p3_full_loop_tests {
 
         // Dispatch a job whose secrets are resolved as PLAINTEXT (claim-based).
         let job_id = uuid::Uuid::new_v4();
-        let secret_map: HashMap<String, String> =
-            [("anthropic/api_key".to_string(), SECRET_VALUE.to_string())]
-                .into_iter()
-                .collect();
+        let secret_map: talos_workflow_engine_core::SecretMap = [(
+            "anthropic/api_key".to_string(),
+            zeroize::Zeroizing::new(SECRET_VALUE.to_string()),
+        )]
+        .into_iter()
+        .collect();
         let job = DispatchJob {
             job_id: Some(job_id),
             module_uri: "test:noop".to_string(),
@@ -2918,7 +2930,10 @@ mod p3_full_loop_tests {
         let mk = |v: &str| DispatchJob {
             module_uri: "test:noop".to_string(),
             input_payload: serde_json::json!({}),
-            plaintext_secrets: Some(HashMap::from([("api/key".to_string(), v.to_string())])),
+            plaintext_secrets: Some(HashMap::from([(
+                "api/key".to_string(),
+                zeroize::Zeroizing::new(v.to_string()),
+            )])),
             secret_paths: vec!["api/key".to_string()],
             timeout: std::time::Duration::from_secs(10),
             ..Default::default()
@@ -2989,10 +3004,12 @@ mod p3_full_loop_tests {
             Arc::new(TrueEval),
         );
 
-        let secret_map: HashMap<String, String> =
-            [("anthropic/api_key".to_string(), "sk-ant-SECRET".to_string())]
-                .into_iter()
-                .collect();
+        let secret_map: talos_workflow_engine_core::SecretMap = [(
+            "anthropic/api_key".to_string(),
+            zeroize::Zeroizing::new("sk-ant-SECRET".to_string()),
+        )]
+        .into_iter()
+        .collect();
         let job = DispatchJob {
             plaintext_secrets: Some(secret_map),
             timeout: std::time::Duration::from_secs(5),

@@ -66,7 +66,6 @@ pub struct CloneActorOutcome {
     pub name: String,
     pub source_name: String,
     pub max_capability_world: String,
-    pub secret_grants_copied: usize,
     pub budget_copied: Option<bool>,
     pub approval_policies_copied: Option<i64>,
     pub memories_copied: Option<i64>,
@@ -215,13 +214,12 @@ pub async fn clone_actor(
 
     let new_actor_id = Uuid::new_v4();
     let rows = actor_repo
-        .insert_actor_with_grants_and_limit_check(
+        .insert_cloned_actor_with_limit_check(
             new_actor_id,
             req.user_id,
             &name,
             description.as_deref(),
             &source.max_capability_world,
-            &source.secret_grants,
             &source.ceilings,
             MAX_ACTORS_PER_USER,
         )
@@ -323,7 +321,6 @@ pub async fn clone_actor(
         name,
         source_name: source.name,
         max_capability_world: source.max_capability_world,
-        secret_grants_copied: source.secret_grants.len(),
         budget_copied,
         approval_policies_copied,
         memories_copied,

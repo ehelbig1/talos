@@ -114,7 +114,7 @@ EXIT_CODE=0
 TREE_PRUNE_FIND=( \( -name .claude -o -name .git \) -prune -o )
 TREE_PRUNE_GREP=( --exclude-dir=.claude --exclude-dir=.git )
 
-# ── clippy `disallowed-methods` rules (checks 29, 53, 63, 78) ─────────
+# ── clippy `disallowed-methods` rules (checks 29, 53, 63, 78, 100) ────
 # Four "never call X outside Y" rules are enforced by CLIPPY, which resolves
 # the call by type — an alias, a re-export or a UFCS call cannot hide one
 # from it, and each could hide from the grep these checks used to run. The
@@ -9599,6 +9599,29 @@ else
     yellow "  → send the module row's world (the one every gate checked),"
     yellow "    or mark it // no-world-hint: <reason>"
     EXIT_CODE=1
+fi
+
+echo
+
+bold "▶ check 100: bytes for a key, nonce or token come from talos_random, not rand"
+
+# CLAUDE.md (2026-10-08): bytes for a key, nonce, salt or bearer token come
+# from `talos_random::fill` / `talos_random::bytes`, never the `rand` crate
+# directly. Nothing enforced it, and the four replay-nonce sites (JobRequest /
+# JobResult signing, the agent envelope, a test helper) were rewritten for
+# rand 0.10 AFTER the rule and kept `rand::rng()` (security review 2026-10-14,
+# C-5). Enforced by CLIPPY (`clippy.toml` `rand::rng` / `rand::random`, which
+# resolves the call by type: an alias or a re-export cannot hide one); this
+# check verifies the config and where each sanctioned allow sits
+# (`scripts/lint-clippy-disallowed.py`, rule 100: tests, and the one marked
+# retry-jitter use in `talos-worker-runtime/src/runtime.rs`).
+# Measured: 5 calls on main @ 4f32b26b (the four nonce sites + the jitter);
+# 1 after (the jitter, sanctioned). Limit: `rand::Rng` methods on an
+# explicitly constructed generator are not covered; none exist outside
+# `talos-random`.
+if ! clippy_disallowed_rule 100; then
+    yellow "  → use talos_random::bytes::<N>() / talos_random::fill(&mut buf);"
+    yellow "    a non-secret use carries // disallowed-method: <path> — <reason> + #[allow(clippy::disallowed_methods)]"
 fi
 
 echo

@@ -422,13 +422,16 @@ impl GoogleCalendarService {
             .await
             .context("Failed to fetch Calendar access token from vault")?;
 
-        secrets.get(&access_token_path).cloned().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Calendar access token not found at vault path '{}'. \
+        secrets
+            .get(&access_token_path)
+            .map(|v| v.to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Calendar access token not found at vault path '{}'. \
                  Reconnect the Google Calendar integration.",
-                access_token_path
-            )
-        })
+                    access_token_path
+                )
+            })
     }
 
     /// List user's integrations
