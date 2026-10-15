@@ -53,6 +53,61 @@ pub(crate) fn expected_embedding_dims() -> usize {
 /// under Postgres' 65535-bind limit with headroom).
 const INSERT_CHUNK: usize = 200;
 
+/// The growth cap a dataset has when its `schema_json` names none
+/// (security review 2026-10-14, I-1): written at create, and the eviction's
+/// fallback for a dataset created before it. Until then a dataset with no
+/// `max_examples` grew without bound through the ungated `__ml_distill__`
+/// protocol. 50 000 is the figure the tools' own schema text used as its
+/// example; the largest dataset on the reference fleet held 3 297 rows.
+pub const DEFAULT_MAX_EXAMPLES: i64 = 50_000;
+
+/// The most `ml_examples` rows one user may hold across every dataset
+/// (I-1): ten datasets at [`DEFAULT_MAX_EXAMPLES`]. The largest user on the
+/// reference fleet held 3 721. An append that would cross it is refused
+/// whole, before anything is written.
+pub const MAX_EXAMPLES_PER_USER: i64 = 500_000;
+
+/// Refuse an append of `adding` rows that would take `user_id` past
+/// [`MAX_EXAMPLES_PER_USER`] (I-1). Counted as if every row were new: an
+/// upsert of existing keys is refused at the ceiling too, the refusing answer.
+pub async fn refuse_past_user_example_ceiling(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    adding: usize,
+) -> Result<()> {
+    if adding == 0 {
+        return Ok(());
+    }
+    let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ml_examples WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await
+        .context("count the user's ml_examples")?;
+    if held.saturating_add(i64::try_from(adding).unwrap_or(i64::MAX)) > MAX_EXAMPLES_PER_USER {
+        anyhow::bail!(
+            "this append would take the user past {MAX_EXAMPLES_PER_USER} stored examples \
+             across all datasets; delete a dataset or dedupe before adding more"
+        );
+    }
+    Ok(())
+}
+
+/// `schema_json` as a dataset is created with it: an object without a
+/// `max_examples` gets [`DEFAULT_MAX_EXAMPLES`]; null becomes an object with
+/// it; any other value is stored as given (the eviction falls back anyway).
+#[must_use]
+pub fn schema_with_default_cap(schema_json: &serde_json::Value) -> serde_json::Value {
+    match schema_json {
+        serde_json::Value::Null => serde_json::json!({ "max_examples": DEFAULT_MAX_EXAMPLES }),
+        serde_json::Value::Object(map) if !map.contains_key("max_examples") => {
+            let mut map = map.clone();
+            map.insert("max_examples".into(), DEFAULT_MAX_EXAMPLES.into());
+            serde_json::Value::Object(map)
+        }
+        other => other.clone(),
+    }
+}
+
 /// Row ceiling for the inline dedupe on the append path. Above this the append
 /// declines and logs, so a growing dataset can never quietly turn every ingest
 /// into an O(N) hash-and-sort; the operator tool is unbounded by design.
@@ -339,6 +394,7 @@ impl DatasetService {
         schema_json: &serde_json::Value,
     ) -> Result<Uuid> {
         let id = Uuid::new_v4();
+        let schema_json = schema_with_default_cap(schema_json);
         sqlx::query(
             "INSERT INTO ml_datasets (id, user_id, org_id, name, task_type, schema_json) \
              VALUES ($1, $2, $3, $4, $5, $6)",
@@ -348,7 +404,7 @@ impl DatasetService {
         .bind(org_id)
         .bind(name)
         .bind(task_type)
-        .bind(schema_json)
+        .bind(&schema_json)
         .execute(&mut *conn)
         .await
         .context("create ml_dataset")?;
@@ -526,6 +582,8 @@ impl DatasetService {
         tenancy: DatasetTenancy,
         prepared: Vec<PreparedExample>,
     ) -> Result<usize> {
+        // The per-user ceiling, before anything is written (I-1).
+        refuse_past_user_example_ceiling(conn, tenancy.user_id, prepared.len()).await?;
         let mut stored = 0usize;
         for chunk in prepared.chunks(INSERT_CHUNK) {
             let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
@@ -624,14 +682,13 @@ impl DatasetService {
                 .fetch_optional(&mut *conn)
                 .await
                 .context("read dataset schema_json")?;
-        let Some(cap) = schema
+        // A dataset that names no positive cap has the default one (I-1).
+        let cap = schema
             .as_ref()
             .and_then(|s| s.get("max_examples"))
             .and_then(|v| v.as_i64())
             .filter(|c| *c > 0)
-        else {
-            return Ok(0);
-        };
+            .unwrap_or(DEFAULT_MAX_EXAMPLES);
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM ml_examples WHERE dataset_id = $1")
                 .bind(dataset_id)
@@ -1715,4 +1772,29 @@ pub async fn grandfather_examples_embedding_model(
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
+}
+
+#[cfg(test)]
+mod default_cap_tests {
+    use super::*;
+
+    /// I-1 (2026-10-14): a dataset created without a cap gets the default; a
+    /// cap the caller names is kept.
+    #[test]
+    fn a_dataset_without_a_cap_is_created_with_the_default() {
+        assert_eq!(
+            schema_with_default_cap(&serde_json::json!({}))["max_examples"],
+            DEFAULT_MAX_EXAMPLES
+        );
+        assert_eq!(
+            schema_with_default_cap(&serde_json::Value::Null)["max_examples"],
+            DEFAULT_MAX_EXAMPLES
+        );
+        let named = serde_json::json!({ "max_examples": 10, "doc": "x" });
+        assert_eq!(schema_with_default_cap(&named), named);
+        let other = serde_json::json!({ "doc": "kept" });
+        let capped = schema_with_default_cap(&other);
+        assert_eq!(capped["doc"], "kept");
+        assert_eq!(capped["max_examples"], DEFAULT_MAX_EXAMPLES);
+    }
 }

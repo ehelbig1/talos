@@ -595,7 +595,29 @@ pub fn memory_consolidation_enabled() -> bool {
     bool_env_or_default("ENABLE_MEMORY_CONSOLIDATION", true)
 }
 
-/// Operator attestation that `OLLAMA_URL` points at an ON-HOST model, so a
+/// The deployment's daily token ceiling for the PLATFORM key — the LLM calls
+/// the controller makes on an actor's behalf with no execution behind them
+/// (graph-RAG extraction, memory consolidation, dashboard generation)
+/// (`TALOS_PLATFORM_LLM_TOKENS_PER_DAY`, security review 2026-10-14, I-2).
+/// Default 1 000 000, summed across every actor and user over the trailing
+/// 24 hours; at or above it graph-RAG and consolidation make no external
+/// call. `=0`/negative/unparsable falls back to the default.
+pub fn platform_llm_tokens_per_day() -> i64 {
+    positive_env_or_default::<i64>("TALOS_PLATFORM_LLM_TOKENS_PER_DAY", 1_000_000)
+}
+
+/// Operator attestation that `EMBEDDING_API_URL` is an ON-HOST embedder, so
+/// a TIER-1 actor's memory text and search queries may be embedded
+/// (`TALOS_EMBEDDING_TIER1_LOCAL_OK`). Default FALSE (fail-closed: tier-1
+/// memory is stored without a vector, and recall falls back to keyword and
+/// recency, unless the operator attests locality). The URL's shape is still
+/// checked as a sanity refusal of an obviously public host (security review
+/// 2026-10-14, I-4). Mirrors `TALOS_GRAPH_RAG_TIER1_LOCAL_OK`.
+pub fn embedding_tier1_local_ok() -> bool {
+    bool_env_or_default("TALOS_EMBEDDING_TIER1_LOCAL_OK", false)
+}
+
+/// Operator attestation that `OLLAMA_URL` points at an ON-HOST model, so a/// Operator attestation that `OLLAMA_URL` points at an ON-HOST model, so a
 /// TIER-1 actor's private memory may be summarized locally without egress
 /// (`MEMORY_CONSOLIDATION_TIER1_LOCAL_OK`). Default FALSE (fail-closed: a
 /// tier-1 actor is SKIPPED unless the operator explicitly attests locality).

@@ -121,6 +121,9 @@ async fn embeddings_arriving_or_changing_model_rewrite_once_and_then_settle() {
     let addr = spawn_mock_embedder(up.clone()).await;
     // Before ANY embedding call: the client's configuration is cached once.
     std::env::set_var("EMBEDDING_API_URL", format!("http://{addr}/v1/embeddings"));
+    // The mock is on-host; ML examples embed local-only, which needs the
+    // operator's attestation (security review 2026-10-14, I-4).
+    std::env::set_var("TALOS_EMBEDDING_TIER1_LOCAL_OK", "true");
     std::env::set_var("EMBEDDING_MODEL", MOCK_MODEL);
     std::env::set_var("EMBEDDING_DIMENSIONS", DIMS.to_string());
     std::env::set_var(

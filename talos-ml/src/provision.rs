@@ -294,6 +294,7 @@ pub async fn provision_classifier(
             "max_examples must be positive (omit it for the default growth behavior)".into(),
         ));
     }
+    // An omitted cap is the default one, stamped by `create_dataset`.
     let schema_json = match input.max_examples {
         Some(cap) => json!({ "max_examples": cap }),
         None => json!({}),

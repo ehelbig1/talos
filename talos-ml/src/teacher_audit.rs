@@ -549,6 +549,19 @@ where
     let Some(guard) = claim_audit_slot(model_id) else {
         return Err(TeacherAuditError::AlreadyRunning);
     };
+    // And across replicas (security review 2026-10-14, I-3): N replicas ran
+    // N audits of one model, each stamping `teacher_audit`. One attempt, no
+    // wait; dropped on any early return, it frees the lock.
+    let Some(fleet_lock) = talos_db::try_named_advisory_lock(
+        pool,
+        &format!("teacher_audit:{model_id}"),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .map_err(|e| TeacherAuditError::Internal(e.into()))?
+    else {
+        return Err(TeacherAuditError::AlreadyRunning);
+    };
 
     if let TeacherBackend::SystemOne { model } = &backend {
         if model.trim().is_empty() || model.chars().count() > MAX_SYSTEM_ONE_MODEL_CHARS {
@@ -611,6 +624,7 @@ where
             classify,
         )
         .await;
+        fleet_lock.release().await;
     });
 
     Ok(TeacherAuditStart { gold_rows })

@@ -1508,6 +1508,20 @@ graphRag:
   tier1LocalOk: false
 
 # ----------------------------------------------------------------------------
+# Embedding provider attestation (security review 2026-10-14, I-4). When true,
+# tier1 (local-only) actors' memory text and queries are embedded by the
+# configured EMBEDDING_API_URL; leave false unless you can vouch that endpoint
+# does not leave the host. False: tier1 memory is stored without a vector.
+embedding:
+  tier1LocalOk: false
+
+# Daily token ceiling on the platform LLM key for the controller's own calls
+# (graph-RAG extraction, memory consolidation), every actor and user, trailing
+# 24 h. Empty → the code default (1000000).
+platformLlm:
+  tokensPerDay: ""
+
+# ----------------------------------------------------------------------------
 # Migrations — one-shot sqlx migrate job, pre-install & pre-upgrade hook.
 # Uses the same image as the controller.
 # ----------------------------------------------------------------------------

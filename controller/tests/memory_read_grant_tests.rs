@@ -436,6 +436,55 @@ async fn a_grant_reads_its_one_key_and_nothing_else() {
         0
     );
 
+    // ── A grant to a key with nothing stored under it spends no read
+    //    (2026-10-14, security review I-8): it answers nothing, the count
+    //    stays, and once the key is written the one read is still there.
+    let later = json!({ "actor_id": actor.to_string(), "key": "briefs/later",
+                        "label": "a brief not yet written", "max_reads": 1 });
+    let (later_id, later_token) = grant(&state, owner, later).await;
+    for _ in 0..2 {
+        assert_eq!(
+            read_with(&app, &later_token).await,
+            (StatusCode::NOT_FOUND, nothing())
+        );
+    }
+    assert_eq!(grant_row(&pool, later_id).await.1, 0, "no read was spent");
+    talos_memory::persist_memory(
+        &pool,
+        actor,
+        "briefs/later",
+        &json!({ "title": "Written later" }),
+        "semantic",
+        None,
+    )
+    .await
+    .expect("write the key");
+    assert_eq!(read_with(&app, &later_token).await.0, StatusCode::OK);
+    assert_eq!(grant_row(&pool, later_id).await.1, 1);
+    assert_eq!(
+        read_with(&app, &later_token).await,
+        (StatusCode::NOT_FOUND, nothing()),
+        "the one read is used"
+    );
+
+    // ── A terminated actor's grants answer nothing (I-8).
+    let (_, ended) = grant(&state, owner, args.clone()).await;
+    assert_eq!(read_with(&app, &ended).await.0, StatusCode::OK);
+    sqlx::query("UPDATE actors SET status = 'terminated' WHERE id = $1")
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .expect("terminate");
+    assert_eq!(
+        read_with(&app, &ended).await,
+        (StatusCode::NOT_FOUND, nothing())
+    );
+    sqlx::query("UPDATE actors SET status = 'active' WHERE id = $1")
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .expect("restore");
+
     // ── The actor must still be the minting user's when the grant is read.
     let (_, live) = grant(&state, owner, args.clone()).await;
     assert_eq!(read_with(&app, &live).await.0, StatusCode::OK);

@@ -146,6 +146,9 @@ async fn the_tool_surveys_by_default_and_re_embeds_only_for_the_owner() {
     let url = start_embedder(calls.clone()).await;
     // Before the first embedding call of the process.
     std::env::set_var("EMBEDDING_API_URL", &url);
+    // The mock is on-host; ML examples embed local-only, which needs the
+    // operator's attestation (security review 2026-10-14, I-4).
+    std::env::set_var("TALOS_EMBEDDING_TIER1_LOCAL_OK", "true");
     std::env::set_var("EMBEDDING_MODEL", MODEL);
     std::env::set_var("EMBEDDING_DIMENSIONS", DIMS.to_string());
     std::env::remove_var("EMBEDDING_API_KEY");

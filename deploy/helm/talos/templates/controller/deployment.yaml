@@ -229,6 +229,14 @@ spec:
             # tier1 graph extraction via the LOCAL model only. Default off.
             - name: TALOS_GRAPH_RAG_TIER1_LOCAL_OK
               value: {{ .Values.graphRag.tier1LocalOk | default false | quote }}
+            # Operator attestation that EMBEDDING_API_URL is ON-HOST — tier1
+            # memory is embedded only when set. Default off.
+            - name: TALOS_EMBEDDING_TIER1_LOCAL_OK
+              value: {{ .Values.embedding.tier1LocalOk | default false | quote }}
+            # Daily token ceiling on the platform LLM key for the controller's
+            # own calls. Empty → the code default (1000000).
+            - name: TALOS_PLATFORM_LLM_TOKENS_PER_DAY
+              value: {{ .Values.platformLlm.tokensPerDay | default "" | quote }}
             # Embedding provider config — two independent sources, secret OR
             # values.yaml controller.env. r241 dropped the `ollama.enabled=true`
             # branch that hard-coded the in-cluster ollama service URL (the
