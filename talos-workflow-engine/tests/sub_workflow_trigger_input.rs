@@ -287,3 +287,52 @@ async fn a_loop_body_inside_a_child_sees_the_outer_trigger() {
         assert_eq!(input["__trigger_input__"], trigger(), "{input}");
     }
 }
+
+/// `trigger → relay → sub_workflow(child_trigger: "input", child: reader)`. A node
+/// that asks for it starts its child with what it relays: the child's module sees
+/// the node's input as `__trigger_input__`, stripped of every `__` key (the forged
+/// one included), and not the outer trigger. Without the setting, the outer trigger.
+///
+/// MUTATION that turns it red: make `subworkflow_trigger_from_input` always false
+/// (the opt-in is ignored), or keep the input's `__` keys.
+#[tokio::test]
+async fn a_node_that_asks_starts_its_child_with_what_it_relays() {
+    for (asks, expected) in [(true, json!({ "upstream_field": 1 })), (false, trigger())] {
+        let (child, upstream, reader) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut parent = WorkflowGraphBuilder::new()
+            .add_module("upstream", upstream, None)
+            .add_system_node("relay_to", sub_workflow(child))
+            .edge("upstream", "relay_to")
+            .build()
+            .unwrap();
+        if asks {
+            for node in parent["nodes"].as_array_mut().unwrap() {
+                if node["id"] == "relay_to" {
+                    node["data"]["child_trigger"] = json!("input");
+                }
+            }
+        }
+        let child_graph = WorkflowGraphBuilder::new()
+            .add_module("reader", reader, None)
+            .build()
+            .unwrap();
+        let mut r = rig(
+            &parent,
+            &[(child, child_graph)],
+            &[
+                // A module's output carries engine keys besides a forged trigger: none may reach the child's trigger.
+                (upstream, json!({ "upstream_field": 1, "__trigger_input__": { "forged": true }, "__fuel_consumed__": 7 })),
+                (reader, json!({ "ok": true })),
+            ],
+        )
+        .await;
+        run(&mut r).await;
+        let seen = inputs_of(&r, reader);
+        assert_eq!(seen.len(), 1, "the child's module ran once");
+        assert_eq!(
+            seen[0]["__trigger_input__"], expected,
+            "asks = {asks}: {}",
+            seen[0]
+        );
+    }
+}
