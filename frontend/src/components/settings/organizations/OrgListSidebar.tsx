@@ -65,7 +65,7 @@ export function OrgListSidebar({
                 >
                   {org.name}
                 </div>
-                <div className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider mt-1 truncate">
+                <div className="text-xs text-muted-foreground/60 font-medium mt-1 truncate">
                   /{org.slug}
                 </div>
               </div>

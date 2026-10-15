@@ -339,7 +339,7 @@ export function EndpointSelector({
                 <div className="flex items-center gap-3 px-1">
                   <Clipboard className="h-3.5 w-3.5 text-primary" />
                   <h5 className="text-2xs font-semibold text-white/70 uppercase tracking-wider">
-                    Header Metadata Streams
+                    Headers
                   </h5>
                 </div>
                 <div className="grid gap-6">

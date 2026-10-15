@@ -178,14 +178,14 @@ function TemplateCard({
       {/* Meta chips */}
       <div className="flex flex-wrap gap-3 mb-8 relative z-10">
         {fieldCount > 0 && (
-          <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-2xs font-semibold uppercase tracking-wider text-muted-foreground/70 bg-surface-4/60 border border-white/5 shadow-sm">
-            {fieldCount} Schema Field{fieldCount === 1 ? "" : "s"}
+          <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-medium text-muted-foreground/70 bg-surface-4/60 border border-white/5 shadow-sm">
+            {fieldCount} field{fieldCount === 1 ? "" : "s"}
           </span>
         )}
         {hasNetworkAccess && (
           <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-2xs font-semibold uppercase tracking-wider text-primary/60 bg-primary/5 border border-primary/20 shadow-sm">
             <Globe className="w-3 h-3 opacity-60" />
-            Egress Authorized
+            Network access
           </span>
         )}
       </div>
@@ -327,7 +327,7 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
             )}
           />
           {configError && (
-            <p className="text-2xs font-semibold text-destructive mt-3 uppercase tracking-wider">
+            <p className="text-xs font-medium text-destructive mt-3">
               {configError}
             </p>
           )}

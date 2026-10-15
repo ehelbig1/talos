@@ -129,7 +129,7 @@ export function OpenAPIBrowser({
             <h4 className="text-xs font-semibold text-white">
               API Schema Deciphered
             </h4>
-            <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
+            <p className="text-xs font-medium text-muted-foreground/50">
               Found {endpoints.length} endpoint
               {endpoints.length !== 1 ? "s" : ""}
             </p>

@@ -334,7 +334,7 @@ export default function WorkflowVersionsPanel({
                             {entry.description}
                           </p>
                         )}
-                        <p className="text-2xs text-muted-foreground/60 mt-3 font-semibold uppercase tracking-wider">
+                        <p className="text-xs text-muted-foreground/60 mt-3 font-medium">
                           {formatDate(entry.publishedAt)}
                         </p>
                       </div>
@@ -405,7 +405,7 @@ export default function WorkflowVersionsPanel({
                             {v.description || "No identifier"}
                           </span>
                         </div>
-                        <div className="flex items-center gap-2 text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider">
+                        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground/60">
                           <Clock className="w-3 h-3" />
                           {formatDate(v.publishedAt)}
                         </div>
@@ -499,8 +499,8 @@ export default function WorkflowVersionsPanel({
               </div>
 
               <div className="text-center py-6">
-                <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
-                  Extended system parameters available in next update
+                <p className="text-xs font-medium text-muted-foreground/50">
+                  No further settings.
                 </p>
               </div>
             </div>

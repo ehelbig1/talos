@@ -250,7 +250,7 @@ function TemplateCard({
         </h3>
 
         <span className="text-2xs font-semibold uppercase tracking-wider text-primary/60 mb-4">
-          {template.category} ARCHITECTURE
+          {template.category}
         </span>
 
         {template.description && (
@@ -260,7 +260,7 @@ function TemplateCard({
         )}
 
         <div className="mt-6 flex items-center justify-between">
-          <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/50 group-hover:text-primary/70 transition-ui">
+          <span className="text-xs font-medium text-muted-foreground/50 group-hover:text-primary/70 transition-ui">
             Use template
           </span>
           <div className="w-6 h-6 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-ui -translate-x-4">

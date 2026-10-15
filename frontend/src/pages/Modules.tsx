@@ -130,7 +130,7 @@ function ModuleCard({
             </p>
           )}
 
-          <div className="flex items-center gap-5 text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60 group-hover:text-muted-foreground/50 transition-ui">
+          <div className="flex items-center gap-5 text-xs font-medium text-muted-foreground/60 group-hover:text-muted-foreground/50 transition-ui">
             <span className="flex items-center gap-2">
               <HardDrive className="w-3.5 h-3.5 opacity-40" />
               {formatBytes(mod.sizeBytes)}

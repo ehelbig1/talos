@@ -8,11 +8,9 @@ import { LoadingSpinner } from "@/components/LoadingSpinner";
 
 const labelStyle: React.CSSProperties = {
   display: "block",
-  fontSize: "10px",
-  fontWeight: "900",
-  textTransform: "uppercase",
-  letterSpacing: "0.2em",
-  color: "hsla(var(--white), 0.3)",
+  fontSize: "12px",
+  fontWeight: "500",
+  color: "hsla(var(--white), 0.6)",
   marginBottom: "12px",
   fontFamily: "var(--font-outfit)",
 };
@@ -76,9 +74,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
           </p>
           <div className="flex items-center gap-2">
             <div className="w-1.5 h-1.5 rounded-full bg-primary/40" />
-            <span className="text-2xs font-semibold text-primary/70 uppercase tracking-wider">
-              Rhai Runtime v1.0
-            </span>
+            <span className="text-xs font-medium text-primary/70">Rhai</span>
           </div>
         </div>
 

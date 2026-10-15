@@ -88,7 +88,7 @@ export function CreateOrgDialog({
                 className="h-14 bg-white/[0.03] border-white/10 focus:border-primary/50 focus:ring-primary/20 rounded-xl pl-[4.5rem] font-mono text-sm text-white placeholder:text-white/10 transition-ui"
               />
             </div>
-            <p className="text-2xs text-muted-foreground/50 font-semibold uppercase tracking-wider ml-1">
+            <p className="text-xs text-muted-foreground/50 font-medium ml-1">
               Lowercase letters, numbers and hyphens only
             </p>
           </div>

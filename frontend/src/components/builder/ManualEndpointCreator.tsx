@@ -125,7 +125,7 @@ export function ManualEndpointCreator({
             <h4 className="text-xs font-semibold text-white">
               Custom endpoint
             </h4>
-            <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
+            <p className="text-xs font-medium text-muted-foreground/50">
               Define the request by hand
             </p>
           </div>
@@ -143,7 +143,7 @@ export function ManualEndpointCreator({
         {/* Method and Path */}
         <div className="flex gap-4">
           <div className="w-32 space-y-2">
-            <label className="text-2xs font-semibold text-white/70 uppercase tracking-wider px-1">
+            <label className="text-xs font-medium text-white/70 px-1">
               Method
             </label>
             <select
@@ -165,7 +165,7 @@ export function ManualEndpointCreator({
           </div>
 
           <div className="flex-1 space-y-2">
-            <label className="text-2xs font-semibold text-white/70 uppercase tracking-wider px-1">
+            <label className="text-xs font-medium text-white/70 px-1">
               Path <span className="text-emerald-400">*</span>
             </label>
             <input
@@ -182,7 +182,7 @@ export function ManualEndpointCreator({
 
         {/* Summary */}
         <div className="space-y-2">
-          <label className="text-2xs font-semibold text-white/70 uppercase tracking-wider px-1">
+          <label className="text-xs font-medium text-white/70 px-1">
             Description
           </label>
           <input
@@ -220,8 +220,8 @@ export function ManualEndpointCreator({
           <div className="space-y-3">
             {parameters.length === 0 ? (
               <div className="py-10 text-center bg-surface-4 border border-white/5 rounded-2xl">
-                <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
-                  Null Parameters Defined
+                <p className="text-xs font-medium text-muted-foreground/50">
+                  No parameters
                 </p>
               </div>
             ) : (

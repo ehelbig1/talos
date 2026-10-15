@@ -237,7 +237,7 @@ export function SummaryPanel({
                         {isAiActor && (
                           <span className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 text-primary text-2xs font-semibold uppercase tracking-wider px-3 py-1 shadow-sm">
                             <Sparkles className="w-3 h-3" />
-                            AI Synthetic
+                            Generated
                           </span>
                         )}
                       </div>
@@ -373,7 +373,7 @@ export function SummaryPanel({
                       <p className="text-xs font-semibold text-white leading-snug truncate group-hover/entry:text-primary transition-colors">
                         {humanizeLogEntry(entry)}
                       </p>
-                      <time className="text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider mt-1 block">
+                      <time className="text-xs font-medium text-muted-foreground/70 mt-1 block">
                         {relativeTime(entry.timestamp)}
                       </time>
                     </div>

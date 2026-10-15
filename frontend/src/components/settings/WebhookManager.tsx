@@ -334,7 +334,7 @@ export default function WebhookManager() {
                           {t.name}
                         </span>
                         <div className="flex items-center gap-3 mt-1">
-                          <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
+                          <span className="text-xs text-muted-foreground/70 font-medium">
                             ID: {t.id.slice(0, 8)}...
                           </span>
                           {!t.enabled && (
@@ -382,21 +382,21 @@ export default function WebhookManager() {
 
                   {/* Stats row */}
                   <div className="flex items-center gap-3 mb-6 relative z-10">
-                    <div className="flex items-center gap-2 text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider bg-white/5 border border-white/5 px-3 py-1.5 rounded-xl shadow-sm">
+                    <div className="flex items-center gap-2 text-xs text-muted-foreground/60 font-medium bg-white/5 border border-white/5 px-3 py-1.5 rounded-xl shadow-sm">
                       <Zap className="w-3 h-3 text-primary" />
                       {t.triggerCount.toLocaleString()} received
                     </div>
-                    <div className="flex items-center gap-2 text-2xs text-success font-semibold uppercase tracking-wider bg-success/5 border border-success/10 px-3 py-1.5 rounded-xl shadow-sm">
+                    <div className="flex items-center gap-2 text-xs text-success font-medium bg-success/5 border border-success/10 px-3 py-1.5 rounded-xl shadow-sm">
                       <CheckCircle2 className="w-3 h-3" />
                       {t.successCount.toLocaleString()} succeeded
                     </div>
                     {t.errorCount > 0 && (
-                      <div className="flex items-center gap-2 text-2xs text-destructive font-semibold uppercase tracking-wider bg-destructive/5 border border-destructive/10 px-3 py-1.5 rounded-xl shadow-sm">
+                      <div className="flex items-center gap-2 text-xs text-destructive font-medium bg-destructive/5 border border-destructive/10 px-3 py-1.5 rounded-xl shadow-sm">
                         <XCircle className="w-3 h-3" />
                         {t.errorCount.toLocaleString()} failed
                       </div>
                     )}
-                    <div className="flex items-center gap-2 text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider ml-auto">
+                    <div className="flex items-center gap-2 text-xs text-muted-foreground/60 font-medium ml-auto">
                       <Shield className="w-3 h-3" />
                       {t.maxRequestsPerMinute} requests/min
                     </div>

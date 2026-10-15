@@ -90,7 +90,7 @@ export function IntegrationsManager() {
                     </span>
                   </div>
                   <div className="hidden sm:block w-1 h-1 rounded-full bg-white/10 shrink-0" />
-                  <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider leading-none shrink-0">
+                  <span className="text-xs text-muted-foreground/70 font-medium leading-none shrink-0">
                     OAuth and API connections
                   </span>
                 </div>

@@ -302,7 +302,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                         <label className="text-xs font-semibold text-white">
                           Continue on error
                         </label>
-                        <p className="text-2xs text-muted-foreground/70 font-bold uppercase tracking-tight">
+                        <p className="text-xs text-muted-foreground/70 font-medium">
                           Keep running the workflow if this node fails
                         </p>
                       </div>
@@ -347,7 +347,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
 
                   <div className="space-y-6 pt-8 border-t border-white/5">
                     <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider ml-1">
-                      Self-Healing Policy
+                      Retries
                     </p>
                     <RetryPolicySection
                       nodeId={node.id}

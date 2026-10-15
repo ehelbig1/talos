@@ -217,7 +217,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
               {nodeStatus?.durationMs != null && (
                 <div className="px-2 py-0.5 rounded-md bg-white/5 border border-white/5 flex items-center gap-1.5">
                   <Timer className="w-2.5 h-2.5 text-muted-foreground/60" />
-                  <span className="text-2xs font-semibold font-mono text-muted-foreground/80 uppercase tracking-wider">
+                  <span className="text-xs font-medium font-mono text-muted-foreground/80">
                     {nodeStatus.durationMs >= 1000
                       ? `${(nodeStatus.durationMs / 1000).toFixed(1)}s`
                       : `${nodeStatus.durationMs}ms`}
@@ -271,7 +271,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
           {configCount > 0 && (
             <div className="mt-4 flex items-center gap-2 relative z-10 opacity-60 group-hover:opacity-100 transition-opacity">
               <div className="w-1.5 h-1.5 rounded-full bg-primary/40" />
-              <p className="text-2xs font-semibold text-muted-foreground uppercase tracking-wider">
+              <p className="text-xs font-medium text-muted-foreground">
                 {configCount} config field{configCount !== 1 ? "s" : ""}
               </p>
             </div>

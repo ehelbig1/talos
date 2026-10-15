@@ -208,7 +208,7 @@ export const ConfigForm = React.memo(function ConfigForm({
               )}
 
               {validationErrors[field] && (
-                <p className="px-2 py-2 bg-destructive/5 border border-destructive/10 rounded-lg text-2xs font-semibold text-destructive uppercase tracking-wider flex items-center gap-2">
+                <p className="px-2 py-2 bg-destructive/5 border border-destructive/10 rounded-lg text-xs font-medium text-destructive flex items-center gap-2">
                   <AlertTriangle className="h-3.5 w-3.5" />
                   {validationErrors[field]}
                 </p>
@@ -230,9 +230,10 @@ export const ConfigForm = React.memo(function ConfigForm({
                       {suggestions.length > 0 && !showSuggestions && (
                         <button
                           onClick={() => setShowSuggestions(true)}
-                          className="text-2xs font-semibold text-primary uppercase tracking-wider"
+                          className="text-xs font-medium text-primary"
                         >
-                          {suggestions.length} Optimizations Ready
+                          {suggestions.length} suggestion
+                          {suggestions.length === 1 ? "" : "s"}
                         </button>
                       )}
                     </div>
@@ -241,7 +242,7 @@ export const ConfigForm = React.memo(function ConfigForm({
                       <div className="space-y-4 relative z-10 pt-4 border-t border-white/5">
                         <p className="text-2xs font-semibold text-white/50 uppercase tracking-wider flex items-center gap-2">
                           <Target className="h-3.5 w-3.5 text-primary" />
-                          Deep Ingress Configuration
+                          Request details
                         </p>
                         <div className="flex gap-3 flex-wrap">
                           <OpenAPIBrowser
@@ -294,7 +295,7 @@ export const ConfigForm = React.memo(function ConfigForm({
                         validationErrors[field] ? false : undefined,
                       )}
                       {validationErrors[field] && (
-                        <p className="text-2xs font-semibold text-destructive uppercase tracking-wider px-2">
+                        <p className="text-xs font-medium text-destructive px-2">
                           {validationErrors[field]}
                         </p>
                       )}

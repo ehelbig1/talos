@@ -229,7 +229,7 @@ export function DLQViewer() {
                   </span>
                 </div>
                 <div className="w-1 h-1 rounded-full bg-white/10" />
-                <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider leading-none">
+                <span className="text-xs text-muted-foreground/70 font-medium leading-none">
                   Failed node jobs and dropped webhook deliveries
                 </span>
               </div>
@@ -243,7 +243,7 @@ export function DLQViewer() {
                   ? pendingNodes.length
                   : pendingWebhooks.length}
               </span>
-              <span className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider leading-none">
+              <span className="text-xs text-muted-foreground/60 font-medium leading-none">
                 {activeTab === "nodes" ? "failed jobs" : "dropped deliveries"}
               </span>
             </div>
@@ -342,7 +342,7 @@ export function DLQViewer() {
                       <span className="text-xs font-semibold text-destructive bg-destructive/5 px-3 py-1 rounded-lg border border-destructive/10">
                         Node {entry.nodeId.slice(0, 8)}
                       </span>
-                      <p className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider mt-2">
+                      <p className="text-xs text-muted-foreground/60 font-medium mt-2">
                         Failed {new Date(entry.createdAt).toLocaleString()}
                       </p>
                     </div>
@@ -417,7 +417,7 @@ export function DLQViewer() {
                   </div>
                   <div className="space-y-1.5">
                     <DropReasonBadge reason={entry.dropReason} />
-                    <p className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                    <p className="text-xs text-muted-foreground/60 font-medium">
                       Dropped {new Date(entry.createdAt).toLocaleString()}
                     </p>
                   </div>
@@ -486,8 +486,8 @@ export function DLQViewer() {
         </div>
         <div className="flex items-center gap-3 relative z-10 transition-ui">
           <Search size={14} className="text-muted-foreground/50" />
-          <span className="text-2xs text-muted-foreground/50 font-semibold uppercase tracking-wider">
-            REGISTRY_V4.2
+          <span className="text-xs text-muted-foreground/50 font-medium">
+            Search
           </span>
         </div>
       </div>

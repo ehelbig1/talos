@@ -252,7 +252,7 @@ function EditForm({ schedule, onDone }: EditFormProps) {
     <div className="mt-6 pt-6 border-t border-white/5 space-y-5">
       <div className="grid grid-cols-2 gap-5">
         <div className="space-y-2">
-          <label className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60 ml-1">
+          <label className="text-xs font-medium text-muted-foreground/60 ml-1">
             Cron expression
           </label>
           <Input
@@ -264,7 +264,7 @@ function EditForm({ schedule, onDone }: EditFormProps) {
           />
         </div>
         <div className="space-y-2">
-          <label className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60 ml-1">
+          <label className="text-xs font-medium text-muted-foreground/60 ml-1">
             Time zone
           </label>
           <Input

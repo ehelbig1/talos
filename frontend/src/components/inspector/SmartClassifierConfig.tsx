@@ -76,8 +76,7 @@ interface SmartClassifierConfigProps {
   updateNodeData: (id: string, data: Partial<WorkflowNodeData>) => void;
 }
 
-const labelStyle =
-  "text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1";
+const labelStyle = "text-xs text-muted-foreground/60 font-medium ml-1";
 const inputBase =
   "w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui placeholder:text-muted-foreground/50";
 const textareaBase =
@@ -304,7 +303,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
               updateNodeData(nodeId, { config: rest });
               setName("");
             }}
-            className="text-2xs font-bold text-muted-foreground/70 hover:text-muted-foreground uppercase tracking-wider transition-ui"
+            className="text-xs font-medium text-muted-foreground/70 hover:text-muted-foreground transition-ui"
           >
             Re-configure classifier…
           </button>
@@ -430,7 +429,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
       <div className="space-y-3">
         <button
           onClick={() => setAdvancedOpen((v) => !v)}
-          className="flex items-center gap-2 text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider hover:text-white transition-ui"
+          className="flex items-center gap-2 text-xs font-medium text-muted-foreground/70 hover:text-white transition-ui"
         >
           <ChevronDown
             className={cn(

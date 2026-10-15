@@ -373,7 +373,7 @@ export function CreateActorPanel({
                         className="w-full bg-surface-4/40 border border-white/10 rounded-2xl px-6 py-4 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-ui relative z-10 font-medium"
                       />
                     </div>
-                    <p className="text-2xs text-muted-foreground/50 font-bold uppercase tracking-wider ml-1">
+                    <p className="text-xs text-muted-foreground/50 font-medium ml-1">
                       Lowercase letters, numbers and hyphens.
                     </p>
                   </div>
@@ -568,13 +568,13 @@ export function CreateActorPanel({
                                 >
                                   {preset.label}
                                 </span>
-                                <span className="text-2xs text-muted-foreground/50 font-bold uppercase tracking-wider mt-1">
+                                <span className="text-xs text-muted-foreground/50 font-medium mt-1">
                                   {preset.summary}
                                 </span>
                               </div>
                               {preset.recommended && (
                                 <span className="text-2xs font-semibold px-2 py-1 rounded bg-primary/20 text-primary uppercase tracking-wider ml-auto border border-primary/20">
-                                  Optimal
+                                  Recommended
                                 </span>
                               )}
                             </div>

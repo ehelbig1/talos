@@ -386,12 +386,12 @@ function RotateMasterKeyCard() {
               </button>
             </div>
             {newMasterKey.length > 0 && !isKeyValid && (
-              <p className="text-2xs text-destructive font-semibold uppercase tracking-wider pl-1 mt-1">
+              <p className="text-xs text-destructive font-medium pl-1 mt-1">
                 Key must be 64 hex characters ({newMasterKey.length}/64)
               </p>
             )}
             {isKeyValid && (
-              <p className="text-2xs text-success font-semibold uppercase tracking-wider pl-1 mt-1 flex items-center gap-2">
+              <p className="text-xs text-success font-medium pl-1 mt-1 flex items-center gap-2">
                 <CheckCircle2 className="w-3 h-3" />
                 Key length OK
               </p>

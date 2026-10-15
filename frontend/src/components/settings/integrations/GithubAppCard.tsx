@@ -61,7 +61,7 @@ export function GithubAppCard({
                 </span>
                 <div className="flex items-center gap-2 mt-1">
                   <div className="w-1.5 h-1.5 rounded-full bg-success" />
-                  <span className="text-2xs text-success font-semibold uppercase tracking-wider">
+                  <span className="text-xs text-success font-medium">
                     {inst.repository_selection === "all"
                       ? "All repositories"
                       : "Selected repositories"}

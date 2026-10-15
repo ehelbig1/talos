@@ -167,7 +167,7 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
         >
           <div className="relative z-10 px-3 py-1.5 mb-1.5 border-b border-white/5">
             <span className="text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider">
-              Logic Primitives
+              Control flow
             </span>
           </div>
           {SYSTEM_NODES.map((sn, idx) => (

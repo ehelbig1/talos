@@ -168,7 +168,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
           className="flex-1 min-h-0 overflow-auto p-4 space-y-3"
         >
           <div className="flex items-center justify-between">
-            <label className="text-2xs font-bold text-cyan-400 uppercase tracking-wider">
+            <label className="text-xs font-medium text-cyan-400">
               Node Input
             </label>
             <CopyButton
@@ -194,7 +194,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
           className="flex-1 min-h-0 overflow-auto p-4 space-y-3"
         >
           <div className="flex items-center justify-between">
-            <label className="text-2xs font-bold text-cyan-400 uppercase tracking-wider">
+            <label className="text-xs font-medium text-cyan-400">
               Node Output
             </label>
             <CopyButton
@@ -220,7 +220,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
           className="flex-1 min-h-0 overflow-auto p-4 space-y-3"
         >
           <div className="flex items-center justify-between">
-            <label className="text-2xs font-bold text-cyan-400 uppercase tracking-wider">
+            <label className="text-xs font-medium text-cyan-400">
               Execution Metadata
             </label>
             <CopyButton

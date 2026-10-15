@@ -237,7 +237,7 @@ export default function AlertTriage() {
                           corrected
                         </span>
                       )}
-                      <span className="ml-auto text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider shrink-0">
+                      <span className="ml-auto text-xs text-muted-foreground/60 font-medium shrink-0">
                         {relativeTime(asIsoString(a.lastSeen))}
                       </span>
                     </div>

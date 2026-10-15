@@ -52,7 +52,7 @@ export function NewKeyDialog({
             </div>
             <div className="relative group">
               <div className="absolute top-3 left-4 text-2xs font-bold uppercase tracking-wider text-muted-foreground pointer-events-none">
-                Talos Secret Credential
+                API key
               </div>
               <pre className="bg-black border border-white/5 text-amber-500 p-6 pt-10 rounded-xl text-[14px] font-mono break-all whitespace-pre-wrap leading-relaxed">
                 {newKey}
