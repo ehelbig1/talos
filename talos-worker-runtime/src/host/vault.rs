@@ -1220,7 +1220,9 @@ impl TalosContext {
     /// 2. **Env var fallback** — e.g. `ANTHROPIC_API_KEY`. Bootstrap path for dev
     ///    environments where the vault isn't populated; read directly from the
     ///    worker process env (not via `get_host_secret`, which would wrap the
-    ///    value with `"Bearer "`).
+    ///    value with `"Bearer "`). REFUSED outside development unless
+    ///    `TALOS_WORKER_ALLOW_ENV_PROVIDER_KEYS` is true (E-5, 2026-10-14;
+    ///    [`crate::context::EnvProviderKeys`]).
     ///
     /// Returns `None` for Ollama (no key required) and for unknown providers.
     ///
@@ -1304,7 +1306,9 @@ impl TalosContext {
             .await;
             return Some(v);
         }
-        let v = std::env::var(env_name).ok().filter(|v| !v.is_empty())?;
+        // E-5 (2026-10-14): the worker-env fallback is refused in production
+        // unless the operator opted in — `EnvProviderKeys` is the one rule.
+        let v = self.env_provider_keys.lookup(env_name)?;
         self.record_secret_use(
             SecretUseSurface::LlmProviderKey,
             &provider,

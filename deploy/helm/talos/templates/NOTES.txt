@@ -47,6 +47,12 @@ SECURITY REMINDERS
 ==================
 
 - Rotate WORKER_SHARED_KEY and TALOS_AUDIT_SIGNING_KEY at least annually.
-- If {{ if .Values.security.sigstore.enabled }}sigstore enforcement is ON{{ else }}sigstore enforcement is DISABLED{{ end }}, all images under
-  {{- range .Values.security.sigstore.imageGlobs }} {{ . }} {{- end }} {{ if .Values.security.sigstore.enabled }}must be signed{{ else }}are NOT verified — enable before production{{ end }}.
+- Sigstore has TWO switches, and each covers something different:
+  * Image admission (security.sigstore.enabled): {{ if .Values.security.sigstore.enabled }}ON — the service images under
+    {{- range .Values.security.sigstore.imageGlobs }} {{ . }} {{- end }} must be signed{{ else }}OFF — the service images under
+    {{- range .Values.security.sigstore.imageGlobs }} {{ . }} {{- end }} are NOT verified; enable before production{{ end }}.
+  {{- $templateMode := .Values.worker.sigstore.required | default "disabled" | toString | trim | lower }}
+  * Template verification (worker.sigstore.required = {{ $templateMode | quote }}): {{ if has $templateMode (list "required" "true" "1") }}ON — a module template the worker pulls from the registry is refused unless signed by the configured identity{{ else if has $templateMode (list "audit" "warn") }}AUDIT — templates are verified, but one that fails still runs (and is not cached){{ else }}OFF — module templates pulled from the registry are NOT signature-verified{{ end }}.
+    {{- if .Values.controller.ociRegistry.url }} The OCI template registry is in use ({{ .Values.controller.ociRegistry.url }}).{{ else }} No OCI template registry is configured; templates come from the image.{{ end }}
+    Image admission does not cover templates: the worker executes them as WASM.
 - Review the chart README for the full secret-rotation and Phase 1 → 2 migration runbook.

@@ -2332,8 +2332,10 @@ async fn main() -> anyhow::Result<()> {
     // had no signal that signature verification was off. Mirrors the
     // `TALOS_AOT_HMAC_KEY` boot discipline so production failures are
     // loud and immediate. Dev/test hosts (`is_production() == false`)
-    // continue to see the silent default.
-    enforce_production_sigstore_policy_explicit()?;
+    // continue to see the silent default. An UNRECOGNISED value is refused
+    // here in every environment (E-7, 2026-10-14), so the two startup checks
+    // below read the policy this gate resolved.
+    let sigstore_policy_at_boot = enforce_production_sigstore_policy_explicit()?;
 
     // Security review 2026-10-14 (B-2): a production worker does not accept
     // a dispatch signed with the fleet-shared WORKER_SHARED_KEY unless
@@ -2361,7 +2363,7 @@ async fn main() -> anyhow::Result<()> {
     // Failing at boot in Required mode is loud, immediate, and
     // points at the right config knob.
     {
-        let sigstore_policy = SigstorePolicy::from_env();
+        let sigstore_policy = sigstore_policy_at_boot;
         if sigstore_policy != SigstorePolicy::Disabled {
             match tokio::process::Command::new("cosign")
                 .arg("version")
@@ -2551,7 +2553,7 @@ async fn main() -> anyhow::Result<()> {
     // and continue (audit is the migration window). `Disabled` mode
     // skips this entirely.
     {
-        let sigstore_policy_at_startup = SigstorePolicy::from_env();
+        let sigstore_policy_at_startup = sigstore_policy_at_boot;
         if sigstore_policy_at_startup != SigstorePolicy::Disabled {
             let regexp = std::env::var("TALOS_SIGSTORE_IDENTITY_REGEXP").unwrap_or_default();
             // The policy-aware validator also refuses, under Required, a
@@ -3039,11 +3041,22 @@ async fn main() -> anyhow::Result<()> {
     // (Phase 2.3). DATABASE_URL is intentionally not read here.
 
     println!("\n[3/5] Creating WASM runtime...");
-    let runtime = Arc::new(TalosRuntime::with_resources(
-        redis_client.clone(),       // Redis client for WASM fetching and caching
-        Some(Arc::new(nc.clone())), // NATS client for WASM log publishing
-        None,                       // No file system sandbox for now
-    )?);
+    // The Redis tier of the module result cache is sealed under a key derived
+    // from WORKER_SHARED_KEY (E-4, 2026-10-14): every worker of the fleet
+    // opens what another sealed, and a value written by anyone without the
+    // key is a miss. See talos_worker_runtime::result_cache_seal.
+    let runtime = Arc::new(
+        TalosRuntime::with_resources(
+            redis_client.clone(),       // Redis client for WASM fetching and caching
+            Some(Arc::new(nc.clone())), // NATS client for WASM log publishing
+            None,                       // No file system sandbox for now
+        )?
+        .with_result_cache_seal_key(
+            worker::result_cache_seal::ResultCacheSealKey::derive(
+                shared_key.signing_key().as_bytes(),
+            ),
+        ),
+    );
     println!("      Runtime created with NATS logging enabled (worker is credential-free; database access via NATS-RPC)");
 
     // The epoch-interruption ticker (the third kill switch alongside fuel +

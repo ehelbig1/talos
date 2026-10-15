@@ -31,6 +31,7 @@ pub mod module_fetcher;
 pub mod provider_options;
 pub mod reason_class;
 pub mod rehearsal;
+pub mod result_cache_seal;
 pub mod runtime;
 pub mod s3_signer;
 pub mod sql_validator;

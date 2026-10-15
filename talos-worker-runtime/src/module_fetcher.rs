@@ -134,9 +134,14 @@ pub use talos_sigstore_policy::SigstorePolicy;
 /// Returns `Err` in production when the env var is unset / empty / set to
 /// an unrecognised value — the operator's intent is ambiguous, refuse to
 /// guess.
+///
+/// An UNRECOGNISED value is refused in EVERY environment (E-7, 2026-10-14):
+/// until then a misspelt `required` booted a dev or staging worker with
+/// verification silently off.
 pub fn enforce_production_sigstore_policy_explicit() -> anyhow::Result<SigstorePolicy> {
     let raw = std::env::var("TALOS_SIGSTORE_REQUIRED").unwrap_or_default();
-    let policy = SigstorePolicy::from_env_str(&raw);
+    let policy = SigstorePolicy::from_env_str(&raw)
+        .map_err(|e| anyhow::anyhow!("CRITICAL: refusing to boot: {e}"))?;
 
     if !talos_config::is_production() {
         return Ok(policy);
@@ -166,6 +171,62 @@ pub use talos_sigstore_policy::{
     validate_sigstore_identity_regexp, validate_sigstore_identity_regexp_for_policy,
     SigstoreRegexpRejection,
 };
+
+/// What the Sigstore step established about one OCI pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigstoreCheck {
+    /// The policy is `disabled`: nothing was asked, by the operator's choice.
+    NotRequested,
+    /// Verification could not run: `TALOS_SIGSTORE_IDENTITY_REGEXP` is empty.
+    NoIdentity,
+    /// `cosign verify` accepted the signature for the configured identity.
+    Verified,
+    /// `cosign verify` ran and refused, or could not be run.
+    Failed(String),
+}
+
+/// What a pull does after its Sigstore step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigstoreVerdict {
+    /// Execute, and the bytes may seed the Redis OCI cache.
+    Cacheable,
+    /// Execute (audit), but never cache: the bytes are digest-checked only.
+    ExecuteUncached,
+    /// Refuse the pull, with this message.
+    Refuse(String),
+}
+
+/// The Sigstore step's decision — ONE home, pure, so the table is tested
+/// without cosign or Redis.
+///
+/// | policy   | Verified  | NoIdentity / Failed |
+/// |----------|-----------|---------------------|
+/// | disabled | —         | — (`NotRequested` → `Cacheable`) |
+/// | audit    | Cacheable | ExecuteUncached     |
+/// | required | Cacheable | Refuse              |
+///
+/// Only a VERIFIED pull (or one under the operator's explicit `disabled`)
+/// may seed the cache: a cache hit skips this step, so caching anything else
+/// would let a later pull — after a flip to `required` — run bytes nobody
+/// verified. `audit` with no identity regexp ran no verification and is NOT
+/// attested (E-7, 2026-10-14; until then it was cached as if verified).
+#[must_use]
+pub fn sigstore_verdict(policy: SigstorePolicy, check: &SigstoreCheck) -> SigstoreVerdict {
+    match (policy, check) {
+        (SigstorePolicy::Disabled, _) => SigstoreVerdict::Cacheable,
+        (_, SigstoreCheck::Verified) => SigstoreVerdict::Cacheable,
+        (SigstorePolicy::Audit, _) => SigstoreVerdict::ExecuteUncached,
+        (SigstorePolicy::Required, SigstoreCheck::Failed(reason)) => {
+            SigstoreVerdict::Refuse(format!("sigstore_required: {reason}"))
+        }
+        (SigstorePolicy::Required, SigstoreCheck::NoIdentity | SigstoreCheck::NotRequested) => {
+            SigstoreVerdict::Refuse(
+                "TALOS_SIGSTORE_IDENTITY_REGEXP must be set when TALOS_SIGSTORE_REQUIRED is enabled"
+                    .to_string(),
+            )
+        }
+    }
+}
 
 /// Build the `cosign verify` argv for a given OCI reference. Pure
 /// (no env reads, no I/O) so the security-critical command construction
@@ -989,22 +1050,28 @@ pub async fn fetch(
             // is for dev only — production deploys MUST set
             // TALOS_SIGSTORE_REQUIRED=true.
             //
-            // `sigstore_pass_in_this_run` tracks the verdict so we can
-            // skip the Redis cache write on Audit-mode failure: a future
-            // pull would otherwise serve attacker-controlled bytes from
-            // cache without re-verifying signature. Required mode is
-            // already fail-closed (returns Failed below), so this flag
-            // is only consulted for the Audit-failure path.
-            //
-            // Starts `true` because Disabled mode + missing-identity-in-
-            // Audit-mode both fall through without a verification
-            // attempt; treating those as "attested" preserves
-            // operator-chosen intent (Disabled = trust the registry;
-            // Audit-with-missing-identity = misconfiguration warning,
-            // not a verification failure).
-            let mut sigstore_pass_in_this_run = true;
-            let sigstore_policy = SigstorePolicy::from_env();
-            if sigstore_policy != SigstorePolicy::Disabled {
+            // `sigstore_pass_in_this_run` is whether this pull's bytes may be
+            // written to the Redis OCI cache: a future pull served from the
+            // cache skips this step, so only a pull that was VERIFIED (or ran
+            // under the operator's explicit `disabled`) may seed it. The
+            // decision is `sigstore_verdict`'s; see its doc for the table.
+            // Until 2026-10-14 the flag started `true` and an `audit` pull with
+            // no identity regexp — which ran no verification at all — kept it,
+            // so unverified bytes were executed AND cached as attested (E-7).
+            let sigstore_policy = match SigstorePolicy::from_env() {
+                Ok(p) => p,
+                Err(e) => {
+                    // The boot gate refuses this value; reaching here means the
+                    // variable changed under a running process. Fail closed.
+                    ::tracing::error!(module_uri = %req.module_uri, "{e}");
+                    return Err(FetchError {
+                        message: format!("sigstore_policy_unrecognised: {e}"),
+                    });
+                }
+            };
+            let sigstore_check = if sigstore_policy == SigstorePolicy::Disabled {
+                SigstoreCheck::NotRequested
+            } else {
                 let identity_regexp =
                     std::env::var("TALOS_SIGSTORE_IDENTITY_REGEXP").unwrap_or_default();
                 // MCP-752 (2026-05-13): filter empty so a helm-rendered
@@ -1019,64 +1086,48 @@ pub async fn fetch(
                 // restricts to GitHub Actions tokens specifically. Without
                 // ... either omission lets a valid Sigstore signature from
                 // any other workflow on any other repo pass verification.").
-                // Same empty-env class as MCP-590/591/653/710. The sibling
-                // `identity_regexp` is already fail-closed in `Required`
-                // mode at the check below — this fix completes the symmetry
-                // by ensuring the `oidc_issuer` argument can never be empty
-                // when `cosign` is invoked.
+                // Same empty-env class as MCP-590/591/653/710.
                 let oidc_issuer = std::env::var("TALOS_SIGSTORE_OIDC_ISSUER")
                     .ok()
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| "https://token.actions.githubusercontent.com".to_string());
                 if identity_regexp.is_empty() {
-                    let err = "TALOS_SIGSTORE_IDENTITY_REGEXP must be set when \
-                               TALOS_SIGSTORE_REQUIRED is enabled"
-                        .to_string();
-                    ::tracing::error!("{}", err);
-                    if sigstore_policy == SigstorePolicy::Required {
-                        return Err(FetchError { message: err });
-                    }
+                    SigstoreCheck::NoIdentity
                 } else {
                     match verify_oci_signature(&pinned.pinned_ref, &identity_regexp, &oidc_issuer)
                         .await
                     {
                         Ok(()) => {
                             span.add_event("sigstore_verify_ok");
+                            SigstoreCheck::Verified
                         }
-                        Err(reason) => match sigstore_policy {
-                            SigstorePolicy::Required => {
-                                let err = format!("sigstore_required: {reason}");
-                                ::tracing::error!(
-                                    module_uri = %req.module_uri,
-                                    "Sigstore verification failed and policy is required — refusing to execute"
-                                );
-                                return Err(FetchError { message: err });
-                            }
-                            SigstorePolicy::Audit => {
-                                ::tracing::warn!(
-                                    module_uri = %req.module_uri,
-                                    reason = %reason,
-                                    "Sigstore verification failed but policy is audit — \
-                                     continuing execution but NOT caching bytes"
-                                );
-                                span.add_event("sigstore_verify_failed_audit");
-                                // Mark this pull unattested so the
-                                // Redis-cache write below is skipped.
-                                // Without this, an Audit-mode failure
-                                // poisons the cache: the same module_uri
-                                // would short-circuit signature
-                                // verification on the next request
-                                // (cache hits bypass the full OCI path).
-                                // Operators flipping from Audit →
-                                // Required mid-flight would not
-                                // re-verify cached entries.
-                                sigstore_pass_in_this_run = false;
-                            }
-                            SigstorePolicy::Disabled => unreachable!(),
-                        },
+                        Err(reason) => SigstoreCheck::Failed(reason),
                     }
                 }
-            }
+            };
+            let sigstore_pass_in_this_run = match sigstore_verdict(sigstore_policy, &sigstore_check)
+            {
+                SigstoreVerdict::Cacheable => true,
+                SigstoreVerdict::ExecuteUncached => {
+                    ::tracing::warn!(
+                        module_uri = %req.module_uri,
+                        check = ?sigstore_check,
+                        "Sigstore verification did not pass and policy is audit — \
+                         continuing execution but NOT caching bytes"
+                    );
+                    span.add_event("sigstore_unverified_audit");
+                    false
+                }
+                SigstoreVerdict::Refuse(message) => {
+                    ::tracing::error!(
+                        module_uri = %req.module_uri,
+                        reason = %message,
+                        "Sigstore verification did not pass and policy is required — \
+                         refusing to execute"
+                    );
+                    return Err(FetchError { message });
+                }
+            };
 
             // H1: digest-keyed cache lookup, keyed on the layer digest named
             // by the manifest whose OWN digest we computed and (per policy)
@@ -1420,7 +1471,7 @@ mod oci_layer_tests {
         // Use a serial scope guard so concurrent tests don't race on env.
         let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("TALOS_SIGSTORE_REQUIRED");
-        assert_eq!(SigstorePolicy::from_env(), SigstorePolicy::Disabled);
+        assert_eq!(SigstorePolicy::from_env(), Ok(SigstorePolicy::Disabled));
     }
 
     #[test]
@@ -1430,7 +1481,7 @@ mod oci_layer_tests {
             std::env::set_var("TALOS_SIGSTORE_REQUIRED", v);
             assert_eq!(
                 SigstorePolicy::from_env(),
-                SigstorePolicy::Required,
+                Ok(SigstorePolicy::Required),
                 "value `{v}` should map to Required"
             );
         }
@@ -1442,20 +1493,89 @@ mod oci_layer_tests {
         let _g = ENV_LOCK.lock().unwrap();
         for v in ["audit", "warn"] {
             std::env::set_var("TALOS_SIGSTORE_REQUIRED", v);
-            assert_eq!(SigstorePolicy::from_env(), SigstorePolicy::Audit);
+            assert_eq!(SigstorePolicy::from_env(), Ok(SigstorePolicy::Audit));
         }
         std::env::remove_var("TALOS_SIGSTORE_REQUIRED");
     }
 
     #[test]
-    fn sigstore_policy_unknown_value_falls_back_to_disabled() {
+    fn sigstore_policy_unknown_value_is_refused_by_the_boot_gate() {
+        // E-7 (2026-10-14): an unrecognised value is NOT `Disabled` — the
+        // parser errs and the boot gate refuses it outside production too.
+        // Until then `yes-please` (or a misspelt `required`) booted a dev or
+        // staging worker with verification silently off.
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("TALOS_SIGSTORE_REQUIRED", "yes-please");
-        // Fail-safe default: anything we don't recognise is treated as
-        // Disabled, NOT as Required. Operators get a clear "verification
-        // didn't run" signal in logs rather than silent failures.
-        assert_eq!(SigstorePolicy::from_env(), SigstorePolicy::Disabled);
+        for v in ["yes-please", "requried"] {
+            std::env::set_var("TALOS_SIGSTORE_REQUIRED", v);
+            assert!(SigstorePolicy::from_env().is_err(), "{v}");
+            let refused = enforce_production_sigstore_policy_explicit()
+                .expect_err("an unrecognised policy refuses boot outside production");
+            assert!(
+                refused.to_string().contains("not a Sigstore policy"),
+                "{refused}"
+            );
+        }
         std::env::remove_var("TALOS_SIGSTORE_REQUIRED");
+    }
+
+    /// E-7 (2026-10-14): the cache-or-not decision. An `audit` pull that ran
+    /// no verification (no identity regexp) executes but is NOT cached — the
+    /// flag that gates the Redis `SET` is false, so no `SET` is sent.
+    #[test]
+    fn audit_without_an_identity_regexp_is_never_cached() {
+        assert_eq!(
+            sigstore_verdict(SigstorePolicy::Audit, &SigstoreCheck::NoIdentity),
+            SigstoreVerdict::ExecuteUncached
+        );
+        assert_eq!(
+            sigstore_verdict(
+                SigstorePolicy::Audit,
+                &SigstoreCheck::Failed("bad sig".into())
+            ),
+            SigstoreVerdict::ExecuteUncached
+        );
+        // Required refuses both, with the messages the pull returns.
+        assert_eq!(
+            sigstore_verdict(SigstorePolicy::Required, &SigstoreCheck::NoIdentity),
+            SigstoreVerdict::Refuse(
+                "TALOS_SIGSTORE_IDENTITY_REGEXP must be set when TALOS_SIGSTORE_REQUIRED is enabled"
+                    .into()
+            )
+        );
+        assert_eq!(
+            sigstore_verdict(
+                SigstorePolicy::Required,
+                &SigstoreCheck::Failed("bad sig".into())
+            ),
+            SigstoreVerdict::Refuse("sigstore_required: bad sig".into())
+        );
+        // CONTROL: a verified pull is cacheable under either policy, and the
+        // operator's explicit `disabled` keeps its meaning (trust the
+        // registry; the cache is digest-keyed and re-verified on a hit).
+        for p in [SigstorePolicy::Audit, SigstorePolicy::Required] {
+            assert_eq!(
+                sigstore_verdict(p, &SigstoreCheck::Verified),
+                SigstoreVerdict::Cacheable
+            );
+        }
+        assert_eq!(
+            sigstore_verdict(SigstorePolicy::Disabled, &SigstoreCheck::NotRequested),
+            SigstoreVerdict::Cacheable
+        );
+    }
+
+    /// TEXTUAL pin: the flag the OCI cache `SET` reads is the verdict's and is
+    /// assigned exactly once, so the pull cannot cache on any other path.
+    #[test]
+    fn the_oci_cache_write_is_gated_on_the_verdict() {
+        let src = include_str!("module_fetcher.rs");
+        let body = &src[src.find("pub async fn fetch(").unwrap()
+            ..src.find("#[cfg(test)]\nmod oci_layer_tests").unwrap()];
+        assert_eq!(body.matches("sigstore_pass_in_this_run =").count(), 1);
+        assert!(body.contains(
+            "let sigstore_pass_in_this_run = match sigstore_verdict(sigstore_policy, &sigstore_check)"
+        ));
+        assert!(body.contains("if sigstore_pass_in_this_run {"));
     }
 
     // ---- Wasm-security review 2026-05-22 (MEDIUM-4) ----

@@ -15,11 +15,15 @@
 //! limit, the verdict and the gate's decision each live here once; the
 //! controller samples the age hourly through [`sample_and_publish_advisory_db_age`].
 //!
-//! **Stated limit.** The controller image and the builder image each bake
-//! their own copy. The gate stats the CONTROLLER's; in container mode
-//! `cargo audit` reads the BUILDER's (2026-07-09 vs 2026-07-07 on the
-//! reference deployment). Only the controller's copy is sampled — it is the
-//! one the gate consults — and the `copy` label says so.
+//! **Which copy.** The controller image and the builder image each bake
+//! their own copy. In container mode `cargo audit` reads the BUILDER's, and
+//! since 2026-10-14 (G-21) the gate dates that one, with a probe run in the
+//! builder image ([`builder_advisory_db_age_days`]); in host mode the audit
+//! and the gate both read the controller's. Until then the gate always
+//! stat'ed the controller's (2026-07-09 vs the builder's 2026-07-07 on the
+//! reference deployment). **Stated limit:** the hourly sampler still samples
+//! only the controller's copy, and the `copy` label says so — the series and
+//! its alerts do not see the builder's age.
 
 use std::io;
 use std::time::{Duration, SystemTime};
@@ -92,10 +96,85 @@ pub fn advisory_db_age_days(db_path: &str) -> Result<u64, AdvisoryDbAgeError> {
             }
         }
     }
-    let age = SystemTime::now()
+    age_days_since(freshest, SystemTime::now())
+}
+
+/// Whole days from `freshest` to `now` — ONE home for the arithmetic, shared
+/// by the host `stat` above and the builder probe below.
+pub fn age_days_since(freshest: SystemTime, now: SystemTime) -> Result<u64, AdvisoryDbAgeError> {
+    let age = now
         .duration_since(freshest)
         .map_err(|_| AdvisoryDbAgeError::FutureDated)?;
     Ok(age.as_secs() / 86_400)
+}
+
+/// The freshest signal in the builder probe's output: one epoch-seconds value
+/// per line (`stat -c %Y`), anything else ignored. `None` when no line parses
+/// — the database is missing from the image.
+#[must_use]
+pub fn freshest_probe_signal(stdout: &[u8]) -> Option<SystemTime> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .max()
+        .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+/// How long a builder probe's reading is reused before the probe runs again:
+/// the sampler's cadence. The age moves once a day; the image changes only
+/// with `TALOS_BUILDER_IMAGE` (the cache key) or a rebuild under the same
+/// tag, which a reading this old has caught up with.
+const BUILDER_PROBE_REUSE: Duration = Duration::from_secs(ADVISORY_DB_AGE_SAMPLE_INTERVAL_SECS);
+
+/// The last successful builder reading: (image, when it was read, freshest
+/// signal). One entry — there is one configured builder image.
+static BUILDER_READING: std::sync::Mutex<Option<(String, std::time::Instant, SystemTime)>> =
+    std::sync::Mutex::new(None);
+
+/// Age of the advisory database inside the BUILDER image — the copy
+/// `cargo audit` reads in container mode (security review 2026-10-14, G-21).
+/// Until then the gate dated the controller image's copy, which the audit
+/// never reads, so a stale builder passed the gate whenever the controller
+/// had been rebuilt more recently.
+///
+/// Runs the [`crate::container::AdvisoryDbProbe`] at most once per
+/// [`BUILDER_PROBE_REUSE`] per image, under the caller's compile slot; the age
+/// is computed from the cached signal on every call, so it still advances.
+/// An unreadable probe is not cached.
+pub async fn builder_advisory_db_age_days(
+    probe: crate::container::AdvisoryDbProbe,
+    slot: &crate::sandbox_run::CompileSlot,
+) -> Result<u64, AdvisoryDbAgeError> {
+    let cached = BUILDER_READING
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|(image, at, _)| *image == probe.image && at.elapsed() < BUILDER_PROBE_REUSE)
+        .map(|(_, _, freshest)| freshest);
+    let freshest = match cached {
+        Some(f) => f,
+        None => {
+            let out = probe
+                .command
+                .run(Duration::from_secs(30), slot)
+                .await
+                .map_err(|e| {
+                    AdvisoryDbAgeError::Unreadable(io::Error::other(format!(
+                        "builder advisory-DB probe did not run: {e}"
+                    )))
+                })?;
+            let freshest = freshest_probe_signal(&out.stdout).ok_or_else(|| {
+                AdvisoryDbAgeError::Unreadable(io::Error::other(
+                    "builder image has no advisory database to date",
+                ))
+            })?;
+            if let Ok(mut g) = BUILDER_READING.lock() {
+                *g = Some((probe.image, std::time::Instant::now(), freshest));
+            }
+            freshest
+        }
+    };
+    age_days_since(freshest, SystemTime::now())
 }
 
 /// The fail-closed limit: `TALOS_ADVISORY_DB_MAX_AGE_DAYS` as a positive
@@ -336,6 +415,80 @@ mod tests {
         assert!(
             matches!(dated, Err(AdvisoryDbAgeError::FutureDated)),
             "{dated:?}"
+        );
+    }
+
+    fn epoch_days_ago(days: u64) -> u64 {
+        (SystemTime::now() - Duration::from_secs(days * DAY + 3600))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn the_probe_output_is_dated_by_its_freshest_line() {
+        let out = format!(
+            "{}\nnot-a-number\n\n{}\n {} \n",
+            epoch_days_ago(100),
+            epoch_days_ago(12),
+            epoch_days_ago(40)
+        );
+        let freshest = freshest_probe_signal(out.as_bytes()).expect("dated");
+        assert_eq!(age_days_since(freshest, SystemTime::now()).unwrap(), 12);
+        assert_eq!(freshest_probe_signal(b""), None, "no database in the image");
+        assert_eq!(freshest_probe_signal(b"stat: cannot stat\n"), None);
+        let future = SystemTime::now() + Duration::from_secs(5 * DAY);
+        assert!(matches!(
+            age_days_since(future, SystemTime::now()),
+            Err(AdvisoryDbAgeError::FutureDated)
+        ));
+    }
+
+    #[test]
+    fn the_probe_reads_the_three_signals_of_the_audited_path() {
+        let script = crate::container::advisory_db_probe_script();
+        let db = crate::container::ADVISORY_DB_PATH;
+        for signal in [
+            format!("{db} "),
+            format!("{db}/.git/refs/heads/main"),
+            format!("{db}/.git/refs/heads/master"),
+            format!("{db}/crates/*"),
+        ] {
+            assert!(script.contains(&signal), "{script} lacks {signal}");
+        }
+        assert!(script.starts_with("stat -c %Y "));
+    }
+
+    /// The probe runs in the builder image under the audit's envelope, with
+    /// no mount at all: it can read only the image's own database.
+    #[test]
+    fn the_probe_container_has_the_audit_envelope_and_no_mounts() {
+        let cmd =
+            crate::container::advisory_db_probe_command("docker", "talos-builder:t", "2g", "2");
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for flag in [
+            "--rm",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "no-new-privileges:true",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
+        }
+        assert!(!args.iter().any(|a| a == "-v"), "a mount: {args:?}");
+        let n = args.len();
+        assert_eq!(
+            &args[n - 4..],
+            &[
+                "talos-builder:t".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                crate::container::advisory_db_probe_script()
+            ]
         );
     }
 

@@ -10246,6 +10246,7 @@ dependencies = [
 name = "talos-worker-runtime"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-nats",
  "base64 0.23.1",
@@ -10279,6 +10280,7 @@ dependencies = [
  "sqlparser",
  "subtle",
  "talos-audit-event",
+ "talos-auth-types",
  "talos-config",
  "talos-dlp-provider",
  "talos-idempotency",

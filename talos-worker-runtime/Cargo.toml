@@ -58,6 +58,7 @@ talos-sigstore-policy = { path = "../talos-sigstore-policy" }
 talos-wit-inspector = { path = "../talos-wit-inspector" }
 talos-trace = { path = "../talos-trace" }
 talos-trace-nats = { path = "../talos-trace-nats" }
+talos-auth-types = { path = "../talos-auth-types" }
 talos-config = { path = "../talos-config" }
 talos-audit-event = { path = "../talos-audit-event" }
 # Worker-side in-memory idempotency dedup store (belt-and-suspenders on top of
@@ -88,6 +89,8 @@ dashmap.workspace = true  # Lock-free concurrent HashMap for component caches
 sha2.workspace = true  # For cache key hashing and crypto interface
 md5 = "0.8"  # MD5 hashing (crypto interface)
 hmac.workspace = true  # HMAC operations (crypto interface)
+# Seals the Redis tier of the module result cache (`result_cache_seal`, E-4).
+aes-gcm.workspace = true
 base64.workspace = true  # Base64 encoding/decoding (crypto interface)
 hex.workspace = true  # Hex encoding/decoding (crypto interface)
 

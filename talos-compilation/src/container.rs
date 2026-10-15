@@ -545,8 +545,45 @@ pub fn build_command(
 /// stable bake-in. If you set `TALOS_BUILDER_IMAGE` to a custom image,
 /// bake the DB at the same path or every audit fails closed.
 pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<SandboxCommand> {
+    audit_command_with_db_probe(workspace, cargo_registry_cache).map(|(audit, _)| audit)
+}
+
+/// The command that dates the advisory database `cargo audit` will read, in
+/// the place it will read it (G-21, 2026-10-14). In container mode the audit
+/// reads the BUILDER image's copy, which the controller cannot `stat`; the
+/// probe runs in the same image under the same envelope (no network,
+/// read-only root, no mounts at all) and prints the mtimes
+/// [`crate::advisory_db::advisory_db_age_days`] reads on the host.
+#[derive(Debug)]
+pub struct AdvisoryDbProbe {
+    /// The builder image the probe (and the audit) runs; the cache key of
+    /// [`crate::advisory_db::builder_advisory_db_age_days`].
+    pub image: String,
+    pub command: SandboxCommand,
+}
+
+/// The shell the probe runs: one line of epoch seconds per signal — the
+/// directory, `.git/refs/heads/{main,master}`, and each `crates/*` entry. A
+/// missing signal prints nothing; `exit 0` because a missing ref is normal.
+#[must_use]
+pub fn advisory_db_probe_script() -> String {
+    format!(
+        "stat -c %Y {db} {db}/.git/refs/heads/main {db}/.git/refs/heads/master {db}/crates/* \
+         2>/dev/null; exit 0",
+        db = ADVISORY_DB_PATH
+    )
+}
+
+/// [`audit_command`] and, in container mode, the [`AdvisoryDbProbe`] for the
+/// copy it reads — from ONE sandbox decision, so the gate dates the copy the
+/// audit uses. `None` in host mode: the host audit reads the host's copy,
+/// which the gate `stat`s directly.
+pub fn audit_command_with_db_probe(
+    workspace: &Path,
+    cargo_registry_cache: &Path,
+) -> Result<(SandboxCommand, Option<AdvisoryDbProbe>)> {
     let Some(runtime) = resolve_sandbox_runtime("audit")? else {
-        return Ok(host_command("cargo"));
+        return Ok((host_command("cargo"), None));
     };
 
     let image = nonempty_env_or("TALOS_BUILDER_IMAGE", DEFAULT_IMAGE);
@@ -606,7 +643,49 @@ pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Sa
         "cargo",
     ]);
 
-    Ok(cmd)
+    let probe = advisory_db_probe_command(runtime, &image, &memory, &cpus);
+    Ok((
+        cmd,
+        Some(AdvisoryDbProbe {
+            image,
+            command: probe,
+        }),
+    ))
+}
+
+/// The probe's container: the audit's envelope with NO mounts (it reads only
+/// the image's own `/opt/talos-advisory-db`) and the script as its command.
+pub(crate) fn advisory_db_probe_command(
+    runtime: &'static str,
+    image: &str,
+    memory: &str,
+    cpus: &str,
+) -> SandboxCommand {
+    let script = advisory_db_probe_script();
+    let mut cmd = SandboxCommand::container_run(runtime);
+    cmd.args([
+        "--rm",
+        "--network=none",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,size=16m",
+        "--memory",
+        memory,
+        "--cpus",
+        cpus,
+        "--pids-limit",
+        CONTAINER_PIDS_LIMIT,
+        "--user",
+        "1000:1000",
+        "--cap-drop=ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        image,
+        "sh",
+        "-c",
+        &script,
+    ]);
+    cmd
 }
 
 /// Build a [`SandboxCommand`] that runs an arbitrary sandboxed TOOL (jco,
@@ -1221,5 +1300,76 @@ mod tests {
 
         std::env::remove_var("TALOS_COMPILATION_CONTAINER");
         std::env::remove_var("RUST_ENV");
+    }
+
+    fn epoch_days_ago(days: u64) -> u64 {
+        (std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400 + 3600))
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// G-21 end to end: the gate dates what the PROBE (the builder image)
+    /// reports, not the controller's copy. A stand-in runtime prints a stale
+    /// builder database; the controller's copy does not enter into it.
+    #[tokio::test]
+    async fn the_gate_dates_the_builder_copy_through_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("fake-runtime");
+        std::fs::write(
+            &runtime,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n' {} {}\n",
+                epoch_days_ago(200),
+                epoch_days_ago(120)
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime: &'static str =
+            Box::leak(runtime.to_string_lossy().into_owned().into_boxed_str());
+
+        let slot = crate::sandbox_run::CompileSlot::acquire(std::sync::Arc::new(
+            tokio::sync::Semaphore::new(1),
+        ))
+        .await
+        .expect("fresh semaphore");
+        let image = "talos-builder:g21-stale-test";
+        let probe = crate::container::AdvisoryDbProbe {
+            image: image.to_string(),
+            command: crate::container::advisory_db_probe_command(runtime, image, "1g", "1"),
+        };
+        let age = crate::advisory_db::builder_advisory_db_age_days(probe, &slot).await;
+        assert_eq!(age.as_ref().ok(), Some(&120), "{age:?}");
+
+        // Production refuses a compile on that reading.
+        let refused =
+            crate::check_measured_advisory_db_age_as(crate::container::ADVISORY_DB_PATH, age, true)
+                .expect_err("a 120-day builder database is refused in production");
+        assert!(refused.to_string().contains("120 days old"), "{refused}");
+
+        // An image with no database (empty probe output) is unreadable, not
+        // fresh.
+        let empty = dir.path().join("empty-runtime");
+        std::fs::write(&empty, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty: &'static str = Box::leak(empty.to_string_lossy().into_owned().into_boxed_str());
+        let image = "talos-builder:g21-empty-test";
+        let unreadable = crate::advisory_db::builder_advisory_db_age_days(
+            crate::container::AdvisoryDbProbe {
+                image: image.to_string(),
+                command: crate::container::advisory_db_probe_command(empty, image, "1g", "1"),
+            },
+            &slot,
+        )
+        .await;
+        assert!(
+            matches!(
+                unreadable,
+                Err(crate::advisory_db::AdvisoryDbAgeError::Unreadable(_))
+            ),
+            "{unreadable:?}"
+        );
     }
 }

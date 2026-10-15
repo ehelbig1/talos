@@ -222,6 +222,16 @@ pub(crate) const MAX_EMBEDDING_TEXT_BYTES: usize = 65_536;
 pub(crate) const MAX_FS_BYTES_PER_EXECUTION: u64 = 1_073_741_824;
 /// Maximum log messages per execution (prevents NATS flooding).
 pub(crate) const MAX_LOG_MESSAGES_PER_EXECUTION: u64 = 10_000;
+/// Maximum bytes of one guest log message (`log` text or `log-json` text);
+/// a longer one is cut at a char boundary and marked `...[TRUNCATED]`.
+pub(crate) const MAX_LOG_MESSAGE_BYTES: usize = 10_000;
+/// Maximum guest log BYTES per execution, across `log` and `log-json`
+/// (E-12, 2026-10-14). Until then only the message count bounded a run, so
+/// one execution could relay 10 000 × 10 000 B ≈ 100 MB to NATS and the
+/// controller's log store. 1 MiB is about 100 full-size messages or several
+/// thousand typical ones; a message that would cross it is dropped, with one
+/// WARN per execution.
+pub(crate) const MAX_LOG_BYTES_PER_EXECUTION: u64 = 1_048_576;
 /// Maximum Tier-2 secret exposures per user per day (global limit across all executions).
 pub(crate) const MAX_TIER2_EXPOSES_PER_USER_PER_DAY: u64 = 100;
 /// Maximum concurrent LLM streams per execution (prevents resource leaks).

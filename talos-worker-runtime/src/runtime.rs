@@ -2942,6 +2942,13 @@ pub struct TalosRuntime {
     /// Populated from the `WASM_RESULT_CACHE_TTL_SECS` env var at runtime
     /// construction to avoid repeated lookups.
     default_result_cache_ttl_secs: Option<u64>,
+    /// Seals the REDIS tier of the result cache (E-4, 2026-10-14). `None` ⇒
+    /// the Redis tier is not used at all (only the in-process tier), because
+    /// an unsealed Redis value is exactly what an attacker could write. Set by
+    /// the worker binary from `WORKER_SHARED_KEY` via
+    /// [`TalosRuntime::with_result_cache_seal_key`]; see
+    /// [`crate::result_cache_seal`].
+    result_cache_seal: Option<crate::result_cache_seal::ResultCacheSealKey>,
     /// Per-user in-memory fallback for the Tier-2 `expose_secret` daily
     /// cap. Shared across ALL executions in this worker process via
     /// `Arc<ExposeFallback>` — see [`crate::expose_fallback`] for the
@@ -3309,12 +3316,24 @@ impl TalosRuntime {
             drop(entry);
             self.in_memory_result_cache.remove(cache_key);
         }
-        // Fall back to Redis if configured.
-        if let Some(redis) = &self.redis_client {
+        // Fall back to Redis if configured AND sealed (E-4): a Redis value is
+        // returned as the module's output only when it opens under the seal
+        // key for exactly this cache key. Anything else — a flipped byte, an
+        // entry moved from another key, a plaintext value — is a miss and the
+        // module runs; a successful run overwrites the entry.
+        if let (Some(redis), Some(seal)) = (&self.redis_client, &self.result_cache_seal) {
             if let Ok(mut conn) = talos_redis::multiplexed(redis).await {
                 use redis::AsyncCommands;
                 if let Ok(cached_str) = conn.get::<_, String>(cache_key).await {
-                    if let Ok(cached_json) = serde_json::from_str::<JsonValue>(&cached_str) {
+                    let opened = crate::result_cache_seal::open(seal, cache_key, &cached_str);
+                    if opened.is_none() {
+                        tracing::warn!(
+                            event_kind = "result_cache_entry_unsealed",
+                            "Redis result-cache entry did not open under the seal key — \
+                             ignored, the module runs"
+                        );
+                    }
+                    if let Some(cached_json) = opened {
                         // Populate in-process cache for future fast reads.
                         // Pull the remaining Redis TTL so the in-memory entry
                         // can't outlive the canonical Redis copy. Fall back to
@@ -3364,11 +3383,11 @@ impl TalosRuntime {
     /// Store result in both in-process cache and Redis (with TTL).
     async fn cache_result(&self, cache_key: &str, result: &JsonValue, ttl_secs: u64) {
         self.insert_to_cache(cache_key.to_string(), result.clone(), ttl_secs);
-        // Also push to Redis if available.
-        if let Some(redis) = &self.redis_client {
+        // Also push to Redis if available — sealed (E-4); never in clear.
+        if let (Some(redis), Some(seal)) = (&self.redis_client, &self.result_cache_seal) {
             if let Ok(mut conn) = talos_redis::multiplexed(redis).await {
                 use redis::AsyncCommands;
-                if let Ok(result_str) = serde_json::to_string(result) {
+                if let Some(result_str) = crate::result_cache_seal::seal(seal, cache_key, result) {
                     let _ = conn
                         .set_ex::<_, _, ()>(cache_key, result_str, ttl_secs)
                         .await;
@@ -3923,10 +3942,24 @@ impl TalosRuntime {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|n| *n > 0),
+            result_cache_seal: None,
             global_expose_fallback: Arc::new(crate::expose_fallback::ExposeFallback::new()),
             cancel_registry: Arc::new(crate::cancel_registry::CancelRegistry::new()),
             _epoch_ticker,
         })
+    }
+
+    /// Turn on the REDIS tier of the result cache, sealed under `key`
+    /// (E-4, 2026-10-14). Without it only the in-process tier is used. The
+    /// worker binary derives the key from `WORKER_SHARED_KEY`
+    /// ([`crate::result_cache_seal::ResultCacheSealKey::derive`]).
+    #[must_use]
+    pub fn with_result_cache_seal_key(
+        mut self,
+        key: crate::result_cache_seal::ResultCacheSealKey,
+    ) -> Self {
+        self.result_cache_seal = Some(key);
+        self
     }
 
     /// Execute a Wasm component bytecode with the given JSON input.
