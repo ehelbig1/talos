@@ -442,3 +442,309 @@ async fn a_dashboard_module_is_created_within_the_users_ceiling() {
         .unwrap();
     assert_eq!(before, after);
 }
+
+async fn seed_workflow(pool: &sqlx::PgPool, user: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, name, graph_json, module_uri, status) \
+         VALUES ($1, $2, $3, '{\"nodes\": [], \"edges\": []}', 'talos://test', 'draft')",
+    )
+    .bind(id)
+    .bind(user)
+    .bind(format!("grant-wf-{}", &id.to_string()[..8]))
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn workflow_tool(
+    state: &Arc<controller::mcp::McpState>,
+    agent: Arc<AgentIdentity>,
+    tool: &str,
+    args: serde_json::Value,
+) -> controller::mcp::types::JsonRpcResponse {
+    controller::mcp::workflows::dispatch(
+        tool,
+        Some(serde_json::json!(1)),
+        &args,
+        state.clone(),
+        agent,
+    )
+    .await
+    .expect("dispatched")
+}
+
+async fn module_count(pool: &sqlx::PgPool, user: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM modules WHERE user_id = $1")
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn graph(pool: &sqlx::PgPool, workflow: Uuid) -> String {
+    sqlx::query_scalar("SELECT graph_json::text FROM workflows WHERE id = $1")
+        .bind(workflow)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A2-1 (2026-10-15): `add_node_to_workflow`'s inline compile takes no
+/// wildcard grant from a bearer — a `*` secret, a `<prefix>/*` secret glob,
+/// a `*` host, nor the every-host default of a network world it used to hand
+/// out when no hosts were named. Refused before anything is compiled; no
+/// module row, no graph change.
+#[tokio::test]
+async fn an_inline_node_takes_no_wildcard_grant_from_a_bearer() {
+    let ctx = common::setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let user = common::create_test_user(&ctx.auth_service, "inline-grant@example.com").await;
+    grant(&pool, user, "automation-node").await;
+    let wf = seed_workflow(&pool, user).await;
+    let before = graph(&pool, wf).await;
+    let state = Arc::new(mcp_common::mcp_state(pool.clone()).await);
+    let token = mcp_common::agent(user);
+    let node = |extra: serde_json::Value| {
+        let mut args = serde_json::json!({
+            "workflow_id": wf.to_string(),
+            "node_id": "inline-probe",
+            "rust_code": "pub fn run(_input: String) -> String { String::new() }",
+            "capability_world": "http-node",
+        });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        args
+    };
+    for extra in [
+        serde_json::json!({ "allowed_secrets": ["*"], "allowed_hosts": ["api.example.test"] }),
+        serde_json::json!({ "allowed_secrets": ["svc/*"], "allowed_hosts": ["api.example.test"] }),
+        serde_json::json!({ "allowed_hosts": ["*"] }),
+    ] {
+        let resp = workflow_tool(
+            &state,
+            token.clone(),
+            "add_node_to_workflow",
+            node(extra.clone()),
+        )
+        .await;
+        assert_eq!(
+            mcp_common::error_message(&resp),
+            WILDCARD_GRANT_NEEDS_SECOND_FACTOR,
+            "{extra}"
+        );
+    }
+    // A network world with no host list: the every-host default is a `*`.
+    let resp = workflow_tool(
+        &state,
+        token.clone(),
+        "add_node_to_workflow",
+        node(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        mcp_common::error_message(&resp),
+        talos_workflow_creation_helpers::HOSTS_MUST_BE_NAMED
+    );
+    assert_eq!(module_count(&pool, user).await, 0, "no module row");
+    assert_eq!(graph(&pool, wf).await, before, "no graph change");
+
+    // create_workflow_from_spec: a spec grants secrets by path.
+    let resp = workflow_tool(
+        &state,
+        token,
+        "create_workflow_from_spec",
+        serde_json::json!({
+            "name": "spec-grant-probe",
+            "nodes": [{
+                "id": "spec-probe",
+                "rust_code": "pub fn run(_input: String) -> String { String::new() }",
+                "capability_world": "http-node",
+                "allowed_hosts": ["api.example.test"],
+                "allowed_secrets": ["*"],
+            }],
+            "edges": [],
+        }),
+    )
+    .await;
+    assert!(
+        mcp_common::error_message(&resp).contains("allowed_secrets may not contain"),
+        "{resp:?}"
+    );
+    assert_eq!(module_count(&pool, user).await, 0);
+}
+
+/// A2-2 (2026-10-15): `add_node_to_workflow`'s inline compile is bounded by
+/// the user's own capability ceiling (and the agent's role), like every other
+/// compile surface — an actor-less workflow has no actor ceiling to stop it.
+#[tokio::test]
+async fn an_inline_node_is_compiled_within_the_users_ceiling() {
+    let ctx = common::setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let user = common::create_test_user(&ctx.auth_service, "inline-ceiling@example.com").await;
+    grant(&pool, user, "minimal-node").await;
+    let wf = seed_workflow(&pool, user).await;
+    let before = graph(&pool, wf).await;
+    let state = Arc::new(mcp_common::mcp_state(pool.clone()).await);
+    let args = serde_json::json!({
+        "workflow_id": wf.to_string(),
+        "node_id": "ceiling-probe",
+        "rust_code": "pub fn run(_input: String) -> String { String::new() }",
+        "capability_world": "http-node",
+        "allowed_hosts": ["api.example.test"],
+    });
+    let resp = workflow_tool(
+        &state,
+        mcp_common::agent(user),
+        "add_node_to_workflow",
+        args.clone(),
+    )
+    .await;
+    assert!(
+        mcp_common::error_message(&resp).contains("your capability ceiling is 'minimal-node'"),
+        "{resp:?}"
+    );
+    // A role below the world refuses too.
+    let resp = workflow_tool(
+        &state,
+        agent_with(user, &["minimal"]),
+        "add_node_to_workflow",
+        args,
+    )
+    .await;
+    assert!(
+        mcp_common::error_message(&resp).contains("lacks capability"),
+        "{resp:?}"
+    );
+    assert_eq!(module_count(&pool, user).await, 0, "no module row");
+    assert_eq!(graph(&pool, wf).await, before, "no graph change");
+}
+
+/// G2-1 (2026-10-15): `import_workflow` holds a bundle module's world — the
+/// bundle's stated world, else the one its source declares — to the caller's
+/// role and capability ceiling before it compiles anything.
+#[tokio::test]
+async fn an_imported_module_is_compiled_within_the_users_ceiling() {
+    let ctx = common::setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let user = common::create_test_user(&ctx.auth_service, "import-ceiling@example.com").await;
+    grant(&pool, user, "minimal-node").await;
+    let state = Arc::new(mcp_common::mcp_state(pool.clone()).await);
+    let module = Uuid::new_v4();
+    let bundle = |world: Option<&str>, source: &str| {
+        let mut m = serde_json::json!({
+            "id": module.to_string(),
+            "name": "imported-probe",
+            "source_code": source,
+        });
+        if let Some(w) = world {
+            m["capability_world"] = serde_json::json!(w);
+        }
+        serde_json::json!({
+            "bundle": {
+                "name": "import-probe",
+                "graph_json": { "nodes": [{ "id": "n1", "type": module.to_string(), "data": {} }],
+                                "edges": [] },
+                "modules": [m],
+            }
+        })
+    };
+    let plain = "pub fn run(_input: String) -> String { String::new() }";
+    let declaring = "#[talos_module(world = \"automation-node\")]\npub fn run(_input: String) -> String { String::new() }";
+    for (world, src) in [(Some("automation-node"), plain), (None, declaring)] {
+        let resp = workflow_tool(
+            &state,
+            mcp_common::agent(user),
+            "import_workflow",
+            bundle(world, src),
+        )
+        .await;
+        assert!(
+            mcp_common::error_message(&resp).contains("your capability ceiling is 'minimal-node'"),
+            "{world:?}: {resp:?}"
+        );
+    }
+    let resp = workflow_tool(
+        &state,
+        agent_with(user, &["minimal"]),
+        "import_workflow",
+        bundle(Some("http-node"), plain),
+    )
+    .await;
+    assert!(
+        mcp_common::error_message(&resp).contains("lacks capability"),
+        "{resp:?}"
+    );
+    assert_eq!(module_count(&pool, user).await, 0, "no module row");
+    let workflows: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows WHERE user_id = $1")
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(workflows, 0, "no workflow imported");
+}
+
+/// A2-3 (2026-10-15): a `<prefix>/*` secret glob is a wildcard for a bearer
+/// on `update_module_secrets` and at the repository write, as the marketplace
+/// install already held it; a second-factor session writes it. A bare
+/// namespace (`oauth/gmail`) is an exact-path-shaped grant and is written.
+#[tokio::test]
+async fn a_bearer_writes_no_secret_glob() {
+    let ctx = common::setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let user = common::create_test_user(&ctx.auth_service, "glob-grant@example.com").await;
+    grant(&pool, user, "automation-node").await;
+    let module = seed_module(&pool, user, "http-node").await;
+    let state = mcp_common::mcp_state(pool.clone()).await;
+    let resp = sandbox(
+        &state,
+        mcp_common::agent(user),
+        "update_module_secrets",
+        serde_json::json!({ "module_id": module.to_string(), "allowed_secrets": ["svc/*"] }),
+    )
+    .await;
+    assert_eq!(
+        mcp_common::error_message(&resp),
+        WILDCARD_GRANT_NEEDS_SECOND_FACTOR
+    );
+    assert_eq!(grants(&pool, module).await.0, vec!["svc/a"]);
+
+    let repo = talos_module_repository::ModuleRepository::new(pool.clone());
+    let glob = vec!["svc/*".to_string()];
+    let keep = |_: &[String], new: &[String]| new.to_vec();
+    assert!(repo
+        .update_module_allowed_secrets(
+            module,
+            user,
+            &glob,
+            &keep,
+            talos_capability_world::ChangeAuthority::BearerCredential,
+        )
+        .await
+        .expect_err("refused")
+        .downcast_ref::<talos_module_repository::WildcardGrantRefused>()
+        .is_some());
+    repo.update_module_allowed_secrets(
+        module,
+        user,
+        &glob,
+        &keep,
+        talos_capability_world::ChangeAuthority::SecondFactorSession,
+    )
+    .await
+    .unwrap()
+    .expect("owned");
+    assert_eq!(grants(&pool, module).await.0, vec!["svc/*"]);
+
+    let resp = sandbox(
+        &state,
+        mcp_common::agent(user),
+        "update_module_secrets",
+        serde_json::json!({ "module_id": module.to_string(), "allowed_secrets": ["oauth/gmail"] }),
+    )
+    .await;
+    assert!(resp.error.is_none(), "{resp:?}");
+    assert_eq!(grants(&pool, module).await.0, vec!["oauth/gmail"]);
+}

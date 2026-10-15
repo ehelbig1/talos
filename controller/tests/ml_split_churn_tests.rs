@@ -110,6 +110,7 @@ async fn seed_examples(dsvc: &DatasetService, pool: &sqlx::PgPool, ds: Uuid, n: 
     };
     for i in 0..n {
         let ex = AppendExample {
+            origin: None,
             features_text: format!("row-{i}"),
             label: if i % 2 == 0 { "a" } else { "b" }.to_string(),
             source: ExampleSource::LlmBootstrap,

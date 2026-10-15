@@ -334,6 +334,7 @@ impl HotUpdateService {
             // declares another world is refused (security review 2026-10-14,
             // G-1) — an existing narrow-labelled module cannot be swapped for
             // a wider binary.
+            // compile-gate-elsewhere: world: the hot_update_module handler's require_world_permitted (sandbox.rs); grants: a hot update recompiles the stored module and changes no grant
             .compile_rust_for_world(
                 user_id,
                 job_id,

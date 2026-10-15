@@ -10338,6 +10338,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde_json",
+ "talos-capability-world",
  "talos-dlp-provider",
  "talos-inline-compile-service",
  "talos-llm",
@@ -10359,6 +10360,7 @@ dependencies = [
  "regex",
  "rhai",
  "serde_json",
+ "talos-capability-world",
  "talos-text-util",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",

@@ -514,6 +514,7 @@ async fn handle_append_examples(
             Err(m) => return mcp_error(req_id, -32602, &format!("examples[{i}]: {m}")),
         };
         examples.push(AppendExample {
+            origin: None,
             features_text: text.to_string(),
             label: label.to_string(),
             source,

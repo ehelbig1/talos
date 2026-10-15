@@ -194,6 +194,20 @@ fn admit_human_labels(
     (kept, refused)
 }
 
+/// Drop the human-confirmed items whose label is not one of the dataset's
+/// classes (`known`), and say how many. The operator path's rule
+/// (`correction::label_in_vocabulary`): an EMPTY vocabulary — a dataset with
+/// no labelled rows yet — accepts anything. Pure.
+fn keep_known_human_labels(items: Vec<DistillItem>, known: &[String]) -> (Vec<DistillItem>, usize) {
+    let before = items.len();
+    let kept: Vec<DistillItem> = items
+        .into_iter()
+        .filter(|i| !i.human_confirmed || crate::correction::label_in_vocabulary(&i.label, known))
+        .collect();
+    let refused = before - kept.len();
+    (kept, refused)
+}
+
 /// Normalize + validate the envelope into an item list. Items with
 /// blank/oversized fields are skipped with a count (partial batches still
 /// distill).
@@ -494,7 +508,33 @@ async fn process_distill(
     if tenancy.user_id != user_id {
         anyhow::bail!("model '{model_name}' dataset is not owned by the resolving user");
     }
+    // A tapped label is gold only when it is one of the dataset's classes —
+    // the rule the operator's correction path applies
+    // (`correction::label_in_vocabulary`; security review 2026-10-15,
+    // I2-1). A typo, or a tap workflow still naming a class set the model was
+    // re-provisioned away from, would otherwise mint a pinned phantom class
+    // with its own few-shot slot. Model labels are not checked here: their
+    // disagreement flow catches them.
+    let known = ctx
+        .dataset_service
+        .label_vocabulary(&mut tx, dataset_id)
+        .await
+        .context("distill label vocabulary")?;
     tx.commit().await.context("commit distill resolve tx")?;
+    let (items, unknown) = keep_known_human_labels(items, &known);
+    if unknown > 0 {
+        // The model and a count, never the label text (caller data).
+        tracing::warn!(
+            target: "talos_ml",
+            model = model_name,
+            refused = unknown,
+            "__ml_distill__: human-confirmed items with a label outside the dataset's \
+             classes were dropped"
+        );
+    }
+    if items.is_empty() {
+        return Ok(());
+    }
 
     // Serialize the shadow→append critical section per model so a
     // concurrent flow's append can't interleave and self-match-inflate
@@ -577,6 +617,8 @@ async fn process_distill(
     let append: Vec<AppendExample> = items
         .iter()
         .map(|i| AppendExample {
+            // I2-5: a tapped label says so in `label_json.origin`.
+            origin: i.human_confirmed.then_some(crate::dataset::TAP_ORIGIN),
             features_text: i.features_text.clone(),
             label: i.label.clone(),
             source: if i.human_confirmed {
@@ -740,6 +782,35 @@ mod tests {
             example_key: Some(key.into()),
             human_confirmed: human,
         }
+    }
+
+    #[test]
+    fn a_tapped_label_outside_the_vocabulary_is_dropped() {
+        let item = |label: &str, human: bool| DistillItem {
+            features_text: "Subject: made-up".to_string(),
+            label: label.to_string(),
+            example_key: None,
+            human_confirmed: human,
+        };
+        let known = vec!["archive".to_string(), "keep".to_string()];
+        let (kept, refused) = keep_known_human_labels(
+            vec![
+                item("made-up-phantom", true),
+                item("keep", true),
+                item("not-a-class-either", false),
+            ],
+            &known,
+        );
+        assert_eq!(refused, 1);
+        let labels: Vec<&str> = kept.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["keep", "not-a-class-either"],
+            "a model label is not held to the vocabulary"
+        );
+        // An empty vocabulary accepts the first label, as the operator path does.
+        let (kept, refused) = keep_known_human_labels(vec![item("first", true)], &[]);
+        assert_eq!((kept.len(), refused), (1, 0));
     }
 
     #[test]

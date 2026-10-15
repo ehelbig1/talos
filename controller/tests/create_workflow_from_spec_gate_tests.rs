@@ -505,6 +505,7 @@ fn persist_input<'a>(user: Uuid, name: &'a str, world: &'a str) -> InlineCompile
         integration_name: None,
         fuel_budget: None,
         on_name_collision: NameCollision::Refuse,
+        authority: talos_capability_world::ChangeAuthority::BearerCredential,
     }
 }
 

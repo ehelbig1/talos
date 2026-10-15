@@ -93,6 +93,7 @@ async fn append_rows(
     let examples: Vec<AppendExample> = keys
         .iter()
         .map(|k| AppendExample {
+            origin: None,
             features_text: format!("Subject: {k}"),
             label: "archive".to_string(),
             source: ExampleSource::LlmProduction,

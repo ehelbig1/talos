@@ -2429,6 +2429,7 @@ pub(crate) async fn seed_templates(
                             "Catalog template needs WASM — background compilation started"
                         );
                         match compiler_bg
+                            // compile-gate-elsewhere: boot-time catalog seed: no user, no caller grant; the template's manifest is its grant
                             .compile_catalog_template(
                                 uuid::Uuid::nil(),
                                 uuid::Uuid::new_v4(),

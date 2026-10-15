@@ -66,6 +66,10 @@ pub struct CreateFromSpecRequest<'a> {
     pub description: &'a str,
     pub spec_nodes: &'a [Value],
     pub spec_edges: &'a [Value],
+    /// Who is asking. An MCP agent token or an API key writes no wildcard
+    /// grant (security review 2026-10-15, A2-1); the inline-compile service
+    /// holds every inline node to it.
+    pub authority: talos_capability_world::ChangeAuthority,
 }
 
 /// Synchronous outcome of the create-from-spec flow.
@@ -318,6 +322,18 @@ pub(crate) fn validate_inline_spec_node(
         return Err(format!("allowed_hosts entry {h:?} is empty"));
     }
     let allowed_secrets = strict_str_array(spec_node, "allowed_secrets")?;
+    // The secrets twin of the hosts rule above (A2-1, 2026-10-15): a spec
+    // grants secrets by PATH; `*` (every stored secret) and a `<prefix>/*`
+    // glob are a deliberate act for update_module_secrets.
+    if talos_capability_world::secret_grant_list_has_wildcard(&allowed_secrets) {
+        return Err(
+            "allowed_secrets may not contain \"*\" or a \"<prefix>/*\" glob: a spec grants \
+             secrets by path. List the paths this module reads; granting every secret is a \
+             deliberate act for update_module_secrets, not a side effect of authoring a \
+             workflow."
+                .to_string(),
+        );
+    }
     let allowed_methods: Vec<String> = strict_str_array(spec_node, "allowed_methods")?
         .into_iter()
         .map(|m| m.to_ascii_uppercase())
@@ -474,9 +490,10 @@ fn node_build_error(
 ) -> NodeBuildError {
     use talos_inline_compile_service::InlineCompileError as E;
     let stage = match e {
-        E::InvalidArg(_) | E::DependencyValidation(_) | E::CapabilityCeilingViolation(_) => {
-            BuildStage::Validate
-        }
+        E::InvalidArg(_)
+        | E::DependencyValidation(_)
+        | E::CapabilityCeilingViolation(_)
+        | E::GrantRefused(_) => BuildStage::Validate,
         E::LintFailed(_) => BuildStage::Lint,
         E::CompilationFailed(_) | E::NoWasmEmitted | E::CompilationDisabled => BuildStage::Compile,
         E::NameCollision(_) | E::SharedModuleOverwrite(_) | E::PermissionDrift(_) => {
@@ -521,7 +538,7 @@ impl super::WorkflowCreationService {
     /// ```ignore
     /// let outcome = service
     ///     .create_from_spec(CreateFromSpecRequest {
-    ///         user_id, name, description, spec_nodes, spec_edges,
+    ///         user_id, name, description, spec_nodes, spec_edges, authority,
     ///     })
     ///     .await?;
     /// match outcome { ... }
@@ -550,7 +567,10 @@ impl super::WorkflowCreationService {
         }
 
         // ── Phase 2: Resolve + compile every node, write nothing ─────
-        let resolved = match self.resolve_spec_nodes(req.user_id, req.spec_nodes).await? {
+        let resolved = match self
+            .resolve_spec_nodes(req.user_id, req.spec_nodes, req.authority)
+            .await?
+        {
             ResolveResult::Resolved(r) => r,
             ResolveResult::Outcome(o) => return Ok(o),
         };
@@ -617,6 +637,7 @@ impl super::WorkflowCreationService {
         &self,
         user_id: Uuid,
         spec_nodes: &[Value],
+        authority: talos_capability_world::ChangeAuthority,
     ) -> anyhow::Result<ResolveResult> {
         struct Compiled<'a> {
             id: String,
@@ -780,7 +801,9 @@ impl super::WorkflowCreationService {
                         integration_name: None,
                         fuel_budget: None,
                         on_name_collision: talos_inline_compile_service::NameCollision::Refuse,
+                        authority,
                     };
+                    // compile-gate-elsewhere: world: the MCP handler's require_world_permitted over inline_compile_worlds; grants: compile_checked → resolve_grant for the request's authority
                     match self.inline_compile.compile_checked(&input).await {
                         Ok(compiled) => slots.push(Slot::Compiled(Box::new(Compiled {
                             id: node_id,

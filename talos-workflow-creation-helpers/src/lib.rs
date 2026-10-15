@@ -1655,19 +1655,26 @@ pub fn wrap_rust_code_with_talos_module(rust_code: &str, capability_world: &str)
     }
 }
 
-/// Compute the default `allowed_hosts` list for an inline-compiled node
-/// when the caller didn't supply one explicitly.
-///
-/// Network-capable worlds (anything containing `http`, `network`, `secrets`,
-/// `automation`, or `database`) get `["*"]` (wildcard); pure-compute worlds
-/// get an empty list. Mirrors the historical inline behaviour in
-/// `handle_add_node_to_workflow` and `handle_compile_custom_sandbox`.
+/// Compute the `allowed_hosts` list for an inline-compiled node.
 ///
 /// `explicit` short-circuits — when `Some(_)` the caller's list wins
-/// regardless of world. `None` means "fall through to defaults".
-pub fn resolve_default_allowed_hosts(world: &str, explicit: Option<Vec<String>>) -> Vec<String> {
+/// regardless of world. `None` means "fall through to defaults":
+/// network-capable worlds (anything containing `http`, `network`, `secrets`,
+/// `automation`, or `database`) default to `["*"]` (every host) and
+/// pure-compute worlds to an empty list.
+///
+/// The every-host default is a `*` grant, so it is given only to a caller
+/// that may loosen (security review 2026-10-15, A2-1): for an MCP agent token
+/// or an API key a network world with no explicit list is `Err` — the caller
+/// names the hosts. Until then `add_node_to_workflow` handed a bearer the
+/// `["*"]` it may not write anywhere else.
+pub fn resolve_default_allowed_hosts(
+    world: &str,
+    explicit: Option<Vec<String>>,
+    authority: talos_capability_world::ChangeAuthority,
+) -> Result<Vec<String>, &'static str> {
     if let Some(hosts) = explicit {
-        return hosts;
+        return Ok(hosts);
     }
     if world.contains("http")
         || world.contains("network")
@@ -1675,11 +1682,19 @@ pub fn resolve_default_allowed_hosts(world: &str, explicit: Option<Vec<String>>)
         || world.contains("automation")
         || world.contains("database")
     {
-        vec!["*".to_string()]
+        if !authority.may_loosen() {
+            return Err(HOSTS_MUST_BE_NAMED);
+        }
+        Ok(vec!["*".to_string()])
     } else {
-        Vec::new()
+        Ok(Vec::new())
     }
 }
+
+/// The sentence a bearer is given for a network world with no host list.
+pub const HOSTS_MUST_BE_NAMED: &str =
+    "This capability world can reach the network, so allowed_hosts must name the hosts the \
+     module calls: an MCP agent token or an API key does not receive the every-host default.";
 
 /// Format the user-facing error when an inline-compile would clobber a
 /// module that's referenced by other live workflows.
@@ -4059,55 +4074,59 @@ mod tests {
 
     // ─── resolve_default_allowed_hosts ───
 
+    const SESSION: talos_capability_world::ChangeAuthority =
+        talos_capability_world::ChangeAuthority::SecondFactorSession;
+    const BEARER: talos_capability_world::ChangeAuthority =
+        talos_capability_world::ChangeAuthority::BearerCredential;
+
     #[test]
     fn allowed_hosts_explicit_short_circuits() {
         let explicit = vec!["api.example.com".to_string()];
-        let out = resolve_default_allowed_hosts("minimal-node", Some(explicit.clone()));
-        assert_eq!(out, explicit);
+        for who in [SESSION, BEARER] {
+            let out = resolve_default_allowed_hosts("http-node", Some(explicit.clone()), who);
+            assert_eq!(out, Ok(explicit.clone()));
+        }
     }
 
     #[test]
     fn allowed_hosts_explicit_empty_short_circuits() {
         // Caller explicitly passing [] means "no hosts" — must be respected, not
         // expanded to a wildcard even if the world is network-capable.
-        let out = resolve_default_allowed_hosts("http-node", Some(vec![]));
-        assert_eq!(out, Vec::<String>::new());
+        let out = resolve_default_allowed_hosts("http-node", Some(vec![]), BEARER);
+        assert_eq!(out, Ok(Vec::<String>::new()));
     }
 
     #[test]
-    fn allowed_hosts_default_for_http_world() {
-        let out = resolve_default_allowed_hosts("http-node", None);
-        assert_eq!(out, vec!["*".to_string()]);
-    }
-
-    #[test]
-    fn allowed_hosts_default_for_network_world() {
-        let out = resolve_default_allowed_hosts("network-egress", None);
-        assert_eq!(out, vec!["*".to_string()]);
-    }
-
-    #[test]
-    fn allowed_hosts_default_for_secrets_world() {
-        let out = resolve_default_allowed_hosts("secrets-handler", None);
-        assert_eq!(out, vec!["*".to_string()]);
-    }
-
-    #[test]
-    fn allowed_hosts_default_for_automation_world() {
-        let out = resolve_default_allowed_hosts("automation-node", None);
-        assert_eq!(out, vec!["*".to_string()]);
-    }
-
-    #[test]
-    fn allowed_hosts_default_for_database_world() {
-        let out = resolve_default_allowed_hosts("database-node", None);
-        assert_eq!(out, vec!["*".to_string()]);
+    fn allowed_hosts_default_every_host_for_network_worlds_only_for_a_session() {
+        for world in [
+            "http-node",
+            "network-egress",
+            "secrets-handler",
+            "automation-node",
+            "database-node",
+        ] {
+            assert_eq!(
+                resolve_default_allowed_hosts(world, None, SESSION),
+                Ok(vec!["*".to_string()]),
+                "{world}"
+            );
+            // A2-1 (2026-10-15): a bearer names its hosts.
+            assert_eq!(
+                resolve_default_allowed_hosts(world, None, BEARER),
+                Err(HOSTS_MUST_BE_NAMED),
+                "{world}"
+            );
+        }
     }
 
     #[test]
     fn allowed_hosts_default_empty_for_minimal_world() {
-        let out = resolve_default_allowed_hosts("minimal-node", None);
-        assert!(out.is_empty());
+        for who in [SESSION, BEARER] {
+            assert_eq!(
+                resolve_default_allowed_hosts("minimal-node", None, who),
+                Ok(vec![])
+            );
+        }
     }
 
     // ─── format_shared_module_overwrite_error ───

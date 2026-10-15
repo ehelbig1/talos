@@ -121,6 +121,7 @@ async fn selector_evaluates_both_backends_and_tags_linear_artifact() {
     for (label, hot) in [("alpha", 0usize), ("bravo", 1), ("charlie", 2)] {
         for i in 0..15 {
             let ex = AppendExample {
+                origin: None,
                 features_text: format!("{label}-{i}"),
                 label: label.to_string(),
                 source: ExampleSource::LlmBootstrap,

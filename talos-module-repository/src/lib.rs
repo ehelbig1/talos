@@ -4398,10 +4398,18 @@ impl ModuleRepository {
         new: &[String],
         beyond: BeyondGrant<'_>,
     ) -> Result<Option<ModulePermissionChange>> {
-        if !authority.may_loosen()
-            && matches!(which, ModulePermission::Secrets | ModulePermission::Hosts)
-            && talos_capability_world::grant_list_has_wildcard(new)
-        {
+        // The one grant rule (`refuse_wildcard_grant`): `*` either list,
+        // and since 2026-10-15 a `<prefix>/*` secret glob (A2-3).
+        let refused = match which {
+            ModulePermission::Secrets => {
+                talos_capability_world::refuse_wildcard_grant(authority, new, &[])
+            }
+            ModulePermission::Hosts => {
+                talos_capability_world::refuse_wildcard_grant(authority, &[], new)
+            }
+            _ => Ok(()),
+        };
+        if refused.is_err() {
             return Err(WildcardGrantRefused.into());
         }
         let mut tx = self.db_pool.begin().await?;

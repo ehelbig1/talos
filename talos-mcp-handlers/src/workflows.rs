@@ -2279,6 +2279,22 @@ async fn handle_add_node_to_workflow(
             },
         };
 
+        // The role and the user's own capability ceiling bound what this
+        // compiles, as on every other compile surface (security review
+        // 2026-10-15, A2-2): until then only the workflow's bound actor's
+        // ceiling applied, which an actor-less workflow does not have.
+        if let Err(resp) = crate::sandbox::require_world_permitted(
+            &req_id,
+            &state.actor_repo,
+            &agent,
+            world,
+            "compile an inline module for",
+        )
+        .await
+        {
+            return resp;
+        }
+
         // N-6 (crate review 2026-05-06, re-verified 2026-07-14):
         // `dependencies` validation now happens inside
         // `InlineCompileService::compile_and_persist` itself (mapped to
@@ -2370,6 +2386,7 @@ async fn handle_add_node_to_workflow(
 
         let outcome = match state
             .inline_compile_service
+            // compile-gate-elsewhere: world: require_world_permitted above; grants: InlineCompileService::compile_checked → resolve_grant (refuse_wildcard_grant) for the input's authority
             .compile_and_persist(talos_inline_compile_service::InlineCompileInput {
                 user_id,
                 workflow_id: wf_id,
@@ -2386,6 +2403,8 @@ async fn handle_add_node_to_workflow(
                 // Re-running add_node_to_workflow with the same node_id
                 // updates that node's module (guarded).
                 on_name_collision: talos_inline_compile_service::NameCollision::Recompile,
+                // An MCP caller holds a bearer token (A2-1).
+                authority: talos_capability_world::ChangeAuthority::BearerCredential,
             })
             .await
         {
@@ -6834,20 +6853,61 @@ async fn handle_import_workflow(
                     let cargo_name =
                         talos_workflow_repository::sanitize_module_cargo_name(mod_name);
 
+                    // The world this module is compiled FOR: the bundle's
+                    // stated world, else the one its source declares, else
+                    // minimal. It is held to the caller's role and capability
+                    // ceiling BEFORE the compile, and the compile is checked
+                    // at it — every other compile surface does both
+                    // (security review 2026-10-15, G2-1; until then this
+                    // compiled at whatever the source declared and asked
+                    // nobody).
+                    let label: String = bundle_mod
+                        .and_then(|m| m.get("capability_world"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .or_else(|| talos_compilation::source_declared_world(src))
+                        .unwrap_or_else(|| "minimal-node".to_string());
+                    if let Err(resp) = crate::sandbox::require_world_permitted(
+                        &req_id,
+                        &state.actor_repo,
+                        &agent,
+                        &label,
+                        "import a module compiled for",
+                    )
+                    .await
+                    {
+                        return Some(resp);
+                    }
                     let job_id = uuid::Uuid::new_v4();
                     match state
                         .compiler
-                        .compile_to_wasm_with_config(
+                        // compile-gate-elsewhere: world: require_world_permitted on the label above; grants: none written (upsert_wasm_module records no grant)
+                        .compile_rust_for_world(
                             user_id,
                             job_id,
                             &cargo_name,
                             src,
                             &serde_json::json!({}),
                             None,
+                            &label,
                         )
                         .await
                     {
                         Ok(res) if res.success => {
+                            // The row records the world the BINARY is, which
+                            // must lie within the label it was checked at
+                            // (security review 2026-10-14, G-1).
+                            let recorded = match talos_compilation::world_to_record(&label, &res) {
+                                Ok(w) => w,
+                                Err(reason) => {
+                                    tracing::warn!(module = %mid, %reason, "import_workflow: compiled module is wider than its checked world");
+                                    still_missing.push((
+                                        mid_str.clone(),
+                                        "compiled, but the binary needs a wider world than it was checked at",
+                                    ));
+                                    continue;
+                                }
+                            };
                             let wasm = match res.wasm_bytes {
                                 Some(bytes) => bytes,
                                 None => {
@@ -6864,21 +6924,7 @@ async fn handle_import_workflow(
                             };
                             match state
                                 .workflow_repo
-                                // The row records the world the BINARY is
-                                // (`res.capability_world`, reconciled against
-                                // the source by the compile), never the
-                                // bundle's claim: a bundle labelled minimal
-                                // whose source builds a wider module is
-                                // recorded wide, so every ceiling reads the
-                                // truth (security review 2026-10-14, G-1).
-                                .upsert_wasm_module(
-                                    *mid,
-                                    user_id,
-                                    mod_name,
-                                    &wasm,
-                                    src,
-                                    res.capability_world.as_node_str(),
-                                )
+                                .upsert_wasm_module(*mid, user_id, mod_name, &wasm, src, recorded)
                                 .await
                             {
                                 Ok(_) => auto_compiled.push(mod_name.to_string()),
@@ -12828,6 +12874,7 @@ async fn handle_create_workflow_from_spec(
             description: &description,
             spec_nodes: &spec_nodes,
             spec_edges: &spec_edges,
+            authority: talos_capability_world::ChangeAuthority::BearerCredential,
         })
         .await
     {

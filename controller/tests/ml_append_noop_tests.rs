@@ -75,6 +75,7 @@ async fn dataset_service(pool: &sqlx::PgPool) -> DatasetService {
 
 fn ex(key: &str, text: &str, label: &str, source: ExampleSource) -> AppendExample {
     AppendExample {
+        origin: None,
         features_text: text.to_string(),
         label: label.to_string(),
         source,
