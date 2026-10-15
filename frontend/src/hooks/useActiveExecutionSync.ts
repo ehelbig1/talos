@@ -14,6 +14,7 @@ import {
   usePersistedExecutionStore,
 } from "@/store/executionStore";
 import { toast } from "sonner";
+import { useUIStore } from "@/store/uiStore";
 
 // MCP-889 (2026-05-14): stuck-execution watchdog threshold. If a
 // detail subscription receives no events for this long AND no node
@@ -183,6 +184,12 @@ export function useActiveExecutionSync(workflowId: string | null) {
     startTimeRef.current = Date.now();
     lastEventTimeRef.current = Date.now();
     setRunning(execId, workflowId!);
+    // A run's output lands in the console; a collapsed console is opened to
+    // its compact size so the first run is not read off node colours alone.
+    // A console the user has opened to full stays full.
+    if (useUIStore.getState().terminalState === "collapsed") {
+      useUIStore.getState().setTerminalState("compact");
+    }
 
     // MCP-889 (2026-05-14): stuck-execution watchdog. Without it, a
     // detail subscription that loses its terminal lifecycle event

@@ -28,7 +28,8 @@ const Terminal = React.lazy(() => import("@/components/Terminal"));
 import { KeyboardShortcutsHelp } from "@/components/KeyboardShortcutsHelp";
 import { cn } from "@/lib/utils";
 import { useKeyboardShortcuts, SHORTCUTS } from "@/hooks/useKeyboardShortcuts";
-import { Zap, FolderPlus, BookOpen } from "lucide-react";
+import { Zap, FolderPlus, BookOpen, Plus } from "lucide-react";
+import { Button } from "@/components/ui";
 
 const proOptions = { hideAttribution: true };
 const nodeTypes = { talosNode: TalosNode };
@@ -195,38 +196,45 @@ function Workspace() {
 
           {nodeCount === 0 && (
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-30 px-6">
-              <div className="text-center pointer-events-auto bg-surface-3/40 border border-white/10 p-16 rounded-2xl max-w-xl w-full relative">
-                <div className="relative z-10">
-                  <div className="w-24 h-24 mx-auto mb-10 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center shadow-2xl transition-ui">
-                    <Zap className="w-12 h-12 text-primary fill-primary/10" />
-                  </div>
-
-                  <h3 className="text-4xl font-semibold text-white tracking-tight mb-4 font-outfit">
-                    Start building
-                  </h3>
-                  <p className="text-sm text-muted-foreground/80 mb-2 leading-relaxed font-medium">
-                    This workflow has no nodes yet. Add a module to begin.
-                  </p>
-
-                  <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-                    <button
-                      onClick={() =>
-                        useUIStore.getState().setToolbarModal("addExisting")
-                      }
-                      className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-sm font-semibold bg-primary text-white rounded-2xl transition-ui shadow-xl"
-                    >
-                      <FolderPlus className="w-4 h-4" />
-                      Add a module
-                    </button>
-                    <button
-                      onClick={() => navigate("/library#templates")}
-                      className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-sm font-semibold bg-white/5 text-muted-foreground border border-white/10 hover:text-white hover:bg-white/10 rounded-2xl transition-ui"
-                    >
-                      <BookOpen className="w-4 h-4" />
-                      Browse templates
-                    </button>
-                  </div>
+              <div className="text-center pointer-events-auto bg-surface-3/40 border border-white/10 p-10 rounded-2xl max-w-md w-full">
+                <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center">
+                  <Zap className="w-6 h-6 text-primary fill-primary/10" />
                 </div>
+
+                <h2 className="text-xl font-semibold text-white tracking-tight mb-2 font-outfit">
+                  An empty canvas
+                </h2>
+                <p className="text-sm text-muted-foreground mb-6 leading-relaxed">
+                  A workflow is made of modules. Create one from a template, or
+                  add one you already have.
+                </p>
+
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
+                  <Button
+                    onClick={() =>
+                      useUIStore.getState().setToolbarModal("create")
+                    }
+                  >
+                    <Plus className="w-4 h-4" />
+                    New module
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={() =>
+                      useUIStore.getState().setToolbarModal("addExisting")
+                    }
+                  >
+                    <FolderPlus className="w-4 h-4" />
+                    Add existing module
+                  </Button>
+                </div>
+                <button
+                  onClick={() => navigate("/library#templates")}
+                  className="mt-5 inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-white transition-ui"
+                >
+                  <BookOpen className="w-3.5 h-3.5" />
+                  Browse templates
+                </button>
               </div>
             </div>
           )}

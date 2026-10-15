@@ -1,25 +1,23 @@
 import { useNavigate } from "react-router";
-import { Zap, Folder, Calendar, Globe, BookOpen } from "lucide-react";
+import { Folder, BookOpen } from "lucide-react";
 import { Button } from "@/components/ui";
 
-const STARTERS = [
+/**
+ * The three things a new user does, in order. Each step says where it
+ * happens; the two buttons above start the first two.
+ */
+const STEPS = [
   {
-    icon: Globe,
-    title: "Call an API",
-    desc: "Fetch from a service on a schedule or a webhook and act on the result.",
-    color: "text-blue-400 bg-blue-500/10 border-blue-500/20",
+    title: "Get a module",
+    desc: "Install one from Templates, or create one in the editor. A module is one unit of work: a fetch, a transform, a send.",
   },
   {
-    icon: Calendar,
-    title: "Run on a schedule",
-    desc: "A recurring job on a cron schedule, with its results kept in memory.",
-    color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/20",
+    title: "Create a workflow",
+    desc: "Add the module to a blank canvas, connect it to any others, and save.",
   },
   {
-    icon: Zap,
-    title: "Process incoming data",
-    desc: "Receive events from a webhook and route them through your modules.",
-    color: "text-violet-400 bg-violet-500/10 border-violet-500/20",
+    title: "Run it",
+    desc: "Run from the editor header. The console opens and shows each node's output.",
   },
 ];
 
@@ -27,55 +25,50 @@ const STARTERS = [
 export default function EmptyState({ onNew }: { onNew: () => void }) {
   const navigate = useNavigate();
   return (
-    <div className="space-y-10">
-      <div className="text-center py-16 px-6 bg-surface-3/40 border border-white/10 border-dashed rounded-2xl">
-        <div className="w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center mx-auto mb-6 border border-primary/20">
-          <Folder className="w-7 h-7 text-primary" />
+    <div className="space-y-8 max-w-3xl mx-auto">
+      <div className="text-center py-14 px-6 bg-surface-3/40 border border-white/10 border-dashed rounded-2xl">
+        <div className="w-14 h-14 bg-primary/10 rounded-2xl flex items-center justify-center mx-auto mb-5 border border-primary/20">
+          <Folder className="w-6 h-6 text-primary" />
         </div>
 
-        <h3 className="text-2xl font-semibold text-white font-outfit mb-3">
+        <h2 className="text-xl font-semibold text-white font-outfit mb-2">
           No workflows yet
-        </h3>
-        <p className="text-sm text-muted-foreground mb-8 max-w-md mx-auto leading-relaxed">
+        </h2>
+        <p className="text-sm text-muted-foreground mb-7 max-w-md mx-auto leading-relaxed">
           A workflow connects modules on a canvas and runs them on a schedule, a
-          webhook, or by hand. Start from a blank canvas or from a template.
+          webhook, or by hand.
         </p>
 
         <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
           <Button onClick={onNew}>Create a workflow</Button>
-          <Button variant="outline" onClick={() => navigate("/catalog")}>
+          <Button
+            variant="outline"
+            onClick={() => navigate("/library#templates")}
+          >
             <BookOpen className="w-4 h-4" />
             Browse templates
           </Button>
         </div>
       </div>
 
-      <div>
-        <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground mb-4 px-1">
-          Common starting points
-        </p>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          {STARTERS.map((card) => (
-            <button
-              key={card.title}
-              onClick={onNew}
-              className="text-left p-5 rounded-2xl bg-surface-3/60 border border-white/5 hover:border-white/20 hover:bg-surface-3 transition-ui focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
-            >
-              <div
-                className={`w-10 h-10 rounded-xl flex items-center justify-center border mb-4 ${card.color}`}
-              >
-                <card.icon className="w-5 h-5" />
-              </div>
-              <p className="text-sm font-semibold text-white font-outfit mb-1">
-                {card.title}
-              </p>
-              <p className="text-xs text-muted-foreground leading-relaxed">
-                {card.desc}
-              </p>
-            </button>
-          ))}
-        </div>
-      </div>
+      <ol className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        {STEPS.map((step, i) => (
+          <li
+            key={step.title}
+            className="p-5 rounded-2xl bg-surface-3/60 border border-white/5"
+          >
+            <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+              Step {i + 1}
+            </p>
+            <p className="text-sm font-semibold text-white font-outfit mb-1">
+              {step.title}
+            </p>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              {step.desc}
+            </p>
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }

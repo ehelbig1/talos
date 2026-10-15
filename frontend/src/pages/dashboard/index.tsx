@@ -332,73 +332,77 @@ export default function Dashboard() {
           }
         />
 
-        {/* Top Panels Grid */}
-        <div className="flex flex-col lg:flex-row gap-5 mb-8 empty:hidden">
-          <ActorsPanel />
-          <div className="flex-1 min-w-0">
-            <WorkflowStatsPanel />
-          </div>
-        </div>
-
-        {/* Filter Bar */}
-        <div className="flex flex-col md:flex-row md:items-center gap-3 mb-8">
-          <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
-            <input
-              type="search"
-              placeholder="Search workflows"
-              aria-label="Search workflows"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="w-full h-10 bg-surface-3/60 border border-white/10 text-white rounded-xl pl-9 pr-4 text-sm focus:outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/20 transition-ui placeholder:text-muted-foreground/60"
-            />
-          </div>
-
-          <div className="flex items-center gap-3">
-            <div className="relative">
-              <select
-                value={sortBy}
-                aria-label="Sort workflows"
-                onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
-                className="h-10 appearance-none bg-surface-3/60 border border-white/10 text-muted-foreground rounded-xl pl-3 pr-9 text-sm focus:outline-none focus:border-primary/40 transition-ui cursor-pointer hover:text-white"
-              >
-                <option value="name">Sort by name</option>
-                <option value="lastRun">Sort by last run</option>
-                <option value="status">Sort by status</option>
-              </select>
-              <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+        {workflows.length > 0 && (
+          <>
+            {/* Top Panels Grid */}
+            <div className="flex flex-col lg:flex-row gap-5 mb-8 empty:hidden">
+              <ActorsPanel />
+              <div className="flex-1 min-w-0">
+                <WorkflowStatsPanel />
+              </div>
             </div>
 
-            <div
-              className="flex p-1 bg-surface-3/60 rounded-xl border border-white/10 shrink-0"
-              role="group"
-              aria-label="Filter by status"
-            >
-              {(
-                [
-                  ["all", "All"],
-                  ["success", "Succeeded"],
-                  ["failed", "Failed"],
-                  ["idle", "Never run"],
-                ] as const
-              ).map(([s, label]) => (
-                <button
-                  key={s}
-                  onClick={() => setStatusFilter(s)}
-                  aria-pressed={statusFilter === s}
-                  className={cn(
-                    "px-3 h-8 text-xs font-medium rounded-lg transition-ui whitespace-nowrap",
-                    statusFilter === s
-                      ? "bg-white/10 text-white"
-                      : "text-muted-foreground hover:text-white",
-                  )}
+            {/* Filter Bar */}
+            <div className="flex flex-col md:flex-row md:items-center gap-3 mb-8">
+              <div className="relative flex-1">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+                <input
+                  type="search"
+                  placeholder="Search workflows"
+                  aria-label="Search workflows"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  className="w-full h-10 bg-surface-3/60 border border-white/10 text-white rounded-xl pl-9 pr-4 text-sm focus:outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/20 transition-ui placeholder:text-muted-foreground/60"
+                />
+              </div>
+
+              <div className="flex items-center gap-3">
+                <div className="relative">
+                  <select
+                    value={sortBy}
+                    aria-label="Sort workflows"
+                    onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
+                    className="h-10 appearance-none bg-surface-3/60 border border-white/10 text-muted-foreground rounded-xl pl-3 pr-9 text-sm focus:outline-none focus:border-primary/40 transition-ui cursor-pointer hover:text-white"
+                  >
+                    <option value="name">Sort by name</option>
+                    <option value="lastRun">Sort by last run</option>
+                    <option value="status">Sort by status</option>
+                  </select>
+                  <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+                </div>
+
+                <div
+                  className="flex p-1 bg-surface-3/60 rounded-xl border border-white/10 shrink-0"
+                  role="group"
+                  aria-label="Filter by status"
                 >
-                  {label}
-                </button>
-              ))}
+                  {(
+                    [
+                      ["all", "All"],
+                      ["success", "Succeeded"],
+                      ["failed", "Failed"],
+                      ["idle", "Never run"],
+                    ] as const
+                  ).map(([s, label]) => (
+                    <button
+                      key={s}
+                      onClick={() => setStatusFilter(s)}
+                      aria-pressed={statusFilter === s}
+                      className={cn(
+                        "px-3 h-8 text-xs font-medium rounded-lg transition-ui whitespace-nowrap",
+                        statusFilter === s
+                          ? "bg-white/10 text-white"
+                          : "text-muted-foreground hover:text-white",
+                      )}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
-          </div>
-        </div>
+          </>
+        )}
 
         {/* Workflow Grid */}
         <section className="relative">

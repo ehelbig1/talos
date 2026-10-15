@@ -2,6 +2,7 @@ import React, { memo, useState } from "react";
 import { ErrorBanner, Dialog, Button, DarkInput } from "@/components/ui";
 import { ModuleItem } from "@/components/dialogs/ModuleItem";
 import { useAddExistingNode } from "@/hooks/useAddExistingNode";
+import { useUIStore } from "@/store/uiStore";
 import { Search, Library } from "lucide-react";
 
 interface AddExistingNodeDialogProps {
@@ -100,14 +101,29 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
             <div>
               <ErrorBanner message={error} />
             </div>
+          ) : modules.length === 0 ? (
+            <div className="flex-1 flex flex-col items-center justify-center py-16 px-8 text-center border border-dashed border-white/10 rounded-2xl">
+              <Library className="w-8 h-8 text-muted-foreground mb-4" />
+              <p className="text-sm font-semibold text-white mb-1">
+                You have no modules yet
+              </p>
+              <p className="text-xs text-muted-foreground leading-relaxed max-w-[280px] mb-5">
+                Create one from a template and it is added to this workflow.
+              </p>
+              <Button
+                onClick={() => useUIStore.getState().setToolbarModal("create")}
+              >
+                New module
+              </Button>
+            </div>
           ) : filteredModules.length === 0 ? (
-            <div className="flex-1 flex flex-col items-center justify-center py-20 px-8 text-center border-2 border-dashed border-white/5 rounded-2xl bg-surface-1/10 grayscale opacity-20">
-              <Search className="w-12 h-12 text-muted-foreground/70 mb-6" />
-              <p className="text-xs font-semibold text-muted-foreground mb-2">
+            <div className="flex-1 flex flex-col items-center justify-center py-16 px-8 text-center border border-dashed border-white/10 rounded-2xl">
+              <Search className="w-8 h-8 text-muted-foreground mb-4" />
+              <p className="text-sm font-semibold text-white mb-1">
                 No modules match
               </p>
-              <p className="text-xs text-muted-foreground/60 leading-relaxed max-w-[240px]">
-                Try a different search, or create a module from the Catalog.
+              <p className="text-xs text-muted-foreground leading-relaxed max-w-[240px]">
+                Try a different search.
               </p>
             </div>
           ) : (

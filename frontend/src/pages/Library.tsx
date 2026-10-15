@@ -12,14 +12,7 @@ function TabLoading() {
         <div className="w-16 h-16 border-4 border-t-primary border-transparent rounded-full animate-spin absolute inset-0" />
       </div>
       <div className="flex flex-col items-center gap-2">
-        <span className="text-xs font-semibold text-white/70">
-          Synchronizing Registry
-        </span>
-        <div className="flex gap-1">
-          <div className="w-1 h-1 rounded-full bg-primary" />
-          <div className="w-1 h-1 rounded-full bg-primary" />
-          <div className="w-1 h-1 rounded-full bg-primary" />
-        </div>
+        <span className="text-xs font-semibold text-white/70">Loading…</span>
       </div>
     </div>
   );

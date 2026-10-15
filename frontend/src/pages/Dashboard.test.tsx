@@ -146,6 +146,22 @@ describe("Dashboard", () => {
 
     const emptyMsg = await screen.findByText(/No workflows yet/i);
     expect(emptyMsg).toBeInTheDocument();
+    // Nothing to search, sort or filter yet: the bar is not drawn over an
+    // empty list.
+    expect(screen.queryByLabelText("Search workflows")).toBeNull();
+    expect(screen.queryByLabelText("Filter by status")).toBeNull();
+    expect(screen.getByText("Step 1")).toBeInTheDocument();
+  });
+
+  it("shows the filter bar once a workflow exists", async () => {
+    mockWorkflows = [{ id: "1", name: "Only one", nodeCount: 0, edgeCount: 0 }];
+
+    renderWithProviders(<Dashboard />);
+
+    expect(await screen.findByText("Only one")).toBeInTheDocument();
+    expect(screen.getByLabelText("Search workflows")).toBeInTheDocument();
+    expect(screen.getByLabelText("Filter by status")).toBeInTheDocument();
+    expect(screen.queryByText(/No workflows yet/i)).toBeNull();
   });
 
   it("renders list of workflows", async () => {

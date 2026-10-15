@@ -268,7 +268,7 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
             <Button
               onClick={() => {
                 onClose();
-                navigate("/modules");
+                navigate("/library#installed");
               }}
               variant="premium"
               className="w-full py-7"
